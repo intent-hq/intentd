@@ -72,10 +72,13 @@ impl Services {
                 if let Ok(rows) = services.store.pending_script_monitors().await {
                     for (row, _) in rows {
                         if row.state == "active" {
-                            let _ = services
+                            if let Err(error) = services
                                 .script_manager()
                                 .reconcile_monitor(&row.workspace_id, &row.monitor_id)
-                                .await;
+                                .await
+                            {
+                                tracing::warn!(%error, monitor=%row.monitor_id, "script monitor reconciliation failed; will retry");
+                            }
                         } else {
                             services.dispatch_script_monitor(&row).await;
                         }

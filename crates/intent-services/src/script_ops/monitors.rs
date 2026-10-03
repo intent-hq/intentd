@@ -490,6 +490,32 @@ impl ScriptManager {
     }
 
     pub(crate) async fn reconcile_monitor(&self, ws: &WorkspaceId, id: &str) -> Result<()> {
+        let initial = self.store.script_monitor(ws, id).await?;
+        if initial.state == "active" {
+            // A failed finalizer retains the observed result in the registry.
+            // Retry before taking monitor_lane: finalization acquires locks in
+            // definition -> publication -> monitor order. Do not stall every
+            // monitor behind a busy start/stop/restart; the next sweep retries.
+            let definition = self.locks.definition_lock(&initial.script_id);
+            if let Ok(_definition) = definition.try_lock() {
+                let generation = self
+                    .scripts
+                    .lock()
+                    .unwrap()
+                    .get(&(ws.clone(), initial.script_id.clone()))
+                    .filter(|m| {
+                        m.run_id.as_ref() == Some(&initial.run_id)
+                            && m.run_generation == Some(m.generation)
+                            && m.pending_result.is_some()
+                            && !m.running_at_shutdown
+                    })
+                    .map(|m| m.generation);
+                if let Some(generation) = generation {
+                    self.finish_run_locked(ws, &initial.script_id, generation)
+                        .await;
+                }
+            };
+        }
         let _lane = self.locks.monitor_lane.lock().await;
         let mut row = self.store.script_monitor(ws, id).await?;
         self.reconcile_locked(&mut row).await?;

@@ -32673,6 +32673,17 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.presence_update_op(connection_id, params).await })
     }
 
+    fn presence_focus_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: intent_core::PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.presence_focus_snapshot_op(workspace_id, principal_id)
+                .await
+        })
+    }
+
     fn presence_snapshot(
         &self,
         workspace_id: WorkspaceId,

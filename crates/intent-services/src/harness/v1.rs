@@ -1192,33 +1192,8 @@ impl Harness for V1 {
                 "merge conflicts resolved".to_string()
             });
         }
-        // Ancestry counts are informational, including when a new base tip
-        // changes them without a head push. Availability is not a zero or a
-        // cleared merge requirement. Revision-only changes stay quiet.
-        match (&o.ancestry, &n.ancestry) {
-            (
-                PrAncestry::Known {
-                    behind_by: before, ..
-                },
-                PrAncestry::Known {
-                    behind_by: after, ..
-                },
-            ) if before != after => {
-                changes.push(format!(
-                    "branch ancestry: {before} → {after} commits behind base"
-                ));
-            }
-            (PrAncestry::Unknown, PrAncestry::Known { behind_by, .. }) => {
-                let suffix = if *behind_by == 1 { "" } else { "s" };
-                changes.push(format!(
-                    "branch ancestry available: {behind_by} commit{suffix} behind base"
-                ));
-            }
-            (PrAncestry::Known { .. }, PrAncestry::Unknown) => {
-                changes.push("branch ancestry unavailable".to_string());
-            }
-            _ => {}
-        }
+        // Ancestry is visible in the checklist, but neither distance nor
+        // availability changes warrant a wake or reset the debounce window.
         // Only a known true→false forge verdict clears this requirement.
         // In particular, an old persisted baseline has None, not false.
         let update_change = match (o.branch_update_required, n.branch_update_required) {

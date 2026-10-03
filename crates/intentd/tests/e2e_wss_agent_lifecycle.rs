@@ -14029,10 +14029,10 @@ fn assert_no_file_data(v: &Value, surface: &str) {
     }
 }
 
-/// Real TLS/WebSocket coverage for the chat-only five-row snapshot policy:
+/// Real TLS/WebSocket coverage for the chat-only twenty-row snapshot policy:
 /// fresh/stale/recent subscriptions, cursor continuation and invalidation reset.
 #[intent_test_macros::daemon_test]
-async fn five_message_chat_snapshots_and_invalidation_over_wss() {
+async fn twenty_message_chat_snapshots_and_invalidation_over_wss() {
     use intent_core::{now_iso, AgentId, WorkspaceApi, WorkspaceId};
     use intent_services::Services;
     use intent_store::Store;
@@ -14055,7 +14055,7 @@ async fn five_message_chat_snapshots_and_invalidation_over_wss() {
         let created = services
             .agent_create(
                 ws.clone(),
-                Some("Five messages".into()),
+                Some("Twenty messages".into()),
                 None,
                 None,
                 None,
@@ -14066,7 +14066,7 @@ async fn five_message_chat_snapshots_and_invalidation_over_wss() {
             .expect("agent");
         let agent = AgentId::from(created["agent"]["id"].as_str().unwrap());
         let mut ids = Vec::new();
-        for seq in 0..12 {
+        for seq in 0..27 {
             ids.push(
                 store
                     .append_agent_message(
@@ -14090,7 +14090,7 @@ async fn five_message_chat_snapshots_and_invalidation_over_wss() {
     let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
     let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
     let mut rpc = connect_ws(port, cfg.clone()).await;
-    // Generic conversation paging keeps its existing default (all 12 here).
+    // Generic conversation paging keeps its existing default (all 27 here).
     let generic = wss_rpc(
         &mut rpc,
         1,
@@ -14098,12 +14098,12 @@ async fn five_message_chat_snapshots_and_invalidation_over_wss() {
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
     )
     .await;
-    assert_eq!(generic["messages"].as_array().unwrap().len(), 12);
+    assert_eq!(generic["messages"].as_array().unwrap().len(), 27);
 
     for (since, expected_start, resumed) in [
         (None, 7, None),
         (Some(ids[3].as_str()), 7, Some(false)),
-        (Some(ids[9].as_str()), 10, Some(true)),
+        (Some(ids[10].as_str()), 11, Some(true)),
     ] {
         let mut chat = connect_ws(port, cfg.clone()).await;
         let mut params = json!({ "agentId": agent_id });
@@ -14145,15 +14145,15 @@ async fn five_message_chat_snapshots_and_invalidation_over_wss() {
         assert_eq!(push["params"]["seq"], 0);
         let snapshot = &push["params"]["snapshot"];
         let rows = snapshot["messages"].as_array().unwrap();
-        assert_eq!(rows.len(), 12 - expected_start);
+        assert_eq!(rows.len(), 27 - expected_start);
         for (row, expected_id) in rows.iter().zip(&ids[expected_start..]) {
             assert_eq!(row["id"], expected_id.as_str());
         }
         assert_eq!(snapshot.get("resumed").and_then(Value::as_bool), resumed);
-        assert_eq!(snapshot["totalMessages"], 12);
+        assert_eq!(snapshot["totalMessages"], 27);
         assert_eq!(snapshot["truncated"], resumed != Some(true));
         eprintln!(
-            "WSS five-message snapshot: resumed={resumed:?} rows={} bytes={}",
+            "WSS twenty-message snapshot: resumed={resumed:?} rows={} bytes={}",
             rows.len(),
             serde_json::to_vec(snapshot).unwrap().len()
         );
@@ -14188,9 +14188,9 @@ async fn five_message_chat_snapshots_and_invalidation_over_wss() {
             assert_eq!(oldest["messages"][1]["id"], ids[1].as_str());
             assert!(oldest["nextToken"].is_null());
         }
-        // An active recent-resume connection must reset to five on replacement.
+        // An active recent-resume connection must reset to twenty on replacement.
         if resumed == Some(true) {
-            let messages: Vec<Value> = (0..9)
+            let messages: Vec<Value> = (0..24)
                 .map(|seq| {
                     json!({ "role": "user",
                 "contentBlocks": [{ "type": "text", "text": format!("replacement {seq}") }] })
@@ -14210,10 +14210,10 @@ async fn five_message_chat_snapshots_and_invalidation_over_wss() {
             assert_eq!(reset["params"]["seq"], 1);
             let snapshot = &reset["params"]["snapshot"];
             assert_eq!(snapshot["resumed"], false);
-            assert_eq!(snapshot["totalMessages"], 9);
-            assert_eq!(snapshot["messages"].as_array().unwrap().len(), 5);
+            assert_eq!(snapshot["totalMessages"], 24);
+            assert_eq!(snapshot["messages"].as_array().unwrap().len(), 20);
             assert_eq!(snapshot["messages"][0]["seq"], 4);
-            assert_eq!(snapshot["messages"][4]["seq"], 8);
+            assert_eq!(snapshot["messages"][19]["seq"], 23);
             assert!(snapshot["nextToken"].is_string());
         }
         chat.close(None).await.expect("close chat");
