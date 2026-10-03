@@ -28,7 +28,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpSocket};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 
 /// A fixed 64-char hex token (valid shape) shared by server + client in tests.
@@ -246,16 +246,34 @@ async fn spawn_echo_listener() -> u16 {
     port
 }
 
-/// Reserve a loopback port that refuses connects for as long as the returned
-/// socket is held: bound but never listening, so the kernel answers connects
-/// with RST while the live bind keeps concurrent processes from reusing the
-/// port (the bind-and-drop pattern raced under parallel test load,
-/// intent-hq/monorepo#3499).
-fn closed_port() -> (TcpSocket, u16) {
-    let socket = TcpSocket::new_v4().expect("socket");
-    socket.bind((Ipv4Addr::LOCALHOST, 0).into()).expect("bind");
-    let port = socket.local_addr().expect("local addr").port();
-    (socket, port)
+/// Hold both ends of an established connection, using its non-listening client
+/// port as the refused target. A bound-but-unconnected socket can silently drop
+/// SYNs on Darwin instead of refusing them. Keeping the connection alive prevents
+/// automatic ephemeral-port reuse (intent-hq/monorepo#3499); this is not a lock
+/// against an explicit competing bind with address reuse enabled.
+async fn closed_port() -> ((TcpStream, TcpStream), u16, std::io::Error) {
+    tokio::time::timeout(common::test_timeout(Duration::from_secs(10)), async {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("reservation listener");
+        let socket = TcpSocket::new_v4().expect("socket");
+        socket.bind((Ipv4Addr::LOCALHOST, 0).into()).expect("bind");
+        let client = socket
+            .connect(listener.local_addr().expect("listener address"))
+            .await
+            .expect("reservation connect");
+        let (peer, _) = listener.accept().await.expect("reservation accept");
+        let port = client.local_addr().expect("client address").port();
+        eprintln!("closed-port reservation ready: target=127.0.0.1:{port}");
+        let error = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect_err("non-listening reserved target must refuse a new connection");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        eprintln!("closed-port reservation qualified: target=127.0.0.1:{port} error={error}");
+        ((client, peer), port, error)
+    })
+    .await
+    .expect("timed out preparing the refused-port reservation")
 }
 
 /// OPEN a live echo port, push data both ways, then tear down with EOF: the
@@ -348,7 +366,7 @@ async fn tunnel_close_tears_down_and_frees_stream_id() {
 #[intent_test_macros::daemon_test]
 async fn tunnel_open_err_for_closed_port_keeps_connection_alive() {
     let srv = start().await;
-    let (_port_reservation, dead_port) = closed_port();
+    let (port_reservation, dead_port, refused) = closed_port().await;
     let echo_port = spawn_echo_listener().await;
     let mut ws = connect_tunnel(srv.port, srv.cfg.clone()).await;
 
@@ -377,6 +395,7 @@ async fn tunnel_open_err_for_closed_port_keeps_connection_alive() {
                 message.contains(&format!("127.0.0.1:{dead_port}")),
                 "OPEN_ERR names the target: {message}"
             );
+            assert_eq!(message, format!("connect 127.0.0.1:{dead_port}: {refused}"));
         }
         other => panic!("expected OPEN_ERR, got {other:?}"),
     }
@@ -400,6 +419,8 @@ async fn tunnel_open_err_for_closed_port_keeps_connection_alive() {
         receive_started.elapsed()
     );
     assert_eq!(frame, Frame::OpenOk { stream_id: 1 });
+    drop(port_reservation);
+    eprintln!("closed-port reservation released: target=127.0.0.1:{dead_port}");
     ws.close(None).await.expect("close ws");
     srv.ws.stop().await;
 }
