@@ -288,10 +288,11 @@ fn args_dump_script() -> String {
 
 // The signal handlers exit the fake daemon while its wait is interrupted.
 // Reap only the background sleep owned by this shell before preserving that exit.
+// KILL cannot be swallowed by the forked shell before it execs sleep.
 const PARKED_CHILD_CLEANUP: &str = r#"sleep_pid=
 stop_sleep() {
     if [ -n "$sleep_pid" ]; then
-        kill "$sleep_pid" 2>/dev/null || :
+        kill -KILL "$sleep_pid" 2>/dev/null || :
         wait "$sleep_pid" 2>/dev/null || :
         sleep_pid=
     fi
@@ -489,7 +490,11 @@ fn fake_daemon_graceful_exit_stops_its_parked_child() {
         assert_eq!(&ready, b"ready");
         child.signal(Signal::SIGTERM).unwrap();
         assert_eq!(
-            wait_exit(&mut child, Duration::from_secs(3)).code(),
+            child
+                .wait_with_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap_or_else(|| panic!("script {index} did not exit within 3s"))
+                .code(),
             Some(0)
         );
         let mut remaining = Vec::new();

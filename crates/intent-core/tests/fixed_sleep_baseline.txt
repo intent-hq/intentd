@@ -42,7 +42,7 @@ crates/intentd/tests/e2e_wss_browser_tabs.rs 2
 crates/intentd/tests/e2e_wss_change_events.rs 1
 crates/intentd/tests/e2e_wss_chat_tool_result_ids.rs 1
 crates/intentd/tests/e2e_wss_chief_workspace.rs 6
-crates/intentd/tests/e2e_wss_codex_session_title.rs 3
+crates/intentd/tests/e2e_wss_codex_session_title.rs 2
 crates/intentd/tests/e2e_wss_delegate_batch.rs 1
 crates/intentd/tests/e2e_wss_delegate_provider_resolution.rs 1
 crates/intentd/tests/e2e_wss_delegation_group_persist.rs 3

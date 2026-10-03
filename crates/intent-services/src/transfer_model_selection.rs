@@ -50,8 +50,9 @@ use intent_store::normalize_compound_model;
 use serde_json::{Map, Value};
 
 use crate::agent_ops::{
-    ensure_effort_supported_by_model, ensure_known_provider, ensure_provider_available,
-    resolve_agent_default_model_with_source, resolve_settings_default_reasoning_effort,
+    ensure_effort_supported_by_model, ensure_known_provider,
+    ensure_provider_available_with_discovery, resolve_agent_default_model_with_source,
+    resolve_settings_default_reasoning_effort,
 };
 
 const IMPORT_METHOD: &str = "workspace.import.commit";
@@ -135,7 +136,20 @@ impl crate::Services {
                 .or_insert_with(|| {
                     ensure_known_provider(IMPORT_METHOD, provider)
                         .and_then(|()| {
-                            ensure_provider_available(IMPORT_METHOD, provider, &settings.providers)
+                            ensure_provider_available_with_discovery(
+                                IMPORT_METHOD,
+                                provider,
+                                &settings.providers,
+                                || {
+                                    #[cfg(test)]
+                                    if let Some(fixture) = &self.import_provider_availability {
+                                        return fixture.get(provider).cloned();
+                                    }
+                                    intent_providers::provider_availability_for(provider, &|key| {
+                                        settings.providers.paths.get(key).cloned()
+                                    })
+                                },
+                            )
                         })
                         .map_err(|e| e.to_string())
                 })

@@ -400,7 +400,7 @@ async fn managed_codex_upgrade_reprobes_persisted_catalog() {
         1_000,
     );
     let reloaded = Arc::new(ModelCatalogCache::new(Some(path)));
-    let key = intent_providers::config::CODEX_ACP_NPX_PACKAGE;
+    let key = intent_providers::codex::ADAPTER_VERSION;
     let result =
         resolve_with_cache(&reloaded, "codex", key, false, 1_001, ok_fetch("gpt-6-sol")).await;
     assert_eq!(result.models, Some(rows("gpt-6-sol")));
@@ -620,12 +620,9 @@ fn registry_version_keys_follow_adapter_pins() {
     assert_eq!(key("opencode"), "");
     assert_eq!(key("grok"), "");
     assert_eq!(key("unsloth"), "");
-    // Codex always uses the pinned adapter, including hosts with native or
+    // Codex always uses the vendored adapter, including hosts with native or
     // JavaScript codex-acp executables installed.
-    assert_eq!(
-        key("codex"),
-        intent_providers::config::CODEX_ACP_NPX_PACKAGE
-    );
+    assert_eq!(key("codex"), super::codex_version());
 }
 
 #[test]
@@ -639,12 +636,7 @@ fn codex_catalog_does_not_reuse_native_adapter_cache() {
         None
     );
 
-    cache.store(
-        "codex",
-        intent_providers::config::CODEX_ACP_NPX_PACKAGE,
-        models,
-        1_000,
-    );
+    cache.store("codex", &super::codex_version(), models, 1_000);
     assert_eq!(
         cache.reader(None).cached_default_model("codex"),
         Some("gpt-5.5".to_string())

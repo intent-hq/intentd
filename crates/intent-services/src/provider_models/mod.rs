@@ -216,16 +216,16 @@ pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
 pub(crate) async fn installed_model_command(provider_id: &str) -> Result<AcpProbeCommand, String> {
     let provider = intent_providers::find_provider(provider_id).ok_or("unknown provider")?;
     let codex = provider_id == "codex";
-    let npx = tokio::task::spawn_blocking(move || {
+    let runtime = tokio::task::spawn_blocking(move || {
         if codex {
-            intent_providers::find_codex_npx()
+            intent_providers::find_codex_node()
         } else {
             find_npx()
         }
     })
     .await
     .map_err(|_| "adapter discovery failed")?;
-    let cmd = crate::complete_ops::one_shot_launch(provider, None, npx, None)
+    let cmd = crate::complete_ops::one_shot_launch(provider, None, runtime, None)
         .ok_or_else(|| crate::complete_ops::missing_one_shot_adapter_message(provider_id))?;
     cmd.check_npx_version().await.map_err(|e| e.to_string())?;
     cmd.prepare_installed_catalog().await
@@ -260,12 +260,12 @@ pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
     fetch_installed_models("codex").await
 }
 
-/// The same pinned launch and policy used by one-shot completions. No native
+/// The same vendored launch and policy used by one-shot completions. No native
 /// or configured adapter path is accepted by a Codex model probe.
 #[cfg(test)]
-fn codex_probe_launch(npx: Option<PathBuf>) -> Option<AcpProbeCommand> {
+fn codex_probe_launch(node: Option<PathBuf>) -> Option<AcpProbeCommand> {
     let provider = intent_providers::find_provider("codex")?;
-    crate::complete_ops::one_shot_launch(provider, None, npx, None)
+    crate::complete_ops::one_shot_launch(provider, None, node, None)
 }
 
 /// Attach a freshly created isolated `CODEX_HOME` to an ephemeral codex

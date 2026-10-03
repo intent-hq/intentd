@@ -175,7 +175,7 @@ impl InstalledContext {
     pub fn key(&self, identity: &InstalledCliIdentity) -> Option<String> {
         let context_key = self.context_key?;
         let adapter = match self.runtime.cli() {
-            InstalledCli::Codex => intent_providers::CODEX_ACP_NPX_PACKAGE,
+            InstalledCli::Codex => intent_providers::codex::ADAPTER_VERSION.trim(),
             InstalledCli::Claude => intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE,
         };
         Some(format!(

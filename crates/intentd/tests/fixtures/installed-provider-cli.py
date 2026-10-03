@@ -1,6 +1,6 @@
 # Installed CLI protocol double, never an ACP adapter. The Rust harness prepends
 # an absolute Python -S shebang and fixed PROVIDER, GENERATION, LOG constants.
-# Each replacement changes only this executable; the npm adapter stays untouched.
+# Each replacement changes only this executable; the ACP adapter stays untouched.
 import json
 import os
 import sys
@@ -46,6 +46,10 @@ for line in sys.stdin:
             result = dict(account={'type': 'apiKey'}, requiresOpenaiAuth=False)
         elif method == 'config/read':
             result = dict(config={}, layers=[])
+        elif method == 'account/rateLimits/read':
+            result = dict(rateLimits={}, rateLimitsByLimitId={})
+        elif method == 'thread/goal/get':
+            result = dict(goal=None)
         elif method == 'model/list':
             result = dict(data=[dict(id=m, model=m, displayName=m, description=m,
                                     isDefault=i == 0, hidden=False, inputModalities=['text'],
@@ -64,7 +68,7 @@ for line in sys.stdin:
         elif method == 'turn/start':
             session = params['threadId']
             if session in ephemeral_threads:
-                # Pinned ACP independently tries an unadvertised title model after
+                # Vendored ACP independently tries an unadvertised title model after
                 # a real turn. Reject only that auxiliary request without killing
                 # the installed CLI or weakening selected-model assertions.
                 assert params.get('outputSchema'), params

@@ -195,6 +195,7 @@ pub(crate) struct AcpAdapterCommand {
     /// npx-run adapters get the longer cold-install timeout budget and start
     /// in a neutral [`NpxLaunchDir`] rather than `cwd`.
     via_npx: bool,
+    bundled_codex: bool,
     /// Parent of the per-launch [`NpxLaunchDir`]; `None` is the OS temp dir.
     npx_launch_root: Option<PathBuf>,
 }
@@ -202,10 +203,16 @@ pub(crate) struct AcpAdapterCommand {
 impl AcpAdapterCommand {
     fn command_in(&self, process_cwd: &std::path::Path) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(&self.program);
+        if self.bundled_codex {
+            command.arg(process_cwd.join("codex-acp.mjs"));
+        }
         command
             .args(&self.args)
             .current_dir(process_cwd)
-            .env("PATH", enhanced_path(Some(&self.program)))
+            .env(
+                "PATH",
+                enhanced_path((!self.bundled_codex).then_some(self.program.as_path())),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -263,9 +270,14 @@ impl AcpAdapterCommand {
         let context_for_home = context.clone();
         let root = self.npx_launch_root.clone();
         let via_npx = self.via_npx;
+        let bundled_codex = self.bundled_codex;
         let (npx_dir, codex_home) = tokio::task::spawn_blocking(move || {
-            let npx_dir = if via_npx {
-                Some(Arc::new(NpxLaunchDir::create(root.as_deref())?))
+            let npx_dir = if via_npx || bundled_codex {
+                let dir = Arc::new(NpxLaunchDir::create(root.as_deref())?);
+                if bundled_codex {
+                    intent_providers::codex::write_adapter(dir.path())?;
+                }
+                Some(dir)
             } else {
                 None
             };
@@ -367,9 +379,6 @@ impl AcpAdapterCommand {
     pub(crate) fn npx(npx: PathBuf, package: &str) -> Self {
         Self {
             installed_cli: match package {
-                intent_providers::CODEX_ACP_NPX_PACKAGE => {
-                    Some(intent_providers::installed_cli::InstalledCli::Codex)
-                }
                 intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE => {
                     Some(intent_providers::installed_cli::InstalledCli::Claude)
                 }
@@ -387,6 +396,7 @@ impl AcpAdapterCommand {
             auth_required_stdout_marker: None,
             cwd: None,
             via_npx: true,
+            bundled_codex: false,
             npx_launch_root: None,
         }
     }
@@ -403,6 +413,7 @@ impl AcpAdapterCommand {
             auth_required_stdout_marker: None,
             cwd: None,
             via_npx: false,
+            bundled_codex: false,
             npx_launch_root: None,
         }
     }
@@ -445,9 +456,17 @@ impl AcpAdapterCommand {
     }
 
     /// Remove an environment variable from the adapter child's inherited env.
+    #[cfg(all(test, unix))]
     pub(crate) fn env_remove(mut self, key: impl Into<String>) -> Self {
         self.envs_removed.push(key.into());
         self
+    }
+
+    pub(crate) fn bundled_codex(node: PathBuf) -> Self {
+        let mut command = Self::binary(node, Vec::new());
+        command.bundled_codex = true;
+        command.installed_cli = Some(intent_providers::installed_cli::InstalledCli::Codex);
+        command
     }
 
     /// Recognize the controlled browser helper's immediate auth signal.
@@ -760,7 +779,7 @@ fn spawn_admitted_adapter(
 ) -> Result<SpawnedAdapter, String> {
     let npx_launch_dir = if let Some(installed) = &cmd.installed {
         installed.npx_dir.clone()
-    } else if cmd.via_npx {
+    } else if cmd.via_npx || cmd.bundled_codex {
         Some(Arc::new(
             NpxLaunchDir::create(cmd.npx_launch_root.as_deref())
                 .map_err(|e| format!("{}: npx launch dir: {e}", cmd.program.display()))?,
@@ -771,6 +790,10 @@ fn spawn_admitted_adapter(
     let process_cwd = npx_launch_dir
         .as_ref()
         .map_or_else(|| cmd.working_dir(), |dir| dir.path().to_path_buf());
+    if cmd.bundled_codex && cmd.installed.is_none() {
+        intent_providers::codex::write_adapter(&process_cwd)
+            .map_err(|e| format!("cannot prepare vendored Codex ACP: {e}"))?;
+    }
     let mut command = cmd.command_in(&process_cwd);
     if let Some(installed) = &cmd.installed {
         installed.apply(&mut command);

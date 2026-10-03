@@ -708,12 +708,9 @@ async fn installed_cli_preparation_retains_actual_directories_on_owner_failure()
         if fail {
             std::fs::write(root.path().join("fail-owner"), "").unwrap();
         }
-        let result = crate::acp_adapter::AcpAdapterCommand::npx(
-            root.path().join("npx"),
-            intent_providers::CODEX_ACP_NPX_PACKAGE,
-        )
-        .prepare_with_context(context)
-        .await;
+        let result = crate::acp_adapter::AcpAdapterCommand::bundled_codex(root.path().join("node"))
+            .prepare_with_context(context)
+            .await;
         assert_eq!(
             result.is_err(),
             fail,
@@ -767,14 +764,11 @@ async fn installed_cli_cancelled_preparation_releases_actual_directories_after_c
     let root = crate::test_support::test_tempdir("installed-version-cancel");
     let context = owner_failure_context(root.path());
     std::fs::write(root.path().join("hang-owner"), "").unwrap();
-    let npx = root.path().join("npx");
+    let node = root.path().join("node");
     let operation = tokio::spawn(async move {
-        let _ = crate::acp_adapter::AcpAdapterCommand::npx(
-            npx,
-            intent_providers::CODEX_ACP_NPX_PACKAGE,
-        )
-        .prepare_with_context(context)
-        .await;
+        let _ = crate::acp_adapter::AcpAdapterCommand::bundled_codex(node)
+            .prepare_with_context(context)
+            .await;
     });
     cancel_version_owner(operation, root.path()).await;
 }

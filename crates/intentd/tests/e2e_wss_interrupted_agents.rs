@@ -235,6 +235,7 @@ async fn interrupted_agents_persisted_across_restart() {
     common::disable_resume_on_start(&data_dir);
     let mut cmd1 = common::serve_command();
     cmd1.env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .stdout(Stdio::null())
@@ -333,6 +334,7 @@ async fn interrupted_agents_persisted_across_restart() {
     }
     let mut cmd2 = common::serve_command();
     cmd2.env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .stdout(Stdio::null())
@@ -384,6 +386,7 @@ async fn interrupted_agents_persisted_across_restart() {
     }
     let mut cmd3 = common::serve_command();
     cmd3.env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .stdout(Stdio::null())
@@ -634,6 +637,7 @@ async fn cancelled_settings_hook_joins_before_main_listener_teardown() {
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TEST_SETTINGS_RESPONSE_GATE", response_path)
         .env("INTENTD_TEST_SETTINGS_WS_START_GATE", start_path)
+        .env("INTENTD_SECRETS_FILE", data.join("secrets.json"))
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&log_path).unwrap()));
     command.process_group(0);
@@ -897,6 +901,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     common::disable_resume_on_start(&data_dir);
     let mut cmd1 = common::serve_command();
     cmd1.env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -1118,6 +1123,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     }
     let mut cmd2 = common::serve_command();
     cmd2.env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)

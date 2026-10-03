@@ -83,7 +83,7 @@ fn run_imports(root: &Path, contract: &Value, fault: &str) -> Result<Value, Stri
     std::fs::create_dir_all(&bin).unwrap();
     let sentinel =
         "#!/bin/sh\nprintf 'unexpected provider launch' > \"$HOME/provider-launched\"\nexit 91\n";
-    for provider in ["auggie", "codex-acp"] {
+    for provider in ["auggie", "codex", "node"] {
         executable(&bin.join(provider), sentinel);
     }
     let shell = root.join("shell");
@@ -150,7 +150,7 @@ async fn import_case(root: &Path, contract: &Value, case: &Value, fault: &str) -
             ("providers.enabled".into(), enabled),
             (
                 "providers.paths".into(),
-                json!({"auggie": bin.join("auggie"), "codex": bin.join("codex-acp")}),
+                json!({"auggie": bin.join("auggie")}),
             ),
         ])
         .unwrap();

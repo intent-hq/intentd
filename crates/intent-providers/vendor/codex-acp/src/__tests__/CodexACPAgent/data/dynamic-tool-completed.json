@@ -1,0 +1,14 @@
+{
+  "method": "sessionUpdate",
+  "args": [
+    {
+      "sessionId": "test-session-id",
+      "update": {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "dyn-tool-123",
+        "name": "list_apps",
+        "status": "completed"
+      }
+    }
+  ]
+}

@@ -237,15 +237,21 @@ fn claude_code_version() -> String {
     intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE.to_string()
 }
 
-/// codex source: ACP probe via the pinned npx adapter.
+/// Codex source: ACP probe via the vendored adapter.
 fn codex_fetch() -> BoxFuture<'static, ModelFetchResult> {
     provider_models_fetch("codex")
 }
 
-/// Codex always uses this adapter pin. Native/custom adapter installations
-/// cannot change the model source or reuse their old unpinned cache entries.
+/// The catalog depends on the vendored adapter and the selected host runtime.
+/// Replacing either invalidates the saved ACP model catalog.
 fn codex_version() -> String {
-    intent_providers::config::CODEX_ACP_NPX_PACKAGE.to_string()
+    let adapter = intent_providers::codex::ADAPTER_VERSION;
+    format!(
+        "{adapter}:{}",
+        intent_providers::codex::runtime_cache_key(
+            intent_providers::codex::host_codex_path().as_deref()
+        )
+    )
 }
 
 /// pi source: ACP probe via the pinned npx adapter.

@@ -60,8 +60,7 @@ async fn spawn_fixture(
     model: &str,
     dir: &tempfile::TempDir,
 ) {
-    // Explicit resolved binary isolates even Codex, whose production npx-only
-    // policy deliberately ignores providers.paths adapter overrides.
+    // Explicit fixture launch preserves the production adapter override policy.
     let config = intent_providers::find_provider(provider).unwrap();
     let script = dir.path().join("adapter.mjs");
     let mut opts = SpawnOptions::new(config);
@@ -89,10 +88,7 @@ fn preference(mgr: &AgentManager, provider: &str, value: bool) {
 }
 
 async fn turn(mgr: &AgentManager, id: &AgentId) -> Value {
-    let sid = mgr
-        .ensure_started(id, &WorkspaceId::from("ws-1"))
-        .await
-        .unwrap();
+    let sid = ensure_started(mgr, id).await.unwrap();
     let conn = mgr.handles.lock().unwrap()[id]
         .execution
         .connection()
@@ -104,6 +100,13 @@ async fn turn(mgr: &AgentManager, id: &AgentId) -> Value {
     .await
     .unwrap()["native"]
         .clone()
+}
+
+async fn ensure_started(mgr: &AgentManager, id: &AgentId) -> Result<String> {
+    mgr.ensure_started_with_codex_node(id, &WorkspaceId::from("ws-1"), || {
+        Some(PathBuf::from("/fixture/node"))
+    })
+    .await
 }
 
 fn calls(dir: &tempfile::TempDir) -> Vec<Value> {
@@ -250,10 +253,7 @@ async fn fast_mode_absent_option_allows_off_then_rechecks_eligible_model() {
 async fn fast_mode_failed_off_blocks_prompt_without_recycling() {
     for provider in ["claude-code", "codex"] {
         let (mgr, id, dir, _cli_env) = fixture(provider, "supported", true).await;
-        let err = mgr
-            .ensure_started(&id, &WorkspaceId::from("ws-1"))
-            .await
-            .unwrap_err();
+        let err = ensure_started(&mgr, &id).await.unwrap_err();
         assert!(
             err.to_string().contains("could not apply Fast mode off"),
             "{err}"

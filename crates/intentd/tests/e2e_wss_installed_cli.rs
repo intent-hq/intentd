@@ -1,8 +1,8 @@
-//! Actual pinned npm adapters + controlled installed CLIs, through production WSS.
-//! Opt in with `INTENTD_TEST_CODEX_ADAPTER` / `INTENTD_TEST_CLAUDE_ADAPTER` pointing
-//! at each package directory (containing package.json), then run this ignored test.
-//! No npm downloads, account credentials or paid prompts occur in this test.
-//! The only package-dispatch shim selects those unchanged adapter entrypoints.
+//! Vendored Codex and pinned Claude ACP + controlled installed CLIs over WSS.
+//! Opt in with `INTENTD_TEST_CLAUDE_ADAPTER` pointing at the Claude package
+//! directory (containing package.json), then run this ignored test. Codex uses
+//! the embedded bundle. No npm downloads, credentials or paid prompts occur.
+//! The package-dispatch shim selects only the unchanged Claude entrypoint.
 #![cfg(unix)]
 mod common;
 use futures_util::{SinkExt, StreamExt};
@@ -261,13 +261,8 @@ async fn prompt(ws: &mut common::TlsWs, workspace: &str, agent: &str, log: &Path
     .expect("fixture prompt completes");
 }
 #[tokio::test]
-#[ignore = "requires actual pinned npm packages; see module prerequisites; no model access"]
-async fn installed_cli_upgrade_through_pinned_adapters_over_wss() {
-    let (codex, codex_bytes) = package(
-        "INTENTD_TEST_CODEX_ADAPTER",
-        intent_providers::CODEX_ACP_NPX_PACKAGE,
-        "@openai/codex",
-    );
+#[ignore = "requires pinned Claude npm package; see module prerequisites; no model access"]
+async fn installed_cli_upgrade_through_reviewed_adapters_over_wss() {
     let (claude, claude_bytes) = package(
         "INTENTD_TEST_CLAUDE_ADAPTER",
         intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE,
@@ -281,11 +276,27 @@ async fn installed_cli_upgrade_through_pinned_adapters_over_wss() {
     std::fs::create_dir_all(home.join(".local/bin")).unwrap();
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::create_dir_all(root.join("workspaces")).unwrap();
+    let expected_adapter = root.join("expected-adapter");
+    std::fs::create_dir(&expected_adapter).unwrap();
+    let codex = intent_providers::codex::write_adapter(&expected_adapter).unwrap();
+    let codex_bytes = std::fs::read(&codex).unwrap();
+    let adapter_launches = root.join("codex-adapter-launches");
     let node = intent_providers::resolve_on_path("node").expect("node prerequisite");
     executable(
         &bin.join("node"),
         &format!(
-            "#!/bin/sh\nexport DD_INSTRUMENT_SERVICE_WITH_APM=false\nexec '{}' \"$@\"\n",
+            r#"#!/bin/sh
+export DD_INSTRUMENT_SERVICE_WITH_APM=false
+case "$1" in
+*/codex-acp.mjs)
+  cmp "$1" '{}' || exit 96
+  printf '%s\n' "$1" >> '{}'
+  ;;
+esac
+exec '{}' "$@"
+"#,
+            codex.display(),
+            adapter_launches.display(),
             node.display()
         ),
     );
@@ -298,14 +309,10 @@ if [ "$1" = --version ]; then echo 10.9.2; exit 0; fi
 for arg in "$@"; do
 case "$arg" in
 '{}') exec '{}' '{}' ;;
-'{}') exec '{}' '{}' ;;
 esac
 done
 exit 97
 "#,
-            intent_providers::CODEX_ACP_NPX_PACKAGE,
-            node.display(),
-            codex.display(),
             intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE,
             node.display(),
             claude.display()
@@ -471,6 +478,12 @@ exit 97
         records(&log).len(),
         before,
         "no CLI or bundled fallback launched"
+    );
+    assert!(
+        !std::fs::read_to_string(adapter_launches)
+            .unwrap()
+            .is_empty(),
+        "Codex launches must use the unchanged embedded bundle"
     );
     assert_eq!(std::fs::read(codex).unwrap(), codex_bytes);
     assert_eq!(std::fs::read(claude).unwrap(), claude_bytes);

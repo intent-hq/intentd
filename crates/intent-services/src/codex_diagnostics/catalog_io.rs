@@ -123,15 +123,11 @@ impl Authentication {
         // Only the selected routing/auth config; no cached models, MCP or keyring.
         // A package boundary also keeps npm away from ancestor workspaces.
         private_file(&home.path().join("package.json"), b"{\"private\":true}").await?;
-        private_file(
-            &home.path().join("config.toml"),
-            b"cli_auth_credentials_store = \"file\"\n",
-        )
-        .await?;
-        if let Some(config) = &self.config {
-            let content = format!("cli_auth_credentials_store = \"file\"\n{config}");
-            private_file(&home.path().join("config.toml"), content.as_bytes()).await?;
-        }
+        let config = format!(
+            "cli_auth_credentials_store = \"file\"\n{}",
+            self.config.as_deref().unwrap_or_default()
+        );
+        private_file(&home.path().join("config.toml"), config.as_bytes()).await?;
         Ok(home)
     }
 

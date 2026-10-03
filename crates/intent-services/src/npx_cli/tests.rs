@@ -62,18 +62,18 @@ fn in_subprocess(test: &str, version: &str) -> bool {
     let root = tmp.path();
     let bin = root.join("bin");
     std::fs::create_dir(&bin).unwrap();
-    std::fs::create_dir(root.join("codex-home")).unwrap();
+    std::fs::create_dir(root.join("claude-home")).unwrap();
     std::fs::write(root.join("adapter.mjs"), ADAPTER).unwrap();
     executable(
         &bin.join("node"),
         "#!/bin/sh\nexec \"$INTENT_TEST_REAL_NODE\" \"$@\"\n",
     );
     executable(&bin.join("npx"), NPX);
-    // Public Codex launches now require a canonical installed CLI even when
+    // Public Claude launches require a canonical installed CLI even when
     // the pinned adapter itself is mocked. It may only be version-probed.
     executable(
-        &bin.join("codex"),
-        "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] && [ \"$CODEX_PATH\" = \"$0\" ] || exit 91\nprintf 'codex-cli 1.2.3\\n'\n",
+        &bin.join("claude"),
+        "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] && [ \"$CLAUDE_CODE_EXECUTABLE\" = \"$0\" ] || exit 91\nprintf 'claude 1.2.3\\n'\n",
     );
     let forbidden = "#!/bin/sh\nprintf 'native\\n' >> \"$INTENT_TEST_NPX_ROOT/native\"\nexit 99\n";
     executable(&bin.join("codex-acp"), forbidden);
@@ -105,7 +105,8 @@ esac
         .env("INTENT_TEST_REAL_NODE", node)
         .env("HOME", root)
         .env("USERPROFILE", root)
-        .env("CODEX_HOME", root.join("codex-home"))
+        .env("CLAUDE_CONFIG_DIR", root.join("claude-home"))
+        .env("CLAUDE_CODE_EXECUTABLE", "/must-not-run/inherited-claude")
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .stdout(Stdio::from(log.try_clone().unwrap()))
         .stderr(Stdio::from(log));
@@ -146,12 +147,12 @@ fn paths(provider: &str) -> HashMap<String, String> {
     )])
 }
 
-async fn services(provider: &str) -> Services {
+async fn services(provider: &str, adapter_paths: &HashMap<String, String>) -> Services {
     let registry = Arc::new(SettingsRegistry::load(root().join("settings.toml")).unwrap());
     registry
         .apply(&[
             ("model.defaultProvider".to_string(), json!(provider)),
-            ("providers.paths".to_string(), json!(paths(provider))),
+            ("providers.paths".to_string(), json!(adapter_paths)),
         ])
         .unwrap();
     if provider == "auggie" {
@@ -215,7 +216,9 @@ async fn stale_npx_completion_is_unavailable_without_package_launch() {
     ) {
         return;
     }
-    let result = completion(&services("codex").await).await.unwrap();
+    let result = completion(&services("claude-code", &HashMap::new()).await)
+        .await
+        .unwrap();
     eprintln!(
         "completion={result}; package launches={:?}",
         lines("packages")
@@ -232,13 +235,13 @@ async fn stale_npx_models_keep_static_warning_without_package_launch() {
     ) {
         return;
     }
-    let result = services("codex")
+    let result = services("claude-code", &HashMap::new())
         .await
-        .models_list(Some("codex".to_string()), true)
+        .models_list(Some("claude-code".to_string()), true)
         .await
         .unwrap();
     eprintln!("models={result}; package launches={:?}", lines("packages"));
-    assert_eq!(result["providerId"], "codex");
+    assert_eq!(result["providerId"], "claude-code");
     assert_eq!(result["source"], "static");
     assert_eq!(result["models"], json!([]));
     assert_stale(result["warning"].as_str().unwrap());
@@ -254,9 +257,9 @@ async fn stale_npx_test_prompt_is_not_installed_without_package_launch() {
     }
     let result = crate::provider_test_prompt::provider_test_prompt(
         None,
-        "codex",
+        "claude-code",
         None,
-        &paths("codex"),
+        &HashMap::new(),
         None,
     )
     .await
@@ -271,16 +274,16 @@ async fn stale_npx_test_prompt_is_not_installed_without_package_launch() {
 }
 
 async fn assert_public_launches_succeed() {
-    let services = services("codex").await;
+    let services = services("claude-code", &HashMap::new()).await;
     assert_eq!(
         completion(&services).await.unwrap()["text"],
         "fixture reply"
     );
     let models = services
-        .models_list(Some("codex".to_string()), true)
+        .models_list(Some("claude-code".to_string()), true)
         .await
         .unwrap();
-    assert_eq!(models["source"], "codex", "{models}");
+    assert_eq!(models["source"], "claude-code", "{models}");
     assert!(
         models["models"]
             .as_array()
@@ -292,9 +295,9 @@ async fn assert_public_launches_succeed() {
     assert_eq!(
         crate::provider_test_prompt::provider_test_prompt(
             None,
-            "codex",
+            "claude-code",
             None,
-            &paths("codex"),
+            &HashMap::new(),
             None
         )
         .await
@@ -315,7 +318,7 @@ async fn assert_public_launches_succeed() {
         vec![
             format!(
                 "--workspaces=false -y {}",
-                intent_providers::CODEX_ACP_NPX_PACKAGE
+                intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
             );
             4
         ]
@@ -372,9 +375,9 @@ async fn direct_adapter_skips_stale_npx_probe_and_package_launch() {
     ) {
         return;
     }
-    // Claude/Codex always use their pinned npm adapters. Auggie still has
-    // supported direct completion and ACP test-prompt paths; both skip npx.
-    let services = services("auggie").await;
+    // Claude uses its pinned npm adapter and Codex uses the vendored bundle.
+    // Auggie's direct completion and ACP test-prompt paths both skip npx.
+    let services = services("auggie", &paths("auggie")).await;
     assert_eq!(
         completion(&services).await.unwrap()["text"],
         "fixture reply"
