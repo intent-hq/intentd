@@ -97,6 +97,7 @@ fn workspace(id: &WorkspaceId, worktree: &str, branch: &str) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: Some(worktree.to_string()),
         repository_path: None,

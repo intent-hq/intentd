@@ -44,6 +44,8 @@ mod terminal_replay;
 
 #[path = "wss_integration/authenticated_devices.rs"]
 mod authenticated_devices;
+#[path = "wss_integration/content_activity.rs"]
+mod content_activity;
 #[path = "wss_integration/member_transport.rs"]
 mod member_transport;
 #[path = "wss_integration/note_search.rs"]
@@ -13896,6 +13898,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,

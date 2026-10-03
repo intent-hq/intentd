@@ -829,10 +829,13 @@ fn channel_event_types_full_matrix() {
         "pr:updated",
         "pr:unlinked",
         "host:members-changed",
+        "note:created",
+        "note:updated",
+        "agent:message",
     ] {
         assert!(ws.iter().any(|s| s == t), "workspace missing {t}");
     }
-    assert_eq!(ws.len(), 11);
+    assert_eq!(ws.len(), 14);
     // Comment channel — creation and deletion refresh the affected thread.
     assert_eq!(
         channel_event_types(Channel::Comment),

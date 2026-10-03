@@ -52,6 +52,7 @@ fn sample_ws(id: &WorkspaceId, worktree: &std::path::Path) -> Workspace {
         created_at: "t0".to_string(),
         updated_at: "t0".to_string(),
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,

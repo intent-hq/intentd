@@ -41,9 +41,9 @@ pub use model::{
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrAncestry,
     PrAncestryIdentity, PrInvolvement, PrObservation, PrPatch, PrQuery, PrState, PullRequest,
-    RateLimitStatus, Repo, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread,
-    ReviewThreadComment, ReviewThreadTally, ReviewVerdict, RollupCheck, RollupCheckKind,
-    ScCapabilities, UserIdentity,
+    PullRequestFile, PullRequestFilesPage, PullRequestReview, RateLimitStatus, Repo, RepoRef,
+    Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
+    ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
 };
 pub use registry::{GithubSettings, GitlabSettings, SourceControlRegistry, SourceControlSettings};
 /// Re-exported so callers can hand [`gitlab_auth::persist_gitlab_token`] a
@@ -175,6 +175,34 @@ pub trait SourceControl: Send + Sync {
     /// List pull requests matching `query`, one §5.5 page at a time (the page
     /// cursor / size travel in `query`). Backs `github.pulls.list/search`.
     async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> Result<Page<PullRequest>>;
+
+    /// Search PRs across token-visible repositories owned by an organization or user.
+    /// Providers must opt in; never silently substitute a repository listing.
+    async fn list_org_prs(&self, _org: &str, _query: PrQuery) -> Result<Page<PullRequest>> {
+        Err(Error::Unsupported(
+            "organization pull request search".into(),
+        ))
+    }
+
+    /// Read one bounded page of changed files including available patches.
+    async fn pull_files(
+        &self,
+        _repo: &RepoRef,
+        _number: u64,
+        _page: PageParams,
+    ) -> Result<PullRequestFilesPage> {
+        Err(Error::Unsupported("pull request files".into()))
+    }
+
+    /// Read one bounded page of reviews without collapsing dismissed states.
+    async fn pull_reviews(
+        &self,
+        _repo: &RepoRef,
+        _number: u64,
+        _page: PageParams,
+    ) -> Result<Page<PullRequestReview>> {
+        Err(Error::Unsupported("pull request review details".into()))
+    }
 
     /// Apply a partial update to a pull request.
     async fn update_pr(&self, repo: &RepoRef, number: u64, patch: PrPatch) -> Result<PullRequest>;

@@ -254,6 +254,42 @@ pub struct Review {
     pub submitted_at: String,
 }
 
+/// One changed PR file; absent patches include binary or forge-omitted diffs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestFile {
+    pub filename: String,
+    #[serde(alias = "previous_filename")]
+    pub previous_filename: Option<String>,
+    pub status: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changes: u64,
+    pub patch: Option<String>,
+    #[serde(alias = "blob_url")]
+    pub url: Option<String>,
+}
+
+/// A bounded changed-file page with an explicit forge-limit signal.
+#[derive(Debug, Clone)]
+pub struct PullRequestFilesPage {
+    pub items: Vec<PullRequestFile>,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+}
+
+/// A review detail row preserving dismissed/pending states and stable identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestReview {
+    pub id: u64,
+    pub author: String,
+    pub state: String,
+    pub body: Option<String>,
+    pub submitted_at: Option<String>,
+    pub url: Option<String>,
+}
+
 /// A conversation (issue/PR) comment, optionally line-anchored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

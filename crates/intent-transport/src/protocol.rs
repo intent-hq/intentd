@@ -698,6 +698,9 @@
 //! An omitted filter preserves the legacy all-definitions list. The
 //! `scriptLifecycle: 1` capability includes atomic command results, one-off
 //! retirement for every settled outcome, and durable admission recovery.
+//!
+//! Version 13.2 adds explicitly addressed read-only PR checks, reviews, and
+//! changed-file pages, including head guards and forge truncation reporting.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -722,7 +725,7 @@ use std::time::{Duration, Instant};
 // Version 13.0 removes the deprecated keyed git.commit RPC. Human and agent
 // commits continue to use git.agentCommit with its existing permissions and
 // non-idempotent contract; MCP ws.git.commit is unchanged.
-pub const PROTOCOL_VERSION: &str = "13.1";
+pub const PROTOCOL_VERSION: &str = "13.2";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
