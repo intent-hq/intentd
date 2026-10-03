@@ -2894,6 +2894,57 @@ fn restart_command_respawns_state_version_without_exiting_sitter() {
 }
 
 #[test]
+fn shutdown_during_startup_check_releases_ownership_without_spawning() {
+    use std::sync::atomic::Ordering;
+
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (signal, code) in [("TERM", 143), ("INT", 130)] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
+        let state_before = fs::read(&paths.state_path).unwrap();
+        let (base_url, hold, parked) = serve_holdable(Arc::new(Mutex::new(HashMap::new())));
+        hold.store(true, Ordering::SeqCst);
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut sitter = spawn_guarded(sitter_command(dir.path(), &base_url).arg("serve"));
+            wait_until("startup check to stall", Duration::from_secs(10), || {
+                parked.load(Ordering::SeqCst) > 0
+            });
+            assert_eq!(
+                read_or_empty(&paths.pid_path).trim(),
+                sitter.id().to_string()
+            );
+            send_signal(&sitter, signal);
+            assert_eq!(
+                wait_exit(&mut sitter, Duration::from_secs(3)).code(),
+                Some(code)
+            );
+            assert!(
+                !paths.pid_path.exists(),
+                "shutdown must remove the PID record"
+            );
+            let lock = fs::OpenOptions::new()
+                .write(true)
+                .open(paths.pid_path.with_extension("lock"))
+                .unwrap();
+            assert!(
+                nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock).is_ok()
+            );
+            assert!(read_or_empty(&daemon_log_path(dir.path())).is_empty());
+            assert_eq!(fs::read(&paths.state_path).unwrap(), state_before);
+        }));
+        // Release the fixture on both pass and panic, after checking that
+        // shutdown completed without waiting for its network response.
+        hold.store(false, Ordering::SeqCst);
+        if let Err(error) = outcome {
+            panic::resume_unwind(error);
+        }
+    }
+}
+
+#[test]
 fn duplicate_serve_preserves_live_sitter_discovery() {
     let _serial = SERVE_LOOP_SERIAL
         .lock()

@@ -462,7 +462,30 @@ impl Supervisor {
 
         let (mut current_version, mut next_check_at) = if supervised {
             // Startup check: always runs, regardless of the persisted schedule.
-            let startup = self.check().await;
+            // Signal handlers are already installed for PID discovery. Keep
+            // consuming them while network I/O is in flight, so service stop
+            // never waits for a manifest/download timeout or spawns a child.
+            let check = self.check();
+            tokio::pin!(check);
+            #[cfg_attr(
+                not(unix),
+                expect(clippy::never_loop, reason = "only the shutdown arm exists off unix")
+            )]
+            let startup = loop {
+                tokio::select! {
+                    biased;
+                    event = signals.recv() => match event {
+                        SignalEvent::Shutdown(signal) => return 128 + signal,
+                        // No child exists yet; startup already checks for an
+                        // update and will spawn the selected version once.
+                        #[cfg(unix)]
+                        SignalEvent::Restart | SignalEvent::CheckNow | SignalEvent::CheckNowIdle => {
+                            eprintln!("intentd-sitter: {} received; startup check is already running", event.name());
+                        }
+                    },
+                    outcome = &mut check => break outcome,
+                }
+            };
             let next_check_at = self.schedule_next_check();
             let version = match startup {
                 Ok(UpdateOutcome::Installed { version, previous }) => {
