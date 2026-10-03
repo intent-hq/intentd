@@ -25901,6 +25901,124 @@ async fn queue_processing_payload_ordinary_drain_retains_recovered_merged_contri
 }
 
 #[tokio::test]
+async fn submission_correlation_legacy_append_failure_stays_unknown_after_restart() {
+    let _env = EnvGuard::set_all(&[("INTENTD_PERSIST_RETRY_BACKOFF_MS", "1,1")]);
+    let (tmp, mgr, mut bus) = manager_with_bus().await;
+    let mut mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-legacy-correlation");
+    let id = AgentId::from("a-legacy-correlation");
+    seed_agent(&mgr, &ws, &id).await;
+    let owner = mgr.services.store.get_primary_principal().await.unwrap().id;
+    let mut legacy = flush_entry("legacy", "legacy queued input".into());
+    legacy.user_origin = true;
+    legacy.message_metadata = Some(json!({"fromPrincipalId":owner.0}));
+    let mut payload = serde_json::to_value(&legacy).unwrap();
+    for field in ["submissionOrder", "correlationOrderKnown"] {
+        payload.as_object_mut().unwrap().remove(field);
+    }
+    mgr.services
+        .store
+        .replace_agent_queue(
+            &id,
+            &[intent_store::AgentQueueRow {
+                id: legacy.id.clone(),
+                agent_id: id.clone(),
+                position: 0,
+                payload,
+                created_at: legacy.queued_at.clone(),
+                turn_id: legacy.turn_id.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_legacy_append BEFORE INSERT ON agent_message WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'test legacy append failure'); END")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+
+    for attempt in 0..2 {
+        assert_eq!(mgr.services.rehydrate_agent_queues().await.unwrap(), 1);
+        let before = mgr.services.queue_snapshot(&id);
+        let row = mgr
+            .services
+            .find_queued_message(&id, before[0]["id"].as_str().unwrap())
+            .unwrap();
+        assert!(
+            row.submission_order > 0,
+            "rehydration assigns synthetic order"
+        );
+        assert!(!row.correlation_order_known);
+        assert_eq!(before[0]["mergeEligible"], false);
+        // Retry the restored row without introducing a new user submission.
+        mgr.services
+            .store
+            .set_agent_session_status(&ws, &id, AgentStatus::RuntimeIdle, false, &now_iso(), None)
+            .await
+            .unwrap();
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        assert!(!mgr.is_busy(&id));
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session(&id)
+                .await
+                .unwrap()
+                .status,
+            AgentStatus::Error
+        );
+        let queue = mgr.services.queue_snapshot(&id);
+        assert_eq!(queue.len(), 1, "failed append retains the legacy row");
+        assert_eq!(
+            queue[0]["mergeEligible"], false,
+            "failure must not invent trusted arrival order"
+        );
+        let restored = mgr
+            .services
+            .find_queued_message(&id, queue[0]["id"].as_str().unwrap())
+            .unwrap();
+        assert!(!restored.correlation_order_known);
+        assert_eq!(restored.submission_order, row.submission_order);
+        assert_eq!(restored.turn_id, legacy.turn_id);
+        assert!(!restored.persisted);
+        assert!(restored.requeued_after_failure);
+        let sources = mgr.services.recovery_sources(&ws, &[restored]).await;
+        assert_eq!(sources.len(), 1);
+        assert!(
+            sources[0].submission_ids.is_none(),
+            "legacy recovery aliases stay unknown"
+        );
+        assert!(mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap()
+            .iter()
+            .all(|m| m.role != "user"));
+        mgr.services.persist_queue_snapshot(&id).await;
+        let stored = mgr.services.store.load_all_agent_queues().await.unwrap();
+        assert_eq!(stored[0].payload["correlationOrderKnown"], false);
+        bus.shutdown().await.unwrap();
+        mgr.services.store.close().await;
+        if attempt == 0 {
+            drop(mgr);
+            let store = Store::open(&tmp.path).await.unwrap();
+            bus = EventBus::new(store.clone());
+            let services = Services::new_with_file_secrets(
+                store,
+                intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
+            )
+            .with_event_bus(bus.clone());
+            mgr = Arc::new(AgentManager::new(
+                services,
+                Arc::new(BusEventSink::new(bus.clone())),
+                8,
+            ));
+        }
+    }
+}
+
+#[tokio::test]
 async fn submission_correlation_single_merged_flush_survives_restart_and_failure() {
     let (tmp, mgr, bus) = manager_with_bus().await;
     let ws = WorkspaceId::from("ws-single-correlation");
