@@ -5043,6 +5043,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Owner-authorized bounded public account suggestions; create still resolves the pin.
+    fn host_invite_search_accounts(
+        &self,
+        provider: String,
+        host: Option<String>,
+        query: String,
+        limit: Option<u8>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, query, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_invite_search_accounts not implemented".into(),
+            ))
+        })
+    }
+
     /// Owner-only, pinned, single-use host membership invitation, lasting seven days.
     /// Provider and nonblank login are required; the transport resolves the tunnel
     /// envelope before this operation persists anything.

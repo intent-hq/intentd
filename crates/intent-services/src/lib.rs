@@ -32738,6 +32738,19 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.host_members_remove_op(&principal_id).await })
     }
 
+    fn host_invite_search_accounts(
+        &self,
+        provider: String,
+        host: Option<String>,
+        query: String,
+        limit: Option<u8>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.host_invite_search_accounts_op(&provider, host.as_deref(), &query, limit)
+                .await
+        })
+    }
+
     fn host_invite_create(
         &self,
         pin: intent_core::InvitePin,
