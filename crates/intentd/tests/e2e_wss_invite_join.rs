@@ -29,6 +29,8 @@
 mod common;
 #[path = "common/invitation_fixture_lifecycle.rs"]
 mod fixture_lifecycle;
+#[path = "common/invitation_client.rs"]
+mod invitation_client;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -38,8 +40,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use intentd_test_support::GuardedChild;
+use invitation_client::{await_workspace_updated, from_raw, wss_rpc, Ws};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
@@ -52,7 +54,6 @@ use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
 
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
@@ -221,44 +222,15 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-type Ws = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
-
 async fn connect_ws(port: u16, cfg: Arc<ClientConfig>, token: &str) -> Ws {
     let url = format!("wss://localhost:{port}/ws?token={token}");
-    common::wss_connect_with_retry(port, cfg, &url).await
+    from_raw(common::wss_connect_with_retry(port, cfg, &url).await)
 }
 
 /// The unauthenticated invite endpoint: no token anywhere.
 async fn connect_invite(port: u16, cfg: Arc<ClientConfig>) -> Ws {
     let url = format!("wss://localhost:{port}/invite");
-    common::wss_connect_with_retry(port, cfg, &url).await
-}
-
-/// One WSS JSON-RPC round-trip returning the full envelope (so callers can
-/// assert on `result` OR `error`). Out-of-band notifications are skipped.
-async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
-    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string().into()))
-        .await
-        .expect("send rpc frame");
-    loop {
-        let next = timeout(Duration::from_secs(30), ws.next())
-            .await
-            .unwrap_or_else(|_| panic!("wss rpc {method} timed out"));
-        match next {
-            Some(Ok(Message::Text(text))) => {
-                let v: Value = serde_json::from_str(&text).expect("json frame");
-                if v["id"] == json!(id) {
-                    return v;
-                }
-            }
-            Some(Ok(Message::Ping(p))) => {
-                let _ = ws.send(Message::Pong(p)).await;
-            }
-            Some(Ok(_)) => {}
-            other => panic!("{method}: expected text frame, got {other:?}"),
-        }
-    }
+    from_raw(common::wss_connect_with_retry(port, cfg, &url).await)
 }
 
 /// Listener readiness does not imply that the detached startup identity refresh
@@ -337,37 +309,6 @@ async fn prove(
         }),
     )
     .await
-}
-
-/// Pump a subscriber until a `workspace:updated` event whose `changes`
-/// satisfy `pred` arrives (bounded).
-async fn await_workspace_updated(ws: &mut Ws, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
-    eprintln!("await workspace:updated ({what})");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let remaining = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .unwrap_or_else(|| panic!("timed out waiting for workspace:updated ({what})"));
-        let next = timeout(remaining, ws.next())
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for workspace:updated ({what})"));
-        match next {
-            Some(Ok(Message::Text(text))) => {
-                let v: Value = serde_json::from_str(&text).expect("json frame");
-                if v["method"] == json!("events.event")
-                    && v["params"]["event"]["type"] == json!("workspace:updated")
-                    && pred(&v["params"]["event"]["data"]["changes"])
-                {
-                    return v["params"]["event"].clone();
-                }
-            }
-            Some(Ok(Message::Ping(p))) => {
-                let _ = ws.send(Message::Pong(p)).await;
-            }
-            Some(Ok(_)) => {}
-            other => panic!("workspace:updated ({what}): expected text frame, got {other:?}"),
-        }
-    }
 }
 
 /// Wait for a `github:auth-changed` event carrying `status`.
