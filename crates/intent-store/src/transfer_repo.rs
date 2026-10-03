@@ -108,6 +108,10 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
     ("note_fts_docsize", "FTS5 shadow table of the derived note index"),
     ("note_fts_idx", "FTS5 shadow table of the derived note index"),
     (
+        "repository_selection_state",
+        "daemon-local root/selection continuity and tombstones; imported intent is unverified",
+    ),
+    (
         "_sqlx_migrations",
         "sqlx's own migration bookkeeping; every database maintains its own",
     ),
@@ -247,6 +251,11 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
     (
         "principal_revocation",
         "host-local principal revocation generations",
+    ),
+    (
+        "repository_authority_revision",
+        "daemon-local authority continuity and tombstones; target mutations retain \
+         their own revisions, and source counters cannot authorize target operations",
     ),
     (
         "host_invite",
@@ -490,6 +499,7 @@ impl Store {
         &self,
         rows: &[(String, Vec<serde_json::Value>)],
     ) -> Result<usize> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         for (table, _) in rows {
             if !TRANSFER_TABLES.iter().any(|(t, _)| t == table) {
                 return Err(Error::InvalidParams(format!(
@@ -557,6 +567,47 @@ impl Store {
                         "transfer import: {table} row is not a JSON object"
                     ))
                 })?;
+                // An archive's target/provenance labels are claims, not proof.
+                // Keep the captured target fields and every old monitor field
+                // for inspection, but require explicit destination validation
+                // through qualify_legacy_pr_monitor_target before using them.
+                // No current remote, authority counter or default forge is used.
+                let monitor_map = if *table == "pr_monitor" {
+                    let mut claim = map.clone();
+                    // The generic importer also supports REAL values. Monitor
+                    // numbers do not: never round a u64 through f64/SQLite or
+                    // coerce text/bools. Signed old values stay inspectable but
+                    // cannot become a resolved target until positive/checked.
+                    if claim
+                        .get("pr_number")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_none()
+                    {
+                        return Err(Error::InvalidParams(
+                            "transfer import: pr_monitor.pr_number must be an exact signed integer"
+                                .into(),
+                        ));
+                    }
+                    let has_target = [
+                        "target_provider",
+                        "target_instance_base_url",
+                        "target_project_path",
+                        "target_kind",
+                    ]
+                    .iter()
+                    .any(|key| claim.get(*key).is_some_and(|v| !v.is_null()));
+                    claim.insert("target_provenance".into(), "unresolved".into());
+                    let reason = if has_target {
+                        "unverified-import"
+                    } else {
+                        "missing-provenance"
+                    };
+                    claim.insert("target_unresolved_reason".into(), reason.into());
+                    Some(claim)
+                } else {
+                    None
+                };
+                let map = monitor_map.as_ref().unwrap_or(map);
                 let mut columns = Vec::with_capacity(map.len());
                 for key in map.keys() {
                     if !schema.contains(key) {
@@ -587,6 +638,28 @@ impl Store {
                         },
                     )?;
                 }
+                if inserted == 0 {
+                    // The one original batch may create grants through workspace
+                    // triggers. Do not nest per-row or membership tickets here.
+                    lifecycle.begin(&[crate::RepositoryLifecycleKey::Database])?;
+                }
+                // Observe the destination before the original INSERT. A source
+                // archive cannot replace its local choice or import continuity.
+                let selection_before = if *table == "workspace" {
+                    let id = map
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            Error::InvalidParams("transfer workspace id must be text".into())
+                        })?;
+                    let id = WorkspaceId::from(id);
+                    let before =
+                        crate::repository_selection_repo::imported_primary_before(&mut tx, &id)
+                            .await?;
+                    Some((id, before))
+                } else {
+                    None
+                };
                 query.execute(&mut *tx).await.map_err(|e| {
                     Error::Internal(format!("transfer import insert into {table} failed: {e}"))
                 })?;
@@ -600,6 +673,12 @@ impl Store {
                         .map_err(|e| {
                             Error::Internal(format!("restore imported monitor history: {e}"))
                         })?;
+                }
+                if let Some((id, before)) = selection_before {
+                    crate::repository_selection_repo::classify_imported_primary(
+                        &mut tx, &id, before,
+                    )
+                    .await?;
                 }
                 inserted += 1;
             }
@@ -715,6 +794,7 @@ impl Store {
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("transfer import commit failed: {e}")))?;
+        lifecycle.settle();
         Ok(inserted)
     }
 }
@@ -951,6 +1031,295 @@ mod tests {
     use intent_core::{AgentId, TokenUsageTotals, WorkspaceId};
     use std::fmt::Write as _;
     use uuid::Uuid;
+
+    fn monitor_import_rows(
+        provider: &str,
+        kind: &str,
+        provenance: &str,
+    ) -> Vec<(String, Vec<serde_json::Value>)> {
+        use serde_json::json;
+        vec![
+            (
+                "workspace".into(),
+                vec![
+                    json!({"id":"monitor-import", "title":"Transferred watch", "branch":"main", "created_at":"created", "updated_at":"updated"}),
+                ],
+            ),
+            (
+                "agent_session".into(),
+                vec![
+                    json!({"id":"monitor-owner", "workspace_id":"monitor-import", "name":"Original owner", "status":"idle", "created_at":"created", "updated_at":"updated"}),
+                ],
+            ),
+            (
+                "pr_monitor".into(),
+                vec![json!({
+                    "monitor_id":"transferred", "workspace_id":"monitor-import", "agent_id":"monitor-owner",
+                    "repo_owner":"o", "repo_name":"r", "pr_number":42, "state":"active",
+                    "last_snapshot":" {\"state\":\"after\"} ", "baseline_snapshot":"{\"state\":\"before\"}",
+                    "pending_changes":"  [ \"Unsent original change\" ] ", "pending_since":"pending", "last_change_at":"changed",
+                    "last_polled_at":"polled", "last_error":"Original error", "created_at":"created", "updated_at":"updated",
+                    "target_provider":provider, "target_instance_base_url":format!("https://{provider}.com"),
+                    "target_project_path":"o/r", "target_kind":kind,
+                    "target_provenance":provenance, "target_unresolved_reason":null
+                })],
+            ),
+        ]
+    }
+
+    fn old_monitor_fields(value: &serde_json::Value) -> serde_json::Value {
+        let mut old = value.as_object().unwrap().clone();
+        old.retain(|key, _| !key.starts_with("target_"));
+        serde_json::Value::Object(old)
+    }
+
+    async fn exported_monitor(store: &Store, id: &str) -> serde_json::Value {
+        store
+            .transfer_export_rows(&WorkspaceId("monitor-import".into()))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(name, _)| name == "pr_monitor")
+            .unwrap()
+            .1
+            .into_iter()
+            .find(|row| row["monitor_id"] == id)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn monitor_import_claims_need_explicit_destination_target_validation() {
+        use crate::{
+            MonitorQualificationOutcome, MonitorTargetProvenance, MonitorTargetUnresolvedReason,
+            PersistedMonitorTarget,
+        };
+        for label in [
+            "captured-request",
+            "legacy-github-writer",
+            "validated-transfer",
+        ] {
+            let db = TempDb::new();
+            let store = Store::open(&db.path).await.unwrap();
+            let rows = monitor_import_rows("github", "pull-request", label);
+            let original = old_monitor_fields(&rows[2].1[0]);
+            store.transfer_import_rows(&rows).await.unwrap();
+            let id = intent_core::PrMonitorId("transferred".into());
+            let imported = store.get_qualified_pr_monitor(&id).await.unwrap();
+            assert_eq!(
+                imported.target(),
+                &PersistedMonitorTarget::Unresolved {
+                    reason: MonitorTargetUnresolvedReason::UnverifiedImport
+                }
+            );
+            assert_eq!(imported.target_evidence()["projectPath"], "o/r");
+            assert_eq!(
+                original,
+                old_monitor_fields(&exported_monitor(&store, "transferred").await)
+            );
+            assert!(
+                store
+                    .find_active_pr_monitor(
+                        &intent_core::AgentId("monitor-owner".into()),
+                        "o",
+                        "r",
+                        42
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "unverified claims must not select the legacy provider path"
+            );
+            // This is explicit fixture-supplied validation, not acceptance of
+            // the archive label. The production provider resolver stays external.
+            let target = intent_core::ReviewTarget {
+                repository: intent_core::RepositoryTarget {
+                    provider: intent_core::RepositoryProvider::Github,
+                    instance_base_url: "https://github.com".into(),
+                    project_path: "o/r".into(),
+                },
+                kind: intent_core::RepositoryResourceKind::PullRequest,
+                number: 42,
+            };
+            assert_eq!(
+                store
+                    .qualify_legacy_pr_monitor_target(
+                        &imported,
+                        &target,
+                        MonitorTargetProvenance::ValidatedTransfer
+                    )
+                    .await
+                    .unwrap(),
+                MonitorQualificationOutcome::Applied
+            );
+            assert_eq!(
+                original,
+                old_monitor_fields(&exported_monitor(&store, "transferred").await)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_import_preserves_same_named_different_provider_claims_without_resolving_them()
+    {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        let mut rows = monitor_import_rows("github", "pull-request", "captured-request");
+        let mut gl = monitor_import_rows("gitlab", "merge-request", "captured-request")[2]
+            .1
+            .remove(0);
+        gl["monitor_id"] = "transferred-gl".into();
+        gl["pending_changes"] = "[\"GitLab original pending change\"]".into();
+        rows[2].1.push(gl);
+        assert_eq!(store.transfer_import_rows(&rows).await.unwrap(), 4);
+        for source in &rows[2].1 {
+            let id = source["monitor_id"].as_str().unwrap();
+            let saved = exported_monitor(&store, id).await;
+            assert_eq!(old_monitor_fields(&saved), old_monitor_fields(source));
+            assert_eq!(saved["target_provider"], source["target_provider"]);
+            assert_eq!(saved["target_provenance"], "unresolved");
+        }
+        let mut duplicate = rows[2].1[0].clone();
+        duplicate["monitor_id"] = "same-unresolved-target-duplicate".into();
+        assert!(store
+            .transfer_import_rows(&[("pr_monitor".into(), vec![duplicate])])
+            .await
+            .is_err());
+        assert_eq!(
+            store
+                .load_active_qualified_pr_monitors()
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_monitor_import_stays_inspectable_and_cancellable() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        let mut rows = monitor_import_rows("unrecognized", "unknown-kind", "pretend-proof");
+        rows[2].1[0]["pr_number"] = (-4).into();
+        rows[2].1[0]["repo_owner"] = "".into();
+        rows[2].1[0]["target_project_path"] = serde_json::Value::Null;
+        store.transfer_import_rows(&rows).await.unwrap();
+        let id = intent_core::PrMonitorId("transferred".into());
+        let claim = store.get_qualified_pr_monitor(&id).await.unwrap();
+        assert!(matches!(
+            claim.target(),
+            crate::PersistedMonitorTarget::Unresolved { .. }
+        ));
+        assert_eq!(claim.target_evidence()["provider"], "unrecognized");
+        assert_eq!(claim.monitor().pending_changes, ["Unsent original change"]);
+        assert!(store
+            .update_pr_monitor_state(&id, intent_core::PrMonitorState::Cancelled, "cancelled")
+            .await
+            .unwrap());
+        let cancelled = store.get_qualified_pr_monitor(&id).await.unwrap();
+        assert_eq!(cancelled.monitor().agent_id, claim.monitor().agent_id);
+        assert_eq!(
+            cancelled.monitor().pending_changes,
+            claim.monitor().pending_changes
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_import_rejects_lossy_or_non_integer_numbers() {
+        for number in [
+            serde_json::json!(u64::MAX),
+            serde_json::json!(i64::MAX as u64 + 1),
+            serde_json::json!(42.5),
+            serde_json::json!("42"),
+            serde_json::json!(true),
+        ] {
+            let db = TempDb::new();
+            let store = Store::open(&db.path).await.unwrap();
+            let mut rows = monitor_import_rows("gitlab", "merge-request", "captured-request");
+            rows[2].1[0]["pr_number"] = number.clone();
+            assert!(
+                store.transfer_import_rows(&rows).await.is_err(),
+                "lossy monitor number {number} was accepted"
+            );
+            assert!(store
+                .get_workspace(&WorkspaceId("monitor-import".into()))
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_import_rejects_runtime_authority_and_credentials_atomically() {
+        for field in [
+            "connection_id",
+            "authority_generation",
+            "credential",
+            "daemon_epoch",
+        ] {
+            let db = TempDb::new();
+            let store = Store::open(&db.path).await.unwrap();
+            let mut rows = monitor_import_rows("gitlab", "merge-request", "validated-transfer");
+            rows[2].1[0][field] = "untrusted runtime data".into();
+            assert!(store.transfer_import_rows(&rows).await.is_err());
+            assert!(store
+                .get_workspace(&WorkspaceId("monitor-import".into()))
+                .await
+                .is_err());
+        }
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        let mut rows = monitor_import_rows("gitlab", "merge-request", "validated-transfer");
+        rows.push(("repository_authority_revision".into(), vec![]));
+        assert!(store.transfer_import_rows(&rows).await.is_err());
+        assert!(store
+            .get_workspace(&WorkspaceId("monitor-import".into()))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn monitor_transfer_retains_pending_but_uses_only_destination_continuity() {
+        let source_db = TempDb::new();
+        let destination_db = TempDb::new();
+        let source = Store::open(&source_db.path).await.unwrap();
+        let destination = Store::open(&destination_db.path).await.unwrap();
+        let input = monitor_import_rows("gitlab", "merge-request", "captured-request");
+        source.transfer_import_rows(&input).await.unwrap();
+        sqlx::query("UPDATE repository_authority_revision SET revision=100 WHERE kind='workspace' AND subject_id='monitor-import'")
+            .execute(source.write_pool()).await.unwrap();
+        let ws = WorkspaceId("monitor-import".into());
+        let exported = source.transfer_export_rows(&ws).await.unwrap();
+        assert!(!exported
+            .iter()
+            .any(|(name, _)| name == "repository_authority_revision"));
+        destination.transfer_import_rows(&exported).await.unwrap();
+        let local = destination
+            .repository_workspace_authority_snapshot(&ws)
+            .await
+            .unwrap();
+        assert_eq!(local.workspace.revision.unwrap().get(), 1);
+        assert_eq!(
+            source
+                .repository_workspace_authority_snapshot(&ws)
+                .await
+                .unwrap()
+                .workspace
+                .revision
+                .unwrap()
+                .get(),
+            100
+        );
+        let id = intent_core::PrMonitorId("transferred".into());
+        let saved = destination.get_qualified_pr_monitor(&id).await.unwrap();
+        assert!(matches!(
+            saved.target(),
+            crate::PersistedMonitorTarget::Unresolved { .. }
+        ));
+        assert_eq!(
+            old_monitor_fields(&exported_monitor(&destination, "transferred").await),
+            old_monitor_fields(&input[2].1[0])
+        );
+        assert_eq!(saved.monitor().agent_id.0, "monitor-owner");
+    }
 
     /// A unique temp DB path cleaned up on drop (mirrors `crate::tests::TempDb`,
     /// which is private to that module).
@@ -1568,7 +1937,7 @@ delegation_group: group_id, workspace_id, parent_agent_id, await_mode, expected_
 completion_watch: id, parent_workspace_id, child_workspace_id, parent_agent_id, parent_agent_name, child_agent_id, group_id, report_delivered, wake_on_attention, created_at, completion_only
 event_subscription: id, workspace_id, subscriber_agent_id, event_types, exclude_self, batch_window_ms, created_at
 hook: hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at, last_run_at, next_run_at, run_count, last_error, last_logs, last_state, expires_at, perpetual, dispatch_count, cron, run_at
-pr_monitor: monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, last_snapshot, pending_changes, pending_since, last_change_at, last_polled_at, last_error, created_at, updated_at, baseline_snapshot
+pr_monitor: monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, last_snapshot, pending_changes, pending_since, last_change_at, last_polled_at, last_error, created_at, updated_at, baseline_snapshot, target_provider, target_instance_base_url, target_project_path, target_kind, target_provenance, target_unresolved_reason
 script: id, workspace_id, name, command, cwd, env, mode, category, source, auto_start, created_at, updated_at, was_running, purpose, archived_at, last_run, pending_run_id, pending_started_at, latest_run_id, latest_run_result
 task_agent_link: workspace_id, note_id, task_key, task_text, agent_id, created_at
 sandbox: id, workspace_id, agent_id, path, branch, base_commit_sha, snapshot_commit_sha, status, created_at, updated_at, retry_count
@@ -1614,6 +1983,149 @@ attachments: id, workspace_id, file_name, mime_type, size, uploaded_at, stored_p
              make sure the import path tolerates its absence (or defaults it);\n\
              then replace TRANSFERRED_COLUMNS with the actual snapshot \
              below:\n\n{actual}\n"
+        );
+    }
+
+    fn selection_import_rows(path: &str) -> Vec<(String, Vec<serde_json::Value>)> {
+        vec![(
+            "workspace".into(),
+            vec![
+                serde_json::json!({"id":"selection-import","title":"Imported","branch":"main","repository_path":path,"created_at":"same","updated_at":"same"}),
+            ],
+        )]
+    }
+    fn selection_import_root() -> intent_core::RepositoryRootId {
+        intent_core::RepositoryRootId {
+            workspace_id: WorkspaceId::from("selection-import"),
+            kind: intent_core::RepositoryRootKind::Primary,
+        }
+    }
+    #[tokio::test]
+    async fn selection_new_import_is_unresolved_without_invented_provenance() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .transfer_import_rows(&selection_import_rows("/imported"))
+            .await
+            .unwrap();
+        let snapshot = store
+            .repository_selection_snapshot(&selection_import_root())
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.selection(),
+            Some(&crate::RepositoryStoredSelection::Saved(
+                intent_core::SavedReviewSelection::UnresolvedHistorical {
+                    source: None,
+                    record_id: None
+                }
+            ))
+        );
+        let export = store
+            .transfer_export_rows(&WorkspaceId::from("selection-import"))
+            .await
+            .unwrap();
+        assert!(!export
+            .iter()
+            .any(|(table, _)| table == "repository_selection_state"));
+    }
+    #[tokio::test]
+    async fn selection_source_counter_table_is_rejected_without_any_import_effect() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        let mut input = selection_import_rows("/imported");
+        input.push((
+            "repository_selection_state".into(),
+            vec![serde_json::json!({"root_incarnation":99,"selection_revision":99})],
+        ));
+        assert!(store.transfer_import_rows(&input).await.is_err());
+        assert!(store
+            .get_workspace(&WorkspaceId::from("selection-import"))
+            .await
+            .is_err());
+    }
+    #[tokio::test]
+    async fn selection_duplicate_import_retains_original_constraint_and_local_choice() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .transfer_import_rows(&selection_import_rows("/local"))
+            .await
+            .unwrap();
+        let root = selection_import_root();
+        let before = store.repository_selection_snapshot(&root).await.unwrap();
+        store
+            .write_repository_selection(
+                &before,
+                crate::RepositorySelectionChange::ExplicitRemote {
+                    remote_name: "local".into(),
+                },
+            )
+            .await
+            .result
+            .unwrap();
+        let local = store.repository_selection_snapshot(&root).await.unwrap();
+        assert!(store
+            .transfer_import_rows(&selection_import_rows("/other"))
+            .await
+            .is_err());
+        let after = store.repository_selection_snapshot(&root).await.unwrap();
+        assert_eq!(after.binding(), local.binding());
+        assert_eq!(after.selection(), local.selection());
+        assert_eq!(after.root_incarnation(), local.root_incarnation());
+        assert_eq!(after.selection_revision(), local.selection_revision());
+    }
+    #[tokio::test]
+    async fn selection_original_import_transaction_preserves_equal_binding_and_marks_rebind() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .transfer_import_rows(&selection_import_rows("/local"))
+            .await
+            .unwrap();
+        // Fixture BEFORE INSERT supplies acknowledged same-row/no-effect and
+        // rebound outcomes to the unchanged generic INSERT algorithm. Production
+        // still uses plain INSERT and retains duplicate-ID constraint errors.
+        sqlx::query("CREATE TRIGGER fixture_import_existing BEFORE INSERT ON workspace WHEN EXISTS(SELECT 1 FROM workspace WHERE id=NEW.id) BEGIN UPDATE workspace SET repository_path=NEW.repository_path WHERE id=NEW.id; SELECT RAISE(IGNORE); END")
+            .execute(store.write_pool()).await.unwrap();
+        let root = selection_import_root();
+        for change in [
+            crate::RepositorySelectionChange::ExplicitRemote {
+                remote_name: "local".into(),
+            },
+            crate::RepositorySelectionChange::Reset,
+        ] {
+            let before = store.repository_selection_snapshot(&root).await.unwrap();
+            store
+                .write_repository_selection(&before, change)
+                .await
+                .result
+                .unwrap();
+            let local = store.repository_selection_snapshot(&root).await.unwrap();
+            for _ in 0..2 {
+                store
+                    .transfer_import_rows(&selection_import_rows("/local"))
+                    .await
+                    .unwrap();
+                let after = store.repository_selection_snapshot(&root).await.unwrap();
+                assert_eq!(after.selection(), local.selection());
+                assert_eq!(after.root_incarnation(), local.root_incarnation());
+                assert_eq!(after.selection_revision(), local.selection_revision());
+            }
+        }
+        store
+            .transfer_import_rows(&selection_import_rows("/rebound"))
+            .await
+            .unwrap();
+        let after = store.repository_selection_snapshot(&root).await.unwrap();
+        assert_eq!(
+            after.selection(),
+            Some(&crate::RepositoryStoredSelection::Saved(
+                intent_core::SavedReviewSelection::UnresolvedHistorical {
+                    source: None,
+                    record_id: None
+                }
+            ))
         );
     }
 }

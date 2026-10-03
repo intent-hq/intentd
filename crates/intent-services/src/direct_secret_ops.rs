@@ -7,15 +7,19 @@ use std::sync::Arc;
 use intent_core::{Error, Result, WorkspaceId};
 use serde_json::{json, Value};
 
+use crate::source_control_auth_ops::repository_owner::{GitlabCredentialGuard, RepositoryWrite};
 use crate::Services;
+
+pub(crate) type RevokeWrite = Option<intent_sourcecontrol::Result<Option<Arc<RepositoryWrite>>>>;
 
 pub(crate) enum Mutation {
     GithubRevoke,
     GitlabPat(
         intent_sourcecontrol::gitlab_auth::GitlabHost,
         intent_sourcecontrol::SecretString,
+        Option<Arc<RepositoryWrite>>,
     ),
-    GitlabRevoke(intent_sourcecontrol::gitlab_auth::GitlabHost),
+    GitlabRevoke(intent_sourcecontrol::gitlab_auth::GitlabHost, RevokeWrite),
     McpCreate(Value),
     McpUpdate(String, Value),
     McpDelete(String),
@@ -59,7 +63,7 @@ impl Services {
                 let mut polled = if matches!(mutation, Mutation::GitlabRevoke(..)) {
                     operation.gitlab_auth.lock().await.revoke_gate_polled.take()
                 } else { None };
-                let acquire = operation.gitlab_credential_gate.clone().lock_owned();
+                let acquire = operation.gitlab_credential_gate.lock();
                 #[cfg(test)]
                 let acquire = {
                     let mut acquire = Box::pin(acquire);
@@ -77,10 +81,10 @@ impl Services {
                 Some(operation.settings_secret_gates.write(&["mcp.servers"]).await)
             };
             let worker = operation.clone();
-            let gitlab_lease = gitlab_guard.as_ref().map(|guard| guard.clone() as intent_sourcecontrol::gitlab_auth::PersistenceLease);
+            let worker_guard = gitlab_guard.clone();
             let mut worker = intent_core::spawn_daemon(intent_core::with_caller(caller,
                 intent_core::caller::with_wire_credential(credential, async move {
-                    worker.execute_direct_secret_mutation(mutation, gitlab_lease).await
+                    worker.execute_direct_secret_mutation(mutation, worker_guard).await
                 })
             ));
             let joined = tokio::select! {
@@ -114,44 +118,26 @@ impl Services {
     async fn execute_direct_secret_mutation(
         &self,
         mutation: Mutation,
-        gitlab_lease: Option<intent_sourcecontrol::gitlab_auth::PersistenceLease>,
+        gitlab_guard: Option<Arc<GitlabCredentialGuard>>,
     ) -> Result<Value> {
         match mutation {
             Mutation::GithubRevoke => self.github_revoke_owned().await,
-            Mutation::GitlabPat(host, token) => {
-                self.secrets
-                    .persist_gitlab_pat(
-                        self.gitlab_secret_store.clone(),
-                        token,
-                        gitlab_lease.expect("GitLab owner lease"),
-                    )
-                    .await
-                    .map_err(|error| {
-                        crate::pr_ops::map_sc_err(intent_sourcecontrol::Error::Api(format!(
-                            "could not persist gitlab token: {error}"
-                        )))
-                    })?;
-                {
-                    let mut state = self.gitlab_auth.lock().await;
-                    state.flow = None;
-                    state.starting = None;
-                }
-                crate::source_control_auth_ops::bind_gitlab_host(
-                    self.settings_registry.as_deref(),
-                    host.host(),
-                );
-                crate::source_control_auth_ops::publish_auth_changed(
-                    self.event_bus.as_ref(),
-                    crate::source_control_auth_ops::Provider::Gitlab,
-                    host.host(),
-                    "authorized",
+            Mutation::GitlabPat(host, token, write) => {
+                self.gitlab_pat_with_owner(
+                    host,
+                    token,
+                    gitlab_guard.as_deref().expect("GitLab owner lease"),
+                    write,
                 )
-                .await;
-                Ok(crate::source_control_auth_ops::pat_connect_response())
+                .await
             }
-            Mutation::GitlabRevoke(host) => {
-                self.gitlab_revoke_owned(host, gitlab_lease.expect("GitLab owner lease"))
-                    .await
+            Mutation::GitlabRevoke(host, write) => {
+                self.gitlab_revoke_with_owner(
+                    host,
+                    gitlab_guard.as_deref().expect("GitLab owner lease"),
+                    write,
+                )
+                .await
             }
             Mutation::McpCreate(config) => self.mcp_servers_service().create(config).await,
             Mutation::McpUpdate(id, config) => self.mcp_servers_service().update(&id, config).await,
@@ -176,57 +162,6 @@ impl Services {
                 Ok(out)
             }
         }
-    }
-
-    async fn gitlab_revoke_owned(
-        &self,
-        host: intent_sourcecontrol::gitlab_auth::GitlabHost,
-        lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
-    ) -> Result<Value> {
-        {
-            let mut state = self.gitlab_auth.lock().await;
-            if state
-                .flow
-                .as_ref()
-                .is_some_and(|flow| flow.host == host.host())
-            {
-                state.flow = None;
-            }
-            if state
-                .starting
-                .as_ref()
-                .is_some_and(|intent| intent.host == host.host())
-            {
-                state.starting = None;
-            }
-        }
-        // Resolve binding and stored presence under the supervisor's primary
-        // credential gate. Revoking another instance is still an exact no-op.
-        if self.gitlab_host_is_bound(&host) {
-            let stored = intent_sourcecontrol::gitlab_auth::stored_credential(
-                self.gitlab_secret_store.clone(),
-            )
-            .await
-            .map_err(crate::pr_ops::map_sc_err)?;
-            if stored != intent_sourcecontrol::StoredCredential::None {
-                self.secrets
-                    .revoke_gitlab_token(self.gitlab_secret_store.clone(), lease)
-                    .await
-                    .map_err(|error| {
-                        crate::pr_ops::map_sc_err(intent_sourcecontrol::Error::Api(format!(
-                            "could not delete gitlab token: {error}"
-                        )))
-                    })?;
-                crate::source_control_auth_ops::publish_auth_changed(
-                    self.event_bus.as_ref(),
-                    crate::source_control_auth_ops::Provider::Gitlab,
-                    host.host(),
-                    "revoked",
-                )
-                .await;
-            }
-        }
-        Ok(json!({"ok":true}))
     }
 
     async fn github_revoke_owned(&self) -> Result<Value> {

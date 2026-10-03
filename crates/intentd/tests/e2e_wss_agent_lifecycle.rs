@@ -13288,7 +13288,9 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
                 saw_settle_idle = true;
             }
             Some("agent:status-changed")
-                if saw_settle_idle && event["data"]["status"] == "idle" =>
+                if saw_settle_idle
+                    && event["data"]["agentId"].as_str() == Some(agent_id.as_str())
+                    && event["data"]["status"] == "idle" =>
             {
                 // The earlier idle event precedes end_turn's durable status
                 // write. Ignore the preemption's idle status before this turn.

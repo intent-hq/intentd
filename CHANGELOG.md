@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.8] - 2026-10-03
+
+### 🚀 Features
+
+- Resolve authorized cross-workspace presence focus ([#2266](https://github.com/intent-hq/intentd/pull/2266))
+- Search GitHub and GitLab invitation accounts ([#2267](https://github.com/intent-hq/intentd/pull/2267))
+
+### 🐛 Bug Fixes
+
+- Cancel watcher lock waits and keep invitation clients responsive ([#2263](https://github.com/intent-hq/intentd/pull/2263))
+- Lease default-port WSS fixture lifecycles ([#2265](https://github.com/intent-hq/intentd/pull/2265))
+- Retry pending script completion settlement ([#2269](https://github.com/intent-hq/intentd/pull/2269))
+- Increase default chat subscription history to 20 ([#2270](https://github.com/intent-hq/intentd/pull/2270))
+
+
 ## [0.10.7] - 2026-10-03
 
 ### 🚀 Features

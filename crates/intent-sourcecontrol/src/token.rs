@@ -45,6 +45,20 @@ const SECRET_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
 /// waiting on the child.
 const GH_CLI_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Process-start opt-out from the installed GitHub CLI credential integration.
+/// Presence (including an empty value) disables lookup, cached-token use,
+/// login synchronization and logout. The daemon freezes this before starting
+/// its runtime; settings and later environment changes cannot re-enable it.
+/// Private file-store and explicitly supplied environment tokens are unaffected.
+pub use intent_core::process_policy::DISABLE_GH_CREDENTIALS_ENV;
+
+/// Freeze/read the process policy before any credential consumers are started.
+/// Library-only owners also freeze it on their first credential access.
+#[must_use]
+pub fn gh_credential_access_allowed() -> bool {
+    intent_core::process_policy::ProcessPolicy::current().gh_credentials_allowed()
+}
+
 /// How long a successful `gh auth token` result is reused before shelling out
 /// again. Keeps bursts of `pr.*` calls from spawning one subprocess each,
 /// while staying short enough that a `gh auth logout` (or token rotation) is
@@ -274,6 +288,10 @@ pub(crate) fn pick_env_token(github: Option<&str>, gh: Option<&str>) -> Option<S
 /// with a bounded timeout so a wedged child can't block a tokio worker. A
 /// success is cached for [`GH_TOKEN_CACHE_TTL`].
 async fn gh_cli_token() -> SourceResult {
+    // This check precedes the positive cache as well as binary discovery.
+    if !gh_credential_access_allowed() {
+        return Err("gh CLI: credential access disabled by process policy".to_string());
+    }
     if let Some(token) = GH_TOKEN_CACHE.fresh(GH_TOKEN_CACHE_TTL) {
         return Ok(token);
     }
@@ -364,6 +382,9 @@ fn interpret_gh_output(gh: &Path, output: std::io::Result<std::process::Output>)
 ///
 /// Shared with [`crate::gh_sync`] so every `gh` lookup in this crate agrees.
 pub(crate) fn find_gh_binary() -> Option<PathBuf> {
+    if !gh_credential_access_allowed() {
+        return None;
+    }
     let is_windows = cfg!(windows);
     find_gh_in_dirs_for(&fast_gh_dirs(), is_windows)
         .or_else(|| find_gh_in_dirs_for(&intent_core::path_utils::enhanced_path_dirs(), is_windows))
@@ -423,6 +444,163 @@ fn non_empty(s: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod credential_policy_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const CHILD: &str = "INTENT_TEST_GH_POLICY_CHILD";
+    const TOKEN: &str = "fixture-only-token";
+
+    async fn check_process(mode: &str) {
+        let disabled = mode != "normal";
+        let dir = tempfile::tempdir().unwrap();
+        let gh = dir.path().join("gh");
+        // Only this owned executable is reachable. Its record contains argv,
+        // never stdin/token bytes; no installed CLI or credential store runs.
+        std::fs::write(
+            &gh,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$GH_RECORD"
+case "$2" in
+  token) printf '%s\n' 'fixture-only-token';;
+  status) [ -f "$GH_STATE" ] || exit 1
+          printf '%s\n' 'Logged in to github.com account fixture' 'Active account: true';;
+  login) token=''; IFS= read -r token || :
+         [ "$token" = 'fixture-only-token' ] || exit 1
+         : > "$GH_STATE";;
+  logout) : > "$GH_LOGGED_OUT";;
+  *) exit 3;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "token::credential_policy_tests::policy_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, mode)
+            .env("HOME", dir.path())
+            .env("PATH", dir.path())
+            .env("INTENTD_SECRETS_FILE", dir.path().join("secrets.json"))
+            .env("GH_RECORD", dir.path().join("calls"))
+            .env("GH_STATE", dir.path().join("logged-in"))
+            .env("GH_LOGGED_OUT", dir.path().join("logged-out"))
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        if mode == "private" {
+            command.env(intent_core::process_policy::PRIVATE_TEST_PROFILE_ENV, "");
+        } else if disabled {
+            command.env(DISABLE_GH_CREDENTIALS_ENV, "1");
+        }
+        let mut child = command.spawn().unwrap();
+        let status = match timeout(Duration::from_secs(20), child.wait()).await {
+            Ok(result) => result.unwrap(),
+            Err(error) => {
+                child.kill().await.unwrap();
+                let _ = child.wait().await.unwrap();
+                panic!("owned policy child did not finish: {error}");
+            }
+        };
+        assert!(status.success(), "policy child failed: {status}");
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default();
+        if disabled {
+            assert!(calls.is_empty(), "disabled process invoked gh: {calls}");
+            assert!(!dir.path().join("logged-in").exists());
+            assert!(!dir.path().join("logged-out").exists());
+        } else {
+            assert_eq!(
+                calls.lines().filter(|s| *s == "auth token").count(),
+                1,
+                "cache hit must not repeat lookup: {calls}"
+            );
+            assert!(calls.contains("auth login --with-token --hostname github.com"));
+            assert!(calls.contains("auth logout --hostname github.com --user fixture"));
+            assert!(dir.path().join("logged-out").exists());
+        }
+        assert!(!calls.contains(TOKEN), "token must not reach argv");
+    }
+
+    #[tokio::test]
+    async fn disabled_process_blocks_lookup_cache_sync_and_logout() {
+        check_process("disabled").await;
+    }
+
+    #[tokio::test]
+    async fn normal_process_keeps_lookup_cache_sync_and_logout() {
+        check_process("normal").await;
+    }
+
+    #[tokio::test]
+    async fn private_profile_alone_blocks_lookup_cache_sync_and_logout() {
+        check_process("private").await;
+    }
+
+    #[test]
+    #[ignore = "owned subprocess only; invoked by the policy controls"]
+    fn policy_child() {
+        let disabled = std::env::var(CHILD).unwrap() != "normal";
+        assert_eq!(gh_credential_access_allowed(), !disabled);
+        // The child has no runtime/other credential consumers yet. Mutating
+        // its environment after the snapshot cannot change the process policy.
+        if disabled {
+            std::env::remove_var(DISABLE_GH_CREDENTIALS_ENV);
+            std::env::remove_var(intent_core::process_policy::PRIVATE_TEST_PROFILE_ENV);
+        } else {
+            std::env::set_var(DISABLE_GH_CREDENTIALS_ENV, "1");
+        }
+        assert_eq!(gh_credential_access_allowed(), !disabled);
+        if disabled {
+            GH_TOKEN_CACHE.store_if_current(GH_TOKEN_CACHE.generation(), TOKEN);
+        } else {
+            assert_eq!(
+                find_gh_binary().unwrap(),
+                PathBuf::from(std::env::var_os("HOME").unwrap()).join("gh")
+            );
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for _ in 0..2 {
+                let result = resolve_detailed(&TokenSource::GhCli).await;
+                if disabled {
+                    assert!(result.token.is_none());
+                    assert!(result
+                        .skipped
+                        .iter()
+                        .any(|s| s.contains("disabled by process policy")));
+                } else {
+                    assert_eq!(result.token.as_deref(), Some(TOKEN));
+                }
+            }
+            if disabled {
+                let result = resolve_detailed(&TokenSource::Auto).await;
+                assert!(
+                    result.token.is_none(),
+                    "auto must not fall back to cached gh"
+                );
+                assert!(find_gh_binary().is_none());
+            }
+            let store = intent_core::FileSecretStore::new();
+            store.store(SECRET_ACCOUNT, TOKEN).unwrap();
+            assert_eq!(
+                resolve(&TokenSource::Explicit).await.as_deref(),
+                Some(TOKEN)
+            );
+            crate::gh_sync::sync_token_to_gh(store).await;
+            crate::gh_sync::logout_gh_after_revoke(Some(TOKEN.to_string())).await;
+        });
     }
 }
 

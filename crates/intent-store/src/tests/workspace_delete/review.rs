@@ -454,6 +454,7 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
         read_pool: crate::connect_read(&tmp.path).await.unwrap(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
         export_author_barrier: std::sync::Arc::default(),
+        repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
     };
     let doomed = seed_workspace(&store, "doomed").await;
     let keeper = seed_workspace(&store, "keeper").await;
