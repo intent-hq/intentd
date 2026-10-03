@@ -432,8 +432,11 @@ impl DetachedCleanup {
                 Err(format!("open detached pidfd: {error}"))
             };
         }
+        // Linux returns descriptors in the C int range; reject an invalid
+        // syscall result before assigning ownership rather than truncating it.
+        let fd = i32::try_from(fd).map_err(|error| format!("invalid detached pidfd: {error}"))?;
         // SAFETY: a successful pidfd_open returned a new descriptor.
-        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
         let identity = std::fs::read(format!("/proc/{pid}/environ"));
         match identity {
             Ok(bytes) if bytes.is_empty() => Ok(Self(None)), // Already a zombie.
