@@ -4820,6 +4820,7 @@ async fn app_agents_send_persists_chief_attribution_and_source_link() {
             "fromWorkspaceId": chief_ws.0,
             "sourceMessageId": source_id,
             "sourceUrl": source_url,
+            "submissionIds": [delivered.id],
         }))
     );
 }
@@ -4883,6 +4884,7 @@ async fn app_agents_send_delivers_despite_target_pending_questions() {
         "fromWorkspaceId": chief_ws.0,
         "sourceMessageId": source_id,
         "sourceUrl": source_url,
+        "submissionIds": [result["messageId"]],
     });
     let target_session = svc
         .store()
@@ -15019,7 +15021,7 @@ async fn send_message_delivers_when_agent_exists() {
 async fn send_message_op_persists_message_metadata() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "MetaRecv").await;
-    let metadata = json!({
+    let mut metadata = json!({
         "type": "agent_message",
         "fromAgentId": "agent-11111111-1111-1111-1111-111111111111",
         "fromAgentName": "Coordinator"
@@ -15038,10 +15040,11 @@ async fn send_message_op_persists_message_metadata() {
     assert_eq!(r["queued"], false);
     let session = svc.store().get_agent_session(&id).await.expect("session");
     assert_eq!(session.messages.len(), 1);
+    metadata["submissionIds"] = json!([session.messages[0].id]);
     assert_eq!(
         session.messages[0].metadata.as_ref(),
         Some(&metadata),
-        "store-only send must persist messageMetadata verbatim"
+        "store-only send must preserve messageMetadata alongside submission identity"
     );
 }
 
@@ -15056,7 +15059,7 @@ async fn send_to_task_store_only_fallback_persists_message_metadata() {
     svc.assign_agent(ws.clone(), note_id.clone(), agent_id.0.clone(), None)
         .await
         .expect("assign");
-    let metadata = json!({
+    let mut metadata = json!({
         "type": "agent_message",
         "fromAgentId": "agent-22222222-2222-2222-2222-222222222222",
         "fromAgentName": "Sender"
@@ -15078,10 +15081,11 @@ async fn send_to_task_store_only_fallback_persists_message_metadata() {
         .await
         .expect("session");
     assert_eq!(session.messages.len(), 1);
+    metadata["submissionIds"] = json!([session.messages[0].id]);
     assert_eq!(
         session.messages[0].metadata.as_ref(),
         Some(&metadata),
-        "store-only sendToTask fallback must persist messageMetadata verbatim"
+        "store-only sendToTask fallback must preserve messageMetadata alongside submission identity"
     );
 }
 
@@ -17055,7 +17059,7 @@ async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
     )
     .await
     .expect("first send");
-    let metadata = answer_metadata(&asked_id);
+    let mut metadata = answer_metadata(&asked_id);
     let r = svc
         .agent_send_message_op(
             id.clone(),
@@ -17068,6 +17072,7 @@ async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
         .await
         .expect("send");
     assert_eq!(r["queued"], true);
+    metadata["submissionIds"] = json!(["dup-id"]);
     assert_eq!(r["queuedMessage"]["messageMetadata"], metadata);
     assert!(
         svc.questions_pending(&id).await,
@@ -17078,9 +17083,22 @@ async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
         .as_str()
         .expect("queued id")
         .to_string();
-    svc.agent_send_queued_message_now_op(id.clone(), queued_id)
+    let drained = svc
+        .agent_send_queued_message_now_op(id.clone(), queued_id.clone())
         .await
         .expect("drain queued answer");
+    assert_ne!(drained["messageId"], "dup-id");
+    let session = svc.store().get_agent_session(&id).await.unwrap();
+    let answer = session.messages.last().unwrap();
+    assert_eq!(json!(answer.id), drained["messageId"]);
+    let answer_metadata = answer.metadata.as_ref().unwrap();
+    assert_eq!(answer_metadata["submissionIds"], json!(["dup-id"]));
+    assert_eq!(answer_metadata["queueInfo"]["queuedMessageId"], queued_id);
+    assert_eq!(
+        session.messages.len(),
+        3,
+        "question, first send, and answer"
+    );
     assert!(
         !svc.questions_pending(&id).await,
         "the drained answer must clear the marker"
@@ -34140,6 +34158,8 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
         hold_until: None,
         child_agent_id: None,
         merged_submission_ids: Vec::new(),
+        recovery_sources: Vec::new(),
+        correlation_order_known: true,
         edit_appended: String::new(),
         edit_prepended: String::new(),
         editing_message_id: None,
@@ -34725,6 +34745,8 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
             hold_until: None,
             child_agent_id: None,
             merged_submission_ids: Vec::new(),
+            recovery_sources: Vec::new(),
+            correlation_order_known: true,
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
@@ -35182,6 +35204,8 @@ fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
         hold_until: None,
         child_agent_id: None,
         merged_submission_ids: Vec::new(),
+        recovery_sources: Vec::new(),
+        correlation_order_known: true,
         edit_appended: String::new(),
         edit_prepended: String::new(),
         editing_message_id: None,
@@ -47890,7 +47914,7 @@ async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
 
 #[tokio::test]
 async fn send_queued_message_now_store_only_processing_requires_successful_persistence() {
-    for outcome in ["new", "persisted", "failure"] {
+    for outcome in ["new", "persisted", "collision", "failure"] {
         let (_tmp, svc, ws, _bus) = setup_with_bus().await;
         let agent = create_agent(&svc, &ws, "Processing").await;
         let queued = svc
@@ -47904,7 +47928,7 @@ async fn send_queued_message_now_store_only_processing_requires_successful_persi
             .await
             .unwrap();
         let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
-        if outcome != "new" {
+        if matches!(outcome, "persisted" | "collision") {
             svc.store
                 .append_agent_message_with_id(
                     &agent,
@@ -47920,10 +47944,25 @@ async fn send_queued_message_now_store_only_processing_requires_successful_persi
         if outcome == "persisted" {
             svc.agent_queues.lock().unwrap().get_mut(&agent).unwrap()[0].persisted = true;
         }
+        if outcome == "failure" {
+            sqlx::query("CREATE TRIGGER fail_queue_delivery BEFORE INSERT ON agent_message BEGIN SELECT RAISE(FAIL, 'queue delivery fault'); END")
+                .execute(svc.store.write_pool())
+                .await
+                .unwrap();
+        }
         let result = svc
             .agent_send_queued_message_now_op(agent.clone(), entry_id.clone())
             .await;
         assert_eq!(result.is_ok(), outcome != "failure");
+        if outcome == "collision" {
+            assert_ne!(result.as_ref().unwrap()["messageId"], entry_id);
+            let session = svc.store.get_agent_session(&agent).await.unwrap();
+            assert_eq!(session.messages.len(), 2);
+            assert_eq!(
+                session.messages[1].metadata.as_ref().unwrap()["submissionIds"],
+                json!([entry_id])
+            );
+        }
         let events: Vec<_> = svc
             .store
             .query_events(&intent_store::EventQuery::default())

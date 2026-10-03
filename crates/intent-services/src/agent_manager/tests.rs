@@ -7036,7 +7036,7 @@ async fn context_size_requeue_replaces_oversized_entry_with_marker() {
     assert_eq!(queued.queued_at, "2026-01-01T00:00:00Z");
     assert_eq!(
         queued.message_metadata,
-        Some(json!({"type": "hook_dispatch"}))
+        Some(json!({"type": "hook_dispatch", "submissionIds": [queued.id]}))
     );
     assert!(queued.interrupt_priority);
     // Wire shape (`agent.getQueue`) shows the marker as a failure requeue.
@@ -7283,6 +7283,8 @@ fn flush_entry(suffix: &str, content: String) -> crate::agent_ops::QueuedMessage
         hold_until: None,
         child_agent_id: None,
         merged_submission_ids: Vec::new(),
+        recovery_sources: Vec::new(),
+        correlation_order_known: true,
         edit_appended: String::new(),
         edit_prepended: String::new(),
         editing_message_id: None,
@@ -15342,6 +15344,8 @@ async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
         hold_until: None,
         child_agent_id: None,
         merged_submission_ids: Vec::new(),
+        recovery_sources: Vec::new(),
+        correlation_order_known: true,
         edit_appended: String::new(),
         edit_prepended: String::new(),
         editing_message_id: None,
@@ -19075,6 +19079,8 @@ mod stale_redrive_tests {
             hold_until: None,
             child_agent_id: None,
             merged_submission_ids: Vec::new(),
+            recovery_sources: Vec::new(),
+            correlation_order_known: true,
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
@@ -19531,6 +19537,8 @@ mod dequeue_wait_tests {
             hold_until: None,
             child_agent_id: None,
             merged_submission_ids: Vec::new(),
+            recovery_sources: Vec::new(),
+            correlation_order_known: true,
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
@@ -20105,7 +20113,9 @@ mod queued_message_id_stamp_tests {
         super::super::stamp_queued_message_id(&mut msg);
         assert_eq!(
             msg.message_metadata,
-            Some(json!({ "queueInfo": { "queuedMessageId": "qm-wait-test" } })),
+            Some(
+                json!({ "submissionIds": ["qm-wait-test"], "queueInfo": { "queuedMessageId": "qm-wait-test" } })
+            ),
             "queueInfo carries ONLY the identity link"
         );
     }
@@ -20156,6 +20166,7 @@ mod queued_message_id_stamp_tests {
             Some(json!({
                 "type": "question_answers",
                 "answeredQuestionsMessageId": "msg-asked",
+                "submissionIds": ["qm-wait-test"],
                 "queueInfo": { "queuedMessageId": "qm-wait-test" },
             })),
             "caller keys untouched, queueInfo added"
@@ -20179,12 +20190,13 @@ mod queued_message_id_stamp_tests {
     }
 
     #[test]
-    fn persisted_requeue_is_never_stamped() {
+    fn persisted_requeue_keeps_correlation_without_a_new_queue_link() {
         let mut msg = queued_msg("already durable", &iso_secs_ago(60), true);
         super::super::stamp_queued_message_id(&mut msg);
         assert_eq!(
-            msg.message_metadata, None,
-            "persisted rows are never rewritten"
+            msg.message_metadata,
+            Some(json!({"submissionIds": ["qm-wait-test"]})),
+            "retry payload retains correlation without changing the durable transcript"
         );
     }
 
@@ -20198,7 +20210,9 @@ mod queued_message_id_stamp_tests {
         super::super::stamp_queued_message_id(&mut msg);
         assert_eq!(
             msg.message_metadata,
-            Some(json!({ "queueInfo": { "queuedMessageId": "qm-wait-test" } }))
+            Some(
+                json!({ "submissionIds": ["qm-wait-test"], "queueInfo": { "queuedMessageId": "qm-wait-test" } })
+            )
         );
         for odd in [json!(7), Value::Null, json!("x"), json!([1])] {
             let mut msg = queued_msg("odd", &iso_secs_ago(60), false);
@@ -20208,7 +20222,8 @@ mod queued_message_id_stamp_tests {
                 msg.message_metadata,
                 Some(json!({
                     "keep": true,
-                    "queueInfo": { "queuedMessageId": "qm-wait-test" },
+                    "submissionIds": ["qm-wait-test"],
+                "queueInfo": { "queuedMessageId": "qm-wait-test" },
                 })),
                 "caller keys kept, reserved queueInfo replaced"
             );
@@ -23508,6 +23523,8 @@ mod flush_queued_messages_tests {
             hold_until: None,
             child_agent_id: None,
             merged_submission_ids: Vec::new(),
+            recovery_sources: Vec::new(),
+            correlation_order_known: true,
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
@@ -25886,4 +25903,488 @@ async fn queue_processing_payload_ordinary_drain_retains_recovered_merged_contri
         queued["messageMetadata"]["mergedMessageMetadata"]
     );
     assert_eq!(rows[0]["author"]["principalId"], owner.0);
+}
+
+#[tokio::test]
+async fn submission_correlation_legacy_append_failure_stays_unknown_after_restart() {
+    let _env = EnvGuard::set_all(&[("INTENTD_PERSIST_RETRY_BACKOFF_MS", "1,1")]);
+    let (tmp, mgr, mut bus) = manager_with_bus().await;
+    let mut mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-legacy-correlation");
+    let id = AgentId::from("a-legacy-correlation");
+    seed_agent(&mgr, &ws, &id).await;
+    let owner = mgr.services.store.get_primary_principal().await.unwrap().id;
+    let mut legacy = flush_entry("legacy", "legacy queued input".into());
+    legacy.user_origin = true;
+    legacy.message_metadata = Some(json!({"fromPrincipalId":owner.0}));
+    let mut payload = serde_json::to_value(&legacy).unwrap();
+    for field in ["submissionOrder", "correlationOrderKnown"] {
+        payload.as_object_mut().unwrap().remove(field);
+    }
+    mgr.services
+        .store
+        .replace_agent_queue(
+            &id,
+            &[intent_store::AgentQueueRow {
+                id: legacy.id.clone(),
+                agent_id: id.clone(),
+                position: 0,
+                payload,
+                created_at: legacy.queued_at.clone(),
+                turn_id: legacy.turn_id.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_legacy_append BEFORE INSERT ON agent_message WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'test legacy append failure'); END")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+
+    for attempt in 0..2 {
+        assert_eq!(mgr.services.rehydrate_agent_queues().await.unwrap(), 1);
+        let before = mgr.services.queue_snapshot(&id);
+        let row = mgr
+            .services
+            .find_queued_message(&id, before[0]["id"].as_str().unwrap())
+            .unwrap();
+        assert!(
+            row.submission_order > 0,
+            "rehydration assigns synthetic order"
+        );
+        assert!(!row.correlation_order_known);
+        assert_eq!(before[0]["mergeEligible"], false);
+        // Retry the restored row without introducing a new user submission.
+        mgr.services
+            .store
+            .set_agent_session_status(&ws, &id, AgentStatus::RuntimeIdle, false, &now_iso(), None)
+            .await
+            .unwrap();
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        assert!(!mgr.is_busy(&id));
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session(&id)
+                .await
+                .unwrap()
+                .status,
+            AgentStatus::Error
+        );
+        let queue = mgr.services.queue_snapshot(&id);
+        assert_eq!(queue.len(), 1, "failed append retains the legacy row");
+        assert_eq!(
+            queue[0]["mergeEligible"], false,
+            "failure must not invent trusted arrival order"
+        );
+        let restored = mgr
+            .services
+            .find_queued_message(&id, queue[0]["id"].as_str().unwrap())
+            .unwrap();
+        assert!(!restored.correlation_order_known);
+        assert_eq!(restored.submission_order, row.submission_order);
+        assert_eq!(restored.turn_id, legacy.turn_id);
+        assert!(!restored.persisted);
+        assert!(restored.requeued_after_failure);
+        let sources = mgr.services.recovery_sources(&ws, &[restored]).await;
+        assert_eq!(sources.len(), 1);
+        assert!(
+            sources[0].submission_ids.is_none(),
+            "legacy recovery aliases stay unknown"
+        );
+        assert!(mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap()
+            .iter()
+            .all(|m| m.role != "user"));
+        mgr.services.persist_queue_snapshot(&id).await;
+        let stored = mgr.services.store.load_all_agent_queues().await.unwrap();
+        assert_eq!(stored[0].payload["correlationOrderKnown"], false);
+        bus.shutdown().await.unwrap();
+        mgr.services.store.close().await;
+        if attempt == 0 {
+            drop(mgr);
+            let store = Store::open(&tmp.path).await.unwrap();
+            bus = EventBus::new(store.clone());
+            let services = Services::new_with_file_secrets(
+                store,
+                intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
+            )
+            .with_event_bus(bus.clone());
+            mgr = Arc::new(AgentManager::new(
+                services,
+                Arc::new(BusEventSink::new(bus.clone())),
+                8,
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn submission_correlation_single_merged_flush_survives_restart_and_failure() {
+    let (tmp, mgr, bus) = manager_with_bus().await;
+    let ws = WorkspaceId::from("ws-single-correlation");
+    let id = AgentId::from("a-single-correlation");
+    seed_agent(&mgr, &ws, &id).await;
+    for mid in ["single-a1", "single-a2"] {
+        mgr.services.enqueue_message_with_id(
+            &id,
+            Some(mid.into()),
+            "identical".into(),
+            None,
+            None,
+            Some(json!({"fromPrincipalId":"a"})),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+    }
+    let selected = mgr.services.dequeue_message(&id).unwrap();
+    assert!(
+        mgr.services.dequeue_message(&id).is_none(),
+        "two submissions merged into one selected row"
+    );
+    let aliases = selected.submission_ids();
+    let order = selected.submission_order;
+    let turn_id = selected.turn_id.clone();
+    let (_, mut restored) =
+        flush_then_fail(&mgr, &ws, &id, vec![selected], "ordinary failure").await;
+    assert_eq!(restored.len(), 1);
+    let retry = restored.remove(0);
+    for alias in &aliases {
+        assert!(
+            retry.submission_ids().contains(alias),
+            "original alias lost: {alias}"
+        );
+    }
+    assert!(
+        retry.correlation_order_known,
+        "new submissions retain known provenance"
+    );
+    assert_eq!(retry.submission_order, order);
+    assert_eq!(retry.turn_id, turn_id);
+    assert!(retry.persisted);
+    assert!(
+        retry.recovery_sources.is_empty(),
+        "ordinary single row keeps ordinary correlation"
+    );
+    assert_eq!(
+        retry.message_metadata.as_ref().unwrap()["fromPrincipalId"],
+        "a"
+    );
+    mgr.services.requeue_front(&id, retry);
+    mgr.services.persist_queue_snapshot(&id).await;
+    bus.shutdown().await.unwrap();
+    mgr.services.store.close().await;
+    drop(mgr);
+    let store = Store::open(&tmp.path).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let services = Services::new_with_file_secrets(
+        store,
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
+    )
+    .with_event_bus(bus.clone());
+    let restarted = AgentManager::new(services, Arc::new(BusEventSink::new(bus.clone())), 8);
+    assert_eq!(
+        restarted.services.rehydrate_agent_queues().await.unwrap(),
+        1
+    );
+    for alias in &aliases {
+        let replay = restarted
+            .services
+            .submission_replay(&id, alias, Some(&json!({"fromPrincipalId":"a"})))
+            .unwrap()
+            .unwrap();
+        assert!(replay["submissionIds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(alias)));
+        assert!(restarted
+            .services
+            .submission_replay(&id, alias, Some(&json!({"fromPrincipalId":"b"})))
+            .is_err());
+    }
+    let retry = restarted.services.dequeue_message(&id).unwrap();
+    let (_, restored) = flush_then_fail(&restarted, &ws, &id, vec![retry], "second failure").await;
+    for alias in &aliases {
+        assert!(restored[0].submission_ids().contains(alias));
+    }
+    assert_eq!(restored[0].turn_id, turn_id);
+    assert!(restored[0].correlation_order_known);
+    assert_eq!(restored[0].submission_order, order);
+    let history = restarted
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    let users: Vec<_> = history.iter().filter(|m| m.role == "user").collect();
+    assert_eq!(users.len(), 1, "redrive never duplicates the persisted row");
+    assert_eq!(
+        users[0].metadata.as_ref().unwrap()["submissionIds"],
+        json!(aliases)
+    );
+    bus.shutdown().await.unwrap();
+    restarted.services.store.close().await;
+}
+
+#[tokio::test]
+async fn submission_correlation_completed_interrupt_replay_is_complete() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-interrupt-correlation");
+    let id = AgentId::from("a-interrupt-correlation");
+    seed_agent(&mgr, &ws, &id).await;
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+    let options = super::TurnOptions {
+        message_metadata: Some(json!({"fromPrincipalId":"a"})),
+        ..Default::default()
+    };
+    let first = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "urgent".into(),
+            Some("interrupt-correlation".into()),
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["submissionIds"], json!(["interrupt-correlation"]));
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("interrupt turn completed");
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_session(&id)
+            .await
+            .unwrap()
+            .status,
+        AgentStatus::RuntimeIdle
+    );
+    let second = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws,
+            "urgent".into(),
+            Some("interrupt-correlation".into()),
+            options,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second,
+        json!({"success":true,"queued":false,"messageId":"interrupt-correlation","submissionIds":["interrupt-correlation"],"deduplicated":true})
+    );
+    let history = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(history.iter().filter(|m| m.role == "user").count(), 1);
+    assert!(!mgr.is_busy(&id));
+}
+
+#[tokio::test]
+async fn submission_correlation_mixed_recovery_survives_restart_and_repeated_failure() {
+    let (tmp, mgr, bus) = manager_with_bus().await;
+    let ws = WorkspaceId::from("ws-correlation");
+    let id = AgentId::from("a-correlation");
+    seed_agent(&mgr, &ws, &id).await;
+    for (mid, principal, origin) in [
+        ("a1", Some("a"), MessageOrigin::User),
+        ("a2", Some("a"), MessageOrigin::User),
+        ("b1", Some("b"), MessageOrigin::User),
+        ("wake", Some("c"), MessageOrigin::Automatic),
+        ("system", None, MessageOrigin::Automatic),
+    ] {
+        mgr.services.enqueue_message_with_id(
+            &id,
+            Some(mid.into()),
+            "identical".into(),
+            None,
+            None,
+            Some(principal.map_or_else(
+                || json!({"source":"system"}),
+                |p| json!({"fromPrincipalId":p}),
+            )),
+            None,
+            false,
+            origin,
+        );
+    }
+    let mut batch = Vec::new();
+    while let Some(entry) = mgr.services.dequeue_message(&id) {
+        batch.push(entry);
+    }
+    assert_eq!(batch.len(), 4);
+    let (_, mut restored) = flush_then_fail(&mgr, &ws, &id, batch, "ordinary failure").await;
+    assert_eq!(restored.len(), 1);
+    let retry = restored.remove(0);
+    let sources = retry.recovery_sources.clone();
+    assert_eq!(sources.len(), 4);
+    assert_eq!(sources[0].author["principalId"], "a");
+    assert_eq!(sources[1].author["principalId"], "b");
+    assert_eq!(sources[2].author["principalId"], "c");
+    assert_eq!(sources[3].author, Value::Null);
+    assert_eq!(sources[2].origin, MessageOrigin::Automatic);
+    assert_eq!(
+        sources[0].submission_ids,
+        Some(vec!["a2".into(), "a1".into()])
+    );
+    assert!(retry.to_value(0).get("submissionIds").is_none());
+    let first_history = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(first_history.iter().filter(|m| m.role == "user").count(), 4);
+    mgr.services.requeue_front(&id, retry);
+    mgr.services.persist_queue_snapshot(&id).await;
+    bus.shutdown().await.unwrap();
+    mgr.services.store.close().await;
+    drop(mgr);
+    let store = Store::open(&tmp.path).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let services = Services::new_with_file_secrets(
+        store,
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
+    )
+    .with_event_bus(bus.clone());
+    let restarted = AgentManager::new(services, Arc::new(BusEventSink::new(bus.clone())), 8);
+    assert_eq!(
+        restarted.services.rehydrate_agent_queues().await.unwrap(),
+        1
+    );
+    let snapshot = restarted.services.queue_snapshot(&id);
+    assert_eq!(snapshot[0]["recoverySources"], json!(sources));
+    assert_eq!(snapshot[0]["mergeEligible"], false);
+    let replay = restarted
+        .services
+        .submission_replay(&id, "b1", Some(&json!({"fromPrincipalId":"b"})))
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay["recoverySources"], json!(sources));
+    assert!(replay.get("submissionIds").is_none());
+    assert!(restarted
+        .services
+        .submission_replay(&id, "b1", Some(&json!({"fromPrincipalId":"a"})))
+        .is_err());
+    let retry = restarted.services.dequeue_message(&id).unwrap();
+    let (_, restored) = flush_then_fail(&restarted, &ws, &id, vec![retry], "second failure").await;
+    assert_eq!(restored[0].recovery_sources, sources);
+    assert_eq!(
+        restarted
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|m| m.role == "user")
+            .count(),
+        4,
+        "redrive never duplicates persisted source rows"
+    );
+    bus.shutdown().await.unwrap();
+    restarted.services.store.close().await;
+}
+
+#[tokio::test]
+async fn submission_correlation_partial_flush_retains_persisted_head_and_tail() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-correlation-partial");
+    let id = AgentId::from("a-correlation-partial");
+    seed_agent(&mgr, &ws, &id).await;
+    let mut batch = Vec::new();
+    for (mid, principal) in [("head", "a"), ("fails", "b"), ("tail", "a")] {
+        let (entry, _) = mgr.services.enqueue_message_with_id(
+            &id,
+            Some(mid.into()),
+            mid.into(),
+            None,
+            None,
+            Some(json!({"fromPrincipalId":principal})),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        batch.push(entry);
+    }
+    mgr.services.agent_queues.lock().unwrap().remove(&id);
+    sqlx::query("CREATE TRIGGER fail_second_correlation BEFORE INSERT ON agent_message WHEN NEW.metadata LIKE '%fails%' BEGIN SELECT RAISE(ABORT, 'test partial persistence'); END")
+        .execute(mgr.services.store.write_pool()).await.unwrap();
+    let draining = mgr.services.mark_draining(&id, &batch);
+    assert!(matches!(
+        super::prepare_flush_turn(&mgr, &id, &ws, batch, draining).await,
+        super::FlushPrep::Parked
+    ));
+    let snapshot = mgr.services.queue_snapshot(&id);
+    assert_eq!(snapshot.len(), 3);
+    for (entry, mid) in snapshot.iter().zip(["head", "fails", "tail"]) {
+        assert_eq!(entry["id"], mid);
+        assert_eq!(entry["submissionIds"], json!([mid]));
+    }
+    let history = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(history.iter().filter(|m| m.role == "user").count(), 1);
+    let head = history.iter().find(|m| m.role == "user").unwrap();
+    assert_eq!(
+        head.metadata.as_ref().unwrap()["submissionIds"],
+        json!(["head"])
+    );
+    sqlx::query("DROP TRIGGER fail_second_correlation")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+    mgr.services.persist_queue_snapshot(&id).await;
+    mgr.services.agent_queues.lock().unwrap().clear();
+    assert_eq!(mgr.services.rehydrate_agent_queues().await.unwrap(), 3);
+    let mut batch = Vec::new();
+    while let Some(entry) = mgr.services.dequeue_message(&id) {
+        batch.push(entry);
+    }
+    assert!(batch[0].persisted);
+    assert!(!batch[1].persisted);
+    let draining = mgr.services.mark_draining(&id, &batch);
+    assert!(matches!(
+        super::prepare_flush_turn(&mgr, &id, &ws, batch, draining).await,
+        super::FlushPrep::Turn { .. }
+    ));
+    let history = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    let users: Vec<_> = history.iter().filter(|m| m.role == "user").collect();
+    assert_eq!(users.len(), 3);
+    for mid in ["head", "fails", "tail"] {
+        assert_eq!(
+            users
+                .iter()
+                .filter(|m| m.metadata.as_ref().unwrap()["submissionIds"] == json!([mid]))
+                .count(),
+            1
+        );
+    }
 }
