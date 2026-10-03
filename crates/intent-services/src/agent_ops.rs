@@ -12377,8 +12377,7 @@ impl Services {
         session: &AgentSession,
     ) -> Result<AgentSnapshot> {
         let agent_id = &session.id;
-        // Count-only aggregate: `active_hooks_for_agent` would hydrate every
-        // hook row the agent ever owned (code + lastState blobs included).
+        // Count-only aggregate: the snapshot needs no per-hook metadata.
         let hooks = usize::try_from(
             self.store
                 .count_active_hooks_by_agent(agent_id)

@@ -79,6 +79,51 @@ pub(crate) async fn count_sqlx_statements<F: Future>(fut: F) -> (F::Output, usiz
     (out, statements)
 }
 
+/// Executed SQL and hydrated row count, scoped like `count_sqlx_statements`.
+#[derive(Debug, Default)]
+pub(crate) struct SqlxQuery {
+    pub sql: String,
+    pub rows_returned: u64,
+}
+
+impl tracing::field::Visit for SqlxQuery {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "db.statement" {
+            self.sql = value.to_owned();
+        }
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "rows_returned" {
+            self.rows_returned = value;
+        }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+type QueryCapture = Arc<Mutex<Vec<SqlxQuery>>>;
+
+fn query_captures() -> &'static Mutex<HashMap<u64, QueryCapture>> {
+    static CAPTURES: OnceLock<Mutex<HashMap<u64, QueryCapture>>> = OnceLock::new();
+    CAPTURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Capture real worker-thread statements, including their returned-row counts.
+/// Warm the pool first and do not hold a thread-local tracing capture.
+pub(crate) async fn capture_sqlx_queries<F: Future>(fut: F) -> (F::Output, Vec<SqlxQuery>) {
+    install_anchor();
+    let span = tracing::trace_span!(STATEMENT_COUNT_SPAN);
+    let id = span.id().expect("query capture span").into_u64();
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    query_captures().lock().unwrap().insert(id, capture.clone());
+    let out = fut.instrument(span.clone()).await;
+    query_captures().lock().unwrap().remove(&id);
+    let queries = std::mem::take(&mut *capture.lock().unwrap());
+    drop(span);
+    (out, queries)
+}
+
 fn install_anchor() {
     static ANCHOR: Once = Once::new();
     ANCHOR.call_once(|| {
@@ -144,6 +189,15 @@ where
         };
         if let Some(counter) = counters().lock().unwrap().get(&marker.id().into_u64()) {
             counter.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(capture) = query_captures()
+            .lock()
+            .unwrap()
+            .get(&marker.id().into_u64())
+        {
+            let mut query = SqlxQuery::default();
+            event.record(&mut query);
+            capture.lock().unwrap().push(query);
         }
     }
 }

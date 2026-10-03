@@ -27399,6 +27399,123 @@ async fn status_list_and_diagnostics_surface_waiting_on_hooks() {
     );
 }
 
+/// The internal decoration must not hydrate retired history or active payloads.
+/// `SQLx` reports actual fetched rows, independently of the final wire projection.
+async fn assert_waiting_hooks_read_cost(batched: bool) {
+    use crate::test_tracing::{capture_sqlx_queries, warm_sqlx_pool};
+    use intent_core::{HookId, HookState};
+
+    let (_t, svc, ws) = setup().await;
+    let owner = create_agent(&svc, &ws, "Owner").await;
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    let bare = create_agent(&svc, &ws, "Bare").await;
+    let other_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other_ws))
+        .await
+        .unwrap();
+    let other = create_agent(&svc, &other_ws, "Other workspace").await;
+    let mut later = seed_active_hook(&svc, &ws, &owner, "Later").await;
+    later.created_at = "2026-08-02T13:00:02Z".into();
+    later.code = "c".repeat(16_384);
+    later.last_logs = Some("l".repeat(16_384));
+    later.last_state = Some("s".repeat(16_384));
+    // Replace the seed to control insertion order independently of creation time.
+    sqlx::query("DELETE FROM hook")
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    let mut earlier = later.clone();
+    earlier.hook_id = HookId::new();
+    earlier.name = "Earlier".into();
+    earlier.created_at = "2026-08-02T13:00:01Z".into();
+    earlier.state = HookState::Running;
+    earlier.next_run_at = None;
+    earlier.expires_at = None;
+    let mut peer_hook = later.clone();
+    peer_hook.hook_id = HookId::new();
+    peer_hook.agent_id = peer.clone();
+    let mut foreign_hook = later.clone();
+    foreign_hook.hook_id = HookId::new();
+    foreign_hook.workspace_id = other_ws;
+    foreign_hook.agent_id = other;
+    for hook in [&later, &peer_hook, &foreign_hook, &earlier] {
+        svc.store().insert_hook(hook).await.unwrap();
+    }
+    let expected = vec![
+        json!({"hookId": earlier.hook_id, "name": "Earlier"}),
+        json!({"hookId": later.hook_id, "name": "Later",
+            "nextRunAt": later.next_run_at, "expiresAt": later.expires_at}),
+    ];
+    warm_sqlx_pool(svc.store().read_pool()).await;
+    // Grow retired history twice; neither growth may increase fetched rows.
+    let mut cost_failures = Vec::new();
+    for retired_count in [0, 256, 512] {
+        if retired_count != 0 {
+            let mut tx = svc.store().write_pool().begin().await.unwrap();
+            for n in 0..256 {
+                let state = ["dispatched", "cancelled", "expired", "evicted"][n % 4];
+                sqlx::query("INSERT INTO hook (hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at, last_logs, last_state) VALUES (?, ?, ?, 'Retired', ?, 10000, ?, '2026-01-01', ?, ?)")
+                    .bind(format!("retired-{retired_count}-{n}"))
+                    .bind(&ws.0).bind(&owner.0).bind(&later.code).bind(state)
+                    .bind(&later.last_logs).bind(&later.last_state)
+                    .execute(&mut *tx).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        let ((), queries) = capture_sqlx_queries(async {
+            if batched {
+                let listed = svc.agent_list_op(ws.clone()).await.unwrap();
+                assert_eq!(listed.len(), 3, "other workspace excluded");
+                let row = |id: &AgentId| listed.iter().find(|a| &a.id == id).unwrap();
+                assert_eq!(row(&owner).waiting_on_hooks, expected);
+                assert_eq!(row(&peer).waiting_on_hooks.len(), 1);
+                assert!(serde_json::to_value(row(&bare))
+                    .unwrap()
+                    .get("waitingOnHooks")
+                    .is_none());
+            } else {
+                let row = svc
+                    .agent_get_op(owner.clone(), Some(ws.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(row.waiting_on_hooks, expected);
+            }
+        })
+        .await;
+        let hook_queries: Vec<_> = queries
+            .iter()
+            .filter(|q| q.sql.contains("FROM hook "))
+            .collect();
+        assert_eq!(hook_queries.len(), 1, "one hook read: {queries:?}");
+        let query = hook_queries[0];
+        if query.rows_returned != if batched { 3 } else { 2 } {
+            cost_failures.push(format!("retired history={retired_count}: {query:?}"));
+        }
+        let columns = query.sql.split("FROM").next().unwrap();
+        for heavy in ["code", "last_logs", "last_state"] {
+            if columns.contains(heavy) {
+                cost_failures.push(format!("active {heavy} payload hydration: {query:?}"));
+            }
+        }
+    }
+    assert!(cost_failures.is_empty(), "{}", cost_failures.join("\n"));
+    // Visibility remains best-effort if the store read fails.
+    svc.store().read_pool().close().await;
+    assert!(svc.active_hooks_for_agent(&owner).await.is_empty());
+    assert!(svc.active_hooks_by_agent(&ws).await.is_empty());
+}
+
+#[tokio::test]
+async fn agent_get_waiting_hooks_does_not_hydrate_history_or_payloads() {
+    assert_waiting_hooks_read_cost(false).await;
+}
+
+#[tokio::test]
+async fn agent_list_waiting_hooks_does_not_hydrate_history_or_payloads() {
+    assert_waiting_hooks_read_cost(true).await;
+}
+
 /// Idle-visibility on the read surfaces (unified external-wait, mirrors
 /// `status_list_and_diagnostics_surface_waiting_on_hooks`): `agent.get`/
 /// `agent.list` overlay `waitingOnPrMonitors` for monitor-owning agents
