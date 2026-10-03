@@ -26055,6 +26055,10 @@ async fn submission_correlation_single_merged_flush_survives_restart_and_failure
             "original alias lost: {alias}"
         );
     }
+    assert!(
+        retry.correlation_order_known,
+        "new submissions retain known provenance"
+    );
     assert_eq!(retry.submission_order, order);
     assert_eq!(retry.turn_id, turn_id);
     assert!(retry.persisted);
@@ -26104,6 +26108,7 @@ async fn submission_correlation_single_merged_flush_survives_restart_and_failure
         assert!(restored[0].submission_ids().contains(alias));
     }
     assert_eq!(restored[0].turn_id, turn_id);
+    assert!(restored[0].correlation_order_known);
     assert_eq!(restored[0].submission_order, order);
     let history = restarted
         .services

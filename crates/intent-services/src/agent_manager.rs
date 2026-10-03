@@ -507,6 +507,8 @@ pub struct TurnOptions {
     pub queued_submission_ids: Vec<String>,
     pub(crate) recovery_sources: Vec<crate::agent_ops::RecoverySource>,
     pub queued_submission_order: u64,
+    /// Explicit provenance: legacy rehydration may assign a synthetic positive order.
+    pub queued_correlation_order_known: bool,
     pub latest_human_submission_at: Option<String>,
     /// STAB-114 / monorepo#1014: text of the user message preempted by a
     /// zero-output interrupt, delivered AHEAD of this turn's own `content` in
@@ -617,6 +619,7 @@ fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
         queued_submission_ids: entry.submission_ids(),
         recovery_sources: entry.recovery_sources.clone(),
         queued_submission_order: entry.submission_order,
+        queued_correlation_order_known: entry.correlation_order_known,
         latest_human_submission_at: entry.latest_human_submission_at.clone(),
         prepend_content: entry.prepend_content.clone(),
         prepend_image_blocks: entry.prepend_image_blocks.clone(),
@@ -6831,6 +6834,7 @@ impl AgentManager {
                 .queue_submission_order
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
+            options.queued_correlation_order_known = true;
         }
         // A2A sender header (intent-hq/intent#3721, monorepo#1015): the runtime front door — gated
         // on the daemon-stamped `fromAgentId`, applied BEFORE every branch
@@ -7668,6 +7672,7 @@ impl AgentManager {
             queued_submission_ids: next.submission_ids(),
             recovery_sources: next.recovery_sources.clone(),
             queued_submission_order: next.submission_order,
+            queued_correlation_order_known: next.correlation_order_known,
             latest_human_submission_at: next.latest_human_submission_at.clone(),
             prepend_content: next.prepend_content.clone(),
             prepend_image_blocks: next.prepend_image_blocks.clone(),
@@ -7835,6 +7840,7 @@ impl AgentManager {
             queued_submission_ids: entry.submission_ids(),
             recovery_sources: entry.recovery_sources.clone(),
             queued_submission_order: entry.submission_order,
+            queued_correlation_order_known: entry.correlation_order_known,
             latest_human_submission_at: entry.latest_human_submission_at.clone(),
             prepend_content: entry.prepend_content.clone(),
             prepend_image_blocks: entry.prepend_image_blocks.clone(),
@@ -12512,6 +12518,7 @@ async fn run_message_worker(
                 queued_submission_ids,
                 recovery_sources: next.recovery_sources.clone(),
                 queued_submission_order: next.submission_order,
+                queued_correlation_order_known: next.correlation_order_known,
                 latest_human_submission_at: next.latest_human_submission_at.clone(),
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
@@ -12715,6 +12722,7 @@ async fn run_message_worker(
                 queued_submission_ids,
                 recovery_sources: next.recovery_sources.clone(),
                 queued_submission_order: next.submission_order,
+                queued_correlation_order_known: next.correlation_order_known,
                 latest_human_submission_at: next.latest_human_submission_at.clone(),
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
@@ -13037,6 +13045,7 @@ async fn prepare_flush_turn(
         } else {
             0
         },
+        queued_correlation_order_known: entries.len() == 1 && entries[0].correlation_order_known,
         interrupt_priority: entries[0].interrupt_priority,
         origin: origin_from_user_flag(entries.iter().any(|m| m.user_origin)),
         // Every entry is `persisted: true` here (the loop above either set
@@ -14084,7 +14093,7 @@ async fn publish_error_status_and_requeue(
             editing_message_id: None,
             provisional: false,
             submission_order: options.queued_submission_order,
-            correlation_order_known: options.queued_submission_order > 0,
+            correlation_order_known: options.queued_correlation_order_known,
             latest_human_submission_at: options.latest_human_submission_at.clone(),
         };
         queued.stamp_correlation();
