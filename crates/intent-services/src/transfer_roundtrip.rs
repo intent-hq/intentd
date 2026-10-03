@@ -932,7 +932,7 @@ fn round_trip_with_installed_cli() {
     let legacy = bin.join("claude-code");
     std::fs::write(
         &legacy,
-        "#!/bin/sh\nprintf 'unexpected CLI launch' > \"$INTENT_TRANSFER_CLI_ROOT/provider-launched\"\nexit 91\n",
+        "#!/bin/sh\nprintf 'unexpected CLI launch' > \"$INTENT_TRANSFER_CLI_ROOT/${0##*/}-launched\"\nexit 91\n",
     )
     .unwrap();
     std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -946,6 +946,11 @@ fn round_trip_with_installed_cli() {
             .path(),
         canonical
     );
+    // The pinned adapter also needs npx. Its lookup prefers the sibling of
+    // the detected node, so fixture both without invoking either program.
+    for command in ["node", "npx"] {
+        std::fs::copy(&canonical, bin.join(command)).unwrap();
+    }
 
     let log_path = root.path().join("worker.log");
     let log = std::fs::File::create(&log_path).unwrap();
@@ -965,6 +970,9 @@ fn round_trip_with_installed_cli() {
         ])
         .env("PATH", std::env::join_paths(paths).unwrap())
         .env("INTENT_TRANSFER_CLI_ROOT", root.path())
+        // The parent owns every worker tempdir even if timeout kills the worker
+        // before its own TempDir destructors can run.
+        .env("TMPDIR", root.path())
         .env_remove("MOCK_AGENT_SCRIPT_PATH")
         .stdin(Stdio::null())
         .stdout(log.try_clone().unwrap())
@@ -973,10 +981,12 @@ fn round_trip_with_installed_cli() {
     drop(env_lock);
     let status = child.wait_with_timeout(Duration::from_secs(120)).unwrap();
     drop(child); // Kill/reap a timed-out worker before inspecting or removing its files.
-    assert!(
-        !root.path().join("provider-launched").exists(),
-        "transfer must not launch the installed CLI"
-    );
+    for command in ["claude", "node", "npx"] {
+        assert!(
+            !root.path().join(format!("{command}-launched")).exists(),
+            "transfer must not launch {command}"
+        );
+    }
     assert!(
         status.is_some_and(|status| status.success()) && root.path().join("completed").exists(),
         "roundtrip worker failed ({status:?}):\n{}",
@@ -1001,6 +1011,7 @@ async fn transfer_round_trip_between_two_stacks() {
             round_trip_with_installed_cli();
             return;
         };
+        assert_eq!(std::env::temp_dir(), Path::new(&root));
         assert_eq!(
             intent_providers::installed_cli::InstalledCli::Claude
                 .resolve()
@@ -1008,6 +1019,23 @@ async fn transfer_round_trip_between_two_stacks() {
                 .path(),
             Path::new(&root).join("bin/claude"),
             "the roundtrip must discover its sentinel, not a host CLI"
+        );
+        assert_eq!(
+            intent_providers::discover::find_node(),
+            Some(Path::new(&root).join("bin/node")),
+            "adapter discovery must select the fixture node"
+        );
+        let availability =
+            intent_providers::discover::provider_availability_for("claude-code", &|_| None)
+                .unwrap();
+        assert!(
+            availability.installed,
+            "fixture must supply CLI and adapter readiness"
+        );
+        assert_eq!(
+            availability.resolved_path,
+            Some(Path::new(&root).join("bin/npx")),
+            "the adapter must resolve through the fixture, not host npx"
         );
     }
     let src_db = TempDir::new("rt-src-db");
