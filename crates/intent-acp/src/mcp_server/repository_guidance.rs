@@ -514,8 +514,14 @@ pub(crate) struct ConnectionToken {
 }
 
 impl ConnectionToken {
-    pub(crate) fn is_live(&self) -> bool {
+    /// A retired endpoint cannot disclose protected results, but a still-open
+    /// original socket can carry its prebuilt, sanitized refusal.
+    pub(crate) fn is_connection_live(&self) -> bool {
         self.live.load(AtomicOrdering::Acquire)
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.is_connection_live()
             && self
                 .endpoint
                 .as_ref()

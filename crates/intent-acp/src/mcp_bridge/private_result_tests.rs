@@ -6,6 +6,83 @@ use std::sync::atomic::Ordering;
 use tokio::io::AsyncBufReadExt;
 
 #[tokio::test]
+async fn retired_bridge_keeps_original_socket_for_required_refusal() {
+    retired_bridge_refusal(false).await;
+}
+
+#[tokio::test]
+async fn retired_bridge_keeps_original_socket_for_qualified_refusal() {
+    retired_bridge_refusal(true).await;
+}
+
+async fn retired_bridge_refusal(optional: bool) {
+    use crate::mcp_server::private_results::tests::optional as o;
+    let api = Arc::new(Api::new());
+    let (server, policy, gate) = if optional {
+        let state = o::State::new();
+        let gate = state.pause_admission(false);
+        (
+            o::server(api.clone(), state.clone(), false),
+            state.required.clone(),
+            gate,
+        )
+    } else {
+        let policy = Policy::new();
+        let gate = policy.pause(McpPrivateBoundaryKind::TcpResponse, false);
+        (server(api.clone(), policy.clone()), policy, gate)
+    };
+    let bridge = serve_workspace_mcp_tcp(Arc::new(server)).await.unwrap();
+    let accept_loop = bridge.accept_loop_handle();
+    let socket = TcpStream::connect(bridge.addr()).await.unwrap();
+    let (read, mut write) = socket.into_split();
+    let mut lines = BufReader::new(read).lines();
+    let message = call(
+        37,
+        "const value=await ws.git.listRoots(); await ws.workspace.info(); return value;",
+    );
+    write
+        .write_all(format!("{message}\n").as_bytes())
+        .await
+        .unwrap();
+    gate.reached().await;
+    policy.retire();
+    drop(bridge);
+    tokio::time::timeout(WAIT, async {
+        while !accept_loop.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    gate.release.add_permits(1);
+    let line = tokio::time::timeout(WAIT, lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let value: Value = serde_json::from_str(&line).unwrap();
+    eprintln!("original retired-endpoint response: {value}");
+    assert_eq!(value["id"], 37);
+    refused(&value);
+    assert!(!line.contains(SECRET));
+    assert!(!o::has_guidance(&value));
+    assert_eq!(api.acquired.load(Ordering::SeqCst), 1);
+    assert!(api.ordinary.load(Ordering::SeqCst) > 0);
+    // A following ordinary request uses the same accepted socket. Its next
+    // response also detects any duplicate reply from the refused request.
+    write
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":38,\"method\":\"ping\"}\n")
+        .await
+        .unwrap();
+    let line = tokio::time::timeout(WAIT, lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], 38);
+}
+
+#[tokio::test]
 async fn tcp_final_admission_retirement_orders_and_completed_effects() {
     for admitted in [false, true] {
         let policy = Policy::new();

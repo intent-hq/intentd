@@ -890,7 +890,7 @@ impl DeliveryResponse {
             // If an effect already happened it cannot be recalled. Otherwise
             // the SAME unused permit carries only the prebuilt control error.
             if let Some(permit) = original_slot.take() {
-                if connection.is_live() {
+                if connection.is_connection_live() {
                     permit.send(control);
                     return DeliveryOutcome::Refused;
                 }
@@ -951,7 +951,7 @@ impl DeliveryResponse {
                     permit.send(original_packet.take().unwrap().without_guidance());
                     return DeliveryOutcome::Admitted;
                 }
-                if connection.is_live() {
+                if connection.is_connection_live() {
                     permit.send(control);
                     return DeliveryOutcome::Refused;
                 }

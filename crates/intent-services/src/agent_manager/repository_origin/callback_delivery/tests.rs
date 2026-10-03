@@ -2983,6 +2983,7 @@ async fn confirmed_read_claimed_delete_retires_original_manager_before_late_outp
     let control = Arc::new(NativeControl::default());
     let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
     h.start().await;
+    let endpoint = h.origin.state.lock().unwrap().endpoint.clone().unwrap();
     let gate = control.at(Boundary::TcpResponse, false);
     let task = h.call_task(
         0,
@@ -3015,6 +3016,18 @@ async fn confirmed_read_claimed_delete_retires_original_manager_before_late_outp
             .unwrap());
     })
     .await;
+    // Taking the pending-delete claim precedes manager retirement. Wait for the
+    // original endpoint to retire before releasing its held response.
+    tokio::time::timeout(WAIT, async {
+        while !h.origin.state.lock().unwrap().retired
+            || !endpoint.cancelled.load(Ordering::Acquire)
+            || endpoint.bridge.lock().unwrap().is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     gate.release.add_permits(1);
     let reply = task.await.unwrap();
     assert!(
