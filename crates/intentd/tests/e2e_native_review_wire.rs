@@ -1438,12 +1438,100 @@ struct DriverBarrier {
 }
 
 fn driver_hash(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
+    // Rehash every original input using the fixture's existing native SHA-256
+    // provider. Instrumented, unoptimized Rust hashing otherwise dominates the
+    // fixed readiness deadline; no identity read or check is cached or skipped.
+    rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+        .tls13()
+        .expect("fixed TLS 1.3 SHA-256 suite")
+        .common
+        .hash_provider
+        .hash(bytes)
+        .as_ref()
         .iter()
         .fold(String::new(), |mut text, byte| {
             write!(text, "{byte:02x}").unwrap();
             text
         })
+}
+
+#[test]
+fn native_review_driver_sha256_matches_independent_reference() {
+    let reference_hash = |bytes: &[u8]| {
+        Sha256::digest(bytes)
+            .iter()
+            .fold(String::new(), |mut text, byte| {
+                write!(text, "{byte:02x}").unwrap();
+                text
+            })
+    };
+    for (bytes, expected) in [
+        (
+            b"".as_slice(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            b"abc".as_slice(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+    ] {
+        assert_eq!(driver_hash(bytes), expected);
+    }
+    assert_eq!(
+        driver_hash(&vec![b'a'; 1_000_000]),
+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+    );
+    for len in [55, 56, 63, 64, 65, 127, 128, 129, 4097, 1_048_577] {
+        let mut bytes: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
+        let reference = reference_hash(&bytes);
+        assert_eq!(driver_hash(&bytes), reference);
+        bytes[len - 1] ^= 1;
+        assert_ne!(driver_hash(&bytes), reference);
+        assert_eq!(driver_hash(&bytes), reference_hash(&bytes));
+    }
+    // Compare the full actual executable with the independent Rust SHA-256
+    // implementation, not merely a prefix or a previously retained digest.
+    let executable = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+    assert_eq!(driver_hash(&executable), reference_hash(&executable));
+}
+
+#[test]
+fn native_review_driver_identity_rechecks_each_descriptor() {
+    let directory = startup_test_directory("itd-hash-");
+    let (_, original) = startup_test_descriptor(directory.path());
+    let original_value: Value = serde_json::from_slice(&original).unwrap();
+    let path = directory.path().join("descriptor.json");
+    for field in [
+        "sourceCommit",
+        "sourceTree",
+        "sourceSha256",
+        "executableSha256",
+    ] {
+        let mut changed = original_value.clone();
+        let current = changed[field].as_str().unwrap();
+        let replacement = if current.bytes().all(|byte| byte == b'0') {
+            '1'
+        } else {
+            '0'
+        };
+        changed[field] = Value::String(replacement.to_string().repeat(current.len()));
+        std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        let error = driver_descriptor_phase(&path, false, true, false)
+            .err()
+            .expect("changed identity must be rejected");
+        assert_eq!(error.to_string(), "source/artifact identity mismatch");
+        assert!(!directory.path().join("ready.json").exists());
+        assert!(!directory.path().join("control.sock").exists());
+        std::fs::write(&path, &original).unwrap();
+        let restored = driver_descriptor_phase(&path, false, true, false).unwrap();
+        assert_eq!(restored.source_commit, original_value["sourceCommit"]);
+        assert_eq!(restored.source_tree, original_value["sourceTree"]);
+        assert_eq!(restored.source_sha256, original_value["sourceSha256"]);
+        assert_eq!(
+            restored.executable_sha256,
+            original_value["executableSha256"]
+        );
+    }
 }
 
 fn driver_source_hash() -> String {
