@@ -855,10 +855,11 @@ jobs:
         env:
           INTENTD_COW_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
           INTENTD_TEST_REQUIRE_COW: "1"
-          INTENTD_ASSERT_BOUND_CALLER: "1"
           CARGO_BUILD_JOBS: "2"
         run: |
           set -euo pipefail
+          # Preserve ordinary Forbidden errors and unwind fixture guards on red.
+          unset INTENTD_ASSERT_BOUND_CALLER INTENTD_TEST_KEEP_TMP
           tests=(
             tests::worktree_provisioning::create_provisions_cow_checkout_when_isolation_enabled
             tests::worktree_provisioning::duplicate_provisions_cow_checkout_when_isolation_enabled
@@ -875,11 +876,19 @@ jobs:
             grep -Fx "$test: test" <<< "$listed" > /dev/null
             grep -Fx '1 test, 0 benchmarks' <<< "$listed" > /dev/null
             log="$RUNNER_TEMP/cow-${test##*::}.log"
-            if ! "${cargo_test[@]}" "$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"; then
+            scratch=$(mktemp -d "$RUNNER_TEMP/cow-${test##*::}.XXXXXX")
+            if ! TMPDIR="$scratch" "${cargo_test[@]}" "$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"; then
+              status=1
+            fi
+            if rmdir "$scratch"; then
+              echo "CoW fixture scratch cleaned: $test"
+            else
+              echo "::error::Fixture scratch remains at $scratch"
               status=1
             fi
             if [[ "$test" == tests::* ]]; then
               grep -Fx 'CoW fixture clone and independent contents verified' "$log" > /dev/null || status=1
+              grep -Fx 'CoW fixture proof scratch cleaned' "$log" > /dev/null || status=1
               grep -Fx "CoW fixture assertions passed: ${test##*::}" "$log" > /dev/null || status=1
             fi
           done

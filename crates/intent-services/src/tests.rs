@@ -33001,18 +33001,23 @@ fn cow_fixture_supported(source: &std::path::Path, root: &std::path::Path) -> bo
         assert_eq!(std::fs::read(&original).unwrap(), b"original");
         std::fs::write(&original, b"source changed").unwrap();
         assert_eq!(std::fs::read(&copy).unwrap(), b"clone changed");
+        dst.close().expect("remove CoW proof destination");
+        src.close().expect("remove CoW proof source");
         eprintln!("CoW fixture clone and independent contents verified");
+        eprintln!("CoW fixture proof scratch cleaned");
     } else {
         assert!(
             std::env::var_os("INTENTD_TEST_REQUIRE_COW").is_none(),
             "native CoW acceptance requires a supported fixture volume"
         );
+        // Supplemental regression on unsupported hosts only. Supported-volume
+        // baselines must reach the original service gate and its real refusal.
+        assert_eq!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Daemon),
+            "workspace CoW fixture must bind its daemon caller"
+        );
     }
-    assert_eq!(
-        intent_core::current_caller(),
-        Some(intent_core::Caller::Daemon),
-        "workspace CoW fixture must bind its daemon caller"
-    );
     support == intent_git::CowSupport::Supported
 }
 
