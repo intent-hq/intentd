@@ -1221,6 +1221,11 @@ async fn two_members_see_shared_queue_and_flush_combines_both_over_wss() {
     )
     .await;
     assert_eq!(hello["server"]["capabilities"]["submissionCorrelation"], 1);
+    assert_eq!(hello["protocolVersion"], intent_transport::PROTOCOL_VERSION);
+    assert_eq!(
+        hello["server"]["protocolVersion"],
+        intent_transport::PROTOCOL_VERSION
+    );
     for (index, invalid) in [json!(null), json!(""), json!(123), json!([])]
         .into_iter()
         .enumerate()
