@@ -1035,8 +1035,7 @@ exit 91
     }
     assert!(
         status.is_some_and(|status| status.success()) && root.path().join("completed").exists(),
-        "roundtrip worker failed ({status:?}):\n{}",
-        worker_log
+        "roundtrip worker failed ({status:?}):\n{worker_log}"
     );
     assert!(
         shell_receipt.is_ok_and(|receipt| receipt.lines().any(|line| line == "captured")),
