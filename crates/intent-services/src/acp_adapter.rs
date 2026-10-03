@@ -456,7 +456,7 @@ impl AcpAdapterCommand {
     }
 
     /// Remove an environment variable from the adapter child's inherited env.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn env_remove(mut self, key: impl Into<String>) -> Self {
         self.envs_removed.push(key.into());
         self
