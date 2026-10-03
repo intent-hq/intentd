@@ -22,6 +22,8 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
+mod presence_focus;
+
 use crate::browser;
 use crate::catalog;
 use crate::client;
@@ -1222,6 +1224,11 @@ pub(crate) async fn handle_sub_fast_path(
     subs: &mut ConnSubs,
 ) -> bool {
     match sub {
+        SubFastPath::Subscribe {
+            id,
+            channel: Channel::PresenceFocus,
+            params,
+        } => presence_focus::subscribe(id, params, api, bus, out_tx, subs).await,
         SubFastPath::Subscribe {
             id,
             channel: Channel::Note,

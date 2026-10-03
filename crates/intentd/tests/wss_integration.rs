@@ -25,6 +25,8 @@ mod integration_context;
 #[cfg(unix)]
 #[path = "wss_integration/linked_skills.rs"]
 mod linked_skills;
+#[path = "wss_integration/presence_focus.rs"]
+mod presence_focus;
 #[cfg(unix)]
 #[path = "wss_integration/removed_rpc.rs"]
 mod removed_rpc;
