@@ -1,4 +1,6 @@
 //! Real TLS/WSS desktop routing, native reverse replies, consent and no reconnect replay.
+#[path = "desktop_control/hello_probe.rs"]
+mod hello_probe;
 use super::*;
 use intent_core::{AgentId, Caller, HostRole};
 use serde_json::json;
