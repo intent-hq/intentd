@@ -1,4 +1,4 @@
-//! `ws.pr.*` bindings (WSAPI-6).
+//! Shared `ws.pr.*` / `ws.mr.*` observation bindings.
 //!
 //! The namespace exposes the read-only `pr.snapshot` (compact, diff-friendly
 //! PR state) plus the centralized PR-monitor surface — `pr.monitor` /
@@ -7,6 +7,10 @@
 //! merge) is intentionally unbound — agents use the `gh` CLI instead. The
 //! bindings only peel arguments and forward the trait's `serde_json::Value`
 //! result unchanged.
+//!
+//! `ws.mr` aliases the same object, arguments and results as `ws.pr`; the
+//! spelling never selects a provider. Both exist independently of remotes,
+//! and both currently use the same GitHub observation backend.
 //!
 //! Monitors are agent-owned, so `pr.monitor` / `pr.unmonitor` / `pr.monitors`
 //! require an agent caller context (mirroring `ws.hook.schedule`): the FE
@@ -25,9 +29,10 @@ pub(crate) const PRELUDE: &str = r"
         snapshot: (prNumber, options) =>
             host({ method: 'pr.snapshot', args: { prNumber, ...(options || {}) } }),
     };
+    ws.mr = ws.pr;
 ";
 
-/// The `agentFeatures.prMonitor` segment of the `ws.pr` prelude: the three
+/// The `agentFeatures.prMonitor` segment of the shared prelude: the three
 /// monitor installers, appended to [`PRELUDE`] only when the toggle is on. A
 /// unit test guards that the segment stays syntactically attachable.
 pub(crate) const MONITOR_PRELUDE_SEGMENT: &str = r"
@@ -38,7 +43,7 @@ pub(crate) const MONITOR_PRELUDE_SEGMENT: &str = r"
     ws.pr.monitors = () => host({ method: 'pr.monitors' });
 ";
 
-/// Feature-aware `ws.pr` prelude: the monitor installers are omitted when
+/// Feature-aware `ws.pr` / `ws.mr` prelude: the monitor installers are omitted when
 /// `agentFeatures.prMonitor` is off, so agent code touching them fails with a
 /// clear `ws.pr.monitor is not a function` `TypeError`.
 pub(crate) fn prelude_for(features: &intent_core::settings_file::AgentFeaturesSettings) -> String {
@@ -163,6 +168,356 @@ mod tests {
     use intent_core::{BoxFuture, Result};
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    use crate::WorkspaceMcpServer;
+
+    struct RecordingApi {
+        calls: Mutex<Vec<Value>>,
+        response: Value,
+        error: Option<&'static str>,
+        retired: bool,
+    }
+
+    impl RecordingApi {
+        fn record(
+            &self,
+            method: &str,
+            ws: &WorkspaceId,
+            owner: Option<AgentId>,
+            number: Option<u64>,
+            repo: Option<&str>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.calls.lock().unwrap().push(json!({
+                "method": method, "workspace": ws.as_str(),
+                "owner": owner.map(|id| id.to_string()), "number": number, "repo": repo,
+            }));
+            Box::pin(async {
+                if let Some(message) = self.error {
+                    return Err(intent_core::Error::Internal(message.to_string()));
+                }
+                Ok(self.response.clone())
+            })
+        }
+    }
+
+    impl WorkspaceApi for RecordingApi {
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                // Keep result comparisons independent of TOON and spill thresholds.
+                let value = match path.as_str() {
+                    "workspaceApi.toonOutput" => json!(false),
+                    "workspaceApi.maxOutputChars" => json!(0),
+                    _ => Value::Null,
+                };
+                Ok(json!({ "path": path, "value": value }))
+            })
+        }
+
+        fn agent_is_retired(&self, _agent_id: AgentId) -> BoxFuture<'_, bool> {
+            Box::pin(async { self.retired })
+        }
+
+        fn pr_state(
+            &self,
+            ws: WorkspaceId,
+            number: u64,
+            repo: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("snapshot", &ws, None, Some(number), repo.as_deref())
+        }
+
+        fn pr_monitor_start(
+            &self,
+            ws: WorkspaceId,
+            owner: AgentId,
+            number: u64,
+            repo: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("monitor", &ws, Some(owner), Some(number), repo.as_deref())
+        }
+
+        fn pr_monitor_stop(
+            &self,
+            ws: WorkspaceId,
+            owner: AgentId,
+            number: u64,
+            repo: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("unmonitor", &ws, Some(owner), Some(number), repo.as_deref())
+        }
+
+        fn pr_monitor_list(
+            &self,
+            ws: WorkspaceId,
+            owner: Option<AgentId>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("monitors", &ws, owner, None, None)
+        }
+    }
+
+    fn bridge(api: Arc<RecordingApi>, enabled: bool, caller: bool) -> WorkspaceMcpServer {
+        WorkspaceMcpServer::new(api, WorkspaceId::from_string("ws-observation"))
+            .with_caller_agent_id(caller.then(|| AgentId::from("agent-owner")))
+            .with_agent_features(AgentFeaturesSettings {
+                pr_monitor: enabled,
+                ..AgentFeaturesSettings::default()
+            })
+    }
+
+    async fn call(server: &WorkspaceMcpServer, code: &str) -> Value {
+        let response = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "workspace_api", "arguments": {
+                    "code": code, "summary": "Observation alias regression test",
+                } },
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 1);
+        response["result"].clone()
+    }
+
+    fn body(result: &Value) -> Value {
+        assert_eq!(result["isError"], false, "{result}");
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    fn recording_api(response: Value) -> Arc<RecordingApi> {
+        Arc::new(RecordingApi {
+            calls: Mutex::new(Vec::new()),
+            response,
+            error: None,
+            retired: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn aliases_forward_the_same_arguments_owners_and_results_through_js_and_raw_host() {
+        for (method, response) in [
+            (
+                "snapshot",
+                json!({ "repo": "o/r", "prNumber": 7, "requirements": { "threads": {} }, "extension": null }),
+            ),
+            ("snapshot", Value::Null),
+            (
+                "monitor",
+                json!({ "ok": true, "monitor": { "monitorId": "m", "prNumber": 7 }, "requirements": null, "pausedUntil": "2026-09-27T13:00:00Z" }),
+            ),
+            (
+                "monitor",
+                json!({ "ok": false, "refused": true, "reason": "already-monitored", "ownerAgentId": "another-agent", "monitorId": "m", "prNumber": 7 }),
+            ),
+            (
+                "unmonitor",
+                json!({ "ok": true, "monitor": { "monitorId": "m", "state": "completed" } }),
+            ),
+            (
+                "monitors",
+                json!({ "monitors": [{ "monitorId": "m", "prNumber": 7, "pendingChanges": { "checks": true } }] }),
+            ),
+            ("monitors", json!([])),
+        ] {
+            for repo in [None, Some("o/r")] {
+                let api = recording_api(response.clone());
+                let server = bridge(api.clone(), true, true);
+                let args = if method == "monitors" {
+                    json!({})
+                } else {
+                    json!({ "prNumber": 7, "repo": repo })
+                };
+                let js_args = if method == "monitors" {
+                    String::new()
+                } else {
+                    format!("7, {{ repo: {} }}", json!(repo))
+                };
+                let expected = if method == "monitors" {
+                    response.get("monitors").unwrap_or(&response)
+                } else {
+                    &response
+                };
+                let mut results = Vec::new();
+                for ns in ["pr", "mr"] {
+                    for code in [
+                        format!("return await ws.{ns}.{method}({js_args});"),
+                        format!("return await host({{ method: '{ns}.{method}', args: {args} }});"),
+                    ] {
+                        let result = call(&server, &code).await;
+                        assert_eq!(&body(&result), expected, "{code}");
+                        results.push(result);
+                    }
+                }
+                assert!(results.windows(2).all(|pair| pair[0] == pair[1]));
+                let expected_call = json!({
+                    "method": method, "workspace": "ws-observation",
+                    "owner": if method == "snapshot" { None } else { Some("agent-owner") },
+                    "number": if method == "monitors" { None } else { Some(7) },
+                    "repo": if method == "monitors" { None } else { repo },
+                });
+                assert_eq!(*api.calls.lock().unwrap(), vec![expected_call; 4]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn aliases_share_validation_errors_before_service_dispatch() {
+        let api = recording_api(Value::Null);
+        let server = bridge(api.clone(), true, true);
+        for method in ["snapshot", "monitor", "unmonitor"] {
+            for (args, expected) in [
+                ("", "prNumber is required"),
+                ("0", "prNumber is required"),
+                ("-1", "prNumber is required"),
+                ("'abc'", "prNumber is required"),
+                ("7, { repo: 123 }", "repo must be an"),
+            ] {
+                let mut results = Vec::new();
+                for ns in ["pr", "mr"] {
+                    let result =
+                        call(&server, &format!("return await ws.{ns}.{method}({args});")).await;
+                    assert_eq!(result["isError"], true);
+                    assert!(result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains(expected));
+                    results.push(result);
+                }
+                assert_eq!(results[0], results[1]);
+            }
+        }
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn aliases_preserve_backend_failures_without_selecting_a_different_provider() {
+        let mut api = recording_api(Value::Null);
+        Arc::get_mut(&mut api).unwrap().error = Some("No repository is configured");
+        let server = bridge(api.clone(), true, false);
+        let pr = call(&server, "return await ws.pr.snapshot(7);").await;
+        let mr = call(&server, "return await ws.mr.snapshot(7);").await;
+        assert_eq!(pr, mr);
+        assert_eq!(mr["isError"], true);
+        assert!(mr["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("No repository is configured"));
+        let calls = api.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], calls[1]);
+    }
+
+    #[tokio::test]
+    async fn aliases_require_the_same_monitor_owner_but_snapshot_needs_no_caller() {
+        let api = recording_api(json!({ "repo": "o/r", "prNumber": 7 }));
+        let server = bridge(api.clone(), true, false);
+        for ns in ["pr", "mr"] {
+            for method in ["monitor", "unmonitor", "monitors"] {
+                let result = call(&server, &format!("return await ws.{ns}.{method}(7);")).await;
+                assert_eq!(result["isError"], true);
+                assert!(result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("requires an agent caller context"));
+            }
+            assert_eq!(
+                body(&call(&server, &format!("return await ws.{ns}.snapshot(7);")).await),
+                api.response
+            );
+        }
+        let calls = api.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls
+            .iter()
+            .all(|call| call["method"] == "snapshot" && call["owner"].is_null()));
+    }
+
+    #[tokio::test]
+    async fn aliases_obey_captured_gate_in_prelude_help_and_raw_dispatch() {
+        let api = recording_api(json!({ "prNumber": 7 }));
+        let disabled = bridge(api.clone(), false, true);
+        let enabled = bridge(api.clone(), true, true);
+        for (enabled, server) in [(false, &disabled), (true, &enabled), (false, &disabled)] {
+            for ns in ["pr", "mr"] {
+                let observed =
+                    body(&call(server, &format!("return Object.keys(ws.{ns}).sort();")).await);
+                let expected = if enabled {
+                    json!(["monitor", "monitors", "snapshot", "unmonitor"])
+                } else {
+                    json!(["snapshot"])
+                };
+                assert_eq!(observed, expected);
+                let help = body(&call(server, &format!("return await ws.help('{ns}');")).await);
+                assert!(help
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("ws.{ns}.snapshot(")));
+                assert_eq!(
+                    help.as_str()
+                        .unwrap()
+                        .contains(&format!("ws.{ns}.monitor(")),
+                    enabled
+                );
+                for method in ["monitor", "unmonitor", "monitors"] {
+                    let result = call(server, &format!("return await host({{ method: '{ns}.{method}', args: {{ prNumber: 7 }} }});")).await;
+                    assert_eq!(result["isError"], !enabled, "{result}");
+                    if !enabled {
+                        assert!(result["content"][0]["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains("agentFeatures.prMonitor = false"));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            api.calls.lock().unwrap().len(),
+            6,
+            "only the enabled bridge may reach the service"
+        );
+        for ns in ["pr", "mr"] {
+            assert_eq!(
+                body(&call(&disabled, &format!("return await ws.{ns}.snapshot(7);")).await),
+                api.response
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn aliases_never_add_create_or_bypass_retired_caller_guard() {
+        let mut api = recording_api(Value::Null);
+        for retired in [false, true] {
+            Arc::get_mut(&mut api).unwrap().retired = retired;
+            let server = bridge(api.clone(), true, true);
+            for ns in ["pr", "mr"] {
+                assert_eq!(
+                    body(&call(&server, &format!("return typeof ws.{ns}.create;")).await),
+                    "undefined"
+                );
+                let result = call(
+                    &server,
+                    &format!("return await host({{ method: '{ns}.create', args: {{}} }});"),
+                )
+                .await;
+                assert_eq!(result["isError"], true);
+                if retired {
+                    let result = call(&server, &format!("return await ws.{ns}.snapshot(7);")).await;
+                    assert_eq!(result["isError"], true);
+                    assert!(result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("retired"));
+                } else {
+                    assert!(result["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("unknown method"));
+                }
+            }
+        }
+        assert!(api.calls.lock().unwrap().is_empty());
+    }
 
     /// `WorkspaceApi` recording whether the ownership-scoped monitor methods
     /// were reached — the caller-context guards must reject before the

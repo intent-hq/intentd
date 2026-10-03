@@ -165,6 +165,7 @@ where
     // listener already spawned the publisher).
     reverse_registry.spawn_client_event_publisher(api.clone());
 
+    let read_listener = crate::context::ReadListenerGuard::default();
     tokio::pin!(shutdown);
     let mut backoff = AcceptBackoff::default();
     loop {
@@ -181,9 +182,10 @@ where
                         let server_pairing_info = server_pairing_info.clone();
                         let reverse_registry = reverse_registry.clone();
                         let limiter = limiter.clone();
+                        let read_owners = read_listener.0.clone();
                         tokio::spawn(async move {
                             let (read_half, write_half) = stream.into_split();
-                            if let Err(e) = handle_connection(read_half, write_half, api, bus, control, server_pairing_info, reverse_registry, limiter).await {
+                            if let Err(e) = handle_connection(read_half, write_half, api, bus, control, server_pairing_info, reverse_registry, limiter, read_owners).await {
                                 tracing::debug!(error = %e, "uds connection ended");
                             }
                         });
@@ -233,11 +235,31 @@ async fn handle_connection<R, W>(
     server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
     reverse_registry: Arc<PrimaryReverseRegistry>,
     limiter: RpcLimiter,
+    read_owners: Arc<crate::context::ReadConnectionOwners>,
 ) -> std::io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // UDS is the local user's transport: bind the primary principal as
+    // administrator for the life of the connection (multiplayer w1). Without
+    // a principal store (test stubs) the connection runs unbound.
+    let caller = crate::auth::ResolvedCredential::Legacy
+        .into_caller(api.as_ref())
+        .await;
+    let read_connection =
+        crate::context::with_credential_context(false, caller.clone(), None, async {
+            if caller.is_some() {
+                crate::context::ReadConnectionGuard::bind(
+                    api.as_ref(),
+                    intent_core::repository_request::RepositoryWireEntry::AdmittedLocal,
+                )
+            } else {
+                crate::context::ReadConnectionGuard::absent()
+            }
+        })
+        .await;
+    read_owners.register(&read_connection);
     let mut reader = BufReader::new(read_half);
 
     // One writer task drains the two-lane outbound queue (priority lane
@@ -245,7 +267,10 @@ where
     // saturated link) and responses and pushed notifications never interleave
     // mid-frame on the socket.
     let (out_tx, mut out_rx) = outbound_channel();
+    let _retirements = read_connection.forward_retirements(out_tx.priority_sender());
+    let writer_read_connection = read_connection.clone();
     let writer = tokio::spawn(async move {
+        let _retire_on_writer_exit = writer_read_connection;
         let mut write_half = write_half;
         while let Some(frame) = out_rx.recv().await {
             // Hard cap: never write multi-hundred-MB frames (observed git.diffs
@@ -282,12 +307,6 @@ where
     let reverse_guard = reverse_registry.register(reverse.clone(), ReverseTransport::Uds);
     // Per-connection logical-client binding (§16): `None` until `client.hello`.
     let mut client_id: Option<intent_core::ClientId> = None;
-    // UDS is the local user's transport: bind the primary principal as
-    // administrator for the life of the connection (multiplayer w1). Without
-    // a principal store (test stubs) the connection runs unbound.
-    let caller = crate::auth::ResolvedCredential::Legacy
-        .into_caller(api.as_ref())
-        .await;
     let mut line = Vec::new();
     let io_result = loop {
         line.clear();
@@ -326,29 +345,37 @@ where
         // UDS is the local control transport, so `is_local = true` (§12.3).
         // Wrap in connection context (is_tcp=false for UDS) so server.* RPCs can
         // gate on real origin (§5.2), with the primary principal bound.
-        let frame_ok = crate::context::with_request_context(false, caller.clone(), async {
-            process_frame(
-                trimmed,
-                &api,
-                &bus,
-                &out_tx,
-                &mut subs,
-                &reverse,
-                &reverse_guard,
-                control.as_ref(),
-                server_pairing_info.as_ref(),
-                &mut client_id,
-                true,
-                &limiter,
-            )
-            .await
-        })
+        let frame_ok = crate::context::with_credential_context(
+            false,
+            caller.clone(),
+            None,
+            read_connection.run(async {
+                crate::context::with_repository_frame(trimmed, || {
+                    process_frame(
+                        trimmed,
+                        &api,
+                        &bus,
+                        &out_tx,
+                        &mut subs,
+                        &reverse,
+                        &reverse_guard,
+                        control.as_ref(),
+                        server_pairing_info.as_ref(),
+                        &mut client_id,
+                        true,
+                        &limiter,
+                    )
+                })
+                .await
+            }),
+        )
         .await;
         if !frame_ok || subs.pairing.revoked {
             break Ok(());
         }
     };
 
+    read_connection.retire();
     // Cleanup: abort all subscriptions, then close the outbound
     // queue and let the writer finish. The reverse channel and its registry
     // guard hold `out_tx` clones, so both must drop before the writer can
@@ -460,6 +487,7 @@ where
     // listener already spawned the publisher).
     reverse_registry.spawn_client_event_publisher(api.clone());
 
+    let read_listener = crate::context::ReadListenerGuard::default();
     tokio::pin!(shutdown);
     let mut backoff = AcceptBackoff::default();
     'accept: loop {
@@ -505,9 +533,10 @@ where
                         let server_pairing_info = server_pairing_info.clone();
                         let reverse_registry = reverse_registry.clone();
                         let limiter = limiter.clone();
+                        let read_owners = read_listener.0.clone();
                         tokio::spawn(async move {
                             let (read_half, write_half) = tokio::io::split(stream);
-                            if let Err(e) = handle_connection(read_half, write_half, api, bus, control, server_pairing_info, reverse_registry, limiter).await {
+                            if let Err(e) = handle_connection(read_half, write_half, api, bus, control, server_pairing_info, reverse_registry, limiter, read_owners).await {
                                 tracing::debug!(error = %e, "named-pipe connection ended");
                             }
                         });
@@ -666,5 +695,174 @@ mod tests {
             "buffered {} bytes past the limit",
             buf.len()
         );
+    }
+
+    // Deterministic writer failure in the actual local connection loop. The
+    // request owner is the same private fixture used by the real UDS/TLS tests.
+    #[tokio::test]
+    async fn read_carrier_writer_failure_retires_a_held_original_request() {
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::task::{Context, Poll};
+
+        use crate::conn::read_delivery_tests::{FixtureApi, Gate};
+        use tokio::io::{AsyncWrite, AsyncWriteExt as _};
+        use tokio::sync::Notify;
+
+        struct BrokenWriter(Arc<Notify>);
+        impl AsyncWrite for BrokenWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                self.0.notify_one();
+                Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let dir = tempfile::Builder::new()
+            .prefix("carrier-writer-")
+            .tempdir()
+            .unwrap();
+        let bus = intent_services::EventBus::new(
+            intent_store::Store::open(&dir.path().join("bus.db"))
+                .await
+                .unwrap(),
+        );
+        let handler = Arc::new(Gate::default());
+        let api = Arc::new(FixtureApi::holding_handler(handler.clone()));
+        let failed = Arc::new(Notify::new());
+        let limiter = crate::rpc_limit::RpcLimiter::new(1);
+        let (mut input, reader) = tokio::io::duplex(2048);
+        let task = tokio::spawn(super::handle_connection(
+            reader,
+            BrokenWriter(failed.clone()),
+            api.clone(),
+            bus,
+            None,
+            None,
+            Arc::new(crate::reverse::PrimaryReverseRegistry::new()),
+            limiter.clone(),
+            Arc::new(crate::context::ReadConnectionOwners::default()),
+        ));
+        input.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"settings.get\",\"params\":{\"path\":\"private\"}}\n").await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handler.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let original = api.connections.lock().unwrap()[0].clone();
+        assert!(!original.is_closed());
+        input.write_all(b"invalid-json\n").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), failed.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !original.is_closed() || !original.captured_are_retired() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !task.is_finished(),
+            "writer failure retired the cohort while the reader still waits"
+        );
+        handler.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while limiter.try_acquire().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(input);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_carrier_late_local_binding_cannot_escape_listener_retirement() {
+        use crate::conn::read_delivery_tests::{FixtureApi, Gate};
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let dir = tempfile::Builder::new()
+            .prefix("carrier-late-bind-")
+            .tempdir()
+            .unwrap();
+        let bus = intent_services::EventBus::new(
+            intent_store::Store::open(&dir.path().join("bus.db"))
+                .await
+                .unwrap(),
+        );
+        let primary = Arc::new(Gate::default());
+        let api = Arc::new(FixtureApi::holding_primary(primary.clone()));
+        let listener = crate::context::ReadListenerGuard::default();
+        let (mut input, reader) = tokio::io::duplex(2048);
+        let (writer, output) = tokio::io::duplex(2048);
+        let task = tokio::spawn(super::handle_connection(
+            reader,
+            writer,
+            api.clone(),
+            bus,
+            None,
+            None,
+            Arc::new(crate::reverse::PrimaryReverseRegistry::new()),
+            crate::rpc_limit::RpcLimiter::unlimited(),
+            listener.0.clone(),
+        ));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            primary.entered.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(api.connections.lock().unwrap().is_empty());
+        drop(listener);
+        primary.release.notify_one();
+        let mut lines = BufReader::new(output).lines();
+        for path in ["private", "ordinary"] {
+            let request = serde_json::json!({"jsonrpc":"2.0","id":7,"method":"settings.get","params":{"path":path}});
+            input
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let result: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(result.get("result").is_some(), path == "ordinary");
+        }
+        let original = api.connections.lock().unwrap()[0].clone();
+        assert!(original.is_closed());
+        assert!(original.captured_are_retired());
+        drop(input);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

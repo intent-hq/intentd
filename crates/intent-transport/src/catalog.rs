@@ -41,6 +41,8 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "accept-changes.getStatus",
     "accept-changes.mergePR",
     "accept-changes.prepare",
+    "accept-changes.reconcile",
+    "accept-changes.release",
     "agent.appendMessage",
     "agent.cancelDelete",
     "agent.cancelSubscriptions",
@@ -305,6 +307,9 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "sourceControl.getUser",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
+    "sourceControl.read.capture",
+    "sourceControl.read.detail",
+    "sourceControl.read.release",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -376,6 +381,14 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
+    "workspace.repositoryContext",
+    "workspace.repositoryContext.capture",
+    "workspace.repositoryContext.release",
+    "workspace.repositorySelection.capture",
+    "workspace.repositorySelection.reconcile",
+    "workspace.repositorySelection.release",
+    "workspace.repositorySelection.reset",
+    "workspace.repositorySelection.save",
     "workspace.restore",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
@@ -476,7 +489,13 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
 /// These are unsolicited notifications sent from the daemon to connected clients
 /// (no request `id`). `events.event` is the sole notification in protocol v2.0.
 #[cfg(test)]
-pub(crate) const NOTIFICATIONS: &[&str] = &["events.event"];
+pub(crate) const NOTIFICATIONS: &[&str] = &[
+    "accept-changes.retired",
+    "events.event",
+    "sourceControl.read.retired",
+    "workspace.repositoryContext.retired",
+    "workspace.repositorySelection.retired",
+];
 
 /// Client-served reverse RPCs (dispatched with `id: "rev-<n>"`).
 ///
@@ -676,6 +695,9 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("search.messages", "Read: workspace-scoped chat search."),
     ("search.notes", "Read: workspace-scoped note search."),
     ("skill.list", "Client boot: available skills for the composer. Names and descriptions only."),
+    ("sourceControl.read.capture", "Read acquisition: original socket, durable host execution and workspace membership; configured nonsecret instance descriptors only."),
+    ("sourceControl.read.detail", "Read: explicit target in the original resource lifetime, with current durable authority and original managed connection/cache fences."),
+    ("sourceControl.read.release", "Release: original socket only, no new read authority or cross-socket lookup."),
     ("specialist.get", "Read: one specialist definition. Create/edit/delete stay daemon administration."),
     ("specialist.list", "Client boot: the specialist catalog the delegate picker renders."),
     ("stats.getRateHistory", "Read: usage rate history. Usage/stats read."),
@@ -710,6 +732,14 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("workspace.markSeen", "Steer: clears the workspace unseen marker."),
     ("workspace.members.leave", "Guest lifecycle: the caller drops its OWN collaborator membership of a workspace; owners cannot leave. Self-directed only, no target parameter; removal of others stays owner-only."),
     ("workspace.members.list", "Read: the membership roster (principal fields + role) of a member workspace. Removal stays owner-only."),
+    ("workspace.repositoryContext", "Read: original socket/root lease; durable repository membership is rechecked. Host account metadata remains administrator-only."),
+    ("workspace.repositoryContext.capture", "Read acquisition: original socket and workspace/root only; require_member decides durable local inventory permission, never write permission."),
+    ("workspace.repositoryContext.release", "Release: only an original socket-owned repository lease; no cross-socket lookup or new authority."),
+    ("workspace.repositorySelection.capture", "Original native socket and exact root; durable workspace-manager permission, independent selection admission and receipt checks."),
+    ("workspace.repositorySelection.reconcile", "Original native socket and exact root; durable workspace-manager permission, independent selection admission and receipt checks."),
+    ("workspace.repositorySelection.release", "Original native socket and exact root; durable workspace-manager permission, independent selection admission and receipt checks."),
+    ("workspace.repositorySelection.reset", "Original native socket and exact root; durable workspace-manager permission, independent selection admission and receipt checks."),
+    ("workspace.repositorySelection.save", "Original native socket and exact root; durable workspace-manager permission, independent selection admission and receipt checks."),
     ("workspace.subscribe", "Client boot: the workspace channel fast path; rows membership-filtered, removals delivered on unshare."),
     ("workspace.unsubscribe", "Client boot: drops the workspace channel subscription."),
     ("workspace.update", "Steer: title / tags / status message / status image of a member workspace. No path or repository fields."),
@@ -738,6 +768,8 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "accept-changes.getStatus",
     "accept-changes.mergePR",
     "accept-changes.prepare",
+    "accept-changes.reconcile",
+    "accept-changes.release",
     "agent.cancelDelete",
     "agent.completeOnce",
     "agent.create",

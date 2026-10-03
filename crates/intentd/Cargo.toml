@@ -24,6 +24,7 @@ tracing-appender = { workspace = true }
 directories = { workspace = true }
 sqlx = { workspace = true }
 
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.10.5", optional = true }
 intent-core = { path = "../intent-core", version = "0.10.5" }
 intent-store = { path = "../intent-store", version = "0.10.5" }
 intent-services = { path = "../intent-services", version = "0.10.5" }
@@ -42,10 +43,17 @@ default = []
 # WSAPI-1 spike: link the QuickJS-backed JS engine. Off by default so the
 # baseline binary is unchanged; enable to measure size / build impact.
 js-engine = ["dep:intent-js"]
+# Explicit cold loopback descriptors for the real GitLab auth socket tests.
+# Packaging and ordinary daemon builds must leave this feature disabled.
+repository-test-fixtures = ["intent-services/repository-test-fixtures", "dep:intent-sourcecontrol"]
+
+[[test]]
+name = "e2e_wss_gitlab_auth"
+required-features = ["repository-test-fixtures"]
 
 [dev-dependencies]
 uuid = { workspace = true }
-intent-services = { path = "../intent-services", version = "0.10.5" }
+intent-services = { path = "../intent-services", version = "0.10.5", features = ["repository-test-fixtures"] }
 intent-acp = { path = "../intent-acp", version = "0.10.5" }
 intent-providers = { path = "../intent-providers", version = "0.10.5" }
 intent-core = { path = "../intent-core", version = "0.10.5" }

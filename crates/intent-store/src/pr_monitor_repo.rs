@@ -7,15 +7,542 @@
 
 use std::sync::LazyLock;
 
-use intent_core::{AgentId, PrMonitor, PrMonitorId, PrMonitorState, Result, WorkspaceId};
+use intent_core::{
+    AgentId, PrMonitor, PrMonitorId, PrMonitorState, RepositoryProvider, RepositoryResourceKind,
+    RepositoryTarget, Result, ReviewTarget, WorkspaceId,
+};
 use sqlx::sqlite::SqliteRow;
-use sqlx::Row;
+use sqlx::{QueryBuilder, Row, Sqlite};
 
 use crate::Store;
+
+#[cfg(test)]
+mod qualification_tests;
 
 const COLUMNS: &str = "monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, \
     state, last_snapshot, baseline_snapshot, pending_changes, pending_since, last_change_at, \
     last_polled_at, last_error, created_at, updated_at";
+
+const TARGET_COLUMNS: &str = "target_provider, target_instance_base_url, target_project_path, \
+    target_kind, target_provenance, target_unresolved_reason";
+
+// This is a compatibility boundary, not evidence that an unresolved row is
+// GitHub. Only a later service with original-writer evidence may qualify it.
+const LEGACY_LOOKUP: &str = "((target_provenance = 'unresolved' AND target_provider IS NULL \
+    AND target_instance_base_url IS NULL AND target_project_path IS NULL AND target_kind IS NULL) OR \
+    (target_provenance != 'unresolved' AND target_provider = 'github' AND target_instance_base_url = 'https://github.com' \
+     AND target_kind = 'pull-request'))";
+
+/// How trusted application code established the durable target. These labels
+/// are not deserialized from a transfer archive and are never read permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorTargetProvenance {
+    CapturedRequest,
+    LegacyGithubWriter,
+    ValidatedTransfer,
+}
+
+impl MonitorTargetProvenance {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CapturedRequest => "captured-request",
+            Self::LegacyGithubWriter => "legacy-github-writer",
+            Self::ValidatedTransfer => "validated-transfer",
+        }
+    }
+}
+
+/// Unresolved records retain their old data and can still be inspected or
+/// cancelled. No default repository or current remote fills in these gaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorTargetUnresolvedReason {
+    MissingProvenance,
+    UnverifiedImport,
+    InvalidTarget,
+}
+
+/// Durable identity only; a resolved target still needs fresh read admission
+/// after restart, transfer, account replacement or caller retirement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistedMonitorTarget {
+    Resolved {
+        target: ReviewTarget,
+        provenance: MonitorTargetProvenance,
+    },
+    Unresolved {
+        reason: MonitorTargetUnresolvedReason,
+    },
+}
+
+/// An unchanged legacy monitor plus target evidence and an opaque snapshot for
+/// target-only comparison-and-swap. Accessors do not expose a mutable guard.
+#[derive(Debug, Clone)]
+pub struct QualifiedPrMonitor {
+    monitor: PrMonitor,
+    target: PersistedMonitorTarget,
+    // Preserve raw pending JSON (including malformed or unusually formatted
+    // legacy values). The legacy PrMonitor decoder deliberately normalizes it.
+    original_text: Vec<Option<String>>,
+    columns: TargetColumns,
+}
+
+impl QualifiedPrMonitor {
+    #[must_use]
+    pub fn monitor(&self) -> &PrMonitor {
+        &self.monitor
+    }
+
+    #[must_use]
+    pub fn target(&self) -> &PersistedMonitorTarget {
+        &self.target
+    }
+
+    /// Raw persisted claims for inspection, including malformed/untrusted
+    /// transferred fields. This projection is not a resolved identity.
+    #[must_use]
+    pub fn target_evidence(&self) -> serde_json::Value {
+        serde_json::json!({
+            "provider": self.columns.provider,
+            "instanceBaseUrl": self.columns.instance,
+            "projectPath": self.columns.project,
+            "kind": self.columns.kind,
+            "provenance": self.columns.provenance,
+            "unresolvedReason": self.columns.reason,
+        })
+    }
+}
+
+/// A conflict leaves all original values and the current target untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorQualificationOutcome {
+    Applied,
+    AlreadyQualified,
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetColumns {
+    provider: Option<String>,
+    instance: Option<String>,
+    project: Option<String>,
+    kind: Option<String>,
+    provenance: String,
+    reason: Option<String>,
+}
+
+fn provider_word(provider: RepositoryProvider) -> &'static str {
+    match provider {
+        RepositoryProvider::Github => "github",
+        RepositoryProvider::Gitlab => "gitlab",
+    }
+}
+
+fn kind_word(kind: RepositoryResourceKind) -> &'static str {
+    match kind {
+        RepositoryResourceKind::PullRequest => "pull-request",
+        RepositoryResourceKind::MergeRequest => "merge-request",
+        RepositoryResourceKind::Issue => "issue",
+    }
+}
+
+/// Validate storage invariants only. Provider URL/path canonicalization belongs
+/// to the caller's canonical resolver, not a second parser in the Store.
+fn target_number(target: &ReviewTarget) -> Result<i64> {
+    let number = i64::try_from(target.number)
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| intent_core::Error::InvalidParams("invalid monitor target number".into()))?;
+    let valid_kind = matches!(
+        (target.repository.provider, target.kind),
+        (
+            RepositoryProvider::Github,
+            RepositoryResourceKind::PullRequest
+        ) | (
+            RepositoryProvider::Gitlab,
+            RepositoryResourceKind::MergeRequest
+        ) | (_, RepositoryResourceKind::Issue)
+    );
+    if !valid_kind
+        || [
+            &target.repository.instance_base_url,
+            &target.repository.project_path,
+        ]
+        .iter()
+        .any(|s| s.is_empty() || s.trim() != s.as_str() || s.contains('\0'))
+    {
+        return Err(intent_core::Error::InvalidParams(
+            "invalid monitor target".into(),
+        ));
+    }
+    Ok(number)
+}
+
+fn validate_monitor_target(
+    monitor: &PrMonitor,
+    target: &ReviewTarget,
+    provenance: MonitorTargetProvenance,
+) -> Result<()> {
+    if target_number(target)? != monitor.pr_number {
+        return Err(intent_core::Error::InvalidParams(
+            "monitor number does not match target".into(),
+        ));
+    }
+    let legacy_github = target.repository.provider == RepositoryProvider::Github
+        && target.repository.instance_base_url == "https://github.com"
+        && target.kind == RepositoryResourceKind::PullRequest;
+    if provenance == MonitorTargetProvenance::LegacyGithubWriter && !legacy_github {
+        return Err(intent_core::Error::InvalidParams(
+            "legacy writer evidence requires a github.com PR".into(),
+        ));
+    }
+    if legacy_github
+        && !target
+            .repository
+            .project_path
+            .split_once('/')
+            .is_some_and(|(owner, name)| monitor.repo() == intent_core::RepoRef::new(owner, name))
+    {
+        return Err(intent_core::Error::InvalidParams(
+            "legacy GitHub projection does not match target".into(),
+        ));
+    }
+    Ok(())
+}
+
+impl TargetColumns {
+    fn resolved(target: &ReviewTarget, provenance: MonitorTargetProvenance) -> Self {
+        Self {
+            provider: Some(provider_word(target.repository.provider).into()),
+            instance: Some(target.repository.instance_base_url.clone()),
+            project: Some(target.repository.project_path.clone()),
+            kind: Some(kind_word(target.kind).into()),
+            provenance: provenance.as_str().into(),
+            reason: None,
+        }
+    }
+
+    fn from_row(row: &SqliteRow) -> Result<Self> {
+        let text = |column| {
+            row.try_get(column).map_err(|e| {
+                intent_core::Error::Internal(format!("read monitor target {column}: {e}"))
+            })
+        };
+        Ok(Self {
+            provider: text("target_provider")?,
+            instance: text("target_instance_base_url")?,
+            project: text("target_project_path")?,
+            kind: text("target_kind")?,
+            provenance: row.try_get("target_provenance").map_err(|e| {
+                intent_core::Error::Internal(format!("read monitor provenance: {e}"))
+            })?,
+            reason: text("target_unresolved_reason")?,
+        })
+    }
+
+    fn resolution(&self, monitor: &PrMonitor) -> PersistedMonitorTarget {
+        let unresolved = |reason| PersistedMonitorTarget::Unresolved { reason };
+        if self.provenance == "unresolved" {
+            return unresolved(match self.reason.as_deref() {
+                Some("missing-provenance") => MonitorTargetUnresolvedReason::MissingProvenance,
+                Some("unverified-import") => MonitorTargetUnresolvedReason::UnverifiedImport,
+                _ => MonitorTargetUnresolvedReason::InvalidTarget,
+            });
+        }
+        let decode = || {
+            let provenance = match self.provenance.as_str() {
+                "captured-request" => MonitorTargetProvenance::CapturedRequest,
+                "legacy-github-writer" => MonitorTargetProvenance::LegacyGithubWriter,
+                "validated-transfer" => MonitorTargetProvenance::ValidatedTransfer,
+                _ => return None,
+            };
+            let provider = match self.provider.as_deref()? {
+                "github" => RepositoryProvider::Github,
+                "gitlab" => RepositoryProvider::Gitlab,
+                _ => return None,
+            };
+            let kind = match self.kind.as_deref()? {
+                "pull-request" => RepositoryResourceKind::PullRequest,
+                "merge-request" => RepositoryResourceKind::MergeRequest,
+                "issue" => RepositoryResourceKind::Issue,
+                _ => return None,
+            };
+            let target = ReviewTarget {
+                repository: RepositoryTarget {
+                    provider,
+                    instance_base_url: self.instance.clone()?,
+                    project_path: self.project.clone()?,
+                },
+                kind,
+                number: u64::try_from(monitor.pr_number).ok()?,
+            };
+            if self.reason.is_some()
+                || validate_monitor_target(monitor, &target, provenance).is_err()
+            {
+                return None;
+            }
+            Some(PersistedMonitorTarget::Resolved { target, provenance })
+        };
+        decode().unwrap_or_else(|| unresolved(MonitorTargetUnresolvedReason::InvalidTarget))
+    }
+
+    fn values(&self) -> [Option<&str>; 6] {
+        [
+            self.provider.as_deref(),
+            self.instance.as_deref(),
+            self.project.as_deref(),
+            self.kind.as_deref(),
+            Some(&self.provenance),
+            self.reason.as_deref(),
+        ]
+    }
+}
+
+fn qualified_from_row(row: &SqliteRow) -> Result<QualifiedPrMonitor> {
+    let monitor = monitor_from_row(row)?;
+    let columns = TargetColumns::from_row(row)?;
+    let original_text = COLUMNS
+        .split(',')
+        .map(str::trim)
+        .map(|column| {
+            if column == "pr_number" {
+                Ok(None)
+            } else {
+                row.try_get(column).map_err(|e| {
+                    intent_core::Error::Internal(format!("capture monitor {column}: {e}"))
+                })
+            }
+        })
+        .collect::<Result<_>>()?;
+    Ok(QualifiedPrMonitor {
+        target: columns.resolution(&monitor),
+        monitor,
+        original_text,
+        columns,
+    })
+}
+
+impl Store {
+    /// Read durable target evidence without resolving a provider or granting a read.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for an absent ID, or `Internal` for a database failure.
+    pub async fn get_qualified_pr_monitor(&self, id: &PrMonitorId) -> Result<QualifiedPrMonitor> {
+        let row = sqlx::query(&format!(
+            "SELECT {COLUMNS}, {TARGET_COLUMNS} FROM pr_monitor WHERE monitor_id = ?"
+        ))
+        .bind(&id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| intent_core::Error::Internal(format!("get qualified monitor: {e}")))?
+        .ok_or_else(|| intent_core::Error::NotFound(format!("pr monitor {} not found", id.0)))?;
+        qualified_from_row(&row)
+    }
+
+    /// Load active resolved AND unresolved records for recovery/inspection.
+    /// Unresolved rows must not issue a provider request or deliver a pending wake.
+    ///
+    /// # Errors
+    /// Returns `Internal` for a database failure.
+    pub async fn load_active_qualified_pr_monitors(&self) -> Result<Vec<QualifiedPrMonitor>> {
+        sqlx::query(&format!("SELECT {COLUMNS}, {TARGET_COLUMNS} FROM pr_monitor WHERE state = 'active' ORDER BY created_at, monitor_id"))
+            .fetch_all(self.read_pool()).await
+            .map_err(|e| intent_core::Error::Internal(format!("load qualified monitors: {e}")))?
+            .iter().map(qualified_from_row).collect()
+    }
+
+    /// Find the active, qualified target owned by this agent. Never uses an
+    /// unresolved legacy slot as a match for a caller's qualified target.
+    ///
+    /// # Errors
+    /// Returns `InvalidParams` for an invalid target or `Internal` on database failure.
+    pub async fn find_active_qualified_pr_monitor(
+        &self,
+        agent: &AgentId,
+        target: &ReviewTarget,
+    ) -> Result<Option<QualifiedPrMonitor>> {
+        self.find_qualified_monitor("agent_id", &agent.0, target)
+            .await
+    }
+
+    /// Owner-agnostic lookup for the existing workspace refusal/adoption boundary.
+    ///
+    /// # Errors
+    /// Returns `InvalidParams` for an invalid target or `Internal` on database failure.
+    pub async fn find_active_qualified_pr_monitor_in_workspace(
+        &self,
+        workspace: &WorkspaceId,
+        target: &ReviewTarget,
+    ) -> Result<Option<QualifiedPrMonitor>> {
+        self.find_qualified_monitor("workspace_id", &workspace.0, target)
+            .await
+    }
+
+    async fn find_qualified_monitor(
+        &self,
+        scope: &str,
+        id: &str,
+        target: &ReviewTarget,
+    ) -> Result<Option<QualifiedPrMonitor>> {
+        let number = target_number(target)?;
+        let sql = format!("SELECT {COLUMNS}, {TARGET_COLUMNS} FROM pr_monitor WHERE {scope} = ? \
+            AND state = 'active' AND target_provenance != 'unresolved' \
+            AND target_provider = ? AND target_instance_base_url = ? AND target_kind = ? AND pr_number = ? \
+            AND CASE WHEN target_provider = 'github' THEN lower(target_project_path) ELSE target_project_path END \
+                = CASE WHEN ? = 'github' THEN lower(?) ELSE ? END");
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .bind(provider_word(target.repository.provider))
+            .bind(&target.repository.instance_base_url)
+            .bind(kind_word(target.kind))
+            .bind(number)
+            .bind(provider_word(target.repository.provider))
+            .bind(&target.repository.project_path)
+            .bind(&target.repository.project_path)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| intent_core::Error::Internal(format!("find qualified monitor: {e}")))?;
+        let found = row.as_ref().map(qualified_from_row).transpose()?;
+        Ok(found.filter(|m| matches!(m.target, PersistedMonitorTarget::Resolved { .. })))
+    }
+
+    /// Insert a canonical target established by trusted application code.
+    /// The caller supplies provenance from actual evidence, never an archive's
+    /// self-asserted label. URL/path canonicalization and admission stay external.
+    ///
+    /// # Errors
+    /// Returns `InvalidParams` for inconsistent data and `Internal` on database failure.
+    /// A uniqueness conflict returns `Ok(false)` without changing the existing owner.
+    pub async fn insert_qualified_pr_monitor(
+        &self,
+        m: &PrMonitor,
+        target: &ReviewTarget,
+        provenance: MonitorTargetProvenance,
+    ) -> Result<bool> {
+        validate_monitor_target(m, target, provenance)?;
+        let sql = format!(
+            "INSERT INTO pr_monitor ({COLUMNS}, {TARGET_COLUMNS}) VALUES ({})",
+            vec!["?"; 22].join(",")
+        );
+        let result = sqlx::query(&sql)
+            .bind(&m.monitor_id.0)
+            .bind(&m.workspace_id.0)
+            .bind(&m.agent_id.0)
+            .bind(&m.repo_owner)
+            .bind(&m.repo_name)
+            .bind(m.pr_number)
+            .bind(state_to_db(m.state))
+            .bind(&m.last_snapshot)
+            .bind(&m.baseline_snapshot)
+            .bind(pending_to_db(&m.pending_changes))
+            .bind(&m.pending_since)
+            .bind(&m.last_change_at)
+            .bind(&m.last_polled_at)
+            .bind(&m.last_error)
+            .bind(&m.created_at)
+            .bind(&m.updated_at)
+            .bind(provider_word(target.repository.provider))
+            .bind(&target.repository.instance_base_url)
+            .bind(&target.repository.project_path)
+            .bind(kind_word(target.kind))
+            .bind(provenance.as_str())
+            .bind(None::<String>)
+            .execute(self.write_pool())
+            .await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(e)
+                if e.as_database_error()
+                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(intent_core::Error::Internal(format!(
+                "insert qualified monitor: {e}"
+            ))),
+        }
+    }
+
+    /// Qualify an unresolved row using separately established target evidence.
+    /// Compares all raw old fields plus all prior target fields in one UPDATE;
+    /// changes ONLY target columns. A competing owner/state/poll/qualification
+    /// write cannot be hidden by an unchanged `updated_at`. Resolved rows are not
+    /// retargeted. Repeating the same applied qualification is idempotent.
+    ///
+    /// # Errors
+    /// Returns `InvalidParams` for inconsistent target data and `Internal` on database failure.
+    pub async fn qualify_legacy_pr_monitor_target(
+        &self,
+        expected: &QualifiedPrMonitor,
+        target: &ReviewTarget,
+        provenance: MonitorTargetProvenance,
+    ) -> Result<MonitorQualificationOutcome> {
+        validate_monitor_target(&expected.monitor, target, provenance)?;
+        let desired = TargetColumns::resolved(target, provenance);
+        let mut query = QueryBuilder::<Sqlite>::new("UPDATE pr_monitor SET ");
+        for (i, (column, value)) in TARGET_COLUMNS
+            .split(',')
+            .map(str::trim)
+            .zip(desired.values())
+            .enumerate()
+        {
+            if i > 0 {
+                query.push(", ");
+            }
+            query.push(column).push(" = ").push_bind(value);
+        }
+        query.push(" WHERE target_provenance = 'unresolved'");
+        for (i, column) in COLUMNS.split(',').map(str::trim).enumerate() {
+            query.push(" AND ").push(column).push(" IS ");
+            if column == "pr_number" {
+                query.push_bind(expected.monitor.pr_number);
+            } else {
+                query.push_bind(expected.original_text[i].as_deref());
+            }
+        }
+        for (column, value) in TARGET_COLUMNS
+            .split(',')
+            .map(str::trim)
+            .zip(expected.columns.values())
+        {
+            query
+                .push(" AND ")
+                .push(column)
+                .push(" IS ")
+                .push_bind(value);
+        }
+        match query.build().execute(self.write_pool()).await {
+            Ok(r) if r.rows_affected() == 1 => return Ok(MonitorQualificationOutcome::Applied),
+            Ok(_) => {}
+            Err(e)
+                if e.as_database_error()
+                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation) =>
+            {
+                return Ok(MonitorQualificationOutcome::Conflict)
+            }
+            Err(e) => {
+                return Err(intent_core::Error::Internal(format!(
+                    "qualify monitor target: {e}"
+                )))
+            }
+        }
+        match self
+            .get_qualified_pr_monitor(&expected.monitor.monitor_id)
+            .await
+        {
+            Ok(current)
+                if current.original_text == expected.original_text
+                    && current.monitor.pr_number == expected.monitor.pr_number
+                    && current.columns == desired =>
+            {
+                Ok(MonitorQualificationOutcome::AlreadyQualified)
+            }
+            Ok(_) | Err(intent_core::Error::NotFound(_)) => {
+                Ok(MonitorQualificationOutcome::Conflict)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
 
 fn state_to_db(state: PrMonitorState) -> &'static str {
     match state {
@@ -500,7 +1027,7 @@ impl Store {
         let sql = format!(
             "SELECT {COLUMNS} FROM pr_monitor WHERE agent_id = ? \
              AND repo_owner = ? COLLATE NOCASE AND repo_name = ? COLLATE NOCASE \
-             AND pr_number = ? AND state = 'active'"
+             AND pr_number = ? AND state = 'active' AND {LEGACY_LOOKUP}"
         );
         let row = sqlx::query(&sql)
             .bind(&agent_id.0)
@@ -533,7 +1060,7 @@ impl Store {
         let sql = format!(
             "SELECT {COLUMNS} FROM pr_monitor WHERE workspace_id = ? \
              AND repo_owner = ? COLLATE NOCASE AND repo_name = ? COLLATE NOCASE \
-             AND pr_number = ? AND state = 'active'"
+             AND pr_number = ? AND state = 'active' AND {LEGACY_LOOKUP}"
         );
         let row = sqlx::query(&sql)
             .bind(&workspace_id.0)

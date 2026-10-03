@@ -1304,10 +1304,27 @@ impl WsInner {
         let credential_binding = admitted
             .as_ref()
             .and_then(|admitted| admitted.binding(self.token_store.as_ref()?, caller.as_ref()?));
+        let read_connection = crate::context::with_credential_context(
+            true,
+            caller.clone(),
+            credential_binding.clone(),
+            async {
+                if credential_binding.is_some() {
+                    crate::context::ReadConnectionGuard::bind(
+                        self.api.as_ref(),
+                        intent_core::repository_request::RepositoryWireEntry::Bearer,
+                    )
+                } else {
+                    crate::context::ReadConnectionGuard::absent()
+                }
+            },
+        )
+        .await;
         let mut rotation = admitted.as_mut().and_then(|c| c.rotation.take());
         subs.pairing.admitted = admitted;
         // Bind reverse authority independently of hello metadata. Members may
         // serve ordinary workspace browsers, while guests remain ineligible.
+        let _retirements = read_connection.forward_retirements(app_tx.priority_sender());
         let reverse = ReverseChannel::new(app_tx.priority_sender())
             .with_administrator(caller.as_ref().is_none_or(Caller::is_administrator))
             .with_member_authority(self.api.clone(), caller.as_ref());
@@ -1371,6 +1388,7 @@ impl WsInner {
                         Ok(ref revocation)
                             if Some(&revocation.principal_id) != revoked_principal.as_ref() => {}
                         _ => {
+                            read_connection.retire();
                             // Stop streams and event producers before the bounded
                             // response drain; only already-admitted replies may leave.
                             let control = revoked
@@ -1485,23 +1503,29 @@ impl WsInner {
                         // bind the caller resolved at upgrade (multiplayer w1).
                         let frame_ok = intent_core::caller::with_wire_credential(
                             credential_binding.clone(),
-                            crate::context::with_request_context(true, caller.clone(), async {
-                                conn::process_frame(
-                                    &text,
-                                    &self.api,
-                                    &self.bus,
-                                    &app_tx,
-                                    &mut subs,
-                                    &reverse,
-                                    &reverse_guard,
-                                    self.control.as_ref(),
-                                    self.server_pairing_info.as_ref(),
-                                    &mut client_id,
-                                    self.locality_is_local,
-                                    &self.rpc_limiter,
-                                )
-                                .await
-                            }),
+                            crate::context::with_request_context(
+                                true,
+                                caller.clone(),
+                                read_connection.run(async {
+                                    crate::context::with_repository_frame(&text, || {
+                                        conn::process_frame(
+                                            &text,
+                                            &self.api,
+                                            &self.bus,
+                                            &app_tx,
+                                            &mut subs,
+                                            &reverse,
+                                            &reverse_guard,
+                                            self.control.as_ref(),
+                                            self.server_pairing_info.as_ref(),
+                                            &mut client_id,
+                                            self.locality_is_local,
+                                            &self.rpc_limiter,
+                                        )
+                                    })
+                                    .await
+                                }),
+                            ),
                         )
                         .await;
                         if !frame_ok {
@@ -1542,6 +1566,7 @@ impl WsInner {
                         }
                     }
                     Some(ConnCmd::Close) => {
+                        read_connection.retire();
                         let _ = sink
                             .send(Message::Close(Some(CloseFrame {
                                 code: CloseCode::Away,
@@ -1553,6 +1578,7 @@ impl WsInner {
                 },
             }
         }
+        read_connection.retire();
         drop(subs);
         reverse.close();
         drop(reverse_guard);

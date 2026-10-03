@@ -22,6 +22,8 @@
 //! hosts' identities come from fake `GITLAB_TOKEN` / `GITHUB_TOKEN` values the
 //! mock recognises; the guests never authenticate — their proof snippets are
 //! scripted straight into the mock, as the GitHub suite scripts gists.
+//! Repository-backed GitLab host cases additionally require the explicit
+//! `repository-test-fixtures` transport registration; CI selects that feature.
 //! Hermetic: no live network, secrets land in a temp `INTENTD_SECRETS_FILE`.
 
 #![cfg(unix)]
@@ -132,6 +134,24 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let gh_config_dir = data_dir.join("gh-config");
     std::fs::create_dir_all(&gh_config_dir).expect("mkdir hermetic gh config dir");
     let mut cmd = common::serve_command();
+    // The owned mock is a finite test transport, never ambient production authority.
+    #[cfg(feature = "repository-test-fixtures")]
+    {
+        let endpoint = env
+            .iter()
+            .find_map(|(key, value)| (*key == "INTENTD_GITLAB_API_BASE_URI").then_some(*value))
+            .expect("owned GitLab mock");
+        let transports = serde_json::to_string(&[("https://gitlab.com", endpoint)]).unwrap();
+        let config = data_dir.join("config.toml");
+        let original = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(
+            config,
+            format!("{original}\n[sourceControl.gitlab]\napiBaseUrl = {endpoint:?}\n"),
+        )
+        .unwrap();
+        cmd.env("INTENTD_REPOSITORY_TEST_TRANSPORTS", transports);
+    }
+    cmd.env("INTENTD_DISABLE_GH_CREDENTIALS", "1");
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -345,14 +365,18 @@ struct MockForge {
     /// answering only a bearer the instance knows.
     private_snippets: Arc<AtomicBool>,
     /// When set, the GitLab snippet routes answer `503` to every read.
+    #[cfg(feature = "repository-test-fixtures")]
     snippet_server_error: Arc<AtomicBool>,
     /// Nonzero status scripts public GitLab pin lookup failures (401 permits
     /// same-instance authenticated fallback).
+    #[cfg(feature = "repository-test-fixtures")]
     user_lookup_status: Arc<AtomicUsize>,
     /// The switches scripting github.com's `GET /user`.
+    #[cfg(feature = "repository-test-fixtures")]
     github_user: GithubUser,
     snippets: Snippets,
     /// Snippet reads (metadata or raw) that carried a bearer token.
+    #[cfg(feature = "repository-test-fixtures")]
     authenticated_snippet_reads: Arc<AtomicUsize>,
 }
 
@@ -391,6 +415,7 @@ impl GithubUser {
     }
 
     /// Wait until `n` reads in total have arrived while held.
+    #[cfg(feature = "repository-test-fixtures")]
     async fn held_reads(&self, n: usize) {
         let mut rx = self.held.subscribe();
         timeout(Duration::from_secs(30), rx.wait_for(|held| *held >= n))
@@ -543,10 +568,14 @@ async fn spawn_mock_forge() -> MockForge {
         base_uri: format!("http://127.0.0.1:{port}"),
         requests,
         private_snippets,
+        #[cfg(feature = "repository-test-fixtures")]
         snippet_server_error,
+        #[cfg(feature = "repository-test-fixtures")]
         user_lookup_status,
+        #[cfg(feature = "repository-test-fixtures")]
         github_user,
         snippets,
+        #[cfg(feature = "repository-test-fixtures")]
         authenticated_snippet_reads,
     }
 }
@@ -810,6 +839,7 @@ async fn next_event(ws: &mut Ws, event_type: &str, secs: u64) -> Value {
 
 /// True when no `events.event` of type `event_type` reaches `ws` within
 /// `window_ms` (a negative assertion: the socket stayed quiet).
+#[cfg(feature = "repository-test-fixtures")]
 async fn stays_quiet(ws: &mut Ws, event_type: &str, window_ms: u64) -> bool {
     timeout(Duration::from_millis(window_ms), async {
         loop {
@@ -835,6 +865,7 @@ async fn stays_quiet(ws: &mut Ws, event_type: &str, window_ms: u64) -> bool {
 }
 
 /// Subscribe `ws` to `principal:identity-changed` (global: no workspace).
+#[cfg(feature = "repository-test-fixtures")]
 async fn subscribe_identity_changed(ws: &mut Ws, id: i64) {
     let v = wss_rpc(
         ws,
@@ -850,6 +881,7 @@ async fn subscribe_identity_changed(ws: &mut Ws, id: i64) {
 }
 
 /// `settings.update` of `identity.provider` to `value` over WSS.
+#[cfg(feature = "repository-test-fixtures")]
 async fn set_identity_provider(owner: &mut Ws, id: i64, value: Value) {
     let v = wss_rpc(
         owner,
@@ -1131,6 +1163,7 @@ async fn preview_pin_identity_keeps_provider_host_and_account_enforcement_over_w
 
 /// (a) + (c): a GitLab-only host mints invites and admits a GitLab guest;
 /// its own account is refused as a guest.
+#[cfg(feature = "repository-test-fixtures")]
 #[tokio::test]
 async fn gitlab_only_host_mints_invites_and_admits_gitlab_guest_over_wss() {
     let mock = spawn_mock_forge().await;
@@ -1384,6 +1417,7 @@ async fn gitlab_only_host_mints_invites_and_admits_gitlab_guest_over_wss() {
 /// host, keeps the nonce, and succeeds once the snippet is public. An
 /// instance answering a server error is `github-unreachable` (the code is
 /// kept for both providers) and the same nonce succeeds on retry.
+#[cfg(feature = "repository-test-fixtures")]
 #[tokio::test]
 async fn restricted_snippet_needs_the_hosts_own_connection_over_wss() {
     let mock = spawn_mock_forge().await;
@@ -1525,6 +1559,7 @@ async fn restricted_snippet_needs_the_hosts_own_connection_over_wss() {
 /// still qualifying nothing changes and nothing is published. A probe that
 /// outlives the next write is superseded: neither its `401` (unlink) nor
 /// its `200` (link) commits over the identity the newer write applied.
+#[cfg(feature = "repository-test-fixtures")]
 #[tokio::test]
 async fn identity_provider_write_rekeys_the_primary_over_wss() {
     let mock = spawn_mock_forge().await;

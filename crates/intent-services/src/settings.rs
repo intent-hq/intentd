@@ -37,6 +37,10 @@ use tokio::time::timeout;
 
 use intent_store::Store;
 
+use crate::source_control_auth_ops::repository_owner::{
+    GitlabCredentialGate, RepositorySettingsWrite,
+};
+
 use crate::settings_registry::{SettingOrigin, SettingsRegistry, KNOWN_PATHS};
 
 /// Placeholder returned for a sensitive setting that **has** a stored value, so
@@ -205,6 +209,9 @@ type MutationHook<T> = Arc<Mutex<Option<Box<dyn FnOnce() -> T + Send>>>>;
 /// invalidated on successful writes and expire on TTL.
 #[derive(Clone)]
 pub(crate) struct AsyncSecretStore {
+    paired_gitlab: Option<std::path::PathBuf>,
+    repository_gate: Arc<OnceLock<GitlabCredentialGate>>,
+    repository_write: Option<Arc<RepositorySettingsWrite>>,
     inner: Arc<dyn SecretStore>,
     state: Arc<Mutex<AsyncState>>,
     mutation_tasks: Arc<crate::delivery_tasks::DeliveryTasks>,
@@ -339,6 +346,9 @@ impl AsyncSecretStore {
         warn_interval: Duration,
     ) -> Self {
         Self {
+            paired_gitlab: None,
+            repository_gate: Arc::new(OnceLock::new()),
+            repository_write: None,
             inner,
             state: Arc::new(Mutex::new(AsyncState {
                 entries: HashMap::new(),
@@ -417,6 +427,43 @@ impl AsyncSecretStore {
             self.state.lock().unwrap().entries.remove(account);
         }
         Ok(guard)
+    }
+
+    /// Explicit common backing-file construction. Generic store injection does
+    /// not establish this provenance even if its values happen to match.
+    pub(crate) fn paired_gitlab(store: intent_core::FileSecretStore) -> Self {
+        let path = store.path().to_path_buf();
+        let mut wrapper = Self::new(Arc::new(store));
+        wrapper.paired_gitlab = Some(path);
+        wrapper
+    }
+
+    pub(crate) fn is_paired_gitlab_store(&self, store: &intent_core::FileSecretStore) -> bool {
+        self.paired_gitlab.as_deref() == Some(store.path())
+    }
+
+    pub(crate) fn install_repository_boundary(&self, gate: GitlabCredentialGate) -> Result<()> {
+        self.repository_gate
+            .set(gate)
+            .map_err(|_| Error::Internal("repository secret boundary already installed".into()))
+    }
+
+    pub(crate) fn with_repository_write(&self, write: Arc<RepositorySettingsWrite>) -> Self {
+        let mut operation = self.clone();
+        operation.repository_write = Some(write);
+        operation
+    }
+
+    fn check_repository_write(&self, account: &str) -> Result<()> {
+        if account == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT
+            || forge_token_secret_siblings(intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT)
+                .contains(&account)
+        {
+            if let Some(gate) = self.repository_gate.get() {
+                gate.check_settings_secret(self.repository_write.as_deref())?;
+            }
+        }
+        Ok(())
     }
 
     /// Override the [`settle_detached`](Self::settle_detached) cap so a test can
@@ -727,8 +774,16 @@ impl AsyncSecretStore {
         let inner = self.inner.clone();
         let owned_account = account.to_string();
         let owned_value = value.to_string();
-        self.mutate(account, move || inner.store(&owned_account, &owned_value))
-            .await?;
+        let operation = self.clone();
+        self.mutate(account, move || {
+            let _lease = operation
+                .repository_write
+                .as_ref()
+                .map(|write| write.lease());
+            operation.check_repository_write(&owned_account)?;
+            inner.store(&owned_account, &owned_value)
+        })
+        .await?;
         self.set_cached(account, Some(value.into()));
         Ok(())
     }
@@ -791,6 +846,55 @@ impl AsyncSecretStore {
         .await
     }
 
+    pub(crate) async fn persist_gitlab_grant_observed(
+        &self,
+        grant: intent_sourcecontrol::gitlab_auth::GitlabGrant,
+        lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
+        observer: Option<Arc<dyn intent_sourcecontrol::gitlab_auth::GitlabWriteObserver>>,
+    ) -> Result<()> {
+        if let Some(observer) = observer {
+            self.mutate_gitlab(grant.into_persistence_observed(lease, observer))
+                .await
+        } else {
+            self.persist_gitlab_grant(grant, lease).await
+        }
+    }
+
+    pub(crate) async fn persist_gitlab_pat_observed(
+        &self,
+        store: intent_core::FileSecretStore,
+        token: intent_sourcecontrol::SecretString,
+        lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
+        observer: Option<Arc<dyn intent_sourcecontrol::gitlab_auth::GitlabWriteObserver>>,
+    ) -> Result<()> {
+        if let Some(observer) = observer {
+            self.mutate_gitlab(intent_sourcecontrol::gitlab_auth::pat_persistence_observed(
+                store, token, lease, observer,
+            ))
+            .await
+        } else {
+            self.persist_gitlab_pat(store, token, lease).await
+        }
+    }
+
+    pub(crate) async fn revoke_gitlab_token_observed(
+        &self,
+        store: intent_core::FileSecretStore,
+        lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
+        observer: Option<Arc<dyn intent_sourcecontrol::gitlab_auth::GitlabWriteObserver>>,
+    ) -> Result<()> {
+        if let Some(observer) = observer {
+            self.mutate_gitlab(
+                intent_sourcecontrol::gitlab_auth::token_revocation_observed(
+                    store, lease, observer,
+                ),
+            )
+            .await
+        } else {
+            self.revoke_gitlab_token(store, lease).await
+        }
+    }
+
     async fn mutate_gitlab(
         &self,
         write: impl FnOnce() -> Result<()> + Send + 'static,
@@ -812,8 +916,16 @@ impl AsyncSecretStore {
     pub(crate) async fn delete(&self, account: &str) -> Result<()> {
         let inner = self.inner.clone();
         let owned_account = account.to_string();
-        self.mutate(account, move || inner.delete(&owned_account))
-            .await?;
+        let operation = self.clone();
+        self.mutate(account, move || {
+            let _lease = operation
+                .repository_write
+                .as_ref()
+                .map(|write| write.lease());
+            operation.check_repository_write(&owned_account)?;
+            inner.delete(&owned_account)
+        })
+        .await?;
         self.set_cached(account, None);
         Ok(())
     }
@@ -1932,6 +2044,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             true,
         ),
         string(
+            "sourceControl.gitlab.instanceBaseUrl",
+            "GitLab instance root",
+            "Logical HTTPS instance root including port and installation path",
+            "integrations",
+            None,
+        ),
+        string(
             "sourceControl.gitlab.host",
             "GitLab host",
             "The bound GitLab instance as a bare host[:port] (no scheme); written by a \
@@ -2844,7 +2963,7 @@ pub(crate) fn wire_value(def: &SettingDefinition, value: Value) -> Value {
 // The `n.abs() <= i64::MAX as f64` guard bounds the float→int cast; the
 // i64::MAX→f64 comparison constant rounding up by one ULP is harmless here.
 #[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-fn registry_value(def: &SettingDefinition, value: &Value) -> Value {
+pub(crate) fn registry_value(def: &SettingDefinition, value: &Value) -> Value {
     if let SettingType::Number { .. } = def.ty {
         if let Some(n) = value.as_f64() {
             if n.is_finite() && n.fract() == 0.0 && n.abs() <= i64::MAX as f64 {
@@ -2863,9 +2982,31 @@ fn registry_value(def: &SettingDefinition, value: &Value) -> Value {
 /// (`config.toml`); without it, every non-secret key keeps the legacy
 /// `SQLite` path (read-only test wiring).
 pub(crate) struct SettingsService<'a> {
+    repository_write: Option<Arc<RepositorySettingsWrite>>,
+    operation_secrets: Option<AsyncSecretStore>,
     store: &'a Store,
     secrets: &'a AsyncSecretStore,
     registry: Option<&'a SettingsRegistry>,
+}
+
+/// Failure evidence from the existing ordinary-settings writer. This describes
+/// only file/database effects; secret and runtime compensation retain their own
+/// owners. An attempted asynchronous database write cannot attest no effect.
+pub(crate) enum NonSecretSettingsFailure {
+    NoEffect(Error),
+    Indeterminate(Error),
+}
+
+impl NonSecretSettingsFailure {
+    pub(crate) fn no_effect(&self) -> bool {
+        matches!(self, Self::NoEffect(_))
+    }
+
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            Self::NoEffect(error) | Self::Indeterminate(error) => error,
+        }
+    }
 }
 
 /// Settings readers/writers of one secret wait for its whole mutation,
@@ -2934,6 +3075,7 @@ impl SecretSettingsGates {
 
 #[derive(Default)]
 pub(crate) struct SecretSettingsUpdate {
+    repository_write: Option<Arc<RepositorySettingsWrite>>,
     applied: Vec<(usize, Value)>,
     prior: Vec<(String, Option<String>)>,
     github_generation: Option<u64>,
@@ -2955,6 +3097,11 @@ impl SecretSettingsUpdate {
     /// stays in `store_secret_and_clear_siblings`; never add its unknown-state
     /// accounts to this ledger.
     pub(crate) async fn rollback(&self, secrets: &AsyncSecretStore) -> bool {
+        let operation = self
+            .repository_write
+            .as_ref()
+            .map(|write| secrets.with_repository_write(write.clone()));
+        let secrets = operation.as_ref().unwrap_or(secrets);
         let mut failed = false;
         for github in [true, false] {
             // Never hold GitHub ownership across another account's backend
@@ -3025,7 +3172,24 @@ impl<'a> SettingsService<'a> {
             store,
             secrets,
             registry,
+            repository_write: None,
+            operation_secrets: None,
         }
+    }
+
+    pub(crate) fn with_repository_write(
+        mut self,
+        write: Option<Arc<RepositorySettingsWrite>>,
+    ) -> Self {
+        self.operation_secrets = write
+            .as_ref()
+            .map(|write| self.secrets().with_repository_write(write.clone()));
+        self.repository_write = write;
+        self
+    }
+
+    fn secrets(&self) -> &AsyncSecretStore {
+        self.operation_secrets.as_ref().unwrap_or(self.secrets)
     }
 
     /// The registry serving `path`, when it is a TOML-backed key and the
@@ -3062,7 +3226,7 @@ impl<'a> SettingsService<'a> {
     /// absent for display.
     async fn current_value(&self, def: &SettingDefinition) -> Value {
         if def.sensitive {
-            match self.secrets.load(def.path).await {
+            match self.secrets().load(def.path).await {
                 Ok(Some(_)) => json!(REDACTED_PLACEHOLDER),
                 Ok(None) | Err(_) => Value::Null,
             }
@@ -3094,7 +3258,7 @@ impl<'a> SettingsService<'a> {
         let futs: Vec<LoadFuture<'_>> = sensitive
             .iter()
             .map(|path| {
-                let fut = self.secrets.load(path);
+                let fut = self.secrets().load(path);
                 Box::pin(fut) as LoadFuture<'_>
             })
             .collect();
@@ -3220,14 +3384,17 @@ impl<'a> SettingsService<'a> {
     /// the caller. No ordinary setting is changed until the final commit.
     pub(crate) async fn update_secrets(&self, changes: &Value) -> Result<SecretSettingsUpdate> {
         let planned = self.validate_update(changes)?;
-        let mut update = SecretSettingsUpdate::default();
+        let mut update = SecretSettingsUpdate {
+            repository_write: self.repository_write.clone(),
+            ..Default::default()
+        };
         let mut prior = Vec::new();
         for (def, _) in planned.iter().filter(|(def, _)| def.sensitive) {
             for path in std::iter::once(def.path)
                 .chain(forge_token_secret_siblings(def.path).iter().copied())
             {
                 if !prior.iter().any(|(p, _)| p == path) {
-                    prior.push((path.to_string(), self.secrets.load_fresh(path).await?));
+                    prior.push((path.to_string(), self.secrets().load_fresh(path).await?));
                 }
             }
         }
@@ -3251,7 +3418,7 @@ impl<'a> SettingsService<'a> {
             if value.as_str() != Some(REDACTED_PLACEHOLDER) {
                 let github_snapshot = async {
                     let guard = if def.path == crate::github_auth_ops::SECRET_ACCOUNT {
-                        let guard = self.secrets.github_mutation().await?;
+                        let guard = self.secrets().github_mutation().await?;
                         if update.github_generation != Some(*guard) {
                             // Preflight can precede another account's slow write.
                             // Snapshot the owner we will replace, not an earlier
@@ -3260,7 +3427,7 @@ impl<'a> SettingsService<'a> {
                                 .iter_mut()
                                 .filter(|(path, _)| is_github_credential(path))
                             {
-                                *value = self.secrets.load_fresh(path).await?;
+                                *value = self.secrets().load_fresh(path).await?;
                             }
                             update.prior.retain(|(path, _)| !is_github_credential(path));
                             update.github_generation = None;
@@ -3274,7 +3441,7 @@ impl<'a> SettingsService<'a> {
                 .await;
                 let mut github_guard = match github_snapshot {
                     Ok(guard) => guard,
-                    Err(error) => return Err(update.compensate_error(self.secrets, error).await),
+                    Err(error) => return Err(update.compensate_error(self.secrets(), error).await),
                 };
                 let desired = match &value {
                     Value::String(s) => s.clone(),
@@ -3304,7 +3471,7 @@ impl<'a> SettingsService<'a> {
                     // failed mutation (including siblings) has settled.
                     if update.prior.iter().any(|(path, _)| owns_account(path)) {
                         for path in std::iter::once(def.path).chain(siblings.iter().copied()) {
-                            if self.secrets.settle_detached(path).await.is_err() {
+                            if self.secrets().settle_detached(path).await.is_err() {
                                 update.prior.retain(|(path, _)| !owns_account(path));
                                 break;
                             }
@@ -3314,7 +3481,7 @@ impl<'a> SettingsService<'a> {
                     // the revision gate. Never compensate untouched accounts
                     // or a failing operation whose state is still unknown.
                     drop(github_guard.take());
-                    return Err(update.compensate_error(self.secrets, error).await);
+                    return Err(update.compensate_error(self.secrets(), error).await);
                 }
                 for (path, value) in prior.iter().filter(|(path, _)| owns_account(path)) {
                     if !update.prior.iter().any(|(p, _)| p == path) {
@@ -3333,7 +3500,34 @@ impl<'a> SettingsService<'a> {
     /// Called with the revision gate held after secret persistence succeeds.
     /// Re-check ordinary values here: another settings call or a config-file
     /// reload may have committed while the secret store was busy.
+    #[cfg(test)]
     pub(crate) async fn update_non_secrets(&self, changes: &Value) -> Result<Vec<(usize, Value)>> {
+        self.update_non_secrets_with_outcome(changes)
+            .await
+            .map_err(NonSecretSettingsFailure::into_error)
+    }
+
+    pub(crate) async fn update_non_secrets_with_outcome(
+        &self,
+        changes: &Value,
+    ) -> std::result::Result<Vec<(usize, Value)>, NonSecretSettingsFailure> {
+        let mut ordinary_effect = false;
+        self.update_non_secrets_inner(changes, &mut ordinary_effect)
+            .await
+            .map_err(|error| {
+                if ordinary_effect {
+                    NonSecretSettingsFailure::Indeterminate(error)
+                } else {
+                    NonSecretSettingsFailure::NoEffect(error)
+                }
+            })
+    }
+
+    async fn update_non_secrets_inner(
+        &self,
+        changes: &Value,
+        ordinary_effect: &mut bool,
+    ) -> Result<Vec<(usize, Value)>> {
         let planned = self.validate_update(changes)?;
         // Keep validated entries only when persisting them would change the
         // observable setting state. For TOML-backed keys, origin is part of
@@ -3389,7 +3583,15 @@ impl<'a> SettingsService<'a> {
                         (path.clone(), prior)
                     })
                     .collect();
-                reg.apply(&registry_changes)?;
+                reg.apply_with_repository_write(
+                    &registry_changes,
+                    self.repository_write.as_deref(),
+                    None,
+                )?;
+                // The registry returns no error after its successful rename:
+                // failed validation/write has no ordinary publication. A later
+                // failure after this point needs separate compensation evidence.
+                *ordinary_effect = true;
             }
         }
 
@@ -3402,11 +3604,16 @@ impl<'a> SettingsService<'a> {
                 Ok(json!({ "path": def.path, "value": wire_value(&def, value) }))
             } else {
                 match serde_json::to_string(&value) {
-                    Ok(raw) => self
-                        .store
-                        .set_setting(def.path, &raw)
-                        .await
-                        .map(|()| json!({ "path": def.path, "value": value })),
+                    Ok(raw) => {
+                        // Cancellation or an error cannot prove that an awaited
+                        // database effect did not land. Existing best-effort
+                        // registry rollback never upgrades that uncertainty.
+                        *ordinary_effect = true;
+                        self.store
+                            .set_setting(def.path, &raw)
+                            .await
+                            .map(|()| json!({ "path": def.path, "value": value }))
+                    }
                     Err(e) => Err(Error::Internal(format!("encode setting failed: {e}"))),
                 }
             };
@@ -3423,7 +3630,11 @@ impl<'a> SettingsService<'a> {
                     // an error and never emits `settings:changed`.
                     if !registry_rollback.is_empty() {
                         if let Some(reg) = self.registry {
-                            if let Err(rollback_err) = reg.apply(&registry_rollback) {
+                            if let Err(rollback_err) = reg.apply_with_repository_write(
+                                &registry_rollback,
+                                self.repository_write.as_deref(),
+                                None,
+                            ) {
                                 tracing::error!(
                                     error = %rollback_err,
                                     "settings.update registry rollback failed after \
@@ -3445,7 +3656,7 @@ impl<'a> SettingsService<'a> {
         match self.update_non_secrets(changes).await {
             Ok(applied) => Ok(secrets.merge_applied(applied)),
             Err(error) => {
-                secrets.rollback(self.secrets).await;
+                secrets.rollback(self.secrets()).await;
                 Err(error)
             }
         }
@@ -3465,13 +3676,13 @@ impl<'a> SettingsService<'a> {
     async fn store_secret_and_clear_siblings(&self, path: &str, value: &str) -> Result<()> {
         let siblings = forge_token_secret_siblings(path);
         if siblings.is_empty() {
-            return self.secrets.store(path, value).await;
+            return self.secrets().store(path, value).await;
         }
         let mut prior = Vec::with_capacity(siblings.len() + 1);
         for account in std::iter::once(path).chain(siblings.iter().copied()) {
-            prior.push((account, self.secrets.load_fresh(account).await?));
+            prior.push((account, self.secrets().load_fresh(account).await?));
         }
-        let failure = match self.secrets.store(path, value).await {
+        let failure = match self.secrets().store(path, value).await {
             Ok(()) => match self.clear_forge_token_secret_siblings(path).await {
                 Ok(()) => return Ok(()),
                 Err(e) => e,
@@ -3479,14 +3690,14 @@ impl<'a> SettingsService<'a> {
             // A synchronous store error mutated nothing; a timed-out write may
             // still land, so wait for it and then put the prior value back.
             Err(e) => {
-                if !self.secrets.settle_detached(path).await? {
+                if !self.secrets().settle_detached(path).await? {
                     return Err(e);
                 }
                 e
             }
         };
         for (account, _) in &prior {
-            if let Err(settle_err) = self.secrets.settle_detached(account).await {
+            if let Err(settle_err) = self.secrets().settle_detached(account).await {
                 tracing::warn!(
                     account = %account,
                     error = %failure,
@@ -3497,8 +3708,8 @@ impl<'a> SettingsService<'a> {
         }
         for (account, prior_value) in prior {
             let restored = match prior_value {
-                Some(v) => self.secrets.store(account, &v).await,
-                None => self.secrets.delete(account).await,
+                Some(v) => self.secrets().store(account, &v).await,
+                None => self.secrets().delete(account).await,
             };
             if let Err(restore_err) = restored {
                 tracing::error!(
@@ -3517,7 +3728,7 @@ impl<'a> SettingsService<'a> {
     /// so the classifier that reads next sees token and siblings move together.
     async fn clear_forge_token_secret_siblings(&self, path: &str) -> Result<()> {
         for sibling in forge_token_secret_siblings(path) {
-            self.secrets.delete(sibling).await?;
+            self.secrets().delete(sibling).await?;
         }
         Ok(())
     }
@@ -3536,7 +3747,7 @@ impl<'a> SettingsService<'a> {
             .ok_or_else(|| Error::InvalidParams(format!("unknown setting: {path}")))?;
         let changed = if def.sensitive {
             let _github_guard = if def.path == crate::github_auth_ops::SECRET_ACCOUNT {
-                let mut guard = self.secrets.github_mutation().await?;
+                let mut guard = self.secrets().github_mutation().await?;
                 *guard += 1;
                 Some(guard)
             } else {
@@ -3550,12 +3761,12 @@ impl<'a> SettingsService<'a> {
             // "absent" would skip the delete while the siblings still go.
             let mut changed = false;
             for sibling in forge_token_secret_siblings(def.path) {
-                if self.secrets.load_fresh(sibling).await?.is_some() {
+                if self.secrets().load_fresh(sibling).await?.is_some() {
                     changed = true;
                 }
             }
-            if self.secrets.load_fresh(def.path).await?.is_some() {
-                self.secrets.delete(def.path).await?;
+            if self.secrets().load_fresh(def.path).await?.is_some() {
+                self.secrets().delete(def.path).await?;
                 changed = true;
             }
             self.clear_forge_token_secret_siblings(def.path).await?;
@@ -3564,7 +3775,11 @@ impl<'a> SettingsService<'a> {
             if matches!(reg.origin(def.path), Some(SettingOrigin::Default)) {
                 false
             } else {
-                reg.apply(&[(def.path.to_string(), Value::Null)])?;
+                reg.apply_with_repository_write(
+                    &[(def.path.to_string(), Value::Null)],
+                    self.repository_write.as_deref(),
+                    None,
+                )?;
                 true
             }
         } else if self.store.get_setting(def.path).await?.is_some() {
@@ -3613,6 +3828,106 @@ async fn join_all_pinned<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[intent_test_macros::daemon_test]
+    async fn ordinary_outcome_attests_validation_and_atomic_file_no_effect() {
+        let dir = crate::test_support::test_tempdir("ordinary-settings-no-effect");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let path = dir.path().join("config.toml");
+        let registry = SettingsRegistry::load(&path).unwrap();
+        let secrets = AsyncSecretStore::new(Arc::new(InMemorySecretStore::default()));
+        let service = SettingsService::new(&store, &secrets, Some(&registry));
+        let original = registry.snapshot();
+        let error = service
+            .update_non_secrets_with_outcome(&json!([
+                {"path":"git.autoCommit","value":"invalid"}
+            ]))
+            .await
+            .expect_err("validation must fail");
+        assert!(error.no_effect());
+        assert!(matches!(error.into_error(), Error::InvalidParams(_)));
+        std::fs::rename(&path, dir.path().join("config.saved")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = service
+            .update_non_secrets_with_outcome(&json!([
+                {"path":"git.autoCommit","value":false}
+            ]))
+            .await
+            .expect_err("atomic file replacement must fail");
+        assert!(error.no_effect());
+        assert!(Arc::ptr_eq(&original, &registry.snapshot()));
+        assert_eq!(store.get_setting("git.autoCommit").await.unwrap(), None);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn ordinary_outcome_never_attests_partial_database_writes_as_compensated() {
+        let dir = crate::test_support::test_tempdir("ordinary-settings-partial-db");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = SettingsRegistry::load(dir.path().join("config.toml")).unwrap();
+        sqlx::query("CREATE TRIGGER reject_workspace_rules BEFORE INSERT ON settings WHEN new.key = 'workspaceRules' BEGIN SELECT RAISE(FAIL, 'fixture refusal'); END")
+            .execute(store.write_pool()).await.unwrap();
+        let secrets = AsyncSecretStore::new(Arc::new(InMemorySecretStore::default()));
+        let service = SettingsService::new(&store, &secrets, Some(&registry));
+        let error = service
+            .update_non_secrets_with_outcome(&json!([
+                {"path":"git.autoCommit","value":false},
+                {"path":"userRules","value":{"rule":"landed"}},
+                {"path":"workspaceRules","value":{"rule":"refused"}}
+            ]))
+            .await
+            .expect_err("the later database write must fail");
+        assert!(!error.no_effect());
+        assert!(matches!(error, NonSecretSettingsFailure::Indeterminate(_)));
+        assert_eq!(registry.get("git.autoCommit"), Some(json!(true)));
+        assert_eq!(
+            store.get_setting("userRules").await.unwrap().as_deref(),
+            Some("{\"rule\":\"landed\"}")
+        );
+        assert_eq!(store.get_setting("workspaceRules").await.unwrap(), None);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn ordinary_outcome_preserves_failed_registry_compensation_as_unknown() {
+        let dir = crate::test_support::test_tempdir("ordinary-settings-rollback-failed");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let path = dir.path().join("config.toml");
+        let registry = Arc::new(SettingsRegistry::load(&path).unwrap());
+        sqlx::query("CREATE TRIGGER reject_workspace_rules BEFORE INSERT ON settings WHEN new.key = 'workspaceRules' BEGIN SELECT RAISE(FAIL, 'fixture refusal'); END")
+            .execute(store.write_pool()).await.unwrap();
+        let secrets = Arc::new(AsyncSecretStore::new(Arc::new(
+            InMemorySecretStore::default(),
+        )));
+        let mut notice = registry.subscribe();
+        let held = store.write_pool().acquire().await.unwrap();
+        let task = tokio::spawn({
+            let store = store.clone();
+            let registry = registry.clone();
+            async move {
+                SettingsService::new(&store, &secrets, Some(&registry))
+                    .update_non_secrets_with_outcome(&json!([
+                        {"path":"git.autoCommit","value":false},
+                        {"path":"workspaceRules","value":{"rule":"refused"}}
+                    ]))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), notice.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(registry.get("git.autoCommit"), Some(json!(false)));
+        std::fs::rename(&path, dir.path().join("config.saved")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        drop(held);
+        let error = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect_err("database refusal must trigger failing registry compensation");
+        assert!(!error.no_effect());
+        assert_eq!(registry.get("git.autoCommit"), Some(json!(false)));
+        assert!(path.is_dir());
+    }
 
     #[intent_test_macros::daemon_test]
     async fn provider_default_blanks_keep_write_responses_and_noops_consistent() {
