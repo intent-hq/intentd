@@ -56,9 +56,7 @@ impl Services {
                 .unwrap_or_else(|| "github.com".into()),
             configured: github_configured,
         }];
-        if let Ok(host) =
-            crate::source_control_auth_ops::parse_gitlab_host(&settings.source_control.gitlab.host)
-        {
+        if let Some(host) = self.bound_gitlab_host() {
             repository_connections.push(RepositoryConnection {
                 provider: "gitlab".into(),
                 host: host.host().into(),

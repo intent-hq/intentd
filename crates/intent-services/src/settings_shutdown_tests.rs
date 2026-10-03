@@ -102,7 +102,7 @@ async fn assert_committed_identity_tail_survives_early_close(external: bool) {
             release.notify_one();
             timeout(Duration::from_secs(5), stopped).await.unwrap();
         } else {
-            let guard = services.gitlab_credential_gate.clone().lock_owned().await;
+            let guard = services.gitlab_credential_gate.lock().await;
             let mut request = Box::pin(services.settings_update(json!([
                 {"path":"sourceControl.gitlab.token","value":"new-pat"},
                 {"path":"identity.provider","value":"gitlab"}
@@ -316,9 +316,6 @@ async fn assert_probe_preserves_newer_token_during_get(retry: bool) {
     ] {
         raw.store(key, value).unwrap();
     }
-    let services = services
-        .with_gitlab_secret_store(raw.clone())
-        .with_secret_store(Arc::new(raw.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     services
@@ -337,13 +334,33 @@ async fn assert_probe_preserves_newer_token_during_get(retry: bool) {
             ),
         ])
         .unwrap();
+    // Refresh publication needs the same original paired file store that the
+    // daemon owns. Replacing builders after construction leaves the source
+    // intentionally unqualified; it cannot prove a settled retry response.
+    let services = crate::Services::new_repository_fixture(
+        services.store.clone(),
+        raw.clone(),
+        Some(
+            intent_sourcecontrol::GitlabDescriptor::with_loopback_endpoint(
+                intent_sourcecontrol::GitlabInstance::parse("https://gitlab.race.test").unwrap(),
+                &origin,
+            )
+            .unwrap(),
+        ),
+    )
+    .with_settings_registry(services.settings_registry.as_ref().unwrap().clone())
+    .with_event_bus(bus.clone());
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let refreshes = Arc::new(AtomicUsize::new(0));
+    let rotated_gets = Arc::new(AtomicUsize::new(0));
+    let old_gets = Arc::new(AtomicUsize::new(0));
     let server = tokio::spawn({
         let entered = entered.clone();
         let release = release.clone();
         let refreshes = refreshes.clone();
+        let rotated_gets = rotated_gets.clone();
+        let old_gets = old_gets.clone();
         async move {
             let mut clients = tokio::task::JoinSet::new();
             loop {
@@ -353,6 +370,8 @@ async fn assert_probe_preserves_newer_token_during_get(retry: bool) {
                         let entered = entered.clone();
                         let release = release.clone();
                         let refreshes = refreshes.clone();
+                        let rotated_gets = rotated_gets.clone();
+                        let old_gets = old_gets.clone();
                         clients.spawn(async move {
                             let mut reader = BufReader::new(stream);
                             let mut request = String::new();
@@ -373,12 +392,24 @@ async fn assert_probe_preserves_newer_token_during_get(retry: bool) {
                                 refreshes.fetch_add(1,Ordering::SeqCst);
                                 ("200 OK",json!({"access_token":"rotated-old","refresh_token":"rotated-refresh","expires_in":7200}))
                             } else if request.starts_with("GET /api/v4/personal_access_tokens/self ") {
-                                assert_eq!(token,"newer-pat");
+                                assert!(matches!(token.as_str(), "newer-pat" | "rotated-old" | "old-device"));
                                 ("200 OK",json!({"scopes":["api"]}))
                             } else {
                                 assert!(request.starts_with("GET /api/v4/user "));
                                 if token=="newer-pat" {
                                     ("200 OK",json!({"id":99,"username":"newer-user","name":"Newer User"}))
+                                } else if token == "old-device"
+                                    && old_gets.fetch_add(1, Ordering::SeqCst) == 0
+                                {
+                                    // Cold startup verifies the stored source before this
+                                    // control exercises a later original probe response.
+                                    ("200 OK",json!({"id":42,"username":"original-user","name":"Original User"}))
+                                } else if token == "rotated-old"
+                                    && rotated_gets.fetch_add(1, Ordering::SeqCst) == 0
+                                {
+                                    // Refresh verifies this grant before persistence. The held
+                                    // response below is the later retry, after that writer settles.
+                                    ("200 OK",json!({"id":42,"username":"verified-user","name":"Verified User"}))
                                 } else {
                                     assert!(matches!(token.as_str(),"old-device"|"rotated-old"));
                                     if token==if retry {"rotated-old"} else {"old-device"} {
@@ -397,6 +428,29 @@ async fn assert_probe_preserves_newer_token_during_get(retry: bool) {
             }
         }
     });
+    // Exercise the actual daemon startup attachment/adoption. A file constructor
+    // alone leaves the directory Unverified; it is not an established connection.
+    services
+        .initialize_repository_test_fixture(
+            intent_sourcecontrol::GitlabDescriptor::with_loopback_endpoint(
+                intent_sourcecontrol::GitlabInstance::parse("https://gitlab.race.test").unwrap(),
+                &origin,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let original = services
+        .repository_connection_directory()
+        .binding()
+        .unwrap();
+    assert_eq!(original.account.account_id, "42");
+    assert_eq!(old_gets.load(Ordering::SeqCst), 1);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
+        Some("old-device")
+    );
     let worker = services.clone();
     let probe = intent_core::spawn_daemon(async move {
         worker.source_control_get_user("gitlab".into(), None).await
@@ -404,6 +458,15 @@ async fn assert_probe_preserves_newer_token_during_get(retry: bool) {
     timeout(Duration::from_secs(5), entered.notified())
         .await
         .unwrap();
+    let held_binding = services.repository_connection_directory().binding();
+    eprintln!(
+        "held probe retry={retry} ready={} refreshes={} old_gets={} rotated_gets={}",
+        held_binding.is_ok(),
+        refreshes.load(Ordering::SeqCst),
+        old_gets.load(Ordering::SeqCst),
+        rotated_gets.load(Ordering::SeqCst)
+    );
+    assert_eq!(held_binding.unwrap().account.account_id, "42");
     // This full public mutation must acquire the credential gate and finish its
     // actual persistence while the older real HTTP response remains held.
     let newer = timeout(
@@ -438,13 +501,20 @@ async fn assert_probe_preserves_newer_token_during_get(retry: bool) {
         .unwrap()
         .unwrap()
         .unwrap();
-    if !retry {
-        assert_eq!(result["user"]["login"], "newer-user");
-    }
+    // The original response belongs to its captured source. It cannot adopt
+    // the replacement's identity; a distinct current request can observe it.
+    assert_eq!(result, json!({"user": null}));
+    let current = services
+        .source_control_get_user("gitlab".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(current["user"]["login"], "newer-user");
     services.shutdown_store_writers().await;
     server.abort();
     let _ = server.await;
+    assert_eq!(old_gets.load(Ordering::SeqCst), 2);
     assert_eq!(refreshes.load(Ordering::SeqCst), usize::from(retry));
+    assert_eq!(rotated_gets.load(Ordering::SeqCst), 2 * usize::from(retry));
     assert_eq!(
         raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
         Some("newer-pat")

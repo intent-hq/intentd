@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use intent_core::settings_file::{LegacySettings, SettingsFile};
@@ -40,6 +40,10 @@ use intent_core::{Error, Result};
 use serde_json::Value;
 use tokio::sync::watch;
 use toml_edit::DocumentMut;
+
+use crate::source_control_auth_ops::repository_owner::{
+    GitlabCredentialGate, RepositorySettingsWrite, RepositoryWrite,
+};
 
 /// Every TOML-backed setting, addressed by its dotted wire path. Mirrors the
 /// [`SettingsFile`] schema leaf-for-leaf (maps such as `providers.paths` are
@@ -91,6 +95,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "sourceControl.github.oauthClientId",
     "sourceControl.github.exposeGitCredentialToChildren",
     "sourceControl.gitlab.host",
+    "sourceControl.gitlab.instanceBaseUrl",
     "sourceControl.gitlab.oauthClientId",
     "sourceControl.gitlab.apiBaseUrl",
     "identity.provider",
@@ -315,13 +320,80 @@ impl SettingsSnapshot {
 
 /// Layered runtime settings store. See the module docs for the full contract.
 pub struct SettingsRegistry {
+    repository_gate: OnceLock<GitlabCredentialGate>,
+    #[cfg(test)]
+    pub(crate) context_publication_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     path: PathBuf,
     inner: Mutex<Inner>,
     snapshot: RwLock<Arc<SettingsSnapshot>>,
     tx: watch::Sender<SettingsChanged>,
 }
 
+/// Fully parsed candidate tied to the snapshot it was prepared from. The
+/// original caller must acquire credential gates before the revision gate.
+pub(crate) struct PreparedRepositorySettings {
+    expected: Arc<SettingsSnapshot>,
+    candidate: Inner,
+    snapshot: Arc<SettingsSnapshot>,
+}
+impl PreparedRepositorySettings {
+    pub(crate) fn snapshot(&self) -> &SettingsSnapshot {
+        &self.snapshot
+    }
+}
+
 impl SettingsRegistry {
+    pub(crate) fn install_repository_boundary(&self, gate: GitlabCredentialGate) -> Result<()> {
+        self.repository_gate
+            .set(gate)
+            .map_err(|_| Error::Internal("repository settings boundary already installed".into()))
+    }
+
+    pub(crate) fn preview(&self, changes: &[(String, Value)]) -> Result<Arc<SettingsSnapshot>> {
+        let inner = self.inner.lock().expect("settings registry lock poisoned");
+        Self::validate_changes(&inner, changes).map(|(_, _, snapshot)| snapshot)
+    }
+
+    fn before_repository_publication(
+        &self,
+        snapshot: &SettingsSnapshot,
+        write: Option<&RepositorySettingsWrite>,
+        auth: Option<&RepositoryWrite>,
+    ) -> Result<()> {
+        // Every caller holds the existing registry writer lock. Compare the
+        // actual effective block, including pins, at publication time.
+        let old = self.snapshot();
+        if old.effective.source_control.gitlab != snapshot.effective.source_control.gitlab
+            && snapshot
+                .effective
+                .source_control
+                .gitlab
+                .instance_base_url
+                .is_some()
+        {
+            crate::source_control_auth_ops::repository_owner::logical_instance(
+                &snapshot.effective.source_control.gitlab,
+            )?;
+        }
+        if let Some(gate) = self.repository_gate.get() {
+            gate.before_settings_publication(&old, snapshot, write, auth)?;
+        }
+        Ok(())
+    }
+
+    fn repository_published(&self, snapshot: &SettingsSnapshot) {
+        if let Some(gate) = self.repository_gate.get() {
+            gate.settings_published(snapshot);
+        }
+        #[cfg(test)]
+        {
+            let probe = self.context_publication_probe.lock().unwrap().take();
+            if let Some(probe) = probe {
+                probe();
+            }
+        }
+    }
+
     /// Load (or initialize) `config.toml` at `path` and build the registry.
     /// Missing file ⇒ the fully-commented default template is written first
     /// (via [`SettingsFile::load_or_init_with_legacy`]); malformed file ⇒
@@ -355,6 +427,9 @@ impl SettingsRegistry {
         let snapshot = Arc::new(build_snapshot(&inner)?);
         let (tx, _rx) = watch::channel(SettingsChanged::default());
         Ok(Self {
+            repository_gate: OnceLock::new(),
+            #[cfg(test)]
+            context_publication_probe: Mutex::new(None),
             path,
             inner: Mutex::new(inner),
             snapshot: RwLock::new(snapshot),
@@ -426,6 +501,27 @@ impl SettingsRegistry {
             .clone()
     }
 
+    /// Optional delivery compares the ORIGINAL allocation under the same read
+    /// guard through its pure consuming action. Never take the writer/inner or
+    /// credential gates here; writers release P metadata before snapshot.write.
+    pub(crate) fn with_original_snapshot<T>(
+        &self,
+        original: &Arc<SettingsSnapshot>,
+        action: impl FnOnce(bool) -> T,
+    ) -> T {
+        let guard = self.snapshot.try_read();
+        let current = guard
+            .as_ref()
+            .is_ok_and(|value| Arc::ptr_eq(value, original));
+        action(current)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context_hold_snapshot_for_test(&self, action: impl FnOnce()) {
+        let _guard = self.snapshot.write().unwrap();
+        action();
+    }
+
     /// Effective JSON value for a dotted wire path (see
     /// [`SettingsSnapshot::get`]).
     pub fn get(&self, path: &str) -> Option<Value> {
@@ -494,6 +590,16 @@ impl SettingsRegistry {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn pin(&self, path: &str, value: Value, flag: &str) -> Result<()> {
+        self.pin_with_repository_write(path, value, flag, None)
+    }
+
+    pub(crate) fn pin_with_repository_write(
+        &self,
+        path: &str,
+        value: Value,
+        flag: &str,
+        write: Option<&RepositorySettingsWrite>,
+    ) -> Result<()> {
         if !KNOWN_PATHS.contains(&path) {
             return Err(Error::InvalidParams(format!("unknown setting: {path}")));
         }
@@ -504,14 +610,22 @@ impl SettingsRegistry {
         }
         json_set(&mut json, path, value.clone());
         typed_from_json(json, path)?;
-        inner.pins.insert(
+        let mut candidate = inner.clone();
+        candidate.pins.insert(
             path.to_string(),
             Pin {
                 value,
                 flag: flag.to_string(),
             },
         );
-        self.swap_snapshot(&inner)?;
+        let snapshot = Arc::new(build_snapshot(&candidate)?);
+        self.before_repository_publication(&snapshot, write, None)?;
+        *inner = candidate;
+        self.repository_published(&snapshot);
+        *self
+            .snapshot
+            .write()
+            .expect("settings snapshot lock poisoned") = snapshot;
         Ok(())
     }
 
@@ -533,12 +647,22 @@ impl SettingsRegistry {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn apply(&self, changes: &[(String, Value)]) -> Result<SettingsChanged> {
+        self.apply_with_repository_write(changes, None, None)
+    }
+
+    pub(crate) fn apply_with_repository_write(
+        &self,
+        changes: &[(String, Value)],
+        write: Option<&RepositorySettingsWrite>,
+        auth: Option<&RepositoryWrite>,
+    ) -> Result<SettingsChanged> {
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
         let (mut candidate, text, snapshot) = Self::validate_changes(&inner, changes)?;
+        self.before_repository_publication(&snapshot, write, auth)?;
         atomic_write(&self.path, &text)?;
         candidate.record_write(&text);
         *inner = candidate;
-
+        self.repository_published(&snapshot);
         Ok(self.publish_snapshot(snapshot, inner.generation))
     }
 
@@ -649,6 +773,19 @@ impl SettingsRegistry {
             other => other,
         })?;
         let snapshot = Arc::new(build_snapshot(&candidate)?);
+        if build_snapshot(inner)?.effective.source_control.gitlab
+            != snapshot.effective.source_control.gitlab
+            && snapshot
+                .effective
+                .source_control
+                .gitlab
+                .instance_base_url
+                .is_some()
+        {
+            crate::source_control_auth_ops::repository_owner::logical_instance(
+                &snapshot.effective.source_control.gitlab,
+            )?;
+        }
         Ok((candidate, text, snapshot))
     }
 
@@ -667,6 +804,22 @@ impl SettingsRegistry {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn reload(&self, text: &str) -> Result<SettingsChanged> {
+        let prepared = self.prepare_repository_reload(text)?;
+        self.publish_repository_reload(prepared, None)
+    }
+
+    pub(crate) fn prepare_repository_reload(
+        &self,
+        text: &str,
+    ) -> Result<PreparedRepositorySettings> {
+        self.prepare_repository_reload_at(text, self.snapshot())
+    }
+
+    pub(crate) fn prepare_repository_reload_at(
+        &self,
+        text: &str,
+        expected: Arc<SettingsSnapshot>,
+    ) -> Result<PreparedRepositorySettings> {
         let mut doc: DocumentMut = text
             .parse()
             .map_err(|e| Error::InvalidInput(format!("invalid config.toml: {e}")))?;
@@ -680,23 +833,55 @@ impl SettingsRegistry {
             SettingsFile::parse_str(text)?
         };
         sync_normalized_compounds(&mut doc, &file)?;
-        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
-        inner.file = file;
-        inner.doc = doc;
-        inner.source_text = text.to_string();
-        // The accepted external edit supersedes every earlier self-write:
-        // clear the history so a later external edit that happens to match
-        // earlier self-written bytes (e.g. a manual revert) is not
-        // misclassified as a self-write and skipped by the watcher.
-        inner.recent_writes.clear();
-        self.publish(&inner)
+        let inner = self.inner.lock().expect("settings registry lock poisoned");
+        // A watcher captures this identity before reading the file. Preparing
+        // older text against a snapshot published during that read would let a
+        // later reload overwrite an already completed settings.update.
+        if !Arc::ptr_eq(&expected, &self.snapshot()) {
+            return Err(Error::Internal(
+                "config snapshot changed after the reload was captured".into(),
+            ));
+        }
+        let mut candidate = inner.clone();
+        candidate.file = file;
+        candidate.doc = doc;
+        candidate.source_text = text.to_string();
+        candidate.recent_writes.clear();
+        let snapshot = Arc::new(build_snapshot(&candidate)?);
+        if expected.effective.source_control.gitlab != snapshot.effective.source_control.gitlab
+            && snapshot
+                .effective
+                .source_control
+                .gitlab
+                .instance_base_url
+                .is_some()
+        {
+            crate::source_control_auth_ops::repository_owner::logical_instance(
+                &snapshot.effective.source_control.gitlab,
+            )?;
+        }
+        Ok(PreparedRepositorySettings {
+            expected,
+            candidate,
+            snapshot,
+        })
     }
 
-    /// Rebuild the snapshot from `inner`, diff effective values against the
-    /// previous snapshot, swap, and broadcast when anything changed.
-    fn publish(&self, inner: &Inner) -> Result<SettingsChanged> {
-        let snapshot = Arc::new(build_snapshot(inner)?);
-        Ok(self.publish_snapshot(snapshot, inner.generation))
+    pub(crate) fn publish_repository_reload(
+        &self,
+        prepared: PreparedRepositorySettings,
+        write: Option<&RepositorySettingsWrite>,
+    ) -> Result<SettingsChanged> {
+        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        if !Arc::ptr_eq(&prepared.expected, &self.snapshot()) {
+            return Err(Error::Internal(
+                "prepared config snapshot changed before publication".into(),
+            ));
+        }
+        self.before_repository_publication(&prepared.snapshot, write, None)?;
+        *inner = prepared.candidate;
+        self.repository_published(&prepared.snapshot);
+        Ok(self.publish_snapshot(prepared.snapshot, inner.generation))
     }
 
     /// Install an already validated snapshot without fallible work after a
@@ -724,16 +909,6 @@ impl SettingsRegistry {
             self.tx.send_replace(notice.clone());
         }
         notice
-    }
-
-    /// Rebuild + install the read snapshot; returns the new snapshot.
-    fn swap_snapshot(&self, inner: &Inner) -> Result<Arc<SettingsSnapshot>> {
-        let snapshot = Arc::new(build_snapshot(inner)?);
-        *self
-            .snapshot
-            .write()
-            .expect("settings snapshot lock poisoned") = snapshot.clone();
-        Ok(snapshot)
     }
 }
 

@@ -1784,7 +1784,9 @@ async fn shared_discovery_repair_authorization_changes_during_monitor_poll() {
     );
     let cached = svc.pr_cache.lock().unwrap();
     assert_ne!(
-        cached[&pr_key_for(&repo, 10978)]
+        cached[&super::super::qualified_cache::CacheKey::Legacy(pr_key_for(&repo, 10978))]
+            .legacy()
+            .unwrap()
             .entry
             .as_ref()
             .unwrap()

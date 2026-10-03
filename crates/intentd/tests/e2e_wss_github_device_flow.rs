@@ -39,6 +39,121 @@ const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc
 const USER_CODE: &str = "WXYZ-4321";
 const ACCESS_TOKEN: &str = "gho_e2e_device_flow_token";
 
+/// Process containment survives ordinary settings changes and the original
+/// authenticated RPC paths. The production login host is retained for revoke
+/// (which performs no HTTP), while all auth probes use the owned local API.
+#[tokio::test]
+async fn disabled_gh_credentials_survive_settings_and_revoke_over_wss() {
+    use std::os::unix::fs::PermissionsExt;
+    let mock = spawn_mock_github().await;
+    let dir = temp_data_dir();
+    let data = dir.path();
+    let bin = data.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_RECORD\"\nexit 71\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let workspaces = data.join("workspaces");
+    std::fs::create_dir(&workspaces).unwrap();
+    let log = std::fs::File::create(data.join("daemon.log")).unwrap();
+    common::enable_ws_api(data);
+    let mut command = common::serve_command();
+    common::hermetic_github_identity(&mut command, data);
+    command
+        .env("HOME", data)
+        .env("INTENTD_DATA_DIR", data)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces)
+        .env("INTENTD_SECRETS_FILE", data.join("secrets.json"))
+        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
+        .env("INTENTD_LEGACY_APP_DIR", "")
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_DISABLE_GH_CREDENTIALS", "1")
+        .env("INTENTD_GITHUB_LOGIN_BASE_URI", "https://github.com")
+        .env("INTENTD_GITHUB_API_BASE_URI", &mock.base_uri)
+        .env("GH_RECORD", data.join("gh-calls"))
+        .env(
+            "PATH",
+            std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            )))
+            .unwrap(),
+        )
+        .env_remove("GH_HOST")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log));
+    let mut daemon = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
+    let socket = data.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut rpc = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    for (i, source) in ["gh-cli", "auto", "explicit"].into_iter().enumerate() {
+        let id = i64::try_from(i).unwrap() * 10;
+        let changed = wss_rpc(
+            &mut rpc,
+            id + 1,
+            "settings.update",
+            json!({"changes":[{"path":"sourceControl.github.tokenSource","value":source}]}),
+        )
+        .await;
+        assert!(changed.get("error").is_none(), "{changed}");
+        let auth = wss_rpc(&mut rpc, id + 2, "github.authStatus", json!({})).await;
+        assert_eq!(auth["result"]["isConfigured"], false, "{auth}");
+        let auth = wss_rpc(
+            &mut rpc,
+            id + 3,
+            "sourceControl.authStatus",
+            json!({"provider":"github"}),
+        )
+        .await;
+        assert_eq!(auth["result"]["isConfigured"], false, "{auth}");
+    }
+    let changed = wss_rpc(
+        &mut rpc,
+        40,
+        "settings.update",
+        json!({"changes":[{"path":"sourceControl.github.token","value":ACCESS_TOKEN}]}),
+    )
+    .await;
+    assert!(changed.get("error").is_none(), "{changed}");
+    assert!(!changed.to_string().contains(ACCESS_TOKEN));
+    // The legacy authStatus registry ignores the local API override.
+    // Prove the explicit credential through the original local getUser path.
+    let requests = mock.user_requests.load(Ordering::SeqCst);
+    let auth = wss_rpc(&mut rpc, 41, "github.getUser", json!({})).await;
+    assert_eq!(auth["result"]["user"]["login"], "octocat", "{auth}");
+    assert!(mock.user_requests.load(Ordering::SeqCst) > requests);
+    assert!(!auth.to_string().contains(ACCESS_TOKEN));
+    let revoked = wss_rpc(&mut rpc, 42, "github.revoke", json!({})).await;
+    assert_eq!(revoked["result"]["ok"], true, "{revoked}");
+    let auth = wss_rpc(&mut rpc, 43, "github.authStatus", json!({})).await;
+    assert_eq!(auth["result"]["isConfigured"], false, "{auth}");
+    rpc.close(None).await.unwrap();
+    daemon.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
+    let exit = daemon
+        .wait_with_timeout(Duration::from_secs(10))
+        .unwrap()
+        .expect("owned daemon stopped");
+    assert!(exit.success(), "{exit}");
+    assert!(
+        !data.join("gh-calls").exists(),
+        "installed-CLI substitute was invoked"
+    );
+    assert!(!std::fs::read_to_string(data.join("daemon.log"))
+        .unwrap()
+        .contains(ACCESS_TOKEN));
+}
+
 struct Daemon {
     child: Child,
 }
