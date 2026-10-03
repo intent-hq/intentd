@@ -9890,7 +9890,7 @@ impl AgentManager {
             .map(|started| started.session_id)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn ensure_started_with_codex_node(
         &self,
         agent_id: &AgentId,
