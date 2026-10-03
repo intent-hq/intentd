@@ -189,6 +189,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "host.executionContext",
     "host.invite.list",
     "host.invite.revoke",
+    "host.invite.searchAccounts",
     "host.members.list",
     "host.members.remove",
     "identity.authStatus",

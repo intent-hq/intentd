@@ -186,13 +186,14 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// (`script.archive`, `script.restore`).
 /// Durable script monitors (protocol 12.1): +3 router methods.
 /// Protocol 13.0 removes the deprecated git.commit router method.
-const EXPECTED_TOTAL_METHODS: usize = 404;
+// Invitation account search adds one owner-only router method.
+const EXPECTED_TOTAL_METHODS: usize = 405;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
-const EXPECTED_ROUTER_METHODS: usize = 349;
+const EXPECTED_ROUTER_METHODS: usize = 350;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 55;
@@ -680,6 +681,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "host.invite.create",
     "host.invite.list",
     "host.invite.revoke",
+    "host.invite.searchAccounts",
     "host.listDirectory",
     "host.listInstalledEditors",
     "host.members.list",
@@ -1245,6 +1247,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "host.invite.create",
     "host.invite.list",
     "host.invite.revoke",
+    "host.invite.searchAccounts",
     "host.listDirectory",
     "host.listInstalledEditors",
     "host.members.list",
@@ -1853,6 +1856,10 @@ mod unbound_owner_only_methods {
             ("hook.runNow", json!({ "workspaceId": ws, "hookId": "h1" })),
             ("host.executionContext", json!({})),
             ("host.invite.list", json!({})),
+            (
+                "host.invite.searchAccounts",
+                json!({"provider":"github","query":"ab"}),
+            ),
             ("host.invite.revoke", json!({ "inviteId": "missing" })),
             ("host.members.list", json!({})),
             ("host.members.remove", json!({"principalId":"missing"})),
@@ -2466,6 +2473,7 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "host.invite.create",
         "host.invite.list",
         "host.invite.revoke",
+        "host.invite.searchAccounts",
         "host.listDirectory",
         "host.listInstalledEditors",
         "host.members.list",
