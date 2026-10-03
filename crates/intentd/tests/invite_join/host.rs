@@ -203,12 +203,13 @@ async fn exercise_host_join(provider: &str, credentials: &[(&str, &str)]) {
         "host.invite.list",
         "host.invite.create",
         "host.invite.revoke",
+        "host.invite.searchAccounts",
     ] {
         let refused = wss_rpc(
             &mut member,
             209,
             method,
-            json!({"inviteId":id,"pinLogin":"gh-guest","pinProvider":"github"}),
+            json!({"inviteId":id,"pinLogin":"gh-guest","pinProvider":"github","provider":"github","query":"gh"}),
         )
         .await;
         assert_eq!(refused["error"]["code"], -32003, "{method}: {refused}");
@@ -481,12 +482,13 @@ async fn guest_upgrades_to_host_member_with_same_principal_and_bearer_over_wss()
         "host.invite.list",
         "host.invite.create",
         "host.invite.revoke",
+        "host.invite.searchAccounts",
     ] {
         let frame = wss_rpc(
             &mut device,
             404,
             method,
-            json!({"inviteId":id,"pinProvider":"gitlab","pinLogin":GUEST_GL_LOGIN}),
+            json!({"inviteId":id,"pinProvider":"gitlab","pinLogin":GUEST_GL_LOGIN,"provider":"gitlab","query":"gl"}),
         )
         .await;
         assert_eq!(frame["error"]["code"], -32003, "{method}: {frame}");
@@ -570,4 +572,139 @@ async fn guest_upgrades_to_host_member_with_same_principal_and_bearer_over_wss()
     assert_eq!(me["hostRole"], "member");
     assert_eq!(me["isAdministrator"], false);
     assert_eq!(me["id"], json!(person));
+}
+
+#[tokio::test]
+async fn invitation_account_search_over_wss_is_public_and_provider_qualified() {
+    let mock = spawn_mock_forge().await;
+    let host = boot(&mock, &[]).await;
+    let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
+    for (provider, login, id) in [
+        ("github", "gh-guest", 9001),
+        ("gitlab", GUEST_GL_LOGIN, GUEST_GL_ID),
+    ] {
+        let result = result(
+            &wss_rpc(
+                &mut owner,
+                500,
+                "host.invite.searchAccounts",
+                json!({"provider":provider,"query":" @gh ","limit":1}),
+            )
+            .await,
+            500,
+        );
+        let forge_host = if provider == "github" {
+            "github.com"
+        } else {
+            "gitlab.com"
+        };
+        assert_eq!(result["users"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            result["users"][0],
+            json!({"identity":{"provider":provider,"host":forge_host,"externalUserId":id.to_string()},"login":login,"name":format!("{login} name"),"avatarUrl":if provider=="github" {format!("https://avatars.example/u/{id}")} else {format!("https://gitlab.example/avatar/{id}")}})
+        );
+    }
+    assert_eq!(
+        result(
+            &wss_rpc(&mut owner, 501, "host.invite.list", json!({})).await,
+            501
+        ),
+        json!({"invites":[]})
+    );
+    for params in [
+        json!({"provider":"github"}),
+        json!({"provider":"gitlab","query":"ab","host":"https://evil.example/path"}),
+        json!({"provider":"github","query":"ab","host":"gitlab.com"}),
+        json!({"provider":"gitlab","query":"a OR b"}),
+        json!({"provider":"gitlab","query":"ab","limit":11}),
+    ] {
+        let response = wss_rpc(&mut owner, 502, "host.invite.searchAccounts", params).await;
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+    }
+    let custom = "gitlab.custom.example:8443";
+    result(
+        &wss_rpc(
+            &mut owner,
+            503,
+            "settings.update",
+            json!({"changes":[{"path":"sourceControl.gitlab.host","value":custom}]}),
+        )
+        .await,
+        503,
+    );
+    let response = result(
+        &wss_rpc(
+            &mut owner,
+            504,
+            "host.invite.searchAccounts",
+            json!({"provider":"gitlab","host":" GitLab.Custom.Example:8443 ","query":"gl"}),
+        )
+        .await,
+        504,
+    );
+    assert_eq!(
+        response["users"][0]["identity"],
+        json!({"provider":"gitlab","host":custom,"externalUserId":GUEST_GL_ID.to_string()})
+    );
+}
+
+#[tokio::test]
+async fn invitation_account_search_over_wss_preserves_directory_errors_and_bound_fallback() {
+    let mock = spawn_mock_forge().await;
+    let host = boot(&mock, &[]).await;
+    let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
+    for (status, code) in [
+        (401, Some("identity-unverifiable")),
+        (403, Some("identity-unverifiable")),
+        (429, Some("rate-limited")),
+        (404, None),
+        (503, None),
+    ] {
+        mock.user_lookup_status.store(status, Ordering::SeqCst);
+        let frame = wss_rpc(
+            &mut owner,
+            510,
+            "host.invite.searchAccounts",
+            json!({"provider":"gitlab","query":"gl"}),
+        )
+        .await;
+        assert_eq!(frame["jsonrpc"], "2.0");
+        assert_eq!(frame["id"], 510);
+        assert_eq!(frame["error"]["code"], -32603, "{frame}");
+        assert!(frame.get("result").is_none());
+        if let Some(code) = code {
+            assert_eq!(frame["error"]["data"]["code"], code);
+        }
+        if status == 401 || status == 403 {
+            assert_eq!(frame["error"]["data"]["host"], HOST);
+        }
+    }
+    mock.user_lookup_status.store(401, Ordering::SeqCst);
+    let connected = boot(&mock, &[("GITLAB_TOKEN", HOST_GL_PAT)]).await;
+    let mut connected_owner = connect_ws(connected.port, connected.cfg.clone(), TOKEN).await;
+    let response = result(
+        &wss_rpc(
+            &mut connected_owner,
+            511,
+            "host.invite.searchAccounts",
+            json!({"provider":"gitlab","query":"gl"}),
+        )
+        .await,
+        511,
+    );
+    assert_eq!(
+        response["users"][0]["identity"],
+        gitlab_identity(GUEST_GL_ID)
+    );
+    let response = result(
+        &wss_rpc(
+            &mut connected_owner,
+            512,
+            "host.invite.searchAccounts",
+            json!({"provider":"github","query":"gh"}),
+        )
+        .await,
+        512,
+    );
+    assert_eq!(response["users"][0]["identity"], github_identity(9001));
 }

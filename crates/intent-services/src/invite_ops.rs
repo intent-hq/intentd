@@ -49,6 +49,7 @@ use intent_store::{
     HostInviteJoinOutcome, HostJoinCredential, InviteInsertOutcome, InviteJoinOutcome,
 };
 
+mod account_search;
 mod host;
 use host::ScopedInvite;
 use serde_json::{json, Value};

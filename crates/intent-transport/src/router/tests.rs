@@ -1361,6 +1361,20 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn host_invite_search_accounts(
+        &self,
+        provider: String,
+        host: Option<String>,
+        query: String,
+        limit: Option<u8>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(
+                serde_json::json!({"provider":provider,"host":host,"query":query,"limit":limit,"users":[]}),
+            )
+        })
+    }
+
     fn github_users_search(
         &self,
         query: String,
@@ -7813,5 +7827,34 @@ async fn agent_create_validates_and_forwards_remember_specialist() {
         let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"workspaceId":"ws-1","rememberSpecialist":value}});
         let response = call(&request.to_string()).await.unwrap();
         assert_eq!(err_code(&response), -32602);
+    }
+}
+
+#[tokio::test]
+async fn invitation_account_search_routes_and_rejects_malformed_params() {
+    let params =
+        serde_json::json!({"provider":"gitlab","host":"custom.example","query":"al","limit":3});
+    let frame=call(&serde_json::json!({"jsonrpc":"2.0","id":71,"method":"host.invite.searchAccounts","params":params}).to_string()).await.unwrap();
+    assert_eq!(
+        frame["result"],
+        serde_json::json!({"provider":"gitlab","host":"custom.example","query":"al","limit":3,"users":[]})
+    );
+    for patch in [
+        serde_json::json!({"provider":null}),
+        serde_json::json!({"query":3}),
+        serde_json::json!({"host":4}),
+        serde_json::json!({"limit":null}),
+        serde_json::json!({"limit":0}),
+        serde_json::json!({"limit":11}),
+        serde_json::json!({"limit":-1}),
+        serde_json::json!({"limit":1.5}),
+        serde_json::json!({"limit":"3"}),
+    ] {
+        let mut invalid = params.clone();
+        for (k, v) in patch.as_object().unwrap() {
+            invalid[k] = v.clone();
+        }
+        let frame=call(&serde_json::json!({"jsonrpc":"2.0","id":71,"method":"host.invite.searchAccounts","params":invalid}).to_string()).await.unwrap();
+        assert_eq!(err_code(&frame), -32602, "{invalid}");
     }
 }

@@ -776,6 +776,24 @@ async fn dispatch(
             .await
             .map_err(domain_to_rpc),
         "host.executionContext" => api.host_execution_context().await.map_err(domain_to_rpc),
+        "host.invite.searchAccounts" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let query = require_str_param(params, "query")?;
+            let limit = params
+                .get("limit")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .filter(|n| (1..=10).contains(n))
+                        .map(|n| u8::try_from(n).expect("bounded limit"))
+                        .ok_or_else(|| invalid_params("limit must be an integer from 1 to 10"))
+                })
+                .transpose()?;
+            api.host_invite_search_accounts(provider, host, query, limit)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
         "host.invite.revoke" => api
             .host_invite_revoke(require_str_param(params, "inviteId")?)
