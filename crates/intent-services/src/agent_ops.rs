@@ -6667,26 +6667,36 @@ impl Services {
         let version_key = antigravity
             .as_ref()
             .map_or_else(|| (source.version_key)(), |s| s.version_key.clone());
-        let resolved = crate::model_catalog::resolve_with_cache(
-            &self.models_catalog,
-            &provider_id,
-            &version_key,
-            force_refresh,
-            crate::model_catalog::ModelCatalogCache::now_ms(),
-            move || {
-                if let Some(antigravity) = antigravity {
-                    Box::pin(async move {
-                        crate::model_catalog::from_provider_fetch(
-                            crate::provider_models::fetch_antigravity_models_at(antigravity.binary)
+        let resolved = if intent_providers::installed_cli::InstalledCli::for_provider(&provider_id)
+            .is_some()
+        {
+            self.models_catalog
+                .resolve_installed(&provider_id, force_refresh)
+                .await
+        } else {
+            crate::model_catalog::resolve_with_cache(
+                &self.models_catalog,
+                &provider_id,
+                &version_key,
+                force_refresh,
+                crate::model_catalog::ModelCatalogCache::now_ms(),
+                move || {
+                    if let Some(antigravity) = antigravity {
+                        Box::pin(async move {
+                            crate::model_catalog::from_provider_fetch(
+                                crate::provider_models::fetch_antigravity_models_at(
+                                    antigravity.binary,
+                                )
                                 .await,
-                        )
-                    })
-                } else {
-                    (source.fetch)()
-                }
-            },
-        )
-        .await;
+                            )
+                        })
+                    } else {
+                        (source.fetch)()
+                    }
+                },
+            )
+            .await
+        };
         match resolved.models {
             Some(models) => {
                 let mut out =

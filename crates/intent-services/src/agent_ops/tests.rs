@@ -9454,11 +9454,15 @@ async fn set_model_normalizes_legacy_provider_aliases() {
 /// against the session provider — proving the param changes the outcome.
 #[tokio::test]
 async fn set_model_bare_model_with_explicit_provider_id() {
-    let (_t, svc, ws) = setup().await;
+    let (tmp, svc, ws) = setup().await;
     // The cross-provider switch below runs the availability gate against the
     // target, so pin claude-code to a deterministic executable rather than
     // depending on whether the test host happens to have it installed.
     seed_provider_path(&svc, "claude-code");
+    #[cfg(unix)]
+    let _cli_env = crate::test_support::installed_cli_env(tmp.path.parent().unwrap(), "claude");
+    #[cfg(not(unix))]
+    let _fixture_owner = tmp;
     // Warm caches: claude-code claims `haiku`, auggie's catalog lacks it.
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog.test_store(

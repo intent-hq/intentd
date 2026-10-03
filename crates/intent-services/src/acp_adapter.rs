@@ -180,7 +180,10 @@ pub fn live_adapters() -> usize {
 }
 
 /// How to launch an ephemeral ACP adapter.
+#[derive(Clone)]
 pub(crate) struct AcpAdapterCommand {
+    installed_cli: Option<intent_providers::installed_cli::InstalledCli>,
+    installed: Option<Arc<PreparedInstalled>>,
     program: PathBuf,
     args: Vec<String>,
     envs: Vec<(String, OsString)>,
@@ -197,6 +200,157 @@ pub(crate) struct AcpAdapterCommand {
 }
 
 impl AcpAdapterCommand {
+    fn command_in(&self, process_cwd: &std::path::Path) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.program);
+        command
+            .args(&self.args)
+            .current_dir(process_cwd)
+            .env("PATH", enhanced_path(Some(&self.program)))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        for (key, value) in &self.envs {
+            command.env(key, value);
+        }
+        for key in &self.envs_removed {
+            command.env_remove(key);
+        }
+        // An inherited npm workspace selector (`npm_config_workspace` and its
+        // case variants) makes npm reject `--workspaces=false` before the adapter
+        // starts (intent-hq/intent#5738); scrub it after every env merge, for the
+        // npx bootstrap only.
+        if self.via_npx {
+            let explicit = self.envs.iter().map(|(key, _)| key.as_str());
+            for key in npm_workspace_selector_env_keys(explicit) {
+                command.env_remove(key);
+            }
+        }
+        #[cfg(unix)]
+        command.process_group(0);
+
+        command
+    }
+
+    pub(crate) async fn prepare_installed(self) -> Result<Self, String> {
+        let Some(cli) = self.installed_cli else {
+            return Ok(self);
+        };
+        if self.installed.is_some() {
+            return Ok(self);
+        }
+        let context = crate::installed_cli::InstalledContext::discover(cli).await?;
+        self.prepare_with_context(context).await
+    }
+
+    pub(crate) async fn prepare_installed_catalog(self) -> Result<Self, String> {
+        let cli = self
+            .installed_cli
+            .ok_or("catalog requires an installed CLI")?;
+        let context = crate::installed_cli::InstalledContext::discover(cli)
+            .await?
+            .with_catalog_fingerprint()
+            .await?;
+        self.prepare_with_context(context).await
+    }
+
+    pub(crate) async fn prepare_with_context(
+        mut self,
+        context: crate::installed_cli::InstalledContext,
+    ) -> Result<Self, String> {
+        let cli = context.runtime.cli();
+        self.installed_cli = Some(cli);
+        let context_for_home = context.clone();
+        let root = self.npx_launch_root.clone();
+        let via_npx = self.via_npx;
+        let (npx_dir, codex_home) = tokio::task::spawn_blocking(move || {
+            let npx_dir = if via_npx {
+                Some(Arc::new(NpxLaunchDir::create(root.as_deref())?))
+            } else {
+                None
+            };
+            let codex_home = if cli == intent_providers::installed_cli::InstalledCli::Codex {
+                Some(Arc::new(crate::provider_models::isolated_codex_home(
+                    context_for_home.codex_home().as_deref(),
+                )?))
+            } else {
+                None
+            };
+            Ok::<_, std::io::Error>((npx_dir, codex_home))
+        })
+        .await
+        .map_err(|_| "installed CLI isolation task failed")?
+        .map_err(|e| format!("installed CLI isolation failed: {e}"))?;
+        let cwd = npx_dir
+            .as_ref()
+            .map_or_else(|| self.working_dir(), |d| d.path().to_owned());
+        let mut command = self.command_in(&cwd);
+        if let Some(home) = &codex_home {
+            command.env("CODEX_HOME", home.path());
+        }
+        context.apply(&mut command);
+        // Own the profile until bounded version cleanup finishes, even if the
+        // caller cancels while waiting for the version child.
+        self.installed = Some(
+            intent_core::caller::spawn_with_current_caller(async move {
+                let dependency = crate::codex_diagnostics::process::ProbeDependency::hold((
+                    npx_dir.clone(),
+                    codex_home.clone(),
+                ));
+                let (identity, _version) = context
+                    .observe_with_dependency(&command, Some(dependency))
+                    .await?;
+                let env = command
+                    .as_std()
+                    .get_envs()
+                    .map(|(k, v)| (k.to_owned(), v.map(std::ffi::OsStr::to_owned)))
+                    .collect();
+                Ok::<_, String>(Arc::new(PreparedInstalled {
+                    context,
+                    identity,
+                    env,
+                    cwd,
+                    npx_dir,
+                    _codex_home: codex_home,
+                }))
+            })
+            .await
+            .map_err(|_| "installed CLI preparation task failed")??,
+        );
+        Ok(self)
+    }
+
+    pub(crate) fn installed_key(&self) -> Option<String> {
+        self.installed
+            .as_ref()
+            .and_then(|p| p.context.key(&p.identity))
+    }
+
+    pub(crate) async fn installed_still_current(&self) -> bool {
+        let Some(p) = self.installed.clone() else {
+            return true;
+        };
+        let mut command = self.command_in(&p.cwd);
+        p.apply(&mut command);
+        intent_core::caller::spawn_with_current_caller(async move {
+            p.context
+                .still_current(
+                    &p.identity,
+                    &command,
+                    crate::codex_diagnostics::process::ProbeDependency::hold(p.clone()),
+                )
+                .await
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    pub(crate) fn probe_session_meta(&self) -> Option<Value> {
+        (self.installed_cli == Some(intent_providers::installed_cli::InstalledCli::Claude))
+            .then(|| crate::complete_ops::one_shot_session_shape("claude-code", "", None).1)
+            .flatten()
+    }
+
     /// Check the selected npx runtime before launch. Direct adapters never
     /// depend on npx, even when a stale installation is present on PATH.
     pub(crate) async fn check_npx_version(&self) -> intent_core::Result<()> {
@@ -212,6 +366,16 @@ impl AcpAdapterCommand {
     /// it to the adapter).
     pub(crate) fn npx(npx: PathBuf, package: &str) -> Self {
         Self {
+            installed_cli: match package {
+                intent_providers::CODEX_ACP_NPX_PACKAGE => {
+                    Some(intent_providers::installed_cli::InstalledCli::Codex)
+                }
+                intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE => {
+                    Some(intent_providers::installed_cli::InstalledCli::Claude)
+                }
+                _ => None,
+            },
+            installed: None,
             program: npx,
             args: vec![
                 NPX_NO_WORKSPACES_ARG.to_string(),
@@ -230,6 +394,8 @@ impl AcpAdapterCommand {
     /// Run a resolved adapter binary with the given args.
     pub(crate) fn binary(bin: PathBuf, args: Vec<String>) -> Self {
         Self {
+            installed_cli: None,
+            installed: None,
             program: bin,
             args,
             envs: Vec::new(),
@@ -335,6 +501,26 @@ impl AcpAdapterCommand {
     }
 }
 
+struct PreparedInstalled {
+    context: crate::installed_cli::InstalledContext,
+    identity: intent_providers::installed_cli::InstalledCliIdentity,
+    env: Vec<(OsString, Option<OsString>)>,
+    cwd: PathBuf,
+    npx_dir: Option<Arc<NpxLaunchDir>>,
+    _codex_home: Option<Arc<tempfile::TempDir>>,
+}
+
+impl PreparedInstalled {
+    fn apply(&self, command: &mut tokio::process::Command) {
+        command.env_clear().current_dir(&self.cwd);
+        for (k, v) in &self.env {
+            if let Some(v) = v {
+                command.env(k, v);
+            }
+        }
+    }
+}
+
 /// A spawned adapter: the child, its ACP connection, and the inbound
 /// notification/request streams the caller drives.
 pub(crate) struct SpawnedAdapter {
@@ -356,8 +542,9 @@ pub(crate) struct SpawnedAdapter {
 /// leave descendants that still run in the directory (in its process group
 /// or escaped from it).
 struct HeldWhileLive {
-    npx_launch_dir: Option<NpxLaunchDir>,
+    npx_launch_dir: Option<Arc<NpxLaunchDir>>,
     slot: OwnedSemaphorePermit,
+    installed: Option<Arc<PreparedInstalled>>,
 }
 
 /// The adapter process plus [`HeldWhileLive`], dereferencing to the
@@ -406,8 +593,9 @@ impl AdapterChild {
         let HeldWhileLive {
             npx_launch_dir,
             slot,
+            installed,
         } = held;
-        let launch_dir = RetainUnlessSwept(npx_launch_dir);
+        let launch_dir = RetainUnlessSwept(npx_launch_dir, installed);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             drop(launch_dir);
             drop(child);
@@ -451,11 +639,12 @@ impl Drop for AdapterChild {
 /// deletes it once the tree has been reaped; dropping the wrapper any other
 /// way (the cleanup future dropped unpolled on a shutting-down runtime, or
 /// never scheduled at all) retains the directory instead of deleting it.
-struct RetainUnlessSwept(Option<NpxLaunchDir>);
+struct RetainUnlessSwept(Option<Arc<NpxLaunchDir>>, Option<Arc<PreparedInstalled>>);
 
 impl RetainUnlessSwept {
     fn remove(mut self) {
         drop(self.0.take());
+        drop(self.1.take());
     }
 }
 
@@ -467,6 +656,10 @@ impl Drop for RetainUnlessSwept {
                 "retaining npx launch dir: adapter cleanup could not finish"
             );
             std::mem::forget(dir);
+        }
+        if let Some(installed) = self.1.take() {
+            // Its isolated auth profile must also survive an unfinished sweep.
+            std::mem::forget(installed);
         }
     }
 }
@@ -520,6 +713,41 @@ pub(crate) async fn spawn_adapter_in(
             limit: slots.limit(),
         });
     };
+    let prepared;
+    let cmd = if cmd.installed_cli.is_some() && cmd.installed.is_none() {
+        prepared = cmd
+            .clone()
+            .prepare_installed()
+            .await
+            .map_err(SpawnError::Spawn)?;
+        &prepared
+    } else {
+        if let Some(selected) = cmd.installed.clone() {
+            // Catalog commands may have been cached while no probe was needed.
+            // Validate the original runtime again at the actual launch boundary.
+            let mut command = cmd.command_in(&selected.cwd);
+            selected.apply(&mut command);
+            intent_core::caller::spawn_with_current_caller(async move {
+                let (identity, _) = selected
+                    .context
+                    .observe_with_dependency(
+                        &command,
+                        Some(crate::codex_diagnostics::process::ProbeDependency::hold(
+                            selected.clone(),
+                        )),
+                    )
+                    .await?;
+                if identity != selected.identity {
+                    return Err(crate::provider_models::INSTALLED_SOURCE_CHANGED.to_owned());
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| SpawnError::Spawn("installed CLI validation task failed".into()))?
+            .map_err(SpawnError::Spawn)?;
+        }
+        cmd
+    };
     spawn_admitted_adapter(cmd, slot).map_err(SpawnError::Spawn)
 }
 
@@ -530,44 +758,23 @@ fn spawn_admitted_adapter(
     cmd: &AcpAdapterCommand,
     slot: OwnedSemaphorePermit,
 ) -> Result<SpawnedAdapter, String> {
-    let npx_launch_dir = if cmd.via_npx {
-        Some(
+    let npx_launch_dir = if let Some(installed) = &cmd.installed {
+        installed.npx_dir.clone()
+    } else if cmd.via_npx {
+        Some(Arc::new(
             NpxLaunchDir::create(cmd.npx_launch_root.as_deref())
                 .map_err(|e| format!("{}: npx launch dir: {e}", cmd.program.display()))?,
-        )
+        ))
     } else {
         None
     };
     let process_cwd = npx_launch_dir
         .as_ref()
         .map_or_else(|| cmd.working_dir(), |dir| dir.path().to_path_buf());
-    let mut command = tokio::process::Command::new(&cmd.program);
-    command
-        .args(&cmd.args)
-        .current_dir(process_cwd)
-        .env("PATH", enhanced_path(Some(&cmd.program)))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    for (key, value) in &cmd.envs {
-        command.env(key, value);
+    let mut command = cmd.command_in(&process_cwd);
+    if let Some(installed) = &cmd.installed {
+        installed.apply(&mut command);
     }
-    for key in &cmd.envs_removed {
-        command.env_remove(key);
-    }
-    // An inherited npm workspace selector (`npm_config_workspace` and its
-    // case variants) makes npm reject `--workspaces=false` before the adapter
-    // starts (intent-hq/intent#5738); scrub it after every env merge, for the
-    // npx bootstrap only.
-    if cmd.via_npx {
-        let explicit = cmd.envs.iter().map(|(key, _)| key.as_str());
-        for key in npm_workspace_selector_env_keys(explicit) {
-            command.env_remove(key);
-        }
-    }
-    #[cfg(unix)]
-    command.process_group(0);
 
     let mut child = command
         .spawn()
@@ -604,6 +811,7 @@ fn spawn_admitted_adapter(
             held: Some(HeldWhileLive {
                 npx_launch_dir,
                 slot,
+                installed: cmd.installed.clone(),
             }),
         },
         conn,

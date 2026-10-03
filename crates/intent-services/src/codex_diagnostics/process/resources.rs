@@ -9,14 +9,27 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(crate) struct ProbeDependency(Arc<Directory>);
 
+impl ProbeDependency {
+    /// Keep existing launch/profile owners alive through the process lease.
+    /// Unconfirmed cleanup retains these owners, even after callers drop theirs.
+    pub(crate) fn hold(resource: impl Send + Sync + 'static) -> Self {
+        Self(Arc::new(Directory {
+            home: None,
+            resource: Some(Box::new(resource)),
+            retained: AtomicBool::new(false),
+        }))
+    }
+}
+
 /// A process lease. Dropping without confirmed cleanup makes retention sticky
 /// for every owner, including cleanup tasks detached by cancellation.
-pub(super) struct ProbeHome(Option<Arc<Directory>>);
+pub(crate) struct ProbeHome(Option<Arc<Directory>>);
 
 impl ProbeHome {
     pub fn new(home: tempfile::TempDir) -> Self {
         Self(Some(Arc::new(Directory {
             home: Some(home),
+            resource: None,
             retained: AtomicBool::new(false),
         })))
     }
@@ -49,6 +62,7 @@ impl Drop for ProbeHome {
 
 struct Directory {
     home: Option<tempfile::TempDir>,
+    resource: Option<Box<dyn Send + Sync>>,
     retained: AtomicBool,
 }
 
@@ -68,6 +82,9 @@ impl Drop for Directory {
         if self.retained.load(Ordering::Acquire) {
             if let Some(home) = self.home.take() {
                 let _ = home.keep();
+            }
+            if let Some(resource) = self.resource.take() {
+                std::mem::forget(resource);
             }
         }
     }

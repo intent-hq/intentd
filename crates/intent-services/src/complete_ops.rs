@@ -304,15 +304,11 @@ pub(crate) fn one_shot_launch(
             .env_remove("CODEX_PATH")
             .env_remove("CODEX_CONFIG")
     };
-    if provider.id == "codex" {
-        // Share persistent-session mode policy without importing unrelated
-        // provider env defaults. Explicit inherited modes remain untouched.
-        if let Some(mode) = intent_providers::build_provider_env_for_spawn(
+    if intent_providers::installed_cli::InstalledCli::for_provider(provider.id).is_some() {
+        for (key, value) in intent_providers::build_provider_env_for_spawn(
             provider, model, None, None, None, via_npx, None,
-        )
-        .remove("INITIAL_AGENT_MODE")
-        {
-            cmd = cmd.env("INITIAL_AGENT_MODE", mode);
+        ) {
+            cmd = cmd.env(key, value);
         }
     }
     Some(apply_one_shot_launch_policy(provider, cmd))
@@ -326,7 +322,7 @@ pub(crate) fn apply_one_shot_launch_policy(
     cmd: OneShotCommand,
 ) -> OneShotCommand {
     if provider.id == "codex" {
-        cmd.env_remove("CODEX_PATH").env(
+        cmd.env(
             "CODEX_CONFIG",
             intent_providers::CODEX_SUBAGENT_POLICY_CONFIG,
         )
@@ -612,22 +608,32 @@ impl Services {
             Some(dir) => cmd.cwd(dir),
             None => cmd,
         };
-        // codex loads MCP servers from its inherited CODEX_HOME regardless of
-        // the empty ACP `mcpServers` list, so the one-shot child gets the same
-        // isolated throwaway home the model probe uses — a one-shot must never
-        // start user-configured MCP servers. The TempDir binding keeps the
-        // isolated home alive for the duration of the run.
-        let (cmd, _codex_home) = if provider_id == "codex" {
-            match crate::provider_models::with_isolated_codex_home(cmd) {
-                Ok((cmd, home)) => (cmd, Some(home)),
-                Err(e) => {
-                    return Ok(unavailable(format!(
-                        "codex: failed to create isolated CODEX_HOME: {e}"
-                    )))
-                }
+        // Unit tests that pin a fake npx also use an isolated installed CLI.
+        // Production and WSS tests always use canonical host discovery.
+        #[cfg(all(test, unix))]
+        let fixture_home = tempfile::tempdir().expect("fixture installed home");
+        #[cfg(all(test, unix))]
+        let cmd = if self.one_shot_npx.is_some() {
+            if let Some(cli) =
+                intent_providers::installed_cli::InstalledCli::for_provider(provider_id)
+            {
+                cmd.prepare_with_context(crate::installed_cli::test_context_in(
+                    cli,
+                    fixture_home.path(),
+                ))
+                .await
+                .map_err(intent_core::Error::Internal)?
+            } else {
+                cmd
             }
         } else {
-            (cmd, None)
+            cmd
+        };
+        // Missing installed runtimes are an actionable unavailable result,
+        // rather than an internal wire error whose details would be hidden.
+        let cmd = match cmd.prepare_installed().await {
+            Ok(cmd) => cmd,
+            Err(reason) => return Ok(unavailable(reason)),
         };
         let (turn_prompt, session_meta) =
             one_shot_session_shape(provider_id, prompt, system_prompt);
@@ -819,6 +825,19 @@ mod tests {
             .collect();
         registry.apply(&applied).expect("apply settings");
         let services = Services::new(store).with_settings_registry(registry);
+        // Installed providers use a pinned adapter through npx. Route their
+        // fixture executables through the explicit npx test seam as well.
+        let fixture_npx = keys
+            .iter()
+            .find(|(key, _)| *key == "providers.paths")
+            .and_then(|(_, paths)| paths.get("claude-code").or_else(|| paths.get("codex")))
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        let services = if let Some(npx) = fixture_npx {
+            services.with_one_shot_npx(Some(npx))
+        } else {
+            services
+        };
         (tmp, services)
     }
 
@@ -915,7 +934,7 @@ rl.on('line', (line) => {
   if (msg.method === 'session/new') { sessionNew = msg.params; return send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1' } }); }
   if (msg.method === 'session/set_config_option') { selectedModel = msg.params.value; return send({ jsonrpc: '2.0', id: msg.id, result: {} }); }
   if (msg.method === 'session/prompt') {
-    const text = JSON.stringify({ sessionNew, prompt: msg.params.prompt[0].text, selectedModel, argv: process.argv.slice(2), config: process.argv.includes('--workspaces=false') ? process.env.CODEX_CONFIG : null, hasCodexPath: 'CODEX_PATH' in process.env });
+    const text = JSON.stringify({ sessionNew, prompt: msg.params.prompt[0].text, selectedModel, argv: process.argv.slice(2), config: process.argv.includes('--workspaces=false') ? process.env.CODEX_CONFIG : null, hasCodexPath: 'CODEX_PATH' in process.env, codexPath: process.env.CODEX_PATH });
     send({
       jsonrpc: '2.0',
       method: 'session/update',
@@ -956,11 +975,12 @@ rl.on('line', (line) => {
             ),
         ])
         .await;
-        let services = if provider == "codex" {
-            services.with_one_shot_npx(Some(bin.to_path_buf()))
-        } else {
-            services
-        };
+        let services =
+            if intent_providers::installed_cli::InstalledCli::for_provider(provider).is_some() {
+                services.with_one_shot_npx(Some(bin.to_path_buf()))
+            } else {
+                services
+            };
         let v = services
             .agent_complete_once_op(
                 "summarize".into(),
@@ -1234,7 +1254,7 @@ rl.on('line', (line) => {
     #[cfg(unix)]
     #[tokio::test]
     async fn one_shot_codex_policy_replaces_enabling_env_in_child() {
-        let (_dir, npx) = fake_acp_adapter_echoing_session("codex-policy");
+        let (dir, npx) = fake_acp_adapter_echoing_session("codex-policy");
         let codex = intent_providers::find_provider("codex").unwrap();
         for model in [None, Some("gpt-5.5"), Some("gpt-5.5/high")] {
             for enabled in [json!(true), json!({"enabled": true})] {
@@ -1252,7 +1272,13 @@ rl.on('line', (line) => {
                         .to_string(),
                 );
                 // Test prompts finalize policy after their provider env merge.
-                let cmd = apply_one_shot_launch_policy(codex, cmd);
+                let cmd = apply_one_shot_launch_policy(codex, cmd)
+                    .prepare_with_context(crate::installed_cli::test_context_in(
+                        intent_providers::installed_cli::InstalledCli::Codex,
+                        &dir.path().join("runtime"),
+                    ))
+                    .await
+                    .unwrap();
                 let reply = run_one_shot_acp(
                     None,
                     cmd,
@@ -1273,7 +1299,11 @@ rl.on('line', (line) => {
                         intent_providers::config::CODEX_ACP_NPX_PACKAGE
                     ])
                 );
-                assert_eq!(observed["hasCodexPath"], false);
+                assert_eq!(observed["hasCodexPath"], true);
+                assert_eq!(
+                    observed["codexPath"],
+                    json!(dir.path().join("runtime/codex"))
+                );
                 let config: Value =
                     serde_json::from_str(observed["config"].as_str().unwrap()).unwrap();
                 assert_eq!(
@@ -1331,7 +1361,7 @@ rl.on('line', (line) => {
             config.map(|value| serde_json::from_str::<Value>(value).unwrap()),
             Some(json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}))
         );
-        assert!(cmd.removed_env_vars().iter().any(|key| key == "CODEX_PATH"));
+        assert!(!cmd.removed_env_vars().iter().any(|key| key == "CODEX_PATH"));
         assert!(!cmd
             .removed_env_vars()
             .iter()
@@ -1351,15 +1381,14 @@ rl.on('line', (line) => {
         let npx = PathBuf::from("/usr/bin/npx");
         let bin = PathBuf::from("/opt/bin/codex-acp");
 
-        // npx-only (claude-code, pi): a resolved binary (the validated
-        // adapter override — monorepo#4352) wins even without npx; otherwise
-        // the pinned package runs via npx, and no npx means no launch at all.
+        // Both installed providers use their reviewed package, even when a
+        // legacy adapter path is present.
         let claude = intent_providers::find_provider("claude-code").unwrap();
         let adapter = PathBuf::from("/opt/lib/claude-agent-acp/dist/index.js");
         let launch = one_shot_launch(claude, Some(adapter.clone()), Some(npx.clone()), None)
             .expect("override launches");
-        assert_eq!(launch.program(), adapter.as_path());
-        assert!(one_shot_launch(claude, Some(adapter), None, None).is_some());
+        assert_eq!(launch.program(), npx.as_path());
+        assert!(one_shot_launch(claude, Some(adapter), None, None).is_none());
         let launch = one_shot_launch(claude, None, Some(npx.clone()), None).expect("npx launches");
         assert_eq!(launch.program(), npx.as_path());
         assert!(one_shot_launch(claude, None, None, None).is_none());
@@ -1384,18 +1413,19 @@ rl.on('line', (line) => {
             .unwrap();
             // The provider suite covers the explicit-value matrix under its
             // env lock; do not mutate process-global env in service tests.
-            let mut expected: Vec<_> = std::env::var_os("INITIAL_AGENT_MODE")
-                .is_none()
-                .then(|| ("INITIAL_AGENT_MODE".to_string(), "agent-full-access".into()))
-                .into_iter()
-                .collect();
+            let mut expected: Vec<_> = intent_providers::build_provider_env_for_spawn(
+                codex, None, None, None, None, true, None,
+            )
+            .into_iter()
+            .map(|(k, v)| (k, std::ffi::OsString::from(v)))
+            .collect();
             expected.push((
                 "CODEX_CONFIG".to_string(),
                 intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into(),
             ));
             assert_eq!(cmd.env_vars(), expected.as_slice());
             let removed: Vec<_> = cmd.removed_env_vars().iter().map(String::as_str).collect();
-            assert_eq!(removed, vec!["CODEX_PATH"]);
+            assert!(removed.is_empty());
         }
         for id in intent_providers::all_provider_ids()
             .into_iter()
@@ -1410,18 +1440,19 @@ rl.on('line', (line) => {
             )
             .unwrap();
             assert!(
-                cmd.env_vars().is_empty(),
-                "{id} must not acquire a Codex mode"
+                !cmd.env_vars()
+                    .iter()
+                    .any(|(key, _)| key == "INITIAL_AGENT_MODE" || key == "CODEX_CONFIG"),
+                "{id} must not acquire Codex policy"
             );
         }
     }
 
-    /// monorepo#4352: an npx-only provider resolves ONLY a valid adapter
-    /// override — never a PATH/managed-bin hit — so one-shots and the live
-    /// test prompt run the same adapter `resolve_spawn` would.
+    /// Installed providers ignore legacy adapter paths consistently for
+    /// one-shots, test prompts, model probes and persistent sessions.
     #[cfg(unix)]
     #[test]
-    fn resolve_one_shot_binary_npx_only_honors_only_valid_override() {
+    fn resolve_one_shot_binary_ignores_legacy_installed_adapter_override() {
         use std::os::unix::fs::PermissionsExt;
         let claude = intent_providers::find_provider("claude-code").unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -1430,7 +1461,7 @@ rl.on('line', (line) => {
         std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             resolve_one_shot_binary(claude, Some(adapter.to_str().unwrap())),
-            Some(adapter.clone())
+            None
         );
         assert_eq!(resolve_one_shot_binary(claude, None), None);
         let missing = dir.path().join("missing");
@@ -2058,7 +2089,7 @@ rl.on('line', (line) => {
     #[cfg(unix)]
     #[tokio::test]
     async fn quick_action_effort_reaches_provider_with_explicit_model_and_cold_catalog() {
-        let (_dir, bin, _) = crate::test_support::quick_action_effort_adapter(&json!({}));
+        let (_dir, bin, _, _cli_env) = crate::test_support::quick_action_effort_adapter(&json!({}));
         let (_tmp, svc) = services_with_settings(&[
             ("model.defaultProvider", json!("claude-code")),
             ("providers.paths", json!({"claude-code":bin})),
@@ -2128,7 +2159,7 @@ rl.on('line', (line) => {
     #[tokio::test]
     async fn quick_action_effort_live_selector_overrules_nonempty_cached_levels() {
         for (cached, live, expected) in [("low", "high", "high"), ("high", "low", "low")] {
-            let (_dir, bin, _) =
+            let (_dir, bin, _, _cli_env) =
                 crate::test_support::quick_action_effort_adapter(&json!({"modelValues":[live]}));
             let (_tmp, svc) = services_with_settings(&[
                 ("model.defaultProvider", json!("claude-code")),
@@ -2191,7 +2222,7 @@ rl.on('line', (line) => {
     #[cfg(unix)]
     #[tokio::test]
     async fn quick_action_effort_legacy_compound_model_does_not_leak_provider_defaults() {
-        let (_dir, bin, _) = crate::test_support::quick_action_effort_adapter(&json!({}));
+        let (_dir, bin, _, _cli_env) = crate::test_support::quick_action_effort_adapter(&json!({}));
         let (tmp, svc) =
             services_with_settings(&[("providers.paths", json!({"claude-code":bin}))]).await;
         let config = tmp.dir.path().join("legacy.toml");

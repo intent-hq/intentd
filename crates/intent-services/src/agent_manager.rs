@@ -3432,8 +3432,34 @@ impl AgentManager {
                 "info",
             )
             .await;
-        let spawned = spawn_provider(&spawn_opts, hooks)
-            .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
+        let spawned = if let Some(cli) =
+            intent_providers::installed_cli::InstalledCli::for_provider(spawn_opts.provider.id)
+        {
+            let context = crate::installed_cli::InstalledContext::discover(cli)
+                .await
+                .map_err(Error::InvalidInput)?;
+            let mut prepared = intent_acp::spawn::prepare_provider(&spawn_opts)
+                .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
+            context.apply(&mut prepared.command);
+            let prepared = intent_core::caller::spawn_with_current_caller(async move {
+                let prepared = Arc::new(prepared);
+                let dependency =
+                    crate::codex_diagnostics::process::ProbeDependency::hold(prepared.clone());
+                context
+                    .observe_with_dependency(&prepared.command, Some(dependency))
+                    .await
+                    .map_err(Error::InvalidInput)?;
+                Arc::try_unwrap(prepared).map_err(|_| {
+                    Error::Internal("installed CLI cleanup still owns the launch directory".into())
+                })
+            })
+            .await
+            .map_err(|_| Error::Internal("installed CLI preparation task failed".into()))??;
+            intent_acp::spawn::spawn_prepared_provider(&spawn_opts, prepared, hooks)
+        } else {
+            spawn_provider(&spawn_opts, hooks)
+        }
+        .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
         let (child, connection, npx_launch_dir) = spawned.into_parts();
         // Pin the spawned child's pid for the exit watcher armed below: the
         // watcher stands down when the handle's child no longer matches it
@@ -14844,25 +14870,26 @@ mod npx_launch_dir_lifetime_tests {
         }).await.unwrap();
         assert!(pid_alive(tree.grandchild));
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), shutdown)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!pid_alive(leader.cast_signed()));
-        assert!(
-            !pid_alive(tree.grandchild),
-            "grandchild {} alive after shutdown; launch_dir_exists={}",
-            tree.grandchild,
-            tree.launch_path.exists()
-        );
-        assert!(!tree.launch_path.exists());
-        // Cleanup has issued the group kill and released its lease, but an
-        // orphaned descendant can remain signal-0-visible until init reaps it.
-        // Keep the shutdown/launch-dir assertions immediate; bound only the
-        // observation that the identified descendant's PID has disappeared.
-        // Use signal 0 directly: pid_alive above already rejects executable
-        // descendants, but deliberately treats unreaped zombies as dead.
         tokio::time::timeout(Duration::from_secs(10), async {
+            shutdown.await.unwrap();
+            // These are synchronous shutdown postconditions: orphan-PID
+            // polling below must not hide delayed resource/registry cleanup.
+            assert!(!pid_alive(leader.cast_signed()));
+            assert!(
+                !pid_alive(tree.grandchild),
+                "grandchild {} alive after shutdown; launch_dir_exists={}",
+                tree.grandchild,
+                tree.launch_path.exists()
+            );
+            assert!(!tree.launch_path.exists());
+            // An aborted acquire skips its existing post-kill deregistration.
+            // Preserve that stale in-memory slot: late ID-only removal could
+            // erase a replacement runtime. The watcher deregisters first.
+            assert_eq!(mgr.registry.is_registered(&agent_id), !unexpected);
+            // Live descendants must be gone before shutdown returns. A dead
+            // orphan may still retain its PID until init reaps it; observe
+            // that retirement within the SAME total shutdown budget. Use
+            // signal 0 because pid_alive deliberately treats zombies as dead.
             while nix::sys::signal::kill(nix::unistd::Pid::from_raw(tree.grandchild), None)
                 != Err(nix::errno::Errno::ESRCH)
             {
@@ -14870,11 +14897,8 @@ mod npx_launch_dir_lifetime_tests {
             }
         })
         .await
-        .expect("cleanup killed the descendant; its orphan PID must be reaped");
-        // An aborted acquire skips its existing post-kill deregistration.
-        // Preserve that stale in-memory slot: late ID-only removal could erase
-        // a replacement runtime. The exit watcher deregisters before cleanup.
-        assert_eq!(mgr.registry.is_registered(&agent_id), !unexpected);
+        .unwrap();
+        assert!(!pid_alive(tree.grandchild));
         svc.shutdown_store_writers().await;
         svc.event_bus.as_ref().unwrap().shutdown().await.unwrap();
         svc.store.close().await;
@@ -19500,28 +19524,22 @@ mod provider_path_override_tests {
         s
     }
 
-    /// monorepo#4352: a valid `providers.paths["claude-code"]` override is
-    /// exec'd directly — the resolved spawn carries the override as
-    /// `provider_binary` and NO npx fallback, so `build_command` spawns the
-    /// override instead of `npx -y <pinned>`.
+    /// Legacy adapter paths must not split session and model-catalog sources.
     #[test]
-    fn claude_code_spawn_honors_valid_path_override() {
+    fn claude_code_spawn_ignores_legacy_path_override() {
+        if intent_providers::find_npx().is_none() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let adapter_stub = exec_stub(dir.path(), "claude-agent-acp-override");
         let settings = settings_with_paths(&[("claude-code", &adapter_stub)]);
-
         let resolved = resolve_spawn(&claude_code_session(), None, &settings, None).unwrap();
+        assert!(resolved.provider_binary.is_none());
+        assert!(resolved.npx_fallback_binary.is_some());
         assert_eq!(
-            resolved.provider_binary.as_deref(),
-            Some(adapter_stub.as_path()),
-            "a valid claude-code override must be the spawned binary"
+            resolved.npx_fallback_package,
+            Some(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
         );
-        assert_eq!(resolved.npx_fallback_binary, None);
-        assert_eq!(resolved.npx_fallback_package, None);
-        let mut opts = SpawnOptions::new(&resolved.provider);
-        opts.provider_binary = resolved.provider_binary.as_deref();
-        let cmd = intent_acp::spawn::build_command(&opts);
-        assert_eq!(cmd.as_std().get_program(), adapter_stub.as_os_str());
     }
 
     /// An invalid override (missing file) contributes nothing: claude-code

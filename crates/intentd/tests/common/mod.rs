@@ -9,6 +9,8 @@
 #![allow(dead_code)]
 
 #[cfg(unix)]
+pub mod claude_npx;
+#[cfg(unix)]
 pub mod codex_npx;
 
 use std::fmt::Write as _;
