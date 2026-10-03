@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.4] - 2026-10-03
+
+### 🐛 Bug Fixes
+
+- Use installed provider CLIs for sessions and models ([#2241](https://github.com/intent-hq/intentd/pull/2241))
+
+
 ## [0.10.3] - 2026-10-02
 
 ### 🧪 Testing
