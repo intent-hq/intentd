@@ -2895,7 +2895,9 @@ fn restart_command_respawns_state_version_without_exiting_sitter() {
 
 #[test]
 fn duplicate_serve_preserves_live_sitter_discovery() {
-    let _serial = SERVE_LOOP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     // Model the daemon's exclusive data-directory claim. A duplicate child
