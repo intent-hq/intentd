@@ -455,8 +455,14 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
         export_author_barrier: std::sync::Arc::default(),
     };
-    let doomed = seed_workspace(&store, "doomed").await;
-    let keeper = seed_workspace(&store, "keeper").await;
+    // This fixture deliberately stops at schema 0130. Current workspace
+    // inserts require newer columns, so seed only the historical columns.
+    for id in ["doomed", "keeper"] {
+        sqlx::query("INSERT INTO workspace (id,title,branch,status,created_at,updated_at) VALUES (?,?,'main','Active','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')")
+            .bind(id).bind(id).execute(store.write_pool()).await.unwrap();
+    }
+    let doomed = intent_core::WorkspaceId::from("doomed");
+    let keeper = intent_core::WorkspaceId::from("keeper");
     seed_unrelated_metadata(&store).await;
     seed_heavy_workspace_children(&store, &doomed, 3).await;
     seed_heavy_workspace_children(&store, &keeper, 3).await;
