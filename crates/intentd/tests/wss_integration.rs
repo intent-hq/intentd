@@ -20419,18 +20419,44 @@ async fn wss_workspace_import_lifecycle() {
             #[cfg(windows)]
             std::fs::write(bin.join(format!("{name}.exe")), b"discovery-only fixture").unwrap();
         }
-        let mut paths = vec![bin.clone()];
-        paths.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
         let log_path = root.path().join("test.log");
         let log = std::fs::File::create(&log_path).unwrap();
         let mut cmd = Command::new(std::env::current_exe().unwrap());
         cmd.args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env_clear()
+            .envs(
+                [
+                    "SystemRoot",
+                    "WINDIR",
+                    "LLVM_PROFILE_FILE",
+                    "INTENTD_TEST_TIMEOUT_MULTIPLIER",
+                ]
+                .into_iter()
+                .filter_map(|key| std::env::var_os(key).map(|value| (key, value))),
+            )
             .env("INTENTD_IMPORT_CLI_TEST", TEST)
-            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("PATH", &bin)
+            .env("HOME", root.path())
+            .env("USERPROFILE", root.path())
+            .env("XDG_CONFIG_HOME", root.path())
+            .env("XDG_DATA_HOME", root.path())
+            .env("TMPDIR", root.path())
+            .env("TEMP", root.path())
+            .env("TMP", root.path())
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let shell = root.path().join("shell");
+            std::fs::write(
+                &shell,
+                "#!/bin/sh\nprintf '__INTENT_PATH_S__%s__INTENT_PATH_E__' \"$PATH\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+            cmd.env("SHELL", shell);
+        }
         #[cfg(unix)]
         let mut child = intentd_test_support::GuardedChild::spawn(&mut cmd).unwrap();
         #[cfg(unix)]
