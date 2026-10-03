@@ -120,12 +120,14 @@ async fn completion_wakes_idle_owner(reject_result: bool) {
         .success());
     let command = format!("cat '{}'; exit 1", fifo.display());
     let code=format!("const s=await ws.script.create('Controlled nonzero exit',{},'command',{{purpose:'saved'}}); const start=await ws.script.start(s.id); return await ws.script.monitor(s.id,{{ttlMs:300000,runId:start.runId}});",json!(command));
-    let behavior=json!({"rules":[{"ifPromptContains":"REGISTER_SCRIPT_MONITOR","toolCall":{"name":"workspace_api","arguments":{"code":code,"summary":"Register native script completion monitor"}},"response":"MONITOR_REGISTERED"}],"response":"WAKE_ACKNOWLEDGED"}).to_string();
+    let rpc_log = data_dir.join("consumed-prompts.jsonl");
+    let behavior=json!({"rules":[{"ifPromptContains":"VERIFY_COMPLETION_DELIVERY","response":"DELIVERY_VERIFIED"},{"ifPromptContains":"REGISTER_SCRIPT_MONITOR","toolCall":{"name":"workspace_api","arguments":{"code":code,"summary":"Register native script completion monitor"}},"response":"MONITOR_REGISTERED"}],"response":"WAKE_ACKNOWLEDGED"}).to_string();
     let ws_id = seed_workspace_only(&data_dir).await;
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", agent_script.as_str()),
         ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_RPC_LOG", rpc_log.to_str().unwrap()),
     ];
     let _daemon = Daemon {
         child: spawn_serve(&data_dir, &env),
@@ -181,12 +183,12 @@ async fn completion_wakes_idle_owner(reject_result: bool) {
     if reject_result {
         loop {
             let log = std::fs::read_to_string(data_dir.join("daemon.log")).unwrap();
-            // supervise queues settlement twice; wait for both attempts to fail so
-            // removing the fault cannot race the second one-shot finalizer.
+            // The two original finalizers still run. Three observed failures
+            // prove maintenance retried too before we release the fault.
             if log
                 .matches("script result persistence failed; leaving active")
                 .count()
-                >= 2
+                >= 3
             {
                 break;
             }
@@ -247,4 +249,81 @@ async fn completion_wakes_idle_owner(reject_result: bool) {
         .script_monitor_wake_pending(row["monitorId"].as_str().unwrap())
         .await
         .unwrap());
+    // Replay the durable outbox twice after actual consumption, then wait for
+    // maintenance to acknowledge each replay. This drives duplicate delivery
+    // attempts without relying on an arbitrary sleep or transcript uniqueness.
+    for _ in 0..2 {
+        sqlx::query("UPDATE script_monitor SET wake_state='pending' WHERE id=?")
+            .bind(row["monitorId"].as_str().unwrap())
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        loop {
+            if !store
+                .script_monitor_wake_pending(row["monitorId"].as_str().unwrap())
+                .await
+                .unwrap()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "outbox replay never acknowledged"
+            );
+            // timing-guard: wait for the maintenance delivery attempt to acknowledge the replay.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":id,"content":"VERIFY_COMPLETION_DELIVERY"}),
+    )
+    .await;
+    await_conversation_contains(&mut rpc, &ws_id, id.as_str(), "DELIVERY_VERIFIED", deadline).await;
+    let calls: Vec<Value> = std::fs::read_to_string(&rpc_log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let completions: Vec<String> = calls
+        .iter()
+        .filter(|call| call["method"] == "session/prompt")
+        .flat_map(|call| call["params"]["prompt"].as_array().unwrap())
+        .filter_map(|part| part["text"].as_str())
+        .filter(|text| text.contains("Monitoring ended."))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        completions.len(),
+        1,
+        "actual consumed completion prompts: {calls:?}"
+    );
+    let prompt = &completions[0];
+    for expected in [
+        row["scriptId"].as_str().unwrap(),
+        row["runId"].as_str().unwrap(),
+        "finished",
+        "\"outcome\":\"failed\"",
+        "\"exitCode\":1",
+    ] {
+        assert!(prompt.contains(expected), "missing {expected}: {prompt}");
+    }
+    let acknowledgements: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_message WHERE agent_id=? AND role='assistant' AND content LIKE '%WAKE_ACKNOWLEDGED%'")
+        .bind(id.as_str()).fetch_one(store.read_pool()).await.unwrap();
+    assert_eq!(
+        acknowledgements, 1,
+        "exactly one actual completion acknowledgement"
+    );
+    let metadata: String = sqlx::query_scalar("SELECT metadata FROM agent_message WHERE id=?")
+        .bind(&mid)
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    let metadata: Value = serde_json::from_str(&metadata).unwrap();
+    assert_eq!(metadata["scriptId"], row["scriptId"]);
+    assert_eq!(metadata["runId"], row["runId"]);
+    assert_eq!(metadata["reason"], "finished");
+    assert_eq!(metadata["result"]["outcome"], "failed");
+    assert_eq!(metadata["result"]["exitCode"], 1);
 }
