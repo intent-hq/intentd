@@ -360,7 +360,17 @@ async fn tunnel_open_err_for_closed_port_keeps_connection_alive() {
         },
     )
     .await;
-    match recv_frame(&mut ws).await {
+    let receive_started = std::time::Instant::now();
+    eprintln!(
+        "tunnel receive begin: phase=closed-port target=127.0.0.1:{dead_port} elapsed={:?}",
+        receive_started.elapsed()
+    );
+    let frame = recv_frame(&mut ws).await;
+    eprintln!(
+        "tunnel receive end: phase=closed-port target=127.0.0.1:{dead_port} elapsed={:?}",
+        receive_started.elapsed()
+    );
+    match frame {
         Frame::OpenErr { stream_id, message } => {
             assert_eq!(stream_id, 1);
             assert!(
@@ -380,7 +390,16 @@ async fn tunnel_open_err_for_closed_port_keeps_connection_alive() {
         },
     )
     .await;
-    assert_eq!(recv_frame(&mut ws).await, Frame::OpenOk { stream_id: 1 });
+    eprintln!(
+        "tunnel receive begin: phase=reused-stream target=127.0.0.1:{echo_port} elapsed={:?}",
+        receive_started.elapsed()
+    );
+    let frame = recv_frame(&mut ws).await;
+    eprintln!(
+        "tunnel receive end: phase=reused-stream target=127.0.0.1:{echo_port} elapsed={:?}",
+        receive_started.elapsed()
+    );
+    assert_eq!(frame, Frame::OpenOk { stream_id: 1 });
     ws.close(None).await.expect("close ws");
     srv.ws.stop().await;
 }
