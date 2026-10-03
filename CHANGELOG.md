@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.5] - 2026-10-03
+
+### 🚀 Features
+
+- Propose assistant project transfers for inline approval ([#2138](https://github.com/intent-hq/intentd/pull/2138))
+
+
 ## [0.10.4] - 2026-10-03
 
 ### 🐛 Bug Fixes
