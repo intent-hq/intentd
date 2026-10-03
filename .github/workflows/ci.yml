@@ -846,6 +846,44 @@ jobs:
             exit 1
           fi
           rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test e2e_doctor_codex --target ${{ matrix.target }} -- --nocapture
+      # These retained workspace fixtures used to skip on Linux before reaching
+      # their unbound caller. Require native CoW operations and original oracles.
+      - name: Retained workspace CoW fixtures (macOS runtime)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'macOS'
+        timeout-minutes: 20
+        shell: bash
+        env:
+          INTENTD_COW_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
+          INTENTD_TEST_REQUIRE_COW: "1"
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set -euo pipefail
+          tests=(
+            tests::worktree_provisioning::create_provisions_cow_checkout_when_isolation_enabled
+            tests::worktree_provisioning::duplicate_provisions_cow_checkout_when_isolation_enabled
+            tests::worktree_provisioning::create_cleans_up_empty_ws_dir_when_cow_provisioning_fails
+            tests::worktree_provisioning::duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails
+            tests::clone_orchestration::progress_id_cow_create_streams_cow_copy_milestone
+            capability::tests::unbound_caller_is_forbidden_on_every_gate
+          )
+          cargo_test=(rustup run "$INTENTD_COW_TOOLCHAIN" cargo test --locked -p intent-services --lib --target ${{ matrix.target }})
+          status=0
+          for test in "${tests[@]}"; do
+            listed=$("${cargo_test[@]}" "$test" -- --exact --list)
+            printf '%s\n' "$listed"
+            grep -Fx "$test: test" <<< "$listed" > /dev/null
+            grep -Fx '1 test, 0 benchmarks' <<< "$listed" > /dev/null
+            log="$RUNNER_TEMP/cow-${test##*::}.log"
+            if ! "${cargo_test[@]}" "$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"; then
+              status=1
+            fi
+            if [[ "$test" == tests::* ]]; then
+              grep -Fx 'CoW fixture clone and independent contents verified' "$log" > /dev/null || status=1
+              grep -Fx "CoW fixture assertions passed: ${test##*::}" "$log" > /dev/null || status=1
+            fi
+          done
+          exit "$status"
       - name: Build (release)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo build --workspace --release --target ${{ matrix.target }}
