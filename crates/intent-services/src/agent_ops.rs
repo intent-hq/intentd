@@ -9915,11 +9915,14 @@ impl Services {
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
-        crate::workspace_mutations::scope(self.agent_delegate_op_admitted(
+        // Keep the admitted future on the heap before passing it through the
+        // mutation scope: its nested persistence path otherwise exhausts a
+        // default-sized runtime thread's stack in unoptimized builds.
+        crate::workspace_mutations::scope(Box::pin(self.agent_delegate_op_admitted(
             workspace_id,
             input,
             parent_agent_id,
-        ))
+        )))
         .await
     }
 
