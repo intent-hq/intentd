@@ -1276,3 +1276,131 @@ async fn native_selection_cancelled_acquisition_cannot_publish_late_success() {
     assert_eq!(fresh.snapshot.selection, SelectionState::NeverSaved);
     assert_eq!(c.selection.feed.lock().unwrap().records.len(), 1);
 }
+
+#[intent_test_macros::daemon_test]
+async fn native_selection_reply_transfer_releases_only_its_original_lane() {
+    let f = Fixture::new().await;
+    let s = f.socket().await;
+    let edit = s.capture(&f).await.unwrap();
+    let q = save_query(&edit);
+    let (original, revision) = s
+        .entered(async {
+            let first = s.owner.capture_selection(&Frame::Save(q.clone())).unwrap();
+            let first_guard = RetireFrame(first.clone());
+            let mut original = None;
+            first
+                .scope(Box::pin(async {
+                    original = Some(
+                        f.services
+                            .repository_selection_save(q.clone())
+                            .await
+                            .unwrap(),
+                    );
+                }))
+                .await;
+            let original = original.unwrap();
+            assert!(matches!(
+                receipt(&original).persistence,
+                Persistence::Committed { .. }
+            ));
+            let stored = f
+                .services
+                .store
+                .repository_selection_snapshot(&edit.root)
+                .await
+                .unwrap();
+            // A completed handler has not yet admitted its reply transfer.
+            let premature = s.owner.capture_selection(&Frame::Save(q.clone())).unwrap();
+            premature
+                .scope(Box::pin(async {
+                    assert!(f
+                        .services
+                        .repository_selection_save(q.clone())
+                        .await
+                        .is_err());
+                }))
+                .await;
+            premature.retire();
+            let mut sent = 0;
+            first
+                .deliver(RepositoryReadReplyKind::Result, &mut || {
+                    sent += 1;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            assert_eq!(sent, 1);
+
+            // The transport can expose the queued reply before dropping its frame.
+            // Capture the next frame in that interval, then finish the old owner.
+            let second = s.owner.capture_selection(&Frame::Save(q.clone())).unwrap();
+            let second_guard = RetireFrame(second.clone());
+            drop(first_guard);
+
+            let mut repeated = None;
+            second
+                .scope(Box::pin(async {
+                    repeated = Some(f.services.repository_selection_save(q.clone()).await);
+                }))
+                .await;
+            assert_eq!(
+                repeated
+                    .unwrap()
+                    .expect("a transferred reply must permit the next original receipt request"),
+                original
+            );
+            // Late cleanup of the first frame must not release the second frame.
+            let overlapping = s.owner.capture_selection(&Frame::Save(q.clone())).unwrap();
+            overlapping
+                .scope(Box::pin(async {
+                    assert!(f
+                        .services
+                        .repository_selection_save(q.clone())
+                        .await
+                        .is_err());
+                }))
+                .await;
+            overlapping.retire();
+
+            second
+                .deliver(RepositoryReadReplyKind::Result, &mut || {
+                    sent += 1;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            drop(second_guard);
+            assert!(first
+                .deliver(RepositoryReadReplyKind::Result, &mut || {
+                    sent += 1;
+                    Ok(())
+                })
+                .await
+                .is_err());
+            assert_eq!(sent, 2);
+            let after = f
+                .services
+                .store
+                .repository_selection_snapshot(&edit.root)
+                .await
+                .unwrap();
+            assert_eq!(after.selection(), stored.selection());
+            assert_eq!(after.selection_revision(), stored.selection_revision());
+            (original, stored.selection_revision())
+        })
+        .await;
+    assert_eq!(
+        s.save(&f, &edit, Choice::Automatic {}).await.unwrap(),
+        original
+    );
+    assert_eq!(s.reconcile(&f, &edit).await.unwrap(), original);
+    assert_eq!(
+        f.services
+            .store
+            .repository_selection_snapshot(&edit.root)
+            .await
+            .unwrap()
+            .selection_revision(),
+        revision
+    );
+}

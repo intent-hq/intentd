@@ -456,7 +456,7 @@ struct Request {
     _subscriptions: Vec<RepositorySubscription>,
     target: Mutex<Option<Arc<Operation>>>,
     initiator: AtomicBool,
-    owns_lane: bool,
+    owns_lane: AtomicBool,
     claimed: AtomicBool,
     completed: AtomicBool,
     consumed: AtomicBool,
@@ -500,6 +500,11 @@ impl Request {
             .clone()
             .ok_or_else(unavailable)
     }
+    fn release_lane(&self, operation: &Operation) {
+        if self.owns_lane.swap(false, Ordering::AcqRel) {
+            operation.active.store(false, Ordering::Release);
+        }
+    }
     fn finish(&self) {
         if self.completed.swap(true, Ordering::AcqRel) {
             return;
@@ -508,9 +513,7 @@ impl Request {
             life.retirement().end_scope();
         }
         if let Ok(op) = self.operation() {
-            if self.owns_lane {
-                op.active.store(false, Ordering::Release);
-            }
+            self.release_lane(&op);
             if self.initiator.load(Ordering::Acquire) {
                 op.retire_write();
                 op.no_start(Failure::AdmissionRetired);
@@ -609,7 +612,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
         _subscriptions: subscriptions,
         target: Mutex::new(target),
         initiator: AtomicBool::new(initiator),
-        owns_lane,
+        owns_lane: AtomicBool::new(owns_lane),
         claimed: AtomicBool::new(false),
         completed: AtomicBool::new(false),
         consumed: AtomicBool::new(false),
@@ -791,6 +794,9 @@ impl RepositoryReadRequestScope for Request {
                                     {
                                         return Err(AdmissionError::Retired);
                                     }
+                                    // Release this frame before its reply becomes observable.
+                                    // Later cleanup must not release a successor frame's lane.
+                                    self.release_lane(&op);
                                     let result =
                                         transfer().map_err(|_| AdmissionError::Unavailable);
                                     if result.is_ok() && matches!(self.frame, Frame::Capture(_)) {
