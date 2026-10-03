@@ -12758,6 +12758,11 @@ async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() 
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
+    if common::claude_npx::in_subprocess(
+        "wss_agent_complete_once_claude_code_sends_slimmed_session_meta",
+    ) {
+        return;
+    }
     // intent-hq/intent#4587: over the real WSS transport, a claude-code
     // `agent.completeOnce` opens the ephemeral session with a slimming
     // `_meta` — the caller's `systemPrompt` as a STRING (replaces the
@@ -12793,8 +12798,9 @@ async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
     srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
     srv.set_setting(
         "providers.paths",
-        serde_json::json!({ "claude-code": bin.to_string_lossy() }),
+        serde_json::json!({ "claude-code": common::claude_npx::legacy_override() }),
     );
+    common::claude_npx::select_adapter(&bin);
 
     let resp = wss_call(
         srv.port,
@@ -20393,6 +20399,52 @@ async fn wss_file_attachment_upload_round_trip() {
 /// a pending session idempotently.
 #[intent_test_macros::daemon_test]
 async fn wss_workspace_import_lifecycle() {
+    // Availability is discovery-only during import. Keep its canonical CLI
+    // fixture and discovery caches in a separate process, including on Windows.
+    const TEST: &str = "wss_workspace_import_lifecycle";
+    if std::env::var("INTENTD_IMPORT_CLI_TEST").as_deref() != Ok(TEST) {
+        use std::process::{Command, Stdio};
+
+        let root = common::test_tempdir("itd-import-cli-");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let cli = bin.join("codex");
+            std::fs::write(&cli, "#!/bin/sh\n: > \"$0.launched\"\nexit 91\n").unwrap();
+            std::fs::set_permissions(cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        std::fs::write(bin.join("codex.exe"), b"discovery-only fixture").unwrap();
+        let mut paths = vec![bin.clone()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let log_path = root.path().join("test.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env("INTENTD_IMPORT_CLI_TEST", TEST)
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log));
+        let mut child = intentd_test_support::GuardedChild::spawn(&mut cmd).unwrap();
+        let status = child
+            .wait_with_timeout(common::test_timeout(std::time::Duration::from_secs(180)))
+            .unwrap()
+            .expect("isolated import test timed out");
+        assert!(
+            status.success(),
+            "{TEST}: {}",
+            std::fs::read_to_string(log_path).unwrap()
+        );
+        assert!(
+            !bin.join("codex.launched").exists(),
+            "import must not launch the installed CLI"
+        );
+        return;
+    }
     use base64::Engine as _;
     use std::io::Write as _;
 
@@ -22819,6 +22871,10 @@ async fn wss_cross_workspace_siblings_resolve_by_github_identity() {
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_quick_action_effort_settings_and_execution_contract() {
+    if common::claude_npx::in_subprocess("wss_quick_action_effort_settings_and_execution_contract")
+    {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     let dir = test_tempdir("wss-quick-action-effort-");
     let log = dir.path().join("requests.jsonl");
@@ -22833,7 +22889,11 @@ async fn wss_quick_action_effort_settings_and_execution_contract() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
-    srv.set_setting("providers.paths", serde_json::json!({"claude-code":bin}));
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({"claude-code":common::claude_npx::legacy_override()}),
+    );
+    common::claude_npx::select_adapter(&bin);
     srv.set_setting(
         "quickActions.typeOverrides",
         serde_json::json!({"commit":"action-model"}),
