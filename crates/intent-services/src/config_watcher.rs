@@ -50,7 +50,7 @@ use tokio::task::JoinHandle;
 use crate::events::shared_watch::{
     os_watch_limits, SharedWatchHub, SubHandle, CREATE_RETRY_CAP, CREATE_RETRY_INITIAL,
 };
-use crate::settings_registry::{SettingsChanged, SettingsRegistry};
+use crate::settings_registry::{SettingsChanged, SettingsRegistry, SettingsSnapshot};
 
 tokio::task_local! {
     // Only the watcher installs this scope, after a reload has committed.
@@ -85,7 +85,12 @@ pub(crate) enum ReloadOutcome {
 /// it can be unit-tested deterministically: read the config file, suppress
 /// self-writes, and strictly reload the registry. Never panics or drops
 /// settings — every failure path keeps last-good values and logs a WARN.
-fn read_config_text(registry: &SettingsRegistry) -> std::result::Result<String, ReloadOutcome> {
+fn read_config_text(
+    registry: &SettingsRegistry,
+) -> std::result::Result<(String, Arc<SettingsSnapshot>), ReloadOutcome> {
+    // Capture before both the read and self-write classification. This same
+    // snapshot must still own preparation and final publication after awaits.
+    let expected = registry.snapshot();
     let path = registry.config_path();
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -105,16 +110,19 @@ fn read_config_text(registry: &SettingsRegistry) -> std::result::Result<String, 
         );
         return Err(ReloadOutcome::SelfWrite);
     }
-    Ok(text)
+    Ok((text, expected))
 }
 
 pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcome {
-    let text = match read_config_text(registry) {
+    let (text, expected) = match read_config_text(registry) {
         Ok(text) => text,
         Err(outcome) => return outcome,
     };
     let path = registry.config_path();
-    match registry.reload(&text) {
+    match registry
+        .prepare_repository_reload_at(&text, expected)
+        .and_then(|candidate| registry.publish_repository_reload(candidate, None))
+    {
         Ok(notice) if notice.changed.is_empty() => ReloadOutcome::Unchanged,
         Ok(notice) => {
             tracing::info!(
@@ -136,7 +144,10 @@ pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcom
 }
 
 type PreparedReload = Arc<
-    dyn Fn(String) -> std::pin::Pin<Box<dyn Future<Output = Result<SettingsChanged>> + Send>>
+    dyn Fn(
+            String,
+            Arc<SettingsSnapshot>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<SettingsChanged>> + Send>>
         + Send
         + Sync,
 >;
@@ -145,11 +156,11 @@ async fn process_prepared_config_change(
     registry: &SettingsRegistry,
     reload: &PreparedReload,
 ) -> ReloadOutcome {
-    let text = match read_config_text(registry) {
+    let (text, expected) = match read_config_text(registry) {
         Ok(text) => text,
         Err(outcome) => return outcome,
     };
-    match reload(text).await {
+    match reload(text, expected).await {
         Ok(notice) if notice.changed.is_empty() => ReloadOutcome::Unchanged,
         Ok(notice) => ReloadOutcome::Applied(notice),
         Err(error) => {
@@ -234,10 +245,11 @@ impl ConfigWatcher {
         reload: F,
     ) -> Result<Self>
     where
-        F: Fn(String) -> Fut + Send + Sync + 'static,
+        F: Fn(String, Arc<SettingsSnapshot>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<SettingsChanged>> + Send + 'static,
     {
-        let reload: PreparedReload = Arc::new(move |text| Box::pin(reload(text)));
+        let reload: PreparedReload =
+            Arc::new(move |text, expected| Box::pin(reload(text, expected)));
         Self::start_with_reload(hub, registry, revision_gate, |_| async {}, Some(reload))
     }
 
@@ -487,13 +499,13 @@ mod tests {
         let reload: PreparedReload = Arc::new({
             let registry = registry.clone();
             let revision = revision.clone();
-            move |text| {
+            move |text, expected| {
                 let registry = registry.clone();
                 let revision = revision.clone();
                 let finished = finished.clone();
                 Box::pin(async move {
                     assert_eq!(registry.get("git.autoCommit"), Some(json!(true)));
-                    let candidate = registry.prepare_repository_reload(&text)?;
+                    let candidate = registry.prepare_repository_reload_at(&text, expected)?;
                     let guard = revision
                         .try_write()
                         .expect("watcher must not acquire revision before the prepared owner");
@@ -531,11 +543,11 @@ mod tests {
         let reload: PreparedReload = Arc::new({
             let registry = registry.clone();
             let calls = calls.clone();
-            move |text| {
+            move |text, expected| {
                 let registry = registry.clone();
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Box::pin(async move {
-                    let candidate = registry.prepare_repository_reload(&text)?;
+                    let candidate = registry.prepare_repository_reload_at(&text, expected)?;
                     registry.publish_repository_reload(candidate, None)
                 })
             }
@@ -561,6 +573,107 @@ mod tests {
         ));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(Arc::ptr_eq(&snapshot, &registry.snapshot()));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn prepared_watcher_read_before_rpc_keeps_the_newer_snapshot() {
+        use intent_core::WorkspaceApi;
+
+        for restore_value in [false, true] {
+            let (dir, registry) = temp_registry(Some("[git]\nautoCommit = true\n"));
+            let store = intent_store::Store::open(&dir.path().join("settings.db"))
+                .await
+                .unwrap();
+            let services = crate::Services::new(store).with_settings_registry(registry.clone());
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let reload: PreparedReload = Arc::new({
+                let services = services.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                move |text, expected| {
+                    let services = services.clone();
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    Box::pin(async move {
+                        entered.notify_one();
+                        release.acquire().await.unwrap().forget();
+                        services
+                            .apply_prepared_settings_reload(text, expected)
+                            .await
+                    })
+                }
+            });
+            let task = intent_core::spawn_daemon({
+                let registry = registry.clone();
+                async move { process_prepared_config_change(&registry, &reload).await }
+            });
+            tokio::time::timeout(crate::events::LIVENESS, entered.notified())
+                .await
+                .expect("original watcher read reached its callback");
+            let applied = services
+                .settings_update(json!([{"path":"git.autoCommit","value":false}]))
+                .await
+                .unwrap();
+            assert_eq!(applied["applied"][0]["value"], false);
+            if restore_value {
+                services
+                    .settings_update(json!([{"path":"git.autoCommit","value":true}]))
+                    .await
+                    .unwrap();
+            }
+            let before = services
+                .settings_get("git.autoCommit".into())
+                .await
+                .unwrap();
+            let snapshot = registry.snapshot();
+            let persisted = std::fs::read_to_string(registry.config_path()).unwrap();
+            let notice = registry.subscribe();
+            release.add_permits(1);
+            let outcome = tokio::time::timeout(crate::events::LIVENESS, task)
+                .await
+                .expect("original callback must settle")
+                .unwrap();
+            let after = services
+                .settings_get("git.autoCommit".into())
+                .await
+                .unwrap();
+            eprintln!("stale reload restore={restore_value} outcome={outcome:?} before={before} after={after}");
+            assert!(matches!(outcome, ReloadOutcome::Invalid));
+            assert_eq!(before["value"], restore_value);
+            assert_eq!(after, before, "stale text must not publish a new revision");
+            assert!(Arc::ptr_eq(&snapshot, &registry.snapshot()));
+            assert!(!notice.has_changed().unwrap());
+            assert_eq!(
+                std::fs::read_to_string(registry.config_path()).unwrap(),
+                persisted
+            );
+
+            // A new read still adopts a genuinely new external edit. Keep the
+            // rejected callback separate from this fresh observation.
+            std::fs::write(
+                registry.config_path(),
+                format!("{persisted}\n[rtk]\nenabled = true\n"),
+            )
+            .unwrap();
+            let fresh: PreparedReload = Arc::new({
+                let services = services.clone();
+                move |text, expected| {
+                    let services = services.clone();
+                    Box::pin(async move {
+                        services
+                            .apply_prepared_settings_reload(text, expected)
+                            .await
+                    })
+                }
+            });
+            assert!(matches!(
+                process_prepared_config_change(&registry, &fresh).await,
+                ReloadOutcome::Applied(_)
+            ));
+            assert_eq!(registry.get("rtk.enabled"), Some(json!(true)));
+            assert_eq!(registry.get("git.autoCommit"), Some(json!(restore_value)));
+        }
     }
 
     #[test]

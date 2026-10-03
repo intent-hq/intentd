@@ -752,6 +752,7 @@ async fn context_output_actual_outer_settings_writers_release_metadata_before_sn
                     intent_core::with_caller(Caller::Daemon,service.settings_update(serde_json::json!([{"path":"sourceControl.gitlab.oauthClientId","value":"new-settings-client"}]))).await.unwrap();
                 }
                 "prepared-reload" => {
+                    let expected = registry.snapshot();
                     let text = std::fs::read_to_string(registry.config_path())
                         .unwrap()
                         .replace(
@@ -759,7 +760,10 @@ async fn context_output_actual_outer_settings_writers_release_metadata_before_sn
                             "oauthClientId = \"new-reload-client\"",
                         );
                     assert!(text.contains("new-reload-client"));
-                    service.apply_prepared_settings_reload(text).await.unwrap();
+                    service
+                        .apply_prepared_settings_reload(text, expected)
+                        .await
+                        .unwrap();
                 }
                 "prepared-pin" => {
                     let guard = service.gitlab_credential_gate.lock().await;

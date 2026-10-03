@@ -812,6 +812,14 @@ impl SettingsRegistry {
         &self,
         text: &str,
     ) -> Result<PreparedRepositorySettings> {
+        self.prepare_repository_reload_at(text, self.snapshot())
+    }
+
+    pub(crate) fn prepare_repository_reload_at(
+        &self,
+        text: &str,
+        expected: Arc<SettingsSnapshot>,
+    ) -> Result<PreparedRepositorySettings> {
         let mut doc: DocumentMut = text
             .parse()
             .map_err(|e| Error::InvalidInput(format!("invalid config.toml: {e}")))?;
@@ -826,13 +834,20 @@ impl SettingsRegistry {
         };
         sync_normalized_compounds(&mut doc, &file)?;
         let inner = self.inner.lock().expect("settings registry lock poisoned");
+        // A watcher captures this identity before reading the file. Preparing
+        // older text against a snapshot published during that read would let a
+        // later reload overwrite an already completed settings.update.
+        if !Arc::ptr_eq(&expected, &self.snapshot()) {
+            return Err(Error::Internal(
+                "config snapshot changed after the reload was captured".into(),
+            ));
+        }
         let mut candidate = inner.clone();
         candidate.file = file;
         candidate.doc = doc;
         candidate.source_text = text.to_string();
         candidate.recent_writes.clear();
         let snapshot = Arc::new(build_snapshot(&candidate)?);
-        let expected = self.snapshot();
         if expected.effective.source_control.gitlab != snapshot.effective.source_control.gitlab
             && snapshot
                 .effective

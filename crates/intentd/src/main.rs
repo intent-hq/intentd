@@ -6267,9 +6267,13 @@ fn spawn_config_watcher_init(
             &hub,
             registry,
             watcher_services.settings_revision_gate(),
-            move |text| {
+            move |text, expected| {
                 let services = watcher_services.clone();
-                async move { services.apply_prepared_settings_reload(text).await }
+                async move {
+                    services
+                        .apply_prepared_settings_reload(text, expected)
+                        .await
+                }
             },
         );
         let mut watcher = match started {

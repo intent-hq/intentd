@@ -17068,12 +17068,16 @@ impl Services {
     ///
     /// # Errors
     /// Rejects invalid or superseded candidates and unprepared relevant changes.
-    pub async fn apply_prepared_settings_reload(&self, text: String) -> Result<SettingsChanged> {
+    pub async fn apply_prepared_settings_reload(
+        &self,
+        text: String,
+        expected: Arc<SettingsSnapshot>,
+    ) -> Result<SettingsChanged> {
         let registry = self
             .settings_registry
             .as_deref()
             .ok_or_else(|| Error::Internal("settings registry is unavailable for reload".into()))?;
-        let candidate = registry.prepare_repository_reload(&text)?;
+        let candidate = registry.prepare_repository_reload_at(&text, expected)?;
         let relevant = candidate.snapshot().effective.source_control.gitlab
             != registry.snapshot().effective.source_control.gitlab;
         let credential_guard = if relevant {
