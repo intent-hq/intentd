@@ -74,7 +74,10 @@ fn spawn_serve_with_claude_config(
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     if let Some(path) = claude_config {
-        cmd.env("CLAUDE_CONFIG_DIR", path);
+        cmd.env("CLAUDE_CONFIG_DIR", path).env(
+            "RUST_LOG",
+            "warn,intent_services::events::linked_watch=debug",
+        );
     }
     // Assert before spawning, so a broken fixture fails without using an
     // inherited credential. Name missing contracts without printing values.

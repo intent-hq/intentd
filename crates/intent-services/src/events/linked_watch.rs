@@ -59,6 +59,7 @@ impl LinkedWatches {
                     if subscription.wait_live().await {
                         backoff = Duration::from_millis(250);
                         on_change();
+                        tracing::debug!(root = %root.display(), "linked directory watch established");
                         while let Some(event) = rx.recv().await {
                             if !matches!(event.kind, notify::EventKind::Access(_)) {
                                 on_change();

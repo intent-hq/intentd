@@ -1011,6 +1011,12 @@ async fn native_review_real_cold_uds_wss_commit_https_push_ready_create_and_rece
     {
         return;
     }
+    tracing_subscriber::fmt()
+        .with_env_filter("off,intent_services::repository_admission::native_review=debug")
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .try_init()
+        .unwrap();
     let h = Harness::boot().await;
     let mut uds = h.uds().await;
     let mut ws = h.wss(TOKEN).await;

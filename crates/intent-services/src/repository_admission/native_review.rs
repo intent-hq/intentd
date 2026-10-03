@@ -2758,6 +2758,7 @@ fn monitor(op: &Arc<Operation>) {
                 .await;
                 if !matches!(current, Ok(Ok(true))) {
                     op.retire();
+                    tracing::debug!(operation = %op.id, phase = "monitor-metadata", "native review admission refused");
                 }
             }
             let expired = op.disclosure_current().is_err();
@@ -3185,17 +3186,27 @@ async fn run_stages(
         admission,
         stage: Some(op.query.action),
     };
-    if content_fingerprint(op.metadata.root.path(), &op.files)? != op.content_fingerprint {
+    if content_fingerprint(op.metadata.root.path(), &op.files).inspect_err(|_| {
+        tracing::debug!(operation = %op.id, phase = "content-read", "native review admission refused");
+    })? != op.content_fingerprint {
+        tracing::debug!(operation = %op.id, phase = "content-mismatch", "native review admission refused");
         return Err(unavailable());
     }
     let plan = stages(&op.query)?;
     for stage in plan {
         pending.stage = Some(stage);
         let preflight = async {
-            op.write_current()?;
-            op.metadata.validate(true).await?;
+            op.write_current().inspect_err(|_| {
+                tracing::debug!(operation = %op.id, ?stage, phase = "write-lifetime", "native review admission refused");
+            })?;
+            op.metadata.validate(true).await.inspect_err(|_| {
+                tracing::debug!(operation = %op.id, ?stage, phase = "metadata", "native review admission refused");
+            })?;
             engine::revalidate_repository_stage(admission, stage)
                 .await
+                .inspect_err(|_| {
+                    tracing::debug!(operation = %op.id, ?stage, phase = "stage-authority", "native review admission refused");
+                })
                 .map_err(denied)
         }
         .await;
@@ -3272,8 +3283,18 @@ async fn run_stages(
             // extra queue is introduced into the R/P comparison itself.
             validate_companion_git(op)?;
         }
+        // Record only the last boundary actually reached. Emission is outside
+        // the original consuming guards; no predicate is repeated for logging.
+        let mut phase = "dispatch-authority";
         let stamp = engine::begin_native_repository_stage(checked, |claim| {
-            op.metadata.with_metadata(|| queue.claim(claim))
+            phase = "dispatch-metadata";
+            op.metadata.with_metadata(|| {
+                phase = "dispatch-queue";
+                queue.claim(claim)
+            })
+        })
+        .inspect_err(|_| {
+            tracing::debug!(operation = %op.id, ?stage, phase, "native review admission refused");
         })
         .map_err(denied)?;
         pending.stage = None;
