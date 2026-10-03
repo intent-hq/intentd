@@ -103,6 +103,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedCh
 /// port (a same-port listener restart, a batch's explicit port).
 fn spawn_serve_fixed_port(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let mut cmd = common::serve_command_fixed_port();
+    cmd.env_remove("INTENTD_TCP_PORT");
     configure_serve(&mut cmd, data_dir, listen, env);
     GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
@@ -2054,7 +2055,7 @@ async fn first_enable_port_lease_blocks_competing_fixture_until_recovery() {
 }
 
 async fn first_enable_scenario(with_contender: bool) {
-    let lease: Option<std::fs::File> = None;
+    let lease = port_lease::acquire();
     let dir = temp_data_dir();
     std::fs::write(
         dir.path().join("config.toml"),
