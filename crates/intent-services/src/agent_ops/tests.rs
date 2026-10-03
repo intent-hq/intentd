@@ -27396,7 +27396,7 @@ async fn status_list_and_diagnostics_surface_waiting_on_hooks() {
 }
 
 /// The internal decoration must not hydrate retired history or active payloads.
-/// SQLx reports actual fetched rows, independently of the final wire projection.
+/// `SQLx` reports actual fetched rows, independently of the final wire projection.
 async fn assert_waiting_hooks_read_cost(batched: bool) {
     use crate::test_tracing::{capture_sqlx_queries, warm_sqlx_pool};
     use intent_core::{HookId, HookState};

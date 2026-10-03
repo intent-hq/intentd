@@ -684,7 +684,7 @@ mod projection_tests {
     use super::*;
     use sqlx::{Column, Executor};
 
-    /// Exercise the production statements against migrated SQLite: scoped
+    /// Exercise the production statements against migrated `SQLite`: scoped
     /// partial-index seeks avoid scanning history and already supply ordering.
     #[tokio::test]
     async fn active_hook_metadata_queries_use_partial_indexes_and_only_metadata() {
