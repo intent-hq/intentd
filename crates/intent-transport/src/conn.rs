@@ -1379,6 +1379,7 @@ pub(crate) async fn handle_sub_fast_path(
         } => match subscriptions::parse_chat_subscribe_params(&params) {
             Ok(p) => {
                 let subscriptions::ChatSubscribeParams {
+                    limit,
                     agent_id,
                     since_message_id,
                     delta_encoding,
@@ -1455,6 +1456,7 @@ pub(crate) async fn handle_sub_fast_path(
                     subscription_id.clone(),
                     out_tx.clone(),
                     timer,
+                    limit,
                 ));
                 subs.insert(subscription_id, handle, replace_group, Some(lifecycle));
                 true
@@ -1772,6 +1774,7 @@ async fn forward_chat_subscription(
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
+    limit: usize,
 ) {
     let scope = agent_id.as_str().to_string();
     let reason = chat_subscription_loop(
@@ -1785,6 +1788,7 @@ async fn forward_chat_subscription(
         subscription_id.clone(),
         out_tx,
         timer,
+        limit,
     )
     .await;
     subscriptions::trace_chat_forwarder_exit(&scope, &subscription_id, reason);
@@ -1807,6 +1811,7 @@ async fn chat_subscription_loop(
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
+    limit: usize,
 ) -> &'static str {
     // Everything this forwarder emits travels on the bulk lane; conflation
     // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
@@ -1834,6 +1839,7 @@ async fn chat_subscription_loop(
         &agent_id,
         since_message_id.as_deref(),
         projection,
+        limit,
     )
     .await;
     subscriptions::stamp_delta_encoding(&mut snapshot, delta_encoding);
@@ -1905,7 +1911,7 @@ async fn chat_subscription_loop(
             () = tokio::time::sleep(CHAT_RECOVERY_RETRY), if pending_recovery.is_some() => {
                 if !attempt_chat_recovery(
                     api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
-                    &mut seq, &out_tx, &mut state, &mut pending_recovery,
+                    &mut seq, &out_tx, &mut state, &mut pending_recovery, limit,
                 ).await {
                     return "client_closed";
                 }
@@ -1928,7 +1934,7 @@ async fn chat_subscription_loop(
                     Delivery::Batch(_) if pending_recovery.is_some() => {
                         if !attempt_chat_recovery(
                             api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
-                            &mut seq, &out_tx, &mut state, &mut pending_recovery,
+                            &mut seq, &out_tx, &mut state, &mut pending_recovery, limit,
                         ).await {
                             return "client_closed";
                         }
@@ -1964,7 +1970,7 @@ async fn chat_subscription_loop(
                         );
                         if !attempt_chat_recovery(
                             api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
-                            &mut seq, &out_tx, &mut state, &mut pending_recovery,
+                            &mut seq, &out_tx, &mut state, &mut pending_recovery, limit,
                         ).await {
                             return "client_closed";
                         }
@@ -1987,7 +1993,7 @@ async fn chat_subscription_loop(
                     pending_recovery = Some(0);
                     if !attempt_chat_recovery(
                         api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
-                        &mut seq, &out_tx, &mut state, &mut pending_recovery,
+                        &mut seq, &out_tx, &mut state, &mut pending_recovery, limit,
                     ).await {
                         return "client_closed";
                     }
@@ -2093,8 +2099,10 @@ async fn attempt_chat_recovery(
     out_tx: &mpsc::Sender<String>,
     state: &mut subscriptions::ChatDeltaState,
     pending_recovery: &mut Option<u64>,
+    limit: usize,
 ) -> bool {
-    let Some(mut snapshot) = subscriptions::chat_recovery_snapshot(api, agent_id, projection).await
+    let Some(mut snapshot) =
+        subscriptions::chat_recovery_snapshot(api, agent_id, projection, limit).await
     else {
         tracing::warn!(
             agent = %agent_id,

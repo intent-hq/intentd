@@ -38,8 +38,9 @@ use std::time::{Duration, Instant};
 
 use crate::events::IdInfo;
 
-/// Chat snapshots have a smaller window than generic paginated RPCs.
+/// Chat snapshots default to a smaller window than generic paginated RPCs.
 const CHAT_SNAPSHOT_MESSAGE_LIMIT: usize = 5;
+const CHAT_SNAPSHOT_MAX_MESSAGE_LIMIT: u64 = 200;
 
 /// A subscription channel selected by the `*.subscribe` method (TB-0 §3). TB-4
 /// wires the `note` collection channel end-to-end; TB-5 adds `task`, `agent`,
@@ -121,6 +122,7 @@ pub(crate) struct CommentSubscribeParams {
 /// (§5.5) — no frame class is exempt.
 #[derive(Debug)]
 pub(crate) struct ChatSubscribeParams {
+    pub limit: usize,
     pub agent_id: String,
     pub since_message_id: Option<String>,
     pub delta_encoding: DeltaEncoding,
@@ -304,12 +306,22 @@ pub(crate) fn parse_comment_subscribe_params(
 /// full-text encoding, `"incremental"` selects append-only text deltas; any
 /// other value is a `-32602` error (a silently ignored typo would leave the
 /// client appending fragments the daemon never sends as fragments).
+/// `limit` defaults to five for absent/null; otherwise it must be an integer
+/// in 1–200 and is retained for every snapshot on the subscription.
 pub(crate) fn parse_chat_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<ChatSubscribeParams, String> {
     let agent_id = match params.get("agentId").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return Err("agentId is required".to_string()),
+    };
+    let limit = match params.get("limit") {
+        None | Some(Value::Null) => CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        Some(value) => value
+            .as_u64()
+            .filter(|limit| (1..=CHAT_SNAPSHOT_MAX_MESSAGE_LIMIT).contains(limit))
+            .and_then(|limit| usize::try_from(limit).ok())
+            .ok_or_else(|| "limit must be an integer between 1 and 200".to_string())?,
     };
     let since_message_id = match params.get("sinceMessageId") {
         None | Some(Value::Null) => None,
@@ -334,6 +346,7 @@ pub(crate) fn parse_chat_subscribe_params(
         Some(_) => return Err("projection must be \"slim\"".to_string()),
     };
     Ok(ChatSubscribeParams {
+        limit,
         agent_id,
         since_message_id,
         delta_encoding,
@@ -787,7 +800,7 @@ pub(crate) async fn channel_snapshot(
 /// `chat.subscribe` arriving mid-turn reconstructs a coherent in-flight message.
 ///
 /// **Bounded** (monorepo#958): exactly ONE conversation read, with no
-/// `nextToken` follow-up and an explicit chat-only limit of five messages,
+/// `nextToken` follow-up and the validated subscription limit (default five),
 /// so the snapshot fetches/decodes only its
 /// bounded newest page regardless of transcript length — the paginated op
 /// selects just that page SQL-side and never re-hydrates the full history.
@@ -817,11 +830,12 @@ pub(crate) async fn chat_snapshot(
     agent_id: &AgentId,
     since_message_id: Option<&str>,
     projection: Option<ConversationProjection>,
+    limit: usize,
 ) -> Value {
     let (mut snapshot, overlay) = match api
         .agent_get_conversation(
             agent_id.clone(),
-            Some(i64::try_from(CHAT_SNAPSHOT_MESSAGE_LIMIT).expect("chat limit fits in i64")),
+            Some(i64::try_from(limit).expect("chat limit fits in i64")),
             None,
             None,
             None,
@@ -858,7 +872,7 @@ pub(crate) async fn chat_snapshot(
         apply_resume_filter(&mut snapshot, since);
     }
     if overlay {
-        overlay_live_state(api, agent_id, &mut snapshot, projection).await;
+        overlay_live_state(api, agent_id, &mut snapshot, projection, limit).await;
     }
     snapshot
 }
@@ -877,11 +891,12 @@ pub(crate) async fn chat_recovery_snapshot(
     api: &dyn WorkspaceApi,
     agent_id: &AgentId,
     projection: Option<ConversationProjection>,
+    limit: usize,
 ) -> Option<Value> {
     let read = || {
         api.agent_get_conversation(
             agent_id.clone(),
-            Some(i64::try_from(CHAT_SNAPSHOT_MESSAGE_LIMIT).expect("chat limit fits in i64")),
+            Some(i64::try_from(limit).expect("chat limit fits in i64")),
             None,
             None,
             None,
@@ -894,7 +909,7 @@ pub(crate) async fn chat_recovery_snapshot(
         Ok(v) => v,
         Err(_) => read().await.ok()?,
     };
-    overlay_live_state(api, agent_id, &mut snapshot, projection).await;
+    overlay_live_state(api, agent_id, &mut snapshot, projection, limit).await;
     Some(snapshot)
 }
 
@@ -910,6 +925,7 @@ async fn overlay_live_state(
     agent_id: &AgentId,
     snapshot: &mut Value,
     projection: Option<ConversationProjection>,
+    limit: usize,
 ) {
     // Read busy BEFORE the slot, never after. The two reads are separate lock
     // acquisitions, so a turn can claim `busy` between them; `try_begin` clears a
@@ -922,7 +938,7 @@ async fn overlay_live_state(
     // content labelled settled, which the next delta or snapshot corrects.
     let is_streaming = api.agent_is_busy(agent_id.clone());
     if let Some(live) = api.agent_live_turn(agent_id.clone()) {
-        merge_live_turn(snapshot, agent_id, &live, is_streaming, projection);
+        merge_live_turn(snapshot, agent_id, &live, is_streaming, projection, limit);
     }
     // Overlay the daemon-owned activity flags (PROTOCOL §7.1) so a client
     // arriving mid-turn renders the same `isResponding`/`isWaitingOnTool`/
@@ -992,7 +1008,7 @@ fn apply_resume_filter(snapshot: &mut Value, since: &str) {
 /// against.
 ///
 /// **Chat count and slim page budget (§5.5).** The live row counts inside the
-/// five-message snapshot window. Under `projection: "slim"` the merged page is
+/// requested snapshot window. Under `projection: "slim"` the merged page is
 /// re-budgeted after the append: the persisted page arrived within
 /// [`SLIM_PAGE_BUDGET_BYTES`], but `slim_message_blocks` caps block *bodies*,
 /// not block *count*, so a streaming turn with hundreds of capped blocks can
@@ -1011,6 +1027,7 @@ fn merge_live_turn(
     live: &Value,
     is_streaming: bool,
     projection: Option<ConversationProjection>,
+    limit: usize,
 ) {
     let Some(message_id) = live.get("messageId").and_then(Value::as_str) else {
         return;
@@ -1059,13 +1076,13 @@ fn merge_live_turn(
         "isStreaming": is_streaming,
     }));
     obj.insert("totalMessages".to_string(), json!(total + 1));
-    rebudget_merged_page(obj, projection);
+    rebudget_merged_page(obj, projection, limit);
 }
 
 /// Re-apply the §5.5 slim page budget to a chat snapshot's `messages` page
 /// after the live-turn append (see [`merge_live_turn`]'s budget note). The
 /// newest row — the just-appended live turn — is the anchor and always
-/// serves; oldest rows are evicted until the page fits the five-message limit
+/// serves; oldest rows are evicted until the page fits the requested message limit
 /// and, for slim projection, [`SLIM_PAGE_BUDGET_BYTES`], with
 /// `truncated`/`nextToken` re-minted at the
 /// oldest kept row's global position (its `seq`, contiguous from 0) so the
@@ -1075,11 +1092,15 @@ fn merge_live_turn(
 /// so both sides of the budget agree on what a row weighs. No-op when the
 /// merged page already fits — the common case, since the persisted page
 /// arrived within budget and a typical live turn is small.
-fn rebudget_merged_page(obj: &mut Map<String, Value>, projection: Option<ConversationProjection>) {
+fn rebudget_merged_page(
+    obj: &mut Map<String, Value>,
+    projection: Option<ConversationProjection>,
+    limit: usize,
+) {
     let Some(arr) = obj.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
-    let mut lo = arr.len().saturating_sub(CHAT_SNAPSHOT_MESSAGE_LIMIT);
+    let mut lo = arr.len().saturating_sub(limit);
     if projection == Some(ConversationProjection::Slim) {
         let sizes: Vec<usize> = arr[lo..]
             .iter()
