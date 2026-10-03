@@ -296,46 +296,60 @@ pub fn read_live_pid(path: &Path) -> Option<nix::unistd::Pid> {
     nix::sys::signal::kill(pid, None).is_ok().then_some(pid)
 }
 
-/// Pidfile guard: writes the sitter's own pid on creation and removes the
-/// file on drop — but only when it still holds this process's pid, so a
-/// later serve sitter's entry (last writer wins) is never deleted by an
-/// earlier one exiting. Serve mode only. On unix `intentd restart` reads it
-/// to find the supervising sitter; on Windows `install.ps1` reads it as the
-/// ownership witness tying the running daemon's process tree to the data
-/// dir being re-installed over.
+/// Exclusive serve ownership, held until after the PID record is removed.
+/// The separate lock file is never unlinked: removing a locked inode would
+/// let another process lock a replacement while the original is still held.
+/// On Unix the PID probe also protects older sitters that do not take the lock.
 struct PidFile {
     path: std::path::PathBuf,
+    #[cfg(unix)]
+    _lock: nix::fcntl::Flock<std::fs::File>,
+    #[cfg(not(unix))]
+    _lock: std::fs::File,
 }
 
 impl PidFile {
-    fn create(path: &Path) -> Option<Self> {
+    fn create(path: &Path) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
-        // Liveness probing is unix-only (`kill(pid, 0)` via nix); windows
-        // just overwrites — last writer wins either way.
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // An exclusive handle is the Windows lifetime ownership lock.
+            options.share_mode(0);
+        }
+        let lock = options.open(path.with_extension("lock"))?;
         #[cfg(unix)]
-        if let Some(pid) = read_live_pid(path) {
-            eprintln!(
-                "intentd-sitter: pidfile {} already names live pid {pid}; another \
-                 serve sitter appears to be running (overwriting — `intentd restart` \
-                 will target this sitter)",
-                path.display()
-            );
-        }
-        match std::fs::write(path, format!("{}\n", std::process::id())) {
-            Ok(()) => Some(Self {
-                path: path.to_path_buf(),
-            }),
-            Err(e) => {
-                eprintln!(
-                    "intentd-sitter: failed to write pidfile {}: {e} \
-                     (`intentd restart` will not find this sitter)",
-                    path.display()
-                );
-                None
+        let lock = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, error)| io::Error::from(error))?;
+        #[cfg(unix)]
+        {
+            let contents = match std::fs::read_to_string(path) {
+                Ok(contents) => contents,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(e),
+            };
+            if let Some(pid) = contents.trim().parse::<i32>().ok().filter(|pid| *pid > 0) {
+                // Only ESRCH proves the old owner is gone. In particular EPERM
+                // must not let a duplicate overwrite another user's live record.
+                if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                    != Err(nix::errno::Errno::ESRCH)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("another serve sitter owns {} (pid {pid})", path.display()),
+                    ));
+                }
             }
         }
+        std::fs::write(path, format!("{}\n", std::process::id()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            _lock: lock,
+        })
     }
 }
 
@@ -424,9 +438,54 @@ impl Supervisor {
         // version exactly once and their exit status passes through.
         let supervised = self.passthrough.first().is_some_and(|arg| arg == "serve");
 
+        let mut signals = match Signals::new() {
+            Ok(signals) => signals,
+            Err(e) => {
+                eprintln!("intentd-sitter: failed to install signal handlers: {e}");
+                return 1;
+            }
+        };
+        // Claim ownership before any startup update can mutate shared state.
+        // Publish only after handlers exist, so discovery cannot expose a
+        // sitter that would die to SIGHUP. Failure must not spawn a child.
+        let _pidfile = if supervised {
+            match PidFile::create(&self.paths.pid_path) {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    eprintln!("intentd-sitter: cannot claim serve ownership: {e}");
+                    return 1;
+                }
+            }
+        } else {
+            None
+        };
+
         let (mut current_version, mut next_check_at) = if supervised {
             // Startup check: always runs, regardless of the persisted schedule.
-            let startup = self.check().await;
+            // Signal handlers are already installed for PID discovery. Keep
+            // consuming them while network I/O is in flight, so service stop
+            // never waits for a manifest/download timeout or spawns a child.
+            let check = self.check();
+            tokio::pin!(check);
+            #[cfg_attr(
+                not(unix),
+                expect(clippy::never_loop, reason = "only the shutdown arm exists off unix")
+            )]
+            let startup = loop {
+                tokio::select! {
+                    biased;
+                    event = signals.recv() => match event {
+                        SignalEvent::Shutdown(signal) => return 128 + signal,
+                        // No child exists yet; startup already checks for an
+                        // update and will spawn the selected version once.
+                        #[cfg(unix)]
+                        SignalEvent::Restart | SignalEvent::CheckNow | SignalEvent::CheckNowIdle => {
+                            eprintln!("intentd-sitter: {} received; startup check is already running", event.name());
+                        }
+                    },
+                    outcome = &mut check => break outcome,
+                }
+            };
             let next_check_at = self.schedule_next_check();
             let version = match startup {
                 Ok(UpdateOutcome::Installed { version, previous }) => {
@@ -492,24 +551,6 @@ impl Supervisor {
             (version, Instant::now())
         };
 
-        let mut signals = match Signals::new() {
-            Ok(signals) => signals,
-            Err(e) => {
-                eprintln!("intentd-sitter: failed to install signal handlers: {e}");
-                return 1;
-            }
-        };
-        // `intentd restart` finds the serve sitter through this pidfile
-        // (and on Windows install.ps1 reads it as the ownership witness);
-        // written only after the signal handlers are installed so a reader
-        // can never SIGHUP a sitter that would still die to it. Removed on
-        // drop (any return path); a hard kill leaves a stale file, which
-        // readers detect via a liveness probe.
-        let _pidfile = if supervised {
-            PidFile::create(&self.paths.pid_path)
-        } else {
-            None
-        };
         let mut backoff = self.config.backoff_initial;
         // Failed starts since the last one that stayed up (see
         // `give_up_after_failures`); reset wherever the backoff resets.
@@ -1619,12 +1660,72 @@ mod tests {
     }
 
     #[test]
+    fn pidfile_guard_rejects_duplicate_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let owner = PidFile::create(&path).expect("first owner");
+        let duplicate = PidFile::create(&path);
+        let rejected = duplicate.is_err();
+        drop(duplicate);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap_or_default().trim(),
+            std::process::id().to_string(),
+            "duplicate cleanup must not remove the original record"
+        );
+        assert!(rejected, "a second owner must be rejected");
+        drop(owner);
+    }
+
+    #[test]
+    fn pidfile_lock_survives_missing_record_and_can_be_reacquired_after_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let owner = PidFile::create(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(PidFile::create(&path).is_err());
+        assert!(!path.exists(), "a duplicate must not invent ownership");
+        drop(owner);
+        let successor = PidFile::create(&path).expect("lock released on exit");
+        drop(successor);
+        assert!(!path.exists());
+        assert!(path.with_extension("lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pidfile_guard_preserves_live_legacy_owner_without_a_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let record = format!("{}\n", std::process::id());
+        std::fs::write(&path, &record).unwrap();
+        assert!(PidFile::create(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), record);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pidfile_guard_reclaims_dead_legacy_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let pid = dead.id();
+        dead.wait().unwrap();
+        std::fs::write(&path, pid.to_string()).unwrap();
+        let owner = PidFile::create(&path).expect("dead owner can be replaced");
+        assert_eq!(
+            read_live_pid(&path),
+            Some(nix::unistd::Pid::from_raw(std::process::id().cast_signed()))
+        );
+        drop(owner);
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn pidfile_guard_drop_leaves_another_sitters_pid_alone() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sitter.pid");
         let guard = PidFile::create(&path).expect("pidfile created");
-        // A later serve sitter overwrites the pidfile (last writer wins);
-        // this guard's drop must not delete that sitter's entry.
+        // An external writer replaces the record; cleanup must not delete it.
         std::fs::write(&path, "999999\n").unwrap();
         drop(guard);
         assert_eq!(
