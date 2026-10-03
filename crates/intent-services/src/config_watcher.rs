@@ -454,7 +454,11 @@ async fn debounce<F, Fut>(
                 if let Some(reload) = prepared_reload {
                     ADMITTED_CALLBACK.scope((), process_prepared_config_change(registry, reload)).await;
                 } else {
-                    let _revision_guard = revision_gate.write().await;
+                    let _revision_guard = tokio::select! {
+                        biased;
+                        _ = stopped.changed() => return,
+                        guard = revision_gate.write() => guard,
+                    };
                     if *stopped.borrow() { return; }
                     if let ReloadOutcome::Applied(notice) = process_config_change(registry) {
                         let callback = ADMITTED_CALLBACK.sync_scope((), || on_change(notice));
@@ -802,6 +806,124 @@ mod tests {
             process_config_change(&reg),
             ReloadOutcome::Unchanged
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_shutdown_cancels_pending_revision_gate() {
+        assert_debounce_revision_gate_schedule(true, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_applies_after_pending_revision_gate_releases() {
+        assert_debounce_revision_gate_schedule(false, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_shutdown_wins_when_revision_gate_also_releases() {
+        assert_debounce_revision_gate_schedule(true, true).await;
+    }
+
+    async fn assert_debounce_revision_gate_schedule(stop: bool, release: bool) {
+        use std::cell::RefCell;
+        use std::task::{Context, Poll, Waker};
+
+        let (_dir, reg) = temp_registry(Some("[git]\nautoCommit = true\n"));
+        let mut notices = reg.subscribe();
+        let generation = reg.generation();
+        let edited = "[git]\nautoCommit = false\n";
+        std::fs::write(reg.config_path(), edited).unwrap();
+        let revision_gate = tokio::sync::RwLock::new(());
+        let mut held = Some(revision_gate.write().await);
+        let (raw_tx, mut raw_rx) = mpsc::unbounded_channel();
+        let (stopping, mut stopped) = tokio::sync::watch::channel(false);
+        let calls = RefCell::new(Vec::new());
+        let mut on_change = |notice| {
+            assert!(
+                owns_admitted_callback(),
+                "callback construction is admitted"
+            );
+            let calls = &calls;
+            let gate = &revision_gate;
+            let reg = &reg;
+            async move {
+                assert!(owns_admitted_callback(), "callback execution is admitted");
+                assert!(gate.try_write().is_err(), "callback owns the revision gate");
+                assert_eq!(reg.get("git.autoCommit"), Some(json!(false)));
+                calls.borrow_mut().push(notice);
+            }
+        };
+        let mut worker = Box::pin(debounce(
+            &reg,
+            &revision_gate,
+            std::ffi::OsStr::new("config.toml"),
+            &mut raw_rx,
+            &mut on_change,
+            &mut stopped,
+            None,
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        // Only the real catch-up timer can become ready: both input channels
+        // stay open and empty, and the revision gate remains held.
+        tokio::time::advance(DEBOUNCE).await;
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        assert!(calls.borrow().is_empty());
+        assert_eq!(reg.get("git.autoCommit"), Some(json!(true)));
+        assert!(!notices.has_changed().unwrap());
+        if stop {
+            stopping.send_replace(true);
+        }
+        if release {
+            drop(held.take());
+            // Tokio's FIFO gate excludes readers behind the queued writer.
+            // This proves the due timer reached lock acquisition, rather than
+            // leaving the worker pending on its timer or empty event channel.
+            assert!(
+                revision_gate.try_read().is_err(),
+                "watcher queued its writer"
+            );
+        }
+        let outcome = worker.as_mut().poll(&mut cx);
+        if !stop {
+            assert!(matches!(outcome, Poll::Pending));
+            let expected = SettingsChanged {
+                generation,
+                changed: ["git.autoCommit".to_owned()].into_iter().collect(),
+            };
+            assert_eq!(*calls.borrow(), vec![expected.clone()]);
+            assert_eq!(reg.get("git.autoCommit"), Some(json!(false)));
+            assert!(notices.has_changed().unwrap());
+            assert_eq!(*notices.borrow_and_update(), expected);
+            assert_eq!(reg.generation(), generation, "reload is not a self-write");
+            stopping.send_replace(true);
+            assert!(worker.as_mut().poll(&mut cx).is_ready());
+            assert_eq!(calls.borrow().len(), 1);
+        }
+        // Keep the event sender and (in the regression) original write guard
+        // alive through the stop poll. Drop the future before failing so the
+        // negative control leaves no pending lock waiter or background task.
+        drop(worker);
+        drop(raw_tx);
+        if stop {
+            assert!(calls.borrow().is_empty());
+            assert_eq!(reg.get("git.autoCommit"), Some(json!(true)));
+            assert_eq!(reg.generation(), generation);
+            assert!(!notices.has_changed().unwrap());
+            assert_eq!(std::fs::read_to_string(reg.config_path()).unwrap(), edited);
+            if !release {
+                assert!(
+                    held.is_some(),
+                    "stop was polled with the original guard held"
+                );
+            }
+        }
+        drop(held);
+        if stop {
+            assert!(
+                outcome.is_ready(),
+                "shutdown must cancel a pending revision-gate acquisition"
+            );
+        }
     }
 
     #[tokio::test]

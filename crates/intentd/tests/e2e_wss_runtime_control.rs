@@ -10,6 +10,9 @@ mod common;
 #[path = "e2e_wss_runtime_control/independent_installations.rs"]
 mod independent_installations;
 
+#[path = "e2e_wss_runtime_control/port_lease.rs"]
+mod port_lease;
+
 use intentd_test_support::GuardedChild;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -100,6 +103,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedCh
 /// port (a same-port listener restart, a batch's explicit port).
 fn spawn_serve_fixed_port(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let mut cmd = common::serve_command_fixed_port();
+    cmd.env_remove("INTENTD_TCP_PORT");
     configure_serve(&mut cmd, data_dir, listen, env);
     GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
@@ -2056,6 +2060,16 @@ fn occupied_fixed_wss_port_fails_daemon_boot() {
 
 #[tokio::test]
 async fn first_enable_publishes_assignment_and_fixed_failure_keeps_daemon_alive() {
+    first_enable_scenario(false).await;
+}
+
+#[tokio::test]
+async fn first_enable_port_lease_blocks_competing_fixture_until_recovery() {
+    first_enable_scenario(true).await;
+}
+
+async fn first_enable_scenario(with_contender: bool) {
+    let lease = port_lease::acquire();
     let dir = temp_data_dir();
     std::fs::write(
         dir.path().join("config.toml"),
@@ -2138,6 +2152,11 @@ async fn first_enable_publishes_assignment_and_fixed_failure_keeps_daemon_alive(
         saved
     );
     drop(hog);
+    let contender = if with_contender {
+        Some(port_lease::Contender::start(port).await)
+    } else {
+        None
+    };
     let retried = uds_rpc(
         &socket,
         6,
@@ -2148,4 +2167,9 @@ async fn first_enable_publishes_assignment_and_fixed_failure_keeps_daemon_alive(
     assert!(retried.get("error").is_none(), "{retried}");
     let status = uds_rpc(&socket, 7, "system.status", json!({})).await;
     assert_eq!(status["result"]["port"], port);
+    if let Some(contender) = contender {
+        drop(daemon);
+        drop(lease);
+        contender.finish(port).await;
+    }
 }

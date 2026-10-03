@@ -142,6 +142,7 @@ fn stop(child: &mut GuardedChild) {
 
 #[tokio::test]
 async fn simultaneous_installations_keep_identity_and_saved_ports_across_restart_and_conflict() {
+    let _lease = port_lease::acquire();
     let a_dir = temp_data_dir();
     let b_dir = temp_data_dir();
     for dir in [a_dir.path(), b_dir.path()] {
