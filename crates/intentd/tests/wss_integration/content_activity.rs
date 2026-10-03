@@ -41,6 +41,28 @@ async fn rpc(client: &mut Ws, id: u64, method: &str, params: Value) -> Value {
     }
 }
 
+async fn subscribed_activity(client: &mut Ws, workspace: &str, stamp: &Value) -> Value {
+    tokio::time::timeout(common::rpc_read_timeout(), async {
+        loop {
+            let value = frame(client).await;
+            if value["method"] == "subscription.push"
+                && value["params"]["seq"].as_u64().unwrap_or(0) > 0
+                && value["params"]["delta"]["updated"]
+                    .as_array()
+                    .is_some_and(|rows| {
+                        rows.iter().any(|row| {
+                            row["id"] == workspace && row["lastContentActivity"] == *stamp
+                        })
+                    })
+            {
+                return value;
+            }
+        }
+    })
+    .await
+    .expect("committed content activity must reach workspace subscribers")
+}
+
 #[intent_test_macros::daemon_test]
 async fn content_activity_backfill_and_writes_are_truthful_over_wss() {
     let srv = start(WsOptions::default()).await;
@@ -206,7 +228,24 @@ async fn content_activity_backfill_and_writes_are_truthful_over_wss() {
         created["result"]["note"]["updatedAt"]
     );
     assert!(fresh["result"]["workspace"]["lastContentActivity"].is_string());
-    evidence.extend([created, fresh]);
+    evidence.push(
+        subscribed_activity(
+            &mut subscriber,
+            "content-empty",
+            &created["result"]["note"]["updatedAt"],
+        )
+        .await,
+    );
+    let edited = rpc(&mut client, 10, "note.update", json!({"workspaceId":"content-empty", "noteId":created["result"]["note"]["id"], "content":"Ordinary note edit"})).await;
+    evidence.push(
+        subscribed_activity(
+            &mut subscriber,
+            "content-empty",
+            &edited["result"]["note"]["updatedAt"],
+        )
+        .await,
+    );
+    evidence.extend([created, fresh, edited]);
     let appended = rpc(
         &mut client,
         8,
@@ -229,7 +268,24 @@ async fn content_activity_backfill_and_writes_are_truthful_over_wss() {
         appended["result"]["message"]["timestamp"]
     );
     assert!(fresh["result"]["workspace"]["lastContentActivity"].is_string());
-    evidence.extend([appended, fresh]);
+    evidence.push(
+        subscribed_activity(
+            &mut subscriber,
+            "content-old",
+            &appended["result"]["message"]["timestamp"],
+        )
+        .await,
+    );
+    let assistant = rpc(&mut client, 11, "agent.appendMessage", json!({"workspaceId":"content-old", "agentId":"content-agent", "role":"assistant", "contentBlocks":[{"type":"text","text":"Assistant content"}]})).await;
+    evidence.push(
+        subscribed_activity(
+            &mut subscriber,
+            "content-old",
+            &assistant["result"]["message"]["timestamp"],
+        )
+        .await,
+    );
+    evidence.extend([appended, fresh, assistant]);
     let artifact = srv.dir.path().join("content-activity-wire.json");
     std::fs::write(&artifact, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
     println!(

@@ -20727,7 +20727,7 @@ impl WorkspaceApi for Services {
                                         &lock_cache,
                                         move || {
                                             if let Some((number, sha)) = pr_checkout.as_ref() {
-                                                intent_git::fetch::prepare_pr_branch(
+                                                intent_git::fetch::prepare_cached_pr_branch(
                                                     &cache,
                                                     "origin",
                                                     *number,

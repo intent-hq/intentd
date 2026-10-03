@@ -329,7 +329,7 @@ async fn checkout_case(branch: &str, available: bool, conflict: bool, mode: &str
         params["isNewRepo"] = json!(mode == "direct");
     }
     let mut rpc = connect(fx.port).await;
-    let response = wss_rpc_raw(&mut rpc, 1, "workspace.create", params).await;
+    let response = wss_rpc_raw(&mut rpc, 1, "workspace.create", params.clone()).await;
     if available && !conflict {
         assert!(response.get("error").is_none(), "{response}");
         let workspace = &response["result"]["workspace"];
@@ -345,6 +345,46 @@ async fn checkout_case(branch: &str, available: bool, conflict: bool, mode: &str
         if mode == "cache" {
             assert!(cache.join(".git").exists());
             assert_ne!(checkout, repo);
+            let mut imports = vec![response.clone()];
+            for (id, parent) in [(2, head.as_str()), (3, base.as_str())] {
+                git(&repo, &["checkout", "--detach", parent]);
+                git(&repo, &["commit", "--allow-empty", "-m", "PR moved"]);
+                let moved = git(&repo, &["rev-parse", "HEAD"]);
+                git(
+                    &repo,
+                    &["push", "--force", "origin", "HEAD:refs/pull/42/head"],
+                );
+                let imported = wss_rpc_raw(&mut rpc, id, "workspace.create", params.clone()).await;
+                assert!(imported.get("error").is_none(), "repeat import: {imported}");
+                let path = std::path::Path::new(
+                    imported["result"]["workspace"]["worktreePath"]
+                        .as_str()
+                        .unwrap(),
+                );
+                assert_eq!(git(path, &["rev-parse", "HEAD"]), moved);
+                assert_eq!(
+                    git(checkout, &["rev-parse", "HEAD"]),
+                    head,
+                    "prior destination stays unchanged"
+                );
+                imports.push(imported);
+            }
+            git(
+                &cache,
+                &["update-ref", &format!("refs/heads/{branch}"), &base],
+            );
+            let rejected = wss_rpc_raw(&mut rpc, 4, "workspace.create", params.clone()).await;
+            assert!(
+                rejected.get("error").is_some(),
+                "changed cache branch must survive"
+            );
+            assert_eq!(git(&cache, &["rev-parse", branch]), base);
+            imports.push(rejected);
+            std::fs::write(
+                fx.dir.path().join("repeat-pr-import-wire.json"),
+                serde_json::to_vec_pretty(&imports).unwrap(),
+            )
+            .unwrap();
             assert!(matches!(
                 workspace["checkoutMode"].as_str(),
                 Some("cow" | "direct")

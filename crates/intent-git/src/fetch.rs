@@ -87,6 +87,35 @@ pub fn prepare_pr_branch(
     expected_sha: Option<&str>,
     token: Option<&str>,
 ) -> Result<()> {
+    prepare_pr_branch_inner(path, remote, number, branch, expected_sha, token, false)
+}
+
+/// Prepare a PR in the daemon-owned repository cache. Only branches created by
+/// this helper and still at their recorded tip may advance. Callers must hold
+/// the cache lock; never use this for a user repository.
+///
+/// # Errors
+/// Returns an error on fetch failure, a moved PR head, or a conflicting branch.
+pub fn prepare_cached_pr_branch(
+    path: &Path,
+    remote: &str,
+    number: u64,
+    branch: &str,
+    expected_sha: Option<&str>,
+    token: Option<&str>,
+) -> Result<()> {
+    prepare_pr_branch_inner(path, remote, number, branch, expected_sha, token, true)
+}
+
+fn prepare_pr_branch_inner(
+    path: &Path,
+    remote: &str,
+    number: u64,
+    branch: &str,
+    expected_sha: Option<&str>,
+    token: Option<&str>,
+    cache: bool,
+) -> Result<()> {
     let target = format!("refs/intent/pr/{number}/head");
     let refspec = format!("+refs/pull/{number}/head:{target}");
     fetch_refspec_with_timeout(path, remote, &refspec, token, SHELL_FETCH_TIMEOUT)?;
@@ -101,23 +130,48 @@ pub fn prepare_pr_branch(
                 .into(),
         ));
     }
-    match repo.find_branch(branch, git2::BranchType::Local) {
-        Ok(existing) => {
-            if existing
+    let ownership_ref = format!("refs/intent/pr/{number}/materialized/{branch}");
+    let owned_tip = if cache {
+        repo.find_reference(&ownership_ref)
+            .ok()
+            .and_then(|reference| reference.target())
+    } else {
+        None
+    };
+    let owns_branch = match repo.find_branch(branch, git2::BranchType::Local) {
+        Ok(mut existing) => {
+            let existing_tip = existing
                 .get()
                 .peel_to_commit()
                 .map_err(crate::map_git_err)?
-                .id()
-                != commit.id()
-            {
-                return Err(Error::InvalidParams(format!("local branch '{branch}' differs from PR #{number}; preserving it instead of creating a workspace on the wrong commits")));
+                .id();
+            let owned = owned_tip == Some(existing_tip) && !existing.is_head();
+            if existing_tip != commit.id() {
+                if !owned {
+                    return Err(Error::InvalidParams(format!("local branch '{branch}' differs from PR #{number}; preserving it instead of creating a workspace on the wrong commits")));
+                }
+                existing
+                    .get_mut()
+                    .set_target(commit.id(), "refresh daemon-owned PR cache branch")
+                    .map_err(crate::map_git_err)?;
             }
+            owned
         }
         Err(error) if error.code() == git2::ErrorCode::NotFound => {
             repo.branch(branch, &commit, false)
                 .map_err(crate::map_git_err)?;
+            cache
         }
         Err(error) => return Err(crate::map_git_err(error)),
+    };
+    if owns_branch {
+        repo.reference(
+            &ownership_ref,
+            commit.id(),
+            true,
+            "record daemon-owned PR cache branch",
+        )
+        .map_err(crate::map_git_err)?;
     }
     Ok(())
 }
