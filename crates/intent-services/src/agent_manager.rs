@@ -8243,6 +8243,7 @@ impl AgentManager {
                         "success": true,
                         "queued": false,
                         "messageId": mid,
+                        "submissionIds": [mid],
                         "deduplicated": true,
                     }));
                 }
@@ -13023,6 +13024,19 @@ async fn prepare_flush_turn(
         prepend_image_blocks,
         prepend_file_blocks,
         turn_id: Some(entries[0].turn_id.clone()),
+        // A plural flush may contain just one ordinary merged queue row.
+        // Keep its aliases and arrival order for the ordinary retry path;
+        // multi-row recovery derives source-scoped leaves from flushed_entries.
+        queued_submission_ids: if entries.len() == 1 {
+            entries[0].submission_ids()
+        } else {
+            Vec::new()
+        },
+        queued_submission_order: if entries.len() == 1 {
+            entries[0].submission_order
+        } else {
+            0
+        },
         interrupt_priority: entries[0].interrupt_priority,
         origin: origin_from_user_flag(entries.iter().any(|m| m.user_origin)),
         // Every entry is `persisted: true` here (the loop above either set
