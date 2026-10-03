@@ -840,6 +840,8 @@ async function handlePrompt(id, params) {
       // collapsed text is truncated and corrupted so neither the resource
       // item nor a parseable {ok, proposal} payload survives — only the
       // turn-attachment registry (deterministic attach) can recover it.
+      // With omitToolOutput, emit a valid status-only terminal update: trusted
+      // registered attachments must survive even without a tool_result block.
       if (result && result.content && Array.isArray(result.content)) {
         let rawOutput = result.content;
         if (active.collapseToolOutput || active.garbleToolOutput) {
@@ -855,8 +857,8 @@ async function handlePrompt(id, params) {
           update: {
             sessionUpdate: 'tool_call_update',
             toolCallId,
-            status: result.isError ? 'error' : 'completed',
-            rawOutput,
+            status: result.isError ? 'failed' : 'completed',
+            ...(active.omitToolOutput ? {} : { rawOutput }),
           },
         });
       }
