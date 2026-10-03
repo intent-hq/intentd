@@ -1812,13 +1812,21 @@ async fn members_list_attaches_the_owner_identity_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_s = data_dir.join("secrets.json").to_string_lossy().to_string();
-    let env: [(&str, &str); 6] = [
+    // A nonempty override bypasses bundled, sibling and PATH discovery even
+    // when the path is absent. Never let this negative fixture start Tailcat.
+    let no_tailcat = data_dir
+        .join("absent-tailcat")
+        .to_string_lossy()
+        .to_string();
+    assert!(!Path::new(&no_tailcat).exists());
+    let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_SECRETS_FILE", &secrets_s),
         ("INTENTD_GITHUB_LOGIN_BASE_URI", &mock.base_uri),
         ("INTENTD_GITHUB_API_BASE_URI", &mock.base_uri),
         ("GITHUB_TOKEN", OWNER_TOKEN),
+        ("INTENTD_TAILCAT_BIN", &no_tailcat),
     ];
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon { child };
@@ -1868,7 +1876,7 @@ async fn members_list_attaches_the_owner_identity_over_wss() {
     .await
     .expect("tunnel startup did not settle");
 
-    // This daemon has no tunnel sidecar (no INTENTD_TAILCAT_BIN), so an
+    // This daemon explicitly selects an absent tunnel sidecar, so an
     // invite link is not mintable: `workspace.invite.create` is refused with
     // the dedicated `tunnel-down` error and nothing is stored. This is NOT
     // the listener-down error (the listener IS up — we are talking to it).
