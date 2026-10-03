@@ -932,7 +932,28 @@ fn round_trip_with_installed_cli() {
     let legacy = bin.join("claude-code");
     std::fs::write(
         &legacy,
-        "#!/bin/sh\nprintf 'unexpected CLI launch' > \"$INTENT_TRANSFER_CLI_ROOT/${0##*/}-launched\"\nexit 91\n",
+        r#"#!/bin/sh
+{
+    printf 'sentinel=%s pid=%s ppid=%s argc=%s\n' "$0" "$$" "$PPID" "$#"
+    if [ -r "/proc/$PPID/comm" ]; then
+        IFS= read -r parent_name < "/proc/$PPID/comm"
+        printf 'parent_name=%s\n' "$parent_name"
+        printf 'parent_exe='
+        /usr/bin/readlink "/proc/$PPID/exe" || true
+    fi
+    index=0
+    for arg do
+        index=$((index + 1))
+        [ "$index" -le 8 ] || break
+        case "$arg" in
+            -v|--version|-h|--help|-p|--print|-e|--eval|--input-type=module|process.execPath|process.version|process.versions.node)
+                printf 'argv[%s]=%s\n' "$index" "$arg" ;;
+            *) printf 'argv[%s]=<redacted:%s bytes>\n' "$index" "${#arg}" ;;
+        esac
+    done
+} >> "$INTENT_TRANSFER_CLI_ROOT/${0##*/}-launched"
+exit 91
+"#,
     )
     .unwrap();
     std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -981,6 +1002,20 @@ fn round_trip_with_installed_cli() {
     drop(env_lock);
     let status = child.wait_with_timeout(Duration::from_secs(120)).unwrap();
     drop(child); // Kill/reap a timed-out worker before inspecting or removing its files.
+    let worker_log = std::fs::read_to_string(&log_path).unwrap();
+    eprintln!(
+        "roundtrip worker status={status:?} completed={}\n{worker_log}",
+        root.path().join("completed").exists()
+    );
+    // Print every sentinel receipt before asserting so panic cleanup cannot
+    // erase the caller evidence for a later sentinel in this list.
+    for command in ["claude", "node", "npx"] {
+        if let Ok(receipt) =
+            std::fs::read_to_string(root.path().join(format!("{command}-launched")))
+        {
+            eprintln!("unexpected {command} invocation:\n{receipt}");
+        }
+    }
     for command in ["claude", "node", "npx"] {
         assert!(
             !root.path().join(format!("{command}-launched")).exists(),
@@ -990,7 +1025,7 @@ fn round_trip_with_installed_cli() {
     assert!(
         status.is_some_and(|status| status.success()) && root.path().join("completed").exists(),
         "roundtrip worker failed ({status:?}):\n{}",
-        std::fs::read_to_string(log_path).unwrap()
+        worker_log
     );
     std::fs::remove_file(canonical).unwrap();
     assert!(InstalledCli::Claude.resolve_in_dirs(&dirs, false).is_err());
@@ -1012,6 +1047,10 @@ async fn transfer_round_trip_between_two_stacks() {
             return;
         };
         assert_eq!(std::env::temp_dir(), Path::new(&root));
+        eprintln!(
+            "roundtrip worker pid={}: canonical CLI discovery",
+            std::process::id()
+        );
         assert_eq!(
             intent_providers::installed_cli::InstalledCli::Claude
                 .resolve()
@@ -1020,11 +1059,13 @@ async fn transfer_round_trip_between_two_stacks() {
             Path::new(&root).join("bin/claude"),
             "the roundtrip must discover its sentinel, not a host CLI"
         );
+        eprintln!("roundtrip worker: node discovery");
         assert_eq!(
             intent_providers::discover::find_node(),
             Some(Path::new(&root).join("bin/node")),
             "adapter discovery must select the fixture node"
         );
+        eprintln!("roundtrip worker: provider availability");
         let availability =
             intent_providers::discover::provider_availability_for("claude-code", &|_| None)
                 .unwrap();
@@ -1039,6 +1080,7 @@ async fn transfer_round_trip_between_two_stacks() {
             Some(std::fs::canonicalize(Path::new(&root).join("bin/npx")).unwrap()),
             "the adapter must resolve through the fixture, not host npx"
         );
+        eprintln!("roundtrip worker: original transfer body");
     }
     let src_db = TempDir::new("rt-src-db");
     let src_ws_root = TempDir::new("rt-src-ws");
