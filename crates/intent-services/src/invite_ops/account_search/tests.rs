@@ -8,7 +8,28 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 #[tokio::test]
-async fn invitation_account_search_authorizes_before_validation_or_io() {
+async fn invitation_account_search_rejects_unbound_caller() {
+    // CI's strict caller seam aborts on an unbound gate. Observe the normal
+    // production refusal in an isolated child without changing the parent env.
+    if std::env::var_os(crate::capability::ASSERT_BOUND_CALLER_ENV).is_some() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "invite_ops::account_search::tests::invitation_account_search_rejects_unbound_caller",
+                "--nocapture",
+            ])
+            .env_remove(crate::capability::ASSERT_BOUND_CALLER_ENV)
+            .output()
+            .expect("run unbound-caller child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "unbound-caller child: {:?}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let tmp = TempDb::new();
     let f = fixture(&tmp).await;
     assert!(matches!(
@@ -17,6 +38,12 @@ async fn invitation_account_search_authorizes_before_validation_or_io() {
             .await,
         Err(Error::Forbidden(_))
     ));
+}
+
+#[tokio::test]
+async fn invitation_account_search_authorizes_before_validation_or_io() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
     for host_role in [intent_core::HostRole::Guest, intent_core::HostRole::Member] {
         let caller = Caller::Wire {
             principal_id: f.collaborator.clone(),
