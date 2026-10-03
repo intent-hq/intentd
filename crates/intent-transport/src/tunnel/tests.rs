@@ -24,8 +24,7 @@ impl std::future::Future for ControlledConnect {
         if let Some(polled) = self.polled.take() {
             polled.send(()).expect("test awaits first connect poll");
         }
-        std::pin::Pin::new(&mut self.result)
-            .poll(cx)
+        std::future::Future::poll(std::pin::Pin::new(&mut self.result), cx)
             .map(|result| result.expect("test retains the connect controller"))
     }
 }
