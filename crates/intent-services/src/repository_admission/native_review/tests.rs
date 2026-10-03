@@ -4466,6 +4466,7 @@ async fn companion_diagnostic_group4_acquisition_deadline() {
 #[test]
 fn companion_diagnostic_group5_reader_bounds_privacy() {
     use companion_observation::{Collector, FrameRecord, Outcome, Phase};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     let (_dispatch, collector) = Collector::new(None);
     let probe = collector.process();
@@ -4601,18 +4602,29 @@ fn companion_diagnostic_group5_reader_bounds_privacy() {
     p.link(Phase::SourceEntered);
     drop(p);
     let report = disk.finish();
-    assert_eq!(report["complete"], true);
-    assert_eq!(
-        std::fs::read_to_string(&disk_path)
-            .unwrap()
-            .lines()
-            .collect::<Vec<_>>(),
-        disk.lines().iter().map(String::as_str).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        std::fs::metadata(disk_path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
+    #[cfg(unix)]
+    {
+        assert_eq!(report["complete"], true);
+        assert_eq!(
+            std::fs::read_to_string(&disk_path)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            disk.lines().iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            std::fs::metadata(disk_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        assert_eq!(report["complete"], false);
+        assert_eq!(report["accounting"]["io"], 1);
+        assert_eq!(report["accounting"]["written"], 0);
+        assert!(report["accounting"]["dropped"].as_u64().unwrap() > 0);
+        assert!(!disk_path.exists());
+    }
     let (_dispatch, io) = Collector::new(Some(&directory.path().join("absent/output")));
     let probe = io.process();
     let result = companion_observe!(probe, Project, Ok::<_, ()>(43));

@@ -609,15 +609,26 @@ mod companion_observation {
         pub fn new(output: Option<&std::path::Path>) -> (tracing::Dispatch, Self) {
             let mut counts = Accounting::default();
             let file = output.and_then(|path| {
-                use std::os::unix::fs::OpenOptionsExt;
-                if let Ok(file) = std::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(path)
+                #[cfg(unix)]
                 {
-                    Some(file)
-                } else {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    if let Ok(file) = std::fs::OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .mode(0o600)
+                        .open(path)
+                    {
+                        Some(file)
+                    } else {
+                        counts.io += 1;
+                        None
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    // Private file retention requires the Unix permission contract.
+                    // Refuse the sink rather than create a file with weaker privacy.
+                    let _ = path;
                     counts.io += 1;
                     None
                 }

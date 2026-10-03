@@ -176,7 +176,7 @@ fn default_reply(path: &str) -> (u16, Value) {
     }
 }
 struct Fixture {
-    dir: tempfile::TempDir,
+    _dir: tempfile::TempDir,
     services: Arc<Services>,
     workspace: WorkspaceId,
     owner: Caller,
@@ -239,7 +239,7 @@ impl Fixture {
             .unwrap();
         let principal = services.store.get_primary_principal().await.unwrap();
         Self {
-            dir,
+            _dir: dir,
             services,
             workspace: workspace.id,
             owner: Caller::Wire {
@@ -1140,7 +1140,7 @@ async fn resource_warm_cache_and_descriptor_do_not_open_secret_file() {
     let server = Server::new().await;
     let f = Fixture::new(&server).await;
     let s = f.socket().await;
-    let mut opens = FileReads::new(&f.dir.path().join("secrets.json"));
+    let mut opens = FileReads::new(&f._dir.path().join("secrets.json"));
     let before = server.count();
     let c = s.capture(&f).await;
     assert!(!opens.observed());

@@ -5501,6 +5501,7 @@ mod live_context {
     }
 }
 
+#[cfg(unix)]
 mod normal_launch {
     use super::*;
     use crate::agent_manager::{

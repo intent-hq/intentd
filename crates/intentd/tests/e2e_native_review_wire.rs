@@ -2230,6 +2230,7 @@ impl DriverTest {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct DriverWire {
     socket_id: String,
     writer: futures_util::stream::SplitSink<common::TlsWs, Message>,
@@ -2238,6 +2239,7 @@ struct DriverWire {
     buffered: Vec<Value>,
     next_id: u64,
 }
+#[cfg(target_os = "linux")]
 impl DriverWire {
     async fn member(ready: &Value) -> Self {
         let host = &ready["hosts"][0];
@@ -4291,6 +4293,7 @@ mod startup_milestones {
     thread_local! { static STATE: RefCell<Option<State>> = const { RefCell::new(None) }; }
     pub(super) struct Session(bool);
     impl Session {
+        #[cfg(target_os = "linux")]
         pub(super) fn from_environment() -> Self {
             if std::env::var("NATIVE_REVIEW_COMPANION_DIAGNOSTIC_6328").as_deref() != Ok("1") {
                 return Self(false);
