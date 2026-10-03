@@ -3,6 +3,10 @@
 #[path = "../src/repository_context_reader.rs"]
 mod repository_context_reader;
 #[path = "../src/test_support/scratch.rs"]
+#[expect(
+    dead_code,
+    reason = "rooted scratch helper is exercised by Services CoW fixtures; this harness uses the system temp root"
+)]
 mod test_support;
 
 use std::cell::Cell;
