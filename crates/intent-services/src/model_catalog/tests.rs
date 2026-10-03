@@ -1457,7 +1457,9 @@ require('readline').createInterface({input:process.stdin}).on('line',line=>{
         std::fs::write(&credential, "account-a").unwrap();
         let output=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "model_catalog::tests::installed_cli_credential_file_rotation_rejects_last_good_account", "--nocapture"])
-            .env_clear().env("HOME",root.path()).env("SHELL","/bin/sh")
+            .env_clear()
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
+            .env("HOME",root.path()).env("SHELL","/bin/sh")
             .env("PATH",std::env::join_paths([bin,std::path::PathBuf::from("/usr/bin"),std::path::PathBuf::from("/bin")]).unwrap())
             .env(CHILD,key).env(key,&credential).output().unwrap();
         assert!(

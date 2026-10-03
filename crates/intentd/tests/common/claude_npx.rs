@@ -45,8 +45,8 @@ pub fn in_subprocess(test_name: &str) -> bool {
     let log_path = root.path().join("test.log");
     let log = std::fs::File::create(&log_path).unwrap();
     let mut cmd = Command::new(std::env::current_exe().unwrap());
+    isolate_environment(&mut cmd, std::env::var_os("LLVM_PROFILE_FILE").as_deref());
     cmd.args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-        .env_clear()
         .env("HOME", &home)
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("SHELL", "/bin/sh")
@@ -97,4 +97,36 @@ pub fn select_adapter(adapter: &Path) {
 
 pub fn legacy_override() -> PathBuf {
     PathBuf::from(std::env::var_os("MOCK_CLAUDE_ROOT").unwrap()).join("bin/legacy-adapter")
+}
+
+// Keep runtime discovery isolated without redirecting instrumented children's
+// coverage output away from the collector's configured path.
+fn isolate_environment(command: &mut std::process::Command, profile: Option<&std::ffi::OsStr>) {
+    command.env_clear();
+    if let Some(profile) = profile {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+}
+
+#[test]
+fn isolated_coverage_environment_preserves_configured_path_and_absence() {
+    use std::ffi::OsStr;
+    use std::process::Command;
+
+    for profile in [Some("/tmp/coverage with spaces/%p-%m.profraw"), None] {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.env("UNRELATED_FIXTURE_ENV", "must be removed");
+        isolate_environment(&mut cmd, profile.map(OsStr::new));
+        let status = cmd
+            .args([
+                "-c",
+                "test \"${LLVM_PROFILE_FILE+x}\" = \"$1\" && test \"${LLVM_PROFILE_FILE-}\" = \"$2\" && test \"${UNRELATED_FIXTURE_ENV+x}\" = \"\"",
+                "coverage-env-check",
+                if profile.is_some() { "x" } else { "" },
+                profile.unwrap_or_default(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "profile {profile:?} was not preserved");
+    }
 }

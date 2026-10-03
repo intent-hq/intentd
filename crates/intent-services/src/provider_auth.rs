@@ -1345,6 +1345,7 @@ while IFS= read -r unexpected; do exit 95; done
                 "--test-threads=1",
             ])
             .env_clear()
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
             .env("INTENT_TEST_AUTH_FALLBACK_CHILD", "1")
             .env("HOME", dir.path())
             .env("USERPROFILE", dir.path())

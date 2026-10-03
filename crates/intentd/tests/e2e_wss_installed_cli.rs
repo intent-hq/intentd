@@ -187,6 +187,7 @@ async fn start(root: &Path, home: &Path, bin: &Path) -> (GuardedChild, common::T
         .unwrap();
     let mut cmd = common::serve_command();
     cmd.env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
         .env("INTENTD_TCP_PORT", "0")
         .env("INTENTD_DATA_DIR", root)
         .env("INTENTD_WORKSPACES_DIR", root.join("workspaces"))

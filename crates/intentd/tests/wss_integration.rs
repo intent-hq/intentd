@@ -20429,11 +20429,30 @@ async fn wss_workspace_import_lifecycle() {
             .env("PATH", std::env::join_paths(paths).unwrap())
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log));
+        #[cfg(unix)]
         let mut child = intentd_test_support::GuardedChild::spawn(&mut cmd).unwrap();
+        #[cfg(unix)]
         let status = child
             .wait_with_timeout(common::test_timeout(std::time::Duration::from_secs(180)))
             .unwrap()
             .expect("isolated import test timed out");
+        #[cfg(not(unix))]
+        let mut child = common::DaemonGuard::process_only(cmd.spawn().unwrap());
+        #[cfg(not(unix))]
+        let status = tokio::time::timeout(
+            common::test_timeout(std::time::Duration::from_secs(180)),
+            async {
+                loop {
+                    if let Some(status) = child.child_mut().try_wait().unwrap() {
+                        break status;
+                    }
+                    // timing-guard: poll the owned test child's exit within the bounded wait.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .expect("isolated import test timed out");
         assert!(
             status.success(),
             "{TEST}: {}",
