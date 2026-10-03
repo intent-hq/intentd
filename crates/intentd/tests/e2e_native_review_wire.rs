@@ -2188,6 +2188,34 @@ impl DriverTest {
         assert!(driver_safe(value));
         private_json(&self.directory.path().join(name), value).unwrap();
     }
+    fn failure_details(&self) {
+        use std::io::{Read as _, Seek as _};
+        // Retain already-written observations after the original child wait.
+        // Missing/truncated output does not prove a cause or successful cleanup.
+        for name in [
+            "failed.json",
+            "worker-failed.json",
+            "ownership.jsonl",
+            "child.log",
+        ] {
+            let observed = (|| -> std::io::Result<_> {
+                let mut file = std::fs::File::open(self.directory.path().join(name))?;
+                let total = file.metadata()?.len();
+                let offset = total.saturating_sub(16_384);
+                file.seek(std::io::SeekFrom::Start(offset))?;
+                let mut bytes = Vec::new();
+                file.take(16_384).read_to_end(&mut bytes)?;
+                Ok((total, offset, String::from_utf8_lossy(&bytes).into_owned()))
+            })();
+            match observed {
+                Ok((total, offset, text)) if driver_safe(&Value::String(text.clone())) => {
+                    eprintln!("driver failure {name} total={total} offset={offset}: {text}");
+                }
+                Ok(_) => eprintln!("driver failure {name}: output withheld by privacy guard"),
+                Err(error) => eprintln!("driver failure {name}: {:?}", error.kind()),
+            }
+        }
+    }
     async fn finish(&mut self, envelopes: Vec<Value>) -> Value {
         let finish = self
             .control(json!({"command":"stop","phase":"finish","pending":[],"envelopes":envelopes}))
@@ -2209,6 +2237,9 @@ impl DriverTest {
             "child-exit.json",
             &json!({"pid":self.child.id(),"code":status.code(),"success":status.success()}),
         );
+        if !status.success() {
+            self.failure_details();
+        }
         assert!(
             status.success(),
             "driver child failed; retained {}",

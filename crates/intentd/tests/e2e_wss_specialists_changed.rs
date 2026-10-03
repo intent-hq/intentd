@@ -118,12 +118,29 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     write_half.write_all(line.as_bytes()).await.unwrap();
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
-        .await
-        .expect("uds rpc timed out")
-        .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
+    timeout(common::rpc_read_timeout(), async {
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            assert!(
+                reader.read_line(&mut buf).await.expect("read uds frame") > 0,
+                "UDS closed before the original RPC response"
+            );
+            let frame: Value = serde_json::from_str(buf.trim_end()).expect("invalid JSON frame");
+            if frame["id"] == json!(id) {
+                return frame;
+            }
+            // Retirement notifications may precede a shutdown reply on this
+            // same connection; a notification is not the request's result.
+            assert!(
+                common::is_repository_retirement_notification(&frame),
+                "unexpected UDS response: {frame}"
+            );
+            eprintln!("UDS RPC {id}: original notification {}", frame["method"]);
+        }
+    })
+    .await
+    .expect("uds rpc timed out")
 }
 
 #[derive(Debug)]

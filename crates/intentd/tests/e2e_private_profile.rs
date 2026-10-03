@@ -207,10 +207,12 @@ async fn private_profile_pins_real_startup_settings_reload_and_recovery() {
     )
     .await;
     assert!(changed.get("error").is_none(), "{changed}");
-    assert_eq!(
-        rpc(data, "settings.get", json!({"path":"git.autoCommit"})).await["result"]["value"],
-        false
+    let current = rpc(data, "settings.get", json!({"path":"git.autoCommit"})).await;
+    eprintln!(
+        "private preference immediate readback: updateRevision={} get={current}",
+        changed["result"]["revision"]
     );
+    assert_eq!(current["result"]["value"], false);
     assert_private(data).await;
     // A real external file replacement must apply the unrelated preference,
     // proving the watcher completed; conflicting safety values stay pinned.

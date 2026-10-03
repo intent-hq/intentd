@@ -1846,9 +1846,12 @@ async fn held_startup(
     mock.flags.hold_start.store(true, Ordering::SeqCst);
     let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
     let params = json!({"provider": "gitlab", "host": host});
-    let task =
+    let mut task =
         tokio::spawn(async move { wss_rpc(&mut rpc, 81, "sourceControl.connect", params).await });
-    await_latch(&mock.flags.start_held, "hold the startup response").await;
+    tokio::select! {
+        () = await_latch(&mock.flags.start_held, "hold the startup response") => {},
+        result = &mut task => panic!("startup returned before its original mock hold: {result:?}"),
+    }
     task
 }
 
@@ -1875,7 +1878,12 @@ async fn gitlab_startup_newer_host_wins_both_response_orders_over_wss() {
     for newer_finishes_first in [true, false] {
         let a = spawn_mock_gitlab().await;
         let b = spawn_mock_gitlab().await;
-        let h = boot(&a).await;
+        let transports = serde_json::to_string(&[
+            ("https://gitlab.com", a.base_uri.as_str()),
+            ("https://gitlab.other.internal", b.base_uri.as_str()),
+        ])
+        .unwrap();
+        let h = boot_with_env(&a, &[("INTENTD_REPOSITORY_TEST_TRANSPORTS", &transports)]).await;
         let mut rpc = connect_ws(h.port, h.cfg.clone()).await;
         let mut sub = subscriber(&h).await;
         let old = held_startup(&h, &a, HOST).await;
@@ -3015,9 +3023,49 @@ async fn run_interleaving(case: &'static Case) {
             }
         }
     }
+    let mut observed_events = Vec::new();
     for action in after {
         if matches!(action, Action::PatAfter(_) | Action::RevokeAfter(_)) {
-            await_log_marker(&h.log_file, "gitlab device grant finished", name).await;
+            // Success publishes this event and returns; the terminal "finished"
+            // log belongs to failed/expired grants. Publication is not a worker
+            // join. The next mutation still takes the original credential gate.
+            let event = await_auth_changed_matching(&mut sub, None, 15).await;
+            assert_eq!(
+                event,
+                json!({"provider":"gitlab","host":HOST,"status":"authorized"}),
+                "{name}: first completion event"
+            );
+            observed_events.push(event);
+            let secrets = read_secrets(&h.secrets_file);
+            assert_eq!(stored_in(&secrets), Stored::Device(ACCESS_TOKEN), "{name}");
+            assert_eq!(
+                secrets["sourceControl.gitlab.refreshToken"], REFRESH_TOKEN,
+                "{name}"
+            );
+            let expiry: u64 = secrets["sourceControl.gitlab.tokenExpiresAt"]
+                .as_str()
+                .expect("original device expiry")
+                .parse()
+                .expect("unix seconds");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert!(
+                expiry > now + 3600 && expiry <= now + 7200,
+                "{name}: original device expiry"
+            );
+            let bound = wss_rpc(
+                &mut rpc,
+                58,
+                "settings.get",
+                json!({"path":"sourceControl.gitlab.host"}),
+            )
+            .await;
+            assert_eq!(
+                bound["result"]["value"], HOST,
+                "{name}: original published host: {bound}"
+            );
         }
         let (method, params) = match action {
             Action::PatAfter(host) => (
@@ -3086,8 +3134,12 @@ async fn run_interleaving(case: &'static Case) {
 
     // The expected events, in order. Every emitter has either answered its
     // RPC or (a completion) is awaited here, so what follows is settled.
-    for (host, status) in case.events {
+    for _ in observed_events.len()..case.events.len() {
         let ev = await_auth_changed_matching(&mut sub, None, 15).await;
+        observed_events.push(ev);
+    }
+    assert_eq!(observed_events.len(), case.events.len(), "{name}");
+    for (ev, (host, status)) in observed_events.into_iter().zip(case.events) {
         assert_eq!(
             ev,
             json!({ "provider": "gitlab", "host": host, "status": status }),
