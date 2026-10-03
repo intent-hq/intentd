@@ -3,7 +3,7 @@ use super::*;
 #[cfg(unix)]
 use tokio::io::AsyncBufReadExt;
 
-#[allow(clippy::large_enum_variant)]
+#[cfg_attr(unix, expect(clippy::large_enum_variant))]
 enum ProbeSocket {
     Wss(Socket),
     #[cfg(unix)]
@@ -105,7 +105,7 @@ impl ProbeSocket {
                 workspace_id: ws.clone(),
                 timestamp: intent_core::now_iso(),
                 event_type: "desktop:session-changed".into(),
-                actor: Default::default(),
+                actor: intent_core::EventActor::default(),
                 session_id: None,
                 correlation_id: None,
                 parent_event_id: None,
