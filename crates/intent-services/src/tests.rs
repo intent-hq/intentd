@@ -33683,7 +33683,7 @@ mod worktree_provisioning {
     /// workspace branch from `baseRef`, with `worktreePath`/`baseCommitSha`
     /// populated, `checkoutMode: "cow"` persisted, and untracked source files
     /// carried over.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_provisions_cow_checkout_when_isolation_enabled() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -33925,7 +33925,7 @@ mod worktree_provisioning {
     /// mirrors the create decision matrix — the duplicate gets a standalone
     /// `CoW` clone with `checkoutMode: "cow"` persisted, and the source repo
     /// gains no branch for the duplicate (the branch lives in the clone).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_provisions_cow_checkout_when_isolation_enabled() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -34035,7 +34035,7 @@ mod worktree_provisioning {
     /// unresolvable `baseRef`), the create fails without inserting a row and
     /// without leaving the empty `<root>/<wsId>` dir the probe created behind
     /// — the workspaces root ends up clean.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -34085,7 +34085,7 @@ mod worktree_provisioning {
     /// flow, not a mutation-killing regression test. The #774 regression
     /// coverage lives in the create-path test above and the
     /// `remove_workspace_dir_if_empty` unit test below.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -39470,7 +39470,7 @@ mod clone_orchestration {
     /// `workspace.cowIsolation` on and a CoW-capable filesystem, the local
     /// create streams the `cow-copy 30` milestone (not `worktree`) with the
     /// echoed `progressId` and one terminal done.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn progress_id_cow_create_streams_cow_copy_milestone() {
         let repo = seed_repo("intentd-prog-cow-src");
         let root = unique_dir("intentd-prog-cow-root");
