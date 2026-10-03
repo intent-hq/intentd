@@ -242,15 +242,19 @@ async fn connect_success_before_deadline_relays() {
     tokio::time::pause();
     let mut t = ConnectHarness::start(port).await;
     let started = Instant::now();
-    // Await a timer checkpoint: advance alone does not finish timer processing.
-    tokio::time::sleep_until(started + Duration::from_millis(149)).await;
+    // Pausing after real IO need not align with timer ticks: a 149ms sleep
+    // can auto-advance by 150ms. Leave headroom while retaining the strict
+    // before-deadline OPEN_OK assertion below.
+    tokio::time::sleep_until(started + Duration::from_millis(75)).await;
     t.assert_pending();
     t.release.take().unwrap().send(Ok(tcp)).unwrap();
     assert_eq!(t.receive().await, Frame::OpenOk { stream_id: 7 });
     t.dropped.try_recv().expect("completed connect dropped");
-    // This test paused after real IO, so its clock need not align with the
-    // timer driver's millisecond ticks. It must still complete BEFORE 150ms.
-    assert!(started.elapsed() < TEST_CONNECT_TIMEOUT);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < TEST_CONNECT_TIMEOUT,
+        "OPEN_OK must arrive before {TEST_CONNECT_TIMEOUT:?}, got {elapsed:?}"
+    );
     tokio::time::sleep_until(started + Duration::from_millis(151)).await;
     assert!(matches!(
         t.out_rx.try_recv(),
