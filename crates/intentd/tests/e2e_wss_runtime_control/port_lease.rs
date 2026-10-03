@@ -32,8 +32,27 @@ fn open() -> File {
 
 pub(super) fn acquire() -> File {
     let file = open();
-    file.lock().expect("acquire default-port fixture lease");
+    acquire_bounded(&file);
     file
+}
+
+fn acquire_bounded(file: &File) {
+    let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return,
+            Err(TryLockError::WouldBlock) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture lease acquisition timed out"
+                );
+                // timing-guard: wait for another complete cooperating scenario,
+                // never retry a bind or a failed scenario assertion.
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("acquire default-port fixture lease: {error}"),
+        }
+    }
 }
 
 pub(super) struct Contender {
@@ -112,10 +131,7 @@ impl Contender {
 
         // process::exit in the child skips destructors. Both kernel-owned
         // resources must nevertheless be released, not stranded by a failed test.
-        let lease = open();
-        lease
-            .try_lock()
-            .expect("process exit releases fixture lease");
+        let _lease = acquire();
         let _listener = TcpListener::bind(("127.0.0.1", port))
             .expect("process exit releases the actual contender socket");
         eprintln!("port={port} lease-and-socket-released-on-process-exit");
@@ -158,7 +174,7 @@ fn contender_process() {
     let _listener = if let Some(listener) = listener {
         listener
     } else {
-        lease.try_lock().expect("parent released scenario lease");
+        acquire_bounded(&lease);
         TcpListener::bind(("127.0.0.1", port)).expect("parent released saved port")
     };
     stream.write_all(b"bound-after-release\n").unwrap();
