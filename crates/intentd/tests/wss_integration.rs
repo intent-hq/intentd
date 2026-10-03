@@ -20408,15 +20408,17 @@ async fn wss_workspace_import_lifecycle() {
         let root = common::test_tempdir("itd-import-cli-");
         let bin = root.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let cli = bin.join("codex");
-            std::fs::write(&cli, "#!/bin/sh\n: > \"$0.launched\"\nexit 91\n").unwrap();
-            std::fs::set_permissions(cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["claude", "node", "npx"] {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let cli = bin.join(name);
+                std::fs::write(&cli, "#!/bin/sh\n: > \"$0.launched\"\nexit 91\n").unwrap();
+                std::fs::set_permissions(cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            #[cfg(windows)]
+            std::fs::write(bin.join(format!("{name}.exe")), b"discovery-only fixture").unwrap();
         }
-        #[cfg(windows)]
-        std::fs::write(bin.join("codex.exe"), b"discovery-only fixture").unwrap();
         let mut paths = vec![bin.clone()];
         paths.extend(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
@@ -20458,10 +20460,12 @@ async fn wss_workspace_import_lifecycle() {
             "{TEST}: {}",
             std::fs::read_to_string(log_path).unwrap()
         );
-        assert!(
-            !bin.join("codex.launched").exists(),
-            "import must not launch the installed CLI"
-        );
+        for name in ["claude", "node", "npx"] {
+            assert!(
+                !bin.join(format!("{name}.launched")).exists(),
+                "import must not launch {name}"
+            );
+        }
         return;
     }
     use base64::Engine as _;
@@ -20469,11 +20473,6 @@ async fn wss_workspace_import_lifecycle() {
 
     let srv = start(WsOptions::default()).await;
     srv.set_setting("providers.enabled", serde_json::json!({"auggie":false}));
-    // Import selects a provider but does not launch it; use a supported path override.
-    srv.set_setting(
-        "providers.paths",
-        serde_json::json!({"claude-code":std::env::current_exe().unwrap()}),
-    );
     srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
     srv.set_setting("model.default", serde_json::json!("claude-sonnet-4"));
     srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
