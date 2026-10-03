@@ -22,6 +22,8 @@ mod human_attribution;
 mod imported_queue_authorization;
 #[path = "wss_integration/integration_context.rs"]
 mod integration_context;
+#[path = "wss_integration/invitation_client.rs"]
+mod invitation_client;
 #[cfg(unix)]
 #[path = "wss_integration/linked_skills.rs"]
 mod linked_skills;
