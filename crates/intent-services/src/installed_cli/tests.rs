@@ -322,6 +322,32 @@ async fn installed_cli_claude_state_churn_keeps_catalog_identity() {
     )
     .await;
     assert_ne!(base, after_settings);
+
+    // Explicit credential-file inputs keep raw bytes even when named `.claude.json`.
+    let credential = root.path().join("credentials/.claude.json");
+    std::fs::create_dir(credential.parent().unwrap()).unwrap();
+    let mut env = context.env.clone();
+    env.insert(
+        "GOOGLE_APPLICATION_CREDENTIALS".into(),
+        credential.clone().into_os_string(),
+    );
+    let credential_key = |json: &'static str| {
+        std::fs::write(&credential, json).unwrap();
+        let (runtime, env, names) = (context.runtime.clone(), env.clone(), &context.names);
+        let identity = &identity;
+        async move {
+            InstalledContext::from_inputs(runtime, &BTreeMap::new(), env, names)
+                .unwrap()
+                .with_catalog_fingerprint()
+                .await
+                .unwrap()
+                .key(identity)
+                .unwrap()
+        }
+    };
+    let first = credential_key(r#"{"client_email":"a@example.com"}"#).await;
+    let second = credential_key(r#"{"client_email":"b@example.com"}"#).await;
+    assert_ne!(first, second);
 }
 
 #[tokio::test]

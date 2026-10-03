@@ -261,6 +261,7 @@ fn context_key(
         .or_else(|| nonempty(env, "USERPROFILE"))
         .map(PathBuf::from);
     let mut files = Vec::new();
+    let mut claude_state = Vec::new();
     match cli {
         InstalledCli::Codex => {
             let root = nonempty(env, "CODEX_HOME")
@@ -276,15 +277,12 @@ fn context_key(
                 .map(PathBuf::from)
                 .or_else(|| home.as_ref().map(|p| p.join(".claude")));
             if let Some(root) = root {
-                files.extend([
-                    root.join(".credentials.json"),
-                    root.join("settings.json"),
-                    root.join(".claude.json"),
-                ]);
+                files.extend([root.join(".credentials.json"), root.join("settings.json")]);
+                claude_state.push(root.join(".claude.json"));
             }
             if let Some(home) = home {
+                claude_state.push(home.join(".claude.json"));
                 files.extend([
-                    home.join(".claude.json"),
                     home.join(".aws/credentials"),
                     home.join(".aws/config"),
                     home.join(".config/gcloud/application_default_credentials.json"),
@@ -309,14 +307,13 @@ fn context_key(
         }
     }
     let mut contents = Vec::new();
+    for path in claude_state {
+        let data = bounded_config(&path)?.map(|bytes| claude_state_projection(&bytes));
+        contents.push((path, data));
+    }
     for path in files {
-        let mut data = bounded_config(&path)?;
-        if cli == InstalledCli::Claude
-            && path.file_name() == Some(std::ffi::OsStr::new(".claude.json"))
-        {
-            data = data.map(|bytes| claude_state_projection(&bytes));
-        }
-        contents.push((path.clone(), data));
+        let data = bounded_config(&path)?;
+        contents.push((path, data));
     }
     // Process-private hash: cache files never contain reusable auth fingerprints.
     Ok(private_hash(&(env, contents)))
