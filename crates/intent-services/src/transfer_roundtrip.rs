@@ -375,8 +375,7 @@ async fn fresh_services_with_default_provider(
             (
                 "providers.paths".to_string(),
                 serde_json::json!({
-                    "auggie": std::env::current_exe().unwrap(),
-                    "claude-code": std::env::current_exe().unwrap()
+                    "auggie": std::env::current_exe().unwrap()
                 }),
             ),
             (
@@ -914,6 +913,79 @@ async fn relay(
         .expect("import commit")
 }
 
+/// Supply canonical CLI discovery only to the roundtrip worker, without
+/// exposing its sentinel to unrelated tests in a parallel libtest process.
+#[cfg(unix)]
+fn round_trip_with_installed_cli() {
+    use intent_providers::installed_cli::InstalledCli;
+    use intentd_test_support::GuardedChild;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let root = test_tempdir("transfer-installed-cli-");
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    // Use explicit directories for the absence control: enhanced discovery can
+    // find a user's CLI outside PATH. An adapter name must not satisfy it.
+    let dirs = [bin.clone()];
+    let legacy = bin.join("claude-code");
+    std::fs::write(
+        &legacy,
+        "#!/bin/sh\nprintf 'unexpected CLI launch' > \"$INTENT_TRANSFER_CLI_ROOT/provider-launched\"\nexit 91\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(InstalledCli::Claude.resolve_in_dirs(&dirs, false).is_err());
+    let canonical = bin.join("claude");
+    std::fs::rename(&legacy, &canonical).unwrap();
+    assert_eq!(
+        InstalledCli::Claude
+            .resolve_in_dirs(&dirs, false)
+            .unwrap()
+            .path(),
+        canonical
+    );
+
+    let log_path = root.path().join("worker.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    // Coordinate the inherited PATH snapshot with existing env-mutating tests,
+    // but change only the child environment, never the parent or other tests.
+    let env_lock = crate::agent_manager::tests::EnvGuard::apply(&[]);
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "transfer_roundtrip::transfer_round_trip_between_two_stacks",
+            "--nocapture",
+        ])
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("INTENT_TRANSFER_CLI_ROOT", root.path())
+        .env_remove("MOCK_AGENT_SCRIPT_PATH")
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    let mut child = GuardedChild::spawn(&mut command).unwrap();
+    drop(env_lock);
+    let status = child.wait_with_timeout(Duration::from_secs(120)).unwrap();
+    drop(child); // Kill/reap a timed-out worker before inspecting or removing its files.
+    assert!(
+        !root.path().join("provider-launched").exists(),
+        "transfer must not launch the installed CLI"
+    );
+    assert!(
+        status.is_some_and(|status| status.success()) && root.path().join("completed").exists(),
+        "roundtrip worker failed ({status:?}):\n{}",
+        std::fs::read_to_string(log_path).unwrap()
+    );
+    std::fs::remove_file(canonical).unwrap();
+    assert!(InstalledCli::Claude.resolve_in_dirs(&dirs, false).is_err());
+}
+
 /// The full FE-shaped relay over two in-process stacks: plan on the source,
 /// export → chunked read → staged import → commit on the target →
 /// finalize on the source. Asserts the plan's size estimate is a sane
@@ -923,6 +995,21 @@ async fn relay(
 /// rehydration counts, and the finalized (archived) source.
 #[intent_test_macros::daemon_test]
 async fn transfer_round_trip_between_two_stacks() {
+    #[cfg(unix)]
+    {
+        let Some(root) = std::env::var_os("INTENT_TRANSFER_CLI_ROOT") else {
+            round_trip_with_installed_cli();
+            return;
+        };
+        assert_eq!(
+            intent_providers::installed_cli::InstalledCli::Claude
+                .resolve()
+                .unwrap()
+                .path(),
+            Path::new(&root).join("bin/claude"),
+            "the roundtrip must discover its sentinel, not a host CLI"
+        );
+    }
     let src_db = TempDir::new("rt-src-db");
     let src_ws_root = TempDir::new("rt-src-ws");
     let src_assets_root = TempDir::new("rt-src-assets");
@@ -1221,6 +1308,12 @@ async fn transfer_round_trip_between_two_stacks() {
     assert!(is_untracked(&seeded.repo, "dirty.txt"));
     assert_eq!(repo_head(&seeded.sandbox), seeded.sandbox_tip);
     assert!(seeded.sandbox.join("sb-dirty.txt").exists());
+    #[cfg(unix)]
+    std::fs::write(
+        PathBuf::from(std::env::var_os("INTENT_TRANSFER_CLI_ROOT").unwrap()).join("completed"),
+        "all roundtrip assertions passed",
+    )
+    .unwrap();
 }
 
 /// Failure injection: abort the relay mid-chunk. The source stays intact
