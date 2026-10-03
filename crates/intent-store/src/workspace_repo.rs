@@ -19,7 +19,7 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
     tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode, \
-    browser_client_id";
+    browser_client_id, last_content_activity";
 
 // Shared with deletion query-cost regressions so they exercise the exact
 // production statements, including their candidate-selection work.
@@ -75,7 +75,7 @@ impl Store {
     ) -> Result<()> {
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -112,6 +112,7 @@ impl Store {
             .bind(setup_script_to_db(ws)?)
             .bind(checkout_mode_to_db(ws)?)
             .bind(ws.browser_client_id.as_ref().map(|c| c.0.clone()))
+            .bind(&ws.last_content_activity)
             .bind(auto_commit.map(i64::from))
             .execute(self.write_pool())
             .await
@@ -454,8 +455,9 @@ impl Store {
     /// per-session usage rows and the stored workspace `token_usage`, invoke
     /// the caller's synchronous `compute` closure with both, and — when it
     /// returns `Some(new_usage)` — perform a scoped
-    /// `UPDATE workspace SET token_usage=?, updated_at=?` (never a full-row
-    /// replace, so a concurrent title/status update is never clobbered).
+    /// `UPDATE workspace SET token_usage=?` (never a full-row replace, so a
+    /// concurrent title/status update is never clobbered). Usage bookkeeping
+    /// preserves activity timestamps: a background recount is not new work.
     /// Returns the written [`TokenUsage`] on a committed write, `None` when
     /// the closure declined. `NotFound` if the workspace row is absent.
     /// Layering: aggregation stays in intent-services via the closure; the
@@ -518,9 +520,8 @@ impl Store {
             };
             let json = serde_json::to_string(&new_usage)
                 .map_err(|e| Error::Internal(format!("encode token_usage failed: {e}")))?;
-            let res = sqlx::query("UPDATE workspace SET token_usage=?, updated_at=? WHERE id=?")
+            let res = sqlx::query("UPDATE workspace SET token_usage=? WHERE id=?")
                 .bind(json)
-                .bind(now_iso())
                 .bind(&workspace_id.0)
                 .execute(&mut *conn)
                 .await
@@ -1360,6 +1361,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
         last_activity: col(row, "last_activity")?,
+        last_content_activity: col(row, "last_content_activity")?,
         tags: tags_from_db(&col::<String>(row, "tags")?)?,
         path: col(row, "path")?,
         repository_path: col(row, "repository_path")?,

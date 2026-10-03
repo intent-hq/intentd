@@ -1112,6 +1112,7 @@ fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value
         created_at: now.clone(),
         updated_at: now,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: s("path"),
         repository_path: s("repository_path"),

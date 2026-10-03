@@ -358,6 +358,7 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,

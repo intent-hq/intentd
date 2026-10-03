@@ -181,18 +181,19 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
 /// Direct user retirement (protocol 10.10): +1 router method (`agent.retire`).
+/// Explicit PR detail reads (protocol 13.2): +3 router methods.
 /// Explicit queued batch sending (protocol 13.1): +1 router method.
 /// Reversible script history (protocol 10.11): +2 router methods
 /// (`script.archive`, `script.restore`).
 /// Durable script monitors (protocol 12.1): +3 router methods.
 /// Protocol 13.0 removes the deprecated git.commit router method.
-const EXPECTED_TOTAL_METHODS: usize = 404;
+const EXPECTED_TOTAL_METHODS: usize = 407;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
-const EXPECTED_ROUTER_METHODS: usize = 349;
+const EXPECTED_ROUTER_METHODS: usize = 352;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 55;
@@ -644,10 +645,13 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "github.issues.list",
     "github.issues.search",
     "github.listReviewComments",
+    "github.pulls.checks",
     "github.pulls.create",
+    "github.pulls.files",
     "github.pulls.get",
     "github.pulls.list",
     "github.pulls.merge",
+    "github.pulls.reviews",
     "github.pulls.search",
     "github.pulls.updateBranch",
     "github.relatedRepos.list",
@@ -1210,10 +1214,13 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "github.issues.list",
     "github.issues.search",
     "github.listReviewComments",
+    "github.pulls.checks",
     "github.pulls.create",
+    "github.pulls.files",
     "github.pulls.get",
     "github.pulls.list",
     "github.pulls.merge",
+    "github.pulls.reviews",
     "github.pulls.search",
     "github.pulls.updateBranch",
     "github.relatedRepos.list",
@@ -1831,6 +1838,9 @@ mod unbound_owner_only_methods {
                 "github.pulls.create",
                 json!({ "owner": "o", "repo": "r", "title": "t", "body": "b", "head": "h", "base": "b" }),
             ),
+            ("github.pulls.checks", gh_n.clone()),
+            ("github.pulls.files", gh_n.clone()),
+            ("github.pulls.reviews", gh_n.clone()),
             ("github.pulls.get", gh_n.clone()),
             ("github.pulls.list", gh.clone()),
             ("github.pulls.merge", gh_n.clone()),

@@ -6177,9 +6177,10 @@ impl Services {
     /// transaction ([`Store::update_workspace_token_usage`], monorepo#738):
     /// the tally/change-detection/zero-guard logic below executes as a sync
     /// closure over the in-transaction session rows and stored usage, and the
-    /// persist is a scoped `token_usage` + `updated_at` UPDATE — concurrent
-    /// recomputes fully serialize and a racing title/status update is never
-    /// clobbered. `workspace:tokenUsage-changed` is emitted only after the
+    /// persist is a scoped `token_usage` UPDATE that preserves workspace
+    /// activity timestamps — concurrent recomputes fully serialize and a
+    /// racing title/status update is never clobbered.
+    /// `workspace:tokenUsage-changed` is emitted only after the
     /// store reports a committed write.
     ///
     /// `guard_zero_regression` (set by the scan, not the live path): when the
@@ -12890,48 +12891,12 @@ fn remove_workspace_dir_if_empty(ws_dir: &Path) {
     let _ = std::fs::remove_dir(ws_dir);
 }
 
-/// Loud degradation probe for PR-aware creates (§5.1): when the workspace
-/// branch was derived from a PR head but the source repo has neither a local
-/// branch nor a `refs/remotes/{remote}/{branch}` tip — a fork-hosted head
-/// (the base repo carries no ref for it), or a never-fetched branch on a
-/// local-repo create (provisioning does no network fetch) — the checkout
-/// silently materializes as a FRESH branch at the base commit, named like
-/// the PR head but carrying none of its commits, while `pr_number`/`pr_url`
-/// claim PR linkage. Warn so the degradation is visible; best-effort and
-/// read-only (probe errors are ignored — provisioning surfaces real
-/// failures itself).
-fn warn_if_pr_head_missing(
-    repo_path: &Path,
-    branch: &str,
-    remote: &str,
-    link: Option<&intent_core::ContextLink>,
-) {
-    let Some(link) = link else { return };
-    let Ok(repo) = git2::Repository::open(repo_path) else {
-        return;
-    };
-    let local = repo.find_branch(branch, git2::BranchType::Local).is_ok();
-    let remote_tip = repo
-        .find_reference(&format!("refs/remotes/{remote}/{branch}"))
-        .is_ok();
-    if !local && !remote_tip {
-        tracing::warn!(
-            owner = %link.owner,
-            repo = %link.repo,
-            pr = link.number,
-            branch = %branch,
-            "workspace.create: PR head branch has no local or remote-tracking ref (fork-hosted head, or never fetched); the checkout will be a fresh branch at the base commit WITHOUT the PR's commits"
-        );
-    }
-}
-
 /// `baseCommitSha` for a PR-derived checkout (§5.1): the provisioning helpers
 /// return the CHECKED-OUT tip, which for a materialized PR head is the head
 /// SHA — not the base boundary the `baseCommitSha` contract records. Resolve
 /// the merge-base of the checkout's HEAD with the (PR-derived) `baseRef`
 /// instead, falling back to the checked-out tip when the boundary cannot be
-/// resolved (e.g. the head degraded to a fresh branch at the base commit,
-/// where tip == boundary anyway).
+/// resolved (for example, the base branch has not been fetched).
 fn pr_aware_base_commit_sha(
     checkout_path: &Path,
     base_ref: Option<&str>,
@@ -20305,9 +20270,9 @@ impl WorkspaceApi for Services {
                     // materializes remote-only branches at the remote tip)
                     // and `baseRef` to the PR base branch, so ahead/behind
                     // and diffs reflect the merge target. Explicit `branch`/
-                    // `baseRef` params always win. Lookup failure is
-                    // non-fatal: the create proceeds without the PR-derived
-                    // git setup. With multiple pr-kind links the FIRST one
+                    // `baseRef` params always win. A real PR checkout must
+                    // resolve its head and fetch the canonical PR ref; only
+                    // registry-only rows retain best-effort lookup semantics. With multiple pr-kind links the FIRST one
                     // wins (deliberate tie-break: the FE puts the primary
                     // link first).
                     let pr_link = input.context_links.as_deref().and_then(|links| {
@@ -20397,7 +20362,7 @@ impl WorkspaceApi for Services {
                                             repo = %link.repo,
                                             pr = link.number,
                                             error = %e,
-                                            "workspace.create: PR contextLink forge lookup failed; creating without PR-derived git setup"
+                                            "workspace.create: PR contextLink forge lookup failed; canonical PR checkout still requires a resolved branch and fetched head"
                                         );
                                     }
                                     Err(_) => {
@@ -20406,7 +20371,7 @@ impl WorkspaceApi for Services {
                                             repo = %link.repo,
                                             pr = link.number,
                                             timeout = ?services.pr_refresh_fetch_timeout,
-                                            "workspace.create: PR contextLink forge lookup timed out; creating without PR-derived git setup"
+                                            "workspace.create: PR contextLink forge lookup timed out; canonical PR checkout still requires a resolved branch and fetched head"
                                         );
                                     }
                                 }
@@ -20415,10 +20380,49 @@ impl WorkspaceApi for Services {
                                 tracing::warn!(
                                     pr = link.number,
                                     error = %e,
-                                    "workspace.create: no source-control provider for PR contextLink; creating without PR-derived git setup"
+                                    "workspace.create: no source-control provider for PR contextLink; canonical PR checkout still requires a resolved branch and fetched head"
                                 );
                             }
                         }
+                    }
+                    // A real PR checkout must resolve a head; never disguise a
+                    // generated branch at the base as a successful PR import.
+                    let pr_checkout = pr_link
+                        .as_ref()
+                        .filter(|_| {
+                            linked_pr
+                                .as_ref()
+                                .is_none_or(|pr| input.branch.as_deref() == Some(pr.source_branch.as_str()))
+                        })
+                        .map(|link| {
+                            (
+                                link.number,
+                                linked_pr.as_ref().and_then(|pr| pr.head_sha.clone()),
+                            )
+                        });
+                    if pr_checkout.is_some()
+                        && input
+                            .repository_path
+                            .as_deref()
+                            .is_some_and(|path| !path.is_empty())
+                    {
+                        if input.branch.as_deref().is_none_or(str::is_empty) {
+                            return Err(Error::InvalidParams(
+                                "cannot resolve the PR head branch; refresh the pull request and try again".into(),
+                            ));
+                        }
+                        if input.skip_isolation.unwrap_or(false)
+                            || input
+                                .worktree_path
+                                .as_deref()
+                                .is_some_and(|path| !path.is_empty())
+                            || input.is_remote.unwrap_or(false)
+                        {
+                            return Err(Error::InvalidParams(
+                                "PR checkout requires daemon-managed checkout provisioning".into(),
+                            ));
+                        }
+                        pr_derived_branch = true;
                     }
                     // Branch naming (TS parity): an explicit `branch` wins
                     // untouched; otherwise the branch is a friendly slug —
@@ -20525,6 +20529,7 @@ impl WorkspaceApi for Services {
                         // populated — the emit path (§9.1) still enriches
                         // with the max of notes / agents / updatedAt.
                         last_activity: Some(now),
+                        last_content_activity: None,
                         tags: input.tags.unwrap_or_default(),
                         path: input.path,
                         repository_path: input.repository_path,
@@ -20679,17 +20684,16 @@ impl WorkspaceApi for Services {
                             }
                             let branch = ws.branch.clone();
                             let base_ref = ws.base_ref.clone();
-                            if pr_derived_branch {
-                                warn_if_pr_head_missing(
-                                    &cache_path,
-                                    &branch,
-                                    "origin",
-                                    pr_link.as_ref(),
-                                );
-                            }
+                            let pr_token = if pr_checkout.is_some() {
+                                github_git_token(services.settings_registry.as_deref(), &cache_path).await
+                            } else {
+                                None
+                            };
                             let provision_progress = progress.clone();
                             let provision = |mode: intent_core::CheckoutMode| {
                                 let cache = cache_path.clone();
+                                let pr_checkout = pr_checkout.clone();
+                                let pr_token = pr_token.clone();
                                 let checkout = checkout_path.clone();
                                 let branch = branch.clone();
                                 let base_ref = base_ref.clone();
@@ -20721,16 +20725,26 @@ impl WorkspaceApi for Services {
                                     };
                                     let result = intent_git::repo_cache::with_cache_lock_blocking(
                                         &lock_cache,
-                                        move || match mode {
-                                            intent_core::CheckoutMode::Cow => {
-                                                // No cowCloneExclude here (unlike
-                                                // the cowIsolation arm below):
-                                                // the source is the pristine
-                                                // cache clone — tracked files
-                                                // only, no deps/build artifacts
-                                                // for excludes to skip.
-                                                let sha =
-                                                    intent_git::cow_checkout::provision_cow_checkout(
+                                        move || {
+                                            if let Some((number, sha)) = pr_checkout.as_ref() {
+                                                intent_git::fetch::prepare_pr_branch(
+                                                    &cache,
+                                                    "origin",
+                                                    *number,
+                                                    &branch,
+                                                    sha.as_deref(),
+                                                    pr_token.as_deref(),
+                                                )?;
+                                            }
+                                            let result = match mode {
+                                                intent_core::CheckoutMode::Cow => {
+                                                    // No cowCloneExclude here (unlike
+                                                    // the cowIsolation arm below):
+                                                    // the source is the pristine
+                                                    // cache clone — tracked files
+                                                    // only, no deps/build artifacts
+                                                    // for excludes to skip.
+                                                    let sha = intent_git::cow_checkout::provision_cow_checkout(
                                                         &cache,
                                                         &checkout,
                                                         &branch,
@@ -20738,34 +20752,39 @@ impl WorkspaceApi for Services {
                                                         "origin",
                                                         &[],
                                                     )?;
-                                                // The CoW clone inherits the
-                                                // cache's `origin` (already the
-                                                // GitHub URL); retarget
-                                                // explicitly so the checkout
-                                                // never references the cache
-                                                // even if the cache was seeded
-                                                // differently.
-                                                intent_git::remote::set_remote_url(
-                                                    &checkout, "origin", &url,
-                                                )?;
-                                                Ok(sha)
+                                                    // The CoW clone inherits the
+                                                    // cache's `origin` (already the
+                                                    // GitHub URL); retarget
+                                                    // explicitly so the checkout
+                                                    // never references the cache
+                                                    // even if the cache was seeded
+                                                    // differently.
+                                                    intent_git::remote::set_remote_url(&checkout, "origin", &url)?;
+                                                    Ok(sha)
+                                                }
+                                                intent_core::CheckoutMode::Direct => {
+                                                    intent_git::repo_cache::provision_direct_checkout_with_progress(
+                                                        &cache,
+                                                        &checkout,
+                                                        &url,
+                                                        &branch,
+                                                        base_ref.as_deref(),
+                                                        sub_chunk,
+                                                    )
+                                                }
+                                                intent_core::CheckoutMode::Worktree => Err(Error::Internal(
+                                                    "cache hydration never provisions a linked worktree".to_string(),
+                                                )),
+                                            };
+                                            let checked_out = result?;
+                                            if let Some((number, _)) = pr_checkout.as_ref() {
+                                                let expected =
+                                                    intent_git::refs::rev_parse(&cache, &format!("refs/intent/pr/{number}/head"))?;
+                                                if checked_out != expected {
+                                                    return Err(Error::InvalidParams("provisioned checkout does not match the fetched PR head; workspace creation cancelled".into()));
+                                                }
                                             }
-                                            intent_core::CheckoutMode::Direct => {
-                                                intent_git::repo_cache::provision_direct_checkout_with_progress(
-                                                    &cache,
-                                                    &checkout,
-                                                    &url,
-                                                    &branch,
-                                                    base_ref.as_deref(),
-                                                    sub_chunk,
-                                                )
-                                            }
-                                            intent_core::CheckoutMode::Worktree => {
-                                                Err(Error::Internal(
-                                                    "cache hydration never provisions a linked worktree"
-                                                        .to_string(),
-                                                ))
-                                            }
+                                            Ok(checked_out)
                                         },
                                     )
                                     .await;
@@ -20860,9 +20879,28 @@ impl WorkspaceApi for Services {
                                 let branch = ws.branch.clone();
                                 let base_ref = ws.base_ref.clone();
                                 let repo = repo_dir.clone();
+                                let pr_checkout = pr_checkout.clone();
+                                let pr_remote = input.remote.clone().unwrap_or_else(|| "origin".into());
+                                let pr_token = if pr_checkout.is_some() {
+                                    github_git_token(services.settings_registry.as_deref(), &repo_dir).await
+                                } else {
+                                    None
+                                };
                                 let sha = worktree_locks
                                     .with_lock(&repo_dir, move || async move {
                                         tokio::task::spawn_blocking(move || {
+                                            if let Some((number, sha)) = pr_checkout.as_ref() {
+                                                intent_git::fetch::prepare_pr_branch(
+                                                    &repo,
+                                                    &pr_remote,
+                                                    *number,
+                                                    &branch,
+                                                    sha.as_deref(),
+                                                    pr_token.as_deref(),
+                                                )?;
+                                                intent_git::branches::checkout_branch(&repo, &branch)?;
+                                                return intent_git::refs::rev_parse(&repo, "HEAD");
+                                            }
                                             // Reuse an existing branch of the
                                             // same name (retried create), else
                                             // create it — at the caller's
@@ -20915,7 +20953,15 @@ impl WorkspaceApi for Services {
                                 ws.worktree_path =
                                     Some(repo_dir.to_string_lossy().into_owned());
                                 if ws.base_commit_sha.is_none() {
-                                    ws.base_commit_sha = Some(sha);
+                                    ws.base_commit_sha = Some(if pr_derived_branch {
+                                        pr_aware_base_commit_sha(
+                                            &repo_dir,
+                                            ws.base_ref.as_deref(),
+                                            sha,
+                                        )
+                                    } else {
+                                        sha
+                                    });
                                 }
                             }
                         }
@@ -20934,14 +20980,11 @@ impl WorkspaceApi for Services {
                                 let base_ref = ws.base_ref.clone();
                                 let remote =
                                     input.remote.unwrap_or_else(|| "origin".to_string());
-                                if pr_derived_branch {
-                                    warn_if_pr_head_missing(
-                                        &repo_dir,
-                                        &branch,
-                                        &remote,
-                                        pr_link.as_ref(),
-                                    );
-                                }
+                                let pr_token = if pr_checkout.is_some() {
+                                    github_git_token(services.settings_registry.as_deref(), &repo_dir).await
+                                } else {
+                                    None
+                                };
                                 let mut mode = if cow_isolation
                                     && repo_dir.join(".git").is_file()
                                 {
@@ -21036,6 +21079,8 @@ impl WorkspaceApi for Services {
                                 }
                                 let provision = |mode: intent_core::CheckoutMode| {
                                     let name = name.clone();
+                                    let pr_checkout = pr_checkout.clone();
+                                    let pr_token = pr_token.clone();
                                     let branch = branch.clone();
                                     let base_ref = base_ref.clone();
                                     let remote = remote.clone();
@@ -21064,37 +21109,51 @@ impl WorkspaceApi for Services {
                                                     std::time::Instant::now();
                                                 let repo_for_log = repo.clone();
                                                 let result = match tokio::task::spawn_blocking(
-                                                    move || match mode {
-                                                        intent_core::CheckoutMode::Cow => {
-                                                            intent_git::cow_checkout::provision_cow_checkout(
+                                                    move || {
+                                                        if let Some((number, sha)) = pr_checkout.as_ref() {
+                                                            intent_git::fetch::prepare_pr_branch(
+                                                                &repo,
+                                                                &remote,
+                                                                *number,
+                                                                &branch,
+                                                                sha.as_deref(),
+                                                                pr_token.as_deref(),
+                                                            )?;
+                                                        }
+                                                        let result = match mode {
+                                                            intent_core::CheckoutMode::Cow => intent_git::cow_checkout::provision_cow_checkout(
                                                                 &repo,
                                                                 &wt,
                                                                 &branch,
                                                                 base_ref.as_deref(),
                                                                 &remote,
                                                                 &clone_excludes,
-                                                            )
-                                                        }
-                                                        intent_core::CheckoutMode::Worktree => {
-                                                            intent_git::worktree::provision_worktree(
+                                                            ),
+                                                            intent_core::CheckoutMode::Worktree => intent_git::worktree::provision_worktree(
                                                                 &repo,
                                                                 &name,
                                                                 &wt,
                                                                 &branch,
                                                                 base_ref.as_deref(),
                                                                 &remote,
-                                                            )
+                                                            ),
+                                                            // Local-repo creates never
+                                                            // select `direct` (cache
+                                                            // hydration has its own
+                                                            // provisioning arm above).
+                                                            intent_core::CheckoutMode::Direct => Err(Error::Internal(
+                                                                "direct checkout mode is not provisioned from a local repository".to_string(),
+                                                            )),
+                                                        };
+                                                        let checked_out = result?;
+                                                        if let Some((number, _)) = pr_checkout.as_ref() {
+                                                            let expected =
+                                                                intent_git::refs::rev_parse(&repo, &format!("refs/intent/pr/{number}/head"))?;
+                                                            if checked_out != expected {
+                                                                return Err(Error::InvalidParams("provisioned checkout does not match the fetched PR head; workspace creation cancelled".into()));
+                                                            }
                                                         }
-                                                        // Local-repo creates never
-                                                        // select `direct` (cache
-                                                        // hydration has its own
-                                                        // provisioning arm above).
-                                                        intent_core::CheckoutMode::Direct => {
-                                                            Err(Error::Internal(
-                                                                "direct checkout mode is not provisioned from a local repository"
-                                                                    .to_string(),
-                                                            ))
-                                                        }
+                                                        Ok(checked_out)
                                                     },
                                                 )
                                                 .await
@@ -21207,6 +21266,27 @@ impl WorkspaceApi for Services {
                                     repository_path = %repo_dir.display(),
                                     "workspace.create: repositoryPath is not a local git repo; skipping worktree provisioning"
                                 );
+                            }
+                        }
+                    }
+                    if pr_checkout.is_some()
+                        && ws
+                            .repository_path
+                            .as_deref()
+                            .is_some_and(|path| !path.is_empty())
+                    {
+                        let checkout = ws.worktree_path.as_deref().ok_or_else(|| {
+                            Error::InvalidParams(
+                                "PR checkout was not provisioned; select a local Git repository".into(),
+                            )
+                        })?;
+                        let actual = intent_git::refs::rev_parse(Path::new(checkout), "HEAD")?;
+                        if let Some((_, Some(expected))) = pr_checkout.as_ref() {
+                            if !actual.eq_ignore_ascii_case(expected) {
+                                return Err(Error::InvalidParams(
+                                    "provisioned checkout does not match the PR head; workspace creation cancelled"
+                                        .into(),
+                                ));
                             }
                         }
                     }
@@ -23059,6 +23139,7 @@ impl WorkspaceApi for Services {
                 // then folds in any copied notes / activity carried over from
                 // the source workspace.
                 last_activity: Some(now.clone()),
+                last_content_activity: None,
                 tags: source.tags.clone(),
                 path: source.path.clone(),
                 repository_path: source.repository_path.clone(),
@@ -31256,6 +31337,85 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn github_pulls_checks(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsChecks").await?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let pr = sc
+                .get_pr(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let head_sha = pr
+                .head_sha
+                .filter(|sha| !sha.is_empty())
+                .ok_or_else(|| Error::Internal("Pull request head SHA unavailable".into()))?;
+            let checks = sc
+                .check_runs(&repo_ref, &head_sha)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({ "headSha": head_sha, "checks": checks }))
+        })
+    }
+
+    fn github_pulls_reviews(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsReviews").await?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let page = sc.pull_reviews(&repo_ref, number, intent_sourcecontrol::PageParams {
+                limit: github_ops::clamp_limit(limit).min(100),
+                cursor: github_ops::decode_next_token(next_token.as_deref()),
+            }).await.map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({ "reviews": page.items, "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()) }))
+        })
+    }
+
+    fn github_pulls_files(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+        next_token: Option<String>,
+        expected_head_sha: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsFiles").await?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let head_sha = sc.get_pr(&repo_ref, number).await.map_err(pr_ops::map_sc_err)?.head_sha
+                .filter(|sha| !sha.is_empty()).ok_or_else(|| Error::Internal("Pull request head SHA unavailable".into()))?;
+            if expected_head_sha.as_ref().is_some_and(|expected| expected != &head_sha) {
+                return Err(Error::Conflict { current: serde_json::json!({"headSha": head_sha}) });
+            }
+            let page = sc.pull_files(&repo_ref, number, intent_sourcecontrol::PageParams {
+                limit: github_ops::clamp_limit(limit).min(100),
+                cursor: github_ops::decode_next_token(next_token.as_deref()),
+            }).await.map_err(pr_ops::map_sc_err)?;
+            let after = sc.get_pr(&repo_ref, number).await.map_err(pr_ops::map_sc_err)?.head_sha;
+            if after.as_ref() != Some(&head_sha) {
+                return Err(Error::Conflict { current: serde_json::json!({"headSha": after}) });
+            }
+            Ok(serde_json::json!({ "headSha": head_sha, "truncated": page.truncated, "files": page.items, "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()) }))
+        })
+    }
+
     fn github_pulls_list(
         &self,
         owner: String,
@@ -31355,6 +31515,66 @@ impl WorkspaceApi for Services {
                     github_ops::pull_to_json_with_repo(p, &github_ops::hit_repo(&scope, &p.url))
                 })
                 .collect();
+            Ok(serde_json::json!({
+                "pulls": pulls,
+                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
+            }))
+        })
+    }
+
+    fn github_org_pulls_search(
+        &self,
+        org: String,
+        filter: Option<String>,
+        state: Option<String>,
+        query: Option<String>,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsSearch").await?;
+            if org.is_empty()
+                || org.len() > 39
+                || !org.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                return Err(Error::InvalidParams(
+                    "org must be a GitHub owner slug".into(),
+                ));
+            }
+            let involvement = github_ops::parse_pr_involvement(filter.as_deref())?;
+            let state = github_ops::parse_pr_state(Some(state.as_deref().unwrap_or("open")))?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let page = sc
+                .list_org_prs(
+                    &org,
+                    intent_sourcecontrol::PrQuery {
+                        state,
+                        involvement,
+                        search: github_ops::normalize_search_query(query),
+                        limit: Some(github_ops::clamp_limit(limit)),
+                        cursor: github_ops::decode_next_token(next_token.as_deref()),
+                        ..intent_sourcecontrol::PrQuery::default()
+                    },
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let pulls = page
+                .items
+                .iter()
+                .map(|pr| {
+                    let repo = github_ops::repo_from_html_url(&pr.url)
+                        .filter(|repo| {
+                            *repo == intent_sourcecontrol::RepoRef::new(&org, &repo.name)
+                        })
+                        .ok_or_else(|| {
+                            Error::Internal(
+                                "organization PR search returned an invalid repository URL".into(),
+                            )
+                        })?;
+                    Ok(github_ops::pull_to_json_with_repo(pr, &repo))
+                })
+                .collect::<Result<Vec<_>>>()?;
             Ok(serde_json::json!({
                 "pulls": pulls,
                 "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),

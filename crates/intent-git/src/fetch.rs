@@ -70,7 +70,65 @@ pub(crate) fn fetch_with_timeout(
     // is not configured with a default fetch refspec (parity with the previous
     // libgit2 fetch that installed the same refspec).
     let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+    fetch_refspec_with_timeout(worktree_path, remote, &refspec, token, timeout)
+}
 
+/// Fetch GitHub's canonical PR head (including fork heads) and materialize its
+/// named local branch without ever overwriting an existing local branch.
+/// Callers hold their repository provisioning lock across this and checkout.
+///
+/// # Errors
+/// Returns an error on fetch failure, a moved PR head, or a conflicting local branch.
+pub fn prepare_pr_branch(
+    path: &Path,
+    remote: &str,
+    number: u64,
+    branch: &str,
+    expected_sha: Option<&str>,
+    token: Option<&str>,
+) -> Result<()> {
+    let target = format!("refs/intent/pr/{number}/head");
+    let refspec = format!("+refs/pull/{number}/head:{target}");
+    fetch_refspec_with_timeout(path, remote, &refspec, token, SHELL_FETCH_TIMEOUT)?;
+    let repo = git2::Repository::open(path).map_err(crate::map_git_err)?;
+    let commit = repo
+        .find_reference(&target)
+        .and_then(|reference| reference.peel_to_commit())
+        .map_err(crate::map_git_err)?;
+    if expected_sha.is_some_and(|sha| !sha.eq_ignore_ascii_case(&commit.id().to_string())) {
+        return Err(Error::InvalidParams(
+            "PR head changed while preparing checkout; refresh the pull request and try again"
+                .into(),
+        ));
+    }
+    match repo.find_branch(branch, git2::BranchType::Local) {
+        Ok(existing) => {
+            if existing
+                .get()
+                .peel_to_commit()
+                .map_err(crate::map_git_err)?
+                .id()
+                != commit.id()
+            {
+                return Err(Error::InvalidParams(format!("local branch '{branch}' differs from PR #{number}; preserving it instead of creating a workspace on the wrong commits")));
+            }
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => {
+            repo.branch(branch, &commit, false)
+                .map_err(crate::map_git_err)?;
+        }
+        Err(error) => return Err(crate::map_git_err(error)),
+    }
+    Ok(())
+}
+
+fn fetch_refspec_with_timeout(
+    worktree_path: &Path,
+    remote: &str,
+    refspec: &str,
+    token: Option<&str>,
+    timeout: Duration,
+) -> Result<()> {
     // `git -C <path>` so the child cwd is not this crate's cwd (parity with the
     // reference TS handler); `GIT_TERMINAL_PROMPT=0` turns any credential prompt
     // into a fast error rather than a hidden hang.
@@ -94,7 +152,7 @@ pub(crate) fn fetch_with_timeout(
     let mut child = cmd
         .arg("fetch")
         .arg(remote)
-        .arg(&refspec)
+        .arg(refspec)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         // Discard stdout: git-fetch progress output is only for TTY users, and

@@ -87,7 +87,7 @@ pub(crate) fn hit_repo(scope: &[RepoRef], html_url: &str) -> RepoRef {
 
 /// Parse `{owner}/{repo}` off a GitHub `html_url` (`https://<host>/{owner}/
 /// {repo}/...`); `None` when the path carries fewer than two segments.
-fn repo_from_html_url(html_url: &str) -> Option<RepoRef> {
+pub(crate) fn repo_from_html_url(html_url: &str) -> Option<RepoRef> {
     let rest = html_url.split_once("://").map_or(html_url, |(_, r)| r);
     let mut segments = rest.split('/').skip(1).filter(|s| !s.is_empty());
     let owner = segments.next()?;

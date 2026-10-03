@@ -47,6 +47,7 @@ fn test_workspace(ws_id: &WorkspaceId, ts: &str) -> Workspace {
         created_at: ts.to_string(),
         updated_at: ts.to_string(),
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,

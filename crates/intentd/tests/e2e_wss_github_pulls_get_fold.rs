@@ -397,6 +397,7 @@ async fn boot() -> Fixture {
         created_at: ts.clone(),
         updated_at: ts.clone(),
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
