@@ -52,6 +52,7 @@ fn malformed_empty_and_absent_catalogs_are_distinct() {
 async fn command_isolation_replaces_inherited_configuration_and_preloads() {
     let root = crate::test_support::test_tempdir("codex-command-isolation");
     let launch = CodexLaunch {
+        installed: None,
         selection: ProviderLaunch::Managed {
             npx: root.path().join("npx"),
             package: crate::codex_diagnostics::TEST_CODEX_PACKAGE,
@@ -205,6 +206,7 @@ child.on('exit',code=>process.exit(code||0));
 
         fn launch(&self, managed: bool) -> CodexLaunch {
             CodexLaunch {
+                installed: None,
                 selection: if managed {
                     ProviderLaunch::Managed {
                         npx: self.root.path().join("bin/npx"),
@@ -824,7 +826,7 @@ child.on('exit',code=>process.exit(code||0));
 
     #[tokio::test]
     async fn catalog_launch_keeps_the_production_policy_and_ignores_runtime_overrides() {
-        let fixture = Fixture::new(&json!({}));
+        let fixture = Fixture::new(&json!({"installed":true}));
         let custom = Fixture::new(&json!({"model":"custom-model"}));
         let mut launch = fixture.launch(true);
         let mut options = launch.spawn_options();
@@ -834,15 +836,44 @@ child.on('exit',code=>process.exit(code||0));
         options
             .extra_env
             .insert("CODEX_CONFIG".into(), "credential-canary".into());
-        let command = intent_acp::spawn::build_command(&options);
+        let installed_dir = fixture.root.path().join("installed");
+        std::fs::create_dir(&installed_dir).unwrap();
+        symlink(&fixture.runtime, installed_dir.join("codex")).unwrap();
+        let runtime = intent_providers::installed_cli::InstalledCli::Codex
+            .resolve_in_dirs(std::slice::from_ref(&installed_dir), false)
+            .unwrap();
+        let context = crate::installed_cli::InstalledContext::from_inputs(
+            runtime,
+            &std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([
+                (
+                    OsString::from("HOME"),
+                    fixture.root.path().as_os_str().to_owned(),
+                ),
+                (OsString::from("PATH"), fixture.path.clone()),
+            ]),
+            &intent_core::cli_env::CodexEnvNames::default(),
+        )
+        .unwrap();
+        let mut command = intent_acp::spawn::build_command(&options);
+        context.apply(&mut command);
         launch.codex_path = super::super::super::effective_env(&command, "CODEX_PATH");
-        assert!(launch.codex_path.is_none());
+        assert_eq!(
+            launch.codex_path,
+            Some(installed_dir.join("codex").into_os_string())
+        );
+        launch.installed = Some(context);
         let report = launch
             .catalogs_with_auth(Ok(fixture.auth().await), Limits::default())
             .await;
         assert_eq!(
             report.runtime.runtime_source,
-            RuntimeSource::AdapterDependency
+            RuntimeSource::EnvironmentOverride
+        );
+        assert_eq!(
+            report.runtime.runtime_version,
+            VersionMeasurement::Measured("0.333.5".into()),
+            "measure the version with the final isolated probe environment and cwd"
         );
         assert_eq!(catalog(&report.raw).models[0].id, "fixture-model");
         assert!(matches!(report.acp, CatalogOutcome::Success(_)));
@@ -851,8 +882,62 @@ child.on('exit',code=>process.exit(code||0));
             .into_iter()
             .find(|v| v["started"] == true)
             .unwrap();
-        assert!(boot["codexPath"].is_null());
+        assert_eq!(boot["codexPath"], json!(installed_dir.join("codex")));
         fixture.assert_clean();
+    }
+
+    #[tokio::test]
+    async fn installed_cli_identity_and_raw_catalog_survive_adapter_start_failure() {
+        let fixture = Fixture::new(&json!({"installed":true}));
+        let mut launch = fixture.launch(true);
+        let installed_dir = fixture.root.path().join("installed");
+        std::fs::create_dir(&installed_dir).unwrap();
+        symlink(&fixture.runtime, installed_dir.join("codex")).unwrap();
+        let runtime = intent_providers::installed_cli::InstalledCli::Codex
+            .resolve_in_dirs(std::slice::from_ref(&installed_dir), false)
+            .unwrap();
+        let context = crate::installed_cli::InstalledContext::from_inputs(
+            runtime,
+            &std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([
+                (
+                    OsString::from("HOME"),
+                    fixture.root.path().as_os_str().to_owned(),
+                ),
+                (OsString::from("PATH"), fixture.path.clone()),
+            ]),
+            &intent_core::cli_env::CodexEnvNames::default(),
+        )
+        .unwrap();
+        launch.codex_path = Some(installed_dir.join("codex").into_os_string());
+        launch.installed = Some(context);
+        for missing in [false, true] {
+            let npx = fixture.root.path().join("bin/npx");
+            if missing {
+                std::fs::remove_file(npx).unwrap();
+            } else {
+                executable(&npx, "#!/bin/sh\nexit 7\n");
+            }
+            let before = launch.inspect_local().await;
+            assert!(before.report.runtime_path.is_some());
+            assert!(!before.report.removes_codex_overrides);
+            let report = launch
+                .catalogs_with_auth(Ok(fixture.auth().await), Limits::default())
+                .await;
+            assert_eq!(report.runtime.runtime_path, before.report.runtime_path);
+            assert!(!report.runtime.removes_codex_overrides);
+            assert_eq!(
+                report.runtime.runtime_source,
+                RuntimeSource::EnvironmentOverride
+            );
+            assert!(matches!(
+                report.runtime.adapter_version,
+                VersionMeasurement::Unknown(_)
+            ));
+            assert!(matches!(report.acp, CatalogOutcome::Failed(_)));
+            assert_eq!(catalog(&report.raw).models[0].id, "fixture-model");
+            fixture.assert_clean();
+        }
     }
 
     #[tokio::test]
@@ -880,4 +965,59 @@ child.on('exit',code=>process.exit(code||0));
         assert!(fixture.events().is_empty());
         fixture.assert_clean();
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn installed_cli_diagnostic_version_retains_actual_profile_on_owner_failure() {
+    for fail in [false, true] {
+        let root = crate::test_support::test_tempdir("diagnostic-version-profile");
+        let context = crate::installed_cli::owner_failure_context(root.path());
+        if fail {
+            std::fs::write(root.path().join("fail-owner"), "").unwrap();
+        }
+        let launch = CodexLaunch {
+            installed: Some(context.clone()),
+            selection: ProviderLaunch::Bare { command: "unused" },
+            path: std::ffi::OsString::from("/usr/bin:/bin"),
+            codex_path: Some(root.path().join("codex").into_os_string()),
+        };
+        let home = crate::test_support::test_tempdir("diagnostic-version-owned-home");
+        let path = home.path().to_owned();
+        let mut command = Command::new("unused");
+        command.current_dir(&path).env("CODEX_HOME", &path);
+        context.apply(&mut command);
+        let result = launch.validate_installed_command(command, home).await;
+        assert_eq!(result.is_err(), fail);
+        drop(result);
+        let retained = path.exists();
+        if fail {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+        assert_eq!(retained, fail);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn installed_cli_cancelled_diagnostic_version_releases_actual_profile_after_cleanup() {
+    let root = crate::test_support::test_tempdir("diagnostic-version-cancel");
+    let context = crate::installed_cli::owner_failure_context(root.path());
+    std::fs::write(root.path().join("hang-owner"), "").unwrap();
+    let launch = CodexLaunch {
+        installed: Some(context.clone()),
+        selection: ProviderLaunch::Bare { command: "unused" },
+        path: std::ffi::OsString::from("/usr/bin:/bin"),
+        codex_path: Some(root.path().join("codex").into_os_string()),
+    };
+    let home = crate::test_support::test_tempdir("diagnostic-version-owned-home");
+    let mut command = Command::new("unused");
+    command
+        .current_dir(home.path())
+        .env("CODEX_HOME", home.path());
+    context.apply(&mut command);
+    let operation = tokio::spawn(async move {
+        let _ = launch.validate_installed_command(command, home).await;
+    });
+    crate::installed_cli::cancel_version_owner(operation, root.path()).await;
 }

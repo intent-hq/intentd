@@ -14,7 +14,10 @@ pub fn install(data_dir: &Path, script: &str) -> Vec<(String, String)> {
             "node",
             "#!/bin/sh\ncase \"$1\" in\n*/codex-acp.mjs) exec \"$MOCK_AGENT_NODE\" \"$MOCK_AGENT_SCRIPT_PATH\" \"$@\";;\n*) exec \"$MOCK_AGENT_NODE\" \"$@\";;\nesac\n",
         ),
-        ("codex", "#!/bin/sh\nexit 99\n"),
+        (
+            "codex",
+            "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] && [ \"$CODEX_PATH\" = \"$0\" ] || exit 91\nprintf 'codex-cli 1.0.0\\n'\n",
+        ),
         ("npx", "#!/bin/sh\nexit 99\n"),
     ] {
         let path = bin.join(name);
@@ -40,15 +43,17 @@ pub fn in_subprocess(test_name: &str) -> bool {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    if std::env::var("INTENTD_CODEX_NPX_TEST").as_deref() == Ok(test_name) {
+    if std::env::var("INTENTD_CODEX_RUNTIME_TEST").as_deref() == Ok(test_name) {
         return false;
     }
     if intent_providers::resolve_on_path("node").is_none() {
         eprintln!("skipping {test_name}: node not on PATH");
         return true;
     }
-    let dir = super::test_tempdir("itd-codex-npx-process-");
+    let dir = super::test_tempdir("itd-codex-runtime-process-");
     let env = install(dir.path(), "unused-by-selectable-node");
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).expect("create isolated home");
     std::fs::write(
         dir.path().join("codex-toolchain/node"),
         "#!/bin/sh\ncase \"$1\" in\n*/codex-acp.mjs) IFS= read -r adapter < \"$MOCK_CODEX_ADAPTER_FILE\"; exec \"$adapter\" \"$@\";;\n*) exec \"$MOCK_AGENT_NODE\" \"$@\";;\nesac\n",
@@ -58,14 +63,22 @@ pub fn in_subprocess(test_name: &str) -> bool {
     let log = std::fs::File::create(&log_path).expect("create isolated test log");
     let mut cmd = Command::new(std::env::current_exe().expect("test executable"));
     cmd.args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
         .envs(env)
-        .env("INTENTD_CODEX_NPX_TEST", test_name)
+        .env("HOME", &home)
+        .env("SHELL", "/bin/sh")
+        .env("CODEX_PATH", "/must-not-run/inherited-codex")
+        .env("INTENTD_CODEX_RUNTIME_TEST", test_name)
         .env("MOCK_CODEX_ADAPTER_FILE", dir.path().join("adapter-path"))
         .stdout(Stdio::from(log.try_clone().expect("clone log")))
         .stderr(Stdio::from(log));
+    if let Some(multiplier) = std::env::var_os("INTENTD_TEST_TIMEOUT_MULTIPLIER") {
+        cmd.env("INTENTD_TEST_TIMEOUT_MULTIPLIER", multiplier);
+    }
     let mut child = GuardedChild::spawn(&mut cmd).expect("spawn isolated WSS test");
     let status = child
-        .wait_with_timeout(Duration::from_secs(180))
+        .wait_with_timeout(super::test_timeout(Duration::from_secs(180)))
         .expect("wait for isolated WSS test")
         .expect("isolated WSS test timed out");
     assert!(

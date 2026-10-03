@@ -12758,6 +12758,11 @@ async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() 
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
+    if common::claude_npx::in_subprocess(
+        "wss_agent_complete_once_claude_code_sends_slimmed_session_meta",
+    ) {
+        return;
+    }
     // intent-hq/intent#4587: over the real WSS transport, a claude-code
     // `agent.completeOnce` opens the ephemeral session with a slimming
     // `_meta` — the caller's `systemPrompt` as a STRING (replaces the
@@ -12793,8 +12798,9 @@ async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
     srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
     srv.set_setting(
         "providers.paths",
-        serde_json::json!({ "claude-code": bin.to_string_lossy() }),
+        serde_json::json!({ "claude-code": common::claude_npx::legacy_override() }),
     );
+    common::claude_npx::select_adapter(&bin);
 
     let resp = wss_call(
         srv.port,
@@ -17351,10 +17357,10 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let agent = AgentId::from(agent_id.as_str());
 
     // Seed a 120-message transcript — well past the 50-message default page.
-    // Capture the id at seq 100 (inside the bounded newest page 70..=119) for
+    // Capture the id at seq 117 (inside the newest-five snapshot 115..=119) for
     // the `chat.subscribe` resume path below.
     let mut newest_message_id = String::new();
-    let mut seq_100_message_id = String::new();
+    let mut seq_117_message_id = String::new();
     for i in 0..120 {
         let (role, text) = if i % 2 == 0 {
             ("user", format!("prompt {i}"))
@@ -17372,8 +17378,8 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
             .await
             .expect("append message")
             .id;
-        if i == 100 {
-            seq_100_message_id = newest_message_id.clone();
+        if i == 117 {
+            seq_117_message_id = newest_message_id.clone();
         }
     }
 
@@ -17790,7 +17796,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     );
 
     // chat.subscribe — the seq-0 snapshot over WSS is the bounded newest
-    // `agent.getConversation` page (PROTOCOL §7.1), not the full history.
+    // five-message page (PROTOCOL §7.1), independent of the generic default 50.
     let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
     sub.send(Message::Text(
         format!(
@@ -17834,11 +17840,11 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let snap_msgs = snapshot["messages"].as_array().expect("snapshot messages");
     assert_eq!(
         snap_msgs.len(),
-        50,
-        "seq-0 snapshot is the bounded default page, not all 120"
+        5,
+        "seq-0 snapshot is the newest-five page, not all 120"
     );
-    assert_eq!(snap_msgs[0]["seq"], 70);
-    assert_eq!(snap_msgs[49]["seq"], 119);
+    assert_eq!(snap_msgs[0]["seq"], 115);
+    assert_eq!(snap_msgs[4]["seq"], 119);
     assert_eq!(snapshot["truncated"], true);
     assert_eq!(snapshot["totalMessages"], 120);
     assert!(
@@ -17851,6 +17857,25 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     );
     drop(sub);
 
+    // The snapshot cursor continues immediately before seq 115, without
+    // repeating its oldest row or skipping any history.
+    let snapshot_cursor = snapshot["nextToken"].as_str().unwrap();
+    let older = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":39,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":5,"nextToken":"{snapshot_cursor}"}}}}"#
+        ),
+    )
+    .await;
+    let older_seqs: Vec<i64> = older["result"]["messages"]
+        .as_array()
+        .expect("older snapshot page")
+        .iter()
+        .map(|message| message["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(older_seqs, (110..=114).collect::<Vec<i64>>());
+
     // chat.subscribe resume (PROTOCOL §7.1): `sinceMessageId` inside the
     // bounded page yields only the messages AFTER it, `resumed: true`, and no
     // older-pages cursor (the client already holds everything up to the id).
@@ -17858,7 +17883,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         srv.port,
         srv.cfg.clone(),
         &format!(
-            r#"{{"jsonrpc":"2.0","id":40,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","sinceMessageId":"{seq_100_message_id}"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":40,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","sinceMessageId":"{seq_117_message_id}"}}}}"#
         ),
         40,
     )
@@ -17866,11 +17891,11 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let msgs = resumed["messages"].as_array().expect("resumed messages");
     assert_eq!(
         msgs.len(),
-        19,
-        "only rows after seq 100 (101..=119): {resumed}"
+        2,
+        "only rows after seq 117 (118..=119): {resumed}"
     );
-    assert_eq!(msgs[0]["seq"], 101);
-    assert_eq!(msgs[18]["seq"], 119);
+    assert_eq!(msgs[0]["seq"], 118);
+    assert_eq!(msgs[1]["seq"], 119);
     assert_eq!(resumed["resumed"], true);
     assert_eq!(resumed["truncated"], false);
     assert!(resumed["nextToken"].is_null(), "no gap cursor: {resumed}");
@@ -17891,18 +17916,16 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     )
     .await;
     let msgs = fallback["messages"].as_array().expect("fallback messages");
-    assert_eq!(
-        msgs.len(),
-        50,
-        "full bounded page on unknown id: {fallback}"
-    );
-    assert_eq!(msgs[0]["seq"], 70);
+    assert_eq!(msgs.len(), 5, "newest-five page on unknown id: {fallback}");
+    assert_eq!(msgs[0]["seq"], 115);
+    assert_eq!(msgs[4]["seq"], 119);
     assert_eq!(fallback["resumed"], false);
     assert_eq!(fallback["truncated"], true);
     assert!(
         fallback["nextToken"].as_str().is_some(),
         "fallback keeps the older-pages cursor"
     );
+    assert_eq!(fallback["nextToken"], snapshot["nextToken"]);
 
     // Hydration regression: corrupt every row OLDER than the newest bounded
     // page — any path that fetches/decodes them now fails hard.
@@ -20376,6 +20399,71 @@ async fn wss_file_attachment_upload_round_trip() {
 /// a pending session idempotently.
 #[intent_test_macros::daemon_test]
 async fn wss_workspace_import_lifecycle() {
+    // Availability is discovery-only during import. Keep its canonical CLI
+    // fixture and discovery caches in a separate process, including on Windows.
+    const TEST: &str = "wss_workspace_import_lifecycle";
+    if std::env::var("INTENTD_IMPORT_CLI_TEST").as_deref() != Ok(TEST) {
+        use std::process::{Command, Stdio};
+
+        let root = common::test_tempdir("itd-import-cli-");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let cli = bin.join("codex");
+            std::fs::write(&cli, "#!/bin/sh\n: > \"$0.launched\"\nexit 91\n").unwrap();
+            std::fs::set_permissions(cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        std::fs::write(bin.join("codex.exe"), b"discovery-only fixture").unwrap();
+        let mut paths = vec![bin.clone()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let log_path = root.path().join("test.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env("INTENTD_IMPORT_CLI_TEST", TEST)
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log));
+        #[cfg(unix)]
+        let mut child = intentd_test_support::GuardedChild::spawn(&mut cmd).unwrap();
+        #[cfg(unix)]
+        let status = child
+            .wait_with_timeout(common::test_timeout(std::time::Duration::from_secs(180)))
+            .unwrap()
+            .expect("isolated import test timed out");
+        #[cfg(not(unix))]
+        let mut child = common::DaemonGuard::process_only(cmd.spawn().unwrap());
+        #[cfg(not(unix))]
+        let status = tokio::time::timeout(
+            common::test_timeout(std::time::Duration::from_secs(180)),
+            async {
+                loop {
+                    if let Some(status) = child.child_mut().try_wait().unwrap() {
+                        break status;
+                    }
+                    // timing-guard: poll the owned test child's exit within the bounded wait.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .expect("isolated import test timed out");
+        assert!(
+            status.success(),
+            "{TEST}: {}",
+            std::fs::read_to_string(log_path).unwrap()
+        );
+        assert!(
+            !bin.join("codex.launched").exists(),
+            "import must not launch the installed CLI"
+        );
+        return;
+    }
     use base64::Engine as _;
     use std::io::Write as _;
 
@@ -22803,6 +22891,10 @@ async fn wss_cross_workspace_siblings_resolve_by_github_identity() {
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_quick_action_effort_settings_and_execution_contract() {
+    if common::claude_npx::in_subprocess("wss_quick_action_effort_settings_and_execution_contract")
+    {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     let dir = test_tempdir("wss-quick-action-effort-");
     let log = dir.path().join("requests.jsonl");
@@ -22817,7 +22909,11 @@ async fn wss_quick_action_effort_settings_and_execution_contract() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
-    srv.set_setting("providers.paths", serde_json::json!({"claude-code":bin}));
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({"claude-code":common::claude_npx::legacy_override()}),
+    );
+    common::claude_npx::select_adapter(&bin);
     srv.set_setting(
         "quickActions.typeOverrides",
         serde_json::json!({"commit":"action-model"}),

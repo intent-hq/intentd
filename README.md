@@ -381,29 +381,88 @@ Paths are resolved via the `directories` crate and can be overridden with the
 `INTENTD_DATA_DIR` and `INTENTD_CONFIG` environment variables. The data dir holds the SQLite
 database (`intentd.db`) and the socket (`intentd.sock`).
 
+### Installed Codex and Claude CLIs
+
+Install and authenticate the canonical `codex` or `claude` executable on the
+execution host. In remote workspaces this is the daemon/worker host, not the desktop.
+Intent resolves executable files through PATH, supported installer/version-manager
+locations and captured login-shell PATH; aliases and shell functions do not qualify.
+Codex requires Node.js 22+ for the vendored ACP adapter. Claude requires Node.js and npx
+for its pinned upstream ACP adapter.
+
+Upgrade the installed CLI and refresh the model picker to discover its current model
+advertisements. Intent keeps the reviewed adapter fixed and supplies the resolved absolute
+CLI path through `CODEX_PATH` or `CLAUDE_CODE_EXECUTABLE`. Inherited overrides cannot
+redirect it. Missing or incompatible CLIs fail explicitly; bundled adapter dependencies
+never supply a fallback runtime or model. A future CLI protocol change can still require
+an adapter update. Catalog membership does not establish account entitlement.
+
+Provider authentication/configuration and network environment are preserved. Captured
+login-shell values are below inherited daemon values (including empty values), then
+trusted daemon overrides and the selected runtime/policy take precedence. Codex custom
+credential variables referenced by its configuration are included. Login-shell capture
+is cached: restart the daemon after changing shell-only environment or PATH. Intent
+always enforces its Codex native-subagent denial and Claude tool restrictions.
+
+Codex model probes use private temporary profiles, copy supported auth/routing
+configuration, and exclude user MCP servers/hooks. Claude model probes retain user
+settings for authentication (`settingSources: ["user"]`), disable tools (`tools: []`),
+and enforce `strictMcpConfig: true` with no MCP servers; they do not strip user hooks.
+Neither provider's model probes send prompts or initiate login. The installed executable,
+bounded version observation, adapter identity and private auth/config fingerprint identify
+each cached catalog. Ordinary reads recheck the runtime at most once per minute;
+explicit refresh observes changes immediately, even behind an unchanged CLI wrapper.
+Last-good fallback is confined to that identity. Codex/Claude
+catalogs are memory-only; the first request after daemon restart must probe again.
+Catalog fingerprinting inspects relevant credential/configuration files with a 1 MiB
+limit per file. An unreadable or oversized file makes catalog discovery unavailable
+without reusing a previous account's models; these catalog inspection limits do not
+block ordinary installed-CLI launches.
+Existing sessions retain their process; new/recreated launches resolve the installed CLI
+again. Resuming across upgrades remains subject to adapter/CLI compatibility.
+
+The opt-in functional test runs the vendored Codex adapter and pinned Claude adapter
+against synthetic installed CLIs over authenticated, fingerprint-pinned WSS. It replaces
+only CLI executables, checks catalog refresh, selected-model turns and same-process
+continuity across CLI replacements, and never uses provider accounts. Codex uses the
+checked-in bundle. Prepare the exact Claude package named by
+`crates/intent-providers/src/config.rs` outside the checkout, including its optional
+dependencies. Set `INTENTD_TEST_CLAUDE_ADAPTER` to its package directory (containing
+`package.json`), then:
+
+```bash
+cargo nextest run -p intentd --test e2e_wss_installed_cli --run-ignored all --test-threads 1
+```
+
+This Unix fixture requires Node and Python 3. It excludes host tracing only for its
+synthetic processes; production timeouts remain unchanged. It is adapter compatibility
+proof with controlled CLIs, not a live account or cross-platform certification.
+
 ### Codex diagnostics
 
-`intentd doctor` reports the vendored Codex ACP adapter and the Codex CLI installed
-on the daemon host. Node.js 22+ and the host CLI are required. Production selection ignores
-`providers.paths.codex`, local `codex-acp` installations on PATH, and `CODEX_PATH`.
-The adapter receives the daemon-owned, fixed `CODEX_CONFIG` policy that disables
-built-in subagents; inherited configuration is replaced, not merged.
+`intentd doctor` reports the vendored Codex ACP adapter and the canonical Codex CLI
+installed on the daemon host. Node.js 22+ and the host CLI are required. Production
+selection ignores `providers.paths.codex`, local `codex-acp` installations and inherited
+`CODEX_PATH`; the daemon sets its selected runtime path and fixed `CODEX_CONFIG` policy.
 
 The adapter's content hash identifies the shipped bundle; it is not a measured
-version. On Linux and Windows, ordinary doctor measures the selected host CLI with
-an isolated, bounded `--version` call. Missing runtimes and failed checks remain
-explicitly unknown. Updating the host Codex CLI changes the runtime used by new
-ACP sessions and model discovery without installing another adapter package.
+version. Ordinary doctor measures the selected host CLI with a bounded `--version`
+observation using the launch environment. Failed version checks remain explicitly unknown.
+The runtime measurement never comes from a neighboring bundled dependency. Updating the
+host Codex CLI changes the runtime used by new ACP sessions and model discovery without
+installing another adapter package.
 
-On Linux, diagnostic process probes also require `/bin/bash` for private process
-supervision. If it is unavailable, probes report a failure and their results remain
-unknown; diagnostics do not install Bash or fall back to another shell. This requirement
-applies only to diagnostic probes, not normal provider launches.
+On Linux, `/bin/bash` is required for private process supervision during both
+normal installed-CLI launch version checks and diagnostic probes. If it is unavailable,
+normal launch checks fail and diagnostic results remain unknown. Intent does not install
+Bash or fall back to another shell.
 
 On macOS, diagnostics report the vendored bundle identity and resolved host CLI path
-without inspecting ignored local adapters. They do not execute Node, the adapter, or Codex.
-Version and catalog process probes are explicitly unsupported because detached-child
-cleanup cannot be guaranteed. Even with `--codex-models`, macOS performs no diagnostic
+without inspecting ignored local adapters. Adapter and catalog diagnostic process probes
+are explicitly unsupported because detached-child cleanup cannot be guaranteed. The normal
+installed-CLI version check remains enabled and bounded, with direct-child/process-group
+cleanup on a best-effort basis; escaped detached descendants are not guaranteed to be
+contained. Even with `--codex-models`, macOS performs no diagnostic
 authentication capture, npm resolution, or temporary probe setup; catalog comparison
 remains inconclusive. This does not change normal agent/provider execution.
 
@@ -426,14 +485,16 @@ model access. No prompts, login, or token-refresh requests are sent.
 The probe copies existing file authentication from `CODEX_HOME/auth.json` (otherwise
 `$HOME/.codex/auth.json`, with `USERPROFILE` as the home fallback) and selected
 `OPENAI_API_KEY`, `CODEX_API_KEY`, or `CODEX_ACCESS_TOKEN` environment credentials into
-private temporary state. It does not import keyring-only credentials, user/project
-configuration, MCP servers, or cached model catalogs. Authentication may therefore be
+private temporary state. It also preserves supported provider routing/credential configuration and relevant
+provider/network environment. It does not import keyring-only credentials, MCP servers,
+hooks, unrelated user/project configuration, or cached model catalogs. Authentication may therefore be
 unavailable even when an ordinary session is logged in. Do not paste credentials into
 diagnostic commands. Output contains safe report fields and fixed failure messages,
 never raw provider errors or account metadata.
 
-Each local inspection/version operation has a three-second deadline and a 16 KiB stdout
-limit. ACP startup/conversation and raw startup/conversation each have their own
+Installed-runtime version observations have a three-second deadline and a 4 KiB stdout
+limit; legacy package inspection uses a 16 KiB limit. ACP startup/conversation and raw
+startup/conversation each have their own
 30-second deadline and 1 MiB limit per output stream. Catalogs are bounded to 2,000 rows;
 raw pagination allows at most ten pages and rejects repeated cursors. Authentication and
 entrypoint files are bounded to 64 KiB. Local inspection, process startup and cleanup

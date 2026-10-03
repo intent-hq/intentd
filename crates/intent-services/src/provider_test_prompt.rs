@@ -179,22 +179,9 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
         cmd = cmd.env(key, value);
     }
     let cmd = crate::complete_ops::apply_one_shot_launch_policy(provider, cmd);
-    // codex loads MCP servers from its inherited CODEX_HOME regardless of the
-    // empty ACP `mcpServers` list; the probe child gets the same isolated
-    // throwaway home the one-shot completion path uses — a test prompt must
-    // never start user-configured MCP servers.
-    let (cmd, _codex_home) = if provider_id == "codex" {
-        match crate::provider_models::with_isolated_codex_home(cmd) {
-            Ok((cmd, home)) => (cmd, Some(home)),
-            Err(e) => {
-                return Ok(failure(
-                    "spawn-failed",
-                    format!("codex: failed to create isolated CODEX_HOME: {e}"),
-                ))
-            }
-        }
-    } else {
-        (cmd, None)
+    let cmd = match cmd.prepare_installed().await {
+        Ok(cmd) => cmd,
+        Err(reason) => return Ok(failure("not-installed", reason)),
     };
     let outcome = run_one_shot_acp(
         Some((

@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 /// Resolve on each launch so a host installation upgraded in place is picked up.
 #[must_use]
 pub fn host_codex_path() -> Option<PathBuf> {
-    crate::find_provider_binary("codex", "codex", None)
+    crate::installed_cli::InstalledCli::Codex
+        .resolve()
+        .ok()
+        .map(|runtime| runtime.path().to_owned())
 }
 
 /// Content identity of the shipped adapter, including local patches.

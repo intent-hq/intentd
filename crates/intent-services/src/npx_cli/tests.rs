@@ -62,19 +62,38 @@ fn in_subprocess(test: &str, version: &str) -> bool {
     let root = tmp.path();
     let bin = root.join("bin");
     std::fs::create_dir(&bin).unwrap();
-    std::fs::create_dir(root.join("codex-home")).unwrap();
+    std::fs::create_dir(root.join("claude-home")).unwrap();
     std::fs::write(root.join("adapter.mjs"), ADAPTER).unwrap();
     executable(
         &bin.join("node"),
         "#!/bin/sh\nexec \"$INTENT_TEST_REAL_NODE\" \"$@\"\n",
     );
     executable(&bin.join("npx"), NPX);
+    // Public Claude launches require a canonical installed CLI even when
+    // the pinned adapter itself is mocked. It may only be version-probed.
+    executable(
+        &bin.join("claude"),
+        "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] && [ \"$CLAUDE_CODE_EXECUTABLE\" = \"$0\" ] || exit 91\nprintf 'claude 1.2.3\\n'\n",
+    );
     let forbidden = "#!/bin/sh\nprintf 'native\\n' >> \"$INTENT_TEST_NPX_ROOT/native\"\nexit 99\n";
     executable(&bin.join("codex-acp"), forbidden);
     executable(&root.join("custom-codex-acp"), forbidden);
     executable(
         &root.join("direct-adapter"),
-        "#!/bin/sh\nprintf 'direct\\n' >> \"$INTENT_TEST_NPX_ROOT/direct\"\nexec \"$INTENT_TEST_REAL_NODE\" \"$INTENT_TEST_NPX_ROOT/adapter.mjs\" \"$@\"\n",
+        r#"#!/bin/sh
+case "$1" in
+  --version) printf '0.35.0\n'; exit 0 ;;
+  --print)
+    printf 'print\n' >> "$INTENT_TEST_NPX_ROOT/direct"
+    cat >/dev/null
+    printf 'fixture reply\n'
+    exit 0 ;;
+  --acp)
+    printf 'acp\n' >> "$INTENT_TEST_NPX_ROOT/direct"
+    exec "$INTENT_TEST_REAL_NODE" "$INTENT_TEST_NPX_ROOT/adapter.mjs" "$@" ;;
+  *) exit 92 ;;
+esac
+"#,
     );
     let log_path = root.join("test.log");
     let log = std::fs::File::create(&log_path).unwrap();
@@ -86,7 +105,8 @@ fn in_subprocess(test: &str, version: &str) -> bool {
         .env("INTENT_TEST_REAL_NODE", node)
         .env("HOME", root)
         .env("USERPROFILE", root)
-        .env("CODEX_HOME", root.join("codex-home"))
+        .env("CLAUDE_CONFIG_DIR", root.join("claude-home"))
+        .env("CLAUDE_CODE_EXECUTABLE", "/must-not-run/inherited-claude")
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .stdout(Stdio::from(log.try_clone().unwrap()))
         .stderr(Stdio::from(log));
@@ -135,6 +155,14 @@ async fn services(provider: &str, adapter_paths: &HashMap<String, String>) -> Se
             ("providers.paths".to_string(), json!(adapter_paths)),
         ])
         .unwrap();
+    if provider == "auggie" {
+        registry
+            .apply(&[(
+                "context.auggiePath".into(),
+                json!(root().join("direct-adapter")),
+            )])
+            .unwrap();
+    }
     Services::new(Store::open(&root().join("store.db")).await.unwrap())
         .with_settings_registry(registry)
 }
@@ -347,7 +375,9 @@ async fn direct_adapter_skips_stale_npx_probe_and_package_launch() {
     ) {
         return;
     }
-    let services = services("claude-code", &paths("claude-code")).await;
+    // Claude uses its pinned npm adapter and Codex uses the vendored bundle.
+    // Auggie's direct completion and ACP test-prompt paths both skip npx.
+    let services = services("auggie", &paths("auggie")).await;
     assert_eq!(
         completion(&services).await.unwrap()["text"],
         "fixture reply"
@@ -355,16 +385,16 @@ async fn direct_adapter_skips_stale_npx_probe_and_package_launch() {
     assert_eq!(
         crate::provider_test_prompt::provider_test_prompt(
             None,
-            "claude-code",
+            "auggie",
             None,
-            &paths("claude-code"),
+            &paths("auggie"),
             None
         )
         .await
         .unwrap(),
         json!({"ok": true})
     );
-    assert_eq!(lines("direct").len(), 2);
+    assert_eq!(lines("direct"), vec!["print", "acp"]);
     assert!(
         lines("probes").is_empty(),
         "direct adapters must not run npx --version"

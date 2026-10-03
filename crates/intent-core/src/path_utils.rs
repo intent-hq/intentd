@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 #[cfg(unix)]
 use std::time::Duration;
 
+use crate::cli_env::CodexEnvNames;
 use directories::BaseDirs;
 
 fn home_dir() -> Option<PathBuf> {
@@ -27,6 +28,7 @@ fn home_dir() -> Option<PathBuf> {
 struct LoginShellCapture {
     dirs: Vec<PathBuf>,
     credential_env: BTreeMap<String, String>,
+    codex_env_names: CodexEnvNames,
 }
 
 impl LoginShellCapture {
@@ -34,6 +36,7 @@ impl LoginShellCapture {
         Self {
             dirs: Vec::new(),
             credential_env: BTreeMap::new(),
+            codex_env_names: CodexEnvNames::default(),
         }
     }
 }
@@ -61,7 +64,8 @@ const ENV_END_SENTINEL: &str = "__INTENT_ENV_E__";
 /// CLI (or its backing SDK) reads it for authentication/configuration —
 /// exact names for cross-provider credentials (Anthropic/OpenAI/xAI keys,
 /// AWS credentials for Bedrock, Hugging Face tokens), one prefix per
-/// provider CLI's own env namespace. Keep both in sync with the provider
+/// provider CLI's own env namespace. Codex/Claude namespace and shared inputs
+/// are defined in `cli_env`, excluding Intent-owned controls. Keep in sync with the provider
 /// catalog (`intent-providers`) as providers are added or removed.
 #[cfg(unix)]
 const CREDENTIAL_ENV_EXACT: &[&str] = &[
@@ -80,21 +84,14 @@ const CREDENTIAL_ENV_EXACT: &[&str] = &[
 /// Credential env vars captured by name prefix. See the inclusion criterion
 /// on [`CREDENTIAL_ENV_EXACT`].
 #[cfg(unix)]
-const CREDENTIAL_ENV_PREFIXES: &[&str] = &[
-    "AUGGIE_",
-    "CLAUDE_",
-    "CODEX_",
-    "OPENCODE_",
-    "DROID_",
-    "CORTEX_",
-    "GROK_",
-    "PI_",
-];
+const CREDENTIAL_ENV_PREFIXES: &[&str] =
+    &["AUGGIE_", "OPENCODE_", "DROID_", "CORTEX_", "GROK_", "PI_"];
 
 /// Whether an env var name is on the credential allow-list.
 #[cfg(unix)]
 fn is_credential_env_allow_listed(name: &str) -> bool {
-    CREDENTIAL_ENV_EXACT.contains(&name)
+    crate::cli_env::is_installed_cli_env(name)
+        || CREDENTIAL_ENV_EXACT.contains(&name)
         || CREDENTIAL_ENV_PREFIXES
             .iter()
             .any(|prefix| name.starts_with(prefix))
@@ -103,12 +100,20 @@ fn is_credential_env_allow_listed(name: &str) -> bool {
 /// Parse a NUL-separated `env -0` payload into the allow-listed credential
 /// vars. NUL separation tolerates values containing newlines. Non-allow-listed
 /// vars are discarded here and never leave this function.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn parse_credential_env(payload: &str) -> BTreeMap<String, String> {
+    parse_credential_env_with_names(payload, &CodexEnvNames::default())
+}
+
+#[cfg(unix)]
+fn parse_credential_env_with_names(
+    payload: &str,
+    names: &CodexEnvNames,
+) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for entry in payload.split('\0') {
         if let Some((name, value)) = entry.split_once('=') {
-            if is_credential_env_allow_listed(name) {
+            if is_credential_env_allow_listed(name) || names.contains(name) {
                 map.insert(name.to_string(), value.to_string());
             }
         }
@@ -347,15 +352,56 @@ fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<LoginShellCaptu
     // Extract the env payload from the same output; missing env sentinels
     // degrade to an empty map (PATH capture still succeeds). Only allow-listed
     // vars survive parsing — the raw payload never leaves this function.
-    let credential_env =
-        extract_between_sentinels(&output_str, ENV_START_SENTINEL, ENV_END_SENTINEL)
-            .map(parse_credential_env)
-            .unwrap_or_default();
+    let payload = extract_between_sentinels(&output_str, ENV_START_SENTINEL, ENV_END_SENTINEL)
+        .unwrap_or_default();
+    let (credential_env, codex_env_names) = capture_credential_env(payload);
 
     Some(LoginShellCapture {
         dirs,
         credential_env,
+        codex_env_names,
     })
+}
+
+/// Add non-prefixed names referenced by the user's Codex configuration before
+/// discarding the raw shell payload. Existing provider namespaces are captured
+/// independently of configuration. The config is never executed or logged.
+#[cfg(unix)]
+fn capture_credential_env(payload: &str) -> (BTreeMap<String, String>, CodexEnvNames) {
+    // Unit tests inject homes directly below; never inspect the developer's
+    // actual Codex config as a side effect of a fake-shell fixture.
+    #[cfg(not(test))]
+    let (inherited_home, default_home) = (std::env::var_os("CODEX_HOME"), home_dir());
+    #[cfg(test)]
+    let (inherited_home, default_home): (Option<std::ffi::OsString>, Option<PathBuf>) =
+        (None, None);
+    capture_credential_env_for(payload, inherited_home.as_deref(), default_home.as_deref())
+}
+
+#[cfg(unix)]
+fn capture_credential_env_for(
+    payload: &str,
+    inherited_home: Option<&std::ffi::OsStr>,
+    default_home: Option<&Path>,
+) -> (BTreeMap<String, String>, CodexEnvNames) {
+    let shell_home = payload
+        .split('\0')
+        .filter_map(|entry| entry.split_once('='))
+        .find_map(|(name, value)| (name == "CODEX_HOME").then_some(value));
+    // Select the value the child inherits first. An empty or non-Unicode
+    // inherited value still shadows the shell, but Codex uses its default home.
+    let home = inherited_home
+        .or_else(|| shell_home.map(std::ffi::OsStr::new))
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| default_home.map(|home| home.join(".codex")));
+    let names = home
+        .map(|home| CodexEnvNames::from_home(&home).unwrap_or_else(|_| {
+            tracing::warn!("could not read Codex config credential references; additional non-prefixed shell credentials unavailable");
+            CodexEnvNames::default()
+        })).unwrap_or_default();
+    (parse_credential_env_with_names(payload, &names), names)
 }
 
 /// Extract the value between a sentinel pair in shell output.
@@ -395,6 +441,16 @@ pub(crate) fn login_shell_dirs() -> &'static [PathBuf] {
 #[must_use]
 pub fn login_shell_credential_env() -> &'static BTreeMap<String, String> {
     &login_shell_capture().credential_env
+}
+
+/// Custom Codex credential names selected in the same capture as
+/// [`login_shell_credential_env`]. Carry these into the provider environment
+/// overlay, including when a probe subsequently isolates `CODEX_HOME`.
+/// Like the captured shell values, this selection is cached until restart.
+/// CODEX_/CLAUDE_ values are retained independently of these selected names.
+#[must_use]
+pub fn login_shell_codex_env_names() -> &'static CodexEnvNames {
+    &login_shell_capture().codex_env_names
 }
 
 /// Force the login-shell PATH capture (`$SHELL -ilc`, falling back to `-lc`;
@@ -534,15 +590,52 @@ fn enriched_tool_dirs_impl<F>(home: Option<&std::path::Path>, login_dirs_fn: F) 
 where
     F: FnOnce() -> &'static [PathBuf],
 {
+    enriched_tool_dirs_for(home, login_dirs_fn, cfg!(windows), &|key| {
+        std::env::var_os(key).or_else(|| {
+            (key == "VOLTA_HOME")
+                .then(|| login_shell_credential_env().get(key).map(Into::into))
+                .flatten()
+        })
+    })
+}
+
+fn enriched_tool_dirs_for<F>(
+    home: Option<&std::path::Path>,
+    login_dirs_fn: F,
+    is_windows: bool,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf>
+where
+    F: FnOnce() -> &'static [PathBuf],
+{
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
+    // Volta documents a distinct Windows default. Keep its configurable home
+    // consistent with the environment inherited by installed CLI shims.
+    let volta_home = env("VOLTA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            if is_windows {
+                env("LOCALAPPDATA")
+                    .filter(|value| !value.is_empty())
+                    .map(|local| PathBuf::from(local).join("Volta"))
+            } else {
+                home.map(|home| home.join(".volta"))
+            }
+        });
 
-    if cfg!(windows) {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
+    if is_windows {
+        if let Some(appdata) = env("APPDATA") {
             push_dir(&mut dirs, &mut seen, PathBuf::from(&appdata).join("npm"));
         }
         if let Some(home) = home {
             push_dir(&mut dirs, &mut seen, home.join(".npm-global"));
+            // Claude's native Windows installer.
+            push_dir(&mut dirs, &mut seen, home.join(".local").join("bin"));
+        }
+        if let Some(volta_home) = volta_home {
+            push_dir(&mut dirs, &mut seen, volta_home.join("bin"));
         }
     } else {
         // Add common Unix/macOS bin directories
@@ -565,10 +658,14 @@ where
                 [".npm-global", "bin"],
                 [".npm-packages", "bin"],
                 [".local", "bin"],
-                [".volta", "bin"],
             ] {
                 push_dir(&mut dirs, &mut seen, home.join(sub[0]).join(sub[1]));
             }
+        }
+        if let Some(volta_home) = volta_home {
+            push_dir(&mut dirs, &mut seen, volta_home.join("bin"));
+        }
+        if let Some(home) = home {
             push_dir(&mut dirs, &mut seen, home.join(".asdf").join("shims"));
         }
     }
@@ -872,6 +969,51 @@ mod tests {
     }
 
     #[test]
+    fn installed_cli_known_user_directories_include_windows_native_installs() {
+        let home = unique_temp_dir("cli-tool-dirs");
+        for windows in [false, true] {
+            let dirs = enriched_tool_dirs_for(Some(home.path()), || &[], windows, &|_| None);
+            assert!(dirs.contains(&home.path().join(".local").join("bin")));
+            if !windows {
+                assert!(dirs.contains(&home.path().join(".volta").join("bin")));
+            }
+        }
+    }
+
+    #[test]
+    fn review_regression_windows_volta_uses_local_appdata_and_custom_home() {
+        let home = unique_temp_dir("volta-home");
+        let local = home.path().join("Local AppData");
+        let custom = home.path().join("Custom Volta");
+        let dirs = enriched_tool_dirs_for(Some(home.path()), || &[], true, &|key| {
+            (key == "LOCALAPPDATA").then(|| local.as_os_str().to_owned())
+        });
+        assert!(
+            dirs.contains(&local.join("Volta").join("bin")),
+            "missing documented Windows Volta default"
+        );
+        assert!(
+            !dirs.contains(&home.path().join(".volta").join("bin")),
+            "must not use Unix default on Windows"
+        );
+        let dirs = enriched_tool_dirs_for(Some(home.path()), || &[], true, &|key| match key {
+            "LOCALAPPDATA" => Some(local.as_os_str().to_owned()),
+            "VOLTA_HOME" => Some(custom.as_os_str().to_owned()),
+            _ => None,
+        });
+        assert!(dirs.contains(&custom.join("bin")));
+        assert!(!dirs.contains(&local.join("Volta").join("bin")));
+        for name in ["codex.exe", "claude.cmd"] {
+            std::fs::create_dir_all(custom.join("bin")).unwrap();
+            let fixture = custom.join("bin").join(name);
+            std::fs::write(&fixture, "synthetic wrapper").unwrap();
+            assert!(dirs
+                .iter()
+                .map(|dir| dir.join(name))
+                .any(|path| is_executable_file_for(&path, true)));
+        }
+    }
+    #[test]
     #[cfg(not(windows))]
     fn enriched_tool_dirs_scans_every_nvm_node_version_newest_first() {
         let unique = format!(
@@ -1105,8 +1247,185 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn installed_cli_environment_capture_includes_config_endpoints_and_network() {
+        for key in [
+            "CODEX_HOME",
+            "CODEX_CA_CERTIFICATE",
+            "OPENAI_BASE_URL",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "AWS_CONFIG_FILE",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "NO_PROXY",
+            "SSL_CERT_FILE",
+            "NODE_EXTRA_CA_CERTS",
+        ] {
+            assert!(is_credential_env_allow_listed(key), "missing {key}");
+        }
+        for key in [
+            "CODEX_PATH",
+            "CLAUDE_CODE_EXECUTABLE",
+            "CODEX_CONFIG",
+            "NODE_OPTIONS",
+            "UNRELATED_SECRET",
+        ] {
+            assert!(
+                !is_credential_env_allow_listed(key),
+                "must not capture {key}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn review_regression_claude_auth_refresh_and_network_optouts() {
+        let captured = parse_credential_env(concat!(
+            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS=30000\0",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\0",
+            "DISABLE_TELEMETRY=1\0DISABLE_ERROR_REPORTING=1\0",
+        ));
+        for name in [
+            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+            "DISABLE_TELEMETRY",
+            "DISABLE_ERROR_REPORTING",
+        ] {
+            assert!(captured.contains_key(name), "lost supported setting {name}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compatibility_regression_empty_or_non_unicode_home_uses_default() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = unique_temp_dir("effective-codex-home");
+        let default = root.path().join(".codex");
+        let shell = root.path().join("shell-home");
+        let opaque = root
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"opaque-\xff"));
+        for (home, name) in [
+            (&default, "DEFAULT_TOKEN"),
+            (&shell, "SHELL_TOKEN"),
+            (&opaque, "OPAQUE_TOKEN"),
+        ] {
+            std::fs::create_dir_all(home).unwrap();
+            std::fs::write(
+                home.join("config.toml"),
+                format!("[model_providers.gateway]\nenv_key=\"{name}\"\n"),
+            )
+            .unwrap();
+        }
+        for (inherited, shell_home) in [
+            (None, ""),
+            (Some(std::ffi::OsStr::new("")), shell.to_str().unwrap()),
+            (Some(opaque.as_os_str()), shell.to_str().unwrap()),
+        ] {
+            let payload = format!("CODEX_HOME={shell_home}\0DEFAULT_TOKEN=synthetic\0SHELL_TOKEN=synthetic\0OPAQUE_TOKEN=synthetic\0");
+            let (captured, names) =
+                capture_credential_env_for(&payload, inherited, Some(root.path()));
+            assert!(
+                names.contains("DEFAULT_TOKEN"),
+                "effective home must fall back to default"
+            );
+            assert!(captured.contains_key("DEFAULT_TOKEN"));
+            assert!(!names.contains("SHELL_TOKEN"));
+            assert!(!names.contains("OPAQUE_TOKEN"));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compatibility_regression_namespace_capture_is_independent_of_config_selection() {
+        let root = unique_temp_dir("namespace-capture");
+        let config = root.path().join("config.toml");
+        let payload = concat!(
+            "CODEX_FIRST_TOKEN=first\0CODEX_SECOND_TOKEN=second\0",
+            "CODEX_SYSTEM_TOKEN=system\0CODEX_SYSTEM_HEADER=header\0",
+            "CLAUDE_CUSTOM_TOKEN=claude\0UNRELATED_SECRET=excluded\0",
+            "CODEX_PATH=/wrong\0CODEX_CONFIG=unsafe\0CLAUDE_CODE_EXECUTABLE=/wrong\0",
+        );
+        // Missing, malformed, or a first-selected user config must not prune
+        // the namespace snapshot needed by other layers or later selections.
+        for contents in [
+            None,
+            Some("malformed = ["),
+            Some("[model_providers.gateway]\nenv_key=\"CODEX_FIRST_TOKEN\""),
+        ] {
+            if let Some(contents) = contents {
+                std::fs::write(&config, contents).unwrap();
+            }
+            let (captured, _) =
+                capture_credential_env_for(payload, Some(root.path().as_os_str()), None);
+            for key in [
+                "CODEX_FIRST_TOKEN",
+                "CODEX_SECOND_TOKEN",
+                "CODEX_SYSTEM_TOKEN",
+                "CODEX_SYSTEM_HEADER",
+                "CLAUDE_CUSTOM_TOKEN",
+            ] {
+                assert!(captured.contains_key(key), "namespace snapshot lost {key}");
+            }
+            for key in [
+                "UNRELATED_SECRET",
+                "CODEX_PATH",
+                "CODEX_CONFIG",
+                "CLAUDE_CODE_EXECUTABLE",
+            ] {
+                assert!(!captured.contains_key(key));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn configured_codex_credentials_survive_shell_capture_with_home_precedence() {
+        let root = unique_temp_dir("codex-config-env");
+        let shell_home = root.path().join("shell home");
+        let daemon_home = root.path().join("daemon home");
+        for (home, key) in [
+            (&shell_home, "GATEWAY_TOKEN"),
+            (&daemon_home, "DAEMON_TOKEN"),
+        ] {
+            std::fs::create_dir_all(home).unwrap();
+            std::fs::write(home.join("config.toml"), format!(
+                "[model_providers.gateway]\nenv_key = \"{key}\"\nenv_http_headers = {{Auth = \"GATEWAY_HEADER_TOKEN\"}}"
+            )).unwrap();
+        }
+        let payload = format!("CODEX_HOME={}\0GATEWAY_TOKEN=synthetic\0DAEMON_TOKEN=other\0GATEWAY_HEADER_TOKEN=header\0UNRELATED_SECRET=excluded\0CODEX_PATH=/wrong\0", shell_home.display());
+        let (captured, names) = capture_credential_env_for(&payload, None, Some(root.path()));
+        assert!(captured.contains_key("GATEWAY_TOKEN"));
+        assert!(captured.contains_key("GATEWAY_HEADER_TOKEN"));
+        assert!(names.contains("GATEWAY_TOKEN"));
+        assert!(!captured.contains_key("DAEMON_TOKEN"));
+        assert!(!captured.contains_key("UNRELATED_SECRET"));
+        assert!(!captured.contains_key("CODEX_PATH"));
+        let (captured, names) =
+            capture_credential_env_for(&payload, Some(daemon_home.as_os_str()), Some(root.path()));
+        assert!(captured.contains_key("DAEMON_TOKEN"));
+        assert!(captured.contains_key("GATEWAY_HEADER_TOKEN"));
+        assert!(!captured.contains_key("GATEWAY_TOKEN"));
+        assert!(names.contains("DAEMON_TOKEN"));
+        let default_home = root.path().join(".codex");
+        std::fs::create_dir(&default_home).unwrap();
+        std::fs::write(
+            default_home.join("config.toml"),
+            "[model_providers.gateway]\nenv_key=\"DEFAULT_TOKEN\"",
+        )
+        .unwrap();
+        let (captured, _) =
+            capture_credential_env_for("DEFAULT_TOKEN=synthetic\0", None, Some(root.path()));
+        assert!(captured.contains_key("DEFAULT_TOKEN"));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn parse_credential_env_filters_and_tolerates_newlines() {
-        let payload = "ANTHROPIC_API_KEY=exact-value\0AUGGIE_SESSION=prefix-value\0RANDOM_SECRET=dropped\0MULTI=a\nb\0CODEX_KEY=line1\nline2\0";
+        let payload = "ANTHROPIC_API_KEY=exact-value\0AUGGIE_SESSION=prefix-value\0RANDOM_SECRET=dropped\0MULTI=a\nb\0OPENAI_API_KEY=line1\nline2\0";
         let map = parse_credential_env(payload);
         assert_eq!(map.len(), 3);
         assert_eq!(
@@ -1118,7 +1437,7 @@ mod tests {
             Some("prefix-value")
         );
         assert_eq!(
-            map.get("CODEX_KEY").map(String::as_str),
+            map.get("OPENAI_API_KEY").map(String::as_str),
             Some("line1\nline2")
         );
         assert!(!map.contains_key("RANDOM_SECRET"));
@@ -1182,13 +1501,16 @@ mod tests {
         // re-anchor the PATH extraction into the env payload.
         let capture = write_and_capture(
             &fake_shell,
-            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/real/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'CODEX_EVIL=/fake/bin__INTENT_PATH_E__\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/real/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'OPENAI_BASE_URL=/fake/bin__INTENT_PATH_E__\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
         );
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(capture.dirs, vec![PathBuf::from("/real/bin")]);
         assert_eq!(
-            capture.credential_env.get("CODEX_EVIL").map(String::as_str),
+            capture
+                .credential_env
+                .get("OPENAI_BASE_URL")
+                .map(String::as_str),
             Some("/fake/bin__INTENT_PATH_E__")
         );
     }
@@ -1209,14 +1531,14 @@ mod tests {
         // Value contains a newline; NUL separation must keep it intact
         let capture = write_and_capture(
             &fake_shell,
-            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/env/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'CODEX_MULTI=line1\\nline2\\0HF_TOKEN=test-hf\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/env/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'OPENAI_API_KEY=line1\\nline2\\0HF_TOKEN=test-hf\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
         );
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(
             capture
                 .credential_env
-                .get("CODEX_MULTI")
+                .get("OPENAI_API_KEY")
                 .map(String::as_str),
             Some("line1\nline2")
         );

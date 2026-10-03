@@ -1174,3 +1174,291 @@ async fn antigravity_inflight_and_negative_results_cannot_cross_executables() {
     .await;
     assert_eq!(b_result.models.unwrap()[0]["id"], "model-b-new");
 }
+
+fn installed_selection(key: &str) -> super::InstalledSelection {
+    super::InstalledSelection {
+        observed: tokio::time::Instant::now(),
+        key: key.into(),
+        command: Err("must not start a CLI on a cached read".into()),
+    }
+}
+
+#[tokio::test]
+async fn installed_cli_cached_reads_do_not_start_version_or_adapter_processes() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let key = "installed-test:cached";
+    cache
+        .installed
+        .lock()
+        .unwrap()
+        .insert("codex".into(), installed_selection(key));
+    cache.test_store(
+        "codex",
+        key,
+        vec![serde_json::json!({"id":"new-model"})],
+        ModelCatalogCache::now_ms(),
+    );
+    for _ in 0..5 {
+        let resolved = cache.resolve_installed("codex", false).await;
+        assert_eq!(resolved.models.unwrap()[0]["id"], "new-model");
+        assert!(!resolved.stale);
+    }
+    assert_eq!(
+        cache
+            .reader(None)
+            .cached_catalog_claims("codex", "new-model"),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn installed_cli_obsolete_inflight_probe_cannot_overwrite_or_serve_new_source() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    cache
+        .installed
+        .lock()
+        .unwrap()
+        .insert("codex".into(), installed_selection("installed-test:old"));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let old_cache = cache.clone();
+    let old = tokio::spawn(async move {
+        resolve_with_cache(
+            &old_cache,
+            "codex",
+            "installed-test:old",
+            true,
+            ModelCatalogCache::now_ms(),
+            move || {
+                Box::pin(async move {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    ModelFetchResult {
+                        models: Some(vec![serde_json::json!({"id":"old"})]),
+                        warning: None,
+                    }
+                })
+            },
+        )
+        .await
+    });
+    started_rx.await.unwrap();
+    cache
+        .installed
+        .lock()
+        .unwrap()
+        .insert("codex".into(), installed_selection("installed-test:new"));
+    cache.test_store(
+        "codex",
+        "installed-test:new",
+        vec![serde_json::json!({"id":"new"})],
+        ModelCatalogCache::now_ms(),
+    );
+    release_tx.send(()).unwrap();
+    let result = old.await.unwrap();
+    assert!(result.models.is_none());
+    assert_eq!(
+        cache.last_good("codex", "installed-test:new").unwrap()[0]["id"],
+        "new"
+    );
+}
+
+#[tokio::test]
+async fn installed_cli_failed_refresh_only_serves_same_runtime_and_auth_last_good() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let key = "installed-test:account-a";
+    cache
+        .installed
+        .lock()
+        .unwrap()
+        .insert("codex".into(), installed_selection(key));
+    cache.test_store(
+        "codex",
+        key,
+        vec![serde_json::json!({"id":"a-model"})],
+        ModelCatalogCache::now_ms(),
+    );
+    let failure = || {
+        Box::pin(async {
+            ModelFetchResult {
+                models: None,
+                warning: Some("offline".into()),
+            }
+        }) as intent_core::BoxFuture<'static, ModelFetchResult>
+    };
+    let same = resolve_with_cache(
+        &cache,
+        "codex",
+        key,
+        true,
+        ModelCatalogCache::now_ms(),
+        failure,
+    )
+    .await;
+    assert!(same.stale);
+    assert_eq!(same.models.unwrap()[0]["id"], "a-model");
+    let next = "installed-test:account-b";
+    cache
+        .installed
+        .lock()
+        .unwrap()
+        .insert("codex".into(), installed_selection(next));
+    let changed = resolve_with_cache(
+        &cache,
+        "codex",
+        next,
+        true,
+        ModelCatalogCache::now_ms(),
+        failure,
+    )
+    .await;
+    assert!(changed.models.is_none());
+    assert!(!changed.stale);
+}
+
+/// Run production discovery in a fresh process so cached shell state and the
+/// developer's credentials cannot participate in this account-change test.
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_credential_file_rotation_rejects_last_good_account() {
+    use intent_core::WorkspaceApi;
+    use std::os::unix::fs::PermissionsExt;
+    const CHILD: &str = "INTENT_TEST_CREDENTIAL_FILE";
+    if let Ok(key) = std::env::var(CHILD) {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let root = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+            let services = crate::Services::new(
+                intent_store::Store::open(&root.join("test.db"))
+                    .await
+                    .unwrap(),
+            );
+            let first = services
+                .models_list(Some("claude-code".into()), true)
+                .await
+                .unwrap();
+            assert_eq!(first["models"][0]["id"], "account-a", "{key}: {first}");
+            // Failed fingerprinting must invalidate access to the previous
+            // account's models, even while its last-good entry is still fresh.
+            let credential = root.join("credential");
+            std::fs::remove_file(&credential).unwrap();
+            std::fs::create_dir(&credential).unwrap();
+            let unreadable = services
+                .models_list(Some("claude-code".into()), true)
+                .await
+                .unwrap();
+            assert_eq!(
+                unreadable["models"],
+                serde_json::json!([]),
+                "{key}: {unreadable}"
+            );
+            assert!(!unreadable["stale"].as_bool().unwrap_or(false));
+            let cached_failure = services
+                .models_list(Some("claude-code".into()), false)
+                .await
+                .unwrap();
+            assert_eq!(cached_failure["models"], serde_json::json!([]));
+            std::fs::remove_dir(&credential).unwrap();
+            std::fs::write(&credential, "account-a").unwrap();
+            if key == "CLAUDE_CODE_CLIENT_KEY" {
+                let config = root.join(".claude.json");
+                std::fs::write(
+                    &config,
+                    serde_json::json!({"history":"x".repeat(1024 * 1024)}).to_string(),
+                )
+                .unwrap();
+                let oversized = services
+                    .models_list(Some("claude-code".into()), true)
+                    .await
+                    .unwrap();
+                assert_eq!(oversized["models"], serde_json::json!([]), "{oversized}");
+                assert!(!oversized["stale"].as_bool().unwrap_or(false));
+                std::fs::remove_file(config).unwrap();
+            }
+            std::fs::write(root.join("fail"), "").unwrap();
+            let unchanged = services
+                .models_list(Some("claude-code".into()), true)
+                .await
+                .unwrap();
+            assert_eq!(unchanged["models"], first["models"], "{key}: {unchanged}");
+            assert_eq!(unchanged["stale"], true, "{key}: {unchanged}");
+            std::fs::write(root.join("credential"), "account-b").unwrap();
+            let second = services
+                .models_list(Some("claude-code".into()), true)
+                .await
+                .unwrap();
+            assert_eq!(
+                second["models"].as_array().unwrap().len(),
+                0,
+                "{key}: {second}"
+            );
+            assert!(
+                !second["stale"].as_bool().unwrap_or(false),
+                "{key}: {second}"
+            );
+        });
+        return;
+    }
+    let node = intent_providers::find_node().expect("Node required");
+    for key in [
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CONFIG_FILE",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AZURE_FEDERATED_TOKEN_FILE",
+        "AZURE_CLIENT_CERTIFICATE_PATH",
+        "CLAUDE_CODE_CLIENT_CERT",
+        "CLAUDE_CODE_CLIENT_KEY",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // Discovery pairs npx with the real Node location. A symlink would
+        // select the host's npx, so keep a launcher inside the fixture directory.
+        let launcher = format!(
+            "#!/bin/sh\nexec '{}' \"$@\"\n",
+            node.to_string_lossy().replace('\'', "'\\''")
+        );
+        std::fs::write(bin.join("node"), launcher).unwrap();
+        std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (name, script) in [
+            ("claude", "#!/bin/sh\nprintf '2.0.0 (Claude Code)\\n'\n"),
+            (
+                "npx",
+                r"#!/usr/bin/env node
+const fs=require('fs'),path=require('path'),root=process.env.HOME;
+if(process.argv.includes('--version')) { console.log('11.0.0');process.exit(0); }
+if(process.env.CLAUDE_CODE_EXECUTABLE!==path.join(root,'bin/claude')) process.exit(8);
+require('readline').createInterface({input:process.stdin}).on('line',line=>{
+ const m=JSON.parse(line); if(m.id===undefined)return;
+ if(m.method==='session/new' && fs.existsSync(path.join(root,'fail'))) {
+  console.log(JSON.stringify({jsonrpc:'2.0',id:m.id,error:{code:-32000,message:'fixture auth unavailable'}}));return;
+ }
+ const token=fs.readFileSync(process.env[process.env.INTENT_TEST_CREDENTIAL_FILE],'utf8');
+ const result=m.method==='initialize'?{protocolVersion:1,agentCapabilities:{}}:
+ {sessionId:'fixture',models:{availableModels:[{modelId:token,name:token}],currentModelId:token}};
+ console.log(JSON.stringify({jsonrpc:'2.0',id:m.id,result}));
+});
+",
+            ),
+        ] {
+            let file = bin.join(name);
+            std::fs::write(&file, script).unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let credential = root.path().join("credential");
+        std::fs::write(&credential, "account-a").unwrap();
+        let output=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "model_catalog::tests::installed_cli_credential_file_rotation_rejects_last_good_account", "--nocapture"])
+            .env_clear()
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
+            .env("HOME",root.path()).env("SHELL","/bin/sh")
+            .env("PATH",std::env::join_paths([bin,std::path::PathBuf::from("/usr/bin"),std::path::PathBuf::from("/bin")]).unwrap())
+            .env(CHILD,key).env(key,&credential).output().unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{key}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

@@ -104,3 +104,21 @@ async fn private_files_are_ready_private_and_never_overwrite() {
         );
     }
 }
+
+#[tokio::test]
+async fn isolated_home_keeps_selected_routing_configuration() {
+    let seed = "model_provider = \"fixture\"\n[model_providers.fixture]\nname = \"Fixture\"\nbase_url = \"https://provider.invalid/v1\"\n";
+    let auth = Authentication {
+        config: Some(seed.into()),
+        ..Authentication::default()
+    };
+    let home = auth.home().await.unwrap();
+    let config = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    let parsed = config.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(parsed["cli_auth_credentials_store"].as_str(), Some("file"));
+    assert_eq!(parsed["model_provider"].as_str(), Some("fixture"));
+    assert_eq!(
+        parsed["model_providers"]["fixture"]["base_url"].as_str(),
+        Some("https://provider.invalid/v1")
+    );
+}

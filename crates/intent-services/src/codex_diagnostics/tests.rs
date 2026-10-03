@@ -121,6 +121,7 @@ mod unix {
 
         fn local(&self, source: ProviderBinarySource) -> CodexLaunch {
             CodexLaunch {
+                installed: None,
                 selection: ProviderLaunch::Local(ProviderBinary {
                     path: self.adapter.clone(),
                     source,
@@ -132,6 +133,7 @@ mod unix {
 
         fn managed(&self) -> CodexLaunch {
             CodexLaunch {
+                installed: None,
                 selection: ProviderLaunch::Managed {
                     npx: self.root.path().join("bin/npx"),
                     package: TEST_CODEX_PACKAGE,
@@ -280,6 +282,7 @@ mod unix {
                 std::fs::copy(std::env::current_exe().unwrap(), &adapter).unwrap();
             }
             let launch = CodexLaunch {
+                installed: None,
                 selection: ProviderLaunch::Local(ProviderBinary {
                     path: adapter,
                     source: ProviderBinarySource::SettingsOverride,
@@ -366,6 +369,7 @@ mod unix {
         let link = fixture.root.path().join("bin/codex-acp");
         symlink(&fixture.adapter, &link).unwrap();
         let launch = CodexLaunch {
+            installed: None,
             selection: ProviderLaunch::Local(ProviderBinary {
                 path: link,
                 source: ProviderBinarySource::LocalDiscovery,
@@ -544,8 +548,22 @@ mod unix {
             options
                 .extra_env
                 .insert("CODEX_CONFIG".into(), "private config".into());
-            let command = build_command(&options);
-            assert!(effective_env(&command, "CODEX_PATH").is_none());
+            let mut command = build_command(&options);
+            let runtime = intent_providers::installed_cli::InstalledCli::Codex
+                .resolve_in_dirs(&[fixture.root.path().join("bin")], false)
+                .unwrap();
+            let context = crate::installed_cli::InstalledContext::from_inputs(
+                runtime,
+                &std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+                &intent_core::cli_env::CodexEnvNames::default(),
+            )
+            .unwrap();
+            context.apply(&mut command);
+            assert_eq!(
+                effective_env(&command, "CODEX_PATH"),
+                Some(fixture.root.path().join("bin/codex").into_os_string())
+            );
             assert_eq!(
                 effective_env(&command, "CODEX_CONFIG").as_deref(),
                 Some(OsStr::new(CODEX_SUBAGENT_POLICY_CONFIG))
@@ -757,4 +775,74 @@ setInterval(() => {}, 1000);
             "cancelled probe must reap descendants before removing its home"
         );
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn installed_cli_diagnostics_measure_selected_native_entry_with_same_environment() {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let cli = root.path().join("codex");
+    std::fs::write(&cli,"#!/bin/sh\n[ \"$CODEX_DIAGNOSTIC_TOKEN\" = test-private-token ] || exit 7\nprintf 'codex-cli 9.8.7\\n'\n").unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let runtime = intent_providers::installed_cli::InstalledCli::Codex
+        .resolve_in_dirs(&[root.path().to_owned()], false)
+        .unwrap();
+    let context = crate::installed_cli::InstalledContext::from_inputs(
+        runtime,
+        &BTreeMap::new(),
+        BTreeMap::from([
+            (OsString::from("HOME"), root.path().as_os_str().to_owned()),
+            ("CODEX_DIAGNOSTIC_TOKEN".into(), "test-private-token".into()),
+            ("PATH".into(), "/bin:/usr/bin".into()),
+        ]),
+        &intent_core::cli_env::CodexEnvNames::default(),
+    )
+    .unwrap();
+    let launch = CodexLaunch {
+        selection: ProviderLaunch::VendoredCodex {
+            node: root.path().join("must-not-run-node"),
+            runtime: cli.clone(),
+        },
+        installed: Some(context),
+        path: "/bin:/usr/bin".into(),
+        codex_path: Some(cli.as_os_str().to_owned()),
+    };
+    let result = launch.inspect_local().await;
+    assert_eq!(
+        result.report.runtime_version,
+        VersionMeasurement::Measured("9.8.7".into())
+    );
+    assert_eq!(
+        result.report.runtime_source,
+        RuntimeSource::EnvironmentOverride
+    );
+    assert_eq!(result.runtime.unwrap().program, cli);
+    assert!(!serde_json::to_string(&result.report)
+        .unwrap()
+        .contains("test-private-token"));
+    assert!(matches!(
+        result.report.adapter_version,
+        VersionMeasurement::Unknown(UnknownReason::BundledAdapterNotMeasured)
+    ));
+}
+
+#[tokio::test]
+async fn installed_cli_diagnostics_absent_runtime_has_no_dependency_fallback() {
+    let launch = CodexLaunch {
+        installed: None,
+        selection: ProviderLaunch::Managed {
+            npx: PathBuf::from("/unused/npx"),
+            package: TEST_CODEX_PACKAGE,
+        },
+        path: OsString::new(),
+        codex_path: Some(OsString::new()),
+    };
+    let inspection = launch.inspect_local().await;
+    assert!(inspection.runtime.is_none());
+    assert_eq!(
+        inspection.report.runtime_version,
+        VersionMeasurement::Unknown(UnknownReason::RuntimeNotFound)
+    );
 }

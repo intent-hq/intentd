@@ -209,55 +209,60 @@ where
 /// resolved to the real model it stands for (marked `isDefault: true`) and
 /// dropped whenever a real row exists; it is kept only as a sole row.
 pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
-    let Some(npx) = find_npx() else {
-        return ProviderModelsFetch::unavailable(
-            "claude-code",
-            "npx not found; cannot run the pinned claude-agent-acp adapter",
-        );
-    };
-    let cmd = AcpProbeCommand::npx(npx, intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE);
-    if let Err(err) = cmd.check_npx_version().await {
-        return ProviderModelsFetch::unavailable("claude-code", err);
-    }
-    finish(
-        "claude-code",
-        run_acp_probe(cmd, |v| parse::parse_acp_models(v, "claude-code")).await,
-    )
+    fetch_installed_models("claude-code").await
 }
 
-/// codex: ACP probe via the vendored adapter and device Codex CLI.
-/// Effort-capable base models carry `effortLevels` on one row.
-///
-/// The probe child runs with an isolated `CODEX_HOME` (fresh per-probe temp
-/// dir, removed after the probe) so the user's `~/.codex/config.toml` — and
-/// any `mcp_servers` it registers — is never loaded by the throwaway
-/// codex-acp process. `auth.json` is seeded into the isolated home so a
-/// logged-in codex stays logged in, plus a minimal `config.toml` carrying
-/// only the user's configured `model` / `model_reasoning_effort` so that
-/// model appears in the reported catalog.
-pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
-    let Some(cmd) = codex_probe_launch(intent_providers::find_codex_node()) else {
-        return ProviderModelsFetch::unavailable(
-            "codex",
-            intent_providers::CODEX_ACP_PREREQUISITE_ERROR,
-        );
-    };
-    let (cmd, codex_home) = match with_isolated_codex_home(cmd) {
-        Ok(pair) => pair,
-        Err(e) => {
-            return ProviderModelsFetch::unavailable(
-                "codex",
-                format!("failed to create isolated CODEX_HOME: {e}"),
-            )
+/// Resolve the installed runtime once, then use that launch for the catalog.
+pub(crate) async fn installed_model_command(provider_id: &str) -> Result<AcpProbeCommand, String> {
+    let provider = intent_providers::find_provider(provider_id).ok_or("unknown provider")?;
+    let codex = provider_id == "codex";
+    let runtime = tokio::task::spawn_blocking(move || {
+        if codex {
+            intent_providers::find_codex_node()
+        } else {
+            find_npx()
         }
+    })
+    .await
+    .map_err(|_| "adapter discovery failed")?;
+    let cmd = crate::complete_ops::one_shot_launch(provider, None, runtime, None)
+        .ok_or_else(|| crate::complete_ops::missing_one_shot_adapter_message(provider_id))?;
+    cmd.check_npx_version().await.map_err(|e| e.to_string())?;
+    cmd.prepare_installed_catalog().await
+}
+
+async fn fetch_installed_models(provider_id: &str) -> ProviderModelsFetch {
+    match installed_model_command(provider_id).await {
+        Ok(cmd) => fetch_installed_models_at(provider_id, cmd).await,
+        Err(reason) => ProviderModelsFetch::unavailable(provider_id, reason),
+    }
+}
+
+pub(crate) const INSTALLED_SOURCE_CHANGED: &str =
+    "installed CLI or authentication/configuration changed during model discovery; refresh again";
+
+pub(crate) async fn fetch_installed_models_at(
+    provider_id: &str,
+    cmd: AcpProbeCommand,
+) -> ProviderModelsFetch {
+    let outcome = if provider_id == "codex" {
+        run_acp_probe(cmd.clone(), parse::parse_codex_acp_models).await
+    } else {
+        run_acp_probe(cmd.clone(), |v| parse::parse_acp_models(v, "claude-code")).await
     };
-    let outcome = run_acp_probe(cmd, parse::parse_codex_acp_models).await;
-    drop(codex_home);
-    finish("codex", outcome)
+    if !cmd.installed_still_current().await {
+        return ProviderModelsFetch::unavailable(provider_id, INSTALLED_SOURCE_CHANGED);
+    }
+    finish(provider_id, outcome)
+}
+
+pub(crate) async fn fetch_codex_models() -> ProviderModelsFetch {
+    fetch_installed_models("codex").await
 }
 
 /// The same vendored launch and policy used by one-shot completions. No native
 /// or configured adapter path is accepted by a Codex model probe.
+#[cfg(test)]
 fn codex_probe_launch(node: Option<PathBuf>) -> Option<AcpProbeCommand> {
     let provider = intent_providers::find_provider("codex")?;
     crate::complete_ops::one_shot_launch(provider, None, node, None)
@@ -269,6 +274,7 @@ fn codex_probe_launch(node: Option<PathBuf>) -> Option<AcpProbeCommand> {
 /// must never load the user's real `~/.codex/config.toml` (and the
 /// `mcp_servers` it can register). The returned [`tempfile::TempDir`] must
 /// outlive the run; dropping it removes the throwaway home.
+#[cfg(test)]
 pub(crate) fn with_isolated_codex_home(
     cmd: AcpProbeCommand,
 ) -> std::io::Result<(AcpProbeCommand, tempfile::TempDir)> {
@@ -279,6 +285,7 @@ pub(crate) fn with_isolated_codex_home(
 
 /// The user's real codex home: `$CODEX_HOME` when set, else `~/.codex`.
 /// Env vars that are set but empty are treated as unset.
+#[cfg(test)]
 fn user_codex_dir() -> Option<PathBuf> {
     let non_empty = |key: &str| std::env::var_os(key).filter(|v| !v.is_empty());
     if let Some(home) = non_empty("CODEX_HOME") {
@@ -288,15 +295,10 @@ fn user_codex_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".codex"))
 }
 
-/// Top-level scalar keys copied from the user's `config.toml` into the
-/// isolated probe home. `model` (and its effort) is what surfaces
-/// user-configured models (e.g. a newer model than the adapter presets) in
-/// codex-acp's reported catalog. Everything else — notably `mcp_servers` —
-/// is deliberately never copied. Known limitation: a model configured only
-/// via a codex profile (`profile = "x"` + `[profiles.x].model`) or backed by
-/// a custom `[model_providers.*]` entry is not seeded — only top-level
-/// scalars are read.
-const CODEX_CONFIG_SEED_KEYS: &[&str] = &["model", "model_reasoning_effort"];
+/// Model/effort/provider routing copied into an isolated probe home. Selected
+/// profiles and provider transport/auth fields are preserved below; MCP servers,
+/// hooks and unrelated user policy are deliberately excluded.
+const CODEX_CONFIG_SEED_KEYS: &[&str] = &["model", "model_reasoning_effort", "model_provider"];
 
 /// Create a fresh temp dir to serve as a probe's `CODEX_HOME` (codex requires
 /// the directory to exist). `auth.json` is copied from `user_codex_dir` so a
@@ -305,7 +307,9 @@ const CODEX_CONFIG_SEED_KEYS: &[&str] = &["model", "model_reasoning_effort"];
 /// model shows up in the probe's catalog. The user's full `config.toml` is
 /// deliberately NOT copied so user-configured `mcp_servers` never start under
 /// the probe.
-fn isolated_codex_home(user_codex_dir: Option<&Path>) -> std::io::Result<tempfile::TempDir> {
+pub(crate) fn isolated_codex_home(
+    user_codex_dir: Option<&Path>,
+) -> std::io::Result<tempfile::TempDir> {
     let dir = tempfile::Builder::new()
         .prefix("intentd-codex-home-")
         .tempdir()?;
@@ -329,12 +333,9 @@ fn isolated_codex_home(user_codex_dir: Option<&Path>) -> std::io::Result<tempfil
     Ok(dir)
 }
 
-/// Build the minimal `config.toml` text to seed into the isolated probe home:
-/// only the [`CODEX_CONFIG_SEED_KEYS`] top-level string values from the
-/// user's config at `path`. Returns `None` — seed nothing, the probe still
-/// works with adapter presets — when the file is absent, unreadable, or
-/// malformed, or when none of the allowlisted keys hold a string.
-fn minimal_codex_config_seed(path: &Path) -> Option<String> {
+/// Seed model routing and credentials without importing executable tools or
+/// MCP configuration. User config is read before the isolated home is applied.
+pub(crate) fn minimal_codex_config_seed(path: &Path) -> Option<String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -343,17 +344,46 @@ fn minimal_codex_config_seed(path: &Path) -> Option<String> {
             return None;
         }
     };
-    let doc: toml_edit::DocumentMut = match text.parse() {
-        Ok(doc) => doc,
-        Err(e) => {
-            tracing::warn!("user codex config.toml is malformed; seeding nothing: {e}");
-            return None;
-        }
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        tracing::warn!("user codex config.toml is malformed; seeding nothing");
+        return None;
     };
     let mut seed = toml_edit::DocumentMut::new();
     for key in CODEX_CONFIG_SEED_KEYS {
         if let Some(value) = doc.get(key).and_then(|item| item.as_str()) {
             seed[key] = toml_edit::value(value);
+        }
+    }
+    if let Some(profile) = doc
+        .get("profile")
+        .and_then(|v| v.as_str())
+        .and_then(|name| doc.get("profiles")?.get(name))
+    {
+        for key in CODEX_CONFIG_SEED_KEYS {
+            if let Some(value) = profile.get(key).and_then(|v| v.as_str()) {
+                seed[key] = toml_edit::value(value);
+            }
+        }
+    }
+    if let Some(providers) = doc.get("model_providers").and_then(|v| v.as_table_like()) {
+        for (name, provider) in providers.iter() {
+            for key in [
+                "name",
+                "base_url",
+                "env_key",
+                "env_key_instructions",
+                "wire_api",
+                "http_headers",
+                "env_http_headers",
+                "requires_openai_auth",
+                "request_max_retries",
+                "stream_max_retries",
+                "stream_idle_timeout_ms",
+            ] {
+                if let Some(value) = provider.get(key) {
+                    seed["model_providers"][name][key] = value.clone();
+                }
+            }
         }
     }
     if seed.as_table().is_empty() {
@@ -458,17 +488,16 @@ pub(crate) async fn probe_pi_auth() -> Option<bool> {
 /// unknown — it can never confirm `Some(true)`, because the adapter serves
 /// its model catalog without credentials (see
 /// [`claude_code_acp_auth_verdict`]). The caller gates on the `claude` CLI
-/// being installed. The probe runs the SAME adapter a session spawn would
-/// (intent-hq/monorepo#4352): `adapter_override` — the validated
-/// `providers.paths["claude-code"]` binary
-/// ([`intent_providers::resolve_npx_only_override`]) — when set, else the
-/// pinned npx adapter ([`intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE`]),
-/// so the verdict reflects what sessions actually run.
+/// being installed. The probe runs the pinned adapter with that canonical CLI,
+/// matching session launches. The legacy `adapter_override` argument is ignored;
+/// it cannot replace the reviewed package or satisfy the installed-CLI gate.
 pub(crate) async fn probe_claude_code_auth(adapter_override: Option<PathBuf>) -> Option<bool> {
-    let cmd = match adapter_override {
-        Some(bin) => AcpProbeCommand::binary(bin, Vec::new()),
-        None => AcpProbeCommand::npx(find_npx()?, intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE),
-    };
+    let provider = intent_providers::find_provider("claude-code")?;
+    let _ = intent_providers::discover::resolve_npx_only_override(
+        provider,
+        adapter_override.as_deref().and_then(Path::to_str),
+    );
+    let cmd = installed_model_command("claude-code").await.ok()?;
     let outcome = run_acp_probe(cmd, |v| parse::parse_acp_models(v, "claude-code")).await;
     claude_code_acp_auth_verdict(outcome)
 }

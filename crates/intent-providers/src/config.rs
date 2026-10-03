@@ -45,8 +45,8 @@ pub const NPX_NPM_REQUIREMENT: &str = "npm 7+";
 /// Daemon-owned Codex subagent denial shared by persistent agents, model
 /// probes, and one-shot launches. V2 feature enabling takes precedence over
 /// `agents.enabled` in this runtime, so both settings must be false. Set this
-/// after all environment merges and remove `CODEX_PATH` so the adapter uses
-/// the device Codex executable. Do not merge user `CODEX_CONFIG`.
+/// after all environment merges and set the resolved `CODEX_PATH` so the adapter uses
+/// the installed CLI. Do not merge user `CODEX_CONFIG`.
 pub const CODEX_SUBAGENT_POLICY_CONFIG: &str =
     r#"{"agents":{"enabled":false},"features":{"multi_agent_v2":false}}"#;
 
@@ -225,7 +225,7 @@ pub struct ProviderConfig {
     pub login_docs_url: Option<&'static str>,
     /// When provider binary cannot be resolved, fall back to spawning this npm
     /// package via `npx -y <package>`. Only set for providers shipped as npm
-    /// packages (e.g. codex's `@agentclientprotocol/codex-acp`).
+    /// packages. Codex instead uses the daemon's vendored adapter.
     pub fallback_npx_package: Option<&'static str>,
     /// When set, the provider is spawned via `npx -y <package>` with a
     /// version pinned by us — auto-discovery (managed bin, PATH scan) is
@@ -240,15 +240,14 @@ pub struct ProviderConfig {
     /// session spawn, discovery `installed`, one-shot / test-prompt launches,
     /// the ACP auth fallback probe) — so users can track the adapter
     /// themselves (intent-hq/monorepo#4352). An invalid override contributes
-    /// nothing and the pinned spawn applies. Opt-in per provider: claude-code
-    /// (a self-contained adapter). pi stays pinned-npx-only — its adapter
-    /// additionally routes through the version-gated real `pi` CLI and the
-    /// extension wrapper, and its auth probe runs the pinned package, so an
-    /// override there would advertise `installed` for a spawn that still
-    /// fails the `pi` CLI gate.
+    /// nothing and the pinned spawn applies. Claude and pi do not opt in:
+    /// Claude uses the reviewed adapter with its installed CLI, and pi's
+    /// adapter routes through the version-gated `pi` CLI and extension wrapper.
     pub npx_only_honors_path_override: bool,
     /// When set, discovery (`discover_providers`) only reports this provider
-    /// as `installed` when BOTH `command` AND this secondary CLI resolve.
+    /// as `installed` when BOTH its adapter runtime AND this secondary CLI resolve.
+    /// Codex uses Node for its vendored adapter plus the installed `codex` CLI;
+    /// Claude uses npx for its reviewed adapter plus the installed `claude` CLI.
     /// Unsloth rides the `opencode` binary as its ACP runtime (`command`) but
     /// also requires the `unsloth` CLI itself (the daemon-managed server
     /// lifecycle, `unsloth_server.rs`) — reporting availability off
@@ -433,8 +432,9 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         login_docs_url: Some(
             "https://code.claude.com/docs/en/quickstart#step-2-log-in-to-your-account",
         ),
+        requires_secondary_binary: Some("claude"),
         npx_only_package: Some(CLAUDE_AGENT_ACP_NPX_PACKAGE),
-        npx_only_honors_path_override: true,
+        npx_only_honors_path_override: false,
         short_name: "Claude Code",
         // Claude Code silently truncates MCP tool descriptions at ~2k chars
         // (anthropics/claude-code#53933): serve the compact `workspace_api`
@@ -443,8 +443,8 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {
-        // The selected adapter runs on Node, including when a native or JS
-        // codex-acp is installed. Custom paths cannot bypass the subagent policy.
+        // The vendored adapter runs on Node. Installed adapters and custom
+        // paths cannot bypass the subagent policy or select the Codex runtime.
         runtime: ProviderRuntime::Node,
         can_be_disabled: true,
         // The vendored codex-acp adapter ignores
@@ -479,6 +479,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // the claude-code hint above).
         login_command_hint: Some("codex login"),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
+        requires_secondary_binary: Some("codex"),
         short_name: "Codex",
         ..ProviderConfig::empty("codex", "OpenAI Codex", "codex-acp")
     },

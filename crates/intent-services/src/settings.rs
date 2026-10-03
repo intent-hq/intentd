@@ -2252,16 +2252,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             f64::from(intent_core::config::DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS),
         ),
         enumerated(
-            "agents.flushQueuedMessages",
-            "Flush queued messages",
-            "Controls how messages waiting in the queue are delivered to the agent when a turn ends: \
-             all batches every ready entry into one turn, systemOnly batches only system-origin \
-             entries (user-origin entries stay FIFO), off delivers one turn per queued message",
-            "agents",
-            &["all", "systemOnly", "off"],
-            "all",
-        ),
-        enumerated(
             "agents.resumeInterruptedOnStart",
             "Resume interrupted agents on start",
             "Whether the daemon resumes interrupted agents at startup when --resume-all is absent: \
@@ -3190,12 +3180,14 @@ impl<'a> SettingsService<'a> {
             // monorepo#1729 compatibility: pre-rename clients still write the
             // `backgroundAgents.*` paths. Tolerate-and-ignore these entries —
             // the renamed `quickActions.*` keys are the only writable surface.
+            // Retired batching preferences are ignored: every ready entry batches.
             // The deprecated `providers.active` gets the same treatment so a
             // write can never recreate the key `migrate_active_provider_setting`
             // removed from config.toml (its catalog entry is read-only, but a
             // hard rejection would fail whole batches from old clients).
             if RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
                 || path == DEPRECATED_ACTIVE_PROVIDER_PATH
+                || path == "agents.flushQueuedMessages"
             {
                 tracing::debug!(path, "ignoring settings.update for retired setting");
                 continue;
@@ -3768,7 +3760,7 @@ mod tests {
     async fn rejected_settings_batches_preserve_all_stores() {
         for (invalid_path, invalid_value) in [
             ("future.setting", json!(true)),
-            ("agents.flushQueuedMessages", json!("future-policy")),
+            ("agents.resumeInterruptedOnStart", json!("future-policy")),
             (
                 "quickActions.providerSettings",
                 json!({"future-provider": {"option": null}}),
@@ -6479,84 +6471,10 @@ mod tests {
         }
     }
 
-    /// `agents.flushQueuedMessages` is a TOML-backed enum (`all` / `systemOnly`
-    /// / `off`) defaulting to `all`: the catalog entry and wire round-trip
-    /// through the registry-wired service (default origin → file override →
-    /// reset). Also covers a legacy boolean already on disk loading as the
-    /// wire-reported string.
-    #[tokio::test]
-    async fn agents_flush_queued_messages_round_trip_via_registry() {
-        let def = find_definition("agents.flushQueuedMessages")
-            .expect("agents.flushQueuedMessages missing");
-        assert!(!def.sensitive);
-        assert!(!def.read_only);
-        assert_eq!(def.category, "agents");
-        assert!(
-            matches!(def.ty, SettingType::Enum(values) if values == ["all", "systemOnly", "off"])
-        );
-        assert_eq!(def.default_value, Some(json!("all")));
-        assert!(KNOWN_PATHS.contains(&"agents.flushQueuedMessages"));
-
-        let tag = uuid::Uuid::new_v4();
-        let tmp = std::env::temp_dir().join(format!("intentd-settings-flushq-{tag}.db"));
-        let store = Store::open(&tmp).await.expect("open store");
-        let config_path = std::env::temp_dir().join(format!("intentd-settings-flushq-{tag}.toml"));
-        std::fs::write(&config_path, "").expect("write empty config");
-        let registry = SettingsRegistry::load(&config_path).expect("load registry");
-        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
-        let secrets = AsyncSecretStore::new(secrets);
-        let svc = SettingsService::new(&store, &secrets, Some(&registry));
-
-        // Default with `default` origin.
-        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
-        assert_eq!(got["value"], json!("all"));
-        assert_eq!(got["origin"], json!("default"));
-
-        // Update persists to config.toml with `file` origin, never SQLite.
-        svc.update(&json!([
-            { "path": "agents.flushQueuedMessages", "value": "systemOnly" },
-        ]))
-        .await
-        .expect("update");
-        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
-        assert_eq!(got["value"], json!("systemOnly"));
-        assert_eq!(got["origin"], json!("file"));
-        let text = std::fs::read_to_string(&config_path).expect("read config");
-        assert!(text.contains("flushQueuedMessages"), "{text}");
-        assert_eq!(
-            store
-                .get_setting("agents.flushQueuedMessages")
-                .await
-                .expect("read settings table"),
-            None,
-            "TOML-backed keys must never write a SQLite settings row"
-        );
-
-        // Rejects an unknown enum value.
-        let err = svc
-            .update(&json!([
-                { "path": "agents.flushQueuedMessages", "value": "sometimes" },
-            ]))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("flushQueuedMessages"), "{err}");
-
-        // Reset restores the default.
-        let reset = svc
-            .reset("agents.flushQueuedMessages")
-            .await
-            .expect("reset");
-        assert_eq!(reset["value"], json!("all"));
-        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
-        assert_eq!(got["origin"], json!("default"));
-
-        let _ = std::fs::remove_file(&config_path);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
-                "{}{suffix}",
-                tmp.display()
-            )));
-        }
+    #[test]
+    fn agents_flush_queued_messages_is_not_supported() {
+        assert!(find_definition("agents.flushQueuedMessages").is_none());
+        assert!(!KNOWN_PATHS.contains(&"agents.flushQueuedMessages"));
     }
 
     /// `agents.resumeInterruptedOnStart` is a TOML-backed enum (`auto` / `on`
@@ -6638,36 +6556,6 @@ mod tests {
             .await
             .expect("get");
         assert_eq!(got["origin"], json!("default"));
-
-        let _ = std::fs::remove_file(&config_path);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
-                "{}{suffix}",
-                tmp.display()
-            )));
-        }
-    }
-
-    /// A `config.toml` written by an older daemon (`flushQueuedMessages =
-    /// true/false`) still loads through the registry, wire-reporting the
-    /// equivalent string value.
-    #[tokio::test]
-    async fn agents_flush_queued_messages_legacy_boolean_loads_via_registry() {
-        let tag = uuid::Uuid::new_v4();
-        let tmp = std::env::temp_dir().join(format!("intentd-settings-flushq-legacy-{tag}.db"));
-        let store = Store::open(&tmp).await.expect("open store");
-        let config_path =
-            std::env::temp_dir().join(format!("intentd-settings-flushq-legacy-{tag}.toml"));
-        std::fs::write(&config_path, "[agents]\nflushQueuedMessages = false\n")
-            .expect("write legacy config");
-        let registry = SettingsRegistry::load(&config_path).expect("load registry");
-        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
-        let secrets = AsyncSecretStore::new(secrets);
-        let svc = SettingsService::new(&store, &secrets, Some(&registry));
-
-        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
-        assert_eq!(got["value"], json!("off"));
-        assert_eq!(got["origin"], json!("file"));
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {
@@ -8470,6 +8358,11 @@ mod rollback_order_tests {
             Arc<tokio::sync::Notify>,
             Mutex<std::sync::mpsc::Receiver<()>>,
         )>,
+        newer: Option<(
+            Arc<tokio::sync::Notify>,
+            Mutex<std::sync::mpsc::Receiver<()>>,
+        )>,
+        write_order: Mutex<Vec<&'static str>>,
     }
 
     impl SecretStore for RejectSecondSecret {
@@ -8478,6 +8371,9 @@ mod rollback_order_tests {
         }
 
         fn store(&self, account: &str, value: &str) -> Result<()> {
+            use intent_sourcecontrol::gitlab_token::{
+                EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+            };
             if account == "accounts.sentry.token" && value == "rejected-sentry" {
                 return Err(Error::Internal("injected second-secret failure".into()));
             }
@@ -8492,7 +8388,27 @@ mod rollback_order_tests {
                     let _ = release.lock().unwrap().recv();
                 }
             }
-            self.raw.store(account, value)
+            if account == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT && value == "newer-pat"
+            {
+                // Record entry before the test barrier: parking this write must
+                // not hide a regression that lets it overtake compensation.
+                self.write_order.lock().unwrap().push("newer write entered");
+                if let Some((entered, release)) = &self.newer {
+                    entered.notify_one();
+                    let _ = release.lock().unwrap().recv();
+                }
+            }
+            self.raw.store(account, value)?;
+            let restored = match (account, value) {
+                (SECRET_ACCOUNT, "original-device") => Some("token restored"),
+                (REFRESH_SECRET_ACCOUNT, "original-refresh") => Some("refresh restored"),
+                (EXPIRES_AT_SECRET_ACCOUNT, "12345") => Some("expiry restored"),
+                _ => None,
+            };
+            if let Some(restored) = restored {
+                self.write_order.lock().unwrap().push(restored);
+            }
+            Ok(())
         }
 
         fn delete(&self, account: &str) -> Result<()> {
@@ -8526,13 +8442,18 @@ mod rollback_order_tests {
             .unwrap();
         let entered = Arc::new(tokio::sync::Notify::new());
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let newer_entered = Arc::new(tokio::sync::Notify::new());
+        let (newer_release_tx, newer_release_rx) = std::sync::mpsc::channel();
+        let secrets = Arc::new(RejectSecondSecret {
+            raw: raw.clone(),
+            reject_rollback: false,
+            rollback: concurrent.then_some((entered.clone(), Mutex::new(release_rx))),
+            newer: concurrent.then_some((newer_entered.clone(), Mutex::new(newer_release_rx))),
+            write_order: Mutex::new(Vec::new()),
+        });
         let services = crate::Services::new(store)
             .with_settings_registry(registry)
-            .with_secret_store(Arc::new(RejectSecondSecret {
-                raw: raw.clone(),
-                reject_rollback: false,
-                rollback: concurrent.then_some((entered.clone(), Mutex::new(release_rx))),
-            }))
+            .with_secret_store(secrets.clone())
             .with_event_bus(bus);
         let writer = services.clone();
         let failed = intent_core::spawn_daemon(async move {
@@ -8555,7 +8476,7 @@ mod rollback_order_tests {
                 .expect("rollback parked");
             assert!(
                 poll_fn(|cx| Poll::Ready(newer.as_mut().poll(cx).is_pending())).await,
-                "a newer credential must wait for compensation to finish"
+                "the newer request must remain pending while compensation is parked"
             );
             let ordinary = timeout(
                 Duration::from_secs(3),
@@ -8573,6 +8494,23 @@ mod rollback_order_tests {
             error.to_string().contains("injected second-secret failure"),
             "{error}"
         );
+        if concurrent {
+            // Polling the outer request starts an owned task. Hold its backing
+            // write through the intermediate assertions and revision-one probe.
+            timeout(Duration::from_secs(5), newer_entered.notified())
+                .await
+                .expect("newer write parked");
+            assert_eq!(
+                *secrets.write_order.lock().unwrap(),
+                [
+                    "token restored",
+                    "refresh restored",
+                    "expiry restored",
+                    "newer write entered",
+                ],
+                "compensation must finish before the newer write enters the backing store"
+            );
+        }
         for (account, value) in originals {
             assert_eq!(
                 raw.load(account).unwrap().as_deref(),
@@ -8594,13 +8532,27 @@ mod rollback_order_tests {
         assert_no_settings_events(&mut sub).await;
         assert_next_commit_is_revision_one(&services, &mut sub).await;
         if concurrent {
-            assert_eq!(newer.await.unwrap()["revision"], json!(2));
+            newer_release_tx.send(()).unwrap();
+            let newer = newer.await.unwrap();
+            assert_eq!(newer["revision"], json!(2));
             assert_eq!(
                 raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
                 Some("newer-pat")
             );
             assert_eq!(raw.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
             assert_eq!(raw.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
+            let events = timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .expect("newer settings event")
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].data["revision"], json!(2));
+            assert_eq!(
+                events[0].data["changes"],
+                json!([{"path": SECRET_ACCOUNT, "value": REDACTED_PLACEHOLDER}])
+            );
+            assert_eq!(events[0].data["changes"], newer["applied"]);
+            assert_no_settings_events(&mut sub).await;
         }
     }
 
@@ -8645,6 +8597,8 @@ mod rollback_order_tests {
                 raw: raw.clone(),
                 reject_rollback: true,
                 rollback: None,
+                newer: None,
+                write_order: Mutex::new(Vec::new()),
             }))
             .with_event_bus(bus);
         let error = services

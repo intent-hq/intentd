@@ -2256,8 +2256,45 @@ mod tests {
         ]
     }
 
-    async fn selection_fixture() -> (TempDir, TempDir, tempfile::TempDir, Services) {
+    struct SelectionFixture {
+        root: TempDir,
+        _env: crate::agent_manager::tests::EnvGuard,
+    }
+
+    impl Drop for SelectionFixture {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                assert!(
+                    !self.root.0.join("bin/codex.launched").exists(),
+                    "import selection must not launch the installed CLI"
+                );
+            }
+        }
+    }
+
+    async fn selection_fixture() -> (SelectionFixture, TempDir, tempfile::TempDir, Services) {
         let root = TempDir::new("import-selection");
+        // Codex availability requires its canonical installed CLI, even when
+        // the legacy adapter override below is present. Import only inspects
+        // executable paths and cached catalogs; it must not run the CLI.
+        let bin = root.0.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let cli = bin.join("codex");
+            std::fs::write(&cli, "#!/bin/sh\n: > \"$0.launched\"\nexit 91\n").unwrap();
+            std::fs::set_permissions(cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        std::fs::write(bin.join("codex.exe"), b"discovery-only fixture").unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let path = std::env::join_paths(paths).unwrap();
+        let env =
+            crate::agent_manager::tests::EnvGuard::set_all(&[("PATH", path.to_str().unwrap())]);
         let assets = TempDir::new("import-selection-assets");
         let registry =
             std::sync::Arc::new(crate::SettingsRegistry::load(root.0.join("config.toml")).unwrap());
@@ -2315,7 +2352,7 @@ mod tests {
                 crate::model_catalog::ModelCatalogCache::now_ms(),
             );
         }
-        (root, assets, db_dir, svc)
+        (SelectionFixture { root, _env: env }, assets, db_dir, svc)
     }
 
     fn seed_selection_catalog(svc: &Services, provider: &str, model: &str, now: u64) {

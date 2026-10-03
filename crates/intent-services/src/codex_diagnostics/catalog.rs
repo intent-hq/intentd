@@ -261,7 +261,17 @@ impl CodexLaunch {
         if matches!(self.selection(), ProviderLaunch::Managed { .. }) {
             // Explicit launch may install even if it never reaches the capture
             // hook. Do not reuse the offline reason claiming nothing installed.
-            inspection = self.unknown(UnknownReason::PackageUnreadable);
+            let mut unknown = self.unknown(UnknownReason::PackageUnreadable);
+            // Installed runtime identity is independent of npm materialization.
+            // An adapter failure must not erase it or suppress the raw probe.
+            if self.installed.is_some() {
+                unknown.runtime = inspection.runtime;
+                unknown.report.runtime_path = inspection.report.runtime_path;
+                unknown.report.runtime_source = inspection.report.runtime_source;
+                unknown.report.runtime_version = inspection.report.runtime_version;
+                unknown.report.removes_codex_overrides = inspection.report.removes_codex_overrides;
+            }
+            inspection = unknown;
         }
 
         let acp_deadline = tokio::time::Instant::now() + limits.timeout;
@@ -270,7 +280,7 @@ impl CodexLaunch {
             .unwrap_or(Err(CatalogFailure::TimedOut));
         let mut guard = None;
         let acp = match started {
-            Ok((mut process, home)) => {
+            Ok((mut process, home, version)) => {
                 let cwd = home.clone();
                 let auth_ref = &auth;
                 let remaining = acp_deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -324,6 +334,9 @@ impl CodexLaunch {
                         }
                     }
                 }
+                if let Some(version) = version {
+                    inspection.report.runtime_version = version;
+                }
                 guard = Some(process);
                 result
             }
@@ -334,6 +347,7 @@ impl CodexLaunch {
                 self.raw_catalog(
                     runtime.command(),
                     &mut auth,
+                    &mut inspection.report.runtime_version,
                     limits,
                     guard
                         .as_ref()
@@ -366,7 +380,14 @@ impl CodexLaunch {
     async fn start_acp(
         &self,
         auth: &Authentication,
-    ) -> Result<(ProbeProcess, std::path::PathBuf), CatalogFailure> {
+    ) -> Result<
+        (
+            ProbeProcess,
+            std::path::PathBuf,
+            Option<super::VersionMeasurement>,
+        ),
+        CatalogFailure,
+    > {
         super::process::ensure_supported()?;
         let home = auth.home().await?;
         let path = home.path().to_owned();
@@ -402,18 +423,58 @@ impl CodexLaunch {
                 )
                 .env("INTENT_CODEX_ENTRY", path.join("entry.json"));
         }
+        let (command, home, version) = self.validate_installed_command(command, home).await?;
         Ok((
             ProbeProcess::spawn(command, home)
                 .await
                 .map_err(CatalogFailure::from)?,
             path,
+            version,
         ))
+    }
+
+    async fn validate_installed_command(
+        &self,
+        command: Command,
+        home: tempfile::TempDir,
+    ) -> Result<
+        (
+            Command,
+            tempfile::TempDir,
+            Option<super::VersionMeasurement>,
+        ),
+        CatalogFailure,
+    > {
+        let Some(context) = self.installed.clone() else {
+            return Ok((command, home, None));
+        };
+        // Keep the isolated profile alive through bounded version cleanup even
+        // when the outer diagnostic deadline cancels its caller.
+        intent_core::caller::spawn_with_current_caller(async move {
+            let home = std::sync::Arc::new(home);
+            let dependency = ProbeDependency::hold(home.clone());
+            let (_, version) = context
+                .observe_with_dependency(&command, Some(dependency))
+                .await
+                .map_err(|_| CatalogFailure::RuntimeUnverified)?;
+            let measured = super::parse_version(version.as_bytes(), super::VersionKind::Runtime)
+                .map_or(
+                    super::VersionMeasurement::Unknown(UnknownReason::InvalidVersion),
+                    super::VersionMeasurement::Measured,
+                );
+            let home =
+                std::sync::Arc::try_unwrap(home).map_err(|_| CatalogFailure::RuntimeUnverified)?;
+            Ok((command, home, Some(measured)))
+        })
+        .await
+        .map_err(|_| CatalogFailure::RuntimeUnverified)?
     }
 
     async fn raw_catalog(
         &self,
         mut command: Command,
         auth: &mut Authentication,
+        runtime_version: &mut super::VersionMeasurement,
         limits: Limits,
         dependency: Option<ProbeDependency>,
     ) -> Result<Catalog, CatalogFailure> {
@@ -425,6 +486,10 @@ impl CodexLaunch {
         auth.isolate(&mut command, self, home.path());
         // app-server defaults to newline-delimited stdio; no thread/turn is created.
         command.arg("app-server");
+        let (command, home, version) = self.validate_installed_command(command, home).await?;
+        if let Some(version) = version {
+            *runtime_version = version;
+        }
         let mut guard = tokio::time::timeout_at(
             deadline,
             ProbeProcess::spawn_with_dependency(command, home, dependency),

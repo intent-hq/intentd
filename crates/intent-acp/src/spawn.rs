@@ -657,12 +657,11 @@ fn build_command_in(
         cmd.env(key, value);
     }
 
-    // Every Codex launch uses the vendored adapter. Enforce both denial
-    // settings after every env merge so user/captured overrides cannot enable
-    // V2 or select an incompatible Codex executable. The adapter applies this
-    // config on each thread start and resume; Intent's MCP tools are unchanged.
+    // Enforce both native-subagent denial settings after every env merge.
+    // The services launch boundary selects the installed executable on this
+    // prepared command before version validation and spawning. The vendored adapter
+    // applies this config on thread start and resume.
     if opts.provider.id == "codex" {
-        cmd.env_remove("CODEX_PATH");
         cmd.env("CODEX_CONFIG", CODEX_SUBAGENT_POLICY_CONFIG);
         tracing::debug!(
             mechanism = "CODEX_CONFIG",
@@ -778,22 +777,23 @@ impl SpawnedAgent {
     }
 }
 
-/// Spawn the provider and wire up its [`Connection`] (§6.2 + §6.3).
-///
+/// A fully assembled launch; callers may validate its exact environment and cwd
+/// before spawning. The neutral directory remains owned through process cleanup.
+pub struct PreparedProvider {
+    pub command: Command,
+    npx_launch_dir: Option<NpxLaunchDir>,
+}
+
+/// Build a launch without starting a process.
 /// # Errors
-///
-/// Returns [`AcpError::ProviderNotFound`] when the spawn failed with `ENOENT`
-/// and the launched program is established to be missing (see
-/// [`classify_not_found`]), naming the launch tier that was missing, and
-/// [`AcpError::Spawn`] for every other spawn failure, when the neutral npx
-/// launch directory cannot be created, or when the stdio pipes cannot be
-/// taken.
-pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
+/// Returns a spawn error when the neutral directory or vendored adapter
+/// cannot be written.
+pub fn prepare_provider(opts: &SpawnOptions) -> AcpResult<PreparedProvider> {
     let nice_increment = agent_nice();
-    let (launch, target) = opts.launch_target();
+    let (_, target) = opts.launch_target();
     let command_name = target.to_string_lossy().into_owned();
-    // An npx launch starts in a fresh neutral directory, never the workspace
-    // (intent-hq/intent#5738); the workspace remains the ACP session cwd.
+    // npx and the vendored adapter start in a fresh private directory, never
+    // the workspace (intent-hq/intent#5738); the workspace remains the ACP cwd.
     let npx_launch_dir = if opts.via_npx() || opts.via_bundled_codex() {
         Some(NpxLaunchDir::create(opts.npx_launch_root).map_err(|e| {
             AcpError::Spawn(format!(
@@ -808,7 +808,39 @@ pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<
         intent_providers::codex::write_adapter(directory)
             .map_err(|e| AcpError::Spawn(format!("cannot prepare vendored Codex ACP: {e}")))?;
     }
-    let mut cmd = build_command_in(opts, captured_credential_env(), nice_increment, launch_cwd);
+    let command = build_command_in(opts, captured_credential_env(), nice_increment, launch_cwd);
+    Ok(PreparedProvider {
+        command,
+        npx_launch_dir,
+    })
+}
+
+/// Prepare and spawn a provider.
+/// # Errors
+/// Returns [`AcpError::ProviderNotFound`] when the launched program is
+/// established to be missing (see [`classify_not_found`]), naming its launch
+/// tier. Other directory, process, or stdio failures return [`AcpError::Spawn`].
+pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
+    spawn_prepared_provider(opts, prepare_provider(opts)?, hooks)
+}
+
+/// Spawn a previously validated launch without rebuilding its environment.
+/// # Errors
+/// Returns process/stdio setup failures, like `spawn_provider`.
+pub fn spawn_prepared_provider(
+    opts: &SpawnOptions,
+    prepared: PreparedProvider,
+    hooks: ConnectionHooks,
+) -> AcpResult<SpawnedAgent> {
+    let PreparedProvider {
+        command: mut cmd,
+        npx_launch_dir,
+    } = prepared;
+    #[cfg(unix)]
+    let nice_increment = agent_nice();
+    let (launch, target) = opts.launch_target();
+    let command_name = target.to_string_lossy().into_owned();
+    let launch_cwd = npx_launch_dir.as_ref().map(NpxLaunchDir::path);
     let process_cwd = process_cwd(opts, launch_cwd);
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -1461,6 +1493,41 @@ mod build_command_tests {
             .any(|arg| arg == "-c" || arg == "-y"));
     }
 
+    #[test]
+    fn prepare_bundled_codex_writes_adapter_and_owns_its_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        opts.bundled_codex_node = Some(Path::new("/runtime/node"));
+        opts.npx_launch_root = Some(root.path());
+        opts.cwd = Some(root.path());
+        let mut prepared = prepare_provider(&opts).unwrap();
+        let directory = prepared
+            .command
+            .as_std()
+            .get_current_dir()
+            .unwrap()
+            .to_owned();
+        assert_ne!(directory, root.path());
+        assert_eq!(directory.parent(), Some(root.path()));
+        assert_eq!(
+            prepared.command.as_std().get_args().next(),
+            Some(directory.join("codex-acp.mjs").as_os_str())
+        );
+        for asset in ["codex-acp.mjs", "LICENSE", "THIRD_PARTY_LICENSES"] {
+            assert!(std::fs::metadata(directory.join(asset)).unwrap().len() > 0);
+        }
+        // InstalledContext can finalize the selected runtime on this command
+        // while the adapter assets remain alive until process cleanup.
+        prepared.command.env("CODEX_PATH", "/selected/codex");
+        assert_eq!(
+            env_value(&prepared.command, "CODEX_PATH").as_deref(),
+            Some("/selected/codex")
+        );
+        drop(prepared);
+        assert!(!directory.exists());
+    }
+
     /// Whether `cmd` explicitly removes `key` from the child's inherited env
     /// (`get_envs()` yields `(key, None)` for `env_remove` entries).
     fn env_removed(cmd: &Command, key: &str) -> bool {
@@ -1571,17 +1638,35 @@ mod build_command_tests {
     }
 
     #[test]
+    fn installed_cli_regression_preserves_selected_codex_path() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        opts.bundled_codex_node = Some(Path::new("/runtime/node"));
+        opts.extra_env
+            .insert("CODEX_PATH".into(), "/selected/codex".into());
+        let cmd = build_command(&opts);
+        assert_eq!(
+            env_value(&cmd, "CODEX_PATH"),
+            Some("/selected/codex".into())
+        );
+        assert_eq!(
+            env_value(&cmd, "CODEX_CONFIG"),
+            Some(CODEX_SUBAGENT_POLICY_CONFIG.into())
+        );
+    }
+
+    #[test]
     fn build_command_sets_codex_subagent_policy_on_bundled_adapter_spawn() {
-        // The vendored adapter is daemon-managed: a stray CODEX_PATH /
-        // CODEX_CONFIG in the daemon env must not redirect the adapter (#555).
+        // The vendored adapter uses daemon-owned CODEX_CONFIG, while the
+        // services boundary selects CODEX_PATH on the prepared command.
         let provider = intent_providers::find_provider("codex").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/node");
         opts.bundled_codex_node = Some(&npx_path);
         let cmd = build_command(&opts);
         assert!(
-            env_removed(&cmd, "CODEX_PATH"),
-            "vendored Codex spawn must remove CODEX_PATH from the child env"
+            !env_removed(&cmd, "CODEX_PATH"),
+            "command assembly must preserve the selected installed runtime"
         );
         let config = env_value(&cmd, "CODEX_CONFIG")
             .expect("vendored Codex spawn must set daemon-owned CODEX_CONFIG");
@@ -1649,8 +1734,8 @@ mod build_command_tests {
 
     /// intent-hq/intent#5738: a workspace selector reaching the npx bootstrap
     /// from any env source — here the explicit `extra_env` merged last — is
-    /// removed from the child env on both npx tiers (npx-only claude-code,
-    /// codex), while unrelated npm settings merged alongside it stay.
+    /// removed from the child env for npx-only claude-code and pi, while
+    /// unrelated npm settings merged alongside it stay.
     #[test]
     fn build_command_strips_npm_workspace_selectors_on_npx_spawns() {
         let npx_path = PathBuf::from("/usr/local/bin/npx");
@@ -1836,7 +1921,7 @@ mod captured_env_tests {
     #[test]
     fn codex_subagent_policy_overrides_captured_and_extra_env_on_bundled_adapter() {
         // The daemon policy runs after every env merge, replacing arbitrary
-        // CODEX_CONFIG and keeping CODEX_PATH removed (#555).
+        // CODEX_CONFIG; installed runtime selection follows on the prepared launch.
         let provider = intent_providers::find_provider("codex").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/node");
@@ -1864,8 +1949,8 @@ mod captured_env_tests {
             assert!(
                 cmd.as_std()
                     .get_envs()
-                    .any(|(k, v)| k == "CODEX_PATH" && v.is_none()),
-                "CODEX_PATH must stay removed for {source} env"
+                    .any(|(k, v)| k == "CODEX_PATH" && v.is_some()),
+                "runtime selection is finalized on the prepared launch for {source} env"
             );
             let config = env_value(&cmd, "CODEX_CONFIG")
                 .expect("pinned adapter must set the daemon-owned subagent policy");

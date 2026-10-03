@@ -365,7 +365,7 @@ async fn annotate_unblocked_hints(
     }
 }
 
-/// Combined provider prompt for a batch flush (`agents.flushQueuedMessages`):
+/// Combined provider prompt for a batch flush:
 /// a header naming the flushed count, then each entry's content under a
 /// `Message #N:` label in delivery order. Entry contents already carry their
 /// per-entry [`dequeue_wait_note`] (and any #576 stale-redrive note), so each
@@ -3432,8 +3432,34 @@ impl AgentManager {
                 "info",
             )
             .await;
-        let spawned = spawn_provider(&spawn_opts, hooks)
-            .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
+        let spawned = if let Some(cli) =
+            intent_providers::installed_cli::InstalledCli::for_provider(spawn_opts.provider.id)
+        {
+            let context = crate::installed_cli::InstalledContext::discover(cli)
+                .await
+                .map_err(Error::InvalidInput)?;
+            let mut prepared = intent_acp::spawn::prepare_provider(&spawn_opts)
+                .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
+            context.apply(&mut prepared.command);
+            let prepared = intent_core::caller::spawn_with_current_caller(async move {
+                let prepared = Arc::new(prepared);
+                let dependency =
+                    crate::codex_diagnostics::process::ProbeDependency::hold(prepared.clone());
+                context
+                    .observe_with_dependency(&prepared.command, Some(dependency))
+                    .await
+                    .map_err(Error::InvalidInput)?;
+                Arc::try_unwrap(prepared).map_err(|_| {
+                    Error::Internal("installed CLI cleanup still owns the launch directory".into())
+                })
+            })
+            .await
+            .map_err(|_| Error::Internal("installed CLI preparation task failed".into()))??;
+            intent_acp::spawn::spawn_prepared_provider(&spawn_opts, prepared, hooks)
+        } else {
+            spawn_provider(&spawn_opts, hooks)
+        }
+        .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
         let (child, connection, npx_launch_dir) = spawned.into_parts();
         // Pin the spawned child's pid for the exit watcher armed below: the
         // watcher stands down when the handle's child no longer matches it
@@ -6939,9 +6965,7 @@ impl AgentManager {
         // auto-unarchives at the single existing choke point, and the batch
         // flush delivers the parked entries FIFO in the SAME combined turn
         // as this user message with the trailing unarchive prompt notice.
-        // Requires the `all` flush mode (without batching no combined turn
-        // exists to carry the parked entries), skipped when nothing is
-        // parked (the common
+        // Skipped when nothing is parked (the common
         // direct-send path is untouched), and skipped for a session parked
         // in `Error`, whose documented recovery IS the direct fresh send
         // (the STAB-52 gate in `try_drain_queue` would strand a converted
@@ -6951,8 +6975,6 @@ impl AgentManager {
         if options.origin.is_user()
             && session.status != AgentStatus::Error
             && !workspace_id.is_chief()
-            && self.services.flush_queued_messages_mode()
-                == intent_core::FlushQueuedMessagesMode::All
             && self.services.has_ready_to_send(&agent_id)
             && matches!(
                 self.services.store.get_workspace(&workspace_id).await,
@@ -7229,7 +7251,7 @@ impl AgentManager {
     /// will start a turn, so it runs alone, exactly like the direct
     /// Error-redrive arm of `send_message`, rather than whatever the generic
     /// drain would pick (a terminal-failure requeue sits at the queue FRONT;
-    /// under `flushQueuedMessages = off`/`systemOnly` the head pop would
+    /// without batching the head pop would
     /// retry the failed entry instead and leave the recovery send parked).
     /// The marker is only PEEKED here: the drain claims it atomically with
     /// the in-flight slot and the entry pop
@@ -7488,19 +7510,17 @@ impl AgentManager {
                 return;
             };
             admission = claimed;
-            // Batch flush (`agents.flushQueuedMessages`, default `all`): with
-            // a batching mode and MORE THAN ONE eligible entry waiting, drain
+            // Batch flush: with MORE THAN ONE eligible entry waiting, drain
             // them all into ONE combined provider turn while persisting each
             // entry as its own transcript row. Under an archived-workspace
             // exemption (`archived_drain`) the flush fires only because a
             // user-origin entry is ready — the parked automatic entries ride
             // its combined turn FIFO instead of being bypassed
-            // (intent-hq/intent#3883). A single eligible entry (or the `off`
-            // mode) falls through to the existing single-entry path unchanged.
-            let mode = self.services.flush_queued_messages_mode();
+            // (intent-hq/intent#3883). A single eligible entry falls through
+            // to the existing single-entry path unchanged.
             if let Some((batch, draining)) =
                 self.services
-                    .dequeue_flush_batch_draining(&agent_id, mode, archived_drain, 2)
+                    .dequeue_ready_batch_draining(&agent_id, archived_drain, 2)
             {
                 match self
                     .prepare_admitted_flush_turn(
@@ -7932,6 +7952,85 @@ impl AgentManager {
             "messageId": entry_id,
             "turnId": turn_id,
         }))
+    }
+
+    /// Send exactly the caller's ready snapshot as one interrupt-priority turn.
+    pub(crate) async fn send_queued_messages_now(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        message_ids: Vec<String>,
+    ) -> Result<Value> {
+        self.services
+            .discard_revoked_instructions(&agent_id)
+            .await?;
+        let session = self.services.require_agent_session(&agent_id).await?;
+        let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
+        let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
+        let gate = self.services.queue_entry_gate(&agent_id, false).await?;
+        self.services.park_queue_mutation_gate(gate.as_ref()).await;
+        let quarantined = self.services.session_poisoned(&session);
+        let (mut entries, draining) = self.services.take_queued_messages_draining_gated(
+            &agent_id,
+            &message_ids,
+            gate.as_ref(),
+            !quarantined,
+        )?;
+        let ids: Vec<_> = entries.iter().map(|m| m.id.clone()).collect();
+        if quarantined {
+            return Ok(json!({"success":true,"queued":true,"quarantined":true,"messageIds":ids}));
+        }
+        let draining = draining.expect("a non-quarantined selection owns its draining guard");
+        let mut interrupt = TurnOptions {
+            origin: intent_core::MessageOrigin::User,
+            interrupt_priority: true,
+            ..TurnOptions::default()
+        };
+        self.preempt_busy_turn(&agent_id, &mut interrupt).await;
+        // Keep the preempted zero-output payload on an entry, so both a lost
+        // slot and a partial persist failure retain it for the retry batch.
+        let last = entries.last_mut().expect("selection is nonempty");
+        merge_prepend_payload(
+            &mut last.prepend_content,
+            &mut last.prepend_image_blocks,
+            &mut last.prepend_file_blocks,
+            crate::agent_ops::QueuedPrepend {
+                content: interrupt.prepend_content,
+                image_blocks: interrupt.prepend_image_blocks,
+                file_blocks: interrupt.prepend_file_blocks,
+            },
+        );
+        let Some(admission) = self.try_begin_turn(&agent_id, &workspace_id).await else {
+            self.services.requeue_front_batch(&agent_id, entries);
+            drop(draining);
+            self.services.publish_queue_updated(&agent_id).await;
+            self.redrive_parked_recovery_send(&agent_id, &workspace_id)
+                .await;
+            return Ok(json!({"success":true,"queued":true,"messageIds":ids}));
+        };
+        self.services
+            .commit_provisional_queue_delivery(&agent_id, &entries);
+        match self
+            .prepare_admitted_flush_turn(&agent_id, &workspace_id, entries, draining, admission)
+            .await
+        {
+            FlushPrep::Turn {
+                content,
+                mut options,
+            } => {
+                // The action is human initiated, but each entry keeps its own
+                // captured provenance, including automatic messages.
+                options.origin = intent_core::MessageOrigin::User;
+                options.interrupt_priority = true;
+                let turn_id = options.turn_id.clone();
+                self.spawn_worker(agent_id, workspace_id, content, *options, true, admission);
+                Ok(json!({"success":true,"queued":false,"messageIds":ids,"turnId":turn_id}))
+            }
+            FlushPrep::Parked => {
+                self.finish_admission(&agent_id, admission, false).await;
+                Ok(json!({"success":true,"queued":true,"messageIds":ids}))
+            }
+        }
     }
 
     /// `agent.editAndRegenerate` runtime path (§5.5): edit a past user message
@@ -11642,26 +11741,13 @@ fn dequeue_worker_raced_tail(
     services: &Services,
     agent_id: &AgentId,
     next: &QueuedMessage,
-    mode: intent_core::FlushQueuedMessagesMode,
 ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
     // The head was popped before the slot reclaim, so queue selectors can no
     // longer see its monitor identity. Never attach unrelated work to its wake.
     if crate::script_monitor::monitor_id(next.message_metadata.as_ref()).is_some() {
         return None;
     }
-    match mode {
-        intent_core::FlushQueuedMessagesMode::All => {
-            services.dequeue_ready_batch_draining(agent_id, false, 1)
-        }
-        intent_core::FlushQueuedMessagesMode::SystemOnly => {
-            if next.user_origin {
-                None
-            } else {
-                services.dequeue_system_only_batch_draining(agent_id, 1)
-            }
-        }
-        intent_core::FlushQueuedMessagesMode::Off => None,
-    }
+    services.dequeue_ready_batch_draining(agent_id, false, 1)
 }
 
 /// Background turn worker: drive the current message to completion, then drain
@@ -12341,15 +12427,14 @@ async fn run_message_worker(
         }
         #[cfg(test)]
         mgr.services.queue_drain_commit_pause.pause().await;
-        // Batch flush (`agents.flushQueuedMessages`): same contract as the
+        // Batch flush: same contract as the
         // `try_drain_queue` flush arm — ≥2 ready entries drain into one
         // combined provider turn; otherwise the single-entry arm below runs
         // unchanged.
         {
-            let mode = mgr.services.flush_queued_messages_mode();
             if let Some((batch, draining)) = mgr
                 .services
-                .dequeue_flush_batch_draining(&agent_id, mode, false, 2)
+                .dequeue_ready_batch_draining(&agent_id, false, 2)
             {
                 match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch, draining).await {
                     FlushPrep::Turn {
@@ -12554,17 +12639,9 @@ async fn run_message_worker(
                 .commit_provisional_queue_delivery(&agent_id, &raced);
             let mut next = raced.pop().expect("raced batch non-empty");
             let mut draining = raced_draining.take().expect("raced batch guard");
-            // Batch flush (`agents.flushQueuedMessages`): the single `next`
-            // was popped before the slot re-claim, so fold any FURTHER
-            // eligible entries in behind it and run them as one combined
-            // turn. Mode `all`: any further ready entry (min 1 more ⇒ ≥2
-            // total). Mode `systemOnly`: only when `next` is ITSELF
-            // system-origin — a user-origin `next` never batches under
-            // `systemOnly`, so it falls through to the single-entry path
-            // below unchanged. With no extra entry (or the `off` mode) the
-            // single-entry path below also runs unchanged.
-            let mode = mgr.services.flush_queued_messages_mode();
-            let extra_batch = dequeue_worker_raced_tail(&mgr.services, &agent_id, &next, mode);
+            // The first entry was popped before re-claiming the slot.
+            // Fold any further ready entries into the same provider turn.
+            let extra_batch = dequeue_worker_raced_tail(&mgr.services, &agent_id, &next);
             if let Some((mut batch, extra_draining)) = extra_batch {
                 batch.insert(0, next);
                 draining.merge(extra_draining);
@@ -12756,7 +12833,7 @@ enum FlushPrep {
     Parked,
 }
 
-/// Prepare a batch-flushed turn (`agents.flushQueuedMessages`, default on):
+/// Prepare a batch-flushed turn:
 /// the caller has already claimed the in-flight slot and batch-dequeued ≥2
 /// ready-to-send entries in drain order. This mirrors the single-entry drain
 /// sequence once per entry — stale-redrive (#576) + dequeue-wait annotation,
@@ -12869,7 +12946,10 @@ async fn prepare_flush_turn(
         let failed = entries.remove(i);
         let tail = entries.split_off(i);
         let head = entries;
-        let options = turn_options_for_entry(&failed, stale);
+        let options = TurnOptions {
+            flushed_entries: Some(vec![failed.clone()]),
+            ..turn_options_for_entry(&failed, stale)
+        };
         mgr.services.requeue_front_batch(agent_id, tail);
         let vanished =
             handle_drain_persist_failure(mgr, agent_id, workspace_id, &failed.content, &options)
@@ -13855,6 +13935,10 @@ async fn publish_error_status_and_requeue(
     // the retry correlates with the turn it redrives; a missing option (bare
     // test wiring — spawn_worker always mints one) falls back to the new id.
     //
+    // A failed pre-turn batch append also supplies its original failed
+    // entry through `flushed_entries`: retain its id and provenance so a
+    // send-all caller can retry the same snapshot without a phantom new row.
+    //
     // Context-size failure on an oversized entry (intent-hq/intent#4703): a
     // 413 against a payload above `CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS`
     // means the MESSAGE itself cannot fit, so re-queueing it verbatim would
@@ -13891,11 +13975,17 @@ async fn publish_error_status_and_requeue(
     if let Some(entries) = options
         .flushed_entries
         .as_ref()
-        .filter(|entries| context_size_failure && !entries.is_empty())
+        .filter(|entries| (context_size_failure || !persisted) && !entries.is_empty())
     {
         let restored: Vec<crate::agent_ops::QueuedMessage> = entries
             .iter()
             .map(|entry| {
+                if !context_size_failure {
+                    return crate::agent_ops::QueuedMessage {
+                        requeued_after_failure: true,
+                        ..entry.clone()
+                    };
+                }
                 let (content, persisted, prepend_content) = requeue_payload_after_context_failure(
                     agent_id,
                     &entry.content,
@@ -14817,27 +14907,35 @@ mod npx_launch_dir_lifetime_tests {
         }).await.unwrap();
         assert!(pid_alive(tree.grandchild));
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), shutdown)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!pid_alive(leader.cast_signed()));
-        assert!(!tree.launch_path.exists());
-        // Cleanup has issued the group kill and released its lease, but an
-        // orphaned descendant can remain signal-0-visible until init reaps it.
-        // Keep the shutdown/launch-dir assertions immediate; bound only the
-        // observation that the identified descendant's PID has disappeared.
         tokio::time::timeout(Duration::from_secs(10), async {
-            while pid_alive(tree.grandchild) {
+            shutdown.await.unwrap();
+            // These are synchronous shutdown postconditions: orphan-PID
+            // polling below must not hide delayed resource/registry cleanup.
+            assert!(!pid_alive(leader.cast_signed()));
+            assert!(
+                !pid_alive(tree.grandchild),
+                "grandchild {} alive after shutdown; launch_dir_exists={}",
+                tree.grandchild,
+                tree.launch_path.exists()
+            );
+            assert!(!tree.launch_path.exists());
+            // An aborted acquire skips its existing post-kill deregistration.
+            // Preserve that stale in-memory slot: late ID-only removal could
+            // erase a replacement runtime. The watcher deregisters first.
+            assert_eq!(mgr.registry.is_registered(&agent_id), !unexpected);
+            // Live descendants must be gone before shutdown returns. A dead
+            // orphan may still retain its PID until init reaps it; observe
+            // that retirement within the SAME total shutdown budget. Use
+            // signal 0 because pid_alive deliberately treats zombies as dead.
+            while nix::sys::signal::kill(nix::unistd::Pid::from_raw(tree.grandchild), None)
+                != Err(nix::errno::Errno::ESRCH)
+            {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("cleanup killed the descendant; its orphan PID must be reaped");
-        // An aborted acquire skips its existing post-kill deregistration.
-        // Preserve that stale in-memory slot: late ID-only removal could erase
-        // a replacement runtime. The exit watcher deregisters before cleanup.
-        assert_eq!(mgr.registry.is_registered(&agent_id), !unexpected);
+        .unwrap();
+        assert!(!pid_alive(tree.grandchild));
         svc.shutdown_store_writers().await;
         svc.event_bus.as_ref().unwrap().shutdown().await.unwrap();
         svc.store.close().await;
@@ -15054,7 +15152,59 @@ mod npx_launch_dir_lifetime_tests {
     }
 
     fn pid_alive(pid: i32) -> bool {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+        let signal_probe = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
+        if signal_probe.is_err() {
+            return false;
+        }
+        // kill(pid, 0) still succeeds for an exited child until its parent
+        // reaps it. Such a process cannot use the launch directory anymore.
+        // Keep unknown states conservative: a live/stopped process must still
+        // fail the lifetime assertions if cleanup removes its directory.
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            eprintln!(
+                "pid_alive({pid}): signal_probe={signal_probe:?}, stat={stat:?}, cwd={:?}, subsequent_stat={:?}",
+                std::fs::read_link(format!("/proc/{pid}/cwd")),
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            );
+            stat
+        } {
+            if matches!(
+                stat.rsplit_once(") ")
+                    .and_then(|(_, fields)| fields.split_whitespace().next()),
+                Some("Z" | "X")
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid_alive_distinguishes_live_stopped_and_unreaped_children() {
+        use nix::sys::signal::{kill, Signal};
+        use nix::sys::wait::{waitid, Id, WaitPidFlag};
+        use nix::unistd::Pid;
+
+        let mut child = intentd_test_support::GuardedChild::spawn(
+            std::process::Command::new("sleep").arg("300"),
+        )
+        .unwrap();
+        let pid = Pid::from_raw(child.id().cast_signed());
+        assert!(pid_alive(pid.as_raw()), "an executable process is alive");
+
+        kill(pid, Signal::SIGSTOP).unwrap();
+        waitid(Id::Pid(pid), WaitPidFlag::WSTOPPED | WaitPidFlag::WNOWAIT).unwrap();
+        assert!(pid_alive(pid.as_raw()), "a stopped process can resume");
+
+        child.kill().unwrap();
+        // Observe exit without reaping, deterministically retaining a zombie.
+        waitid(Id::Pid(pid), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT).unwrap();
+        assert!(kill(pid, None).is_ok(), "the zombie still has a pid");
+        assert!(!pid_alive(pid.as_raw()), "a zombie cannot use its cwd");
+        child.wait().unwrap();
     }
 
     /// A leader whose cwd is `dir`: it starts a same-group grandchild that
@@ -19428,28 +19578,22 @@ mod provider_path_override_tests {
         s
     }
 
-    /// monorepo#4352: a valid `providers.paths["claude-code"]` override is
-    /// exec'd directly — the resolved spawn carries the override as
-    /// `provider_binary` and NO npx fallback, so `build_command` spawns the
-    /// override instead of `npx -y <pinned>`.
+    /// Legacy adapter paths must not split session and model-catalog sources.
     #[test]
-    fn claude_code_spawn_honors_valid_path_override() {
+    fn claude_code_spawn_ignores_legacy_path_override() {
+        if intent_providers::find_npx().is_none() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let adapter_stub = exec_stub(dir.path(), "claude-agent-acp-override");
         let settings = settings_with_paths(&[("claude-code", &adapter_stub)]);
-
         let resolved = resolve_spawn(&claude_code_session(), None, &settings, None).unwrap();
+        assert!(resolved.provider_binary.is_none());
+        assert!(resolved.npx_fallback_binary.is_some());
         assert_eq!(
-            resolved.provider_binary.as_deref(),
-            Some(adapter_stub.as_path()),
-            "a valid claude-code override must be the spawned binary"
+            resolved.npx_fallback_package,
+            Some(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
         );
-        assert_eq!(resolved.npx_fallback_binary, None);
-        assert_eq!(resolved.npx_fallback_package, None);
-        let mut opts = SpawnOptions::new(&resolved.provider);
-        opts.provider_binary = resolved.provider_binary.as_deref();
-        let cmd = intent_acp::spawn::build_command(&opts);
-        assert_eq!(cmd.as_std().get_program(), adapter_stub.as_os_str());
     }
 
     /// An invalid override (missing file) contributes nothing: claude-code
@@ -20182,10 +20326,7 @@ mod agent_retry_tests {
 
     #[intent_test_macros::daemon_test]
     async fn raced_monitor_head_never_consumes_ordinary_tail() {
-        for mode in [
-            intent_core::FlushQueuedMessagesMode::All,
-            intent_core::FlushQueuedMessagesMode::SystemOnly,
-        ] {
+        {
             for exporting in [false, true] {
                 let agent = AgentId::from("monitor-raced-owner");
                 let ws = WorkspaceId::from("monitor-raced-workspace");
@@ -20211,8 +20352,8 @@ mod agent_retry_tests {
                     intent_core::MessageOrigin::Automatic,
                 );
                 assert!(
-                    dequeue_worker_raced_tail(&mgr.services, &agent, &next, mode).is_none(),
-                    "popped monitor must not absorb ordinary entries: {mode:?}"
+                    dequeue_worker_raced_tail(&mgr.services, &agent, &next).is_none(),
+                    "popped monitor must not absorb ordinary entries"
                 );
                 assert!(mgr.services.is_message_queued(&agent, &tail.id));
                 drop(draining);

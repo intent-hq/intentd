@@ -14027,6 +14027,197 @@ fn assert_no_file_data(v: &Value, surface: &str) {
     }
 }
 
+/// Real TLS/WebSocket coverage for the chat-only five-row snapshot policy:
+/// fresh/stale/recent subscriptions, cursor continuation and invalidation reset.
+#[intent_test_macros::daemon_test]
+async fn five_message_chat_snapshots_and_invalidation_over_wss() {
+    use intent_core::{now_iso, AgentId, WorkspaceApi, WorkspaceId};
+    use intent_services::Services;
+    use intent_store::Store;
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let (ws_id, agent_id, ids) = {
+        let store = Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("store");
+        let ws_root = common::hermetic_workspaces_root();
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(common::registry_with_default_provider(ws_root.path()));
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace_seed(&ws))
+            .await
+            .expect("workspace");
+        let created = services
+            .agent_create(
+                ws.clone(),
+                Some("Five messages".into()),
+                None,
+                None,
+                None,
+                None,
+                intent_core::AgentCreateExtra::default(),
+            )
+            .await
+            .expect("agent");
+        let agent = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let mut ids = Vec::new();
+        for seq in 0..12 {
+            ids.push(
+                store
+                    .append_agent_message(
+                        &agent,
+                        "user",
+                        &json!([{ "type": "text", "text": format!("message {seq}") }]),
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("message")
+                    .id,
+            );
+        }
+        (ws.0, agent.0, ids)
+    };
+    let child = spawn_serve(&data_dir, "both", &[("INTENTD_AUTH_TOKEN", TOKEN)]);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    // Generic conversation paging keeps its existing default (all 12 here).
+    let generic = wss_rpc(
+        &mut rpc,
+        1,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(generic["messages"].as_array().unwrap().len(), 12);
+
+    for (since, expected_start, resumed) in [
+        (None, 7, None),
+        (Some(ids[3].as_str()), 7, Some(false)),
+        (Some(ids[9].as_str()), 10, Some(true)),
+    ] {
+        let mut chat = connect_ws(port, cfg.clone()).await;
+        let mut params = json!({ "agentId": agent_id });
+        if let Some(since) = since {
+            params["sinceMessageId"] = json!(since);
+        }
+        // Read the response envelope explicitly as well as the push envelope.
+        chat.send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": 10,
+            "method": "chat.subscribe", "params": params })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("subscribe");
+        let response: Value = loop {
+            let frame = timeout(Duration::from_secs(15), chat.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            match frame {
+                Message::Text(text) => break serde_json::from_str(&text).unwrap(),
+                Message::Ping(p) => chat.send(Message::Pong(p)).await.unwrap(),
+                other => panic!("unexpected subscribe response: {other:?}"),
+            }
+        };
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 10);
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(response["result"]["subscriptionId"].is_string());
+        let push = wss_push(&mut chat, 15).await;
+        assert_eq!(push["jsonrpc"], "2.0");
+        assert_eq!(
+            push["params"]["subscriptionId"],
+            response["result"]["subscriptionId"]
+        );
+        assert_eq!(push["params"]["kind"], "snapshot");
+        assert_eq!(push["params"]["seq"], 0);
+        let snapshot = &push["params"]["snapshot"];
+        let rows = snapshot["messages"].as_array().unwrap();
+        assert_eq!(rows.len(), 12 - expected_start);
+        for (row, expected_id) in rows.iter().zip(&ids[expected_start..]) {
+            assert_eq!(row["id"], expected_id.as_str());
+        }
+        assert_eq!(snapshot.get("resumed").and_then(Value::as_bool), resumed);
+        assert_eq!(snapshot["totalMessages"], 12);
+        assert_eq!(snapshot["truncated"], resumed != Some(true));
+        eprintln!(
+            "WSS five-message snapshot: resumed={resumed:?} rows={} bytes={}",
+            rows.len(),
+            serde_json::to_vec(snapshot).unwrap().len()
+        );
+        if resumed == Some(true) {
+            assert!(snapshot["nextToken"].is_null());
+        } else {
+            let older = wss_rpc(
+                &mut rpc,
+                11,
+                "agent.getConversation",
+                json!({
+                "workspaceId": ws_id, "agentId": agent_id, "limit": 5,
+                "nextToken": snapshot["nextToken"] }),
+            )
+            .await;
+            let older_rows = older["messages"].as_array().unwrap();
+            assert_eq!(older_rows.len(), 5);
+            for (row, expected_id) in older_rows.iter().zip(&ids[2..7]) {
+                assert_eq!(row["id"], expected_id.as_str());
+            }
+            let oldest = wss_rpc(
+                &mut rpc,
+                12,
+                "agent.getConversation",
+                json!({
+                "workspaceId": ws_id, "agentId": agent_id, "limit": 5,
+                "nextToken": older["nextToken"] }),
+            )
+            .await;
+            assert_eq!(oldest["messages"].as_array().unwrap().len(), 2);
+            assert_eq!(oldest["messages"][0]["id"], ids[0].as_str());
+            assert_eq!(oldest["messages"][1]["id"], ids[1].as_str());
+            assert!(oldest["nextToken"].is_null());
+        }
+        // An active recent-resume connection must reset to five on replacement.
+        if resumed == Some(true) {
+            let messages: Vec<Value> = (0..9)
+                .map(|seq| {
+                    json!({ "role": "user",
+                "contentBlocks": [{ "type": "text", "text": format!("replacement {seq}") }] })
+                })
+                .collect();
+            let replaced = wss_rpc(
+                &mut rpc,
+                13,
+                "agent.replaceMessages",
+                json!({
+                "workspaceId": ws_id, "agentId": agent_id, "messages": messages }),
+            )
+            .await;
+            assert_eq!(replaced["success"], true);
+            let reset = wss_push(&mut chat, 15).await;
+            assert_eq!(reset["params"]["kind"], "snapshot", "{reset}");
+            assert_eq!(reset["params"]["seq"], 1);
+            let snapshot = &reset["params"]["snapshot"];
+            assert_eq!(snapshot["resumed"], false);
+            assert_eq!(snapshot["totalMessages"], 9);
+            assert_eq!(snapshot["messages"].as_array().unwrap().len(), 5);
+            assert_eq!(snapshot["messages"][0]["seq"], 4);
+            assert_eq!(snapshot["messages"][4]["seq"], 8);
+            assert!(snapshot["nextToken"].is_string());
+        }
+        chat.close(None).await.expect("close chat");
+    }
+}
+
 /// Protocol 10.0 serve side over the real WSS wire: a legacy inline file
 /// block already persisted on a user row (`{ type: 'file', data, fileName }`
 /// with no `attachmentId`, written by a pre-10.0 daemon) is served as a
@@ -16696,18 +16887,20 @@ async fn usage_update_cost_captured_over_wss() {
 }
 
 /// Observe Codex's real child argv, including after an idle child is lost.
-/// Drive the selected npx package even when an explicit custom adapter and
-/// a PATH adapter are present. The fake npx captures the actual launch argv.
+/// Drive the vendored bundle even when an explicit custom adapter and a PATH
+/// adapter are present. The Node fixture captures the actual launch argv.
 async fn assert_codex_runtime_subagent_policy_over_wss(advertise_load: bool) {
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(script) = gate("WSS Codex selected npx subagent policy E2E") else {
+    let Some(script) = gate("WSS vendored Codex subagent policy E2E") else {
         return;
     };
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path();
     let ws_id = seed_workspace_only(data_dir).await;
     let toolchain = common::codex_runtime::install(data_dir, &script);
+    let selected_cli = std::path::absolute(data_dir.join("codex-toolchain/codex"))
+        .expect("absolute installed CLI fixture path");
     let wrapper = data_dir.join("fake-codex-acp");
     std::fs::write(
         &wrapper,
@@ -16717,7 +16910,7 @@ async fn assert_codex_runtime_subagent_policy_over_wss(advertise_load: bool) {
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
         .expect("chmod Codex wrapper");
     // A genuine native executable and a JS adapter must both lose to the
-    // selected package. The explicit custom path must also be ignored.
+    // vendored bundle. The explicit custom path must also be ignored.
     let installed = data_dir.join("codex-toolchain/codex-acp");
     if advertise_load {
         std::fs::write(&installed, "#!/usr/bin/env node\nprocess.exit(91);\n")
@@ -16731,7 +16924,7 @@ async fn assert_codex_runtime_subagent_policy_over_wss(advertise_load: bool) {
         data_dir.join("config.toml"),
         format!("[providers.paths]\ncodex = {}\n", json!(wrapper)),
     )
-    .expect("seed custom path that selected npx must ignore");
+    .expect("seed custom path that vendored Codex must ignore");
     let session_log = data_dir.join("sessions.jsonl");
     let behavior = json!({
         "response": "Codex policy turn complete",
@@ -16864,8 +17057,12 @@ async fn assert_codex_runtime_subagent_policy_over_wss(advertise_load: bool) {
         );
         assert_eq!(
             session["codexPolicy"],
-            json!({"config": {"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}, "pathPresent": false}),
-            "daemon policy must replace enabling environment on every launch: {session}"
+            json!({
+                "config": {"agents": {"enabled": false}, "features": {"multi_agent_v2": false}},
+                "pathPresent": true,
+                "codexPath": selected_cli,
+            }),
+            "each launch must replace hostile runtime overrides with the selected installed CLI and enforce daemon policy: {session}"
         );
         let pid = session["pid"].as_u64().expect("mock child pid");
         if turn == 0 {

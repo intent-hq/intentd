@@ -11,7 +11,8 @@
 //!
 //! Hermetic setup: the daemon child's `PATH` starts with a scratch `bin/`
 //! holding a fake `node` (a shim onto the host's node) and, beside it, a
-//! fake `npx` — the daemon pairs npx with the `node` it detects
+//! fake `npx`, plus a version-only canonical `claude` CLI. The daemon pairs
+//! npx with the `node` it detects
 //! (intent-hq/intent#5725), so the fake pair is what a shim-only `bin/`
 //! would not be: the selected toolchain. The fake `npx` answers the
 //! spawn-time `--version` probe like npm ≥ 7 and otherwise behaves like
@@ -345,6 +346,7 @@ if [ "$1" = --version ]; then
 fi
 printf '%s\n' "$PWD" >> '__REPORT__.cwd'
 printf '%s\n' "$*" >> '__REPORT__.args'
+printf '%s\n' "$CLAUDE_CODE_EXECUTABLE" >> '__REPORT__.runtime'
 no_ws=0
 for a in "$@"; do
   case "$a" in
@@ -393,6 +395,16 @@ exec '__NODE__' '__SCRIPT__'
 fn write_fake_npx(bin_dir: &Path, report: &Path, script: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let node = intent_providers::resolve_on_path("node").expect("node on PATH (gated)");
+    let cli = bin_dir.join("claude");
+    std::fs::write(
+        &cli,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}.cli'\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'claude 1.0.0\\n'\n",
+            report.display()
+        ),
+    )
+    .expect("write canonical Claude CLI");
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).expect("chmod CLI");
     let fake_node = bin_dir.join("node");
     std::fs::write(
         &fake_node,
@@ -456,7 +468,8 @@ async fn vendored_codex_adapter_refreshes_models_after_host_cli_upgrade() {
         std::fs::write(
             &codex,
             format!(
-                "#!/bin/sh\n[ \"$1\" = app-server ] || exit 17\n[ -z \"${{CODEX_PATH+x}}\" ] || exit 18\nexec '{}' '{}' app-server '{}'\n",
+                "#!/bin/sh\n[ \"$CODEX_PATH\" = \"$0\" ] || exit 18\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then printf 'codex-cli {}\\n'; exit 0; fi\n[ \"$1\" = app-server ] || exit 17\nexec '{}' '{}' app-server '{}'\n",
+                model,
                 node.display(),
                 mock.display(),
                 model
@@ -489,15 +502,22 @@ async fn vendored_codex_adapter_refreshes_models_after_host_cli_upgrade() {
     let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
     let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
     let mut rpc = connect_ws(port, cfg).await;
-    for (id, model) in [
-        (1, "host-original"),
-        (2, "host-original"),
-        (3, "host-upgraded-new"),
+    for (id, model, refresh) in [
+        (1, "host-original", false),
+        (2, "host-original", false),
+        (3, "host-original", false),
+        (4, "host-upgraded-new", true),
     ] {
         if id == 3 {
-            install(model);
+            install("host-upgraded-new");
         }
-        let result = wss_rpc(&mut rpc, id, "models.list", json!({"providerId": "codex"})).await;
+        let result = wss_rpc(
+            &mut rpc,
+            id,
+            "models.list",
+            json!({"providerId": "codex", "forceRefresh": refresh}),
+        )
+        .await;
         assert_eq!(result["source"], "codex", "{result}");
         assert_eq!(result["models"][0]["id"], model, "{result}");
         let launches = std::fs::read_to_string(&report).unwrap();
@@ -510,7 +530,7 @@ async fn vendored_codex_adapter_refreshes_models_after_host_cli_upgrade() {
                 .iter()
                 .filter(|call| call["method"] == "initialize")
                 .count(),
-            if id == 3 { 2 } else { 1 }
+            if refresh { 2 } else { 1 }
         );
         assert!(calls
             .iter()
@@ -597,7 +617,7 @@ async fn npx_launch_runs_outside_the_workspace_while_session_cwd_is_the_workspac
     // node/npx pair wins over any real install on the host.
     let path = format!("{}:/usr/bin:/bin", bin_dir.display());
     let behavior = json!({ "response": "NPX_ISOLATION_E2E_REPLY" }).to_string();
-    let env: [(&str, &str); 7] = [
+    let env: [(&str, &str); 8] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("PATH", path.as_str()),
         ("HOME", home_dir.to_str().unwrap()),
@@ -605,6 +625,7 @@ async fn npx_launch_runs_outside_the_workspace_while_session_cwd_is_the_workspac
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_SESSION_LOG", &session_log_s),
+        ("CLAUDE_CODE_EXECUTABLE", "/must-not-be-used/claude"),
     ];
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
@@ -703,6 +724,20 @@ async fn npx_launch_runs_outside_the_workspace_while_session_cwd_is_the_workspac
     let args = std::fs::read_to_string(format!("{}.args", report.display()))
         .expect("fake npx recorded its argv");
     let first_args = args.lines().next().expect("at least one npx launch");
+    let runtime = std::fs::read_to_string(format!("{}.runtime", report.display()))
+        .expect("fake npx recorded its selected CLI");
+    let selected_cli = bin_dir.join("claude");
+    assert_eq!(
+        runtime.lines().collect::<Vec<_>>(),
+        vec![selected_cli.to_str().expect("fixture CLI path"); args.lines().count()],
+        "every adapter launch must use the canonical CLI, not the inherited override"
+    );
+    let cli_calls = std::fs::read_to_string(format!("{}.cli", report.display()))
+        .expect("canonical CLI was checked before launch");
+    assert!(
+        !cli_calls.is_empty() && cli_calls.lines().all(|call| call == "--version"),
+        "canonical CLI fixture only serves bounded version checks: {cli_calls}"
+    );
     assert_eq!(
         first_args,
         format!(
