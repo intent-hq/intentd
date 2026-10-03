@@ -765,6 +765,13 @@ fn success(value: &Value) -> &Value {
 }
 fn git(path: &std::path::Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
+        // Keep automatic maintenance within the original owned command's wait.
+        .args([
+            "-c",
+            "maintenance.autoDetach=false",
+            "-c",
+            "gc.autoDetach=false",
+        ])
         .arg("-C")
         .arg(path)
         .args(args)
