@@ -2115,6 +2115,33 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Queue a prepared submission with a caller identity. Legacy implementors
+    /// continue to support requests which omit the optional identity.
+    fn agent_queue_submission(
+        &self,
+        agent_id: AgentId,
+        message_id: Option<String>,
+        content: String,
+        image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        if message_id.is_some() {
+            return Box::pin(async {
+                Err(Error::Unsupported(
+                    "submission correlation is unavailable".into(),
+                ))
+            });
+        }
+        self.agent_queue_message(
+            agent_id,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+        )
+    }
+
     /// `agent.editQueuedMessage`: edit a queued message's content (PROTOCOL §5.5).
     /// `editing` (optional) toggles the entry's under-edit state — when `Some(true)`
     /// the entry is excluded from the ready-to-send queue (drain skips it); when

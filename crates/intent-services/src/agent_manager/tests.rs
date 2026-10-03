@@ -7033,7 +7033,7 @@ async fn context_size_requeue_replaces_oversized_entry_with_marker() {
     assert_eq!(queued.queued_at, "2026-01-01T00:00:00Z");
     assert_eq!(
         queued.message_metadata,
-        Some(json!({"type": "hook_dispatch"}))
+        Some(json!({"type": "hook_dispatch", "submissionIds": [queued.id]}))
     );
     assert!(queued.interrupt_priority);
     // Wire shape (`agent.getQueue`) shows the marker as a failure requeue.
@@ -7280,6 +7280,8 @@ fn flush_entry(suffix: &str, content: String) -> crate::agent_ops::QueuedMessage
         hold_until: None,
         child_agent_id: None,
         merged_submission_ids: Vec::new(),
+        recovery_sources: Vec::new(),
+        correlation_order_known: true,
         edit_appended: String::new(),
         edit_prepended: String::new(),
         editing_message_id: None,
@@ -15338,6 +15340,8 @@ async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
         hold_until: None,
         child_agent_id: None,
         merged_submission_ids: Vec::new(),
+        recovery_sources: Vec::new(),
+        correlation_order_known: true,
         edit_appended: String::new(),
         edit_prepended: String::new(),
         editing_message_id: None,
@@ -19071,6 +19075,8 @@ mod stale_redrive_tests {
             hold_until: None,
             child_agent_id: None,
             merged_submission_ids: Vec::new(),
+            recovery_sources: Vec::new(),
+            correlation_order_known: true,
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
@@ -19527,6 +19533,8 @@ mod dequeue_wait_tests {
             hold_until: None,
             child_agent_id: None,
             merged_submission_ids: Vec::new(),
+            recovery_sources: Vec::new(),
+            correlation_order_known: true,
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
@@ -20101,7 +20109,9 @@ mod queued_message_id_stamp_tests {
         super::super::stamp_queued_message_id(&mut msg);
         assert_eq!(
             msg.message_metadata,
-            Some(json!({ "queueInfo": { "queuedMessageId": "qm-wait-test" } })),
+            Some(
+                json!({ "submissionIds": ["qm-wait-test"], "queueInfo": { "queuedMessageId": "qm-wait-test" } })
+            ),
             "queueInfo carries ONLY the identity link"
         );
     }
@@ -20152,6 +20162,7 @@ mod queued_message_id_stamp_tests {
             Some(json!({
                 "type": "question_answers",
                 "answeredQuestionsMessageId": "msg-asked",
+                "submissionIds": ["qm-wait-test"],
                 "queueInfo": { "queuedMessageId": "qm-wait-test" },
             })),
             "caller keys untouched, queueInfo added"
@@ -20175,12 +20186,13 @@ mod queued_message_id_stamp_tests {
     }
 
     #[test]
-    fn persisted_requeue_is_never_stamped() {
+    fn persisted_requeue_keeps_correlation_without_a_new_queue_link() {
         let mut msg = queued_msg("already durable", &iso_secs_ago(60), true);
         super::super::stamp_queued_message_id(&mut msg);
         assert_eq!(
-            msg.message_metadata, None,
-            "persisted rows are never rewritten"
+            msg.message_metadata,
+            Some(json!({"submissionIds": ["qm-wait-test"]})),
+            "retry payload retains correlation without changing the durable transcript"
         );
     }
 
@@ -20194,7 +20206,9 @@ mod queued_message_id_stamp_tests {
         super::super::stamp_queued_message_id(&mut msg);
         assert_eq!(
             msg.message_metadata,
-            Some(json!({ "queueInfo": { "queuedMessageId": "qm-wait-test" } }))
+            Some(
+                json!({ "submissionIds": ["qm-wait-test"], "queueInfo": { "queuedMessageId": "qm-wait-test" } })
+            )
         );
         for odd in [json!(7), Value::Null, json!("x"), json!([1])] {
             let mut msg = queued_msg("odd", &iso_secs_ago(60), false);
@@ -20204,7 +20218,8 @@ mod queued_message_id_stamp_tests {
                 msg.message_metadata,
                 Some(json!({
                     "keep": true,
-                    "queueInfo": { "queuedMessageId": "qm-wait-test" },
+                    "submissionIds": ["qm-wait-test"],
+                "queueInfo": { "queuedMessageId": "qm-wait-test" },
                 })),
                 "caller keys kept, reserved queueInfo replaced"
             );
@@ -23503,6 +23518,8 @@ mod flush_queued_messages_tests {
             hold_until: None,
             child_agent_id: None,
             merged_submission_ids: Vec::new(),
+            recovery_sources: Vec::new(),
+            correlation_order_known: true,
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
@@ -25881,4 +25898,194 @@ async fn queue_processing_payload_ordinary_drain_retains_recovered_merged_contri
         queued["messageMetadata"]["mergedMessageMetadata"]
     );
     assert_eq!(rows[0]["author"]["principalId"], owner.0);
+}
+
+#[tokio::test]
+async fn submission_correlation_mixed_recovery_survives_restart_and_repeated_failure() {
+    let (tmp, mgr, bus) = manager_with_bus().await;
+    let ws = WorkspaceId::from("ws-correlation");
+    let id = AgentId::from("a-correlation");
+    seed_agent(&mgr, &ws, &id).await;
+    for (mid, principal, origin) in [
+        ("a1", Some("a"), MessageOrigin::User),
+        ("a2", Some("a"), MessageOrigin::User),
+        ("b1", Some("b"), MessageOrigin::User),
+        ("wake", Some("c"), MessageOrigin::Automatic),
+        ("system", None, MessageOrigin::Automatic),
+    ] {
+        mgr.services.enqueue_message_with_id(
+            &id,
+            Some(mid.into()),
+            "identical".into(),
+            None,
+            None,
+            Some(principal.map_or_else(
+                || json!({"source":"system"}),
+                |p| json!({"fromPrincipalId":p}),
+            )),
+            None,
+            false,
+            origin,
+        );
+    }
+    let mut batch = Vec::new();
+    while let Some(entry) = mgr.services.dequeue_message(&id) {
+        batch.push(entry);
+    }
+    assert_eq!(batch.len(), 4);
+    let (_, mut restored) = flush_then_fail(&mgr, &ws, &id, batch, "ordinary failure").await;
+    assert_eq!(restored.len(), 1);
+    let retry = restored.remove(0);
+    let sources = retry.recovery_sources.clone();
+    assert_eq!(sources.len(), 4);
+    assert_eq!(sources[0].author["principalId"], "a");
+    assert_eq!(sources[1].author["principalId"], "b");
+    assert_eq!(sources[2].author["principalId"], "c");
+    assert_eq!(sources[3].author, Value::Null);
+    assert_eq!(sources[2].origin, MessageOrigin::Automatic);
+    assert_eq!(
+        sources[0].submission_ids,
+        Some(vec!["a2".into(), "a1".into()])
+    );
+    assert!(retry.to_value(0).get("submissionIds").is_none());
+    let first_history = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(first_history.iter().filter(|m| m.role == "user").count(), 4);
+    mgr.services.requeue_front(&id, retry);
+    mgr.services.persist_queue_snapshot(&id).await;
+    bus.shutdown().await.unwrap();
+    mgr.services.store.close().await;
+    drop(mgr);
+    let store = Store::open(&tmp.path).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let services = Services::new_with_file_secrets(
+        store,
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
+    )
+    .with_event_bus(bus.clone());
+    let restarted = AgentManager::new(services, Arc::new(BusEventSink::new(bus.clone())), 8);
+    assert_eq!(
+        restarted.services.rehydrate_agent_queues().await.unwrap(),
+        1
+    );
+    let snapshot = restarted.services.queue_snapshot(&id);
+    assert_eq!(snapshot[0]["recoverySources"], json!(sources));
+    assert_eq!(snapshot[0]["mergeEligible"], false);
+    let replay = restarted
+        .services
+        .submission_replay(&id, "b1", Some(&json!({"fromPrincipalId":"b"})))
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay["recoverySources"], json!(sources));
+    assert!(replay.get("submissionIds").is_none());
+    assert!(restarted
+        .services
+        .submission_replay(&id, "b1", Some(&json!({"fromPrincipalId":"a"})))
+        .is_err());
+    let retry = restarted.services.dequeue_message(&id).unwrap();
+    let (_, restored) = flush_then_fail(&restarted, &ws, &id, vec![retry], "second failure").await;
+    assert_eq!(restored[0].recovery_sources, sources);
+    assert_eq!(
+        restarted
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|m| m.role == "user")
+            .count(),
+        4,
+        "redrive never duplicates persisted source rows"
+    );
+    bus.shutdown().await.unwrap();
+    restarted.services.store.close().await;
+}
+
+#[tokio::test]
+async fn submission_correlation_partial_flush_retains_persisted_head_and_tail() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-correlation-partial");
+    let id = AgentId::from("a-correlation-partial");
+    seed_agent(&mgr, &ws, &id).await;
+    let mut batch = Vec::new();
+    for (mid, principal) in [("head", "a"), ("fails", "b"), ("tail", "a")] {
+        let (entry, _) = mgr.services.enqueue_message_with_id(
+            &id,
+            Some(mid.into()),
+            mid.into(),
+            None,
+            None,
+            Some(json!({"fromPrincipalId":principal})),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        batch.push(entry);
+    }
+    mgr.services.agent_queues.lock().unwrap().remove(&id);
+    sqlx::query("CREATE TRIGGER fail_second_correlation BEFORE INSERT ON agent_message WHEN NEW.metadata LIKE '%fails%' BEGIN SELECT RAISE(ABORT, 'test partial persistence'); END")
+        .execute(mgr.services.store.write_pool()).await.unwrap();
+    let draining = mgr.services.mark_draining(&id, &batch);
+    assert!(matches!(
+        super::prepare_flush_turn(&mgr, &id, &ws, batch, draining).await,
+        super::FlushPrep::Parked
+    ));
+    let snapshot = mgr.services.queue_snapshot(&id);
+    assert_eq!(snapshot.len(), 3);
+    for (entry, mid) in snapshot.iter().zip(["head", "fails", "tail"]) {
+        assert_eq!(entry["id"], mid);
+        assert_eq!(entry["submissionIds"], json!([mid]));
+    }
+    let history = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(history.iter().filter(|m| m.role == "user").count(), 1);
+    let head = history.iter().find(|m| m.role == "user").unwrap();
+    assert_eq!(
+        head.metadata.as_ref().unwrap()["submissionIds"],
+        json!(["head"])
+    );
+    sqlx::query("DROP TRIGGER fail_second_correlation")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .unwrap();
+    mgr.services.persist_queue_snapshot(&id).await;
+    mgr.services.agent_queues.lock().unwrap().clear();
+    assert_eq!(mgr.services.rehydrate_agent_queues().await.unwrap(), 3);
+    let mut batch = Vec::new();
+    while let Some(entry) = mgr.services.dequeue_message(&id) {
+        batch.push(entry);
+    }
+    assert!(batch[0].persisted);
+    assert!(!batch[1].persisted);
+    let draining = mgr.services.mark_draining(&id, &batch);
+    assert!(matches!(
+        super::prepare_flush_turn(&mgr, &id, &ws, batch, draining).await,
+        super::FlushPrep::Turn { .. }
+    ));
+    let history = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    let users: Vec<_> = history.iter().filter(|m| m.role == "user").collect();
+    assert_eq!(users.len(), 3);
+    for mid in ["head", "fails", "tail"] {
+        assert_eq!(
+            users
+                .iter()
+                .filter(|m| m.metadata.as_ref().unwrap()["submissionIds"] == json!([mid]))
+                .count(),
+            1
+        );
+    }
 }

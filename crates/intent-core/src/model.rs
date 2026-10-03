@@ -3770,7 +3770,8 @@ pub fn chief_prompt_version(metadata: &serde_json::Value) -> Option<u32> {
 /// an answer-tagged row, `agent.dismissQuestions`, or a newer question turn,
 /// never by delivery order. `Automatic` is the `Default` so unmarked internal
 /// paths fail closed (never mistaken for a user action).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MessageOrigin {
     /// FE-originated user action: `agent.sendMessage` (typed message or
     /// wizard answers), a drained `agent.queueMessage` entry,

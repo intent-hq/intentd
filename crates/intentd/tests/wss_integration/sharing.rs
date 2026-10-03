@@ -373,6 +373,9 @@ async fn sharing_authorship_and_sender_spoofing_over_wss() {
             previous_queue.len() + 1,
             "shared queue: {queue}"
         );
+        for previous in &mut previous_queue {
+            previous["mergeEligible"] = json!(false);
+        }
         assert_eq!(&entries[..previous_queue.len()], previous_queue.as_slice());
         let queued_id = &queued["result"]["queuedMessage"]["id"];
         assert!(queued_id.is_string(), "canonical queued identity: {queued}");
@@ -400,6 +403,9 @@ async fn sharing_authorship_and_sender_spoofing_over_wss() {
             .await;
         let entries = queue["result"]["queue"].as_array().unwrap();
         assert_eq!(entries.len(), previous_queue.len() + 1);
+        for previous in &mut previous_queue {
+            previous["mergeEligible"] = json!(false);
+        }
         assert_eq!(&entries[..previous_queue.len()], previous_queue.as_slice());
         let edited = entries
             .iter()
