@@ -1295,12 +1295,25 @@ pub(crate) fn diff_snapshots(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -
     crate::harness::latest().pr_diff_lines(old, new)
 }
 
-/// Whether a row's persisted pending set is what the coalescing poll would
-/// recompute anyway — `diff(baseline, last_snapshot)`. A set that does NOT
-/// survive is a legacy accumulated log (pre-coalescing rows whose upgrade
-/// migration backfilled `baseline_snapshot = last_snapshot`, making their
-/// recomputed diff empty): boot rehydration delivers those as-is instead of
-/// letting the first poll silently discard them.
+/// Retired ancestry deltas can remain in rows persisted by older daemons.
+/// Preserve other legacy lines, which may not be reconstructable from snapshots.
+fn actionable_pending_changes(m: &PrMonitor) -> Vec<String> {
+    m.pending_changes
+        .iter()
+        .filter(|line| {
+            !line.starts_with("branch ancestry:")
+                && !line.starts_with("branch ancestry available:")
+                && line.as_str() != "branch ancestry unavailable"
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether actionable persisted changes survive a coalescing poll's
+/// `diff(baseline, last_snapshot)`. Boot rehydration handles other sets before
+/// polling: obsolete ancestry-only sets are cleared, while legacy accumulated
+/// actionable logs are delivered rather than silently discarded. Pre-coalescing
+/// rows had `baseline_snapshot = last_snapshot` backfilled by migration.
 fn pending_survives_recompute(m: &PrMonitor) -> bool {
     let parse = |s: &Option<String>| -> Option<PrMonitorSnapshot> {
         s.as_deref().and_then(|s| serde_json::from_str(s).ok())
@@ -1311,7 +1324,11 @@ fn pending_survives_recompute(m: &PrMonitor) -> bool {
         // set until it can, so nothing is at risk.
         return true;
     };
-    diff_snapshots(&baseline, &last) == m.pending_changes
+    let pending = actionable_pending_changes(m);
+    // An ancestry-only set should be cleared immediately without a wake.
+    // Mixed coalesced rows still await a fresh poll, folding downtime changes
+    // (including reverts) into one wake rather than replaying a stale alert.
+    !pending.is_empty() && diff_snapshots(&baseline, &last) == pending
 }
 
 /// The `<owner>/<name>#<number>` label every wake and event payload uses.
@@ -3702,8 +3719,8 @@ impl Services {
     /// debounce state (pending cleared, anchors dropped). Returns `false`
     /// without waking when the guarded clear loses — the row moved (a
     /// concurrent poll recomputed the set, or a flush/cancel/re-register
-    /// landed) between the caller's read and the clear — so no change line is
-    /// ever cleared without having been rendered into a delivered wake; the
+    /// landed) between the caller's read and the clear — so no actionable line
+    /// is cleared without being rendered into a delivered wake; the
     /// surviving pending state re-emits on a later tick. An EMPTY coalesced
     /// set (a PR that fully reverted to its baseline) also returns `false`:
     /// there is nothing to report, so no wake is sent.
@@ -3739,7 +3756,12 @@ impl Services {
             // dropping them; the next poll writes a snapshot and emits.
             return Ok(false);
         };
-        let message = render_change_wake(monitor, &monitor.pending_changes, &snapshot);
+        // Older daemons persisted informational ancestry deltas. Rehydration
+        // and explicit flush can deliver those without a fresh poll: remove
+        // only those retired lines, preserving legacy actionable changes that
+        // cannot necessarily be reconstructed from the stored snapshots.
+        let changes = actionable_pending_changes(monitor);
+        let message = render_change_wake(monitor, &changes, &snapshot);
         let now = now_iso();
         // The delivered snapshot becomes the new emit baseline: the next
         // wake reports only what moves from here.
@@ -3769,6 +3791,17 @@ impl Services {
         emitted.pending_since = None;
         emitted.last_change_at = None;
         emitted.updated_at = now;
+        if changes.is_empty() {
+            // Publish the cleared pending state, but do not wake the owner or
+            // claim an emission when only obsolete informational lines remain.
+            self.emit_pr_monitor_event(
+                PR_MONITOR_CHANGED,
+                &emitted,
+                Some(json!({ "changes": [] })),
+            )
+            .await;
+            return Ok(false);
+        }
         self.wake_pr_monitor_owner(&emitted, &message, "changed")
             .await;
         self.emit_pr_monitor_event(PR_MONITOR_EMITTED, &emitted, None)
@@ -3983,7 +4016,8 @@ impl Services {
                 self.maybe_emit_waiting_changed(&monitor.workspace_id).await;
                 continue;
             }
-            // Upgrade path: deliver a pending set the recompute would lose.
+            // Upgrade path: deliver legacy actionable lines the recompute would
+            // lose, or silently clear retired ancestry-only pending sets.
             // Coalesced-era rows are a fixed point of the recompute and stay
             // on the normal catch-up poll, which folds downtime changes into
             // one consolidated wake.

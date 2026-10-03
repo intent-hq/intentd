@@ -75,29 +75,17 @@ fn ancestry_message_transitions_never_invent_an_update_or_clear() {
     let first = ready();
     assert_eq!(
         diff_snapshots(&old, &first),
-        vec![
-            "branch ancestry available: 1 commit behind base",
-            "forge branch-update requirement available: not required",
-        ]
+        vec!["forge branch-update requirement available: not required",]
     );
     let mut moved = first.clone();
     moved.requirements.ancestry = known(2);
-    assert_eq!(
-        diff_snapshots(&first, &moved),
-        vec!["branch ancestry: 1 → 2 commits behind base"]
-    );
+    assert_eq!(diff_snapshots(&first, &moved), Vec::<String>::new());
     let mut current = moved.clone();
     current.requirements.ancestry = known(0);
-    assert_eq!(
-        diff_snapshots(&moved, &current),
-        vec!["branch ancestry: 2 → 0 commits behind base"]
-    );
+    assert_eq!(diff_snapshots(&moved, &current), Vec::<String>::new());
     assert_eq!(
         diff_snapshots(&first, &old),
-        vec![
-            "branch ancestry unavailable",
-            "forge branch-update requirement unknown",
-        ]
+        vec!["forge branch-update requirement unknown",]
     );
     let mut required = first.clone();
     required.requirements.branch_update_required = Some(true);
@@ -112,10 +100,7 @@ fn ancestry_message_transitions_never_invent_an_update_or_clear() {
     );
     assert_eq!(
         diff_snapshots(&required, &old),
-        vec![
-            "branch ancestry unavailable",
-            "forge branch-update requirement unknown",
-        ]
+        vec!["forge branch-update requirement unknown",]
     );
     let mut other_pair = first.clone();
     other_pair.requirements.ancestry = PrAncestry::Known {
@@ -127,6 +112,27 @@ fn ancestry_message_transitions_never_invent_an_update_or_clear() {
         diff_snapshots(&first, &other_pair).is_empty(),
         "same count is not a change to readiness"
     );
+}
+
+#[test]
+fn ancestry_only_transitions_are_quiet() {
+    for before in [PrAncestry::Unknown, known(0), known(1), known(2)] {
+        for after in [PrAncestry::Unknown, known(0), known(1), known(2)] {
+            let mut old = ready();
+            old.requirements.ancestry = before.clone();
+            let mut new = old.clone();
+            new.requirements.ancestry = after;
+            assert!(diff_snapshots(&old, &new).is_empty());
+            new.requirements.branch_update_required = Some(true);
+            assert!(diff_snapshots(&old, &new)
+                .iter()
+                .any(|s| s.contains("now requires")));
+            new.requirements.has_conflicts = true;
+            assert!(diff_snapshots(&old, &new)
+                .iter()
+                .any(|s| s == "merge conflicts appeared"));
+        }
+    }
 }
 
 #[test]
@@ -206,8 +212,7 @@ async fn ancestry_message_service_projections_and_event_deltas_agree() {
             assert_eq!(reduced[field], full[field], "{field}");
         }
     }
-    // Only the base moves. A measured lag creates a neutral lifecycle event,
-    // re-fetchable summary and wake; it cannot invent a branch-update blocker.
+    // Only the base moves: refresh visibility without creating a pending wake.
     mock.edit(|s| {
         s.pr["baseRef"]["target"]["oid"] = json!("c".repeat(40));
         s.compare = json!({"behind_by":2});
@@ -217,32 +222,230 @@ async fn ancestry_message_service_projections_and_event_deltas_agree() {
     let current = &listed["monitors"][0];
     assert_eq!(current["lastSnapshot"]["ancestry"]["behindBy"], 2);
     assert_eq!(current["lastSnapshot"]["branchUpdateRequired"], false);
-    let delta = json!(["branch ancestry: 1 → 2 commits behind base"]);
-    assert_eq!(current["pendingChanges"], delta);
+    assert_eq!(current["pendingChanges"], json!([]));
+    assert_eq!(current["hasPendingChanges"], false);
     let events = svc
         .store()
         .query_events(&intent_store::EventQuery {
             workspace_id: Some(ws.clone()),
-            event_types: vec![PR_MONITOR_CHANGED.to_string()],
+            event_types: vec![
+                PR_MONITOR_CHANGED.to_string(),
+                PR_MONITOR_EMITTED.to_string(),
+            ],
             ..Default::default()
         })
         .await
         .unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].data["changes"], delta);
+    assert!(events.is_empty());
     let id = PrMonitorId::from(current["monitorId"].as_str().unwrap());
     assert_eq!(
         svc.pr_monitor_flush_op(&ws, &id, false).await.unwrap()["flushed"],
-        true
+        false
     );
+    assert!(!owner_messages(&svc, &owner).await.contains("PR monitor"));
+    let snapshot = svc
+        .pr_state(ws.clone(), 10978, Some("o/r".into()))
+        .await
+        .unwrap();
+    assert_eq!(snapshot["requirements"]["ancestry"]["behindBy"], 2);
+
+    // A real update requirement starts debounce. Further ancestry churn must
+    // leave both its net changes and its quiet-window anchor untouched.
+    mock.edit(|s| s.pr["mergeStateStatus"] = json!("BEHIND"));
+    svc.poll_pr_monitors().await;
+    let held = svc.store().get_pr_monitor(&id).await.unwrap();
+    assert!(held
+        .pending_changes
+        .iter()
+        .any(|s| s.contains("now requires")));
+    let anchor = (time::OffsetDateTime::now_utc() - time::Duration::seconds(120))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    assert!(svc
+        .store()
+        .update_pr_monitor_poll(
+            &id,
+            PrMonitorPollUpdate {
+                last_snapshot: held.last_snapshot.as_deref(),
+                baseline_snapshot: held.baseline_snapshot.as_deref(),
+                pending_changes: &held.pending_changes,
+                pending_since: Some(&anchor),
+                last_change_at: Some(&anchor),
+                last_polled_at: held.last_polled_at.as_deref(),
+                last_error: None,
+                updated_at: &now_iso(),
+                expected_updated_at: &held.updated_at,
+            }
+        )
+        .await
+        .unwrap());
+    mock.edit(|s| {
+        s.pr["baseRef"]["target"]["oid"] = json!("d".repeat(40));
+        s.compare = json!({"behind_by":3});
+    });
+    svc.poll_pr_monitors().await;
+    let current = svc.store().get_pr_monitor(&id).await.unwrap();
+    assert_eq!(current.pending_changes, held.pending_changes);
+    assert_eq!(current.last_change_at.as_deref(), Some(anchor.as_str()));
+    assert_eq!(current.pending_since.as_deref(), Some(anchor.as_str()));
+    // 120 seconds is past one quiet window, but below the max-wait bound.
+    let svc = svc.with_pr_monitor_debounce_seconds(60);
+    mock.edit(|s| {
+        s.pr["baseRef"]["target"]["oid"] = json!("e".repeat(40));
+        s.compare = json!({"behind_by":4});
+    });
+    svc.poll_pr_monitors().await;
     let wake = owner_messages(&svc, &owner).await;
+    assert_eq!(wake.matches("[PR monitor o/r#10978]").count(), 1, "{wake}");
     assert!(
-        wake.contains("branch ancestry: 1 → 2 commits behind base"),
+        wake.contains("forge now requires a branch update"),
         "{wake}"
     );
     assert!(
-        wake.contains("forge branch-update requirement: not required"),
+        wake.contains("branch ancestry: 4 commits behind base"),
         "{wake}"
     );
-    assert!(!wake.contains("requires a branch update"), "{wake}");
+    assert!(!wake.contains("→ 4 commits behind base"), "{wake}");
+}
+
+#[tokio::test]
+async fn ancestry_persisted_pending_is_suppressed_on_restart_and_flush() {
+    for restart in [false, true] {
+        for mixed in [false, true] {
+            let (_db, _root, svc, _forge, ws, owner) = setup().await;
+            let monitor = register(&svc, &ws, &owner).await;
+            let mut baseline = snapshot(|_| {});
+            baseline.requirements.ancestry = known(1);
+            let mut last = baseline.clone();
+            last.requirements.ancestry = known(2);
+            let baseline = serde_json::to_string(&baseline).unwrap();
+            let last = serde_json::to_string(&last).unwrap();
+            let mut pending = vec![
+                "branch ancestry: 1 → 2 commits behind base".to_string(),
+                "branch ancestry available: 2 commits behind base".to_string(),
+                "branch ancestry unavailable".to_string(),
+            ];
+            if mixed {
+                // A legacy accumulated actionable line cannot be reconstructed
+                // from the snapshots; preserve it while removing ancestry noise.
+                pending.push("check build: pending → failed".into());
+            }
+            assert!(svc
+                .store()
+                .update_pr_monitor_poll(
+                    &monitor.monitor_id,
+                    PrMonitorPollUpdate {
+                        last_snapshot: Some(&last),
+                        baseline_snapshot: Some(&baseline),
+                        pending_changes: &pending,
+                        pending_since: Some(&now_iso()),
+                        last_change_at: Some(&now_iso()),
+                        last_polled_at: monitor.last_polled_at.as_deref(),
+                        last_error: None,
+                        updated_at: &now_iso(),
+                        expected_updated_at: &monitor.updated_at,
+                    }
+                )
+                .await
+                .unwrap());
+            if restart {
+                assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 1);
+            } else {
+                assert_eq!(
+                    svc.pr_monitor_flush_op(&ws, &monitor.monitor_id, false)
+                        .await
+                        .unwrap()["flushed"],
+                    mixed
+                );
+            }
+            let row = svc
+                .store()
+                .get_pr_monitor(&monitor.monitor_id)
+                .await
+                .unwrap();
+            assert!(row.pending_changes.is_empty());
+            assert!(row.pending_since.is_none());
+            assert!(row.last_change_at.is_none());
+            let messages = owner_messages(&svc, &owner).await;
+            assert_eq!(messages.contains("PR monitor"), mixed, "{messages}");
+            for obsolete in &pending[..3] {
+                assert!(!messages.contains(obsolete), "{messages}");
+            }
+            if mixed {
+                assert!(
+                    messages.contains("check build: pending → failed"),
+                    "{messages}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn ancestry_coalesced_pending_recomputes_downtime_changes_before_waking() {
+    for comments_after_restart in [0, 2] {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+        forge.edit(|s| s.conversation_comments = 1);
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let mut baseline: PrMonitorSnapshot =
+            serde_json::from_str(row.baseline_snapshot.as_deref().unwrap()).unwrap();
+        let mut last: PrMonitorSnapshot =
+            serde_json::from_str(row.last_snapshot.as_deref().unwrap()).unwrap();
+        baseline.requirements.ancestry = known(1);
+        last.requirements.ancestry = known(2);
+        let baseline = serde_json::to_string(&baseline).unwrap();
+        let last = serde_json::to_string(&last).unwrap();
+        let mut pending = row.pending_changes.clone();
+        pending.push("branch ancestry: 1 → 2 commits behind base".into());
+        assert!(svc
+            .store()
+            .update_pr_monitor_poll(
+                &monitor.monitor_id,
+                PrMonitorPollUpdate {
+                    last_snapshot: Some(&last),
+                    baseline_snapshot: Some(&baseline),
+                    pending_changes: &pending,
+                    pending_since: row.pending_since.as_deref(),
+                    last_change_at: row.last_change_at.as_deref(),
+                    last_polled_at: row.last_polled_at.as_deref(),
+                    last_error: None,
+                    updated_at: &now_iso(),
+                    expected_updated_at: &row.updated_at,
+                }
+            )
+            .await
+            .unwrap());
+        forge.edit(|s| s.conversation_comments = comments_after_restart);
+        assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 1);
+        assert!(
+            !owner_messages(&svc, &owner).await.contains("PR monitor"),
+            "a coalesced row must await the current forge state"
+        );
+        svc.poll_pr_monitors().await;
+        let messages = owner_messages(&svc, &owner).await;
+        assert_eq!(
+            messages.matches("[PR monitor o/r#42]").count(),
+            usize::from(comments_after_restart != 0),
+            "{messages}"
+        );
+        if comments_after_restart != 0 {
+            assert!(
+                messages.contains("+2 conversation comments (2 total)"),
+                "{messages}"
+            );
+        }
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(row.pending_changes.is_empty());
+    }
 }
