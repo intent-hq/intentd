@@ -9,6 +9,7 @@
 //!
 //! Caller/RPC and monitor scheduler integration is deliberately separate.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
@@ -267,8 +268,13 @@ pub(crate) struct CacheRead<T> {
 /// This owns no payload or authority. Cache -> caller -> provider is the same
 /// lock order as start/install, so denial and transfer are serialized.
 #[derive(Clone)]
-pub(crate) struct CacheDelivery(Arc<DeliveryCheck>);
-type DeliveryCheck = dyn Fn(&mut CacheAdmissionAction<'_>) -> CredentialResult<()> + Send + Sync;
+pub(crate) struct CacheDelivery {
+    cache: usize,
+    receipt: Arc<dyn Any + Send + Sync>,
+    check: Arc<DeliveryCheck>,
+}
+type DeliveryCheck =
+    dyn Fn(&[&CacheDelivery], &mut CacheAdmissionAction<'_>) -> CredentialResult<()> + Send + Sync;
 impl std::fmt::Debug for CacheDelivery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CacheDelivery(original observation)")
@@ -279,12 +285,42 @@ impl CacheDelivery {
         &self,
         action: &mut CacheAdmissionAction<'_>,
     ) -> CredentialResult<()> {
-        (self.0)(action)
+        (self.check)(&[self], action)
+    }
+
+    /// A request may retain several reads (and repeated aliases) from the same
+    /// map. Lock each original map once, in stable order, and keep every receipt
+    /// current through the caller/provider transfer rather than relocking it.
+    pub(crate) fn with_all_current(
+        deliveries: &[&Self],
+        action: &mut CacheAdmissionAction<'_>,
+    ) -> CredentialResult<()> {
+        let mut ordered = deliveries.to_vec();
+        ordered.sort_unstable_by_key(|delivery| delivery.cache);
+        Self::with_groups(&ordered, action)
+    }
+
+    fn with_groups(
+        deliveries: &[&Self],
+        action: &mut CacheAdmissionAction<'_>,
+    ) -> CredentialResult<()> {
+        let Some(first) = deliveries.first() else {
+            return action();
+        };
+        let end = deliveries.partition_point(|delivery| delivery.cache == first.cache);
+        (first.check)(&deliveries[..end], &mut || {
+            Self::with_groups(&deliveries[end..], action)
+        })
     }
 }
 enum DeliveryObservation {
     Complete(Arc<ObservationReceipt>),
     Partial(ObservationTicket),
+}
+struct DeliveryReceipt<K> {
+    key: CacheKey<K>,
+    connection: ConnectionObservations,
+    observation: DeliveryObservation,
 }
 fn delivery<K: Eq + Hash + Send + Sync + 'static, L: Send + 'static, T: Send + 'static>(
     cache: Weak<Mutex<CacheMap<K, L, T>>>,
@@ -292,26 +328,46 @@ fn delivery<K: Eq + Hash + Send + Sync + 'static, L: Send + 'static, T: Send + '
     connection: ConnectionObservations,
     observation: DeliveryObservation,
 ) -> CacheDelivery {
-    CacheDelivery(Arc::new(move |action| {
-        let cache = cache.upgrade().ok_or(RepositoryCredentialError::Retired)?;
-        let locked = cache
-            .lock()
-            .map_err(|_| RepositoryCredentialError::Indeterminate)?;
-        let Some(CacheSlot::Qualified(slot)) = locked.get(&key) else {
-            return Err(RepositoryCredentialError::Retired);
-        };
-        let current = slot.observations.belongs_to(&connection)
-            && match &observation {
-                DeliveryObservation::Complete(receipt) => {
-                    slot.observations.can_serve(receipt, &connection)
+    let identity = cache.as_ptr().addr();
+    CacheDelivery {
+        cache: identity,
+        receipt: Arc::new(DeliveryReceipt {
+            key,
+            connection,
+            observation,
+        }),
+        check: Arc::new(move |deliveries, action| {
+            let cache = cache.upgrade().ok_or(RepositoryCredentialError::Retired)?;
+            let locked = cache
+                .lock()
+                .map_err(|_| RepositoryCredentialError::Indeterminate)?;
+            for delivery in deliveries {
+                if delivery.cache != identity {
+                    return Err(RepositoryCredentialError::BoundaryMismatch);
                 }
-                DeliveryObservation::Partial(ticket) => slot.observations.validate(ticket).is_ok(),
-            };
-        if !current {
-            return Err(RepositoryCredentialError::Retired);
-        }
-        action()
-    }))
+                let receipt = delivery
+                    .receipt
+                    .downcast_ref::<DeliveryReceipt<K>>()
+                    .ok_or(RepositoryCredentialError::BoundaryMismatch)?;
+                let Some(CacheSlot::Qualified(slot)) = locked.get(&receipt.key) else {
+                    return Err(RepositoryCredentialError::Retired);
+                };
+                let current = slot.observations.belongs_to(&receipt.connection)
+                    && match &receipt.observation {
+                        DeliveryObservation::Complete(observation) => slot
+                            .observations
+                            .can_serve(observation, &receipt.connection),
+                        DeliveryObservation::Partial(ticket) => {
+                            slot.observations.validate(ticket).is_ok()
+                        }
+                    };
+                if !current {
+                    return Err(RepositoryCredentialError::Retired);
+                }
+            }
+            action()
+        }),
+    }
 }
 
 #[derive(Debug)]

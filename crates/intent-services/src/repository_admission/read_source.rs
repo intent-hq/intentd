@@ -2,7 +2,7 @@
 //! existing member gate, retained request and actual credential owner all apply.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use intent_acp::mcp_server::private_results::{McpHostCall, McpReadReservation};
@@ -17,7 +17,7 @@ use intent_sourcecontrol::{RepoRef, ReviewObservation};
 use intent_store::{RepositoryLifecycleKey, RepositoryWorkspaceAuthoritySnapshot};
 
 use crate::pr_monitor::qualified_cache::{
-    read_managed_review, CacheAdmissionGuard, CacheFailure, CacheRead, CacheRequest,
+    read_managed_review, CacheAdmissionGuard, CacheDelivery, CacheFailure, CacheRead, CacheRequest,
     ManagedCacheRequest,
 };
 use crate::pr_monitor::PrReadPolicy;
@@ -320,6 +320,7 @@ pub(crate) struct ReadRecord {
     facts: Arc<ReadFacts>,
     pub(crate) operation: Arc<Mutex<ReadState>>,
     pub(crate) eligibility: Arc<RepositoryReadEligibility>,
+    delivery: Arc<OnceLock<CacheDelivery>>,
     #[cfg(test)]
     acquisition: Arc<ReadAuthority>,
 }
@@ -495,6 +496,7 @@ impl ReadRecord {
             facts: self.facts.clone(),
             operation: self.operation.clone(),
             eligibility: self.eligibility.clone(),
+            delivery: self.delivery.clone(),
             #[cfg(test)]
             acquisition: self.acquisition.clone(),
         }))
@@ -616,6 +618,7 @@ async fn read_review(
                 facts: facts.clone(),
                 operation,
                 eligibility,
+                delivery: Arc::new(OnceLock::new()),
                 #[cfg(test)]
                 acquisition: authority.clone(),
             };
@@ -692,6 +695,12 @@ async fn read_review(
                 Ok(()) = refusal => return Err(AdmissionError::Retired),
                 result = &mut read => result,
             };
+            if let Ok(read) = &result {
+                record
+                    .delivery
+                    .set(read.delivery.clone())
+                    .map_err(|_| AdmissionError::Retired)?;
+            }
             finish.finish()?;
             Ok(ReadOutcome::Managed {
                 target: review.clone(),
@@ -712,6 +721,36 @@ async fn read_review(
 
 fn reserve_subread(call: &McpHostCall, record: &ReadRecord) -> AdmissionResult<()> {
     record.bind(call.reserve().map_err(|_| AdmissionError::Retired)?)
+}
+
+fn with_deliveries<T: Send>(
+    records: &[&ReadRecord],
+    transfer: impl FnOnce() -> AdmissionResult<T> + Send,
+) -> AdmissionResult<T> {
+    let mut deliveries = Vec::new();
+    for record in records {
+        // Finish is published only after the successful receipt is installed.
+        // An acquiring/abandoned record cannot be mistaken for a completed Err
+        // (which has no private payload and therefore no delivery receipt).
+        if *record
+            .operation
+            .lock()
+            .map_err(|_| AdmissionError::Retired)?
+            != ReadState::Finished
+        {
+            return Err(AdmissionError::Retired);
+        }
+        deliveries.extend(record.delivery.get());
+    }
+    let mut output = None;
+    let mut transfer = Some(transfer);
+    CacheDelivery::with_all_current(&deliveries, &mut || {
+        let transfer = transfer.take().ok_or(RepositoryCredentialError::Retired)?;
+        output = Some(transfer());
+        Ok(())
+    })
+    .map_err(|_| AdmissionError::Retired)?;
+    output.ok_or(AdmissionError::Retired)?
 }
 
 /// Fresh simultaneous validation for one original boundary. All source locks
@@ -776,21 +815,23 @@ pub(crate) async fn with_records<T: Send>(
                 .iter()
                 .map(|r| r.eligibility.as_ref())
                 .collect::<Vec<_>>();
-            child.transfer(|| {
-                let states = operations
-                    .iter()
-                    .map(|op| op.lock().map_err(|_| AdmissionError::Retired))
-                    .collect::<AdmissionResult<Vec<_>>>()?;
-                if states.iter().any(|state| **state != ReadState::Finished) {
-                    return Err(AdmissionError::Retired);
-                }
-                let mut output = None;
-                RepositoryReadEligibility::with_all_current(&eligibility, || {
-                    output = Some(transfer());
-                    Ok(())
+            with_deliveries(records, || {
+                child.transfer(|| {
+                    let states = operations
+                        .iter()
+                        .map(|op| op.lock().map_err(|_| AdmissionError::Retired))
+                        .collect::<AdmissionResult<Vec<_>>>()?;
+                    if states.iter().any(|state| **state != ReadState::Finished) {
+                        return Err(AdmissionError::Retired);
+                    }
+                    let mut output = None;
+                    RepositoryReadEligibility::with_all_current(&eligibility, || {
+                        output = Some(transfer());
+                        Ok(())
+                    })
+                    .map_err(|_| AdmissionError::Unavailable)?;
+                    output.ok_or(AdmissionError::Retired)
                 })
-                .map_err(|_| AdmissionError::Unavailable)?;
-                output.ok_or(AdmissionError::Retired)
             })
         },
     )
@@ -867,21 +908,23 @@ pub(crate) async fn with_joint_local_records<T: Send>(
                 .iter()
                 .map(|r| r.eligibility.as_ref())
                 .collect::<Vec<_>>();
-            child.transfer_with_optional(optional, |include| {
-                let states = operations
-                    .iter()
-                    .map(|op| op.lock().map_err(|_| AdmissionError::Retired))
-                    .collect::<AdmissionResult<Vec<_>>>()?;
-                if states.iter().any(|state| **state != ReadState::Finished) {
-                    return Err(AdmissionError::Retired);
-                }
-                let mut output = None;
-                RepositoryReadEligibility::with_all_current(&eligibility, || {
-                    output = Some(transfer(include));
-                    Ok(())
+            with_deliveries(records, || {
+                child.transfer_with_optional(optional, |include| {
+                    let states = operations
+                        .iter()
+                        .map(|op| op.lock().map_err(|_| AdmissionError::Retired))
+                        .collect::<AdmissionResult<Vec<_>>>()?;
+                    if states.iter().any(|state| **state != ReadState::Finished) {
+                        return Err(AdmissionError::Retired);
+                    }
+                    let mut output = None;
+                    RepositoryReadEligibility::with_all_current(&eligibility, || {
+                        output = Some(transfer(include));
+                        Ok(())
+                    })
+                    .map_err(|_| AdmissionError::Unavailable)?;
+                    output.ok_or(AdmissionError::Retired)
                 })
-                .map_err(|_| AdmissionError::Unavailable)?;
-                output.ok_or(AdmissionError::Retired)
             })
         },
     )
@@ -1007,7 +1050,8 @@ pub(crate) async fn with_context_records<T: Send>(
             .unwrap_or(AdmissionError::Unavailable));
     };
     let eligibility = eligibility.iter().map(Arc::as_ref).collect::<Vec<_>>();
-    child.transfer_with_optional(Some(optional.prepared.metadata()), |local_current| {
+    with_deliveries(records, || {
+        child.transfer_with_optional(Some(optional.prepared.metadata()), |local_current| {
         facts.with_revision(|revision_current| {
             let states = operations.iter().map(|op| op.lock().map_err(|_| AdmissionError::Retired)).collect::<AdmissionResult<Vec<_>>>()?;
             if states.iter().any(|state| **state != ReadState::Finished) { return Err(AdmissionError::Retired); }
@@ -1024,6 +1068,7 @@ pub(crate) async fn with_context_records<T: Send>(
                 .map_err(|_| AdmissionError::Unavailable)?;
             output.ok_or(AdmissionError::Retired)
         })
+    })
     })
 }
 

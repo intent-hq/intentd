@@ -6267,11 +6267,11 @@ fn spawn_config_watcher_init(
             &hub,
             registry,
             watcher_services.settings_revision_gate(),
-            move |text, expected| {
+            move |text, expected, admission| {
                 let services = watcher_services.clone();
                 async move {
                     services
-                        .apply_prepared_settings_reload(text, expected)
+                        .apply_prepared_settings_reload(text, expected, admission)
                         .await
                 }
             },

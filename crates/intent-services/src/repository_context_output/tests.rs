@@ -760,8 +760,13 @@ async fn context_output_actual_outer_settings_writers_release_metadata_before_sn
                             "oauthClientId = \"new-reload-client\"",
                         );
                     assert!(text.contains("new-reload-client"));
+                    let (_stopping, stopped) = tokio::sync::watch::channel(false);
                     service
-                        .apply_prepared_settings_reload(text, expected)
+                        .apply_prepared_settings_reload(
+                            text,
+                            expected,
+                            crate::PreparedReloadAdmission::new(stopped),
+                        )
                         .await
                         .unwrap();
                 }

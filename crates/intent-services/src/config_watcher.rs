@@ -62,6 +62,51 @@ pub(crate) fn owns_admitted_callback() -> bool {
     ADMITTED_CALLBACK.try_with(|()| ()).is_ok()
 }
 
+/// The original watcher's stop admission, carried through prepared lock waits.
+/// Only the watcher constructs it; it supplies no settings or credential authority.
+pub struct PreparedReloadAdmission {
+    stopped: tokio::sync::watch::Receiver<bool>,
+}
+
+impl PreparedReloadAdmission {
+    pub(crate) fn new(stopped: tokio::sync::watch::Receiver<bool>) -> Self {
+        Self { stopped }
+    }
+
+    fn stopped() -> Error {
+        Error::Internal("config watcher stopped before reload admission".into())
+    }
+
+    pub(crate) async fn wait<T>(&mut self, future: impl Future<Output = T>) -> Result<T> {
+        if *self.stopped.borrow() {
+            return Err(Self::stopped());
+        }
+        tokio::select! {
+            biased;
+            _ = self.stopped.changed() => Err(Self::stopped()),
+            value = future => Ok(value),
+        }
+    }
+
+    pub(crate) fn publish<T>(&self, publish: impl FnOnce() -> Result<T>) -> Result<T> {
+        // Serialize shutdown with the last synchronous admission/publication
+        // interval. No asynchronous lock wait or callback is inside this watch borrow.
+        let stopped = self.stopped.borrow();
+        if *stopped {
+            return Err(Self::stopped());
+        }
+        publish()
+    }
+
+    pub(crate) async fn finish<T>(self, tail: impl Future<Output = T>) -> T {
+        // Publication has finished. Shutdown must join the original hooks and
+        // settlement; cancellation is no longer an uncommitted edit refusal.
+        let result = ADMITTED_CALLBACK.scope((), tail).await;
+        drop(self);
+        result
+    }
+}
+
 /// Debounce window: the file is read once, this long after the *last* raw
 /// event (editors emit create+modify+rename flurries per save).
 const DEBOUNCE: Duration = Duration::from_millis(300);
@@ -147,6 +192,7 @@ type PreparedReload = Arc<
     dyn Fn(
             String,
             Arc<SettingsSnapshot>,
+            PreparedReloadAdmission,
         ) -> std::pin::Pin<Box<dyn Future<Output = Result<SettingsChanged>> + Send>>
         + Send
         + Sync,
@@ -155,12 +201,19 @@ type PreparedReload = Arc<
 async fn process_prepared_config_change(
     registry: &SettingsRegistry,
     reload: &PreparedReload,
+    stopped: &tokio::sync::watch::Receiver<bool>,
 ) -> ReloadOutcome {
     let (text, expected) = match read_config_text(registry) {
         Ok(text) => text,
         Err(outcome) => return outcome,
     };
-    match reload(text, expected).await {
+    match reload(
+        text,
+        expected,
+        PreparedReloadAdmission::new(stopped.clone()),
+    )
+    .await
+    {
         Ok(notice) if notice.changed.is_empty() => ReloadOutcome::Unchanged,
         Ok(notice) => ReloadOutcome::Applied(notice),
         Err(error) => {
@@ -245,11 +298,14 @@ impl ConfigWatcher {
         reload: F,
     ) -> Result<Self>
     where
-        F: Fn(String, Arc<SettingsSnapshot>) -> Fut + Send + Sync + 'static,
+        F: Fn(String, Arc<SettingsSnapshot>, PreparedReloadAdmission) -> Fut
+            + Send
+            + Sync
+            + 'static,
         Fut: Future<Output = Result<SettingsChanged>> + Send + 'static,
     {
         let reload: PreparedReload =
-            Arc::new(move |text, expected| Box::pin(reload(text, expected)));
+            Arc::new(move |text, expected, admission| Box::pin(reload(text, expected, admission)));
         Self::start_with_reload(hub, registry, revision_gate, |_| async {}, Some(reload))
     }
 
@@ -452,7 +508,7 @@ async fn debounce<F, Fut>(
                 deadline = None;
                 if *stopped.borrow() { return; }
                 if let Some(reload) = prepared_reload {
-                    ADMITTED_CALLBACK.scope((), process_prepared_config_change(registry, reload)).await;
+                    process_prepared_config_change(registry, reload, stopped).await;
                 } else {
                     let _revision_guard = tokio::select! {
                         biased;
@@ -503,7 +559,7 @@ mod tests {
         let reload: PreparedReload = Arc::new({
             let registry = registry.clone();
             let revision = revision.clone();
-            move |text, expected| {
+            move |text, expected, _admission| {
                 let registry = registry.clone();
                 let revision = revision.clone();
                 let finished = finished.clone();
@@ -542,12 +598,13 @@ mod tests {
 
     #[tokio::test]
     async fn prepared_watcher_preserves_self_write_missing_and_invalid_outcomes() {
+        let (_stopping, stopped) = tokio::sync::watch::channel(false);
         let (_dir, registry) = temp_registry(None);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let reload: PreparedReload = Arc::new({
             let registry = registry.clone();
             let calls = calls.clone();
-            move |text, expected| {
+            move |text, expected, _admission| {
                 let registry = registry.clone();
                 calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Box::pin(async move {
@@ -561,18 +618,18 @@ mod tests {
             .unwrap();
         let snapshot = registry.snapshot();
         assert!(matches!(
-            process_prepared_config_change(&registry, &reload).await,
+            process_prepared_config_change(&registry, &reload, &stopped).await,
             ReloadOutcome::SelfWrite
         ));
         std::fs::remove_file(registry.config_path()).unwrap();
         assert!(matches!(
-            process_prepared_config_change(&registry, &reload).await,
+            process_prepared_config_change(&registry, &reload, &stopped).await,
             ReloadOutcome::Missing
         ));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         std::fs::write(registry.config_path(), "[git]\nautoCommit = 'invalid'\n").unwrap();
         assert!(matches!(
-            process_prepared_config_change(&registry, &reload).await,
+            process_prepared_config_change(&registry, &reload, &stopped).await,
             ReloadOutcome::Invalid
         ));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -584,6 +641,7 @@ mod tests {
         use intent_core::WorkspaceApi;
 
         for restore_value in [false, true] {
+            let (_stopping, stopped) = tokio::sync::watch::channel(false);
             let (dir, registry) = temp_registry(Some("[git]\nautoCommit = true\n"));
             let store = intent_store::Store::open(&dir.path().join("settings.db"))
                 .await
@@ -595,7 +653,7 @@ mod tests {
                 let services = services.clone();
                 let entered = entered.clone();
                 let release = release.clone();
-                move |text, expected| {
+                move |text, expected, admission| {
                     let services = services.clone();
                     let entered = entered.clone();
                     let release = release.clone();
@@ -603,14 +661,17 @@ mod tests {
                         entered.notify_one();
                         release.acquire().await.unwrap().forget();
                         services
-                            .apply_prepared_settings_reload(text, expected)
+                            .apply_prepared_settings_reload(text, expected, admission)
                             .await
                     })
                 }
             });
             let task = intent_core::spawn_daemon({
                 let registry = registry.clone();
-                async move { process_prepared_config_change(&registry, &reload).await }
+                {
+                    let stopped = stopped.clone();
+                    async move { process_prepared_config_change(&registry, &reload, &stopped).await }
+                }
             });
             tokio::time::timeout(crate::events::LIVENESS, entered.notified())
                 .await
@@ -662,17 +723,17 @@ mod tests {
             .unwrap();
             let fresh: PreparedReload = Arc::new({
                 let services = services.clone();
-                move |text, expected| {
+                move |text, expected, admission| {
                     let services = services.clone();
                     Box::pin(async move {
                         services
-                            .apply_prepared_settings_reload(text, expected)
+                            .apply_prepared_settings_reload(text, expected, admission)
                             .await
                     })
                 }
             });
             assert!(matches!(
-                process_prepared_config_change(&registry, &fresh).await,
+                process_prepared_config_change(&registry, &fresh, &stopped).await,
                 ReloadOutcome::Applied(_)
             ));
             assert_eq!(registry.get("rtk.enabled"), Some(json!(true)));
@@ -811,6 +872,225 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn debounce_shutdown_cancels_pending_revision_gate() {
         assert_debounce_revision_gate_schedule(true, false).await;
+    }
+
+    async fn prepared_shutdown_lock_schedule(credential: bool, release: bool) {
+        use std::task::{Context, Waker};
+
+        let (dir, registry) =
+            temp_registry(Some("[sourceControl.gitlab]\noauthClientId = 'before'\n"));
+        let store = intent_store::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let services = crate::Services::new(store).with_settings_registry(registry.clone());
+        let snapshot = registry.snapshot();
+        let notice = registry.subscribe();
+        let revision = services
+            .settings_revision
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let edited = "[sourceControl.gitlab]\noauthClientId = 'after'\n";
+        std::fs::write(registry.config_path(), edited).unwrap();
+        let mut credential_held = if credential {
+            Some(services.gitlab_credential_gate.lock().await)
+        } else {
+            None
+        };
+        let mut revision_held = if credential {
+            None
+        } else {
+            Some(services.settings_revision_gate.write().await)
+        };
+        let reload: PreparedReload = Arc::new({
+            let services = services.clone();
+            move |text, expected, admission| {
+                let services = services.clone();
+                Box::pin(async move {
+                    services
+                        .apply_prepared_settings_reload(text, expected, admission)
+                        .await
+                })
+            }
+        });
+        let (_raw_tx, mut raw_rx) = mpsc::unbounded_channel();
+        let (stopping, mut stopped) = tokio::sync::watch::channel(false);
+        let mut legacy = |_| async { panic!("actual prepared owner handles publication") };
+        let mut worker = Box::pin(debounce(
+            &registry,
+            &services.settings_revision_gate,
+            std::ffi::OsStr::new("config.toml"),
+            &mut raw_rx,
+            &mut legacy,
+            &mut stopped,
+            Some(&reload),
+        ));
+        tokio::time::pause();
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        tokio::time::advance(DEBOUNCE + Duration::from_millis(1)).await;
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        assert!(Arc::ptr_eq(&snapshot, &registry.snapshot()));
+        stopping.send_replace(true);
+        if release {
+            drop(credential_held.take());
+            drop(revision_held.take());
+            if credential {
+                assert!(
+                    services.gitlab_credential_gate.try_lock().is_err(),
+                    "original credential waiter was queued"
+                );
+            } else {
+                assert!(
+                    services.settings_revision_gate.try_read().is_err(),
+                    "original revision waiter was queued"
+                );
+            }
+        }
+        let stopped = worker.as_mut().poll(&mut cx).is_ready();
+        drop(worker);
+        tokio::time::resume();
+        drop(credential_held);
+        drop(revision_held);
+        assert!(
+            Arc::ptr_eq(&snapshot, &registry.snapshot()),
+            "stopped prepared candidate must never publish"
+        );
+        assert!(!notice.has_changed().unwrap());
+        assert_eq!(
+            services
+                .settings_revision
+                .load(std::sync::atomic::Ordering::SeqCst),
+            revision
+        );
+        assert_eq!(
+            std::fs::read_to_string(registry.config_path()).unwrap(),
+            edited
+        );
+        assert!(
+            stopped,
+            "shutdown must cancel the original prepared lock wait"
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn prepared_shutdown_cancels_credential_wait() {
+        prepared_shutdown_lock_schedule(true, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn prepared_shutdown_cancels_revision_wait() {
+        prepared_shutdown_lock_schedule(false, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn prepared_shutdown_wins_simultaneous_lock_release() {
+        prepared_shutdown_lock_schedule(true, true).await;
+        prepared_shutdown_lock_schedule(false, true).await;
+    }
+
+    struct PreparedRuntimeHook {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl intent_core::ServerControl for PreparedRuntimeHook {
+        fn start_ws_listener(&self) -> intent_core::BoxFuture<'_, Result<u16>> {
+            assert!(
+                owns_admitted_callback(),
+                "hook construction follows publication"
+            );
+            Box::pin(async move {
+                assert!(owns_admitted_callback(), "hook execution stays admitted");
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.entered.notify_one();
+                self.release.acquire().await.unwrap().forget();
+                Ok(8787)
+            })
+        }
+        fn stop_ws_listener(&self) -> intent_core::BoxFuture<'_, ()> {
+            Box::pin(async { panic!("not the selected setting hook") })
+        }
+        fn ws_listener_port(&self) -> intent_core::BoxFuture<'_, Option<u16>> {
+            Box::pin(async { None })
+        }
+        fn is_tcp_connection(&self) -> bool {
+            false
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn prepared_shutdown_joins_published_runtime_hook_and_durable_event() {
+        let (dir, registry) = temp_registry(Some("[server.wsApi]\nenabled = false\n"));
+        let store = intent_store::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let bus = crate::events::bus::EventBus::new(store.clone());
+        let services = crate::Services::new(store.clone())
+            .with_settings_registry(registry.clone())
+            .with_event_bus(bus.clone());
+        let control = Arc::new(PreparedRuntimeHook {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        services.attach_server_control(control.clone());
+        let mut watcher = ConfigWatcher::start_prepared_reload(
+            &SharedWatchHub::new(),
+            registry.clone(),
+            services.settings_revision_gate(),
+            {
+                let services = services.clone();
+                move |text, expected, admission| {
+                    assert!(
+                        !owns_admitted_callback(),
+                        "preparation is not committed callback authority"
+                    );
+                    let services = services.clone();
+                    async move {
+                        services
+                            .apply_prepared_settings_reload(text, expected, admission)
+                            .await
+                    }
+                }
+            },
+        )
+        .unwrap();
+        assert!(watcher.ready().await);
+        std::fs::write(registry.config_path(), "[server.wsApi]\nenabled = true\n").unwrap();
+        tokio::time::timeout(crate::events::LIVENESS, control.entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(registry.get("server.wsApi.enabled"), Some(json!(true)));
+        assert!(
+            services.settings_revision_gate.try_read().is_err(),
+            "published callback retains the original revision guard"
+        );
+        let shutdown = watcher.shutdown();
+        tokio::pin!(shutdown);
+        let escaped = tokio::select! { biased; () = &mut shutdown => true, () = std::future::ready(()) => false };
+        control.release.add_permits(1);
+        tokio::time::timeout(crate::events::LIVENESS, &mut shutdown)
+            .await
+            .unwrap();
+        assert!(!escaped, "shutdown must join an already published callback");
+        assert_eq!(control.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(services.settings_revision_gate.try_write().is_ok());
+        bus.shutdown().await.unwrap();
+        store.close().await;
+        let reopened = intent_store::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == "settings:changed")
+                .count(),
+            1
+        );
+        reopened.close().await;
     }
 
     #[tokio::test(start_paused = true)]

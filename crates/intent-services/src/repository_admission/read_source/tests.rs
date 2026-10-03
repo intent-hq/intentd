@@ -215,6 +215,210 @@ async fn same_request_cache_hit_and_repeated_records_share_one_fresh_final_child
     );
 }
 
+// The provider changes only after the original successful Services read. The
+// next MR read observes the real project denial through the same HTTP fixture.
+struct DenyProjectAfterRead {
+    services: Arc<Services>,
+    replies: Arc<Replies>,
+    status: u16,
+}
+impl WorkspaceApi for DenyProjectAfterRead {
+    fn agent_is_retired(&self, agent: AgentId) -> BoxFuture<'_, bool> {
+        self.services.agent_is_retired(agent)
+    }
+    fn get_workspace(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, intent_core::Result<intent_core::Workspace>> {
+        self.services.get_workspace(id)
+    }
+    fn settings_get(&self, path: String) -> BoxFuture<'_, intent_core::Result<Value>> {
+        self.services.settings_get(path)
+    }
+    fn pr_state(
+        &self,
+        workspace: WorkspaceId,
+        number: u64,
+        repo: Option<String>,
+    ) -> BoxFuture<'_, intent_core::Result<Value>> {
+        Box::pin(async move {
+            let result = self.services.pr_state(workspace, number, repo).await;
+            if number == 4 && result.is_ok() {
+                self.replies
+                    .statuses
+                    .lock()
+                    .unwrap()
+                    .insert(PROJECT.into(), self.status);
+            }
+            result
+        })
+    }
+}
+
+async fn retained_snapshot_after_project_denial(partial: bool, cached: bool) {
+    for status in [403, 404] {
+        let http = ReadServer::new().await;
+        let f = ActualRead::new(&http).await;
+        if partial {
+            http.status(&format!("{MR}/approvals"), 500);
+        }
+        let before = std::fs::read(f.auth.service.gitlab_secret_store.path()).unwrap();
+        let server = WorkspaceMcpServer::new(
+            Arc::new(DenyProjectAfterRead {
+                services: f.auth.service.clone(),
+                replies: http.replies.clone(),
+                status,
+            }),
+            f.git.workspace.id.clone(),
+        )
+        .with_caller_agent_id(Some(f.agent.clone()))
+        .with_request_context(Arc::new(f.context()));
+        let code = if cached {
+            "await ws.pr.snapshot(4); const a=await ws.pr.snapshot(4); try {await ws.pr.snapshot(5);} catch(e) {} return a;"
+        } else {
+            "const a=await ws.pr.snapshot(4); try {await ws.pr.snapshot(5);} catch(e) {} return a;"
+        };
+        let reply = run(&server, code).await;
+        let calls = http.replies.calls.lock().unwrap().clone();
+        eprintln!("project-denial partial={partial} cached={cached} status={status} calls={calls:?} reply={reply}");
+        assert!(
+            calls.iter().filter(|p| p.as_str() == PROJECT).count() >= 2,
+            "original denial HTTP reached"
+        );
+        assert_eq!(
+            calls.iter().filter(|p| p.as_str() == MR).count(),
+            1,
+            "original MR and cached duplicate"
+        );
+        assert_eq!(
+            before,
+            std::fs::read(f.auth.service.gitlab_secret_store.path()).unwrap()
+        );
+        assert!(!reply.to_string().contains("stored-pat"));
+        assert!(
+            !reply.to_string().contains("actual review"),
+            "invalidated snapshot escaped: {reply}"
+        );
+        assert!(
+            reply
+                .to_string()
+                .contains("Private result delivery refused"),
+            "{reply}"
+        );
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn mcp_delivery_complete_snapshot_rejects_later_project_denial() {
+    retained_snapshot_after_project_denial(false, false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn mcp_delivery_cached_snapshot_rejects_later_project_denial() {
+    retained_snapshot_after_project_denial(false, true).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn mcp_delivery_partial_snapshot_rejects_later_project_denial() {
+    retained_snapshot_after_project_denial(true, false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn mcp_delivery_denial_prevents_artifact_and_attachment_effects() {
+    for artifact in [true, false] {
+        let http = ReadServer::new().await;
+        let f = ActualRead::new(&http).await;
+        f.auth
+            .registry
+            .apply(&[("workspaceApi.maxOutputChars".into(), json!(1000))])
+            .unwrap();
+        let attachments = Arc::new(intent_core::TurnAttachmentRegistry::new());
+        let server = WorkspaceMcpServer::new(
+            Arc::new(DenyProjectAfterRead {
+                services: f.auth.service.clone(),
+                replies: http.replies.clone(),
+                status: 403,
+            }),
+            f.git.workspace.id.clone(),
+        )
+        .with_caller_agent_id(Some(f.agent.clone()))
+        .with_request_context(Arc::new(f.context()))
+        .with_turn_attachments(Some(attachments.clone()));
+        let code = if artifact {
+            "const a=await ws.pr.snapshot(4); try {await ws.pr.snapshot(5);} catch(e) {} return a.title.repeat(300);"
+        } else {
+            "const a=await ws.pr.snapshot(4); try {await ws.pr.snapshot(5);} catch(e) {} return {__mcpContentItems:[{type:'resource',resource:{uri:'fixture://denied',mimeType:'application/json',text:JSON.stringify({title:a.title})}}]};"
+        };
+        let reply = run(&server, code).await;
+        assert!(
+            reply
+                .to_string()
+                .contains("Private result delivery refused"),
+            "{reply}"
+        );
+        assert!(!reply.to_string().contains("actual review"));
+        assert!(!f.git.dir.path().join("tool-outputs").exists());
+        assert_eq!(
+            attachments.pending_count_by_mime(&f.agent, "application/json"),
+            0
+        );
+        assert!(
+            http.replies
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.as_str() == PROJECT)
+                .count()
+                >= 2
+        );
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn mcp_delivery_optional_context_cannot_disclose_denied_snapshot_over_tcp() {
+    use crate::repository_context_live::tests::LiveFixture;
+    use crate::repository_context_output::tests::{tcp, FACTS};
+
+    let http = ReadServer::new().await;
+    let f = LiveFixture::new(&http).await;
+    let server = WorkspaceMcpServer::new(
+        Arc::new(DenyProjectAfterRead {
+            services: f.base.auth.service.clone(),
+            replies: http.replies.clone(),
+            status: 404,
+        }),
+        f.session.workspace_id.clone(),
+    )
+    .with_caller_agent_id(Some(f.session.id.clone()))
+    .with_request_context(f.owner.mcp_context())
+    .with_repository_guidance(&f.session, f.owner.guidance_source());
+    let reply = tcp(
+        server,
+        "const a=await ws.pr.snapshot(4); try {await ws.pr.snapshot(5);} catch(e) {} return a;",
+    )
+    .await;
+    f.owner.drain_jobs().await;
+    assert!(!reply.to_string().contains("actual review"), "{reply}");
+    assert!(!reply.to_string().contains(FACTS), "{reply}");
+    assert!(
+        reply
+            .to_string()
+            .contains("Private result delivery refused"),
+        "{reply}"
+    );
+    assert!(
+        http.replies
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.as_str() == PROJECT)
+            .count()
+            >= 2
+    );
+}
+
 #[intent_test_macros::daemon_test]
 async fn ambiguous_unmapped_and_missing_anchor_discovery_never_acquire_or_disclose() {
     for mode in ["ambiguous", "unmapped", "missing-anchor"] {
@@ -686,6 +890,7 @@ pub(crate) async fn retain_and_check_records(
             facts: value.facts.clone(),
             operation: value.operation.clone(),
             eligibility: value.eligibility.clone(),
+            delivery: value.delivery.clone(),
             acquisition: value.acquisition.clone(),
         }));
     }

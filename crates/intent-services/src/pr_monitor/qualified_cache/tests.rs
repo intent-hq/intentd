@@ -2296,3 +2296,74 @@ async fn retained_cache_delivery_rechecks_original_complete_and_partial_observat
         assert_eq!(sent, 2);
     }
 }
+
+#[tokio::test]
+async fn cache_delivery_batch_locks_shared_and_distinct_maps_once() {
+    let reviews = PrCache::default();
+    let issues = IssueCache::default();
+    let conn = connection("batch-delivery");
+    let a = mr("team/app", 7);
+    let b = mr("team/app", 8);
+    let i = target("team/app", RepositoryResourceKind::Issue, 9);
+    let first = review(
+        &reviews,
+        &request(&conn, &a),
+        Duration::ZERO,
+        Ok(observation(7, "first")),
+    )
+    .await
+    .unwrap();
+    let second = review(
+        &reviews,
+        &request(&conn, &b),
+        Duration::ZERO,
+        Ok(observation(8, "second")),
+    )
+    .await
+    .unwrap();
+    let third = issue_read(
+        &issues,
+        &request(&conn, &i),
+        Duration::ZERO,
+        Ok(issue(9, "third")),
+    )
+    .await
+    .unwrap();
+    let aliases = [
+        &third.delivery,
+        &first.delivery,
+        &second.delivery,
+        &first.delivery,
+    ];
+    let mut calls = 0;
+    let original_error = CacheDelivery::with_all_current(&aliases, &mut || {
+        assert!(reviews.try_lock().is_err());
+        assert!(issues.try_lock().is_err());
+        calls += 1;
+        Err(RepositoryCredentialError::AuthorityDenied)
+    });
+    assert!(matches!(
+        original_error,
+        Err(RepositoryCredentialError::AuthorityDenied)
+    ));
+    assert_eq!(calls, 1);
+    assert!(reviews.try_lock().is_ok());
+    assert!(issues.try_lock().is_ok());
+    assert!(issue_read(
+        &issues,
+        &request(&conn, &i),
+        Duration::ZERO,
+        Err(denied(ProviderFailureKind::ProjectDenied))
+    )
+    .await
+    .is_err());
+    assert!(CacheDelivery::with_all_current(&aliases, &mut || {
+        calls += 1;
+        Ok(())
+    })
+    .is_err());
+    assert_eq!(
+        calls, 1,
+        "no consumer action after any original observation was denied"
+    );
+}

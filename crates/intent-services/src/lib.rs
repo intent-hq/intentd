@@ -290,7 +290,7 @@ mod v2_5_goldens;
 mod v2_7_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
-pub use config_watcher::ConfigWatcher;
+pub use config_watcher::{ConfigWatcher, PreparedReloadAdmission};
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
@@ -17072,6 +17072,7 @@ impl Services {
         &self,
         text: String,
         expected: Arc<SettingsSnapshot>,
+        mut admission: PreparedReloadAdmission,
     ) -> Result<SettingsChanged> {
         let registry = self
             .settings_registry
@@ -17081,33 +17082,40 @@ impl Services {
         let relevant = candidate.snapshot().effective.source_control.gitlab
             != registry.snapshot().effective.source_control.gitlab;
         let credential_guard = if relevant {
-            Some(self.gitlab_credential_gate.lock().await)
+            Some(admission.wait(self.gitlab_credential_gate.lock()).await?)
         } else {
             None
         };
-        let revision_guard = self.settings_revision_gate.write().await;
-        let write = if self.gitlab_credential_gate.has_settings_boundary() {
-            credential_guard
-                .as_ref()
-                .map(|guard| {
-                    self.gitlab_credential_gate.prepare_settings(
-                        registry,
-                        candidate.snapshot(),
-                        guard,
-                    )
-                })
-                .transpose()?
-        } else {
-            None
-        };
-        let result = registry.publish_repository_reload(candidate, write.as_deref());
-        if let Ok(notice) = &result {
-            self.apply_external_settings_change(notice).await;
-        }
-        drop(revision_guard);
-        self.settle_gitlab_repository_settings(write.as_deref(), result.is_ok(), false)
-            .await;
-        result
+        let revision_guard = admission.wait(self.settings_revision_gate.write()).await?;
+        let (write, result) = admission.publish(|| {
+            let write = if self.gitlab_credential_gate.has_settings_boundary() {
+                credential_guard
+                    .as_ref()
+                    .map(|guard| {
+                        self.gitlab_credential_gate.prepare_settings(
+                            registry,
+                            candidate.snapshot(),
+                            guard,
+                        )
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            let result = registry.publish_repository_reload(candidate, write.as_deref());
+            Ok((write, result))
+        })?;
+        admission
+            .finish(async {
+                if let Ok(notice) = &result {
+                    self.apply_external_settings_change(notice).await;
+                }
+                drop(revision_guard);
+                self.settle_gitlab_repository_settings(write.as_deref(), result.is_ok(), false)
+                    .await;
+                result
+            })
+            .await
     }
 
     /// Apply an **externally driven** settings change (config.toml
