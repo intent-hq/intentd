@@ -394,7 +394,8 @@ import subprocess,os,pathlib,time
 child=subprocess.Popen(['/bin/sleep','120'],start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 root=pathlib.Path(os.environ['HOME'])
 controlled=(root/'hold-publication').exists()
-with (root/'detached-pid').open('w') as output:
+staging=root/'detached-pid.staging'
+with staging.open('w') as output:
     if controlled:
         (root/'publication-entered').touch()
         deadline=time.monotonic()+2
@@ -402,6 +403,7 @@ with (root/'detached-pid').open('w') as output:
             if time.monotonic()>=deadline: raise RuntimeError('publication barrier expired')
             time.sleep(0.005)
     output.write(str(child.pid))
+os.replace(staging,root/'detached-pid')
 if controlled: (root/'publication-finished').touch()
 if os.environ['VERSION_MODE']!='success':time.sleep(120)
 print('2.0.0 (Claude Code)')
