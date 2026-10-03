@@ -1612,6 +1612,74 @@ async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
     want_obj.insert("waitingForAgentIds".into(), json!([]));
     assert_eq!(snap["params"]["snapshot"], want);
 
+    // Keep a larger window through explicit invalidation on the same subscription.
+    send(
+        &mut sub_write,
+        &json!({"jsonrpc":"2.0", "id":2, "method":"chat.subscribe",
+        "params":{"agentId":agent_id, "limit":50, "replaceGroup":"configured"}})
+        .to_string(),
+    )
+    .await;
+    let configured_response = read_json(&mut sub_reader).await;
+    assert_eq!(configured_response["id"], 2);
+    let configured_id = configured_response["result"]["subscriptionId"].clone();
+    let configured = read_json(&mut sub_reader).await;
+    let rows = configured["params"]["snapshot"]["messages"]
+        .as_array()
+        .unwrap();
+    assert_eq!(rows.len(), 50);
+    assert_eq!(rows[0]["seq"], 70);
+    assert_eq!(rows[49]["seq"], 119);
+
+    // Invalid requests must fail before replacing the existing group.
+    send(
+        &mut sub_write,
+        &json!({"jsonrpc":"2.0", "id":3, "method":"chat.subscribe",
+        "params":{"agentId":agent_id, "limit":0, "replaceGroup":"configured"}})
+        .to_string(),
+    )
+    .await;
+    let invalid = read_json(&mut sub_reader).await;
+    assert_eq!(invalid["id"], 3);
+    assert_eq!(invalid["error"]["code"], -32602);
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        intent_core::events::AGENT_UPDATED,
+        json!({"agentId":agent_id, "replacedCount":1}),
+    )
+    .await;
+    let mut recovered = std::collections::HashMap::new();
+    for _ in 0..2 {
+        let push = read_json(&mut sub_reader).await;
+        assert_eq!(push["params"]["kind"], "snapshot");
+        assert_eq!(push["params"]["seq"], 1);
+        assert_eq!(push["params"]["snapshot"]["resumed"], false);
+        recovered.insert(
+            push["params"]["subscriptionId"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            push,
+        );
+    }
+    assert_eq!(
+        recovered[configured_id.as_str().unwrap()]["params"]["snapshot"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        50
+    );
+    assert_eq!(
+        recovered[resp["result"]["subscriptionId"].as_str().unwrap()]["params"]["snapshot"]
+            ["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }
@@ -1654,6 +1722,19 @@ async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
 
     // A persisted user message anchors the seq-0 snapshot.
     let store = bus.store();
+    for seq in 0..60 {
+        store
+            .append_agent_message_with_id(
+                &AgentId::from(agent_id.as_str()),
+                &format!("history-{seq}"),
+                "user",
+                &json!([{"type":"text", "text":"history"}]),
+                None,
+                &now_iso(),
+            )
+            .await
+            .expect("append history");
+    }
     let user_id = Uuid::now_v7().to_string();
     store
         .append_agent_message_with_id(
@@ -1673,7 +1754,7 @@ async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
         &mut sub_write,
         &serde_json::to_string(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
-            "params": { "agentId": agent_id }
+            "params": { "agentId": agent_id, "limit": 50 }
         }))
         .unwrap(),
     )
@@ -1683,6 +1764,14 @@ async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
     let snap = read_json(&mut sub_reader).await;
     assert_eq!(snap["params"]["kind"], "snapshot");
     assert_eq!(snap["params"]["seq"], 0);
+
+    assert_eq!(
+        snap["params"]["snapshot"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        50
+    );
 
     // The turn starts normally: the first chunk arrives as delta seq 1.
     let mid = Uuid::now_v7().to_string();
@@ -1793,7 +1882,13 @@ async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
     let messages = recovery["params"]["snapshot"]["messages"]
         .as_array()
         .unwrap();
-    assert_eq!(messages.len(), 2, "user + persisted assistant message");
+    assert_eq!(
+        messages.len(),
+        50,
+        "lag recovery retains the requested window"
+    );
+    assert_eq!(messages[0]["seq"], 12);
+    assert_eq!(messages[49]["id"], mid);
     assert!(
         messages.iter().all(|m| m.get("isStreaming").is_none()),
         "the recovered transcript is not stranded mid-turn"

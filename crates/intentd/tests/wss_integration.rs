@@ -17927,6 +17927,39 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     );
     assert_eq!(fallback["nextToken"], snapshot["nextToken"]);
 
+    // An explicit subscription limit selects the newest requested window.
+    for (limit, count) in [
+        (json!(50), 50),
+        (json!(1), 1),
+        (json!(200), 120),
+        (Value::Null, 5),
+    ] {
+        let request = json!({"jsonrpc":"2.0", "id":42, "method":"chat.subscribe",
+            "params":{"agentId":agent_id, "limit":limit}});
+        let configured =
+            chat_subscribe_snapshot(srv.port, srv.cfg.clone(), &request.to_string(), 42).await;
+        let messages = configured["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), count, "limit={limit}: {configured}");
+        assert_eq!(messages[0]["seq"], 120 - count);
+        assert_eq!(messages[count - 1]["seq"], 119);
+        assert_eq!(configured["truncated"], count < 120);
+    }
+    for limit in [
+        json!(0),
+        json!(-1),
+        json!(201),
+        json!(1.5),
+        json!("50"),
+        json!(true),
+    ] {
+        let request = json!({"jsonrpc":"2.0", "id":43, "method":"chat.subscribe",
+            "params":{"agentId":agent_id, "limit":limit}});
+        let invalid = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+        assert_eq!(invalid["jsonrpc"], "2.0");
+        assert_eq!(invalid["id"], 43);
+        assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    }
+
     // Hydration regression: corrupt every row OLDER than the newest bounded
     // page — any path that fetches/decodes them now fails hard.
     sqlx::query("UPDATE agent_message SET content = 'not-json{' WHERE agent_id = ? AND seq < 70")
@@ -18326,7 +18359,7 @@ async fn wss_slim_conversation_pages_are_byte_budgeted() {
         srv.port,
         srv.cfg.clone(),
         &format!(
-            r#"{{"jsonrpc":"2.0","id":4,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","projection":"slim"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":4,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","projection":"slim","limit":50}}}}"#
         ),
         4,
     )
