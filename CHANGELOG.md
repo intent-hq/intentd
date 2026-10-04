@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.10] - 2026-10-04
+
+### 🚀 Features
+
+- Expose authoritative submission correlation for optimistic display ([#2271](https://github.com/intent-hq/intentd/pull/2271))
+
+
 ## [0.10.9] - 2026-10-04
 
 ### 🚀 Features
