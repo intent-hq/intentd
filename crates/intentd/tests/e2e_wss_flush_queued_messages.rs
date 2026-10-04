@@ -2323,6 +2323,11 @@ async fn self_queue_reads_do_not_reveal_or_consume_pending_messages_over_wss() {
         const hook = await ws.hook.schedule({name:'Self queue read probe', delayMs:10000, ttlMs:10000,
             code: `const q = await ws.agent.getQueue('${target.id}');
                 const d = await ws.agent.diagnostics();
+                const row = d.diagnostics.queues.find(q => q.agentId === '${target.id}');
+                if (row.queueLength !== 2 || row.entries.length !== 0 || !d.text.includes('contents hidden'))
+                    throw new Error('hook diagnostics lost count or visibility notice');
+                if (d.diagnostics.stuckRisks.some(r => r.type === 'stale-queue-entry' && r.agentId === '${target.id}'))
+                    throw new Error('fresh active owner queue incorrectly flagged stale');
                 const e = await ws.event.query({eventType:'agent:queue:*'});
                 if (!q.refused || q.queueLength !== 2 || JSON.stringify({q,d,e}).includes(['PENDING','WSS','SECRET'].join('-')))
                     throw new Error('hook self queue leaked');

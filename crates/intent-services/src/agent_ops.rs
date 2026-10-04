@@ -13250,14 +13250,6 @@ impl Services {
                 q.insert("agentName".into(), json!(s.name));
             }
             q.insert("queueLength".into(), json!(entries.len()));
-            // Keep the real count, but remove every payload-bearing field
-            // before diagnostics (including its text) is assembled.
-            let entries =
-                if intent_core::queue_contents_visible_to(caller.as_ref(), &AgentId(id.clone())) {
-                    entries
-                } else {
-                    Vec::new()
-                };
             q.insert("entries".into(), Value::Array(entries));
             queues.push(Value::Object(q));
         }
@@ -13427,6 +13419,15 @@ impl Services {
                 "ageMs": oldest_age,
                 "count": stale.len(),
             }));
+        }
+        // Derive content-free stale risks before hiding recipient entries.
+        // Keep queue counts, but remove payloads before assembling either
+        // structured diagnostics or its text (including for owner hooks).
+        for q in &mut queues {
+            let aid = AgentId::from(q["agentId"].as_str().unwrap_or_default());
+            if !intent_core::queue_contents_visible_to(caller.as_ref(), &aid) {
+                q["entries"] = json!([]);
+            }
         }
         for sub in &subscriptions {
             if sub["orphaned"].as_bool() == Some(true) {
