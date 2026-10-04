@@ -20,7 +20,7 @@ impl Store {
         }
         let now = i64::try_from(intent_core::now_epoch_ms()).map_err(|_| invalid())?;
         let mut tx = self
-            .write_pool()
+            .artifact_pool()?
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_error)?;

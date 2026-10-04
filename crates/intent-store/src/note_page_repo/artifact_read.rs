@@ -17,8 +17,8 @@ pub struct ArtifactJournalRecord {
 impl Store {
     /// Read one accepted record through an active consumer lease. A trusted
     /// profile selector supplies its indexed ordinal; no preceding records are
-    /// enumerated. Source and lease authorization share the record read's SQL
-    /// snapshot, and runtime expiry is checked again before returning bytes.
+    /// enumerated. A main writer guard keeps source authority stable through the
+    /// arena read transaction; runtime expiry is rechecked before returning bytes.
     /// This internal seam does not establish native index/profile completeness
     /// or expose an artifact RPC. Its caller owns response/frame admission.
     ///
@@ -42,7 +42,12 @@ impl Store {
         if token.1 != "r" || token.3 != 0 || uuid::Uuid::parse_str(lease).is_err() {
             return Err(invalid());
         }
-        let mut tx = self.read_pool().begin().await.map_err(db_error)?;
+        let mut source_guard = self
+            .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_error)?;
+        let mut tx = self.artifact_pool()?.begin().await.map_err(db_error)?;
         let job = sqlx::query("SELECT j.generation,j.header,j.runtime_id,j.expires_at FROM note_artifact_lease l JOIN note_artifact_job j ON j.generation=l.generation WHERE l.lease_id=? AND l.released=0 AND j.principal=? AND j.workspace_id=? AND j.source_snapshot=? AND j.state='admitted' AND j.cleanup_complete=0 AND l.final_digest=j.current_digest AND l.expires_at=j.expires_at")
             .bind(lease).bind(principal).bind(workspace_id).bind(&token.0)
             .fetch_optional(&mut *tx).await.map_err(db_error)?
@@ -56,7 +61,7 @@ impl Store {
         let header: ArtifactHeader = serde_json::from_str(job.try_get("header").map_err(db_error)?)
             .map_err(|_| Error::Internal("Invalid stored artifact header".into()))?;
         let source = self
-            .authorize_artifact_source_in(&mut tx, workspace_id, principal, &header)
+            .authorize_artifact_source_in(&mut source_guard, workspace_id, principal, &header)
             .await?;
         let generation: String = job.try_get("generation").map_err(db_error)?;
         // Exact primary-key lookup: no artifact hydration, offset or prefix scan.
@@ -73,7 +78,7 @@ impl Store {
                 })
             })
             .transpose()?;
-        tx.commit().await.map_err(db_error)?;
+        Self::commit_artifact_with_source_guard(source_guard, tx, source.clone()).await?;
         self.note_pages.snapshot(
             &source.snapshot_id,
             workspace_id,

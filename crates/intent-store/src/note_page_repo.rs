@@ -1,6 +1,8 @@
 //! Bounded reads over write-maintained indexes. Tokens are authenticated with a
 //! persistent database secret, while bounded snapshot leases are process-local.
 mod artifact;
+mod artifact_arena;
+pub(crate) use artifact_arena::ArtifactArena;
 mod artifact_append;
 pub use artifact_append::ArtifactJournalRecordCost;
 mod artifact_begin;
@@ -37,6 +39,15 @@ struct Snapshot {
     principal: String,
     born: Instant,
     expires: String,
+    pins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Debug)]
+pub(super) struct SnapshotPin(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for SnapshotPin {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg_attr(test, derive(Default))]
@@ -157,7 +168,7 @@ impl Runtime {
         }
         Ok(snapshot.clone())
     }
-    fn remember(&self, snapshot: Snapshot) -> Result<String> {
+    fn remember(&self, mut snapshot: Snapshot) -> Result<String> {
         let mut snapshots = self
             .snapshots
             .lock()
@@ -166,15 +177,32 @@ impl Runtime {
         if snapshots.len() >= MAX_SNAPSHOTS {
             if let Some(id) = snapshots
                 .iter()
+                .filter(|(_, s)| s.pins.load(std::sync::atomic::Ordering::Relaxed) == 0)
                 .min_by_key(|(_, s)| s.born)
                 .map(|(id, _)| id.clone())
             {
                 snapshots.remove(&id);
+            } else {
+                return Err(failure(NotePageError::Budget));
             }
         }
         let id = uuid::Uuid::new_v4().simple().to_string();
+        snapshot.pins = std::sync::Arc::default();
         snapshots.insert(id.clone(), snapshot);
         Ok(id)
+    }
+    fn pin_snapshot(&self, id: &str) -> Result<std::sync::Arc<SnapshotPin>> {
+        let snapshots = self.snapshots.lock().map_err(|_| invalid())?;
+        let snapshot = snapshots
+            .get(id)
+            .ok_or_else(|| failure(NotePageError::Expired))?;
+        if snapshot.born.elapsed().as_secs() >= SNAPSHOT_SECONDS {
+            return Err(failure(NotePageError::Expired));
+        }
+        snapshot
+            .pins
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(std::sync::Arc::new(SnapshotPin(snapshot.pins.clone())))
     }
     fn reference(&self, snapshot: &str, raw: &str) -> String {
         let (collection, offset) = raw.split_once('@').map_or((raw, 0), |(c, n)| {
@@ -393,6 +421,7 @@ impl Store {
             principal: principal.into(),
             born: Instant::now(),
             expires: intent_core::iso_ms_from_now(300_000),
+            pins: std::sync::Arc::default(),
         });
         let snapshot_id = match snapshot_id {
             Some(id) => id.into(),
@@ -888,6 +917,7 @@ mod lifetime_tests {
             principal: "alice".into(),
             born: Instant::now(),
             expires: "fixed".into(),
+            pins: std::sync::Arc::default(),
         };
         let id = runtime.remember(snapshot.clone()).unwrap();
         let value = Token(
@@ -943,6 +973,17 @@ mod lifetime_tests {
             runtime.snapshot(&id, "ws", "n", "alice"),
             Err(Error::NotePage(NotePageError::Expired))
         ));
+        let pinned_id = runtime.remember(snapshot.clone()).unwrap();
+        let pin = runtime.pin_snapshot(&pinned_id).unwrap();
+        for _ in 0..MAX_SNAPSHOTS {
+            runtime.remember(snapshot.clone()).unwrap();
+        }
+        assert!(runtime.snapshot(&pinned_id, "ws", "n", "alice").is_ok());
+        drop(pin);
+        for _ in 0..MAX_SNAPSHOTS {
+            runtime.remember(snapshot.clone()).unwrap();
+        }
+        assert!(runtime.snapshot(&pinned_id, "ws", "n", "alice").is_err());
         for encoded in [&legacy, &compact] {
             let token = runtime.decode(encoded).unwrap();
             assert!(matches!(

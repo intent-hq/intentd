@@ -40,8 +40,13 @@ impl Store {
             return Err(invalid());
         }
         // A managed transaction also rolls back if this future is cancelled.
-        let mut connection = self
+        let mut source_guard = self
             .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_error)?;
+        let mut connection = self
+            .artifact_pool()?
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_error)?;
@@ -57,7 +62,7 @@ impl Store {
             // Revalidate after obtaining the writer lock, even for an identical
             // replay. An earlier read grant is not mutation authority.
             let source = self.authorize_artifact_source_in(
-                &mut connection, workspace_id, principal, &request.header,
+                &mut source_guard, workspace_id, principal, &request.header,
             ).await?;
             let source_expiry = intent_core::parse_iso(&source.expires_at).ok_or_else(invalid)?;
             let now = intent_core::parse_iso(&intent_core::now_iso()).ok_or_else(invalid)?;
@@ -67,7 +72,7 @@ impl Store {
             if let Some(row) = existing {
                 // Preserve the original state/receipt and reservation. In
                 // particular, aborted/released jobs never become building again.
-                return status(&self.note_pages, &row);
+                return status(&self.note_pages, &row).map(|state| (state, source));
             }
             let generation = uuid::Uuid::new_v4().simple().to_string();
             let reservation = &request.header.reservation;
@@ -88,10 +93,10 @@ impl Store {
             if intent_core::now_epoch_ms() >= u64::try_from(expires_at).map_err(|_| invalid())? {
                 return Err(invalid());
             }
-            status(&self.note_pages, &row)
+            status(&self.note_pages, &row).map(|state| (state, source))
         }.await;
-        let state = result?;
-        connection.commit().await.map_err(db_error)?;
+        let (state, source) = result?;
+        Self::commit_artifact_with_source_guard(source_guard, connection, source).await?;
         Ok(state)
     }
 }

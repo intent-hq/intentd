@@ -85,7 +85,7 @@ impl Store {
             .bind(principal)
             .bind(workspace_id)
             .bind(job_id)
-            .fetch_optional(self.read_pool())
+            .fetch_optional(self.artifact_pool()?)
             .await
             .map_err(db_error)?;
         let Some(row) = row else { return Ok(None) };
@@ -122,7 +122,7 @@ impl Store {
         // The guard rolls back even if cancellation interrupts BEGIN or a later
         // SQL await; a raw BEGIN can leave the sole pooled writer in a transaction.
         let mut connection = self
-            .write_pool()
+            .artifact_pool()?
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_error)?;
@@ -178,7 +178,7 @@ impl Store {
         // retires only this lease. Repeated release matches the retained row.
         let changed = sqlx::query("UPDATE note_artifact_lease SET released=1 WHERE lease_id=? AND generation IN (SELECT generation FROM note_artifact_job WHERE principal=? AND workspace_id=? AND source_snapshot=?)")
             .bind(lease).bind(principal).bind(workspace_id).bind(&token.0)
-            .execute(self.write_pool()).await.map_err(db_error)?;
+            .execute(self.artifact_pool()?).await.map_err(db_error)?;
         if changed.rows_affected() == 0 {
             return Err(Error::NotFound("Artifact lease not found".into()));
         }
@@ -196,25 +196,29 @@ mod tests {
         let store = Store::open(&directory.path().join("artifact.sqlite"))
             .await
             .unwrap();
+        store
+            .configure_note_artifact_arena(&directory.path().join("arena.sqlite"), 1024)
+            .await
+            .unwrap();
         for (kind, id) in [("global", ""), ("principal", "alice"), ("workspace", "ws")] {
             sqlx::query("INSERT INTO note_artifact_capacity(scope_kind,scope_id,payload_limit,record_limit,index_limit,storage_limit,job_limit) VALUES (?,?,100,1,1,4096,1)")
-                .bind(kind).bind(id).execute(store.write_pool()).await.unwrap();
+                .bind(kind).bind(id).execute(store.artifact_pool().unwrap()).await.unwrap();
         }
         let digest = "0".repeat(64);
         let generation = "00000000000000000000000000000001";
         let snapshot = "00000000000000000000000000000002";
         let lease = "00000000000000000000000000000003";
         sqlx::query("INSERT INTO note_artifact_job(principal,workspace_id,job_id,generation,runtime_id,header_digest,header,source_snapshot,source_revision,note_id,note_instance_id,source_collection,state,expires_at,status_until,payload_limit,record_limit,index_limit,storage_limit,current_digest) VALUES ('alice','ws','job',?,'runtime',?,'{}',?,'revision','note','instance','f:source','building',100,200,100,1,1,4096,?)")
-            .bind(generation).bind(&digest).bind(snapshot).bind(&digest).execute(store.write_pool()).await.unwrap();
+            .bind(generation).bind(&digest).bind(snapshot).bind(&digest).execute(store.artifact_pool().unwrap()).await.unwrap();
         sqlx::query("INSERT INTO note_artifact_record(generation,sequence,previous_digest,digest,record,index_charge,storage_charge,is_manifest) VALUES (?,0,?,?,'{}',1,100,1)")
-            .bind(generation).bind(&digest).bind(&digest).execute(store.write_pool()).await.unwrap();
+            .bind(generation).bind(&digest).bind(&digest).execute(store.artifact_pool().unwrap()).await.unwrap();
         sqlx::query("UPDATE note_artifact_job SET state='sealed' WHERE generation=?")
             .bind(generation)
-            .execute(store.write_pool())
+            .execute(store.artifact_pool().unwrap())
             .await
             .unwrap();
         sqlx::query("INSERT INTO note_artifact_lease(generation,admission_id,lease_id,final_digest,expires_at) VALUES (?,'admission',?,?,100)")
-            .bind(generation).bind(lease).bind(&digest).execute(store.write_pool()).await.unwrap();
+            .bind(generation).bind(lease).bind(&digest).execute(store.artifact_pool().unwrap()).await.unwrap();
         let reference = store.note_pages.reference(snapshot, &format!("l:{lease}"));
         for (principal, workspace) in [("bob", "ws"), ("alice", "other")] {
             assert!(store
@@ -236,12 +240,12 @@ mod tests {
             .is_err());
         assert!(
             sqlx::query("UPDATE note_artifact_job SET cleanup_complete=1")
-                .execute(store.write_pool())
+                .execute(store.artifact_pool().unwrap())
                 .await
                 .is_err()
         );
         let before: i64 = sqlx::query_scalar("SELECT released FROM note_artifact_lease")
-            .fetch_one(store.read_pool())
+            .fetch_one(store.artifact_pool().unwrap())
             .await
             .unwrap();
         assert_eq!(before, 0);
@@ -253,7 +257,7 @@ mod tests {
                 .unwrap();
         }
         let row = sqlx::query("SELECT j.state,j.cleanup_complete,j.storage_charge,l.released,l.lease_id,l.admission_id FROM note_artifact_job j JOIN note_artifact_lease l USING(generation)")
-            .fetch_one(store.read_pool()).await.unwrap();
+            .fetch_one(store.artifact_pool().unwrap()).await.unwrap();
         assert_eq!(row.get::<String, _>("state"), "admitted");
         assert_eq!(row.get::<i64, _>("cleanup_complete"), 0);
         assert_eq!(row.get::<i64, _>("storage_charge"), 100);
@@ -263,22 +267,22 @@ mod tests {
         // A simulated physical-owner acknowledgement may refund the logical
         // reservation after release without changing historical admission state.
         sqlx::query("UPDATE note_artifact_job SET cleanup_complete=1")
-            .execute(store.write_pool())
+            .execute(store.artifact_pool().unwrap())
             .await
             .unwrap();
         let state: String = sqlx::query_scalar("SELECT state FROM note_artifact_job")
-            .fetch_one(store.read_pool())
+            .fetch_one(store.artifact_pool().unwrap())
             .await
             .unwrap();
         assert_eq!(state, "admitted");
         let reserved: i64 =
             sqlx::query_scalar("SELECT sum(storage_reserved) FROM note_artifact_capacity")
-                .fetch_one(store.read_pool())
+                .fetch_one(store.artifact_pool().unwrap())
                 .await
                 .unwrap();
         assert_eq!(reserved, 0);
         assert!(sqlx::query("UPDATE note_artifact_lease SET released=0")
-            .execute(store.write_pool())
+            .execute(store.artifact_pool().unwrap())
             .await
             .is_err());
     }

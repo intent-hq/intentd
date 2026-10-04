@@ -101,6 +101,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("note_artifact_source", "derived canonical source grants rebuilt in the destination; artifact arena never transfers"),
     ("note_page_backend", "database-local namespace and authentication secret never transfer"),
     ("note_page_head", "fresh note incarnations created by import insert triggers"),
     ("note_page_piece", "derived source index rebuilt inside import transaction"),

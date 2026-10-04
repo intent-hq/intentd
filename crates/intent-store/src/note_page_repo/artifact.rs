@@ -19,6 +19,7 @@ pub struct ArtifactSourceGrant {
     pub source_collection: String,
     pub native_collection: String,
     pub expires_at: String,
+    _pin: std::sync::Arc<super::SnapshotPin>,
 }
 
 impl Store {
@@ -78,6 +79,7 @@ impl Store {
         {
             return Err(failure(NotePageError::CursorInvalid));
         }
+        let pin = self.note_pages.pin_snapshot(snapshot_id)?;
         let snapshot = self.note_pages.snapshot(
             snapshot_id,
             workspace_id,
@@ -129,6 +131,7 @@ impl Store {
             source_collection: source.2,
             native_collection: owner.2,
             expires_at: snapshot.expires,
+            _pin: pin,
         })
     }
 }

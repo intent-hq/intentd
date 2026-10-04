@@ -28,6 +28,7 @@ pub struct ArtifactJournalLease {
 impl Store {
     async fn artifact_publication_job(
         &self,
+        source_guard: &mut SqliteConnection,
         tx: &mut SqliteConnection,
         principal: &str,
         workspace_id: &str,
@@ -57,7 +58,7 @@ impl Store {
         let header: ArtifactHeader = serde_json::from_str(row.try_get("header").map_err(db_error)?)
             .map_err(|_| Error::Internal("Invalid stored artifact header".into()))?;
         let source = self
-            .authorize_artifact_source_in(tx, workspace_id, principal, &header)
+            .authorize_artifact_source_in(source_guard, workspace_id, principal, &header)
             .await?;
         self.artifact_publication_current(principal, &state, &source)?;
         Ok((state, source))
@@ -97,13 +98,24 @@ impl Store {
         request: &ArtifactSeal,
     ) -> Result<ArtifactJournalStatus> {
         request.validate().map_err(|_| invalid())?;
-        let mut tx = self
+        let mut source_guard = self
             .write_pool()
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_error)?;
+        let mut tx = self
+            .artifact_pool()?
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_error)?;
         let (mut state, source) = self
-            .artifact_publication_job(&mut tx, principal, workspace_id, &request.job_ref)
+            .artifact_publication_job(
+                &mut source_guard,
+                &mut tx,
+                principal,
+                workspace_id,
+                &request.job_ref,
+            )
             .await?;
         if state.current_digest != request.final_digest
             || state.next_sequence != super::signed(request.expected_records)?
@@ -131,7 +143,7 @@ impl Store {
             _ => return Err(invalid()),
         }
         self.artifact_publication_current(principal, &state, &source)?;
-        tx.commit().await.map_err(db_error)?;
+        Self::commit_artifact_with_source_guard(source_guard, tx, source).await?;
         Ok(state)
     }
 
@@ -150,13 +162,24 @@ impl Store {
         request: &ArtifactAdmit,
     ) -> Result<ArtifactJournalLease> {
         request.validate().map_err(|_| invalid())?;
-        let mut tx = self
+        let mut source_guard = self
             .write_pool()
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_error)?;
+        let mut tx = self
+            .artifact_pool()?
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_error)?;
         let (state, source) = self
-            .artifact_publication_job(&mut tx, principal, workspace_id, &request.job_ref)
+            .artifact_publication_job(
+                &mut source_guard,
+                &mut tx,
+                principal,
+                workspace_id,
+                &request.job_ref,
+            )
             .await?;
         if state.current_digest != request.final_digest {
             return Err(Error::InvalidParams(
@@ -197,7 +220,7 @@ impl Store {
         };
         let receipt = self.artifact_lease_receipt(&state, &source, &row)?;
         self.artifact_publication_current(principal, &state, &source)?;
-        tx.commit().await.map_err(db_error)?;
+        Self::commit_artifact_with_source_guard(source_guard, tx, source).await?;
         Ok(receipt)
     }
 

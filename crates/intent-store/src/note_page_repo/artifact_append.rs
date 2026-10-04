@@ -48,8 +48,13 @@ impl Store {
         if token.1 != "r" || token.3 != 0 || uuid::Uuid::parse_str(generation).is_err() {
             return Err(invalid());
         }
-        let mut tx = self
+        let mut source_guard = self
             .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_error)?;
+        let mut tx = self
+            .artifact_pool()?
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_error)?;
@@ -76,7 +81,7 @@ impl Store {
         let header: ArtifactHeader = serde_json::from_str(row.try_get("header").map_err(db_error)?)
             .map_err(|_| Error::Internal("Invalid stored artifact header".into()))?;
         let source = self
-            .authorize_artifact_source_in(&mut tx, workspace_id, principal, &header)
+            .authorize_artifact_source_in(&mut source_guard, workspace_id, principal, &header)
             .await?;
         let sequence = super::signed(request.sequence)?;
         let old = sqlx::query("SELECT r.previous_digest,r.digest,r.record,a.accepted_bytes FROM note_artifact_record r JOIN note_artifact_ack a USING(generation,sequence) WHERE r.generation=? AND r.sequence=?")
@@ -126,7 +131,7 @@ impl Store {
         {
             return Err(invalid());
         }
-        tx.commit().await.map_err(db_error)?;
+        Self::commit_artifact_with_source_guard(source_guard, tx, source).await?;
         Ok(receipt)
     }
 }

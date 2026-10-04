@@ -370,6 +370,7 @@ pub struct Store {
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
     note_pages: std::sync::Arc<note_page_repo::Runtime>,
+    artifact_arena: std::sync::Arc<tokio::sync::OnceCell<note_page_repo::ArtifactArena>>,
     #[cfg(test)]
     export_author_barrier: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
@@ -444,6 +445,7 @@ impl Store {
         Ok(Self {
             repository_lifecycle,
             note_pages,
+            artifact_arena: std::sync::Arc::default(),
             write_pool,
             read_pool,
             browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
@@ -611,6 +613,9 @@ impl Store {
     /// This ensures WAL changes are visible to subsequent daemon instances
     /// (regression: persisted settings must survive app relaunches in sidecar mode).
     pub async fn close(&self) {
+        if let Some(arena) = self.artifact_arena.get() {
+            arena.pool.close().await;
+        }
         let started = std::time::Instant::now();
         self.log_close_phase("wal_checkpoint", "started", 0);
         // Best-effort WAL checkpoint before closing the pools (via write pool).

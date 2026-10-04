@@ -7264,6 +7264,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
     };
     let store = Store {
         note_pages: std::sync::Arc::default(),
+        artifact_arena: std::sync::Arc::default(),
         write_pool,
         read_pool: crate::connect_read(&tmp.path)
             .await

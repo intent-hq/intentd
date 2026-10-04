@@ -451,6 +451,7 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
     legacy.run(&pool).await.unwrap();
     let store = Store {
         note_pages: std::sync::Arc::default(),
+        artifact_arena: std::sync::Arc::default(),
         write_pool: pool,
         read_pool: crate::connect_read(&tmp.path).await.unwrap(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),

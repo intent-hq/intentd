@@ -2303,6 +2303,10 @@ async fn artifact_begin_fixture() -> (
     intent_core::note_artifact::request::ArtifactBegin,
 ) {
     let (store, temporary, note) = setup("```diff\n-old\n+new\n```\n").await;
+    store
+        .configure_note_artifact_arena(&temporary.path.with_extension("artifacts.sqlite"), 1024)
+        .await
+        .unwrap();
     let first = page(&store, json!({"kind":"source"})).await;
     let context = page(
         &store,
@@ -2348,7 +2352,7 @@ async fn artifact_begin_fixture() -> (
         ("workspace", "pages"),
     ] {
         sqlx::query("INSERT INTO note_artifact_capacity(scope_kind,scope_id,payload_limit,record_limit,index_limit,storage_limit,job_limit) VALUES (?,?,1024,2,2,4096,1)")
-            .bind(kind).bind(id).execute(store.write_pool()).await.unwrap();
+            .bind(kind).bind(id).execute(store.artifact_pool().unwrap()).await.unwrap();
     }
     (store, temporary, note, request)
 }
@@ -2420,7 +2424,7 @@ async fn artifact_begin_reserves_once_and_preserves_retired_replay() {
     assert_eq!(replay.state, "aborted");
     assert_eq!(replay.generation, first.generation);
     let rows = sqlx::query("SELECT jobs_reserved,payload_reserved,records_reserved,indexes_reserved,storage_reserved FROM note_artifact_capacity")
-        .fetch_all(store.read_pool()).await.unwrap();
+        .fetch_all(store.artifact_pool().unwrap()).await.unwrap();
     for row in rows {
         assert_eq!(row.get::<i64, _>("jobs_reserved"), 1);
         assert_eq!(row.get::<i64, _>("payload_reserved"), 1024);
@@ -2430,7 +2434,7 @@ async fn artifact_begin_reserves_once_and_preserves_retired_replay() {
     }
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_job")
-            .fetch_one(store.read_pool())
+            .fetch_one(store.artifact_pool().unwrap())
             .await
             .unwrap(),
         1
@@ -2467,14 +2471,14 @@ async fn artifact_begin_revalidates_source_after_waiting_for_writer() {
     assert!(admission.await.is_err());
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_job")
-            .fetch_one(store.read_pool())
+            .fetch_one(store.artifact_pool().unwrap())
             .await
             .unwrap(),
         0
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT sum(jobs_reserved) FROM note_artifact_capacity")
-            .fetch_one(store.read_pool())
+            .fetch_one(store.artifact_pool().unwrap())
             .await
             .unwrap(),
         0
@@ -2485,6 +2489,124 @@ async fn artifact_begin_revalidates_source_after_waiting_for_writer() {
         .begin_note_artifact_journal("alice", "pages", &request, artifact_retention(&request))
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn artifact_arena_commit_keeps_main_source_mutation_serialized() {
+    use std::future::Future as _;
+    let (store, _temporary, mut note, request) = artifact_begin_fixture().await;
+    let arena_io = store.artifact_pool().unwrap().acquire().await.unwrap();
+    let mut admission = Box::pin(store.begin_note_artifact_journal(
+        "alice",
+        "pages",
+        &request,
+        artifact_retention(&request),
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(admission.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            if store.write_pool().num_idle() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("admission did not acquire the main source guard");
+    note.title = "queued after source guard".into();
+    let mut edit = Box::pin(store.update_note(&note));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(edit.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    // Main readers retain progress while its writer guard waits for arena I/O.
+    let notes: i64 = sqlx::query_scalar("SELECT count(*) FROM note")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert!(notes > 0);
+    drop(arena_io);
+    let (admitted, edited) = tokio::join!(admission, edit);
+    assert_eq!(admitted.unwrap().state, "building");
+    edited.unwrap();
+    assert!(store
+        .begin_note_artifact_journal("alice", "pages", &request, artifact_retention(&request))
+        .await
+        .is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_job")
+            .fetch_one(store.artifact_pool().unwrap())
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn artifact_cancelled_commit_keeps_source_guard_until_worker_settles() {
+    let (store, _temporary, mut note, request) = artifact_begin_fixture().await;
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let mut reached_tx = Some(reached_tx);
+    let mut connection = store.artifact_pool().unwrap().acquire().await.unwrap();
+    connection
+        .lock_handle()
+        .await
+        .unwrap()
+        .set_commit_hook(move || {
+            if let Some(sender) = reached_tx.take() {
+                let _ = sender.send(());
+                return resume_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .is_ok();
+            }
+            true
+        });
+    drop(connection);
+    let mut admission = Box::pin(store.begin_note_artifact_journal(
+        "alice",
+        "pages",
+        &request,
+        artifact_retention(&request),
+    ));
+    let reached = tokio::select! {
+        result = tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx) => matches!(result, Ok(Ok(()))),
+        _ = &mut admission => false,
+    };
+    drop(admission);
+    assert!(
+        reached,
+        "admission did not reach the actual SQLite commit hook"
+    );
+    note.title = "edit after caller cancellation".into();
+    // COMMIT is physically paused in the SQLite worker. Cancelling its caller
+    // must not let the independent main writer mutate the authorized source.
+    let edit = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        store.update_note(&note),
+    )
+    .await;
+    let _ = resume_tx.send(());
+    let mut connection = store.artifact_pool().unwrap().acquire().await.unwrap();
+    connection.lock_handle().await.unwrap().remove_commit_hook();
+    drop(connection);
+    store.update_note(&note).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_job")
+            .fetch_one(store.artifact_pool().unwrap())
+            .await
+            .unwrap(),
+        1,
+    );
+    assert!(
+        edit.is_err(),
+        "main source changed before cancelled arena COMMIT settled"
+    );
 }
 
 #[tokio::test]
@@ -2531,14 +2653,14 @@ async fn artifact_begin_rejects_bad_integrity_and_source_deadline_without_chargi
     }
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_job")
-            .fetch_one(store.read_pool())
+            .fetch_one(store.artifact_pool().unwrap())
             .await
             .unwrap(),
         0
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT sum(jobs_reserved) FROM note_artifact_capacity")
-            .fetch_one(store.read_pool())
+            .fetch_one(store.artifact_pool().unwrap())
             .await
             .unwrap(),
         0
@@ -2549,6 +2671,10 @@ async fn artifact_begin_rejects_bad_integrity_and_source_deadline_without_chargi
         .unwrap();
     drop(store);
     let restarted = Store::open(&temporary.path).await.unwrap();
+    restarted
+        .configure_note_artifact_arena(&temporary.path.with_extension("artifacts.sqlite"), 1024)
+        .await
+        .unwrap();
     assert!(restarted
         .begin_note_artifact_journal("alice", "pages", &request, artifact_retention(&request))
         .await
@@ -2660,7 +2786,7 @@ async fn artifact_append_replays_original_ack_after_later_record_and_seal() {
         i64::try_from(record.len() + manifest.record.len()).unwrap()
     );
     sqlx::query("UPDATE note_artifact_job SET state='sealed'")
-        .execute(store.write_pool())
+        .execute(store.artifact_pool().unwrap())
         .await
         .unwrap();
     let replay = store
@@ -2684,7 +2810,7 @@ async fn artifact_append_replays_original_ack_after_later_record_and_seal() {
     assert_eq!(current.state, "sealed");
     assert_eq!(current.accepted_bytes, last.accepted_bytes);
     assert_eq!(current.current_digest, last.current_digest);
-    let totals = sqlx::query("SELECT count(*) AS records,sum(index_charge) AS indexes,sum(storage_charge) AS storage FROM note_artifact_record").fetch_one(store.read_pool()).await.unwrap();
+    let totals = sqlx::query("SELECT count(*) AS records,sum(index_charge) AS indexes,sum(storage_charge) AS storage FROM note_artifact_record").fetch_one(store.artifact_pool().unwrap()).await.unwrap();
     assert_eq!(totals.get::<i64, _>("records"), 2);
     assert_eq!(totals.get::<i64, _>("indexes"), 2);
     assert_eq!(totals.get::<i64, _>("storage"), 256);
@@ -2738,7 +2864,7 @@ async fn artifact_append_failure_cannot_mutate_accepted_prefix() {
     let row = sqlx::query(
         "SELECT next_sequence,accepted_bytes,index_entries,storage_charge FROM note_artifact_job",
     )
-    .fetch_one(store.read_pool())
+    .fetch_one(store.artifact_pool().unwrap())
     .await
     .unwrap();
     for field in [
@@ -2751,7 +2877,7 @@ async fn artifact_append_failure_cannot_mutate_accepted_prefix() {
     }
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_ack")
-            .fetch_one(store.read_pool())
+            .fetch_one(store.artifact_pool().unwrap())
             .await
             .unwrap(),
         0
@@ -2854,7 +2980,7 @@ async fn artifact_lease_record_read_is_scoped_indexed_and_revocable() {
         .await
         .is_err());
     let plan = sqlx::query("EXPLAIN QUERY PLAN SELECT previous_digest,digest,record FROM note_artifact_record WHERE generation=? AND sequence=?")
-        .bind(&lease.generation).bind(0_i64).fetch_all(store.read_pool()).await.unwrap();
+        .bind(&lease.generation).bind(0_i64).fetch_all(store.artifact_pool().unwrap()).await.unwrap();
     let details = plan
         .iter()
         .map(|row| row.get::<String, _>("detail"))
@@ -2916,6 +3042,13 @@ async fn artifact_record_reads_reject_abort_source_change_and_restart() {
             }
             "restart" => {
                 let restarted = crate::Store::open(&temporary.path).await.unwrap();
+                restarted
+                    .configure_note_artifact_arena(
+                        &temporary.path.with_extension("artifacts.sqlite"),
+                        1024,
+                    )
+                    .await
+                    .unwrap();
                 assert!(restarted
                     .read_note_artifact_journal_record("alice", "pages", &lease.artifact_ref, 0)
                     .await
@@ -3014,7 +3147,7 @@ async fn artifact_seal_and_admit_replay_cannot_revive_released_lease() {
     // Exercise the already-defined logical cleanup transition. This direct SQL
     // fixture does not claim actual file/arena physical reclamation.
     sqlx::query("UPDATE note_artifact_job SET cleanup_complete=1")
-        .execute(store.write_pool())
+        .execute(store.artifact_pool().unwrap())
         .await
         .unwrap();
     assert_eq!(
@@ -3034,14 +3167,14 @@ async fn artifact_seal_and_admit_replay_cannot_revive_released_lease() {
     assert_eq!(status.private_artifact_ref, sealed.private_artifact_ref);
     let row =
         sqlx::query("SELECT count(*) AS leases,sum(released) AS released FROM note_artifact_lease")
-            .fetch_one(store.read_pool())
+            .fetch_one(store.artifact_pool().unwrap())
             .await
             .unwrap();
     assert_eq!(row.get::<i64, _>("leases"), 1);
     assert_eq!(row.get::<i64, _>("released"), 1);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT sum(jobs_reserved) FROM note_artifact_capacity")
-            .fetch_one(store.read_pool())
+            .fetch_one(store.artifact_pool().unwrap())
             .await
             .unwrap(),
         0
@@ -3068,7 +3201,7 @@ async fn artifact_abort_and_admit_serialize_both_orders_without_reviving() {
                 .is_err());
             assert_eq!(
                 sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_lease")
-                    .fetch_one(store.read_pool())
+                    .fetch_one(store.artifact_pool().unwrap())
                     .await
                     .unwrap(),
                 0
@@ -3093,7 +3226,7 @@ async fn artifact_abort_and_admit_serialize_both_orders_without_reviving() {
             );
             assert_eq!(
                 sqlx::query_scalar::<_, i64>("SELECT released FROM note_artifact_lease")
-                    .fetch_one(store.read_pool())
+                    .fetch_one(store.artifact_pool().unwrap())
                     .await
                     .unwrap(),
                 1
@@ -3112,7 +3245,7 @@ async fn artifact_abort_and_admit_serialize_both_orders_without_reviving() {
         assert!(status.private_artifact_ref.is_none());
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT sum(jobs_reserved) FROM note_artifact_capacity")
-                .fetch_one(store.read_pool())
+                .fetch_one(store.artifact_pool().unwrap())
                 .await
                 .unwrap(),
             3
@@ -3140,13 +3273,17 @@ async fn artifact_publication_revalidates_source_after_private_seal() {
         .is_err());
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_lease")
-            .fetch_one(store.read_pool())
+            .fetch_one(store.artifact_pool().unwrap())
             .await
             .unwrap(),
         0
     );
     drop(store);
     let restarted = Store::open(&temporary.path).await.unwrap();
+    restarted
+        .configure_note_artifact_arena(&temporary.path.with_extension("artifacts.sqlite"), 1024)
+        .await
+        .unwrap();
     assert!(restarted
         .admit_note_artifact_journal("alice", "pages", &admit)
         .await
