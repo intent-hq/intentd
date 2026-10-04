@@ -11,6 +11,8 @@ use std::sync::{
     Arc,
 };
 
+mod artifact_crash;
+
 fn request(value: Value) -> NotePageRequest {
     serde_json::from_value(value).unwrap()
 }
