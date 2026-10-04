@@ -1173,7 +1173,7 @@ fn client_callable_universe() -> BTreeSet<String> {
 /// `voice.*`, `settings.*`, `repo.*` / `repoConfig.*`, `mcp.*`, `server.*`,
 /// `pairing.*`, `providers.setup.*`, `system.*` (but `system.capabilities`
 /// and `system.status`),
-/// `rules.*`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
+/// `rules.list` / `rules.update`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
 /// export / import / setup / browser-client pinning, `git.clone`,
 /// `git.agentCommit` (agent-only), agent creation / delegation (decided
 /// 2026-09-19: guests steer existing agents only — `agent.create`,
@@ -1326,7 +1326,6 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "repoConfig.get",
     "repoConfig.has",
     "repoConfig.save",
-    "rules.get",
     "rules.list",
     "rules.update",
     "sandbox.cow.discard",
@@ -1955,10 +1954,6 @@ mod unbound_owner_only_methods {
             (
                 "repoConfig.save",
                 json!({ "workspaceId": ws, "config": {} }),
-            ),
-            (
-                "rules.get",
-                json!({ "workspaceId": ws, "ruleType": "agents" }),
             ),
             ("rules.list", json!({})),
             (

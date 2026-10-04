@@ -18422,7 +18422,24 @@ impl WorkspaceApi for Services {
         rule_type: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            if workspace_id.as_str() == "global" && rule_type == "base-system-prompt" {
+                // Settings uses an exact placeholder, not a workspace. Recheck
+                // durable admission without exposing any other override or file.
+                if let Some(principal) = capability::gated_collaborator_caller("rules.get")? {
+                    if self.store.get_host_role(&principal).await? == intent_core::HostRole::Guest
+                        && !self.store.has_workspace_membership(&principal).await?
+                    {
+                        return Err(Error::Forbidden(
+                            "rules.get requires current admission".into(),
+                        ));
+                    }
+                }
+            } else {
+                // Guests gain only the settings read above, not the member
+                // workspace rules surface now reachable through the catalog.
+                self.require_host_execution("rules.get").await?;
+                self.require_member(&workspace_id).await?;
+            }
             rules::RulesService::new(&self.store).get(&rule_type).await
         })
     }
@@ -18435,7 +18452,8 @@ impl WorkspaceApi for Services {
         enabled: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            // All overrides are instance-wide, even with a real workspace ID.
+            Self::require_administrator("rules.update")?;
             let _revision_guard = self.settings_revision_gate.write().await;
             let path = ft_worktree(&self.store, &workspace_id).await;
             let (rules, changed) = rules::RulesService::new(&self.store)
@@ -18466,6 +18484,10 @@ impl WorkspaceApi for Services {
         // Decoration uses those resolved rows without further filesystem reads.
         let services = self.clone();
         Box::pin(async move {
+            if let Some(path) = workspace_path.as_deref() {
+                self.require_member_repo_path(path, "specialist.list")
+                    .await?;
+            }
             tokio::task::spawn_blocking(move || {
                 let provider = specialist_preview_provider(provider)?;
                 let ws_path = workspace_path.as_deref().map(Path::new);
@@ -18525,6 +18547,10 @@ impl WorkspaceApi for Services {
         // (monorepo#4148).
         let services = self.clone();
         Box::pin(async move {
+            if let Some(path) = workspace_path.as_deref() {
+                self.require_member_repo_path(path, "specialist.get")
+                    .await?;
+            }
             tokio::task::spawn_blocking(move || {
                 let provider = specialist_preview_provider(provider)?;
                 let ws_path = workspace_path.as_deref().map(Path::new);

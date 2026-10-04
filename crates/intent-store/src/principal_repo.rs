@@ -783,6 +783,18 @@ impl Store {
         rows.iter().map(map_member_row).collect()
     }
 
+    /// Whether a principal retains any workspace grant, without loading the roster.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn has_workspace_membership(&self, principal_id: &PrincipalId) -> Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_member WHERE principal_id = ?)")
+            .bind(&principal_id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("check principal membership failed: {e}")))
+    }
+
     /// A principal's role in a workspace; `None` when not a member.
     ///
     /// # Errors

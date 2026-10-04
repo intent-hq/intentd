@@ -388,7 +388,7 @@ async fn specialist_provider_explicit_choices_and_effort_stay_authoritative() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_provider_uses_merged_tiers_and_preserves_an_explicit_clear() {
     let (tmp, svc, ws) = setup().await;
     let root = tmp.path.parent().unwrap();
