@@ -1,5 +1,10 @@
 //! Isolated source lifecycle dispatcher. No Store access, generic router or String queue.
-use super::*;
+use super::{
+    cancelled, internal, watch, AsyncWriteExt, Context, CountedTcp, Duration, Error, Future,
+    Message, Result, Revocations, Shared, SinkExt, StreamExt, WebSocketStream,
+};
+#[cfg(test)]
+use super::{io, Arc, Ordering};
 use intent_core::note_source_session::{wire, SessionError};
 use intent_services::source_session::{Delivery, Open, SourceConnection, SourceWriter};
 use std::pin::Pin;
@@ -157,7 +162,7 @@ async fn wait_delivery<F: Future<Output = std::result::Result<Delivery, SessionE
     });
     #[cfg(test)]
     tokio::pin!(future);
-    match work(
+    if let Some(result) = work(
         future.as_mut(),
         ws,
         stop,
@@ -168,19 +173,22 @@ async fn wait_delivery<F: Future<Output = std::result::Result<Delivery, SessionE
     )
     .await
     {
-        Some(result) => result.map(Some).map_err(failure),
-        None => {
-            context.phase(6);
-            source.revoke();
-            drop(ws.take());
-            match future.await {
-                Ok(delivery) => delivery.discard().map_err(failure)?,
-                Err(error) => return Err(failure(error)),
-            }
-            Ok(None)
+        result.map(Some).map_err(failure)
+    } else {
+        context.phase(6);
+        source.revoke();
+        drop(ws.take());
+        match future.await {
+            Ok(delivery) => delivery.discard().map_err(failure)?,
+            Err(error) => return Err(failure(error)),
         }
+        Ok(None)
     }
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the delivery, connection, credential and borrowed transport owners explicit"
+)]
 async fn output(
     mut delivery: Delivery,
     source: &SourceConnection,
@@ -246,18 +254,15 @@ async fn output(
         Some(source),
     )
     .await;
-    let result = match authorized {
-        Some(result) => result,
-        None => {
-            context.phase(6);
-            source.revoke();
-            drop(ws.take());
-            let result = authorization.as_mut().await;
-            drop(authorization);
-            result?;
-            delivery.discard().map_err(failure)?;
-            return Ok(false);
-        }
+    let Some(result) = authorized else {
+        context.phase(6);
+        source.revoke();
+        drop(ws.take());
+        let result = authorization.as_mut().await;
+        drop(authorization);
+        result?;
+        delivery.discard().map_err(failure)?;
+        return Ok(false);
     };
     drop(authorization);
     #[cfg(test)]
@@ -384,6 +389,10 @@ async fn control(
         .map_err(internal)?;
     Ok(true)
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the admitted source, credential and borrowed transport owners explicit"
+)]
 pub(super) async fn run(
     shared: &Shared,
     context: &mut Context,
