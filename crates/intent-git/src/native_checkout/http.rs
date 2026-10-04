@@ -430,5 +430,22 @@ pub(super) fn push(
     }
     // This one requested ref is now confirmed; later caller retirement cannot
     // turn it into an unsent operation or trigger an automatic retry.
+    // Admit local bookkeeping under the original operation, then perform IO
+    // outside its metadata locks. Ref/admission failure cannot undo the ACK.
+    if source_matches(repo, source) {
+        let mut admitted = false;
+        let current = credential.with_current(&mut || {
+            admitted = true;
+            Ok(())
+        });
+        if current.is_ok() && admitted {
+            let _ = repo.reference(
+                &format!("refs/remotes/origin/{branch}"),
+                new,
+                true,
+                "confirmed native push",
+            );
+        }
+    }
     Ok(selection)
 }

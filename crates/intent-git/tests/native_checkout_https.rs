@@ -119,6 +119,10 @@ fn child(mode: &str) {
     match mode {
         "success"
         | "push"
+        | "push_first"
+        | "push_retire_before_refs"
+        | "push_first_retire_before_refs"
+        | "push_ref_locked"
         | "push_lost_response"
         | "fetch_redirect"
         | "push_redirect"
@@ -161,16 +165,58 @@ fn child(mode: &str) {
                 "local"
             );
             if mode.starts_with("push") {
+                let branch = if mode.starts_with("push_first") {
+                    repo.branch(
+                        "new/first-push",
+                        &repo.head().unwrap().peel_to_commit().unwrap(),
+                        false,
+                    )
+                    .unwrap();
+                    repo.set_head("refs/heads/new/first-push").unwrap();
+                    "new/first-push"
+                } else {
+                    &selection.branch
+                };
+                let tracking_ref = format!("refs/remotes/origin/{branch}");
+                let previous = repo.refname_to_id(&tracking_ref).ok();
                 let head = commit(&repo, false);
-                let pushed = push_original(
-                    &directory,
-                    &source,
-                    &selection.branch,
-                    false,
-                    &mut credential,
-                );
-                if mode == "push" {
+                let before = intent_git::status::status(&directory).unwrap();
+                assert_eq!(before.has_upstream, previous.is_some());
+                assert!(!intent_git::history::history(&directory, 1).unwrap()[0].is_pushed);
+                if mode.ends_with("retire_before_refs") {
+                    credential.mode = "retire_before_refs".into();
+                    credential.responses.set(0);
+                }
+                if mode == "push_ref_locked" {
+                    std::fs::write(repo.path().join(format!("{tracking_ref}.lock")), "held")
+                        .unwrap();
+                }
+                let pushed = push_original(&directory, &source, branch, false, &mut credential);
+                if matches!(
+                    mode,
+                    "push_first"
+                        | "push_retire_before_refs"
+                        | "push_first_retire_before_refs"
+                        | "push_ref_locked"
+                ) {
+                    let acknowledged = pushed.unwrap();
+                    assert_eq!(acknowledged.branch, branch);
+                    assert_eq!(acknowledged.commit_sha, head.to_string());
+                    if mode == "push_first" {
+                        assert_pushed(&directory, branch, head);
+                    } else {
+                        assert_eq!(repo.refname_to_id(&tracking_ref).ok(), previous);
+                        assert!(!intent_git::history::history(&directory, 1).unwrap()[0].is_pushed);
+                        if mode.ends_with("retire_before_refs") {
+                            assert!(
+                                credential.with_current(&mut || Ok(())).is_err(),
+                                "late delivery remains refused"
+                            );
+                        }
+                    }
+                } else if mode == "push" {
                     assert_eq!(pushed.unwrap().commit_sha, head.to_string());
+                    assert_pushed(&directory, branch, head);
                     let orphan = commit(&repo, true);
                     assert!(matches!(
                         push_original(
@@ -195,12 +241,14 @@ fn child(mode: &str) {
                         orphan.to_string()
                     );
                     assert_eq!(repo.head().unwrap().target(), Some(orphan));
+                    assert_pushed(&directory, branch, orphan);
                 } else {
                     assert!(pushed.is_err());
                     if mode == "push_lost_response" {
                         assert!(pushed.unwrap_err().to_string().contains("unknown"));
                     }
                     assert_eq!(repo.head().unwrap().target(), Some(head));
+                    assert_eq!(repo.refname_to_id(&tracking_ref).ok(), previous);
                 }
             }
             assert!(!REJECTED.with(std::cell::Cell::get));
@@ -228,6 +276,22 @@ fn child(mode: &str) {
     }
 }
 
+fn assert_pushed(path: &Path, branch: &str, acknowledged: git2::Oid) {
+    let repo = git2::Repository::open(path).unwrap();
+    assert_eq!(
+        repo.refname_to_id(&format!("refs/remotes/origin/{branch}"))
+            .unwrap(),
+        acknowledged
+    );
+    let status = intent_git::status::status(path).unwrap();
+    assert!(status.has_upstream);
+    assert_eq!(
+        (status.ahead, status.behind, status.unpushed_count),
+        (0, 0, Some(0))
+    );
+    assert!(intent_git::history::history(path, 1).unwrap()[0].is_pushed);
+}
+
 fn commit(repo: &git2::Repository, orphan: bool) -> git2::Oid {
     let old = repo.head().unwrap().peel_to_commit().unwrap();
     let signature = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
@@ -248,7 +312,7 @@ fn commit(repo: &git2::Repository, orphan: bool) -> git2::Oid {
         )
         .unwrap();
     repo.reference(
-        "refs/heads/feature/beyond-page-one",
+        repo.head().unwrap().name().unwrap(),
         new,
         true,
         "fixture commit",
@@ -537,12 +601,23 @@ async fn run(name: &str, mode: &str) {
     if mode == "retire_before_refs" {
         assert_eq!(requests.len(), 2);
     }
-    if mode == "push" || mode == "push_lost_response" {
+    if matches!(
+        mode,
+        "push"
+            | "push_first"
+            | "push_retire_before_refs"
+            | "push_first_retire_before_refs"
+            | "push_ref_locked"
+            | "push_lost_response"
+    ) {
         let repo =
             git2::Repository::open_bare(scratch.path().join("forge/team/project.git")).unwrap();
-        let remote = repo
-            .refname_to_id("refs/heads/feature/beyond-page-one")
-            .unwrap();
+        let branch = if mode.starts_with("push_first") {
+            "new/first-push"
+        } else {
+            "feature/beyond-page-one"
+        };
+        let remote = repo.refname_to_id(&format!("refs/heads/{branch}")).unwrap();
         assert_ne!(
             remote.to_string(),
             sha,
@@ -553,6 +628,10 @@ async fn run(name: &str, mode: &str) {
         mode,
         "success"
             | "push"
+            | "push_first"
+            | "push_retire_before_refs"
+            | "push_first_retire_before_refs"
+            | "push_ref_locked"
             | "push_lost_response"
             | "fetch_redirect"
             | "push_redirect"
@@ -759,6 +838,38 @@ async fn native_moved_selected_sha_refuses_before_pack_request() {
     run(
         "native_moved_selected_sha_refuses_before_pack_request",
         "sha_mismatch",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_first_push_creates_tracking_ref() {
+    run("native_first_push_creates_tracking_ref", "push_first").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirmed_native_push_survives_retired_ref_and_delivery_admission() {
+    run(
+        "confirmed_native_push_survives_retired_ref_and_delivery_admission",
+        "push_retire_before_refs",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirmed_native_first_push_does_not_publish_after_retirement() {
+    run(
+        "confirmed_native_first_push_does_not_publish_after_retirement",
+        "push_first_retire_before_refs",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirmed_native_push_survives_locked_tracking_ref() {
+    run(
+        "confirmed_native_push_survives_locked_tracking_ref",
+        "push_ref_locked",
     )
     .await;
 }
