@@ -167,6 +167,15 @@ fn repository(root: &Path) -> String {
 #[intent_test_macros::daemon_test]
 async fn checkout_legacy_local_repository_and_public_git_route_remain_available() {
     let h = Harness::with_workspace(false).await;
+    let initial_provider_calls = h
+        .server
+        .as_ref()
+        .unwrap()
+        .state
+        .routes
+        .lock()
+        .unwrap()
+        .clone();
     let selected = repository(h.dir.path());
     let source = h.dir.path().join("seed");
     let bare = h.dir.path().join("install/Team/Sub/Project.git");
@@ -211,9 +220,9 @@ async fn checkout_legacy_local_repository_and_public_git_route_remain_available(
         pushed
     );
     assert_eq!(
-        h.server.as_ref().unwrap().count(),
-        0,
-        "local Git does not consult configured GitLab credentials"
+        *h.server.as_ref().unwrap().state.routes.lock().unwrap(),
+        initial_provider_calls,
+        "local Git does not add provider requests after fixture authentication"
     );
     client.close().await;
     h.finish().await;
@@ -662,6 +671,7 @@ async fn checkout_original_tls_wire_direct_cached_exact_head_and_private_account
 async fn wait_for_file(path: &Path) {
     tokio::time::timeout(ACQUIRE, async {
         while !path.exists() {
+            // timing-guard: poll the owned child phase file within the original acquire deadline.
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
