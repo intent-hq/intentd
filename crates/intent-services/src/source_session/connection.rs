@@ -384,23 +384,33 @@ impl SourceConnection {
         let guard = Guard::new(owner.clone());
         let (tx, rx) = tokio::sync::oneshot::channel();
         let task_owner = owner.clone();
-        tokio::spawn(async move {
-            let mut guard = guard;
-            let result = pending.read.await.map_err(map_error);
-            if matches!(result, Err(SessionError::Uncertain)) {
-                task_owner.uncertain();
-            }
-            let delivery = Delivery::new(
-                task_owner,
-                result,
-                Some(pending.hold),
-                limit,
-                id,
-                read.sequence + 1,
-            );
-            guard.complete = true;
-            let _ = tx.send(delivery);
-        });
+        // caller-binding: allow — the submitted future binds the original admitted caller, never the ambient caller
+        tokio::spawn(intent_core::with_caller(
+            task_owner.caller.clone(),
+            async move {
+                #[cfg(test)]
+                assert_eq!(
+                    intent_core::current_caller(),
+                    Some(task_owner.caller.clone()),
+                    "source worker must retain its original caller"
+                );
+                let mut guard = guard;
+                let result = pending.read.await.map_err(map_error);
+                if matches!(result, Err(SessionError::Uncertain)) {
+                    task_owner.uncertain();
+                }
+                let delivery = Delivery::new(
+                    task_owner,
+                    result,
+                    Some(pending.hold),
+                    limit,
+                    id,
+                    read.sequence + 1,
+                );
+                guard.complete = true;
+                let _ = tx.send(delivery);
+            },
+        ));
         Ok(AwaitDelivery::new(owner, rx))
     }
 

@@ -194,7 +194,14 @@ impl Owner {
         let owner = self.clone();
         let guard = Guard::new(owner.clone());
         let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
+        // caller-binding: allow — the submitted future binds the original admitted caller, never the ambient caller
+        tokio::spawn(intent_core::with_caller(owner.caller.clone(), async move {
+            #[cfg(test)]
+            assert_eq!(
+                intent_core::current_caller(),
+                Some(owner.caller.clone()),
+                "source worker must retain its original caller"
+            );
             let mut guard = guard;
             let result = intent_core::with_caller(
                 owner.caller.clone(),
@@ -240,7 +247,7 @@ impl Owner {
             let delivery = Delivery::new(owner.clone(), outcome, hold, 4096, id, 0);
             guard.complete = true;
             let _ = tx.send(delivery);
-        });
+        }));
         AwaitDelivery::new(self.clone(), rx)
     }
 }

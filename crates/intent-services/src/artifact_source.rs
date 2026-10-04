@@ -392,7 +392,14 @@ impl Services {
         let runtime = tokio::runtime::Handle::current();
         let (tx, rx) = oneshot::channel();
         // Cancellation of open cannot detach SQL from its admission/pin owner.
-        tokio::spawn(async move {
+        // caller-binding: allow — the submitted future binds the original admitted caller, never the ambient caller
+        tokio::spawn(intent_core::with_caller(caller.clone(), async move {
+            #[cfg(test)]
+            assert_eq!(
+                intent_core::current_caller(),
+                Some(caller.clone()),
+                "source worker must retain its original caller"
+            );
             let workspace = WorkspaceId::from(binding.scope.workspace_id.clone());
             let result = async {
                 let membership =
@@ -481,7 +488,7 @@ impl Services {
             .await;
             guard.finish(result.is_ok());
             let _ = tx.send(result);
-        });
+        }));
         rx.await.map_err(|_| uncertain())?
     }
 }

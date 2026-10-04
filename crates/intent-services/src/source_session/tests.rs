@@ -200,7 +200,12 @@ async fn real_open_duplicate_delivery_and_replacement_cleanup_do_not_rebind() {
     let (replacement_context, replacement) =
         connection(&services, caller.clone(), Mode::Cleanup, 2);
     assert!(Arc::ptr_eq(&original.registry, &replacement.registry));
-    let Open::Pending(open) = original.open(op.clone(), json!("actual\"id")).unwrap() else {
+    // The workers must bind their admitted Wire caller even when invoked by a daemon task.
+    let Open::Pending(open) = intent_core::with_caller(Caller::Daemon, async {
+        original.open(op.clone(), json!("actual\"id")).unwrap()
+    })
+    .await
+    else {
         panic!("new owner required")
     };
     assert!(matches!(
@@ -214,7 +219,10 @@ async fn real_open_duplicate_delivery_and_replacement_cleanup_do_not_rebind() {
         op.descriptor.accept_until
     );
     let read:Read=serde_json::from_value(json!({"workspaceId":ws.0,"operationId":op.operation_id,"sequence":0,"request":{"kind":"context","contextRef":binding.owner_ref,"maxItems":1,"maxWireBytes":8192}})).unwrap();
-    let pending = original.read(read, json!(1)).unwrap();
+    let pending = intent_core::with_caller(Caller::Daemon, async {
+        original.read(read, json!(1)).unwrap()
+    })
+    .await;
     let page = deliver(pending.await.unwrap(), original.epoch()).await;
     assert_eq!(page["result"]["items"][0]["nodeType"], "diffBlock");
     services
