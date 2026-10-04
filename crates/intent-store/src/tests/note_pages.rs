@@ -2763,3 +2763,270 @@ async fn artifact_append_failure_cannot_mutate_accepted_prefix() {
         .await
         .unwrap();
 }
+
+async fn artifact_publication_requests(
+    store: &Store,
+    begin: &intent_core::note_artifact::request::ArtifactBegin,
+) -> (
+    intent_core::note_artifact::request::ArtifactSeal,
+    intent_core::note_artifact::request::ArtifactAdmit,
+) {
+    let job = store
+        .begin_note_artifact_journal("alice", "pages", begin, artifact_retention(begin))
+        .await
+        .unwrap();
+    let manifest = artifact_append_request(
+        &job,
+        0,
+        &job.header_digest,
+        r#"{"kind":"diff.manifest","value":{}}"#,
+    );
+    // Journal consistency fixture only: no native profile or physical index is
+    // finalized by this deliberately minimal record.
+    let cost = crate::ArtifactJournalRecordCost {
+        index_entries: 1,
+        storage_bytes: 128,
+        final_manifest: true,
+    };
+    let ack = store
+        .append_note_artifact_journal("alice", "pages", &manifest, &cost)
+        .await
+        .unwrap();
+    assert!(ack.private_artifact_ref.is_none());
+    (
+        intent_core::note_artifact::request::ArtifactSeal {
+            job_ref: job.job_ref.clone(),
+            expected_records: 1,
+            expected_bytes: u64::try_from(ack.accepted_bytes).unwrap(),
+            final_digest: manifest.digest.clone(),
+        },
+        intent_core::note_artifact::request::ArtifactAdmit {
+            job_ref: job.job_ref,
+            admission_id: "admission".into(),
+            final_digest: manifest.digest,
+        },
+    )
+}
+
+#[tokio::test]
+async fn artifact_seal_and_admit_replay_cannot_revive_released_lease() {
+    let (store, _temporary, _note, begin) = artifact_begin_fixture().await;
+    let (seal, admit) = artifact_publication_requests(&store, &begin).await;
+    assert!(store
+        .admit_note_artifact_journal("alice", "pages", &admit)
+        .await
+        .is_err());
+    let mut wrong = seal.clone();
+    wrong.expected_bytes += 1;
+    assert!(store
+        .seal_note_artifact_journal("alice", "pages", &wrong)
+        .await
+        .is_err());
+    wrong = seal.clone();
+    wrong.final_digest = "f".repeat(64);
+    assert!(store
+        .seal_note_artifact_journal("alice", "pages", &wrong)
+        .await
+        .is_err());
+    assert!(store
+        .seal_note_artifact_journal("bob", "pages", &seal)
+        .await
+        .is_err());
+    let sealed = store
+        .seal_note_artifact_journal("alice", "pages", &seal)
+        .await
+        .unwrap();
+    assert_eq!(sealed.state, "sealed");
+    assert!(sealed.private_artifact_ref.is_some());
+    let mut private_handle = admit.clone();
+    private_handle.job_ref = sealed.private_artifact_ref.clone().unwrap();
+    assert!(store
+        .admit_note_artifact_journal("alice", "pages", &private_handle)
+        .await
+        .is_err());
+    let replay = store
+        .seal_note_artifact_journal("alice", "pages", &seal)
+        .await
+        .unwrap();
+    assert_eq!(replay.private_artifact_ref, sealed.private_artifact_ref);
+    assert!(store
+        .admit_note_artifact_journal("bob", "pages", &admit)
+        .await
+        .is_err());
+    let lease = store
+        .admit_note_artifact_journal("alice", "pages", &admit)
+        .await
+        .unwrap();
+    assert_ne!(
+        Some(&lease.artifact_ref),
+        sealed.private_artifact_ref.as_ref()
+    );
+    assert_eq!(
+        store
+            .admit_note_artifact_journal("alice", "pages", &admit)
+            .await
+            .unwrap(),
+        lease
+    );
+    let mut another = admit.clone();
+    another.admission_id = "another".into();
+    assert!(store
+        .admit_note_artifact_journal("alice", "pages", &another)
+        .await
+        .is_err());
+    store
+        .release_note_artifact_lease("alice", "pages", &lease.artifact_ref)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .admit_note_artifact_journal("alice", "pages", &admit)
+            .await
+            .unwrap(),
+        lease
+    );
+    // Exercise the already-defined logical cleanup transition. This direct SQL
+    // fixture does not claim actual file/arena physical reclamation.
+    sqlx::query("UPDATE note_artifact_job SET cleanup_complete=1")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .admit_note_artifact_journal("alice", "pages", &admit)
+            .await
+            .unwrap(),
+        lease
+    );
+    let status = store
+        .note_artifact_journal_status("alice", "pages", &begin.job_id, &begin.header_digest)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.state, "admitted");
+    assert!(status.cleanup_complete);
+    assert_eq!(status.private_artifact_ref, sealed.private_artifact_ref);
+    let row =
+        sqlx::query("SELECT count(*) AS leases,sum(released) AS released FROM note_artifact_lease")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(row.get::<i64, _>("leases"), 1);
+    assert_eq!(row.get::<i64, _>("released"), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT sum(jobs_reserved) FROM note_artifact_capacity")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn artifact_abort_and_admit_serialize_both_orders_without_reviving() {
+    for abort_first in [true, false] {
+        let (store, _temporary, _note, begin) = artifact_begin_fixture().await;
+        let (seal, admit) = artifact_publication_requests(&store, &begin).await;
+        store
+            .seal_note_artifact_journal("alice", "pages", &seal)
+            .await
+            .unwrap();
+        if abort_first {
+            store
+                .abort_note_artifact_journal("alice", "pages", &seal.job_ref)
+                .await
+                .unwrap();
+            assert!(store
+                .admit_note_artifact_journal("alice", "pages", &admit)
+                .await
+                .is_err());
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_lease")
+                    .fetch_one(store.read_pool())
+                    .await
+                    .unwrap(),
+                0
+            );
+        } else {
+            let lease = store
+                .admit_note_artifact_journal("alice", "pages", &admit)
+                .await
+                .unwrap();
+            let aborted = store
+                .abort_note_artifact_journal("alice", "pages", &seal.job_ref)
+                .await
+                .unwrap();
+            assert_eq!(aborted.state, "aborted");
+            assert!(aborted.private_artifact_ref.is_none());
+            assert_eq!(
+                store
+                    .admit_note_artifact_journal("alice", "pages", &admit)
+                    .await
+                    .unwrap(),
+                lease
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT released FROM note_artifact_lease")
+                    .fetch_one(store.read_pool())
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+        assert!(store
+            .seal_note_artifact_journal("alice", "pages", &seal)
+            .await
+            .is_err());
+        let status = store
+            .note_artifact_journal_status("alice", "pages", &begin.job_id, &begin.header_digest)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, "aborted");
+        assert!(status.private_artifact_ref.is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT sum(jobs_reserved) FROM note_artifact_capacity")
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap(),
+            3
+        );
+    }
+}
+
+#[tokio::test]
+async fn artifact_publication_revalidates_source_after_private_seal() {
+    let (store, temporary, mut note, begin) = artifact_begin_fixture().await;
+    let (seal, admit) = artifact_publication_requests(&store, &begin).await;
+    store
+        .seal_note_artifact_journal("alice", "pages", &seal)
+        .await
+        .unwrap();
+    note.title = "source revision advanced before admit".into();
+    store.update_note(&note).await.unwrap();
+    assert!(store
+        .admit_note_artifact_journal("alice", "pages", &admit)
+        .await
+        .is_err());
+    assert!(store
+        .seal_note_artifact_journal("alice", "pages", &seal)
+        .await
+        .is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_lease")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap(),
+        0
+    );
+    drop(store);
+    let restarted = Store::open(&temporary.path).await.unwrap();
+    assert!(restarted
+        .admit_note_artifact_journal("alice", "pages", &admit)
+        .await
+        .is_err());
+    restarted
+        .abort_note_artifact_journal("alice", "pages", &seal.job_ref)
+        .await
+        .unwrap();
+}

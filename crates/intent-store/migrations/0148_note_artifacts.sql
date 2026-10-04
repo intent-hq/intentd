@@ -185,7 +185,17 @@ CREATE TRIGGER note_artifact_lease_admit BEFORE INSERT ON note_artifact_lease BE
     SELECT CASE WHEN NOT EXISTS (
         SELECT 1 FROM note_artifact_job j WHERE j.generation=new.generation
         AND j.state='sealed' AND j.final_manifest=1
+        AND j.cleanup_complete=0
         AND j.current_digest=new.final_digest AND j.expires_at=new.expires_at
+        AND (SELECT count(*) FROM note_artifact_capacity c WHERE
+            ((c.scope_kind='global' AND c.scope_id='') OR
+             (c.scope_kind='principal' AND c.scope_id=j.principal) OR
+             (c.scope_kind='workspace' AND c.scope_id=j.workspace_id))
+            AND c.payload_reserved>=j.payload_limit
+            AND c.records_reserved>=j.record_limit
+            AND c.indexes_reserved>=j.index_limit
+            AND c.storage_reserved>=j.storage_limit
+            AND c.jobs_reserved>0)=3
     ) THEN RAISE(ABORT,'artifact lease admission failed') END;
 END;
 CREATE TRIGGER note_artifact_lease_account AFTER INSERT ON note_artifact_lease BEGIN
@@ -204,6 +214,18 @@ WHEN new.state<>old.state BEGIN
     ) THEN RAISE(ABORT,'invalid artifact state transition') END;
     SELECT CASE WHEN new.state='sealed' AND (new.final_manifest<>1 OR new.next_sequence=0)
         THEN RAISE(ABORT,'artifact final manifest required') END;
+    -- Finalization may inspect all staged records; ordinary reads/replay may not.
+    -- Cached counters alone cannot seal a generation with missing output/ACKs.
+    SELECT CASE WHEN new.state='sealed' AND NOT EXISTS (
+        SELECT 1 FROM note_artifact_record r JOIN note_artifact_ack a USING(generation,sequence)
+        WHERE r.generation=new.generation GROUP BY r.generation
+        HAVING count(*)=new.next_sequence AND min(r.sequence)=0
+        AND max(r.sequence)=new.next_sequence-1
+        AND sum(length(CAST(r.record AS BLOB)))=new.accepted_bytes
+        AND sum(r.is_manifest)=1
+        AND max(CASE WHEN r.is_manifest=1 THEN r.sequence END)=new.next_sequence-1
+        AND max(a.accepted_bytes)=new.accepted_bytes
+    ) THEN RAISE(ABORT,'artifact staged records are incomplete') END;
 END;
 CREATE TRIGGER note_artifact_record_immutable BEFORE UPDATE ON note_artifact_record BEGIN
     SELECT RAISE(ABORT,'accepted artifact record is immutable');

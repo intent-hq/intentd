@@ -7,8 +7,10 @@ mod artifact_begin;
 mod token;
 pub use artifact::ArtifactSourceGrant;
 mod artifact_lifecycle;
+mod artifact_publication;
 use crate::Store;
 pub use artifact_lifecycle::ArtifactJournalStatus;
+pub use artifact_publication::ArtifactJournalLease;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
 use intent_core::{

@@ -178,6 +178,52 @@ async fn artifact_record_acknowledgements_keep_original_cumulative_bytes() {
 }
 
 #[tokio::test]
+async fn artifact_seal_rejects_missing_final_record_even_with_cached_totals() {
+    let (store, _temporary) = setup().await;
+    append(&store, 0, &"0".repeat(64), &"1".repeat(64), true)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM note_artifact_record")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert!(sqlx::query("UPDATE note_artifact_job SET state='sealed'")
+        .execute(store.write_pool())
+        .await
+        .is_err());
+    let state: String = sqlx::query_scalar("SELECT state FROM note_artifact_job")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(state, "building");
+}
+
+#[tokio::test]
+async fn artifact_admit_requires_all_logical_reservations_to_remain_held() {
+    let (store, _temporary) = setup().await;
+    append(&store, 0, &"0".repeat(64), &"1".repeat(64), true)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE note_artifact_job SET state='sealed'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM note_artifact_capacity WHERE scope_kind='global'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert!(sqlx::query("INSERT INTO note_artifact_lease(generation,admission_id,lease_id,final_digest,expires_at) VALUES ('00000000000000000000000000000001','admission','lease',?,100)")
+        .bind("1".repeat(64)).execute(store.write_pool()).await.is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_lease")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn artifact_reservations_release_once_only_after_explicit_cleanup() {
     let (store, _temporary) = setup().await;
     let reserved: i64 =

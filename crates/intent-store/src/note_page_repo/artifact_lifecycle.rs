@@ -19,6 +19,7 @@ pub struct ArtifactJournalStatus {
     pub expires_at: i64,
     pub status_until: i64,
     pub cleanup_complete: bool,
+    pub private_artifact_ref: Option<String>,
 }
 
 pub(super) const STATUS_COLUMNS: &str = "job_id,generation,source_snapshot,header_digest,state,next_sequence,accepted_bytes,current_digest,expires_at,status_until,cleanup_complete";
@@ -29,18 +30,22 @@ pub(super) fn status(runtime: &super::Runtime, row: &SqliteRow) -> Result<Artifa
     if uuid::Uuid::parse_str(&snapshot).is_err() || uuid::Uuid::parse_str(&generation).is_err() {
         return Err(Error::Internal("Invalid stored artifact identity".into()));
     }
+    let state: String = row.try_get("state").map_err(db_error)?;
+    let private_artifact_ref = matches!(state.as_str(), "sealed" | "admitted")
+        .then(|| runtime.reference(&snapshot, &format!("p:{generation}")));
     Ok(ArtifactJournalStatus {
         job_id: row.try_get("job_id").map_err(db_error)?,
         job_ref: runtime.reference(&snapshot, &format!("j:{generation}")),
         generation: row.try_get("generation").map_err(db_error)?,
         header_digest: row.try_get("header_digest").map_err(db_error)?,
-        state: row.try_get("state").map_err(db_error)?,
+        state,
         next_sequence: row.try_get("next_sequence").map_err(db_error)?,
         accepted_bytes: row.try_get("accepted_bytes").map_err(db_error)?,
         current_digest: row.try_get("current_digest").map_err(db_error)?,
         expires_at: row.try_get("expires_at").map_err(db_error)?,
         status_until: row.try_get("status_until").map_err(db_error)?,
         cleanup_complete: row.try_get("cleanup_complete").map_err(db_error)?,
+        private_artifact_ref,
     })
 }
 
@@ -129,6 +134,7 @@ impl Store {
                 sqlx::query("UPDATE note_artifact_job SET state='aborted' WHERE generation=?")
                     .bind(generation).execute(&mut *connection).await.map_err(db_error)?;
                 current.state = "aborted".into();
+                current.private_artifact_ref = None;
             }
             // The state trigger atomically retires any provisional lease. This
             // same transaction retains counters and immutable replay identity.

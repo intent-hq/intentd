@@ -11,7 +11,9 @@ use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, Sq
 use sqlx::{Row, SqlitePool};
 
 pub use intent_core::{Error, Result};
-pub use note_page_repo::{ArtifactJournalRecordCost, ArtifactJournalStatus, ArtifactSourceGrant};
+pub use note_page_repo::{
+    ArtifactJournalLease, ArtifactJournalRecordCost, ArtifactJournalStatus, ArtifactSourceGrant,
+};
 
 mod advisory_wake_delivery_repo;
 mod agent_flipped_completion_repo;

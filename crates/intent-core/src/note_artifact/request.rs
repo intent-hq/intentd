@@ -165,6 +165,65 @@ impl ArtifactAppend {
     }
 }
 
+/// Exact accepted-prefix totals requested for private sealing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArtifactSeal {
+    pub job_ref: String,
+    pub expected_records: u64,
+    pub expected_bytes: u64,
+    pub final_digest: String,
+}
+
+impl ArtifactSeal {
+    /// Validate bounded seal arguments, independently of stored/profile state.
+    ///
+    /// # Errors
+    /// Rejects malformed handles/digests and zero or unsafe counters.
+    pub fn validate(&self) -> Result<(), RequestError> {
+        bounded_text(&self.job_ref, 256)?;
+        for count in [self.expected_records, self.expected_bytes] {
+            safe_integer(count)?;
+            if count == 0 {
+                return Err(RequestError::Invalid);
+            }
+        }
+        digest_text(&self.final_digest)
+    }
+}
+
+/// Idempotent admission identity for one privately sealed generation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArtifactAdmit {
+    pub job_ref: String,
+    pub admission_id: String,
+    pub final_digest: String,
+}
+
+impl ArtifactAdmit {
+    /// Validate the immutable lease-admission request shape.
+    ///
+    /// # Errors
+    /// Rejects malformed identifiers or a noncanonical digest string.
+    pub fn validate(&self) -> Result<(), RequestError> {
+        bounded_text(&self.job_ref, 256)?;
+        bounded_text(&self.admission_id, 256)?;
+        digest_text(&self.final_digest)
+    }
+}
+
+fn digest_text(value: &str) -> Result<(), RequestError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(RequestError::Invalid);
+    }
+    Ok(())
+}
+
 fn bounded_text(value: &str, maximum: usize) -> Result<(), RequestError> {
     if value.is_empty() || value.contains('\0') {
         return Err(RequestError::Invalid);
@@ -445,6 +504,39 @@ mod tests {
                 assert!(changed.validate(header).is_err());
             }
         }
+    }
+
+    #[test]
+    fn publication_requests_reject_invalid_totals_and_identity() {
+        let seal = ArtifactSeal {
+            job_ref: "opaque-job".into(),
+            expected_records: 1,
+            expected_bytes: 10,
+            final_digest: "a".repeat(64),
+        };
+        assert!(seal.validate().is_ok());
+        for count in [0, SAFE_INTEGER + 1] {
+            let mut bad = seal.clone();
+            bad.expected_records = count;
+            assert!(bad.validate().is_err());
+            let mut bad = seal.clone();
+            bad.expected_bytes = count;
+            assert!(bad.validate().is_err());
+        }
+        let admit = ArtifactAdmit {
+            job_ref: seal.job_ref,
+            admission_id: "admission".into(),
+            final_digest: seal.final_digest,
+        };
+        assert!(admit.validate().is_ok());
+        for id in [String::new(), "x".repeat(257), "a\0b".into()] {
+            let mut bad = admit.clone();
+            bad.admission_id = id;
+            assert!(bad.validate().is_err());
+        }
+        let mut bad = admit;
+        bad.final_digest.make_ascii_uppercase();
+        assert!(bad.validate().is_err());
     }
 
     #[test]

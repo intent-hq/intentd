@@ -114,6 +114,7 @@ impl Store {
         receipt.current_digest.clone_from(&request.digest);
         receipt.state = "building".into();
         receipt.cleanup_complete = false;
+        receipt.private_artifact_ref = None;
         self.note_pages.snapshot(
             &source.snapshot_id,
             workspace_id,
