@@ -1026,6 +1026,17 @@ mod lifetime_tests {
             Err(Error::NotePage(NotePageError::Expired))
         ));
         let pinned_id = runtime.remember(snapshot.clone()).unwrap();
+        // Make this entry strictly oldest; equal ages otherwise tie on random IDs.
+        runtime
+            .snapshots
+            .lock()
+            .unwrap()
+            .get_mut(&pinned_id)
+            .unwrap()
+            .born = snapshot
+            .born
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
         let pin = runtime.pin_snapshot(&pinned_id).unwrap();
         for _ in 0..MAX_SNAPSHOTS {
             runtime.remember(snapshot.clone()).unwrap();
@@ -1035,7 +1046,10 @@ mod lifetime_tests {
         for _ in 0..MAX_SNAPSHOTS {
             runtime.remember(snapshot.clone()).unwrap();
         }
-        assert!(runtime.snapshot(&pinned_id, "ws", "n", "alice").is_err());
+        assert!(matches!(
+            runtime.snapshot(&pinned_id, "ws", "n", "alice"),
+            Err(Error::NotePage(NotePageError::Expired))
+        ));
         for encoded in [&legacy, &compact] {
             let token = runtime.decode(encoded).unwrap();
             assert!(matches!(
