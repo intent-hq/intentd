@@ -49,7 +49,7 @@ pub(crate) fn log_provider_notice(
     notice: &session::Notice,
     acp_session_id: Option<&str>,
     agent_id: &AgentId,
-    workspace_id: &WorkspaceId,
+    workspace_id: Option<&WorkspaceId>,
 ) {
     use session::NoticeSeverity;
     let severity = match &notice.severity {
@@ -64,7 +64,7 @@ pub(crate) fn log_provider_notice(
             tracing::event!(
                 $level,
                 agent = %agent_id,
-                workspace = %workspace_id,
+                workspace = workspace_id.map(WorkspaceId::as_str),
                 acp_session_id,
                 severity,
                 title = %notice.title,
@@ -3202,6 +3202,9 @@ impl Services {
     /// into the transcript. Draining them here mirrors TS's "drop `session/update`
     /// when there is no active streaming handler" gate (acp-provider.ts).
     ///
+    /// Live notices are preserved in diagnostics; only replay/cancelled content
+    /// is discarded. Neither kind opens a turn or changes failure state.
+    ///
     /// Bounded so it cannot hang: empty whatever is already buffered with
     /// non-blocking `try_recv`, then wait out a short settle window for stragglers
     /// that may land just after `load_session` resolved (a per-message `recv`
@@ -3210,21 +3213,39 @@ impl Services {
     /// resume path is acceptable.
     pub(crate) async fn drain_replay_notifications(
         notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
+        agent_id: &AgentId,
+        workspace_id: Option<&WorkspaceId>,
     ) {
         use tokio::time::{timeout, Duration, Instant};
         const SETTLE: Duration = Duration::from_millis(50);
         const CAP: Duration = Duration::from_millis(500);
+        let log_notice = |note: IncomingNotification| {
+            // Notices are live diagnostics, never replayed conversation. Avoid
+            // parsing/accumulating the discarded historical text and tool payloads.
+            if note.params["update"]["sessionUpdate"] == "notice" {
+                if let Some(MappedUpdate::Notice(notice)) = session::map_notification(&note) {
+                    log_provider_notice(
+                        &notice,
+                        note.params["sessionId"].as_str(),
+                        agent_id,
+                        workspace_id,
+                    );
+                }
+            }
+        };
         let deadline = Instant::now() + CAP;
         loop {
-            while notifications.try_recv().is_ok() {}
+            while let Ok(note) = notifications.try_recv() {
+                log_notice(note);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match timeout(SETTLE.min(remaining), notifications.recv()).await {
-                Ok(Some(_)) => {} // a straggler arrived → keep draining
-                Ok(None) | Err(_) => break, // channel closed
-                                   // quiet for the settle window → done
+                Ok(Some(note)) => log_notice(note), // a straggler arrived → keep draining
+                Ok(None) | Err(_) => break,         // channel closed
+                                                     // quiet for the settle window → done
             }
         }
     }
@@ -5605,7 +5626,7 @@ impl Services {
                     &notice,
                     note.params["sessionId"].as_str(),
                     agent_id,
-                    workspace_id,
+                    Some(workspace_id),
                 );
                 // Diagnostics are not output: preserve silent-redrive eligibility.
                 return false;

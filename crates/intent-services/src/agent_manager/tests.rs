@@ -21544,7 +21544,7 @@ mod harness_wake_tests {
         };
         {
             let mut guard = notes.lock().await;
-            Services::drain_replay_notifications(&mut guard).await;
+            Services::drain_replay_notifications(&mut guard, &id, Some(&ws)).await;
             assert!(guard.try_recv().is_err(), "replay burst drained");
         }
         gate.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
