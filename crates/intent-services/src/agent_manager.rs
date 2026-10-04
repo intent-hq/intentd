@@ -4073,7 +4073,12 @@ impl AgentManager {
                 // new/recreate sessions have no buffered replay.
                 {
                     let mut guard = notes.lock().await;
-                    Services::drain_replay_notifications(&mut guard).await;
+                    Services::drain_replay_notifications(
+                        &mut guard,
+                        agent_id,
+                        Some(&session_record.workspace_id),
+                    )
+                    .await;
                 }
                 self.maybe_bypass_permissions(
                     conn.as_ref(),
@@ -5898,6 +5903,15 @@ impl AgentManager {
             );
             self.kill_original_child(agent_id, &repository_origin).await;
         }
+        // Capture attribution before draining and releasing the slot; fall back
+        // to the persisted session if the worker already released its slot.
+        let workspace_id = self
+            .agent_ws
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .cloned()
+            .or_else(|| session.as_ref().map(|s| s.workspace_id.clone()));
         // STAB-124: the cancelled child echoes `tool_call_update`s for the
         // aborted tool call (title-less, status failed). With the worker gone,
         // they buffer in the handle's notification channel and would be drained
@@ -5908,18 +5922,8 @@ impl AgentManager {
         // channel lock is released when its task drops, so this cannot deadlock.
         {
             let mut guard = notes.lock().await;
-            Services::drain_replay_notifications(&mut guard).await;
+            Services::drain_replay_notifications(&mut guard, agent_id, workspace_id.as_ref()).await;
         }
-        // Release the in-flight slot (recomputes workspace activity) and capture
-        // the owning workspace BEFORE the slot is dropped so the terminal event
-        // is stamped on the right workspace; fall back to the persisted session.
-        let workspace_id = self
-            .agent_ws
-            .lock()
-            .unwrap()
-            .get(agent_id)
-            .cloned()
-            .or_else(|| session.as_ref().map(|s| s.workspace_id.clone()));
         // Mark the process idle (reapable) but keep its handle so it survives
         // for a follow-up resume. Flip BEFORE the slot release so the release
         // wakes a queued spawn exactly when a slot was actually freed (#5253):
@@ -9044,7 +9048,8 @@ impl AgentManager {
         // emit a phantom `stream:start`/`stream:end` pair with no content
         // and pin the busy slot for the settle window.
         //
-        // A `usage_update` is the one exception: providers commonly emit
+        // Notices are logged without opening a turn. A `usage_update` also
+        // needs handling: providers commonly emit
         // the final usage report after the response, so it can lead a
         // buffered burst. It materializes no transcript content, so its
         // context occupancy is recorded in-memory and any cost is persisted
@@ -9057,6 +9062,15 @@ impl AgentManager {
             Some(intent_acp::session::MappedUpdate::Chunk { .. }) => {}
             Some(intent_acp::session::MappedUpdate::ToolCall(ref tc))
                 if !tc.tool_name.trim().is_empty() => {}
+            Some(intent_acp::session::MappedUpdate::Notice(notice)) => {
+                crate::agent_session::log_provider_notice(
+                    &notice,
+                    first.params["sessionId"].as_str(),
+                    agent_id,
+                    Some(workspace_id),
+                );
+                return true;
+            }
             Some(intent_acp::session::MappedUpdate::Usage(usage)) => {
                 drop(guard);
                 // Context occupancy (intent-hq/intent#3797): latest-wins
@@ -12522,7 +12536,12 @@ async fn run_message_worker(
                                         .map(|h| h.execution.runtime.notifications());
                                     if let Some(notes) = notes {
                                         let mut guard = notes.lock().await;
-                                        Services::drain_replay_notifications(&mut guard).await;
+                                        Services::drain_replay_notifications(
+                                            &mut guard,
+                                            &agent_id,
+                                            Some(&workspace_id),
+                                        )
+                                        .await;
                                     }
                                 } else {
                                     mgr.kill_child_only(&agent_id).await;

@@ -24,6 +24,7 @@ const SESSION_ID = 'mock-session-1';
 // daemon resumes into sees `true`; a fresh `session/new` resets it. Drives the
 // `failPromptIfLoadedRpcError` behavior (monorepo#940 poisoned-session e2e).
 let sessionFromLoad = false;
+let clientSupportsNotices = false;
 // Optional stateful model selector. Prompts report this accepted state, not
 // the last requested value, so rejected selections expose default-model turns.
 let effectiveModel = null;
@@ -425,6 +426,18 @@ async function handlePrompt(id, params) {
     behavior = JSON.parse(process.env.MOCK_AGENT_BEHAVIOR || '{}');
   } catch {
     behavior = {};
+  }
+  // Model the adapter's capability-driven notice/text fallback, including
+  // warnings immediately before a fatal prompt response.
+  for (const notice of behavior.notices || []) {
+    note('session/update', {
+      sessionId: SESSION_ID,
+      update: clientSupportsNotices
+        ? { sessionUpdate: 'notice', ...notice }
+        : { sessionUpdate: 'agent_message_chunk', content: {
+            type: 'text', text: `Warning: ${notice.title}\n\n`,
+          } },
+    });
   }
   // Deterministic mid-turn failure: die while the prompt is in flight for the
   // first N attempts (counter persists across spawns via MOCK_AGENT_ATTEMPT_FILE).
@@ -935,6 +948,9 @@ async function dispatch(msg) {
 
   switch (msg.method) {
     case 'initialize':
+      clientSupportsNotices = typeof msg.params?.clientCapabilities?.session?.notices === 'object'
+        && msg.params.clientCapabilities.session.notices !== null
+        && !Array.isArray(msg.params.clientCapabilities.session.notices);
       // Slow cold-start simulation (monorepo#616): delay the initialize reply
       // by `initializeDelayMs` so tests can prove the daemon's handshake
       // timeout tolerates a slow-to-start agent (or trips when pinned lower).
