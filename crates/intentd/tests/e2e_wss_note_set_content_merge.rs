@@ -1232,3 +1232,80 @@ async fn bounded_note_inline_code_maps_preserve_far_body_and_delimiters_over_wss
     let stale=wss_rpc_raw(&mut rpc,41,"note.get",json!({"workspaceId":ws,"noteId":note,"page":{"kind":"context","contextRef":body_owner.unwrap()}})).await;
     assert_eq!(stale["error"]["data"]["code"], "note-page-stale");
 }
+
+#[tokio::test]
+async fn bounded_note_document_owner_and_native_primitive_values_over_wss() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"title":"Canonical sources","path":"."}),
+    )
+    .await;
+    let ws = workspace["workspace"]["id"].as_str().unwrap();
+    let text = "<table><tr><td>x</td></tr></table>\n\n`After`";
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({"workspaceId":ws,"title":"HTML tail","content":text}),
+    )
+    .await;
+    let note = created["note"]["id"].as_str().unwrap();
+    let at = text.find('`').unwrap();
+    let source = wss_rpc(&mut rpc, 3, "note.get", json!({"workspaceId":ws,"noteId":note,"page":{"kind":"source","at":at,"maxSourceBytes":32,"maxWireBytes":8192}})).await;
+    let frame = wss_rpc_raw(&mut rpc, 4, "note.get", json!({"workspaceId":ws,"noteId":note,"page":{"kind":"context","contextRef":source["contextRef"],"maxWireBytes":8192}})).await;
+    assert!(frame.to_string().len() <= 8192);
+    let items = frame["result"]["items"].as_array().unwrap();
+    assert!(!items.iter().any(|item| item["role"] == "code"));
+    let document = items
+        .iter()
+        .find(|item| item["construct"] == "htmlDocument")
+        .unwrap();
+    let maps = wss_rpc(&mut rpc, 5, "note.get", json!({"workspaceId":ws,"noteId":note,"page":{"kind":"context","contextRef":document["sourceMapRef"],"maxWireBytes":4096}})).await;
+    let map = maps["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["mapping"] == "identity")
+        .unwrap();
+    let rendered = wss_rpc(&mut rpc, 6, "note.get", json!({"workspaceId":ws,"noteId":note,"page":{"kind":"context","contextRef":map["textRef"],"maxWireBytes":4096}})).await;
+    assert_eq!(rendered["items"][0]["text"], "`After`");
+    let direct = wss_rpc(&mut rpc, 7, "note.get", json!({"workspaceId":ws,"noteId":note,"page":{"kind":"context","contextRef":map["ownerRef"]}})).await;
+    assert_eq!(direct["items"][0]["id"], document["id"]);
+    assert!(direct["items"][0].get("sourceMapRef").is_none());
+    let primitive = wss_rpc(&mut rpc, 8, "note.create", json!({"workspaceId":ws,"title":"Native source","content":"```diff title\n-café & old\n+世界 <new>\n```"})).await;
+    let primitive_id = primitive["note"]["id"].as_str().unwrap();
+    let source = wss_rpc(&mut rpc, 9, "note.get", json!({"workspaceId":ws,"noteId":primitive_id,"page":{"kind":"source","maxSourceBytes":4096}})).await;
+    let context = wss_rpc(&mut rpc, 10, "note.get", json!({"workspaceId":ws,"noteId":primitive_id,"page":{"kind":"context","contextRef":source["contextRef"]}})).await;
+    let atom = context["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["nodeType"] == "diffBlock")
+        .unwrap();
+    assert!(atom["nativeRef"].is_string());
+    let root = wss_rpc(&mut rpc, 11, "note.get", json!({"workspaceId":ws,"noteId":primitive_id,"page":{"kind":"metadata","ref":atom["attributesRef"]}})).await;
+    let fields = wss_rpc(&mut rpc, 12, "note.get", json!({"workspaceId":ws,"noteId":primitive_id,"page":{"kind":"metadata","ref":root["items"][0]["childrenRef"]}})).await;
+    let code = fields["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|field| field["key"] == "code")
+        .unwrap();
+    let value = wss_rpc(&mut rpc, 13, "note.get", json!({"workspaceId":ws,"noteId":primitive_id,"page":{"kind":"context","contextRef":code["valueRef"],"maxWireBytes":4096}})).await;
+    assert_eq!(value["items"][0]["text"], "-café & old\n+世界 <new>");
+    let cross_note = wss_rpc_raw(&mut rpc, 14, "note.get", json!({"workspaceId":ws,"noteId":note,"page":{"kind":"context","contextRef":code["valueRef"]}})).await;
+    assert!(cross_note.get("error").is_some());
+    wss_rpc(
+        &mut rpc,
+        15,
+        "note.updateMetadata",
+        json!({"workspaceId":ws,"noteId":primitive_id,"title":"Changed"}),
+    )
+    .await;
+    let stale = wss_rpc_raw(&mut rpc, 16, "note.get", json!({"workspaceId":ws,"noteId":primitive_id,"page":{"kind":"context","contextRef":code["valueRef"]}})).await;
+    assert_eq!(stale["error"]["data"]["code"], "note-page-stale");
+}

@@ -1,7 +1,8 @@
 //! Write-time Markdown code ownership and source normalization receipts.
 use super::{canonical, TextMapping};
 use crate::note_page_index::Entries;
-use pulldown_cmark::{Event, Options, Parser, Tag};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -239,7 +240,7 @@ pub(crate) fn append_codes(
     source: &str,
     units: &[usize],
     entries: &mut Entries,
-    descriptors: &mut [(usize, usize, String, Value)],
+    descriptors: &mut Vec<(usize, usize, String, Value)>,
 ) {
     // The existing entry path interprets raw HTML separately from Markdown.
     if source.trim().starts_with('<')
@@ -248,26 +249,62 @@ pub(crate) fn append_codes(
     {
         return;
     }
-    if !descriptors
-        .iter()
-        .any(|(_, _, _, value)| value["role"] == "code")
-    {
-        return;
-    }
     let events: Vec<_> = Parser::new_ext(source, Options::all())
         .into_offset_iter()
         .collect();
+    let primitive_starts: BTreeSet<_> = events.iter().enumerate().filter_map(|(index, (event, _))| {
+        matches!(event, Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) if format!("language-{info}").split_ascii_whitespace().any(|class| matches!(class, "language-diff" | "language-mermaid"))).then_some(index)
+    }).collect();
+    if primitive_starts.is_empty()
+        && !descriptors
+            .iter()
+            .any(|(_, _, _, value)| value["role"] == "code")
+    {
+        return;
+    }
     let current = Cell::new(0);
     let mut output = Output {
         html: String::new(),
         current: &current,
         ranges: vec![None; events.len()],
     };
+    let mut primitive_body = false;
     pulldown_cmark::html::write_html_fmt(
         &mut output,
         events.iter().enumerate().map(|(index, (event, _))| {
             current.set(index);
-            event.clone()
+            if primitive_body {
+                if matches!(event, Event::End(TagEnd::CodeBlock)) { primitive_body = false; }
+                return Event::Html("".into());
+            }
+            if primitive_starts.contains(&index) {
+                let Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(language))) = event else { unreachable!() };
+                let mut body = String::new();
+                for (part, _) in &events[index + 1..] {
+                    match part {
+                        Event::End(TagEnd::CodeBlock) => break,
+                        Event::Text(text) => body.push_str(text),
+                        _ => {}
+                    }
+                }
+                let body = body.strip_suffix('\n').unwrap_or(&body);
+                primitive_body = true;
+                if matches!(language.as_ref(), "diff" | "mermaid") {
+                    let encoded = STANDARD.encode(body.as_bytes());
+                    return Event::Html(format!("<div data-type=\"{language}-block\" data-{language}-code=\"{encoded}\"></div>\n").into());
+                }
+                // The native Markdown renderer uses a pre/code fallback for
+                // titled fences. Its schema recognizes the language class and
+                // preserves raw code rather than the exact-language base64.
+                let escape = |value: &str| value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#039;");
+                return Event::Html(format!("<pre><code class=\"language-{}\">{}</code></pre>\n", escape(language), escape(body)).into());
+            }
+            // The Markdown entry path treats source HTML as literal text. Only
+            // the explicit generated primitive above creates native HTML atoms.
+            match event {
+                Event::Html(text) | Event::InlineHtml(text) => Event::Text(text.clone()),
+                _ => event.clone(),
+            }
         }),
     )
     .expect("String output cannot fail");
@@ -399,6 +436,19 @@ pub(crate) fn append_codes(
         }
     }
     let mut retained = BTreeSet::new();
+    for id in active
+        .iter()
+        .copied()
+        .filter(|id| matches!(tree.nodes[*id].kind, "diffBlock" | "mermaidBlock"))
+    {
+        let mut next = Some(id);
+        while let Some(id) = next {
+            if !retained.insert(id) {
+                break;
+            }
+            next = tree.nodes[id].parent;
+        }
+    }
     for group in &maps {
         for (leaf, map) in group {
             if map.text.is_empty() {
@@ -439,6 +489,19 @@ pub(crate) fn append_codes(
         .filter(|(_, (_, _, _, value))| value["role"] == "code")
         .map(|(index, (start, end, _, _))| ((*start, *end), index))
         .collect();
+    let primitive_descriptors: BTreeMap<_, _> = descriptors
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, _, value))| value["construct"] == "codeBlock")
+        .map(|(index, (start, end, _, _))| ((*start, *end), index))
+        .collect();
+    let direct_descriptors: BTreeMap<_, _> = entries
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, position, value))| *position == 0 && value["construct"] == "codeBlock")
+        .map(|(index, (collection, _, _))| (collection.clone(), index))
+        .collect();
     let mut child_indices = vec![0; tree.nodes.len()];
     for node in &tree.nodes {
         for (index, child) in node.children.iter().enumerate() {
@@ -464,14 +527,34 @@ pub(crate) fn append_codes(
                 .map(|(_, event)| events[*event].1.clone())
         });
         let range = literal.or(owner_range).unwrap_or(0..0);
+        let attributes_start = entries.rows.len();
         let attrs = entries.context_attributes(&if node.attributes.is_null() {
             json!({})
         } else {
             node.attributes.clone()
         });
+        let primitive = match node.kind {
+            "diffBlock" => Some("diff"),
+            "mermaidBlock" => Some("mermaid"),
+            _ => None,
+        };
+        if let Some(primitive) = primitive {
+            let code_ref = entries.rows[attributes_start..]
+                .iter()
+                .find_map(|(_, _, value)| {
+                    (value["key"] == "code")
+                        .then(|| value["valueRef"].as_str())
+                        .flatten()
+                })
+                .expect("primitive code field")
+                .to_owned();
+            entries
+                .artifact_sources
+                .push((format!("d:{}", ids[&id]), code_ref, primitive));
+        }
         let child_index = child_indices[id];
         let mut native = json!({"kind":"nativeNode","id":ids[&id],"profile":"canonicalNote","profileVersion":1,
-            "nodeType":node.kind,"nodeClass":if node.kind=="text" {"text"} else {"container"},
+            "nodeType":node.kind,"nodeClass":if node.kind=="text" {"text"} else if primitive.is_some() {"atom"} else {"container"},
             "parentRef":node.parent.map(|parent|format!("d:{}",ids[&parent])),"childIndex":child_index,
             "sourceRange":range_value(&range),"provenance":if range.is_empty(){"implicit"}else{"explicit"},"attributesRef":attrs});
         if !node.marks.is_empty() {
@@ -485,6 +568,24 @@ pub(crate) fn append_codes(
             }
             native["provenance"] = json!("repaired");
             native["sourcePiecesRef"] = json!(reference);
+        }
+        if primitive.is_some() {
+            native["nativeRef"] = json!(format!("d:{}", ids[&id]));
+            if let Some(index) = primitive_descriptors.get(&(units[range.start], units[range.end]))
+            {
+                let (_, _, owner, descriptor) = &mut descriptors[*index];
+                descriptor["nativeRef"] = native["nativeRef"].clone();
+                let direct = direct_descriptors
+                    .get(&format!("d:{owner}"))
+                    .expect("persisted lexical owner");
+                entries.rows[*direct].2["nativeRef"] = native["nativeRef"].clone();
+            }
+            descriptors.push((
+                units[range.start],
+                units[range.end],
+                ids[&id].clone(),
+                native.clone(),
+            ));
         }
         entries.rows.push((format!("d:{}", ids[&id]), 0, native));
     }

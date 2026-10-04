@@ -82,6 +82,13 @@ pub(crate) fn append(
     {
         return;
     }
+    // The lexical Markdown scanner can find backticks in an HTML-entry tail,
+    // but that entry path never interprets them as Markdown code spans.
+    for (_, _, _, descriptor) in descriptors.iter_mut() {
+        if descriptor["role"] == "code" {
+            descriptor["role"] = json!("literal");
+        }
+    }
     let tree = canonical(source);
     let mut active = Vec::new();
     let mut pending = vec![0];
@@ -124,7 +131,27 @@ pub(crate) fn append(
         } else {
             node.attributes.clone()
         };
+        let attribute_start = entries.rows.len();
         let attributes_ref = entries.context_attributes(&attrs);
+        let primitive = match node.kind {
+            "diffBlock" => Some("diff"),
+            "mermaidBlock" => Some("mermaid"),
+            _ => None,
+        };
+        if let Some(primitive) = primitive {
+            let code_ref = entries.rows[attribute_start..]
+                .iter()
+                .find_map(|(_, _, value)| {
+                    (value["key"] == "code")
+                        .then(|| value["valueRef"].as_str())
+                        .flatten()
+                })
+                .expect("canonical primitive code field")
+                .to_owned();
+            entries
+                .artifact_sources
+                .push((format!("d:{native_id}"), code_ref, primitive));
+        }
         attributes.insert(id, attributes_ref.clone());
         let pieces = literal_pieces(node);
         let void = matches!(node.kind, "image" | "hardBreak" | "horizontalRule");
@@ -163,7 +190,7 @@ pub(crate) fn append(
         });
         let class = if node.kind == "text" {
             "text"
-        } else if void {
+        } else if void || primitive.is_some() {
             "atom"
         } else {
             "container"
@@ -174,6 +201,15 @@ pub(crate) fn append(
         }
         if provenance == "repaired" {
             value["sourcePiecesRef"] = json!(source_pieces(entries, native_id, &pieces, units));
+        }
+        if primitive.is_some() {
+            value["nativeRef"] = json!(format!("d:{native_id}"));
+            descriptors.push((
+                units[range.start],
+                units[range.end],
+                native_id.clone(),
+                value.clone(),
+            ));
         }
         entries.rows.push((format!("d:{native_id}"), 0, value));
     }
@@ -311,6 +347,9 @@ pub(crate) fn append(
     let mut next_owner = 0;
     let mut admitted = BTreeSet::new();
     let mut positions = BTreeMap::<String, usize>::new();
+    let document_id = entries.id();
+    let mut document_ranges: Vec<Range<usize>> = Vec::new();
+    let mut document_position = 0;
     for (raw, leaf, rendered, text, mapping) in maps {
         while next_owner < owners.len() && owners[next_owner].1.start < raw.end {
             admitted.insert(next_owner);
@@ -322,6 +361,59 @@ pub(crate) fn append(
         } else {
             Some(entries.fragment("renderedText", &text))
         };
+        // The document owner receives only pieces outside table ownership.
+        // Subtract the sorted union; never duplicate table maps in a root map.
+        let mut outside = Vec::new();
+        let mut cursor = raw.start;
+        for &index in &admitted {
+            let range = &owners[index].1;
+            if cursor < range.start.min(raw.end) {
+                outside.push(cursor..range.start.min(raw.end));
+            }
+            cursor = cursor.max(range.end.min(raw.end));
+        }
+        if cursor < raw.end {
+            outside.push(cursor..raw.end);
+        }
+        for piece in outside {
+            let (piece_rendered, piece_text) = if mapping == "identity" {
+                let offset = units[piece.start] - units[raw.start];
+                (
+                    rendered.start + offset
+                        ..rendered.start + offset + units[piece.end] - units[piece.start],
+                    &text[piece.start - raw.start..piece.end - raw.start],
+                )
+            } else {
+                // Non-bijective normalization/entity seams retain their exact
+                // source interval. A table already owning that seam remains its
+                // owner; the document must not invent a split interpolation.
+                if mapping != "omitted" && piece != raw {
+                    continue;
+                }
+                (rendered.clone(), text.as_str())
+            };
+            if let Some(last) = document_ranges
+                .last_mut()
+                .filter(|last| last.end >= piece.start)
+            {
+                last.end = last.end.max(piece.end);
+            } else {
+                document_ranges.push(piece.clone());
+            }
+            let reference = if piece_text.is_empty() {
+                None
+            } else if piece == raw {
+                text_ref.clone()
+            } else {
+                Some(entries.fragment("renderedText", piece_text))
+            };
+            let map_id = entries.id();
+            let value = json!({"kind":"sourceMap","id":map_id,"profile":"canonicalNote","profileVersion":1,"ownerRef":format!("d:{document_id}"),"textNodeId":leaf.map(|id|ids[&id].clone()),"textNodeRef":leaf.map(|id|format!("d:{}",ids[&id])),"sourceRange":wire_range(&piece,units),"renderedRange":{"start":piece_rendered.start,"end":piece_rendered.end},"mapping":mapping,"textRef":reference});
+            entries
+                .rows
+                .push((format!("h:{document_id}"), document_position, value));
+            document_position += 1;
+        }
         for &index in &admitted {
             let (owner, range) = owners[index];
             if raw.end <= range.start || raw.start >= range.end {
@@ -332,6 +424,21 @@ pub(crate) fn append(
             let position = positions.entry(owner.clone()).or_default();
             entries.rows.push((format!("h:{owner}"), *position, map));
             *position += 1;
+        }
+    }
+    if !document_ranges.is_empty() {
+        let mut owner = json!({"kind":"boundary","id":document_id,"construct":"htmlDocument","profile":"canonicalNote","profileVersion":1,"entryPath":"html","sourceRange":{"start":0,"end":units[source.len()]},"nativeRef":format!("d:{}",ids[&0]),"attributesRef":attributes[&0]});
+        entries
+            .rows
+            .push((format!("d:{document_id}"), 0, owner.clone()));
+        owner["sourceMapRef"] = json!(format!("h:{document_id}"));
+        for range in document_ranges {
+            descriptors.push((
+                units[range.start],
+                units[range.end],
+                document_id.clone(),
+                owner.clone(),
+            ));
         }
     }
 }

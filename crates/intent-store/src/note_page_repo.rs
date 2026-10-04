@@ -752,6 +752,7 @@ impl Store {
             if window
                 && matches!(item["kind"].as_str(), Some("boundary" | "span"))
                 && item.get("htmlPosition").is_none()
+                && item.get("codeSource").is_none()
             {
                 if let Some(parent) = item["parentRef"].as_str() {
                     item["parentRef"] = json!(format!(

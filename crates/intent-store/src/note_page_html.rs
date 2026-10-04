@@ -4,6 +4,7 @@
 //! parenting must never turn a DOM ancestor into a fabricated literal range.
 mod index;
 mod markdown;
+mod primitive;
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, Tracer, TreeSink};
 use html5ever::tendril::StrTendril;
 use html5ever::tokenizer::{states::RawKind, Tag, TagKind, Token, TokenSink, TokenSinkResult};
@@ -626,18 +627,49 @@ impl<'a> NativeTree<'a> {
         self.add(Some(parent), "paragraph", None, Value::Null)
     }
     fn text(&mut self, source: &Handle, parent: usize, marks: &[Value]) {
-        let parent = self.inline_parent(parent);
-        let previous = self.nodes[parent].children.last().copied();
+        // Normalize against the existing schema context BEFORE introducing an
+        // implicit paragraph. Whitespace between blocks is not an empty block;
+        // text after a block can retain its leading collapsed space.
+        let context = if matches!(
+            self.nodes[parent].kind,
+            "paragraph" | "heading" | "codeBlock"
+        ) {
+            parent
+        } else {
+            self.nodes[parent]
+                .children
+                .last()
+                .copied()
+                .filter(|id| {
+                    self.nodes[*id].kind == "paragraph" && self.nodes[*id].source.is_none()
+                })
+                .unwrap_or(parent)
+        };
+        let previous = self.nodes[context].children.last().copied();
         let space = previous.is_none_or(|id| {
             self.nodes[id].kind == "hardBreak" || self.nodes[id].text.ends_with(' ')
         });
-        let preserve = self.nodes[parent].kind == "codeBlock";
-        let (text, mut maps) =
-            normalized_text_maps(self.source, &source.text_pieces.borrow(), space, preserve);
+        let preserve = self.nodes[context].kind == "codeBlock";
+        let block_whitespace = !matches!(
+            self.nodes[context].kind,
+            "paragraph" | "heading" | "codeBlock"
+        ) && source
+            .text
+            .borrow()
+            .chars()
+            .all(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n' | '\u{000c}'));
+        let (text, mut maps) = normalized_text_maps(
+            self.source,
+            &source.text_pieces.borrow(),
+            space || block_whitespace,
+            preserve,
+        );
         if text.is_empty() {
             self.omitted.extend(maps);
             return;
         }
+        let parent = self.inline_parent(parent);
+        let previous = self.nodes[parent].children.last().copied();
         if let Some(id) =
             previous.filter(|id| self.nodes[*id].kind == "text" && self.nodes[*id].marks == marks)
         {
@@ -723,6 +755,11 @@ impl<'a> NativeTree<'a> {
                 | "#comment"
                 | "#pi"
         ) {
+            return;
+        }
+        if let Some((kind, code)) = primitive::parse(node) {
+            self.finish_block(parent);
+            self.add(Some(parent), kind, Some(node.clone()), json!({"code":code}));
             return;
         }
         let attr = |name: &str| {
@@ -854,6 +891,31 @@ mod tests {
         }
         found
     }
+    #[test]
+    fn canonical_block_whitespace_preserves_positions_and_literal_tail() {
+        let tree = canonical("<h2>Before</h2>\n<div data-type=\"diff-block\" data-diff-code=\"abc\"></div>\n<p>After</p>");
+        assert_eq!(tree.nodes[0].children.len(), 3);
+        assert_eq!(tree.nodes[tree.nodes[0].children[1]].kind, "diffBlock");
+        let tail = canonical("<table><tr><td>x</td></tr></table>\n\n**After**");
+        assert_eq!(
+            tail.json(0)["content"][1],
+            json!({"type":"paragraph","content":[{"type":"text","text":" **After**"}]})
+        );
+    }
+
+    #[test]
+    fn canonical_primitive_attributes_match_frozen_native_entry_oracles() {
+        // FE2797061, primitive-entry-0210 snapshot915d4a74: attrs.code is the
+        // native schema value BEFORE either primitive renderer decodes it.
+        for (source, first, second) in [
+            ("<div data-type=\"diff-block\" data-diff-code=\"LWNhZsOpICYgb2xkCivkuJbnlYwgPG5ldz4K\"></div><div data-type=\"mermaid-block\" data-mermaid-code=\"Zmxvd2NoYXJ0IExSCiBBWyJjYWbDqSAmIOS4lueVjCJdIC0tPiBCCg==\"></div>", "LWNhZsOpICYgb2xkCivkuJbnlYwgPG5ldz4K", "Zmxvd2NoYXJ0IExSCiBBWyJjYWbDqSAmIOS4lueVjCJdIC0tPiBCCg=="),
+            ("<div data-type=\"diff-block\" data-diff-code=\"-old\n+new\n\"></div><div data-type=\"mermaid-block\" data-mermaid-code=\"graph TD\n A[Alpha]\n\"></div>", "-old\n+new", "graph TD\n A[Alpha]"),
+            ("<pre><code class=\"language-diff\">-café &amp; old\n+世界 &lt;new&gt;\n</code></pre><pre><code class=\"language-mermaid\">flowchart LR\n A[&quot;café &amp; 世界&quot;] --&gt; B\n</code></pre>", "-café & old\n+世界 <new>\n", "flowchart LR\n A[\"café & 世界\"] --> B\n"),
+        ] {
+            assert_eq!(canonical(source).json(0), json!({"type":"doc","content":[{"type":"diffBlock","attrs":{"code":first}},{"type":"mermaidBlock","attrs":{"code":second}}]}), "source: {source}");
+        }
+    }
+
     #[test]
     fn canonical_html_matches_recorded_frontend_native_trees() {
         let cases: Value =

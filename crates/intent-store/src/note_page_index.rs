@@ -22,7 +22,9 @@ pub(crate) fn profile_revision() -> &'static str {
             include_str!("note_page_html.rs"),
             include_str!("note_page_html/index.rs"),
             include_str!("note_page_html/markdown.rs"),
+            include_str!("note_page_html/primitive.rs"),
             include_str!("tests/fixtures/note_html_native.json"),
+            include_str!("tests/fixtures/note_primitive_native.json"),
             include_str!("../../../Cargo.lock"),
         ] {
             digest.update(input.as_bytes());
@@ -85,6 +87,7 @@ pub(crate) fn pieces(text: &str) -> Vec<Piece> {
 
 pub(super) struct Entries {
     pub(super) rows: Vec<(String, usize, Value)>,
+    pub(super) artifact_sources: Vec<(String, String, &'static str)>,
     serial: usize,
 }
 impl Entries {
@@ -426,12 +429,24 @@ fn context_entries(text: &str, parts: &[Piece], entries: &mut Entries) {
     crate::note_page_html::append_codes(text, &units, entries, &mut descriptors);
     descriptors.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
     let mut positions = vec![0; parts.len()];
+    let mut document_occurrences = BTreeMap::<usize, usize>::new();
     for (start, end, _, descriptor) in descriptors {
         let first = parts.partition_point(|p| p.end <= start && p.end != p.start);
         for i in first..parts.len() {
             let part = &parts[i];
             if part.start >= end && end != start {
                 break;
+            }
+            if descriptor["construct"] == "htmlDocument" {
+                if let Some(index) = document_occurrences.get(&i) {
+                    let admission = &mut entries.rows[*index].2["_admissionRange"];
+                    let old_start = admission["start"].as_u64().expect("admission start");
+                    let old_end = admission["end"].as_u64().expect("admission end");
+                    *admission =
+                        json!({"start":old_start.min(start as u64),"end":old_end.max(end as u64)});
+                    continue;
+                }
+                document_occurrences.insert(i, entries.rows.len());
             }
             let mut occurrence = descriptor.clone();
             // Admission can include an implicit/repaired canonical ancestor whose
@@ -526,6 +541,7 @@ pub(crate) fn rebuild<'a>(
         let id = &note.id.0;
         let mut entries = Entries {
             rows: Vec::new(),
+            artifact_sources: Vec::new(),
             serial: 0,
         };
         // Separate namespaces keep metadata-only rewrites from colliding with context.
@@ -583,6 +599,11 @@ pub(crate) fn rebuild<'a>(
                 .execute(&mut *conn)
                 .await
                 .map_err(db_error)?;
+        }
+        for (native, source, primitive) in entries.artifact_sources {
+            sqlx::query("INSERT INTO note_artifact_source(workspace_id,note_id,native_collection,source_collection,primitive) VALUES (?,?,?,?,?)")
+                .bind(ws).bind(id).bind(native).bind(source).bind(primitive)
+                .execute(&mut *conn).await.map_err(db_error)?;
         }
         sqlx::query("UPDATE note_page_head SET indexed_rev=?,profile_revision=? WHERE workspace_id=? AND note_id=?")
             .bind(rev)

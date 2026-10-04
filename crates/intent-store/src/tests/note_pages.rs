@@ -822,6 +822,37 @@ async fn record_page(store: &Store, request: Value, transcript: &mut Vec<Value>)
     response
 }
 
+// This exhaustive traversal is a tiny-fixture capture utility, never a reader
+// implementation or proof that a production consumer should drain every ref.
+async fn record_fixture_closure(store: &Store, items: &Value, transcript: &mut Vec<Value>) {
+    let mut queue = Vec::new();
+    resource_refs(items, &mut queue);
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some((kind, reference)) = queue.pop() {
+        if !seen.insert(reference.clone()) {
+            continue;
+        }
+        assert!(
+            seen.len() < 128,
+            "tiny fixture resource closure must remain finite"
+        );
+        let mut request = json!({"kind":kind,"maxWireBytes":8192,"maxItems":64});
+        request[if kind == "metadata" {
+            "ref"
+        } else {
+            "contextRef"
+        }] = json!(reference);
+        loop {
+            let response = record_page(store, request.clone(), transcript).await;
+            resource_refs(&response["items"], &mut queue);
+            if response["nextCursor"].is_null() {
+                break;
+            }
+            request["cursor"] = response["nextCursor"].clone();
+        }
+    }
+}
+
 fn resource_refs(value: &Value, refs: &mut Vec<(String, String)>) {
     match value {
         Value::Object(object) => {
@@ -1343,5 +1374,589 @@ async fn indexed_inline_code_preserves_container_and_table_source_positions() {
         )
         .await;
         assert_eq!(text["items"][0]["text"], "TARGET", "{source}: {maps}");
+    }
+}
+
+#[tokio::test]
+async fn indexed_html_entry_paths_keep_heading_and_anchor_tables_literal() {
+    // Exact production processMarkdownToHTML/createEditorConfig oracle: these
+    // entry paths escape table tags. A lexical htmlBlock is not a native table.
+    for (name, source) in [
+        (
+            "heading-first",
+            "## Before\n\n<table><tr><td>x</td></tr></table>\n\n**After**",
+        ),
+        (
+            "anchor-first",
+            "<!--anchor:comment-a:point-->\n\n<table><tr><td>x</td></tr></table>\n\n**After**",
+        ),
+    ] {
+        let at = source.find("<td>x").unwrap() + 4;
+        let (store, _temporary, _note) = setup(source).await;
+        let mut transcript = Vec::new();
+        let first = record_page(&store, json!({"kind":"source","at":at,"maxSourceBytes":4096,"maxWireBytes":8192,"maxItems":64}), &mut transcript).await;
+        assert_eq!(first["text"], source[at..]);
+        let mut request = json!({"kind":"context","contextRef":first["contextRef"],"maxWireBytes":8192,"maxItems":64});
+        let mut items = Vec::new();
+        loop {
+            let page = record_page(&store, request.clone(), &mut transcript).await;
+            items.extend(page["items"].as_array().unwrap().iter().cloned());
+            if page["nextCursor"].is_null() {
+                break;
+            }
+            request["cursor"] = page["nextCursor"].clone();
+        }
+        record_fixture_closure(&store, &json!(items), &mut transcript).await;
+        if let Ok(directory) = std::env::var("NOTE_PAGE_TRANSCRIPT_DIR") {
+            let path = std::path::Path::new(&directory).join(format!("mixed-entry-{name}.json"));
+            std::fs::write(
+                path,
+                serde_json::to_vec_pretty(&json!({"source":source,"at":at,"calls":transcript}))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(
+            !items.iter().any(|item| matches!(
+                item["construct"].as_str(),
+                Some("htmlTable" | "htmlTableRow" | "htmlTableCell")
+            )),
+            "literal HTML must not acquire native table context: {items:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn indexed_html_entry_preserves_literal_markdown_tail() {
+    // Frozen FE d8333fc1 canonical entry oracle: HTML-first bypasses Markdown
+    // conversion. The trailing stars remain literal and never become bold.
+    let source = "<table><tr><td>x</td></tr></table>\n\n**After**";
+    let at = source.find("**After**").unwrap();
+    let (store, _temporary, _note) = setup(source).await;
+    let mut transcript = Vec::new();
+    let first = record_page(
+        &store,
+        json!({"kind":"source","at":at,"maxSourceBytes":4096,"maxWireBytes":8192,"maxItems":64}),
+        &mut transcript,
+    )
+    .await;
+    assert_eq!(first["text"], "**After**");
+    let mut queue = vec![(
+        "context".to_owned(),
+        first["contextRef"].as_str().unwrap().to_owned(),
+    )];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some((kind, reference)) = queue.pop() {
+        if !seen.insert(reference.clone()) {
+            continue;
+        }
+        assert!(seen.len() < 128, "tiny canonical fixture must stay bounded");
+        let mut request = json!({"kind":kind,"maxWireBytes":8192,"maxItems":64});
+        request[if kind == "metadata" {
+            "ref"
+        } else {
+            "contextRef"
+        }] = json!(reference);
+        loop {
+            let response = record_page(&store, request.clone(), &mut transcript).await;
+            resource_refs(&response["items"], &mut queue);
+            if response["nextCursor"].is_null() {
+                break;
+            }
+            request["cursor"] = response["nextCursor"].clone();
+        }
+    }
+    if let Ok(directory) = std::env::var("NOTE_PAGE_TRANSCRIPT_DIR") {
+        std::fs::write(
+            std::path::Path::new(&directory).join("html-first-literal-tail.json"),
+            serde_json::to_vec_pretty(&json!({"source":source,"at":at,"calls":transcript}))
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    let items: Vec<_> = transcript
+        .iter()
+        .filter_map(|call| call["response"]["items"].as_array())
+        .flatten()
+        .collect();
+    let map = items
+        .iter()
+        .find(|item| {
+            item["kind"] == "sourceMap"
+                && item["mapping"] == "identity"
+                && item["sourceRange"]["start"]
+                    .as_u64()
+                    .is_some_and(|start| start <= at as u64)
+                && item["sourceRange"]["end"]
+                    .as_u64()
+                    .is_some_and(|end| end >= source.len() as u64)
+        })
+        .expect("HTML-entry document must expose literal tail native mapping");
+    let native = items
+        .iter()
+        .find(|item| item["kind"] == "nativeNode" && item["id"] == map["textNodeId"])
+        .unwrap();
+    assert!(
+        native.get("marksRef").is_none(),
+        "literal tail must not acquire a bold mark"
+    );
+    assert!(items.iter().any(|item| item["field"] == "renderedText"
+        && item["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("**After**"))));
+}
+
+#[tokio::test]
+async fn indexed_native_primitive_grants_bind_exact_code_and_scope() {
+    use intent_core::note_artifact::request::ArtifactHeader;
+    let source = "<div data-type=\"diff-block\" data-diff-code=\"LW9sZAor\"></div><div data-type=\"mermaid-block\" data-mermaid-code=\"graph TD\n A[Alpha]\n\"></div>";
+    let (store, _temporary, mut note) = setup(source).await;
+    let first = page(
+        &store,
+        json!({"kind":"source","maxSourceBytes":4096,"maxItems":128}),
+    )
+    .await;
+    let context = page(
+        &store,
+        json!({"kind":"context","contextRef":first["contextRef"],"maxItems":128}),
+    )
+    .await;
+    let atoms: Vec<_> = context["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["nodeClass"] == "atom")
+        .collect();
+    assert_eq!(atoms.len(), 2);
+    let mut headers = Vec::new();
+    for (atom, primitive, expected) in [
+        (atoms[0], "diff", "LW9sZAor"),
+        (atoms[1], "mermaid", "graph TD\n A[Alpha]"),
+    ] {
+        let owner = page(
+            &store,
+            json!({"kind":"context","contextRef":atom["nativeRef"]}),
+        )
+        .await;
+        assert_eq!(
+            owner["items"][0], *atom,
+            "window atom retains stable parent and self references"
+        );
+        let root = page(
+            &store,
+            json!({"kind":"metadata","ref":atom["attributesRef"]}),
+        )
+        .await;
+        let fields = page(
+            &store,
+            json!({"kind":"metadata","ref":root["items"][0]["childrenRef"]}),
+        )
+        .await;
+        let code = fields["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["key"] == "code")
+            .unwrap();
+        let value = page(
+            &store,
+            json!({"kind":"context","contextRef":code["valueRef"]}),
+        )
+        .await;
+        assert_eq!(value["items"][0]["text"], expected);
+        let header: ArtifactHeader = serde_json::from_value(json!({
+            "scope":first["scope"],"source":{"kind":"snapshot","snapshotId":first["snapshotId"],"sourceRevision":first["sourceRevision"],"ownerRef":atom["nativeRef"],"sourceRef":code["valueRef"]},
+            "primitive":primitive,"profile":"test-profile-not-registered","environment":{"width":800,"height":600,"theme":"light","fontRef":"test-font","fontSize":14,"devicePixelRatio":1},
+            "reservation":{"payloadBytes":4096,"records":10,"indexEntries":10,"storageChargeBytes":65536}
+        })).unwrap();
+        let grant = store
+            .authorize_note_artifact_source("pages", "alice", &header)
+            .await
+            .unwrap();
+        assert_eq!(grant.scope, header.scope);
+        assert!(store
+            .authorize_note_artifact_source("pages", "bob", &header)
+            .await
+            .is_err());
+        assert!(store
+            .authorize_note_artifact_source("other", "alice", &header)
+            .await
+            .is_err());
+        headers.push(header);
+    }
+    let mut swapped = serde_json::to_value(&headers[0]).unwrap();
+    swapped["source"]["sourceRef"] =
+        serde_json::to_value(&headers[1]).unwrap()["source"]["sourceRef"].clone();
+    assert!(store
+        .authorize_note_artifact_source("pages", "alice", &serde_json::from_value(swapped).unwrap())
+        .await
+        .is_err());
+    note.title = "new metadata revision".into();
+    store.update_note(&note).await.unwrap();
+    assert!(store
+        .authorize_note_artifact_source("pages", "alice", &headers[0])
+        .await
+        .is_err());
+    // Content replacement deletes the canonical binding in the same writer tx.
+    note.content = "plain replacement".into();
+    store.update_note(&note).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM note_artifact_source")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn indexed_markdown_primitive_code_matches_predecoder_native_values() {
+    let source = "## Before\n\n```diff\n-café & old\n+世界 <new>\n```\n\n```mermaid\nflowchart LR\n A[\"café & 世界\"] --> B\n```\n\n**After**";
+    let (store, _temporary, _note) = setup(source).await;
+    let first = page(
+        &store,
+        json!({"kind":"source","maxSourceBytes":4096,"maxItems":128}),
+    )
+    .await;
+    let context = page(
+        &store,
+        json!({"kind":"context","contextRef":first["contextRef"],"maxItems":128}),
+    )
+    .await;
+    let atoms: Vec<_> = context["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["nodeClass"] == "atom")
+        .collect();
+    assert_eq!(atoms.len(), 2);
+    for (atom, index, expected) in [
+        (atoms[0], 1, "LWNhZsOpICYgb2xkCivkuJbnlYwgPG5ldz4="),
+        (
+            atoms[1],
+            2,
+            "Zmxvd2NoYXJ0IExSCiBBWyJjYWbDqSAmIOS4lueVjCJdIC0tPiBC",
+        ),
+    ] {
+        let lexical = context["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| {
+                item["construct"] == "codeBlock" && item["sourceRange"] == atom["sourceRange"]
+            })
+            .unwrap();
+        assert_eq!(lexical["nativeRef"], atom["nativeRef"]);
+        let direct: String = sqlx::query_scalar("SELECT value FROM note_page_entry WHERE workspace_id='pages' AND note_id='spec' AND collection=? AND position=0")
+            .bind(format!("d:{}", lexical["id"].as_str().unwrap())).fetch_one(store.read_pool()).await.unwrap();
+        let direct: Value = serde_json::from_str(&direct).unwrap();
+        assert_eq!(
+            direct["nativeRef"],
+            format!("d:{}", atom["id"].as_str().unwrap()),
+            "direct lexical owner must preserve its canonical atom shortcut"
+        );
+        assert_eq!(atom["childIndex"], index);
+        let parent = page(
+            &store,
+            json!({"kind":"context","contextRef":atom["parentRef"]}),
+        )
+        .await;
+        assert_eq!(parent["items"][0]["nodeType"], "doc");
+        let root = page(
+            &store,
+            json!({"kind":"metadata","ref":atom["attributesRef"]}),
+        )
+        .await;
+        let fields = page(
+            &store,
+            json!({"kind":"metadata","ref":root["items"][0]["childrenRef"]}),
+        )
+        .await;
+        let code = fields["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["key"] == "code")
+            .unwrap();
+        let value = page(
+            &store,
+            json!({"kind":"context","contextRef":code["valueRef"]}),
+        )
+        .await;
+        assert_eq!(value["items"][0]["text"], expected);
+    }
+}
+
+#[tokio::test]
+async fn indexed_html_entry_backticks_follow_canonical_entry_mode() {
+    // Frozen FE ffb1ddf7 paired oracle: only the heading-first entry has a code mark.
+    for (prefix, markdown) in [("", false), ("## Before\n\n", true)] {
+        let source = format!("{prefix}<table><tr><td>x</td></tr></table>\n\n`After`");
+        let at = source.find("`After`").unwrap();
+        let (store, _temporary, _) = setup(&source).await;
+        let mut transcript = Vec::new();
+        let first = record_page(
+            &store,
+            json!({"kind":"source","at":at,"maxSourceBytes":32,"maxWireBytes":8192,"maxItems":64}),
+            &mut transcript,
+        )
+        .await;
+        let context = record_page(&store, json!({"kind":"context","contextRef":first["contextRef"],"maxWireBytes":8192,"maxItems":64}), &mut transcript).await;
+        record_fixture_closure(&store, &context["items"], &mut transcript).await;
+        if let Ok(directory) = std::env::var("NOTE_PAGE_TRANSCRIPT_DIR") {
+            let name = if markdown { "markdown" } else { "html" };
+            std::fs::write(
+                std::path::Path::new(&directory).join(format!("backtick-{name}.json")),
+                serde_json::to_vec_pretty(&json!({"source":source,"at":at,"calls":transcript}))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        let items = context["items"].as_array().unwrap();
+        let code = items.iter().find(|item| item["role"] == "code");
+        if markdown {
+            let code = code.expect("Markdown entry must retain code semantics");
+            assert!(code["codeSource"].is_object());
+            assert!(code["nativeRef"].is_string());
+            assert!(code["sourceMapRef"].is_string());
+            let maps = page(
+                &store,
+                json!({"kind":"context","contextRef":code["sourceMapRef"]}),
+            )
+            .await;
+            let direct = page(
+                &store,
+                json!({"kind":"context","contextRef":maps["items"][0]["ownerRef"]}),
+            )
+            .await;
+            assert_eq!(
+                code["parentRef"], direct["items"][0]["parentRef"],
+                "canonical code owner parent is snapshot-stable"
+            );
+            let second = page(
+                &store,
+                json!({"kind":"source","at":at+2,"maxSourceBytes":4,"snapshotId":first["snapshotId"],"sourceRevision":first["sourceRevision"],"noteInstanceId":first["scope"]["noteInstanceId"]}),
+            )
+            .await;
+            let next = page(
+                &store,
+                json!({"kind":"context","contextRef":second["contextRef"],"maxItems":128}),
+            )
+            .await;
+            let next = next["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["role"] == "code")
+                .unwrap();
+            for field in ["id", "parentRef", "nativeRef", "codeSource", "sourceRange"] {
+                assert_eq!(
+                    code[field], next[field],
+                    "code owner {field} changed across source windows"
+                );
+            }
+            assert_ne!(code["sourceMapRef"], next["sourceMapRef"]);
+        } else {
+            assert!(
+                code.is_none(),
+                "HTML-entry backticks must not advertise code semantics: {items:?}"
+            );
+            assert!(items.iter().any(|item| item["role"] == "literal"));
+            assert!(items.iter().any(|item| item["construct"] == "htmlDocument"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn indexed_html_entry_windows_and_prefix_edit_keep_source_ownership_scoped() {
+    let source = format!(
+        "<table><tr><td>x</td></tr></table>\n\n{}",
+        "😀literal&text ".repeat(2000)
+    );
+    let (store, _temporary, mut note) = setup(&source).await;
+    let mut owners = Vec::new();
+    for at in [100, 20100] {
+        let first = page(
+            &store,
+            json!({"kind":"source","at":at,"maxSourceBytes":128}),
+        )
+        .await;
+        let context = page(
+            &store,
+            json!({"kind":"context","contextRef":first["contextRef"],"maxItems":128}),
+        )
+        .await;
+        let owner = context["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["construct"] == "htmlDocument")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            owner["sourceRange"],
+            json!({"start":0,"end":source.encode_utf16().count()})
+        );
+        let maps = page(
+            &store,
+            json!({"kind":"context","contextRef":owner["sourceMapRef"],"maxItems":128}),
+        )
+        .await;
+        for map in maps["items"].as_array().unwrap() {
+            assert!(
+                map["sourceRange"]["end"].as_u64().unwrap()
+                    >= first["range"]["start"].as_u64().unwrap()
+            );
+            assert!(
+                map["sourceRange"]["start"].as_u64().unwrap()
+                    <= first["range"]["end"].as_u64().unwrap()
+            );
+        }
+        let reference = maps["items"][0]["ownerRef"].clone();
+        let direct = page(&store, json!({"kind":"context","contextRef":reference})).await;
+        let direct = &direct["items"][0];
+        assert_eq!(direct["id"], owner["id"]);
+        for field in ["sourceMapRef", "continuationBefore", "continuationAfter"] {
+            assert!(
+                direct.get(field).is_none(),
+                "stable owner must omit {field}"
+            );
+        }
+        owners.push(owner);
+    }
+    assert_eq!(owners[0]["id"], owners[1]["id"]);
+    assert_ne!(owners[0]["sourceMapRef"], owners[1]["sourceMapRef"]);
+    note.content = format!("## Before\n\n{source}");
+    store.update_note(&note).await.unwrap();
+    assert_error(
+        store
+            .read_note_page(
+                "pages",
+                "spec",
+                "alice",
+                request(json!({"kind":"context","contextRef":owners[0]["sourceMapRef"]})),
+                &json!(1),
+            )
+            .await,
+        NotePageError::Stale,
+    );
+    let first = page(
+        &store,
+        json!({"kind":"source","at":20111,"maxSourceBytes":128}),
+    )
+    .await;
+    let context = page(
+        &store,
+        json!({"kind":"context","contextRef":first["contextRef"],"maxItems":128}),
+    )
+    .await;
+    assert!(!context["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["construct"] == "htmlDocument"));
+}
+
+#[tokio::test]
+async fn indexed_markdown_titled_primitives_preserve_raw_predecoder_values() {
+    // Frozen FE e6d6bb999 titled-fence oracle: raw code, unlike exact-language base64.
+    for (language, body) in [
+        ("diff", "-café & old\n+世界 <new>"),
+        ("mermaid", "flowchart LR\n A[\"café & 世界\"] --> B"),
+    ] {
+        let source = format!("```{language} title\n{body}\n```");
+        let (store, _temporary, _) = setup(&source).await;
+        let first = page(&store, json!({"kind":"source","maxSourceBytes":4096})).await;
+        let context = page(
+            &store,
+            json!({"kind":"context","contextRef":first["contextRef"],"maxItems":128}),
+        )
+        .await;
+        let atom = context["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["nodeClass"] == "atom")
+            .expect("titled primitive must retain canonical native atom");
+        let root = page(
+            &store,
+            json!({"kind":"metadata","ref":atom["attributesRef"]}),
+        )
+        .await;
+        let fields = page(
+            &store,
+            json!({"kind":"metadata","ref":root["items"][0]["childrenRef"]}),
+        )
+        .await;
+        let code = fields["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["key"] == "code")
+            .unwrap();
+        let value = page(
+            &store,
+            json!({"kind":"context","contextRef":code["valueRef"]}),
+        )
+        .await;
+        assert_eq!(value["items"][0]["text"], body);
+    }
+}
+
+#[tokio::test]
+async fn indexed_native_primitives_match_all_frozen_entry_values() {
+    let groups: Value =
+        serde_json::from_str(include_str!("fixtures/note_primitive_native.json")).unwrap();
+    for group in groups.as_array().unwrap() {
+        for case in group["cases"].as_array().unwrap() {
+            let source = case["source"].as_str().unwrap();
+            let (store, _temporary, _) = setup(source).await;
+            let first = page(&store, json!({"kind":"source","maxSourceBytes":4096})).await;
+            let context = page(
+                &store,
+                json!({"kind":"context","contextRef":first["contextRef"],"maxItems":128}),
+            )
+            .await;
+            assert!(context["nextCursor"].is_null());
+            let atoms: Vec<_> = context["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["nodeClass"] == "atom")
+                .collect();
+            assert_eq!(
+                atoms.len(),
+                case["atoms"].as_array().unwrap().len(),
+                "{}",
+                case["id"]
+            );
+            for (atom, expected) in atoms.iter().zip(case["atoms"].as_array().unwrap()) {
+                assert_eq!(atom["nodeType"], expected["type"], "{}", case["id"]);
+                let root = page(
+                    &store,
+                    json!({"kind":"metadata","ref":atom["attributesRef"]}),
+                )
+                .await;
+                let fields = page(
+                    &store,
+                    json!({"kind":"metadata","ref":root["items"][0]["childrenRef"]}),
+                )
+                .await;
+                let code = fields["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|field| field["key"] == "code")
+                    .unwrap();
+                let value = page(
+                    &store,
+                    json!({"kind":"context","contextRef":code["valueRef"]}),
+                )
+                .await;
+                assert_eq!(
+                    value["items"][0]["text"], expected["code"],
+                    "{}",
+                    case["id"]
+                );
+            }
+        }
     }
 }
