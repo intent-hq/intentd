@@ -113,7 +113,7 @@ impl Registry {
         if v.state >= 5 {
             return Ok(());
         }
-        if v.state != 3 || v.outstanding != 0 || v.flags & 896 != 0 || e.transport_pending {
+        if v.state != 3 || v.outstanding != 0 || v.flags & 0x0380 != 0 || e.transport_pending {
             return Err(SessionError::Uncertain);
         }
         let result = Control::Settled {
@@ -165,7 +165,7 @@ impl Directory {
                     && e.metadata.fields().is_ok_and(|v| {
                         matches!(v.state, 5 | 6)
                             && v.outstanding == 0
-                            && v.flags & 896 == 0
+                            && v.flags & 0x0380 == 0
                             && now >= v.accept_until
                     })
                     && e.receipt.payload().is_ok()
@@ -279,7 +279,7 @@ impl Registry {
         let mut d = self.state.lock().map_err(|_| SessionError::Uncertain)?;
         let e = d.get_mut(slot).ok_or(SessionError::Uncertain)?;
         let v = e.metadata.fields()?;
-        if v.outstanding != 0 || v.flags & 384 != 0 || v.state >= 4 {
+        if v.outstanding != 0 || v.flags & 0x0180 != 0 || v.state >= 4 {
             return Err(SessionError::Uncertain);
         }
         e.metadata

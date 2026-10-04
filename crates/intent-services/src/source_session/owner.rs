@@ -125,7 +125,7 @@ impl Owner {
                 }
                 if state.open_finished
                     && v.outstanding == 0
-                    && v.flags & 896 == 0
+                    && v.flags & 0x0380 == 0
                     && !entry.transport_pending
                 {
                     break;

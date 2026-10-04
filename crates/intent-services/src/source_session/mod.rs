@@ -8,6 +8,10 @@ mod owner;
 pub(crate) mod registry;
 pub use connection::{Open, SourceConnection};
 pub use delivery::{Delivery, SourceWriter};
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Result::map_err transfers the owned error into this disclosure mapping."
+)]
 fn map_error(error: crate::Error) -> intent_core::note_source_session::SessionError {
     use intent_core::{
         note_page::NotePageError as P, note_source_session::SessionError as S, Error,

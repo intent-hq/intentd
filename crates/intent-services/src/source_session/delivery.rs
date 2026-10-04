@@ -44,6 +44,10 @@ impl Delivery {
     }
     /// Called while the sole writer retains exclusive sink readiness. Keep this
     /// exact future owned through cancellation; Drop retains uncertainty.
+    ///
+    /// # Errors
+    /// Returns uncertain when authorization or the retained outcome cannot be
+    /// safely disclosed. Other refusals replace the retained outcome with an error.
     pub async fn authorize(&mut self) -> Result<()> {
         let mut guard = Guard::new(self.owner.clone());
         let result = if let Some(hold) = &self.hold {
@@ -63,6 +67,10 @@ impl Delivery {
         Ok(())
     }
     /// Materialize only inside the already admitted frame reservation.
+    ///
+    /// # Errors
+    /// Rejects an invalid captured ID, missing authorization, or an envelope that
+    /// exceeds the admitted serialization budget.
     pub fn frame(&self) -> Result<String> {
         let id = &self.id;
         validate_id(id)?;
@@ -80,6 +88,10 @@ impl Delivery {
     /// The typed transport writer must exclusively own sink readiness. Context
     /// then operation locks span the synchronous local check and sink acceptance.
     /// No user callback, SQL, readiness wait, or await occurs in this section.
+    ///
+    /// # Errors
+    /// Rejects stale context/operation authority, missing authorization, duplicate
+    /// writes, invalid frame budgets, or uncertain sink acceptance/registry state.
     pub fn enqueue(&mut self, writer: &mut impl SourceWriter) -> Result<()> {
         if !self.authorized || self.writing {
             return Err(SessionError::Unavailable);
@@ -120,22 +132,19 @@ impl Delivery {
                     fields.sequence,
                     1,
                 )?;
-                match writer.start_send(frame) {
-                    Ok(()) => {
-                        self.writing = true;
-                        Ok(())
-                    }
-                    Err(()) => {
-                        let fields = entry.metadata.fields()?;
-                        entry.metadata.progress(
-                            4,
-                            fields.reason,
-                            fields.flags,
-                            fields.sequence,
-                            fields.outstanding,
-                        )?;
-                        Err(SessionError::Uncertain)
-                    }
+                if let Ok(()) = writer.start_send(frame) {
+                    self.writing = true;
+                    Ok(())
+                } else {
+                    let fields = entry.metadata.fields()?;
+                    entry.metadata.progress(
+                        4,
+                        fields.reason,
+                        fields.flags,
+                        fields.sequence,
+                        fields.outstanding,
+                    )?;
+                    Err(SessionError::Uncertain)
                 }
             })
             .unwrap_or(Err(SessionError::Unavailable));
@@ -146,6 +155,10 @@ impl Delivery {
     }
     /// Only after actual local flush completion. Consumer ownership persists until
     /// the next legal read or close; flush does not establish remote consumption.
+    ///
+    /// # Errors
+    /// Rejects an unaccepted write, duplicate delivery retirement, or uncertain
+    /// registry/consumer ownership.
     pub fn flushed(mut self) -> Result<()> {
         if !self.writing {
             return Err(SessionError::Uncertain);
@@ -172,7 +185,11 @@ impl Delivery {
         Ok(())
     }
     /// Suppress an outcome only after read/auth and any local socket continuation
-    /// have actually retired. Unknown write settlement must call uncertain instead.
+    /// have actually retired. Unknown write settlement must call `uncertain` instead.
+    ///
+    /// # Errors
+    /// Returns the source-hold retirement or registry ownership error without
+    /// manufacturing a settled receipt.
     pub fn discard(mut self) -> Result<()> {
         self.owner.request_close(Reason::Closed);
         if let Some(hold) = self.hold.take() {
@@ -266,8 +283,17 @@ impl Drop for AwaitDelivery {
 }
 
 /// Narrow trusted transport adapter, not a wire-supplied callback. Implementations
-/// must only call their exclusively owned sink start_send, must not reenter any
+/// must only call their exclusively owned sink `start_send`, must not reenter any
 /// Services/context/operation API, and must not block or poll readiness here.
 pub trait SourceWriter {
+    /// Attempt synchronous acceptance by the exclusively ready local sink.
+    ///
+    /// # Errors
+    /// Returns an erased failure if acceptance is not known to have succeeded.
+    /// Every such failure retains uncertain write ownership.
+    #[expect(
+        clippy::result_unit_err,
+        reason = "Transport details are intentionally erased; every failure retains uncertain ownership."
+    )]
     fn start_send(&mut self, frame: String) -> std::result::Result<(), ()>;
 }

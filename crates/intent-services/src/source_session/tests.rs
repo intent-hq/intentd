@@ -397,7 +397,7 @@ async fn actual_id_and_context_invalidation_survive_completed_authorization() {
             0 => context.as_mut().unwrap().phase(6),
             1 => drop(context.take()),
             _ => context.take().unwrap().retire(),
-        };
+        }
         let mut sink = LocalSink::default();
         assert!(delivery.enqueue(&mut sink).is_err());
         assert!(sink.0.is_none());
@@ -641,12 +641,12 @@ async fn terminal_receipt_waits_for_original_transport_retirement() {
         .unwrap();
     // Retire actual source work/consumer, while explicitly retaining the attached
     // transport owner. Direct private publication probe must still refuse.
-    let (held, session) = {
+    let (delivery_hold, session) = {
         let mut state = owner.state.lock().unwrap();
         (state.delivered.take(), state.session.clone().unwrap())
     };
-    if let Some(held) = held {
-        held.retire().unwrap();
+    if let Some(delivery_hold) = delivery_hold {
+        delivery_hold.retire().unwrap();
         owner.registry.consume(owner.slot).unwrap();
     }
     session.close().await.unwrap();

@@ -31,6 +31,10 @@ pub struct SourceConnection {
 }
 impl Services {
     /// No listener activation. Requires a ready context and its actual wire caller.
+    ///
+    /// # Errors
+    /// Rejects an invalid or already claimed context/caller binding, unavailable
+    /// registry initialization, or uncertain ownership.
     pub fn prepared_source_connection(
         &self,
         context: &Context,
@@ -85,6 +89,10 @@ impl SourceConnection {
     }
     /// Attach the original admitted transport before creating an operation.
     /// Its parser, socket and continuations must retire before a settled receipt.
+    ///
+    /// # Errors
+    /// Returns unavailable if the context is no longer current, a transport was
+    /// already attached, or an operation already exists.
     pub fn attach_transport(&mut self) -> Result<()> {
         self.current()?;
         if self.transport.is_some() || self.owner.is_some() {
@@ -95,6 +103,10 @@ impl SourceConnection {
     }
     /// Called only after the original transport's owned continuations and local
     /// socket/parser have retired. This does not establish peer consumption.
+    ///
+    /// # Errors
+    /// Rejects an absent/already retired attachment or an uncertain registry,
+    /// operation state, or pending-transport record.
     pub fn transport_retired(&mut self) -> Result<()> {
         if self.transport != Some(false) {
             return Err(SessionError::Unavailable);
@@ -133,9 +145,15 @@ impl SourceConnection {
             notified.await;
         }
     }
+    #[must_use]
     pub fn epoch(&self) -> [u8; 16] {
         self.identity.epoch
     }
+    /// Admit one descriptor-bound operation before launching source authorization.
+    ///
+    /// # Errors
+    /// Rejects invalid identities, descriptors, IDs, source references, deadlines,
+    /// capacity exhaustion, or uncertain registry ownership.
     pub fn open(&mut self, op: Operation, id: Value) -> Result<Open> {
         self.current()?;
         validate_id(&id)?;
@@ -194,8 +212,19 @@ impl SourceConnection {
         drop(directory);
         Ok(Open::Pending(Box::pin(owner.open(id))))
     }
-    /// Cleanup deliberately does not call require_member. It discloses no source
+    /// Cleanup deliberately does not call `require_member`. It discloses no source
     /// and cannot rebind an old operation to this replacement connection.
+    ///
+    /// # Errors
+    /// Rejects invalid/current-context bindings, malformed or mismatched
+    /// descriptors, exhausted cancellation capacity, or uncertain registry state.
+    ///
+    /// # Panics
+    /// Test builds panic if the injected lock-observation mutex is poisoned.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "The public operation boundary takes ownership of the validated request."
+    )]
     pub fn close(&self, op: Operation) -> Result<Control> {
         #[cfg(test)]
         if let Some(observe) = self.registry.close_blocked.lock().unwrap().clone() {
@@ -274,6 +303,11 @@ impl SourceConnection {
             .ok_or(SessionError::Uncertain)?
             .close_result()
     }
+    /// Admit the next sequential read while retaining its exact request ID.
+    ///
+    /// # Errors
+    /// Rejects stale contexts, wrong identities, invalid requests or sequences,
+    /// unavailable read credit, and uncertain source/registry ownership.
     pub fn read(
         &self,
         read: Read,
@@ -317,7 +351,7 @@ impl SourceConnection {
             if owner.closing.load(Ordering::Acquire)
                 || v.state != 1
                 || v.outstanding != 0
-                || v.flags & 384 != 0
+                || v.flags & 0x0180 != 0
             {
                 return Err(SessionError::Unavailable);
             }
@@ -370,6 +404,7 @@ impl SourceConnection {
         Ok(AwaitDelivery::new(owner, rx))
     }
 
+    #[must_use]
     pub fn expiry(&self) -> Option<i128> {
         let owner = self.owner.as_ref()?;
         let directory = self.registry.state.lock().ok()?;
@@ -382,6 +417,10 @@ impl SourceConnection {
                 .source_expiry,
         )
     }
+    /// Revoke the operation and await its owned settlement.
+    ///
+    /// # Errors
+    /// Returns an error if ownership or the cleanup outcome remains uncertain.
     pub async fn retire(&self) -> Result<()> {
         let Some(owner) = &self.owner else {
             return Ok(());

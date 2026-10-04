@@ -236,7 +236,7 @@ impl Receipt {
                 (6, Reason::Cancelled) | (3, Reason::Closed | Reason::Expired)
             )
             || v.outstanding != 0
-            || v.flags & 896 != 0
+            || v.flags & 0x0380 != 0
             || self.bytes[..4] != [0; 4]
             || hex(&v.digest) != operation_id
         {
