@@ -1,7 +1,11 @@
 //! Bounded reads over write-maintained indexes. Tokens are authenticated with a
 //! persistent database secret, while bounded snapshot leases are process-local.
+mod artifact;
 mod token;
+pub use artifact::ArtifactSourceGrant;
+mod artifact_lifecycle;
 use crate::Store;
+pub use artifact_lifecycle::ArtifactJournalStatus;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
 use intent_core::{
@@ -745,7 +749,10 @@ impl Store {
                 item["continuationAfter"] =
                     json!(item["sourceRange"]["end"].as_u64().expect("index range") > end);
             }
-            if window && item.get("htmlPosition").is_none() {
+            if window
+                && matches!(item["kind"].as_str(), Some("boundary" | "span"))
+                && item.get("htmlPosition").is_none()
+            {
                 if let Some(parent) = item["parentRef"].as_str() {
                     item["parentRef"] = json!(format!(
                         "{parent}:{}:{}",

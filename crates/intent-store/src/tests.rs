@@ -26,6 +26,7 @@ mod workspace_delete;
 mod metadata_key_json;
 mod note_line_attribution;
 mod note_pages;
+mod note_artifacts;
 mod note_search;
 
 /// A unique temp DB path inside an RAII temp dir: the dir (and with it the

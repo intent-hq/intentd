@@ -45,7 +45,11 @@ pub(super) fn encode(token: &Token) -> Vec<u8> {
                 &mut bytes,
                 u64::from_str_radix(part, 16).expect("hex index id"),
             );
-        } else if let Ok(value) = part.parse::<u64>() {
+        } else if let Some(value) = part
+            .parse::<u64>()
+            .ok()
+            .filter(|value| value.to_string() == part)
+        {
             bytes.push(12);
             integer(&mut bytes, value);
         } else {
@@ -229,5 +233,27 @@ mod tests {
         let mut nonminimal = valid[..valid.len() - 4].to_vec();
         nonminimal.extend_from_slice(&[128, 0, 0, 0, 0]);
         assert!(decode(&nonminimal).is_none());
+    }
+
+    #[test]
+    fn reference_preserves_noncanonical_numeric_resource_identity() {
+        let runtime = Runtime {
+            key: vec![23; 32],
+            ..Runtime::default()
+        };
+        let source = "00000000000000000000000000000002";
+        for resource in [
+            "j:00000000000000000000000000000001",
+            "f:01",
+            "f:+1",
+            "f:0",
+            "f:18446744073709551615",
+            "f:18446744073709551616",
+        ] {
+            let token = Token(source.into(), "r".into(), resource.into(), 0, 0, 0, 0);
+            let encoded = runtime.token(&token);
+            assert!(encoded.len() <= 256);
+            assert_eq!(runtime.decode(&encoded).unwrap().2, resource);
+        }
     }
 }
