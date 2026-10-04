@@ -20,7 +20,14 @@ base64 = { workspace = true }
 image = { version = "0.25.6", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 flate2 = "1.1.9"
 
+hmac = "0.12"
+sha2 = "0.10"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+html5gum = { version = "=0.8.4", default-features = false }
+html5ever = "=0.29.1"
+
 [dev-dependencies]
+regex = "1"
 tempfile = "3"
 tokio = { workspace = true }
 uuid = { workspace = true }

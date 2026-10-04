@@ -25,6 +25,7 @@ mod workspace_delete;
 
 mod metadata_key_json;
 mod note_line_attribution;
+mod note_pages;
 mod note_search;
 
 /// A unique temp DB path inside an RAII temp dir: the dir (and with it the
@@ -7261,6 +7262,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
         }
     };
     let store = Store {
+        note_pages: std::sync::Arc::default(),
         write_pool,
         read_pool: crate::connect_read(&tmp.path)
             .await

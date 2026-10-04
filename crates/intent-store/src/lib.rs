@@ -37,6 +37,9 @@ mod message_thumbnails;
 mod metrics_repo;
 mod node_repo;
 mod note_line_attribution_repo;
+mod note_page_html;
+mod note_page_index;
+mod note_page_repo;
 mod note_repo;
 mod note_search_repo;
 mod note_version_repo;
@@ -362,6 +365,7 @@ pub struct Store {
     /// Process-local `displayed` overlay of the browser tab registry; see
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
+    note_pages: std::sync::Arc<note_page_repo::Runtime>,
     #[cfg(test)]
     export_author_barrier: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
@@ -409,9 +413,33 @@ impl Store {
                 "reaped orphaned pre-staged agent_message_payload rows"
             );
         }
+        // Keep the derived-index startup future off enclosing callers' stacks,
+        // and leave the read pool cold until the first actual read.
+        let note_pages = std::sync::Arc::new(
+            Box::pin(async {
+                let mut index_conn = write_pool
+                    .acquire()
+                    .await
+                    .map_err(|e| Error::Internal(format!("note index open: {e}")))?;
+                sqlx::query("BEGIN IMMEDIATE")
+                    .execute(&mut *index_conn)
+                    .await
+                    .map_err(|e| Error::Internal(format!("note index begin: {e}")))?;
+                let indexed = async {
+                    note_page_index::retire_changed_profiles(&mut index_conn).await?;
+                    note_page_index::rebuild_pending(&mut index_conn).await
+                }
+                .await;
+                commit_with_rollback_guard(index_conn, indexed, "note index backfill commit")
+                    .await?;
+                note_page_repo::Runtime::open(&write_pool).await
+            })
+            .await?,
+        );
         lifecycle.settle();
         Ok(Self {
             repository_lifecycle,
+            note_pages,
             write_pool,
             read_pool,
             browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),

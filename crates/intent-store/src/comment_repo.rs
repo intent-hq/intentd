@@ -230,7 +230,7 @@ impl Store {
             // bump, gated on `expected_version`. A miss (gate failed or note
             // absent) is told apart after the rollback.
             let Some(new_rev) = crate::note_repo::exec_update_note(
-                &mut *conn,
+                &mut conn,
                 note,
                 expected_version,
                 crate::note_repo::NoteUpdateScope::FullRow,

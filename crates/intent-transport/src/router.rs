@@ -17,6 +17,7 @@
 //! service authorizes its actual owner. In particular, source export follow-ups
 //! retain their exportId/seq/archiveSource semantics without a workspace lookup.
 
+use futures_util::future::BoxFuture;
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
     ClientId, ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate,
@@ -24,7 +25,7 @@ use intent_core::{
     ScriptMode, TaskAgentLink, WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId,
     WorkspaceUpdate,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::time::Instant;
 use tracing::Instrument;
@@ -97,6 +98,15 @@ fn not_found(message: impl Into<String>) -> RpcErr {
 /// surface as `-32603 "Internal error"` carrying the original cause in `data`.
 fn domain_to_rpc(e: Error) -> RpcErr {
     match e {
+        Error::NotePage(kind) => RpcErr {
+            code: if kind == intent_core::note_page::NotePageError::Stale {
+                -32005
+            } else {
+                -32602
+            },
+            message: "Note page unavailable".into(),
+            data: Some(json!({"code":kind.wire_code()})),
+        },
         Error::ExecutionAuthorization {
             source,
             authorization,
@@ -485,6 +495,11 @@ pub(crate) async fn prepare_message(
         }
     };
 
+    // Never echo an unbounded ID from an opt-in page request.
+    if method == "note.get" && params.contains_key("page") && !valid_note_page_id(&echo_id) {
+        return Some(invalid_note_page_id());
+    }
+
     // Keep one span alive through dispatch AND response encoding. The writer
     // queue consumes the returned frame later, so queue latency is deliberately
     // excluded from `encode_elapsed_ms`. `request_shape` is recorded by the
@@ -503,7 +518,11 @@ pub(crate) async fn prepare_message(
     );
     let profile_span = span.clone();
     async move {
-        let result = dispatch(api, method, &params).await;
+        let result = if method == "note.get" && params.contains_key("page") {
+            Box::pin(dispatch_note_page(api, &params, &echo_id, message.len())).await
+        } else {
+            dispatch(api, method, &params).await
+        };
         let kind = if result.is_ok() {
             intent_core::repository_request::RepositoryReadReplyKind::Result
         } else {
@@ -599,8 +618,100 @@ fn encode_dispatch_result(
     }
 }
 
+fn valid_note_page_id(id: &Value) -> bool {
+    match id {
+        Value::String(s) => s.len() <= 64,
+        Value::Number(n) => n
+            .as_i64()
+            .is_some_and(|v| v.unsigned_abs() <= 9_007_199_254_740_991),
+        _ => false,
+    }
+}
+
+fn invalid_note_page_id() -> PreparedReply {
+    prepared_error(
+        &Value::Null,
+        INVALID_PARAMS,
+        "Invalid note page request",
+        Some(json!({"code":"invalid-params"})),
+    )
+}
+
 /// Dispatch a validated request to the injected [`WorkspaceApi`].
-async fn dispatch(
+async fn dispatch_note_page(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+    id: &Value,
+    request_bytes: usize,
+) -> std::result::Result<Value, RpcErr> {
+    if request_bytes > 65_536 || !valid_note_page_id(id) {
+        return Err(domain_to_rpc(Error::NotePage(
+            intent_core::note_page::NotePageError::Budget,
+        )));
+    }
+    let page = params.get("page").expect("page present");
+    if page
+        .as_object()
+        .is_none_or(|m| m.values().any(Value::is_null))
+    {
+        return Err(invalid_params("Invalid note page request"));
+    }
+    let request = intent_core::note_page::NotePageRequest::deserialize(page)
+        .map_err(|_| invalid_params("Invalid note page request"))?;
+    let ws = require_ws_note(params)?;
+    let note = require_note_id(params)?;
+    if ws.0.len() > 256 || note.0.len() > 256 {
+        return Err(invalid_params("Invalid note page request"));
+    }
+    api.get_note_page(ws, note, request, id.clone())
+        .await
+        .map_err(domain_to_rpc)
+}
+
+// Keep workspace provisioning off the large general dispatch poll frame. Its
+// service call may perform TLS before the first note write; paging must not
+// exhaust the default thread stack on that legacy path.
+fn dispatch<'a>(
+    api: &'a dyn WorkspaceApi,
+    method: &'a str,
+    params: &'a Map<String, Value>,
+) -> BoxFuture<'a, Result<Value, RpcErr>> {
+    match method {
+        "workspace.create" => Box::pin(dispatch_workspace_create(api, params)),
+        _ => Box::pin(dispatch_other(api, method, params)),
+    }
+}
+
+async fn dispatch_workspace_create(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    // Agent ids are server-assigned: reject stale clients that still
+    // send `initialAgent.agentId` before any provisioning runs.
+    if params
+        .get("initialAgent")
+        .and_then(|a| a.get("agentId"))
+        .is_some_and(|v| !v.is_null())
+    {
+        return Err(invalid_params(
+            "initialAgent.agentId: agent IDs are server-assigned and the field must be omitted",
+        ));
+    }
+    let idempotency_key = opt_str(params, "idempotencyKey");
+    let input: WorkspaceCreate = serde_json::from_value(Value::Object(params.clone()))
+        .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+    let res = api
+        .create_workspace(input, idempotency_key)
+        .await
+        .map_err(workspace_err)?;
+    let mut result = json!({ "workspace": res.workspace });
+    if let Some(agent) = res.initial_agent {
+        result["initialAgent"] = agent;
+    }
+    Ok(result)
+}
+
+async fn dispatch_other(
     api: &dyn WorkspaceApi,
     method: &str,
     params: &Map<String, Value>,
@@ -719,31 +830,6 @@ async fn dispatch(
             let id = require_workspace_id(params)?;
             let ws = api.get_workspace(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
-        }
-        "workspace.create" => {
-            // Agent ids are server-assigned: reject stale clients that still
-            // send `initialAgent.agentId` before any provisioning runs.
-            if params
-                .get("initialAgent")
-                .and_then(|a| a.get("agentId"))
-                .is_some_and(|v| !v.is_null())
-            {
-                return Err(invalid_params(
-                    "initialAgent.agentId: agent IDs are server-assigned and the field must be omitted",
-                ));
-            }
-            let idempotency_key = opt_str(params, "idempotencyKey");
-            let input: WorkspaceCreate = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-            let res = api
-                .create_workspace(input, idempotency_key)
-                .await
-                .map_err(workspace_err)?;
-            let mut result = json!({ "workspace": res.workspace });
-            if let Some(agent) = res.initial_agent {
-                result["initialAgent"] = agent;
-            }
-            Ok(result)
         }
         "workspace.update" => {
             let id = require_workspace_id(params)?;

@@ -101,6 +101,10 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("note_page_backend", "database-local namespace and authentication secret never transfer"),
+    ("note_page_head", "fresh note incarnations created by import insert triggers"),
+    ("note_page_piece", "derived source index rebuilt inside import transaction"),
+    ("note_page_entry", "derived context and metadata rebuilt inside import transaction"),
     ("note_search_ctx", "derived note search identities/context; note import triggers rebuild them"),
     ("note_fts", "derived note full-text index; note import triggers rebuild it"),
     ("note_fts_config", "FTS5 shadow table of the derived note index"),
@@ -663,6 +667,9 @@ impl Store {
                 query.execute(&mut *tx).await.map_err(|e| {
                     Error::Internal(format!("transfer import insert into {table} failed: {e}"))
                 })?;
+                if *table == "note" {
+                    crate::note_page_index::rebuild_pending(&mut tx).await?;
+                }
                 if let Some(metadata) = history_metadata {
                     sqlx::query("UPDATE agent_message SET metadata=? WHERE id=? AND agent_id=?")
                         .bind(metadata)

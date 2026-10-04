@@ -970,6 +970,18 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// Fetch one note by id, scoped to the workspace (PROTOCOL §5.2).
+    /// Read bounded indexed source/context/metadata at one live revision.
+    fn get_note_page(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        request: crate::note_page::NotePageRequest,
+        rpc_id: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, note_id, request, rpc_id);
+        Box::pin(async { Err(crate::Error::Unsupported("note pages".into())) })
+    }
+
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
         let _ = (workspace_id, note_id);
         Box::pin(async {

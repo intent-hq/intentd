@@ -947,6 +947,10 @@ impl Store {
         )
         .await?;
         for table in [
+            // Derived page rows can greatly outnumber notes; do not leave them
+            // to a single note/head foreign-key cascade.
+            "note_page_entry",
+            "note_page_piece",
             "note_version",
             "note_line_attribution",
             "note",

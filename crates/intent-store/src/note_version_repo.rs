@@ -103,7 +103,7 @@ impl Store {
 
         let result = async {
             let Some(rev) = crate::note_repo::exec_update_note(
-                &mut *conn,
+                &mut conn,
                 note,
                 expected_version,
                 crate::note_repo::NoteUpdateScope::FullRow,
@@ -161,7 +161,7 @@ impl Store {
         // nothing written before the (no-op) commit.
         let result = async {
             let Some(rev) = crate::note_repo::exec_update_note(
-                &mut *conn,
+                &mut conn,
                 note,
                 expected_version,
                 crate::note_repo::NoteUpdateScope::FullRow,
@@ -172,7 +172,7 @@ impl Store {
             };
             let v = insert_note_version(&mut conn, note, author, date, rev).await?;
             for child in children {
-                crate::note_repo::exec_insert_note(&mut *conn, child).await?;
+                crate::note_repo::exec_insert_note(&mut conn, child).await?;
                 insert_note_version(&mut conn, child, author, &child.updated_at, child.rev).await?;
             }
             Ok(Some((rev, v)))
@@ -220,7 +220,7 @@ impl Store {
             .map_err(|e| Error::Internal(format!("begin IMMEDIATE failed: {e}")))?;
 
         let result = async {
-            crate::note_repo::exec_insert_note(&mut *conn, note).await?;
+            crate::note_repo::exec_insert_note(&mut conn, note).await?;
             insert_note_version(&mut conn, note, author, date, note.rev).await
         }
         .await;
