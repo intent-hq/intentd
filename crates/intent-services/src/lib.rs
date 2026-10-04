@@ -20669,7 +20669,10 @@ impl WorkspaceApi for Services {
                 "",
                 idempotency_key,
                 "workspace.create",
-                move || async move {
+                // Keep the creation operation on the heap through the generic
+                // replay and execution scopes. Its initial-message persistence
+                // path otherwise exhausts the default stack in debug builds.
+                move || Box::pin(async move {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
@@ -22880,7 +22883,7 @@ impl WorkspaceApi for Services {
                         workspace: ws,
                         initial_agent,
                     })
-                },
+                }),
             )
             .await;
 
