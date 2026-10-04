@@ -1,0 +1,143 @@
+{
+  "sourceCommit": "fbf273b836d2ac9a1054ab6abf50b50e4cb548f5",
+  "canonicalization": {
+    "profile": "RFC8785",
+    "note": "Canonical JSON vectors are serialization controls, not schema-valid artifact records unless explicitly used as a header. Invalid JSON, duplicate keys, nonfinite values and unpaired surrogates are rejected before hashing; protocol field constraints still apply.",
+    "values": [
+      {
+        "id": "integer-spelling-and-negative-zero",
+        "rawJson": "{\"z\":1.0,\"a\":-0}",
+        "canonical": "{\"a\":0,\"z\":1}",
+        "utf8Hex": "7b2261223a302c227a223a317d",
+        "sha256": "6f8e07a68fb3342735f01b788af3e724a7056b40e2aad3d4321d38f7de49f905"
+      },
+      {
+        "id": "exponent-thresholds",
+        "rawJson": "{\"small\":1e-7,\"edge\":1e-6,\"below\":1e20,\"at\":1e21}",
+        "canonical": "{\"at\":1e+21,\"below\":100000000000000000000,\"edge\":0.000001,\"small\":1e-7}",
+        "utf8Hex": "7b226174223a31652b32312c2262656c6f77223a3130303030303030303030303030303030303030302c2265646765223a302e3030303030312c22736d616c6c223a31652d377d",
+        "sha256": "cb142fe81637b3b063a4c3b3422ca65f0a6aba5dcb8ce134bc90f28ed27da414"
+      },
+      {
+        "id": "fractional-geometry",
+        "rawJson": "{\"width\":800.5,\"height\":600.125,\"fontSize\":13.333333333333334,\"devicePixelRatio\":1.25}",
+        "canonical": "{\"devicePixelRatio\":1.25,\"fontSize\":13.333333333333334,\"height\":600.125,\"width\":800.5}",
+        "utf8Hex": "7b22646576696365506978656c526174696f223a312e32352c22666f6e7453697a65223a31332e3333333333333333333333333333342c22686569676874223a3630302e3132352c227769647468223a3830302e357d",
+        "sha256": "ea3a5efbfcb32543f6d4c0a97abe74dc0f337f3c33f7b6edd2393d5fb20eb87d"
+      },
+      {
+        "id": "utf16-and-numeric-looking-key-order",
+        "rawJson": "{\"\\ue000\":1,\"\\ud834\\udd1e\":2,\"2\":3,\"10\":4,\"a\":{\"z\":0,\"b\":1},\"list\":[{\"z\":0,\"a\":1},2,1]}",
+        "canonical": "{\"10\":4,\"2\":3,\"a\":{\"b\":1,\"z\":0},\"list\":[{\"a\":1,\"z\":0},2,1],\"𝄞\":2,\"\":1}",
+        "utf8Hex": "7b223130223a342c2232223a332c2261223a7b2262223a312c227a223a307d2c226c697374223a5b7b2261223a312c227a223a307d2c322c315d2c22f09d849e223a322c22ee8080223a317d",
+        "sha256": "95d3cd9567dfcc79b72236c841c31f6365969fc356cfb1e66ddab32776147c03"
+      },
+      {
+        "id": "escaping-without-unicode-normalization",
+        "rawJson": "{\"text\":\"\\u00e9 e\\u0301 \\/ \\u0001 \\b\\t\\n\\f\\r \\\" \\\\\"}",
+        "canonical": "{\"text\":\"é é / \\u0001 \\b\\t\\n\\f\\r \\\" \\\\\"}",
+        "utf8Hex": "7b2274657874223a22c3a92065cc81202f205c7530303031205c625c745c6e5c665c72205c22205c5c227d",
+        "sha256": "bcd953f0f0624c5ab13b744a346f0dd8fc4967ffdd46515d9d0179b1ed1b8a6a"
+      }
+    ],
+    "numbers": [
+      {
+        "id": "negative-zero",
+        "rawJson": "-0",
+        "canonical": "0",
+        "utf8Hex": "30",
+        "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+        "binary64Hex": "8000000000000000"
+      },
+      {
+        "id": "smallest-subnormal",
+        "rawJson": "5e-324",
+        "canonical": "5e-324",
+        "utf8Hex": "35652d333234",
+        "sha256": "c46e7ca1be4c8734f373a56530787288fa2058d73d07855e9247e949f811a42a",
+        "binary64Hex": "0000000000000001"
+      },
+      {
+        "id": "largest-finite",
+        "rawJson": "1.7976931348623157e308",
+        "canonical": "1.7976931348623157e+308",
+        "utf8Hex": "312e37393736393331333438363233313537652b333038",
+        "sha256": "c2784e1abd6317452708f3fbf9641c16b959561bc621a1d408c23a20aa2cb585",
+        "binary64Hex": "7fefffffffffffff"
+      },
+      {
+        "id": "binary64-rounding",
+        "rawJson": "333333333.33333329",
+        "canonical": "333333333.3333333",
+        "utf8Hex": "3333333333333333332e33333333333333",
+        "sha256": "6bd9be1c141028789cc35db62f1b43e80d5d4ee24d6d542e775deb16799ff4c7",
+        "binary64Hex": "41b3de4355555555"
+      },
+      {
+        "id": "ties-to-even",
+        "rawJson": "1424953923781206.25",
+        "canonical": "1424953923781206.2",
+        "utf8Hex": "313432343935333932333738313230362e32",
+        "sha256": "e1547479d27f057e3197d49417a1dcbe19dd8781b34fa9f83b789925943d00cb",
+        "binary64Hex": "43143ff3c1cb0959"
+      },
+      {
+        "id": "fixed-before-exponent",
+        "rawJson": "999999999999999900000",
+        "canonical": "999999999999999900000",
+        "utf8Hex": "393939393939393939393939393939393030303030",
+        "sha256": "914b4f8b4bbe2f6e7c36ad7791fc842a7516d149e694b3a71b78cee465ff6d7a",
+        "binary64Hex": "444b1ae4d6e2ef4f"
+      },
+      {
+        "id": "exponent-at-1e21",
+        "rawJson": "1e21",
+        "canonical": "1e+21",
+        "utf8Hex": "31652b3231",
+        "sha256": "241c4643fa70b1dcde1205b71be4e3bebb17e9f880c8e1a33d0ead6c27271d3c",
+        "binary64Hex": "444b1ae4d6e2ef50"
+      },
+      {
+        "id": "small-fixed-boundary",
+        "rawJson": "0.000001",
+        "canonical": "0.000001",
+        "utf8Hex": "302e303030303031",
+        "sha256": "159fb29a827ad04b260aa6c8ab6d8637f8f2b38af5c4f3cb49d6a21205e040f8",
+        "binary64Hex": "3eb0c6f7a0b5ed8d"
+      },
+      {
+        "id": "small-exponent-boundary",
+        "rawJson": "9.999999999999997e-7",
+        "canonical": "9.999999999999997e-7",
+        "utf8Hex": "392e393939393939393939393939393937652d37",
+        "sha256": "2ace34b29d30d300aeacd4f2bb83367fa186f11a3f02ed461f35f00fd741a242",
+        "binary64Hex": "3eb0c6f7a0b5ed8c"
+      }
+    ],
+    "header": {
+      "id": "fractional-header",
+      "rawJson": "{\"domain\":\"note.artifact.begin.v1\",\"jobId\":\"artifact-job-a\",\"expiresAt\":\"2026-10-04T01:00:00Z\",\"header\":{\"scope\":{\"backendId\":\"db-a\",\"workspaceId\":\"ws-a\",\"noteId\":\"spec\",\"noteInstanceId\":\"inc-a\"},\"source\":{\"kind\":\"snapshot\",\"snapshotId\":\"snap-a\",\"sourceRevision\":\"r:7\",\"ownerRef\":\"native-diff-owner\",\"sourceRef\":\"diff-code-value\"},\"primitive\":\"diff\",\"profile\":\"intent-diff-block/pierre-1.4.1/v1\",\"environment\":{\"width\":800.5,\"height\":600.125,\"theme\":\"light\",\"fontRef\":\"registered-monospace\",\"fontSize\":13.333333333333334,\"devicePixelRatio\":1.25},\"reservation\":{\"payloadBytes\":65536,\"records\":16,\"indexEntries\":64,\"storageChargeBytes\":1048576}}}",
+      "canonical": "{\"domain\":\"note.artifact.begin.v1\",\"expiresAt\":\"2026-10-04T01:00:00Z\",\"header\":{\"environment\":{\"devicePixelRatio\":1.25,\"fontRef\":\"registered-monospace\",\"fontSize\":13.333333333333334,\"height\":600.125,\"theme\":\"light\",\"width\":800.5},\"primitive\":\"diff\",\"profile\":\"intent-diff-block/pierre-1.4.1/v1\",\"reservation\":{\"indexEntries\":64,\"payloadBytes\":65536,\"records\":16,\"storageChargeBytes\":1048576},\"scope\":{\"backendId\":\"db-a\",\"noteId\":\"spec\",\"noteInstanceId\":\"inc-a\",\"workspaceId\":\"ws-a\"},\"source\":{\"kind\":\"snapshot\",\"ownerRef\":\"native-diff-owner\",\"snapshotId\":\"snap-a\",\"sourceRef\":\"diff-code-value\",\"sourceRevision\":\"r:7\"}},\"jobId\":\"artifact-job-a\"}",
+      "utf8Hex": "7b22646f6d61696e223a226e6f74652e61727469666163742e626567696e2e7631222c22657870697265734174223a22323032362d31302d30345430313a30303a30305a222c22686561646572223a7b22656e7669726f6e6d656e74223a7b22646576696365506978656c526174696f223a312e32352c22666f6e74526566223a22726567697374657265642d6d6f6e6f7370616365222c22666f6e7453697a65223a31332e3333333333333333333333333333342c22686569676874223a3630302e3132352c227468656d65223a226c69676874222c227769647468223a3830302e357d2c227072696d6974697665223a2264696666222c2270726f66696c65223a22696e74656e742d646966662d626c6f636b2f7069657272652d312e342e312f7631222c227265736572766174696f6e223a7b22696e646578456e7472696573223a36342c227061796c6f61644279746573223a36353533362c227265636f726473223a31362c2273746f726167654368617267654279746573223a313034383537367d2c2273636f7065223a7b226261636b656e644964223a2264622d61222c226e6f74654964223a2273706563222c226e6f7465496e7374616e63654964223a22696e632d61222c22776f726b73706163654964223a2277732d61227d2c22736f75726365223a7b226b696e64223a22736e617073686f74222c226f776e6572526566223a226e61746976652d646966662d6f776e6572222c22736e617073686f744964223a22736e61702d61222c22736f75726365526566223a22646966662d636f64652d76616c7565222c22736f757263655265766973696f6e223a22723a37227d7d2c226a6f624964223a2261727469666163742d6a6f622d61227d",
+      "sha256": "62b19f606a72faaa9d88990495228021fe164202323e95b3881825616003b5d3"
+    },
+    "append": [
+      {
+        "id": "exact-record-spelling-0",
+        "rawJson": "[\"note.artifact.append.v1\",\"62b19f606a72faaa9d88990495228021fe164202323e95b3881825616003b5d3\",0,\"62b19f606a72faaa9d88990495228021fe164202323e95b3881825616003b5d3\",\"{\\\"kind\\\":\\\"diff.fragment\\\",\\\"value\\\":{\\\"left\\\":1}}\"]",
+        "canonical": "[\"note.artifact.append.v1\",\"62b19f606a72faaa9d88990495228021fe164202323e95b3881825616003b5d3\",0,\"62b19f606a72faaa9d88990495228021fe164202323e95b3881825616003b5d3\",\"{\\\"kind\\\":\\\"diff.fragment\\\",\\\"value\\\":{\\\"left\\\":1}}\"]",
+        "utf8Hex": "5b226e6f74652e61727469666163742e617070656e642e7631222c2236326231396636303661373266616161396438383939303439353232383032316665313634323032333233653935623338383138323536313630303362356433222c302c2236326231396636303661373266616161396438383939303439353232383032316665313634323032333233653935623338383138323536313630303362356433222c227b5c226b696e645c223a5c22646966662e667261676d656e745c222c5c2276616c75655c223a7b5c226c6566745c223a317d7d225d",
+        "sha256": "7eb5aa9238cd32f8e674055f6d9a70f501cd2e7c28a06a30de378befc648c5a3",
+        "record": "{\"kind\":\"diff.fragment\",\"value\":{\"left\":1}}"
+      },
+      {
+        "id": "exact-record-spelling-1",
+        "rawJson": "[\"note.artifact.append.v1\",\"62b19f606a72faaa9d88990495228021fe164202323e95b3881825616003b5d3\",0,\"62b19f606a72faaa9d88990495228021fe164202323e95b3881825616003b5d3\",\"{\\\"kind\\\":\\\"diff.fragment\\\",\\\"value\\\":{\\\"left\\\":1.0}}\"]",
+        "canonical": "[\"note.artifact.append.v1\",\"62b19f606a72faaa9d88990495228021fe164202323e95b3881825616003b5d3\",0,\"62b19f606a72faaa9d88990495228021fe164202323e95b3881825616003b5d3\",\"{\\\"kind\\\":\\\"diff.fragment\\\",\\\"value\\\":{\\\"left\\\":1.0}}\"]",
+        "utf8Hex": "5b226e6f74652e61727469666163742e617070656e642e7631222c2236326231396636303661373266616161396438383939303439353232383032316665313634323032333233653935623338383138323536313630303362356433222c302c2236326231396636303661373266616161396438383939303439353232383032316665313634323032333233653935623338383138323536313630303362356433222c227b5c226b696e645c223a5c22646966662e667261676d656e745c222c5c2276616c75655c223a7b5c226c6566745c223a312e307d7d225d",
+        "sha256": "0f8ccba0e8d803beabf56d898d54ba8051a64dbb607199d9195e90eff655c28f",
+        "record": "{\"kind\":\"diff.fragment\",\"value\":{\"left\":1.0}}"
+      }
+    ]
+  }
+}

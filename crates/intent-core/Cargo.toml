@@ -11,7 +11,9 @@ description = "Intent domain vocabulary: ids, errors, config, events, and cross-
 async-trait = "0.1"
 thiserror = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+ryu-js = "=1.0.2"
+sha2 = "0.10"
 uuid = { workspace = true }
 time = { workspace = true }
 directories = { workspace = true }
