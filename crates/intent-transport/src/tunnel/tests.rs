@@ -1,10 +1,287 @@
-//! Unit tests for the `/tunnel` frame codec and bounded queue admission.
+//! Unit tests for the `/tunnel` codec, connect deadline and bounded queues.
 //! TCP relay/lifecycle behavior is covered by the
 //! `wss_tunnel` integration suite in the `intentd` crate.
 
 use super::*;
 use futures_util::FutureExt;
 use tokio::net::TcpListener;
+
+/// A connect whose completion is controlled independently of kernel backlog
+/// behavior. Receipts prove it was polled and that timeout dropped it.
+struct ControlledConnect {
+    result: tokio::sync::oneshot::Receiver<std::io::Result<TcpStream>>,
+    polled: Option<tokio::sync::oneshot::Sender<()>>,
+    dropped: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl std::future::Future for ControlledConnect {
+    type Output = std::io::Result<TcpStream>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if let Some(polled) = self.polled.take() {
+            polled.send(()).expect("test awaits first connect poll");
+        }
+        std::future::Future::poll(std::pin::Pin::new(&mut self.result), cx)
+            .map(|result| result.expect("test retains the connect controller"))
+    }
+}
+
+impl Drop for ControlledConnect {
+    fn drop(&mut self) {
+        if let Some(dropped) = self.dropped.take() {
+            let _ = dropped.send(());
+        }
+    }
+}
+
+const TEST_CONNECT_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Drive the real relay and outbound frame sender without changing the
+/// connection loop's connector or public options. This is raw WebSocket
+/// framing over duplex IO, not TLS/auth or incoming OPEN dispatch coverage.
+struct ConnectHarness {
+    release: Option<tokio::sync::oneshot::Sender<std::io::Result<TcpStream>>>,
+    dropped: tokio::sync::oneshot::Receiver<()>,
+    relay: tokio::task::JoinHandle<()>,
+    out_rx: mpsc::Receiver<OutboundFrame>,
+    streams: HashMap<u32, StreamHandle>,
+    sink: SplitSink<ClientWs, Message>,
+    client: ClientWs,
+}
+
+impl ConnectHarness {
+    async fn start(port: u16) -> Self {
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let server = WebSocketStream::from_raw_socket(
+            server_io,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let client = WebSocketStream::from_raw_socket(
+            client_io,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let (sink, _) = server.split();
+        let (release, result) = tokio::sync::oneshot::channel();
+        let (polled, first_poll) = tokio::sync::oneshot::channel();
+        let (drop_tx, dropped) = tokio::sync::oneshot::channel();
+        let (msg_tx, msg_rx) = mpsc::channel(STREAM_QUEUE_FRAMES);
+        let (out_tx, out_rx) = mpsc::channel(OUTBOUND_QUEUE_FRAMES);
+        let generation = Arc::new(());
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let credit = CreditWindow::new(TUNNEL_INITIAL_CREDIT_BYTES);
+        let relay = tokio::spawn(run_stream_with_connect(
+            7,
+            generation.clone(),
+            port,
+            msg_rx,
+            queued_bytes.clone(),
+            credit.clone(),
+            out_tx,
+            TunnelLimits {
+                connect_timeout: TEST_CONNECT_TIMEOUT,
+                ..TunnelLimits::default()
+            },
+            ControlledConnect {
+                result,
+                polled: Some(polled),
+                dropped: Some(drop_tx),
+            },
+        ));
+        let streams = HashMap::from([(
+            7,
+            StreamHandle {
+                port,
+                generation,
+                msg_tx,
+                queued_bytes,
+                credit,
+                abort: relay.abort_handle(),
+            },
+        )]);
+        let harness = Self {
+            release: Some(release),
+            dropped,
+            relay,
+            out_rx,
+            streams,
+            sink,
+            client,
+        };
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(1), first_poll)
+            .await
+            .expect("relay starts")
+            .expect("connect polled");
+        assert_eq!(Instant::now(), started, "readiness must not advance time");
+        harness
+    }
+
+    fn assert_pending(&mut self) {
+        // Never await an absent frame: paused Tokio time auto-advances when
+        // idle. The retained release sender keeps this connect pending.
+        assert!(!self.relay.is_finished());
+        assert!(matches!(
+            self.out_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            self.dropped.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(self.client.next().now_or_never().is_none());
+    }
+
+    async fn receive(&mut self) -> Frame {
+        let outbound = tokio::time::timeout(Duration::from_secs(1), self.out_rx.recv())
+            .await
+            .expect("relay produces a frame")
+            .expect("relay output remains open");
+        assert!(send_outbound_frame(&mut self.sink, &mut self.streams, outbound).await);
+        let Message::Binary(bytes) =
+            tokio::time::timeout(Duration::from_secs(1), self.client.next())
+                .await
+                .expect("outbound frame reaches the WebSocket")
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected binary tunnel frame");
+        };
+        Frame::decode(&bytes).unwrap()
+    }
+
+    async fn assert_terminal(&mut self) {
+        tokio::time::timeout(Duration::from_secs(1), &mut self.relay)
+            .await
+            .expect("failed connect finishes")
+            .unwrap();
+        self.dropped.try_recv().expect("connect future dropped");
+        assert!(self.streams.is_empty(), "terminal frame frees stream id");
+        assert!(
+            matches!(
+                self.out_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ),
+            "OPEN_ERR is the only terminal frame; no OPEN_OK or CLOSE"
+        );
+        assert!(self.client.next().now_or_never().is_none());
+    }
+}
+
+impl Drop for ConnectHarness {
+    fn drop(&mut self) {
+        self.relay.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_pending_deadline_emits_terminal_open_err() {
+    let mut t = ConnectHarness::start(12345).await;
+    let started = Instant::now();
+    t.assert_pending();
+    // Await a timer checkpoint: advance alone does not finish timer processing.
+    tokio::time::sleep_until(started + Duration::from_millis(149)).await;
+    t.assert_pending();
+    assert_eq!(started.elapsed(), Duration::from_millis(149));
+    assert_eq!(
+        t.receive().await,
+        Frame::OpenErr {
+            stream_id: 7,
+            message: "connect 127.0.0.1:12345: timed out after 150ms".to_owned(),
+        }
+    );
+    t.assert_terminal().await;
+    assert_eq!(started.elapsed(), TEST_CONNECT_TIMEOUT);
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_reset_preserves_error_before_deadline() {
+    let mut t = ConnectHarness::start(12345).await;
+    let started = Instant::now();
+    // Await a timer checkpoint: advance alone does not finish timer processing.
+    tokio::time::sleep_until(started + Duration::from_millis(149)).await;
+    t.assert_pending();
+    // This is a controlled ErrorKind, not a reproduction of macOS OS54.
+    t.release
+        .take()
+        .unwrap()
+        .send(Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "controlled reset",
+        )))
+        .unwrap();
+    assert_eq!(
+        t.receive().await,
+        Frame::OpenErr {
+            stream_id: 7,
+            message: "connect 127.0.0.1:12345: controlled reset".to_owned(),
+        }
+    );
+    t.assert_terminal().await;
+    assert_eq!(started.elapsed(), Duration::from_millis(149));
+}
+
+#[tokio::test]
+async fn connect_success_before_deadline_relays() {
+    // Establish real TCP before pausing: reactor IO must not race Tokio's
+    // automatic virtual-time advance. Resume before exercising socket IO.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tcp, peer) = tokio::join!(
+        TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+        listener.accept(),
+    );
+    let tcp = tcp.unwrap();
+    let (mut peer, _) = peer.unwrap();
+    tokio::time::pause();
+    let mut t = ConnectHarness::start(port).await;
+    let started = Instant::now();
+    // Pausing after real IO need not align with timer ticks: a 149ms sleep
+    // can auto-advance by 150ms. Leave headroom while retaining the strict
+    // before-deadline OPEN_OK assertion below.
+    tokio::time::sleep_until(started + Duration::from_millis(75)).await;
+    t.assert_pending();
+    t.release.take().unwrap().send(Ok(tcp)).unwrap();
+    assert_eq!(t.receive().await, Frame::OpenOk { stream_id: 7 });
+    t.dropped.try_recv().expect("completed connect dropped");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < TEST_CONNECT_TIMEOUT,
+        "OPEN_OK must arrive before {TEST_CONNECT_TIMEOUT:?}, got {elapsed:?}"
+    );
+    tokio::time::sleep_until(started + Duration::from_millis(151)).await;
+    assert!(matches!(
+        t.out_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(
+        !t.relay.is_finished(),
+        "old connect deadline cannot close success"
+    );
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        assert!(forward_to_stream(&mut t.sink, &mut t.streams, 7, data(vec![42])).await);
+        assert_eq!(peer.read_u8().await.unwrap(), 42);
+        peer.write_u8(42).await.unwrap();
+        assert_eq!(
+            t.receive().await,
+            Frame::Data {
+                stream_id: 7,
+                payload: vec![42]
+            },
+        );
+    })
+    .await
+    .expect("real TCP echo after the connect deadline");
+    t.relay.abort();
+    assert!((&mut t.relay).await.unwrap_err().is_cancelled());
+}
 
 fn data(bytes: Vec<u8>) -> StreamMsg {
     let permit = Arc::new(Semaphore::new(bytes.len()))
