@@ -54,6 +54,10 @@ fn identifier(value: &str) -> Result<()> {
 impl Store {
     /// Look up a lost acknowledgement using the captured connection principal.
     /// A retained terminal row is returned unchanged; no read grant is minted.
+    ///
+    /// # Errors
+    /// Rejects invalid identifiers, mismatched replay identity, corrupt stored
+    /// identity, and database failures.
     pub async fn note_artifact_journal_status(
         &self,
         principal: &str,
@@ -93,6 +97,10 @@ impl Store {
     /// Retire private staging or an unadopted lease under its original signed job
     /// handle. Cleanup remains authorized after source expiry/restart, while
     /// current source reads and publication do not. Physical charges stay intact.
+    ///
+    /// # Errors
+    /// Rejects invalid signed handles, missing scoped jobs, corrupt stored
+    /// identity, and database or transaction failures.
     pub async fn abort_note_artifact_journal(
         &self,
         principal: &str,
@@ -134,6 +142,10 @@ impl Store {
     /// Retire exactly the authenticated consumer lease. Ordinary release retains
     /// the admitted job and original receipt, including after expiry or restart.
     /// Physical reclamation is a separate operation with separate accounting.
+    ///
+    /// # Errors
+    /// Rejects invalid signed handles, missing scoped leases, and database
+    /// failures. Releasing an already released matching lease succeeds.
     pub async fn release_note_artifact_lease(
         &self,
         principal: &str,

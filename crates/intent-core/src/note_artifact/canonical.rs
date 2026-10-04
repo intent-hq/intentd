@@ -6,6 +6,10 @@ use sha2::{Digest, Sha256};
 /// Validate raw JSON before recursive allocation, then serialize exact JCS bytes.
 /// This uses the artifact envelope's structural limits. Record strings are never
 /// recursively parsed or normalized by this serializer.
+///
+/// # Errors
+/// Returns an error for malformed JSON, structural budget violations, or numbers
+/// that cannot be represented as finite binary64 values.
 pub fn canonical_json(raw: &str) -> Result<String, RecordError> {
     preflight(raw, crate::note_page::WIRE_BYTES)?;
     let value: Value = serde_json::from_str(raw).map_err(|_| RecordError::Syntax)?;
@@ -14,6 +18,10 @@ pub fn canonical_json(raw: &str) -> Result<String, RecordError> {
     Ok(output)
 }
 
+/// Hash the validated canonical UTF-8 representation of an integrity envelope.
+///
+/// # Errors
+/// Returns the validation errors from [`canonical_json`].
 pub fn digest(raw: &str) -> Result<String, RecordError> {
     let canonical = canonical_json(raw)?;
     Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
@@ -65,6 +73,7 @@ fn write(value: &Value, output: &mut String) -> Result<(), RecordError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     #[test]
     fn matches_protocol_canonical_utf8_and_sha256_vectors() {
@@ -84,11 +93,13 @@ mod tests {
             let raw = vector["rawJson"].as_str().unwrap();
             let canonical = canonical_json(raw).unwrap();
             assert_eq!(canonical, vector["canonical"], "{}", vector["id"]);
-            let hex: String = canonical
+            let hex = canonical
                 .as_bytes()
                 .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
+                .fold(String::new(), |mut hex, b| {
+                    write!(hex, "{b:02x}").unwrap();
+                    hex
+                });
             assert_eq!(hex, vector["utf8Hex"], "{}", vector["id"]);
             assert_eq!(digest(raw).unwrap(), vector["sha256"], "{}", vector["id"]);
             if let Some(bits) = vector["binary64Hex"].as_str() {

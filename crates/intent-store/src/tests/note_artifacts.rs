@@ -1,4 +1,4 @@
-//! Real disposable SQLite invariants for the prepared artifact lifecycle.
+//! Real disposable `SQLite` invariants for the prepared artifact lifecycle.
 //! Seeded jobs are not source-authorization or profile-producer acceptance.
 use super::TempDb;
 use crate::Store;

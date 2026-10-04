@@ -111,6 +111,10 @@ fn nonnegative(value: f64) -> Result<(), RequestError> {
 impl ArtifactHeader {
     /// Check the untrusted descriptor against the captured request workspace.
     /// The service must independently authorize the principal and stored grant.
+    ///
+    /// # Errors
+    /// Returns `Invalid` for invalid scope or scalar values and `Budget` for
+    /// strings exceeding the declared protocol limits.
     pub fn validate(&self, workspace_id: &str) -> Result<(), RequestError> {
         for id in [
             &self.scope.backend_id,
@@ -219,6 +223,10 @@ pub enum ReadSelector {
 }
 
 impl ReadSelector {
+    /// Validate selector coordinates and safe-integer indices.
+    ///
+    /// # Errors
+    /// Returns `Invalid` for nonfinite, negative, unordered or unsafe values.
     pub fn validate(&self) -> Result<(), RequestError> {
         match self {
             Self::Manifest {} => Ok(()),

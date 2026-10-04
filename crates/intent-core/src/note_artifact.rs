@@ -102,7 +102,7 @@ mod tests {
             Err(RecordError::Syntax)
         );
         for source in [
-            r#"[]"#,
+            "[]",
             r#"{"kind":"diff.row"}"#,
             r#"{"kind":"diff.row","value":{},"extra":0}"#,
             r#"{"kind":"diff.row","value":null}"#,
@@ -197,6 +197,10 @@ fn string_end(source: &str, mut at: usize) -> Result<(usize, usize), RecordError
 
 /// Enforce structural budgets before constructing any recursive JSON value.
 /// This is framing validation only; the registered profile validates semantics.
+///
+/// # Errors
+/// Returns `Budget` when byte or structural limits are exceeded, and `Syntax`
+/// for invalid structural tokens, duplicate keys or invalid string scalars.
 pub fn preflight_record(source: &str) -> Result<(), RecordError> {
     preflight(source, RECORD_BYTES)
 }
@@ -321,6 +325,10 @@ fn preflight(source: &str, byte_limit: usize) -> Result<(), RecordError> {
 
 /// Decode only a preflighted record. Profile-specific validation is mandatory
 /// before its contents can be staged as an indexed native resource.
+///
+/// # Errors
+/// Returns preflight errors or `Syntax` when the record is not exactly the
+/// required kind/value object.
 pub fn decode_record(source: &str) -> Result<ArtifactRecord, RecordError> {
     preflight_record(source)?;
     let value: Value = serde_json::from_str(source).map_err(|_| RecordError::Syntax)?;

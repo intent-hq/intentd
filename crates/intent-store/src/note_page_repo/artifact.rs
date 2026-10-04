@@ -24,6 +24,10 @@ pub struct ArtifactSourceGrant {
 impl Store {
     /// Resolve both signed refs and the writer-maintained owner-to-code binding.
     /// Caller supplies the captured connection principal, never a header identity.
+    ///
+    /// # Errors
+    /// Rejects invalid, stale, expired or mismatched source authority, unsupported
+    /// live sources, and database failures.
     pub async fn authorize_note_artifact_source(
         &self,
         workspace_id: &str,
