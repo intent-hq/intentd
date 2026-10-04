@@ -133,6 +133,16 @@ enum Entry {
 }
 
 impl AsyncTokenStore {
+    /// Isolated prepared bootstrap load. Its admitted context owns this await
+    /// through the actual blocking join, even after eligibility is revoked.
+    /// Deliberately bypasses the timed cache without changing ordinary callers.
+    pub(crate) async fn prepared_load(&self) -> Result<Option<String>> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || inner.load_token())
+            .await
+            .map(|v| v.filter(|s| !s.is_empty()))
+            .map_err(|_| Error::Internal("prepared credential load uncertain".into()))
+    }
     /// Wrap `inner` with the production timeout / TTL defaults.
     pub fn new(inner: Arc<dyn TokenStore>) -> Self {
         Self::with_timings(
@@ -385,6 +395,19 @@ pub(crate) struct LegacyRotation {
 }
 
 impl LegacyRotation {
+    pub(crate) fn prepared_revoked_now(&self) -> bool {
+        self.changes.has_changed().unwrap_or(true)
+            || self
+                .changes
+                .borrow()
+                .as_ref()
+                .is_some_and(|hash| hash != &self.expected)
+    }
+    pub(crate) async fn prepared_revoked(&mut self) {
+        if !self.prepared_revoked_now() {
+            let _ = self.changes.changed().await;
+        }
+    }
     pub(crate) fn new(store: &AsyncTokenStore, token: &str) -> Self {
         Self {
             expected: hash_token(token),
@@ -417,6 +440,36 @@ pub(crate) async fn await_rotation(rotation: &mut Option<LegacyRotation>) {
 }
 
 impl AdmittedCredential {
+    /// Prepared bootstrap revalidation keeps failures typed and blocking loads owned.
+    pub(crate) async fn prepared_valid_for(
+        &self,
+        store: &AsyncTokenStore,
+        api: &dyn WorkspaceApi,
+        caller: &Caller,
+    ) -> Result<bool> {
+        let Some(id) = caller.principal_id() else {
+            return Ok(false);
+        };
+        match &self.resolved {
+            ResolvedCredential::Legacy => Ok(api.primary_principal_id().await? == *id
+                && store
+                    .prepared_load()
+                    .await?
+                    .as_deref()
+                    .is_some_and(|s| token_matches(s, &self.token))),
+            ResolvedCredential::Principal(original) => {
+                if original != id {
+                    return Ok(false);
+                }
+                api.principal_host_role(id.clone()).await?;
+                Ok(api
+                    .resolve_principal_credential(hash_token(&self.token))
+                    .await?
+                    .as_ref()
+                    == Some(id))
+            }
+        }
+    }
     pub(crate) fn new(
         resolved: ResolvedCredential,
         token: String,
@@ -595,6 +648,19 @@ pub(crate) enum ResolvedCredential {
 }
 
 impl ResolvedCredential {
+    /// Prepared path must not turn a failed authority lookup into anonymous refusal.
+    pub(crate) async fn prepared_into_caller(&self, api: &dyn WorkspaceApi) -> Result<Caller> {
+        match self {
+            Self::Legacy => Ok(Caller::Wire {
+                principal_id: api.primary_principal_id().await?,
+                host_role: intent_core::HostRole::Owner,
+            }),
+            Self::Principal(id) => Ok(Caller::Wire {
+                principal_id: id.clone(),
+                host_role: api.principal_host_role(id.clone()).await?,
+            }),
+        }
+    }
     /// The caller to bind on the connection. The legacy token needs the
     /// primary principal's id from the service layer; when the composition
     /// root exposes none (test stubs) the connection is admitted unbound
@@ -655,6 +721,29 @@ pub(crate) async fn validate_token(
             None
         }
     }
+}
+
+/// Same credential matching and durable lookup as the ordinary gate, but with
+/// a joined secret-store load and preserved lookup errors for retained ownership.
+pub(crate) async fn prepared_validate_token(
+    store: &AsyncTokenStore,
+    api: &dyn WorkspaceApi,
+    candidate: &str,
+) -> Result<Option<ResolvedCredential>> {
+    if candidate.is_empty() {
+        return Ok(None);
+    }
+    if store
+        .prepared_load()
+        .await?
+        .as_deref()
+        .is_some_and(|s| token_matches(s, candidate))
+    {
+        return Ok(Some(ResolvedCredential::Legacy));
+    }
+    api.resolve_principal_credential(hash_token(candidate))
+        .await
+        .map(|v| v.map(ResolvedCredential::Principal))
 }
 
 /// Hex SHA-256 of a presented token — the only form the store ever sees.

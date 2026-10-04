@@ -1604,7 +1604,7 @@ pub(crate) async fn recv_revocation(
 
 /// Build a rustls `TlsAcceptor` from the self-signed cert/key, pinning the ring
 /// crypto provider so the process never relies on an ambiguous default.
-fn build_acceptor(tls: &TlsCertificate) -> Result<TlsAcceptor> {
+pub(crate) fn build_acceptor(tls: &TlsCertificate) -> Result<TlsAcceptor> {
     let certs = parse_certs(&tls.cert)?;
     let key = parse_key(&tls.key)?;
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -1663,6 +1663,22 @@ where
         }
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod prepared_bootstrap_baseline {
+    #[tokio::test]
+    async fn complete_http_head_must_not_accept_limit_plus_one_terminator() {
+        let mut bytes = vec![b'x'; super::MAX_HEAD_BYTES - 3];
+        bytes.extend_from_slice(b"\r\n\r\n");
+        let result =
+            crate::prepared_source_bootstrap::read_prepared_head_for_test(&mut bytes.as_slice())
+                .await;
+        assert!(
+            result.is_err(),
+            "prepared HTTP admission must count the final delimiter byte"
+        );
+    }
 }
 
 /// Write a bodyless HTTP error status line and destroy the socket.
