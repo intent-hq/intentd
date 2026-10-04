@@ -37,6 +37,71 @@ pub enum Caller {
     Daemon,
 }
 
+/// Queue contents reach the recipient through normal delivery, never through
+/// its own read tools. Human, daemon and other-agent inspection is unchanged.
+#[must_use]
+pub fn queue_contents_visible_to(caller: Option<&Caller>, target: &AgentId) -> bool {
+    !matches!(caller, Some(Caller::Agent { agent_id }) if agent_id == target)
+}
+
+/// Explanation shared by explicit self queue reads at both boundaries.
+pub const SELF_QUEUE_DELIVERY_MESSAGE: &str =
+    "Your queued messages will be delivered after the current turn. Their contents cannot be read early; queueLength reports the pending count.";
+
+/// Remove payload copies from the recipient's queue event history. Applies
+/// to old snapshots too: delivery belongs to the transcript, and consulting
+/// historical queue events must not recover messages still pending now.
+/// Preserve event rows and page tokens; never modify the stored event.
+pub fn redact_self_queue_events(value: &mut serde_json::Value, agent_id: &AgentId) {
+    use serde_json::{json, Value};
+    match value {
+        Value::Array(rows) => {
+            for row in rows {
+                redact_self_queue_events(row, agent_id);
+            }
+        }
+        Value::Object(obj) => {
+            let queue_event = obj
+                .get("type")
+                .or_else(|| obj.get("eventType"))
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.starts_with("agent:queue:"));
+            let target = obj
+                .get("data")
+                .and_then(|d| d.get("agentId"))
+                .and_then(Value::as_str)
+                .or_else(|| obj.get("sessionId").and_then(Value::as_str))
+                .or_else(|| {
+                    obj.get("actor")
+                        .and_then(|a| a.get("id"))
+                        .and_then(Value::as_str)
+                });
+            if queue_event && target == Some(agent_id.as_str()) {
+                let data = obj.get("data");
+                let count = data
+                    .and_then(|d| d.get("queueLength"))
+                    .and_then(Value::as_u64)
+                    .or_else(|| {
+                        data.and_then(|d| d.get("queue").or_else(|| d.get("queuedMessages")))
+                            .and_then(Value::as_array)
+                            .map(|q| q.len() as u64)
+                    });
+                let mut projected = json!({"agentId": agent_id});
+                if let Some(count) = count {
+                    projected["queueLength"] = json!(count);
+                }
+                obj.insert("data".into(), projected);
+                obj.remove("metadata");
+            } else {
+                for child in obj.values_mut() {
+                    redact_self_queue_events(child, agent_id);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 impl Caller {
     /// The bound principal for a wire caller; `None` for agents and the
     /// daemon, which act on their own authority rather than a person's.

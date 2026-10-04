@@ -7114,6 +7114,16 @@ impl Services {
             }
         }
         let mut queue = self.queue_snapshot(&agent_id);
+        if !intent_core::queue_contents_visible_to(
+            intent_core::current_caller().as_ref(),
+            &agent_id,
+        ) {
+            return Ok(json!({
+                "success": false, "refused": true,
+                "error": intent_core::SELF_QUEUE_DELIVERY_MESSAGE,
+                "queueLength": queue.len(), "queue": [],
+            }));
+        }
         if let Some(ws) = owning_ws.as_ref() {
             crate::principal_ops::MessageAuthorResolver::new(self, ws)
                 .attach_queue(&mut queue)
@@ -12813,11 +12823,9 @@ impl Services {
     /// in-scope agent with a non-empty queue, each listing its entries in
     /// drain order via [`Services::queue_snapshot_preview`] (content truncated
     /// to [`QUEUE_PREVIEW_MAX_CHARS`] chars, sender attribution preserved in
-    /// `messageMetadata`), projected to the bound caller exactly like
-    /// `agent.getQueue` ([`intent_core::project_queue_for_caller`]: a guest
-    /// collaborator sees only its own entries plus unattributed ones, and a
-    /// queue with nothing left to show it is omitted) — and
-    /// `summary.queuedAgents` counts those agents.
+    /// `messageMetadata`). Humans and other agents see the shared queue;
+    /// the recipient sees its queue count with an empty `entries` array.
+    /// `summary.queuedAgents` includes the recipient's non-empty queue.
     /// A queue whose ready-to-send entries have sat undelivered past
     /// [`STALE_QUEUE_ENTRY_AFTER_MS`] while the target agent is not actively
     /// responding raises a `stale-queue-entry` stuck-risk
@@ -13242,6 +13250,14 @@ impl Services {
                 q.insert("agentName".into(), json!(s.name));
             }
             q.insert("queueLength".into(), json!(entries.len()));
+            // Keep the real count, but remove every payload-bearing field
+            // before diagnostics (including its text) is assembled.
+            let entries =
+                if intent_core::queue_contents_visible_to(caller.as_ref(), &AgentId(id.clone())) {
+                    entries
+                } else {
+                    Vec::new()
+                };
             q.insert("entries".into(), Value::Array(entries));
             queues.push(Value::Object(q));
         }
@@ -13553,7 +13569,17 @@ impl Services {
                     let aid = q["agentId"].as_str().unwrap_or_default();
                     let name = q["agentName"].as_str().unwrap_or(aid);
                     let len = q["queueLength"].as_u64().unwrap_or(0);
-                    lines.push(format!("- {name} ({aid}): {len} queued message(s)"));
+                    let visibility = if intent_core::queue_contents_visible_to(
+                        caller.as_ref(),
+                        &AgentId::from(aid),
+                    ) {
+                        ""
+                    } else {
+                        " (contents hidden; messages arrive after the current turn)"
+                    };
+                    lines.push(format!(
+                        "- {name} ({aid}): {len} queued message(s){visibility}"
+                    ));
                 }
             }
         }

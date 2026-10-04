@@ -11063,6 +11063,83 @@ mod wsapi4_bindings_tests {
     }
 
     #[tokio::test]
+    async fn self_queue_reads_keep_counts_without_any_pending_payload() {
+        let (srv, api) = server_with_caller("self-agent");
+        for count in [3_usize, 0] {
+            let entries: Vec<Value> = (0..count).map(|i| json!({
+                "id": format!("entry-{i}"), "content": "PENDING_SECRET",
+                "images": [{"data": "IMAGE_SECRET"}],
+                "messageMetadata": {"fromAgentId": format!("sender-{i}"), "extra": "METADATA_SECRET"},
+                "position": i,
+            })).collect();
+            *api.queue_entries.lock().unwrap() = entries.clone();
+            for method in ["status", "getQueue"] {
+                let resp = call(
+                    &srv,
+                    &format!("return await ws.agent.{method}('self-agent');"),
+                )
+                .await;
+                assert_eq!(resp["result"]["isError"], false, "{resp}");
+                let v = body(&resp);
+                assert_eq!(v["queueLength"], count, "{v}");
+                assert_eq!(v["queue"], json!([]), "self queue payload: {v}");
+                assert!(!v.to_string().contains("SECRET"), "{v}");
+                if method == "status" {
+                    assert!(v["queueNotice"]
+                        .as_str()
+                        .unwrap()
+                        .contains("after the current turn"));
+                }
+                if method == "getQueue" {
+                    assert_eq!(v["refused"], true, "{v}");
+                    assert!(v["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("after the current turn"));
+                }
+            }
+            assert_eq!(
+                *api.queue_entries.lock().unwrap(),
+                entries,
+                "reads never consume"
+            );
+            let other = body(&call(&srv, "return await ws.agent.getQueue('other-agent');").await);
+            assert_eq!(other["queue"].as_array().unwrap().len(), count);
+        }
+    }
+
+    #[tokio::test]
+    async fn self_queue_event_history_hides_all_payload_copies() {
+        let (srv, api) = server_with_caller("self-agent");
+        let rows = json!([
+            {"type":"agent:queue:updated", "actor":{"id":"self-agent"},
+             "data":{"agentId":"self-agent", "queue":[{"content":"SELF_SECRET", "images":["SELF_SECRET"]}]},
+             "metadata":{"copy":"SELF_SECRET"}},
+            {"eventType":"agent:queue:processing", "sessionId":"self-agent",
+             "data":{"agentId":"self-agent", "messageId":"m", "content":"SELF_SECRET", "queuedMessages":[{"content":"SELF_SECRET"}]}},
+            {"eventType":"agent:queue:updated", "data":{"agentId":"other-agent", "queue":[{"content":"OTHER_VISIBLE"}]}}
+        ]);
+        for paginated in [false, true] {
+            *api.event_query_result.lock().unwrap() = Some(if paginated {
+                json!({"items": rows, "nextToken":"next-page"})
+            } else {
+                rows.clone()
+            });
+            for code in [
+                "return await ws.event.query();",
+                "return await ws.event.agentActivity('self-agent');",
+            ] {
+                let result = body(&call(&srv, code).await);
+                assert!(!result.to_string().contains("SELF_SECRET"), "{result}");
+                assert!(result.to_string().contains("OTHER_VISIBLE"), "{result}");
+                if paginated {
+                    assert_eq!(result["nextToken"], "next-page");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn agent_status_forwards_agent_id() {
         let (srv, api) = server();
         let resp = call(&srv, "return await ws.agent.status('a-42');").await;

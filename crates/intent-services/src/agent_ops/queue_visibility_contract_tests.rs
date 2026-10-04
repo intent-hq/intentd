@@ -377,3 +377,129 @@ async fn services_surfaces_match_the_contract_table() {
         CallerClass::ALL.len() * AttributionTier::ALL.len() * services_surfaces.len()
     );
 }
+
+#[intent_test_macros::daemon_test]
+async fn self_queue_service_reads_hide_payloads_but_preserve_counts_and_other_callers() {
+    use intent_core::WorkspaceApi;
+    let f = Fixture::new().await;
+    let self_caller = Caller::Agent {
+        agent_id: f.agent.clone(),
+    };
+    for count in [0_usize, 3] {
+        if count > 0 {
+            for tier in AttributionTier::ALL {
+                f.seed(
+                    *QUEUE_VISIBILITY_CONTRACT
+                        .iter()
+                        .find(|c| {
+                            c.caller == CallerClass::Agent
+                                && c.tier == *tier
+                                && c.surface == QueueSurface::GetQueue
+                        })
+                        .unwrap(),
+                );
+            }
+        }
+        let before = f.snapshot();
+        let own = with_caller(
+            self_caller.clone(),
+            f.svc.agent_get_queue(f.agent.clone(), Some(f.ws.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(own["queueLength"], count, "{own}");
+        assert_eq!(own["queue"], json!([]), "{own}");
+        assert_eq!(own["refused"], true, "{own}");
+        for filter in [None, Some(f.agent.clone())] {
+            let diag = with_caller(
+                self_caller.clone(),
+                f.svc.agent_diagnostics(f.ws.clone(), filter, None, None),
+            )
+            .await
+            .unwrap();
+            assert!(
+                !diag.to_string().contains("entry for"),
+                "rendered or structured diagnostics leak: {diag}"
+            );
+            if count > 0 {
+                let q = &diag["diagnostics"]["queues"][0];
+                assert_eq!(q["queueLength"], count, "{diag}");
+                assert_eq!(q["entries"], json!([]), "{diag}");
+                assert!(diag["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("contents hidden; messages arrive after the current turn"));
+            }
+        }
+        for caller in [
+            f.as_admin.clone(),
+            f.as_guest.clone(),
+            Caller::Agent {
+                agent_id: AgentId::from("other-agent"),
+            },
+        ] {
+            let result = with_caller(
+                caller,
+                f.svc.agent_get_queue(f.agent.clone(), Some(f.ws.clone())),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["queue"].as_array().unwrap().len(), count, "{result}");
+        }
+        assert_eq!(f.snapshot(), before, "reads leave the queue unchanged");
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn self_queue_persisted_history_hides_payloads_and_keeps_pagination() {
+    use intent_core::{EventActor, EventQueryParams, WorkspaceApi};
+    let f = Fixture::new().await;
+    for target in [f.agent.as_str(), "other-agent"] {
+        for event_type in ["agent:queue:updated", "agent:queue:processing"] {
+            f.svc.store().insert_event(&intent_store::NewEvent {
+                workspace_id: f.ws.clone(), timestamp: intent_core::now_iso(),
+                event_type: event_type.into(),
+                actor: EventActor { id: Some(target.into()), ..Default::default() },
+                session_id: Some(target.into()), correlation_id: None, parent_event_id: None,
+                metadata: Some(json!({"copy":"HISTORY_SECRET"})),
+                data: json!({"agentId":target,"content":"HISTORY_SECRET", "queue":[{"content":"HISTORY_SECRET"}], "queuedMessages":[{"images":["HISTORY_SECRET"]}]}),
+            }).await.unwrap();
+        }
+    }
+    for paginate in [false, true] {
+        let params = EventQueryParams {
+            paginate: Some(paginate),
+            limit: Some(10),
+            ..Default::default()
+        };
+        let own = with_caller(
+            Caller::Agent {
+                agent_id: f.agent.clone(),
+            },
+            f.svc.event_query(f.ws.clone(), params.clone()),
+        )
+        .await
+        .unwrap();
+        let rows = if paginate { &own["items"] } else { &own };
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            4,
+            "history preserves row count"
+        );
+        for row in rows.as_array().unwrap() {
+            if row["data"]["agentId"] == f.agent.as_str() {
+                assert!(!row.to_string().contains("HISTORY_SECRET"), "{row}");
+            } else {
+                assert!(row.to_string().contains("HISTORY_SECRET"), "{row}");
+            }
+        }
+        let human = with_caller(f.as_admin.clone(), f.svc.event_query(f.ws.clone(), params))
+            .await
+            .unwrap();
+        assert_eq!(
+            human.to_string().matches("HISTORY_SECRET").count(),
+            16,
+            "durable rows stay intact: {human}"
+        );
+    }
+}
