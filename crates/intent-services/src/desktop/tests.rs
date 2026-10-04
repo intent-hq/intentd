@@ -671,7 +671,14 @@ async fn activation_failure_diagnostics_survive_outbox_and_conversation() {
             "outbox delivery must remain deduplicated"
         );
         assert_eq!(messages[0]["metadata"]["error"], value(&failure));
-        let content = messages[0]["contentBlocks"].to_string();
+        // The renderer/model reads text, not the block's retained messageMetadata.
+        let content = messages[0]["contentBlocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             content.contains(&failure.code),
             "missing failure code: {content}"
