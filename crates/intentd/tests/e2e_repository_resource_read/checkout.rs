@@ -50,6 +50,115 @@ async fn capture(client: &mut Client) -> Value {
 }
 
 #[intent_test_macros::daemon_test]
+async fn checkout_default_provider_self_heal_keeps_original_pages_but_gitlab_settings_aba_retires()
+{
+    for remote in [false, true] {
+        for heal_before_first_page in [true, false] {
+            let h = Harness::with_workspace(false).await;
+            let server = h.server.as_ref().unwrap();
+            let route = "/api/v4/projects?membership=true&order_by=last_activity_at&simple=true";
+            set(
+                server,
+                &format!("{route}&page=1&per_page=50"),
+                json!([repo()]),
+                Some("2"),
+            );
+            set(
+                server,
+                &format!("{route}&page=2&per_page=50"),
+                json!([]),
+                None,
+            );
+            let mut client = if remote {
+                h.wss(TOKEN).await
+            } else {
+                h.uds().await
+            };
+            let original = capture(&mut client).await;
+            let mut query = bound(&original);
+            query["limit"] = json!(50);
+            let mut first = None;
+            if !heal_before_first_page {
+                first = Some(
+                    client
+                        .rpc("sourceControl.checkout.projects", query.clone())
+                        .await,
+                );
+                query["cursor"] = ready(first.as_ref().unwrap())["nextCursor"].clone();
+            }
+            // Invoke the same cache-only self-heal that discovery completed in
+            // the retained Electron trace, without probing installed providers.
+            let healed = h
+                .services
+                .heal_default_provider_settings(&["auggie".into()])
+                .await
+                .unwrap();
+            assert_eq!(healed["healed"], true);
+            assert_eq!(healed["provider"], "auggie");
+            let response = client
+                .rpc("sourceControl.checkout.projects", query.clone())
+                .await;
+            eprintln!("checkout self-heal original response remote={remote} before_first={heal_before_first_page} {response}");
+            if heal_before_first_page {
+                assert_eq!(ready(&response)["items"][0]["projectPath"], PROJECT);
+                query["cursor"] = ready(&response)["nextCursor"].clone();
+                first = Some(response);
+                assert_eq!(
+                    ready(&client.rpc("sourceControl.checkout.projects", query).await)["items"],
+                    json!([])
+                );
+            } else {
+                assert_eq!(ready(&response)["items"], json!([]));
+            }
+            assert!(ready(first.as_ref().unwrap())["nextCursor"].is_string());
+
+            // A real GitLab settings change and restoration is a new authority
+            // generation. Equality of the final settings cannot revive this lease.
+            let mut owner = h.uds().await;
+            for client_id in ["changed-client", "client"] {
+                success(&owner.rpc("settings.update", json!({"changes":[{"path":"sourceControl.gitlab.oauthClientId","value":client_id}]})).await);
+            }
+            let before = server.count();
+            let refused = client
+                .rpc("sourceControl.checkout.projects", bound(&original))
+                .await;
+            assert!(
+                refused.get("error").is_some(),
+                "old settings generation revived: {refused}"
+            );
+            assert_eq!(
+                server.count(),
+                before,
+                "retired settings cannot reach the provider"
+            );
+            let unverified = client
+                .rpc(
+                    "sourceControl.checkout.capture",
+                    json!({"provider":"gitlab","instanceBaseUrl":INSTANCE}),
+                )
+                .await;
+            assert_eq!(success(&unverified)["reason"], "not-connected");
+            // Restoring settings is not verification. Recovery requires a new
+            // public connection that verifies the original private credential.
+            success(&owner.rpc("sourceControl.connect", json!({"provider":"gitlab","instanceBaseUrl":INSTANCE,"method":"pat","token":"stored-pat"})).await);
+            let fresh = capture(&mut client).await;
+            assert_ne!(fresh["revision"], original["revision"]);
+            let mut query = bound(&fresh);
+            query["limit"] = json!(50);
+            assert_eq!(
+                ready(&client.rpc("sourceControl.checkout.projects", query).await)["items"][0]
+                    ["projectPath"],
+                PROJECT
+            );
+            assert_eq!(h.store.list_workspaces(true).await.unwrap().len(), 0);
+            owner.close().await;
+            client.close().await;
+            h.finish().await;
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
 async fn checkout_two_bound_hosts_and_workspace_guest_cannot_borrow_authority() {
     let first = Harness::new().await;
     let second = Harness::new().await;

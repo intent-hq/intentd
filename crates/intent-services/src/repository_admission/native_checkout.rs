@@ -124,7 +124,6 @@ struct Lease {
     _registration: RepositorySubscription,
     _subscription: RepositorySubscription,
     _permit: OwnedSemaphorePermit,
-    settings: (Arc<SettingsRegistry>, Arc<SettingsSnapshot>),
     provider: OnceLock<Arc<GitlabCheckoutConnection>>,
     projects: Mutex<HashMap<String, Project>>,
     branches: Mutex<HashMap<(String, String), CheckoutBranch>>,
@@ -422,15 +421,11 @@ impl Lease {
                         if Instant::now() >= self.deadline {
                             return Err(AdmissionError::Retired);
                         }
-                        self.settings
-                            .0
-                            .with_original_snapshot(&self.settings.1, |current| {
-                                if current {
-                                    Ok(action())
-                                } else {
-                                    Err(AdmissionError::Retired)
-                                }
-                            })
+                        // The original provider adapter holds its GitLab config,
+                        // credential generation and denial guards through this
+                        // action. Unrelated settings publication is not a new
+                        // repository authority or a reason to retire this lease.
+                        Ok(action())
                     };
                     match request {
                         Some(r) => r
@@ -607,7 +602,7 @@ async fn admit_lease(
         .await
         .map_err(denied)??;
     let OriginalConnection {
-        registry,
+        registry: _,
         settings,
         provider,
     } = original;
@@ -649,7 +644,6 @@ async fn admit_lease(
         _registration: registration,
         _subscription: subscription,
         _permit: permit,
-        settings: (registry, settings),
         provider: OnceLock::new(),
         projects: Mutex::default(),
         branches: Mutex::default(),
