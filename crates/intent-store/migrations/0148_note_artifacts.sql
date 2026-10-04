@@ -137,6 +137,19 @@ CREATE TABLE note_artifact_record (
     is_manifest INTEGER NOT NULL CHECK (is_manifest IN (0,1)),
     PRIMARY KEY (generation,sequence)
 );
+-- Original append ACK counters are retained per record. A retry is a point
+-- lookup, never a SUM over preceding output or the job's later current state.
+CREATE TABLE note_artifact_ack (
+    generation TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    accepted_bytes INTEGER NOT NULL CHECK (accepted_bytes BETWEEN 1 AND 9007199254740991),
+    PRIMARY KEY (generation,sequence),
+    FOREIGN KEY (generation,sequence) REFERENCES note_artifact_record(generation,sequence)
+        ON DELETE CASCADE
+);
+CREATE TRIGGER note_artifact_ack_immutable BEFORE UPDATE ON note_artifact_ack BEGIN
+    SELECT RAISE(ABORT,'accepted artifact acknowledgement is immutable');
+END;
 CREATE TRIGGER note_artifact_record_admit BEFORE INSERT ON note_artifact_record BEGIN
     SELECT CASE WHEN NOT EXISTS (
         SELECT 1 FROM note_artifact_job j WHERE j.generation=new.generation
@@ -149,6 +162,9 @@ CREATE TRIGGER note_artifact_record_admit BEFORE INSERT ON note_artifact_record 
     ) THEN RAISE(ABORT,'artifact record admission failed') END;
 END;
 CREATE TRIGGER note_artifact_record_account AFTER INSERT ON note_artifact_record BEGIN
+    INSERT INTO note_artifact_ack(generation,sequence,accepted_bytes)
+        SELECT new.generation,new.sequence,accepted_bytes+length(CAST(new.record AS BLOB))
+        FROM note_artifact_job WHERE generation=new.generation;
     UPDATE note_artifact_job SET next_sequence=next_sequence+1,
         accepted_bytes=accepted_bytes+length(CAST(new.record AS BLOB)),
         index_entries=index_entries+new.index_charge,

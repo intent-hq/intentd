@@ -119,6 +119,52 @@ impl ArtifactBegin {
     }
 }
 
+/// One exact record in the immutable artifact digest chain.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArtifactAppend {
+    pub job_ref: String,
+    pub sequence: u64,
+    pub previous_digest: String,
+    pub record: String,
+    pub digest: String,
+}
+
+impl ArtifactAppend {
+    /// Check framing and chain integrity using the stored job header digest.
+    /// This does not validate native profile semantics or physical index costs.
+    ///
+    /// # Errors
+    /// Rejects oversized/malformed records, invalid counters, or wrong digests.
+    pub fn validate(&self, header_digest: &str) -> Result<(), RequestError> {
+        bounded_text(&self.job_ref, 256)?;
+        safe_integer(self.sequence)?;
+        for digest in [header_digest, &self.previous_digest, &self.digest] {
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(RequestError::Invalid);
+            }
+        }
+        super::decode_record(&self.record).map_err(|_| RequestError::Invalid)?;
+        let envelope = serde_json::json!([
+            "note.artifact.append.v1",
+            header_digest,
+            self.sequence,
+            self.previous_digest,
+            self.record
+        ]);
+        let digest =
+            super::canonical::digest(&envelope.to_string()).map_err(|_| RequestError::Invalid)?;
+        if digest != self.digest {
+            return Err(RequestError::Invalid);
+        }
+        Ok(())
+    }
+}
+
 fn bounded_text(value: &str, maximum: usize) -> Result<(), RequestError> {
     if value.is_empty() || value.contains('\0') {
         return Err(RequestError::Invalid);
@@ -368,6 +414,36 @@ mod tests {
             }))
             .unwrap();
             assert!(request.validate("w").is_err());
+        }
+    }
+
+    #[test]
+    fn append_matches_frozen_exact_record_vectors() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/native_artifact_canonicalization.json"
+        ))
+        .unwrap();
+        for vector in fixture["canonicalization"]["append"].as_array().unwrap() {
+            let raw: Value = serde_json::from_str(vector["rawJson"].as_str().unwrap()).unwrap();
+            let request = ArtifactAppend {
+                job_ref: "opaque-job".into(),
+                sequence: raw[2].as_u64().unwrap(),
+                previous_digest: raw[3].as_str().unwrap().into(),
+                record: raw[4].as_str().unwrap().into(),
+                digest: vector["sha256"].as_str().unwrap().into(),
+            };
+            let header = raw[1].as_str().unwrap();
+            assert!(request.validate(header).is_ok());
+            for field in 0..4 {
+                let mut changed = request.clone();
+                match field {
+                    0 => changed.sequence += 1,
+                    1 => changed.record.push(' '),
+                    2 => changed.previous_digest = "0".repeat(64),
+                    _ => changed.sequence = SAFE_INTEGER + 1,
+                }
+                assert!(changed.validate(header).is_err());
+            }
         }
     }
 

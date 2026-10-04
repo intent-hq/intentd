@@ -149,6 +149,35 @@ async fn artifact_abort_does_not_claim_physical_reclamation() {
 }
 
 #[tokio::test]
+async fn artifact_record_acknowledgements_keep_original_cumulative_bytes() {
+    let (store, _temporary) = setup().await;
+    append(&store, 0, &"0".repeat(64), &"1".repeat(64), false)
+        .await
+        .unwrap();
+    append(&store, 1, &"1".repeat(64), &"2".repeat(64), true)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE note_artifact_job SET state='sealed'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let rows =
+        sqlx::query("SELECT sequence,accepted_bytes FROM note_artifact_ack ORDER BY sequence")
+            .fetch_all(store.read_pool())
+            .await
+            .unwrap();
+    let bytes = i64::try_from(r#"{"kind":"diff.row","value":{}}"#.len()).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<i64, _>("sequence"), 0);
+    assert_eq!(rows[0].get::<i64, _>("accepted_bytes"), bytes);
+    assert_eq!(rows[1].get::<i64, _>("accepted_bytes"), bytes * 2);
+    assert!(sqlx::query("UPDATE note_artifact_ack SET accepted_bytes=1")
+        .execute(store.write_pool())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn artifact_reservations_release_once_only_after_explicit_cleanup() {
     let (store, _temporary) = setup().await;
     let reserved: i64 =

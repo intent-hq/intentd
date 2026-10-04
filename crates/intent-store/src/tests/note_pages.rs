@@ -2564,3 +2564,202 @@ async fn artifact_begin_rejects_bad_integrity_and_source_deadline_without_chargi
         .await
         .unwrap();
 }
+
+fn artifact_append_request(
+    job: &crate::ArtifactJournalStatus,
+    sequence: u64,
+    previous: &str,
+    record: &str,
+) -> intent_core::note_artifact::request::ArtifactAppend {
+    let digest = intent_core::note_artifact::canonical::digest(
+        &json!([
+            "note.artifact.append.v1",
+            job.header_digest,
+            sequence,
+            previous,
+            record
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    intent_core::note_artifact::request::ArtifactAppend {
+        job_ref: job.job_ref.clone(),
+        sequence,
+        previous_digest: previous.into(),
+        record: record.into(),
+        digest,
+    }
+}
+
+#[tokio::test]
+async fn artifact_append_replays_original_ack_after_later_record_and_seal() {
+    let (store, _temporary, mut note, begin) = artifact_begin_fixture().await;
+    let job = store
+        .begin_note_artifact_journal("alice", "pages", &begin, artifact_retention(&begin))
+        .await
+        .unwrap();
+    // These profile-shaped values exercise only the prepared journal seam, not
+    // native profile validation, index construction, or physical allocation.
+    let record = r#"{"kind":"diff.row","value":{"left":1}}"#;
+    let first = artifact_append_request(&job, 0, &job.header_digest, record);
+    let cost = crate::ArtifactJournalRecordCost {
+        index_entries: 1,
+        storage_bytes: 128,
+        final_manifest: false,
+    };
+    for (principal, workspace) in [("bob", "pages"), ("alice", "other")] {
+        assert!(store
+            .append_note_artifact_journal(principal, workspace, &first, &cost)
+            .await
+            .is_err());
+    }
+    let ack = store
+        .append_note_artifact_journal("alice", "pages", &first, &cost)
+        .await
+        .unwrap();
+    assert_eq!(ack.next_sequence, 1);
+    assert_eq!(ack.accepted_bytes, i64::try_from(record.len()).unwrap());
+    let changed = artifact_append_request(
+        &job,
+        0,
+        &job.header_digest,
+        r#"{"kind":"diff.row","value":{"left":1.0}}"#,
+    );
+    assert!(store
+        .append_note_artifact_journal("alice", "pages", &changed, &cost)
+        .await
+        .is_err());
+    let gap = artifact_append_request(&job, 2, &first.digest, record);
+    assert!(store
+        .append_note_artifact_journal("alice", "pages", &gap, &cost)
+        .await
+        .is_err());
+    let wrong_previous = artifact_append_request(&job, 1, &job.header_digest, record);
+    assert!(store
+        .append_note_artifact_journal("alice", "pages", &wrong_previous, &cost)
+        .await
+        .is_err());
+    let manifest = artifact_append_request(
+        &job,
+        1,
+        &first.digest,
+        r#"{"kind":"diff.manifest","value":{"rows":1}}"#,
+    );
+    let final_cost = crate::ArtifactJournalRecordCost {
+        index_entries: 1,
+        storage_bytes: 128,
+        final_manifest: true,
+    };
+    let last = store
+        .append_note_artifact_journal("alice", "pages", &manifest, &final_cost)
+        .await
+        .unwrap();
+    assert_eq!(last.next_sequence, 2);
+    assert_eq!(
+        last.accepted_bytes,
+        i64::try_from(record.len() + manifest.record.len()).unwrap()
+    );
+    sqlx::query("UPDATE note_artifact_job SET state='sealed'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let replay = store
+        .append_note_artifact_journal("alice", "pages", &first, &cost)
+        .await
+        .unwrap();
+    assert_eq!(replay.next_sequence, ack.next_sequence);
+    assert_eq!(replay.accepted_bytes, ack.accepted_bytes);
+    assert_eq!(replay.current_digest, ack.current_digest);
+    assert_eq!(replay.state, ack.state);
+    let third = artifact_append_request(&job, 2, &manifest.digest, record);
+    assert!(store
+        .append_note_artifact_journal("alice", "pages", &third, &cost)
+        .await
+        .is_err());
+    let current = store
+        .note_artifact_journal_status("alice", "pages", &begin.job_id, &begin.header_digest)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.state, "sealed");
+    assert_eq!(current.accepted_bytes, last.accepted_bytes);
+    assert_eq!(current.current_digest, last.current_digest);
+    let totals = sqlx::query("SELECT count(*) AS records,sum(index_charge) AS indexes,sum(storage_charge) AS storage FROM note_artifact_record").fetch_one(store.read_pool()).await.unwrap();
+    assert_eq!(totals.get::<i64, _>("records"), 2);
+    assert_eq!(totals.get::<i64, _>("indexes"), 2);
+    assert_eq!(totals.get::<i64, _>("storage"), 256);
+    note.title = "advance source revision".into();
+    store.update_note(&note).await.unwrap();
+    assert!(store
+        .append_note_artifact_journal("alice", "pages", &first, &cost)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn artifact_append_failure_cannot_mutate_accepted_prefix() {
+    let (store, _temporary, _note, begin) = artifact_begin_fixture().await;
+    let job = store
+        .begin_note_artifact_journal("alice", "pages", &begin, artifact_retention(&begin))
+        .await
+        .unwrap();
+    let cost = crate::ArtifactJournalRecordCost {
+        index_entries: 1,
+        storage_bytes: 128,
+        final_manifest: false,
+    };
+    let record = r#"{"kind":"diff.row","value":{}}"#;
+    let first = artifact_append_request(&job, 0, &job.header_digest, record);
+    let mut wrong_digest = first.clone();
+    wrong_digest.digest = "f".repeat(64);
+    let mut oversized = first.clone();
+    oversized.record = " ".repeat(16_385);
+    let duplicate = artifact_append_request(
+        &job,
+        0,
+        &job.header_digest,
+        r#"{"kind":"diff.row","kind":"diff.row","value":{}}"#,
+    );
+    for bad in [wrong_digest, oversized, duplicate] {
+        assert!(store
+            .append_note_artifact_journal("alice", "pages", &bad, &cost)
+            .await
+            .is_err());
+    }
+    let over = crate::ArtifactJournalRecordCost {
+        index_entries: 3,
+        storage_bytes: 128,
+        final_manifest: false,
+    };
+    assert!(store
+        .append_note_artifact_journal("alice", "pages", &first, &over)
+        .await
+        .is_err());
+    let row = sqlx::query(
+        "SELECT next_sequence,accepted_bytes,index_entries,storage_charge FROM note_artifact_job",
+    )
+    .fetch_one(store.read_pool())
+    .await
+    .unwrap();
+    for field in [
+        "next_sequence",
+        "accepted_bytes",
+        "index_entries",
+        "storage_charge",
+    ] {
+        assert_eq!(row.get::<i64, _>(field), 0);
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_ack")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap(),
+        0
+    );
+    // All failed transactions returned the writer credit and left the original
+    // digest usable for the first valid append.
+    store
+        .append_note_artifact_journal("alice", "pages", &first, &cost)
+        .await
+        .unwrap();
+}

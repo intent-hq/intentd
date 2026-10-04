@@ -1,6 +1,8 @@
 //! Bounded reads over write-maintained indexes. Tokens are authenticated with a
 //! persistent database secret, while bounded snapshot leases are process-local.
 mod artifact;
+mod artifact_append;
+pub use artifact_append::ArtifactJournalRecordCost;
 mod artifact_begin;
 mod token;
 pub use artifact::ArtifactSourceGrant;
