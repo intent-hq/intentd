@@ -33038,6 +33038,51 @@ mod known_repo {
     }
 }
 
+/// Keep the caller regression observable even on hosts that skip `CoW` tests.
+/// Native acceptance additionally requires a real clone and independent contents
+/// on the same volume pair used by the workspace fixture.
+fn cow_fixture_supported(source: &std::path::Path, root: &std::path::Path) -> bool {
+    let support = intent_git::cow_probe(source, root).expect("probe fixture CoW support");
+    eprintln!("CoW fixture probe: {support:?}; source={source:?}; root={root:?}");
+    if support == intent_git::CowSupport::Supported {
+        let src = crate::test_support::test_tempdir_in(
+            source.to_str().expect("fixture source path"),
+            "cow-proof-source-",
+        );
+        let dst = crate::test_support::test_tempdir_in(
+            root.to_str().expect("fixture root path"),
+            "cow-proof-destination-",
+        );
+        let original = src.path().join("payload");
+        let cloned = dst.path().join("clone");
+        std::fs::write(&original, b"original").unwrap();
+        intent_git::cow_clone(src.path(), &cloned).expect("real fixture CoW clone");
+        let copy = cloned.join("payload");
+        assert_eq!(std::fs::read(&copy).unwrap(), b"original");
+        std::fs::write(&copy, b"clone changed").unwrap();
+        assert_eq!(std::fs::read(&original).unwrap(), b"original");
+        std::fs::write(&original, b"source changed").unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), b"clone changed");
+        dst.close().expect("remove CoW proof destination");
+        src.close().expect("remove CoW proof source");
+        eprintln!("CoW fixture clone and independent contents verified");
+        eprintln!("CoW fixture proof scratch cleaned");
+    } else {
+        assert!(
+            std::env::var_os("INTENTD_TEST_REQUIRE_COW").is_none(),
+            "native CoW acceptance requires a supported fixture volume"
+        );
+        // Supplemental regression on unsupported hosts only. Supported-volume
+        // baselines must reach the original service gate and its real refusal.
+        assert_eq!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Daemon),
+            "workspace CoW fixture must bind its daemon caller"
+        );
+    }
+    support == intent_git::CowSupport::Supported
+}
+
 mod worktree_provisioning {
     use super::*;
     use intent_core::WorkspaceCreate;
@@ -33700,7 +33745,7 @@ mod worktree_provisioning {
     /// workspace branch from `baseRef`, with `worktreePath`/`baseCommitSha`
     /// populated, `checkoutMode: "cow"` persisted, and untracked source files
     /// carried over.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_provisions_cow_checkout_when_isolation_enabled() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -33708,10 +33753,7 @@ mod worktree_provisioning {
         // Untracked build artifact in the source repo — CoW carries it over.
         std::fs::write(repo_dir.0.join("untracked.log"), "artifact\n").unwrap();
         let root = unique_dir("intentd-cowprov-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -33759,6 +33801,9 @@ mod worktree_provisioning {
         assert_eq!(
             persisted.checkout_mode,
             Some(intent_core::CheckoutMode::Cow)
+        );
+        eprintln!(
+            "CoW fixture assertions passed: create_provisions_cow_checkout_when_isolation_enabled"
         );
     }
 
@@ -33942,16 +33987,13 @@ mod worktree_provisioning {
     /// mirrors the create decision matrix — the duplicate gets a standalone
     /// `CoW` clone with `checkoutMode: "cow"` persisted, and the source repo
     /// gains no branch for the duplicate (the branch lives in the clone).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_provisions_cow_checkout_when_isolation_enabled() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, head_branch) = seed_repo("intentd-cowdup-repo");
         let root = unique_dir("intentd-cowdup-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -33999,6 +34041,7 @@ mod worktree_provisioning {
             persisted.checkout_mode,
             Some(intent_core::CheckoutMode::Cow)
         );
+        eprintln!("CoW fixture assertions passed: duplicate_provisions_cow_checkout_when_isolation_enabled");
     }
 
     /// cowIsolation on + CoW-incapable filesystem: `workspace.duplicate`
@@ -34054,16 +34097,13 @@ mod worktree_provisioning {
     /// unresolvable `baseRef`), the create fails without inserting a row and
     /// without leaving the empty `<root>/<wsId>` dir the probe created behind
     /// — the workspaces root ends up clean.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowfail-repo");
         let root = unique_dir("intentd-cowfail-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -34092,6 +34132,7 @@ mod worktree_provisioning {
                 .is_none(),
             "workspaces root must have no leftover empty <root>/<wsId> dir"
         );
+        eprintln!("CoW fixture assertions passed: create_cleans_up_empty_ws_dir_when_cow_provisioning_fails");
     }
 
     /// monorepo#774, `workspace.duplicate` path: a `CoW` provisioning failure
@@ -34106,16 +34147,13 @@ mod worktree_provisioning {
     /// flow, not a mutation-killing regression test. The #774 regression
     /// coverage lives in the create-path test above and the
     /// `remove_workspace_dir_if_empty` unit test below.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowdupfail-repo");
         let root = unique_dir("intentd-cowdupfail-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -34147,6 +34185,7 @@ mod worktree_provisioning {
             vec![".workspace".to_string()],
             "duplicate ws dir holds only the metadata dir"
         );
+        eprintln!("CoW fixture assertions passed: duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails");
     }
 
     /// The #774 cleanup helper only ever removes *empty* dirs: a non-empty
@@ -39493,13 +39532,11 @@ mod clone_orchestration {
     /// `workspace.cowIsolation` on and a CoW-capable filesystem, the local
     /// create streams the `cow-copy 30` milestone (not `worktree`) with the
     /// echoed `progressId` and one terminal done.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn progress_id_cow_create_streams_cow_copy_milestone() {
         let repo = seed_repo("intentd-prog-cow-src");
         let root = unique_dir("intentd-prog-cow-root");
-        if intent_git::cow_probe(&repo.0, &root.0).unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -39550,6 +39587,9 @@ mod clone_orchestration {
         assert!(
             !frames.iter().any(|f| f.data["phase"] == "worktree"),
             "no worktree milestone on the CoW path: {frames:?}"
+        );
+        eprintln!(
+            "CoW fixture assertions passed: progress_id_cow_create_streams_cow_copy_milestone"
         );
     }
 

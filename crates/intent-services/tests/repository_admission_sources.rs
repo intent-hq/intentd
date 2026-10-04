@@ -29,4 +29,8 @@ mod repository_credentials;
 #[path = "../src/repository_admission/source_tests.rs"]
 mod source_tests;
 #[path = "../src/test_support/scratch.rs"]
+#[expect(
+    dead_code,
+    reason = "rooted scratch helper is exercised by Services CoW fixtures; this harness uses the system temp root"
+)]
 mod test_support;
