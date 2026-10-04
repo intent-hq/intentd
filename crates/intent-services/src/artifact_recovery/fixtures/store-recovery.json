@@ -1,0 +1,115 @@
+{
+  "boundary": "Actual Store-generated prepared DTO. No public RPC/profile/physical authority. Signed references are historical test evidence, not live construction grants.",
+  "beginInput": {
+    "jobId": "job",
+    "expiresAt": "2026-10-04T07:10:29.08766834Z",
+    "header": {
+      "scope": {
+        "backendId": "5ceef6702f632ec208e5b43798b39249",
+        "workspaceId": "pages",
+        "noteId": "spec",
+        "noteInstanceId": "23e7c769f8b164817557d2b5195e0672"
+      },
+      "source": {
+        "kind": "snapshot",
+        "snapshotId": "c9c1f8511c2c43288eabc1b457051109",
+        "sourceRevision": "r:0:8cbb922fa07041e8948ec412605c60d8",
+        "ownerRef": "AcnB-FEcLEMojqvBtFcFEQkAAgILCAAAAAA.OGQUX89guQKzlxkQ_1EguYg4JlNKM90BggAH8SCZnt0",
+        "sourceRef": "AcnB-FEcLEMojqvBtFcFEQkAAgMLDAAAAAA._gp_-Ww7WojwdezPoY56m3Ium9Lo4hkSmwBMRI2VxCk"
+      },
+      "primitive": "diff",
+      "profile": "journal-test-not-registered",
+      "environment": {
+        "width": 800.5,
+        "height": 600.0,
+        "theme": "light",
+        "fontRef": "test-only",
+        "fontSize": 14.0,
+        "devicePixelRatio": 1.25
+      },
+      "reservation": {
+        "payloadBytes": 1024,
+        "records": 2,
+        "indexEntries": 2,
+        "storageChargeBytes": 4096
+      }
+    },
+    "headerDigest": "b315f85fe16f8335416220679327456076be459876a8c9ba5173e23cf16256db"
+  },
+  "result": {
+    "originalAppendAckAfterSeal": {
+      "kind": "artifactJobState",
+      "jobId": "job",
+      "jobRef": "AcnB-FEcLEMojqvBtFcFEQkAAg0Bag0gMDIyY2VlODE4MTNlNGJhMjhkMjVlYzhmYjY5ZDIyYjgAAAAA.Oh0KWs7P2eqn72X-7FcA5tCbX6hxWdchtZJcEeX44fc",
+      "headerDigest": "b315f85fe16f8335416220679327456076be459876a8c9ba5173e23cf16256db",
+      "state": "building",
+      "nextSequence": 1,
+      "acceptedBytes": 35,
+      "currentDigest": "90ea315bd079ef8581edd68df049e89d467fc0f5636f7a3a0897354269f43037",
+      "expiresAt": "2026-10-04T07:10:29.08766834Z",
+      "statusUntil": "2026-10-04T07:11:29.087Z",
+      "reservation": {
+        "payloadBytes": 1024,
+        "records": 2,
+        "indexEntries": 2,
+        "storageChargeBytes": 4096
+      }
+    },
+    "admitted": {
+      "kind": "artifactLease",
+      "jobId": "job",
+      "headerDigest": "b315f85fe16f8335416220679327456076be459876a8c9ba5173e23cf16256db",
+      "finalDigest": "90ea315bd079ef8581edd68df049e89d467fc0f5636f7a3a0897354269f43037",
+      "admissionId": "admission",
+      "artifactRef": "AcnB-FEcLEMojqvBtFcFEQkAAg0BbA0gM2ZjMWZmNWRiYTBmNGM0ZDhmNzUwNTNjMmFkNjkxOTgAAAAA.gsNgwTzThmuJZPVE1JloRABierlGNFllg4MuK99ichM",
+      "generation": "022cee81813e4ba28d25ec8fb69d22b8",
+      "expiresAt": "2026-10-04T07:10:29.08766834Z",
+      "statusUntil": "2026-10-04T07:11:29.087Z"
+    },
+    "afterOrdinaryRelease": {
+      "kind": "artifactLease",
+      "jobId": "job",
+      "headerDigest": "b315f85fe16f8335416220679327456076be459876a8c9ba5173e23cf16256db",
+      "finalDigest": "90ea315bd079ef8581edd68df049e89d467fc0f5636f7a3a0897354269f43037",
+      "admissionId": "admission",
+      "artifactRef": "AcnB-FEcLEMojqvBtFcFEQkAAg0BbA0gM2ZjMWZmNWRiYTBmNGM0ZDhmNzUwNTNjMmFkNjkxOTgAAAAA.gsNgwTzThmuJZPVE1JloRABierlGNFllg4MuK99ichM",
+      "generation": "022cee81813e4ba28d25ec8fb69d22b8",
+      "expiresAt": "2026-10-04T07:10:29.08766834Z",
+      "statusUntil": "2026-10-04T07:11:29.087Z"
+    },
+    "afterAbort": {
+      "kind": "artifactJobState",
+      "jobId": "job",
+      "jobRef": "AcnB-FEcLEMojqvBtFcFEQkAAg0Bag0gMDIyY2VlODE4MTNlNGJhMjhkMjVlYzhmYjY5ZDIyYjgAAAAA.Oh0KWs7P2eqn72X-7FcA5tCbX6hxWdchtZJcEeX44fc",
+      "headerDigest": "b315f85fe16f8335416220679327456076be459876a8c9ba5173e23cf16256db",
+      "state": "aborted",
+      "nextSequence": 1,
+      "acceptedBytes": 35,
+      "currentDigest": "90ea315bd079ef8581edd68df049e89d467fc0f5636f7a3a0897354269f43037",
+      "expiresAt": "2026-10-04T07:10:29.08766834Z",
+      "statusUntil": "2026-10-04T07:11:29.087Z",
+      "reservation": {
+        "payloadBytes": 1024,
+        "records": 2,
+        "indexEntries": 2,
+        "storageChargeBytes": 4096
+      }
+    },
+    "internalOriginalLease": {
+      "artifactRef": "AcnB-FEcLEMojqvBtFcFEQkAAg0BbA0gM2ZjMWZmNWRiYTBmNGM0ZDhmNzUwNTNjMmFkNjkxOTgAAAAA.gsNgwTzThmuJZPVE1JloRABierlGNFllg4MuK99ichM",
+      "generation": "022cee81813e4ba28d25ec8fb69d22b8",
+      "expiresAtEpochMs": 1791097829088
+    },
+    "admitInput": {
+      "jobRef": "AcnB-FEcLEMojqvBtFcFEQkAAg0Bag0gMDIyY2VlODE4MTNlNGJhMjhkMjVlYzhmYjY5ZDIyYjgAAAAA.Oh0KWs7P2eqn72X-7FcA5tCbX6hxWdchtZJcEeX44fc",
+      "admissionId": "admission",
+      "finalDigest": "90ea315bd079ef8581edd68df049e89d467fc0f5636f7a3a0897354269f43037"
+    },
+    "sealInput": {
+      "jobRef": "AcnB-FEcLEMojqvBtFcFEQkAAg0Bag0gMDIyY2VlODE4MTNlNGJhMjhkMjVlYzhmYjY5ZDIyYjgAAAAA.Oh0KWs7P2eqn72X-7FcA5tCbX6hxWdchtZJcEeX44fc",
+      "expectedRecords": 1,
+      "expectedBytes": 35,
+      "finalDigest": "90ea315bd079ef8581edd68df049e89d467fc0f5636f7a3a0897354269f43037"
+    }
+  }
+}

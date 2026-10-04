@@ -33,6 +33,55 @@ impl Services {
         operation: PreparedArtifactRecovery,
         rpc_id: Value,
     ) -> Result<Value> {
+        let lookup_workspace = workspace.clone();
+        self.prepared_artifact_disclose(workspace, rpc_id, |principal| async move {
+            let workspace = lookup_workspace;
+            Ok(match operation {
+                PreparedArtifactRecovery::Status {
+                    job_id,
+                    header_digest,
+                } => {
+                    self.store
+                        .recover_note_artifact_receipt(
+                            &principal,
+                            &workspace.0,
+                            &job_id,
+                            &header_digest,
+                        )
+                        .await?
+                }
+                PreparedArtifactRecovery::Abort { job_ref } => {
+                    let ack = self
+                        .store
+                        .abort_note_artifact_journal(&principal, &workspace.0, &job_ref)
+                        .await?;
+                    self.store
+                        .note_artifact_job_receipt(&principal, &workspace.0, &ack)
+                        .await?
+                }
+                PreparedArtifactRecovery::Release { artifact_ref } => {
+                    self.store
+                        .release_note_artifact_lease(&principal, &workspace.0, &artifact_ref)
+                        .await?;
+                    Receipt::Released
+                }
+            })
+        })
+        .await
+    }
+
+    // The lookup is private and supplied only by the unregistered Store boundary
+    // above. Tests substitute a controlled future, never an arena authority.
+    async fn prepared_artifact_disclose<F, Fut>(
+        &self,
+        workspace: WorkspaceId,
+        rpc_id: Value,
+        lookup: F,
+    ) -> Result<Value>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Result<Receipt>>,
+    {
         let caller = intent_core::current_caller()
             .ok_or_else(|| Error::Forbidden("Caller required".into()))?;
         let principal = match &caller {
@@ -41,38 +90,9 @@ impl Services {
             Caller::Daemon => "daemon".into(),
         };
         intent_core::with_caller(caller.clone(), self.require_member(&workspace)).await?;
-        let receipt = match operation {
-            PreparedArtifactRecovery::Status {
-                job_id,
-                header_digest,
-            } => {
-                self.store
-                    .recover_note_artifact_receipt(
-                        &principal,
-                        &workspace.0,
-                        &job_id,
-                        &header_digest,
-                    )
-                    .await?
-            }
-            PreparedArtifactRecovery::Abort { job_ref } => {
-                let ack = self
-                    .store
-                    .abort_note_artifact_journal(&principal, &workspace.0, &job_ref)
-                    .await?;
-                self.store
-                    .note_artifact_job_receipt(&principal, &workspace.0, &ack)
-                    .await?
-            }
-            PreparedArtifactRecovery::Release { artifact_ref } => {
-                self.store
-                    .release_note_artifact_lease(&principal, &workspace.0, &artifact_ref)
-                    .await?;
-                Receipt::Released
-            }
-        };
+        let outcome = lookup(principal).await;
         intent_core::with_caller(caller, self.require_member(&workspace)).await?;
-        receipt.rpc_result(&rpc_id)
+        outcome?.rpc_result(&rpc_id)
     }
 }
 
@@ -118,3 +138,6 @@ mod tests {
         services.store.close().await;
     }
 }
+
+#[cfg(test)]
+mod disclosure_tests;
