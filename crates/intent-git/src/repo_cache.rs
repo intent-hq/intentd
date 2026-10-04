@@ -1535,6 +1535,30 @@ pub(crate) fn provision_plain_clone_checkout(
             None,
             cache_fetch_timeout(),
         )?;
+        // Match the CoW path's preference for an existing source-local branch.
+        // A local clone maps source heads to origin/*; the overlay above can
+        // replace that tip with a stale upstream ref (notably after a cached
+        // PR branch has advanced). Materialize the source-local branch in the
+        // new destination before checkout, without changing either source ref.
+        let source = Repository::open(source_path).map_err(map_git_err)?;
+        match source.find_branch(branch, git2::BranchType::Local) {
+            Ok(source_branch) => {
+                let destination = Repository::open(checkout_path).map_err(map_git_err)?;
+                match destination.find_branch(branch, git2::BranchType::Local) {
+                    Ok(_) => {}
+                    Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                        let tip = source_branch.get().peel_to_commit().map_err(map_git_err)?;
+                        let commit = destination.find_commit(tip.id()).map_err(map_git_err)?;
+                        destination
+                            .branch(branch, &commit, false)
+                            .map_err(map_git_err)?;
+                    }
+                    Err(error) => return Err(map_git_err(error)),
+                };
+            }
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => return Err(map_git_err(error)),
+        }
         let sha =
             crate::cow_checkout::checkout_in_clone(checkout_path, branch, base_ref, "origin")?;
         let repo = Repository::open(checkout_path).map_err(map_git_err)?;
@@ -2808,6 +2832,67 @@ mod tests {
             std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
             "one\n"
         );
+    }
+
+    /// A refreshed daemon-owned PR branch must survive a stale cache
+    /// remote-tracking overlay in the Direct path, including force pushes.
+    #[tokio::test]
+    async fn direct_checkout_preserves_refreshed_pr_branch_over_stale_remote() {
+        let origin = init_repo("repocache-direct-pr");
+        commit_file(origin.path(), "a.txt", "base\n");
+        let base = head_sha(origin.path());
+        crate::testutil::create_branch(origin.path(), "topic");
+        let root = CacheRoot::new("direct-pr");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let cache_head = head_sha(&cache);
+        let checkout_root = CacheRoot::new("direct-pr-dst");
+        let mut prior_checkouts: Vec<(PathBuf, String)> = Vec::new();
+        for label in ["first", "forward", "force"] {
+            if label == "force" {
+                let repo = Repository::open(origin.path()).unwrap();
+                let base = repo.revparse_single(&base).unwrap();
+                repo.reset(&base, git2::ResetType::Hard, None).unwrap();
+            }
+            commit_file(origin.path(), "a.txt", label);
+            let expected = head_sha(origin.path());
+            let repo = Repository::open(origin.path()).unwrap();
+            repo.reference(
+                "refs/pull/42/head",
+                git2::Oid::from_str(&expected).unwrap(),
+                true,
+                "move canonical PR head",
+            )
+            .unwrap();
+            crate::fetch::prepare_cached_pr_branch(
+                &cache,
+                "origin",
+                42,
+                "topic",
+                Some(&expected),
+                None,
+            )
+            .unwrap();
+            let checkout = checkout_root.path().join(label);
+            let actual = provision_direct_checkout(&cache, &checkout, &url, "topic", None).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
+                label
+            );
+            assert_eq!(head_sha(&cache), cache_head, "cache HEAD stays unchanged");
+            assert_eq!(
+                crate::refs::rev_parse(&cache, "refs/remotes/origin/topic").unwrap(),
+                base,
+                "stale upstream ref is preserved, not rewritten"
+            );
+            for (path, sha) in &prior_checkouts {
+                assert_eq!(&head_sha(path), sha, "earlier destination is preserved");
+            }
+            prior_checkouts.push((checkout, expected));
+        }
     }
 
     /// A `base_ref` naming a non-default origin branch resolves through the

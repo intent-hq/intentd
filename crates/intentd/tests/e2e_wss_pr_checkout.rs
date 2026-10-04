@@ -269,6 +269,7 @@ fn git(path: &std::path::Path, args: &[&str]) -> String {
 // Each case owns a local bare origin. Only refs/pull/42/head exposes the PR
 // commit: this reproduces a fork without network, credentials or a fork remote.
 async fn checkout_case(branch: &str, available: bool, conflict: bool, mode: &str) {
+    let cached = mode.starts_with("cache");
     let fx = boot(branch).await;
     let origin = fx.dir.path().join("o/r.git");
     std::fs::create_dir_all(&origin).unwrap();
@@ -292,6 +293,12 @@ async fn checkout_case(branch: &str, available: bool, conflict: bool, mode: &str
     let head = git(&repo, &["rev-parse", "HEAD"]);
     if available {
         git(&repo, &["push", "origin", "HEAD:refs/pull/42/head"]);
+        if mode == "cache-topic" {
+            git(
+                &repo,
+                &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+            );
+        }
     }
     git(&repo, &["checkout", "main"]);
     git(&repo, &["branch", "-D", "fixture-head"]);
@@ -303,7 +310,7 @@ async fn checkout_case(branch: &str, available: bool, conflict: bool, mode: &str
         "o",
         "r",
     );
-    if mode == "cache" && conflict {
+    if cached && conflict {
         std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
         git(
             fx.dir.path(),
@@ -322,7 +329,7 @@ async fn checkout_case(branch: &str, available: bool, conflict: bool, mode: &str
         "branch":branch, "baseRef":"main",
         "contextLinks":[{"kind":"pr","owner":"o","repo":"r","number":42,"url":"https://github.com/o/r/pull/42"}]
     });
-    if mode == "cache" {
+    if cached {
         params["githubUrl"] = json!(format!("file://{}", origin.display()));
     } else {
         params["repositoryPath"] = json!(repo);
@@ -342,7 +349,7 @@ async fn checkout_case(branch: &str, available: bool, conflict: bool, mode: &str
         if mode == "direct" {
             assert_eq!(workspace["checkoutMode"], "direct");
         }
-        if mode == "cache" {
+        if cached {
             assert!(cache.join(".git").exists());
             assert_ne!(checkout, repo);
             let mut imports = vec![response.clone()];
@@ -354,6 +361,25 @@ async fn checkout_case(branch: &str, available: bool, conflict: bool, mode: &str
                     &repo,
                     &["push", "--force", "origin", "HEAD:refs/pull/42/head"],
                 );
+                if mode == "cache-topic" {
+                    git(
+                        &repo,
+                        &[
+                            "push",
+                            "--force",
+                            "origin",
+                            &format!("HEAD:refs/heads/{branch}"),
+                        ],
+                    );
+                    assert_eq!(
+                        git(
+                            &cache,
+                            &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+                        ),
+                        head,
+                        "repeat import starts with a stale cache remote-tracking ref"
+                    );
+                }
                 let imported = wss_rpc_raw(&mut rpc, id, "workspace.create", params.clone()).await;
                 assert!(imported.get("error").is_none(), "repeat import: {imported}");
                 let path = std::path::Path::new(
@@ -402,7 +428,7 @@ async fn checkout_case(branch: &str, available: bool, conflict: bool, mode: &str
         assert_eq!(git(&repo, &["rev-parse", "main"]), base);
         if conflict {
             assert_eq!(git(&repo, &["rev-parse", branch]), base);
-            if mode == "cache" {
+            if cached {
                 assert_eq!(git(&cache, &["rev-parse", branch]), base);
             }
         }
@@ -415,6 +441,10 @@ async fn canonical_fork_pr_head_is_checked_out() {
     for mode in ["worktree", "direct", "cache"] {
         checkout_case("fork-feature", true, false, mode).await;
     }
+}
+#[intent_test_macros::daemon_test]
+async fn cached_same_repository_pr_head_survives_stale_tracking_ref() {
+    checkout_case("topic", true, false, "cache-topic").await;
 }
 #[intent_test_macros::daemon_test]
 async fn missing_pr_ref_cannot_fall_back_to_base() {
