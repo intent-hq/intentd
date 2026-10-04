@@ -36,6 +36,7 @@ fn seed_workspace(id: &WorkspaceId) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts.clone(),
         last_activity: None,
+        last_content_activity: None,
         tags: vec!["seed".to_string()],
         path: None,
         repository_path: None,

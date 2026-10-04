@@ -329,6 +329,7 @@ async fn seed_workspace_only(data_dir: &Path, repository_path: Option<&Path>) ->
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: repository_path.map(|path| path.to_string_lossy().into_owned()),
