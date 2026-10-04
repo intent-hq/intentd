@@ -353,6 +353,7 @@ async fn original_child(instance: &str, sha: &str) {
         .unwrap()
         .iter()
         .any(|b| b["name"] == "release/later-page" && b["commitSha"] == sha));
+    moved_branch_create_controls(&h, &mut client, &selection, sha).await;
     let mut created = Vec::new();
     for mode in ["direct", "cached"] {
         let mut creator = h.wss(if mode == "cached" { MEMBER } else { TOKEN }).await;
@@ -622,6 +623,7 @@ async fn checkout_original_tls_wire_direct_cached_exact_head_and_private_account
                                 let method=words.next().unwrap().to_owned();let target=words.next().unwrap().to_owned();
                                 eprintln!("owned checkout TLS request {method} {target}");
                                 assert!(target.starts_with("/install/Team/Sub/Project.git/"));
+                                std::fs::OpenOptions::new().create(true).append(true).open(root.join("https-requests")).unwrap().write_all(b".").unwrap();
                                 let authorized=header.lines().any(|line|line.split_once(':').is_some_and(|(key,value)|key.eq_ignore_ascii_case("authorization") && value.trim()=="Basic b2F1dGgyOnN0b3JlZC1wYXQ="));
                                 let length=header.lines().find_map(|line|line.split_once(':').and_then(|(key,value)|key.eq_ignore_ascii_case("content-length").then(||value.trim().parse::<usize>().unwrap()))).unwrap_or(0);
                                 assert!(length<65536);let mut body=vec![0;length];stream.read_exact(&mut body).await.unwrap();
@@ -662,10 +664,88 @@ async fn checkout_original_tls_wire_direct_cached_exact_head_and_private_account
         stop.send(()).unwrap();tokio::time::timeout(LIMIT,server).await.unwrap().unwrap();
         let text=std::fs::read_to_string(&log).unwrap();
         eprintln!("owned checkout authenticated request count={}",requests.load(Ordering::SeqCst));
+        for receipt in text.lines().filter(|line|line.starts_with("checkout moved-branch receipt ")) { eprintln!("{receipt}"); }
         assert!(outcome.is_some_and(|s|s.success()),"{text}");
         assert!(!helper_log.exists(),"native checkout/fetch/push invoked a user helper, gh, or glab");
         assert!(requests.load(Ordering::SeqCst)>=4,"warm and direct used actual authenticated smart HTTPS");
     }).await;
+}
+
+async fn moved_branch_create_controls(
+    h: &Harness,
+    client: &mut Client,
+    selection: &Value,
+    selected: &str,
+) {
+    let root = PathBuf::from(std::env::var_os("INTENT_CHECKOUT_ROOT").unwrap());
+    let bare = root.join("install/Team/Sub/Project.git");
+    let reference = "refs/heads/release/later-page";
+    assert_eq!(git(&bare, &["rev-parse", reference]), selected);
+    let moved = git(&bare, &["rev-parse", "refs/heads/main"]);
+    assert_ne!(moved, selected);
+    git(&bare, &["update-ref", reference, &moved, selected]);
+
+    let before = h.store.list_workspaces(true).await.unwrap().len();
+    let mut direct = selection.clone();
+    direct["mode"] = json!("direct");
+    let refused = client
+        .rpc(
+            "workspace.create",
+            json!({"repositoryCheckout":direct,"branch":"workspace/moved-direct"}),
+        )
+        .await;
+    assert_eq!(
+        refused,
+        json!({"jsonrpc":"2.0","id":client.id,"error":{"code":-32003,"message":"Forbidden","data":{"code":"forbidden","detail":"Repository checkout unavailable"}}}),
+        "assert the final protected wire envelope, not the upstream native error"
+    );
+    let after_refusal = h.store.list_workspaces(true).await.unwrap().len();
+    assert_eq!(after_refusal, before);
+    let published_before = h
+        .store
+        .list_workspaces(true)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|workspace| workspace.branch == "workspace/moved-direct")
+        .count();
+    assert_eq!(published_before, 0);
+
+    // This original cache is still authorized and holds the exact selected SHA.
+    // A cache hit is neither a remote freshness probe nor a permission probe.
+    let requests_before = std::fs::metadata(root.join("https-requests"))
+        .unwrap()
+        .len();
+    let cached = client
+        .rpc(
+            "workspace.create",
+            json!({"repositoryCheckout":selection,"branch":"workspace/moved-cached"}),
+        )
+        .await;
+    let result = success(&cached);
+    let workspace = result.get("workspace").unwrap_or(result);
+    let path = Path::new(workspace["worktreePath"].as_str().unwrap());
+    assert!(path.starts_with(h.dir.path()));
+    let cached_head = git(path, &["rev-parse", "HEAD"]);
+    assert_eq!(cached_head, selected);
+    assert_eq!(workspace["baseCommitSha"], selected);
+    assert_eq!(
+        git(path, &["branch", "--show-current"]),
+        "workspace/moved-cached"
+    );
+    let requests_after = std::fs::metadata(root.join("https-requests"))
+        .unwrap()
+        .len();
+    assert_eq!(requests_after, requests_before);
+    let after_cached = h.store.list_workspaces(true).await.unwrap().len();
+    assert_eq!(after_cached, before + 1);
+    assert_eq!(git(&bare, &["rev-parse", reference]), moved);
+    eprintln!(
+        "checkout moved-branch receipt {}",
+        json!({"observedSha":selected,"remoteSha":moved,"directResponse":refused,"workspaceCountBefore":before,"workspaceCountAfterDirect":after_refusal,"cachedResponse":cached,"cachedHead":cached_head,"workspaceCountAfterCached":after_cached,"httpsRequestsBeforeCached":requests_before,"httpsRequestsAfterCached":requests_after})
+    );
+    // Restore only the disposable provider ref for the existing later controls.
+    git(&bare, &["update-ref", reference, selected, &moved]);
 }
 
 async fn wait_for_file(path: &Path) {
