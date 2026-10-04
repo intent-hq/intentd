@@ -12,6 +12,7 @@ mod artifact_lifecycle;
 mod artifact_maintenance;
 mod artifact_publication;
 mod artifact_read;
+mod artifact_response;
 use crate::Store;
 pub use artifact_lifecycle::ArtifactJournalStatus;
 pub use artifact_maintenance::ArtifactJournalPurge;

@@ -30,8 +30,8 @@ impl Store {
         identifier(workspace_id)?;
         request.validate(workspace_id).map_err(|_| invalid())?;
         let expiry = intent_core::parse_iso(&request.expires_at).ok_or_else(invalid)?;
-        let expires_at =
-            i64::try_from(expiry.unix_timestamp_nanos() / 1_000_000).map_err(|_| invalid())?;
+        let expires_at = i64::try_from((expiry.unix_timestamp_nanos() + 999_999) / 1_000_000)
+            .map_err(|_| invalid())?;
         if expires_at <= 0 || status_until < expires_at {
             return Err(invalid());
         }
@@ -76,12 +76,12 @@ impl Store {
             }
             let generation = uuid::Uuid::new_v4().simple().to_string();
             let reservation = &request.header.reservation;
-            sqlx::query("INSERT INTO note_artifact_job(principal,workspace_id,job_id,generation,runtime_id,header_digest,header,source_snapshot,source_revision,note_id,note_instance_id,source_collection,state,expires_at,status_until,payload_limit,record_limit,index_limit,storage_limit,current_digest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'building',?,?,?,?,?,?,?)")
+            sqlx::query("INSERT INTO note_artifact_job(principal,workspace_id,job_id,generation,runtime_id,header_digest,header,source_snapshot,source_revision,note_id,note_instance_id,source_collection,state,expires_at,expires_at_text,status_until,payload_limit,record_limit,index_limit,storage_limit,current_digest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'building',?,?,?,?,?,?,?,?)")
                 .bind(principal).bind(workspace_id).bind(&request.job_id).bind(&generation)
                 .bind(&self.note_pages.id).bind(&request.header_digest).bind(&header)
                 .bind(&source.snapshot_id).bind(&source.source_revision).bind(&source.scope.note_id)
                 .bind(&source.scope.note_instance_id).bind(&source.source_collection)
-                .bind(expires_at).bind(status_until)
+                .bind(expires_at).bind(&request.expires_at).bind(status_until)
                 .bind(super::signed(reservation.payload_bytes)?).bind(super::signed(reservation.records)?)
                 .bind(super::signed(reservation.index_entries)?).bind(super::signed(reservation.storage_charge_bytes)?)
                 .bind(&request.header_digest).execute(&mut *connection).await.map_err(db_error)?;
@@ -90,7 +90,7 @@ impl Store {
             // Runtime eviction/expiry can race SQL awaits; rollback the logical
             // reservation if its original source lease is no longer current.
             self.note_pages.snapshot(&source.snapshot_id, workspace_id, &source.scope.note_id, principal)?;
-            if intent_core::now_epoch_ms() >= u64::try_from(expires_at).map_err(|_| invalid())? {
+            if expiry <= intent_core::parse_iso(&intent_core::now_iso()).ok_or_else(invalid)? {
                 return Err(invalid());
             }
             status(&self.note_pages, &row).map(|state| (state, source, true))

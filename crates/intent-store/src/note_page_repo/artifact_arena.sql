@@ -46,6 +46,7 @@ CREATE TABLE note_artifact_job (
     source_collection TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('building','sealed','admitted','aborted','expired')),
     expires_at INTEGER NOT NULL,
+    expires_at_text TEXT NOT NULL DEFAULT '' CHECK (length(CAST(expires_at_text AS BLOB))<=64),
     status_until INTEGER NOT NULL CHECK (status_until >= expires_at),
     payload_limit INTEGER NOT NULL CHECK (payload_limit BETWEEN 1 AND 9007199254740991),
     record_limit INTEGER NOT NULL CHECK (record_limit BETWEEN 1 AND 9007199254740991),
@@ -94,7 +95,7 @@ CREATE TRIGGER note_artifact_job_charge AFTER INSERT ON note_artifact_job BEGIN
 END;
 CREATE TRIGGER note_artifact_job_identity BEFORE UPDATE OF principal,workspace_id,job_id,generation,
     runtime_id,header_digest,header,source_snapshot,source_revision,note_id,note_instance_id,
-    source_collection,expires_at,status_until,payload_limit,record_limit,index_limit,storage_limit
+    source_collection,expires_at,expires_at_text,status_until,payload_limit,record_limit,index_limit,storage_limit
     ON note_artifact_job BEGIN
     SELECT RAISE(ABORT,'artifact job identity and reservation are immutable');
 END;

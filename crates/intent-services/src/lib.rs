@@ -184,6 +184,7 @@ mod repository_read_policy;
 mod repository_read_source;
 
 mod agent_list_cache;
+pub mod artifact_recovery;
 pub mod checkpoint;
 mod direct_secret_ops;
 mod fast_mode;

@@ -17,12 +17,21 @@ pub struct ArtifactJournalStatus {
     pub accepted_bytes: i64,
     pub current_digest: String,
     pub expires_at: i64,
+    pub expires_at_text: String,
     pub status_until: i64,
     pub cleanup_complete: bool,
     pub private_artifact_ref: Option<String>,
 }
 
-pub(super) const STATUS_COLUMNS: &str = "job_id,generation,source_snapshot,header_digest,state,next_sequence,accepted_bytes,current_digest,expires_at,status_until,cleanup_complete";
+impl ArtifactJournalStatus {
+    pub(super) fn deadline_expired(&self) -> Result<bool> {
+        let expiry = intent_core::parse_iso(&self.expires_at_text).ok_or_else(invalid)?;
+        let now = intent_core::parse_iso(&intent_core::now_iso()).ok_or_else(invalid)?;
+        Ok(expiry <= now)
+    }
+}
+
+pub(super) const STATUS_COLUMNS: &str = "job_id,generation,source_snapshot,header_digest,state,next_sequence,accepted_bytes,current_digest,expires_at,expires_at_text,status_until,cleanup_complete";
 
 pub(super) fn status(runtime: &super::Runtime, row: &SqliteRow) -> Result<ArtifactJournalStatus> {
     let snapshot: String = row.try_get("source_snapshot").map_err(db_error)?;
@@ -43,6 +52,7 @@ pub(super) fn status(runtime: &super::Runtime, row: &SqliteRow) -> Result<Artifa
         accepted_bytes: row.try_get("accepted_bytes").map_err(db_error)?,
         current_digest: row.try_get("current_digest").map_err(db_error)?,
         expires_at: row.try_get("expires_at").map_err(db_error)?,
+        expires_at_text: row.try_get("expires_at_text").map_err(db_error)?,
         status_until: row.try_get("status_until").map_err(db_error)?,
         cleanup_complete: row.try_get("cleanup_complete").map_err(db_error)?,
         private_artifact_ref,

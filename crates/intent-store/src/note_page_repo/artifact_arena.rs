@@ -180,11 +180,11 @@ impl Store {
                             .map_err(db_error)?;
                         sqlx::query("INSERT INTO note_artifact_arena_owner(singleton,backend_id,max_pages) VALUES (1,?,?)")
                             .bind(&self.note_pages.backend).bind(max_pages).execute(&mut *tx).await.map_err(db_error)?;
-                        sqlx::query("PRAGMA user_version=1")
+                        sqlx::query("PRAGMA user_version=2")
                             .execute(&mut *tx)
                             .await
                             .map_err(db_error)?;
-                    } else if version != 1 {
+                    } else if version != 2 {
                         return Err(Error::Internal("Unsupported artifact arena schema".into()));
                     }
                     let owner: (String, i64) = sqlx::query_as("SELECT backend_id,max_pages FROM note_artifact_arena_owner WHERE singleton=1")
@@ -308,7 +308,7 @@ mod tests {
                     .fetch_one(&outside)
                     .await
                     .unwrap(),
-                1
+                2
             );
             outside.close().await;
             let reopened = Store::open(&main_path).await.unwrap();

@@ -73,8 +73,7 @@ impl Store {
             .validate(&receipt.header_digest)
             .map_err(|_| invalid())?;
         if row.try_get::<String, _>("runtime_id").map_err(db_error)? != self.note_pages.id
-            || receipt.expires_at
-                <= i64::try_from(intent_core::now_epoch_ms()).map_err(|_| invalid())?
+            || receipt.deadline_expired()?
         {
             return Err(invalid());
         }
@@ -126,9 +125,7 @@ impl Store {
             &source.scope.note_id,
             principal,
         )?;
-        if receipt.expires_at
-            <= i64::try_from(intent_core::now_epoch_ms()).map_err(|_| invalid())?
-        {
+        if receipt.deadline_expired()? {
             return Err(invalid());
         }
         Self::commit_artifact_with_source_guard(source_guard, tx, source).await?;

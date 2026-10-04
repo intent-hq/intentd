@@ -9,8 +9,8 @@ use sqlx::SqliteConnection;
 // type/name/tbl_name/sql field is prefixed by its big-endian u64 UTF-8 length.
 // Intentional schema changes must update this manifest and the arena version.
 const OBJECTS: i64 = 32;
-const FIELD_BYTES: i64 = 14_640;
-const FINGERPRINT: &str = "6a9741e65b4ebcb1d85348dabb08cf5cece92d81791d4bd85dd03f773990c4b6";
+const FIELD_BYTES: i64 = 14_752;
+const FINGERPRINT: &str = "5c5daa00365c6e6fd15b460a65ce6fc2e96c333c437f91b5c9cd1dfcdbffb38a";
 
 pub(super) async fn verify(connection: &mut SqliteConnection) -> Result<()> {
     let shape: (i64, i64) = sqlx::query_as(

@@ -76,7 +76,7 @@ impl Store {
             &source.scope.note_id,
             principal,
         )?;
-        if state.expires_at <= i64::try_from(intent_core::now_epoch_ms()).map_err(|_| invalid())? {
+        if state.deadline_expired()? {
             return Err(invalid());
         }
         Ok(())

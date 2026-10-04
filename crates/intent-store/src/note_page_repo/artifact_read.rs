@@ -48,13 +48,15 @@ impl Store {
             .await
             .map_err(db_error)?;
         let mut tx = self.artifact_pool()?.begin().await.map_err(db_error)?;
-        let job = sqlx::query("SELECT j.generation,j.header,j.runtime_id,j.expires_at FROM note_artifact_lease l JOIN note_artifact_job j ON j.generation=l.generation WHERE l.lease_id=? AND l.released=0 AND j.principal=? AND j.workspace_id=? AND j.source_snapshot=? AND j.state='admitted' AND j.cleanup_complete=0 AND l.final_digest=j.current_digest AND l.expires_at=j.expires_at")
+        let job = sqlx::query("SELECT j.generation,j.header,j.runtime_id,j.expires_at_text FROM note_artifact_lease l JOIN note_artifact_job j ON j.generation=l.generation WHERE l.lease_id=? AND l.released=0 AND j.principal=? AND j.workspace_id=? AND j.source_snapshot=? AND j.state='admitted' AND j.cleanup_complete=0 AND l.final_digest=j.current_digest AND l.expires_at=j.expires_at")
             .bind(lease).bind(principal).bind(workspace_id).bind(&token.0)
             .fetch_optional(&mut *tx).await.map_err(db_error)?
             .ok_or_else(|| Error::NotFound("Artifact lease is unavailable".into()))?;
-        let expires: i64 = job.try_get("expires_at").map_err(db_error)?;
+        let expires: String = job.try_get("expires_at_text").map_err(db_error)?;
+        let expires = intent_core::parse_iso(&expires).ok_or_else(invalid)?;
+        let now = intent_core::parse_iso(&intent_core::now_iso()).ok_or_else(invalid)?;
         if job.try_get::<String, _>("runtime_id").map_err(db_error)? != self.note_pages.id
-            || expires <= i64::try_from(intent_core::now_epoch_ms()).map_err(|_| invalid())?
+            || expires <= now
         {
             return Err(invalid());
         }
@@ -85,7 +87,7 @@ impl Store {
             &source.scope.note_id,
             principal,
         )?;
-        if expires <= i64::try_from(intent_core::now_epoch_ms()).map_err(|_| invalid())? {
+        if expires <= intent_core::parse_iso(&intent_core::now_iso()).ok_or_else(invalid)? {
             return Err(invalid());
         }
         Ok(record)

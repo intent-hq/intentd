@@ -6,6 +6,8 @@ use std::collections::BTreeSet;
 pub mod canonical;
 #[path = "note_artifact/request.rs"]
 pub mod request;
+#[path = "note_artifact/response.rs"]
+pub mod response;
 
 pub const RECORD_BYTES: usize = 16_384;
 pub const RECORD_DEPTH: usize = 32;
