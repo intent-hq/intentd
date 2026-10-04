@@ -2,7 +2,7 @@
 use super::{canonical, TextMapping};
 use crate::note_page_index::Entries;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,6 +34,7 @@ struct Code {
     generated: Range<usize>,
     // HTML scalar/escape receipts. Long identity runs use bounded chunks.
     atoms: Vec<(Range<usize>, Range<usize>)>,
+    block: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -209,6 +210,72 @@ fn code_receipts(
         body,
         generated,
         atoms,
+        block: None,
+    }
+}
+
+fn text_receipts(
+    prepared: &super::markdown_source::Prepared,
+    input: Range<usize>,
+    text: &str,
+    generated: Range<usize>,
+    block: usize,
+) -> Code {
+    let raw = prepared.original(&input);
+    let mut atoms: Vec<(Range<usize>, Range<usize>)> = Vec::new();
+    let mut at = generated.start;
+    let mut decoded = super::TextAtoms {
+        source: &prepared.text,
+        position: input.start,
+        end: input.end,
+    };
+    let mut consumed = 0;
+    while let Some(mut atom) = decoded.next() {
+        if atom.text == "\\" && !text[consumed..].starts_with('\\') {
+            if let Some(next) = decoded.next() {
+                atom.raw.end = next.raw.end;
+                atom.text = next.text;
+            }
+        }
+        debug_assert!(
+            text[consumed..].starts_with(&atom.text),
+            "Markdown text receipt: {:?} != {:?}",
+            atom.text,
+            &text[consumed..]
+        );
+        consumed += atom.text.len();
+        let raw = prepared.original(&atom.raw);
+        let bytes: usize = atom
+            .text
+            .chars()
+            .map(|ch| match ch {
+                '&' => 5,
+                '<' | '>' => 4,
+                _ => ch.len_utf8(),
+            })
+            .sum();
+        if let Some((html, prior)) = atoms.last_mut().filter(|(html, prior)| {
+            html.end == at
+                && prior.end == raw.start
+                && html.len() == prior.len()
+                && bytes == raw.len()
+                && html.len() + bytes <= crate::note_page_index::PIECE_BYTES
+        }) {
+            html.end += bytes;
+            prior.end = raw.end;
+        } else {
+            atoms.push((at..at + bytes, raw));
+        }
+        at += bytes;
+    }
+    debug_assert_eq!(consumed, text.len());
+    debug_assert_eq!(at, generated.end);
+    Code {
+        body: raw.clone(),
+        raw,
+        generated,
+        atoms,
+        block: Some(block),
     }
 }
 
@@ -249,13 +316,31 @@ pub(crate) fn append_codes(
     {
         return;
     }
-    let events: Vec<_> = Parser::new_ext(source, Options::all())
+    let prepared = super::markdown_source::Prepared::new(source);
+    let input_events: Vec<_> = Parser::new_ext(&prepared.text, super::markdown_source::options())
         .into_offset_iter()
+        .collect();
+    let events: Vec<_> = input_events
+        .iter()
+        .map(|(event, range)| (event.clone(), prepared.original(range)))
+        .collect();
+    let blocks: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (event, raw))| {
+            (matches!(event, Event::Start(Tag::Paragraph))
+                && prepared
+                    .escaped
+                    .get(prepared.escaped.partition_point(|tag| tag.end <= raw.start))
+                    .is_some_and(|tag| tag.start < raw.end))
+            .then_some((index, raw.clone()))
+        })
         .collect();
     let primitive_starts: BTreeSet<_> = events.iter().enumerate().filter_map(|(index, (event, _))| {
         matches!(event, Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) if format!("language-{info}").split_ascii_whitespace().any(|class| matches!(class, "language-diff" | "language-mermaid"))).then_some(index)
     }).collect();
-    if primitive_starts.is_empty()
+    if blocks.is_empty()
+        && primitive_starts.is_empty()
         && !descriptors
             .iter()
             .any(|(_, _, _, value)| value["role"] == "code")
@@ -303,6 +388,7 @@ pub(crate) fn append_codes(
             // the explicit generated primitive above creates native HTML atoms.
             match event {
                 Event::Html(text) | Event::InlineHtml(text) => Event::Text(text.clone()),
+                Event::SoftBreak => Event::HardBreak,
                 _ => event.clone(),
             }
         }),
@@ -312,7 +398,12 @@ pub(crate) fn append_codes(
     let mut stack = Vec::new();
     let mut containers = Vec::new();
     let mut tables = 0;
-    for ((event, raw), generated) in events.iter().zip(&output.ranges) {
+    for (event_index, ((event, raw), generated)) in events.iter().zip(&output.ranges).enumerate() {
+        let candidate = blocks.partition_point(|(_, range)| range.end <= raw.start);
+        let block = blocks
+            .get(candidate)
+            .filter(|(_, range)| raw.start >= range.start && raw.end <= range.end)
+            .map(|_| candidate);
         match event {
             Event::Start(tag) => {
                 let container = match tag {
@@ -347,12 +438,31 @@ pub(crate) fn append_codes(
                     .as_ref()
                     .filter(|range| output.html[(*range).clone()].starts_with("<code>"))
                 {
-                    codes.push(code_receipts(
+                    let mut code = code_receipts(
                         source,
                         raw.clone(),
                         generated.clone(),
                         &containers,
                         tables > 0,
+                    );
+                    if !descriptors.iter().any(|(start, end, _, value)| {
+                        *start == units[raw.start]
+                            && *end == units[raw.end]
+                            && value["role"] == "code"
+                    }) {
+                        code.block = block;
+                    }
+                    codes.push(code);
+                }
+            }
+            Event::Text(text) => {
+                if let (Some(block), Some(generated)) = (block, generated) {
+                    codes.push(text_receipts(
+                        &prepared,
+                        input_events[event_index].1.clone(),
+                        text,
+                        generated.clone(),
+                        block,
                     ));
                 }
             }
@@ -436,6 +546,38 @@ pub(crate) fn append_codes(
         }
     }
     let mut retained = BTreeSet::new();
+    let block_nodes: Vec<_> = blocks
+        .iter()
+        .map(|(event, _)| {
+            let generated = output.ranges[*event].as_ref().expect("paragraph output");
+            active
+                .iter()
+                .copied()
+                .find(|id| {
+                    tree.nodes[*id].kind == "paragraph"
+                        && tree.nodes[*id]
+                            .source
+                            .as_ref()
+                            .and_then(|source| source.opening.as_ref())
+                            .is_some_and(|opening| {
+                                opening.start >= generated.start && opening.start < generated.end
+                            })
+                })
+                .expect("canonical paragraph")
+        })
+        .collect();
+    for &paragraph in &block_nodes {
+        let mut pending = vec![paragraph];
+        while let Some(id) = pending.pop() {
+            retained.insert(id);
+            pending.extend(tree.nodes[id].children.iter().copied());
+        }
+        let mut parent = tree.nodes[paragraph].parent;
+        while let Some(id) = parent {
+            retained.insert(id);
+            parent = tree.nodes[id].parent;
+        }
+    }
     for id in active
         .iter()
         .copied()
@@ -554,7 +696,7 @@ pub(crate) fn append_codes(
         }
         let child_index = child_indices[id];
         let mut native = json!({"kind":"nativeNode","id":ids[&id],"profile":"canonicalNote","profileVersion":1,
-            "nodeType":node.kind,"nodeClass":if node.kind=="text" {"text"} else if primitive.is_some() {"atom"} else {"container"},
+            "nodeType":node.kind,"nodeClass":if node.kind=="text" {"text"} else if primitive.is_some() || node.kind=="hardBreak" {"atom"} else {"container"},
             "parentRef":node.parent.map(|parent|format!("d:{}",ids[&parent])),"childIndex":child_index,
             "sourceRange":range_value(&range),"provenance":if range.is_empty(){"implicit"}else{"explicit"},"attributesRef":attrs});
         if !node.marks.is_empty() {
@@ -587,13 +729,47 @@ pub(crate) fn append_codes(
                 native.clone(),
             ));
         }
+        if node.kind == "hardBreak" {
+            descriptors.push((
+                units[range.start],
+                units[range.end],
+                ids[&id].clone(),
+                native.clone(),
+            ));
+        }
         entries.rows.push((format!("d:{}", ids[&id]), 0, native));
     }
+    let mut block_maps: Vec<Vec<(Option<usize>, TextMapping)>> =
+        (0..blocks.len()).map(|_| Vec::new()).collect();
+    let mut block_excluded: Vec<Vec<Range<usize>>> =
+        (0..blocks.len()).map(|_| Vec::new()).collect();
+    for (event, range) in &events {
+        if matches!(event, Event::SoftBreak | Event::HardBreak) {
+            let block = blocks.partition_point(|(_, raw)| raw.end <= range.start);
+            if blocks
+                .get(block)
+                .is_some_and(|(_, raw)| range.start >= raw.start && range.end <= raw.end)
+            {
+                block_excluded[block].push(range.clone());
+            }
+        }
+    }
     for (code, mut group) in codes.into_iter().zip(maps) {
+        if let Some(block) = code.block {
+            block_maps[block].extend(group);
+            continue;
+        }
         let Some(index) = code_descriptors.get(&(units[code.raw.start], units[code.raw.end]))
         else {
             continue;
         };
+        let block = blocks.partition_point(|(_, raw)| raw.end <= code.raw.start);
+        if blocks
+            .get(block)
+            .is_some_and(|(_, raw)| code.raw.start >= raw.start && code.raw.end <= raw.end)
+        {
+            block_excluded[block].push(code.raw.clone());
+        }
         let (_, _, owner, descriptor) = &mut descriptors[*index];
         let native = group
             .iter()
@@ -645,6 +821,73 @@ pub(crate) fn append_codes(
             entries.rows.push((format!("h:{owner}"),position,json!({"kind":"sourceMap","id":id,"profile":"canonicalNote","profileVersion":1,
                 "ownerRef":format!("d:{owner}"),"textNodeId":leaf.map(|id|ids[&id].clone()),"textNodeRef":leaf.map(|id|format!("d:{}",ids[&id])),
                 "sourceRange":range_value(&map.raw),"renderedRange":{"start":map.rendered.start,"end":map.rendered.end},"mapping":map.mapping,"textRef":text_ref})));
+        }
+    }
+    for ((((_, raw), node), mut group), mut covered) in blocks
+        .into_iter()
+        .zip(block_nodes)
+        .zip(block_maps)
+        .zip(block_excluded)
+    {
+        covered.extend(group.iter().map(|(_, map)| map.raw.clone()));
+        covered.sort_by_key(|range| (range.start, range.end));
+        let mut at = raw.start;
+        for range in covered.into_iter().chain(std::iter::once(raw.end..raw.end)) {
+            if at < range.start {
+                group.push((
+                    None,
+                    TextMapping {
+                        raw: at..range.start,
+                        rendered: 0..0,
+                        text: String::new(),
+                        mapping: "omitted",
+                    },
+                ));
+            }
+            at = at.max(range.end);
+        }
+        let owner = entries.id();
+        let native = entries
+            .rows
+            .iter()
+            .find(|(collection, _, _)| *collection == format!("d:{}", ids[&node]))
+            .expect("native paragraph")
+            .2
+            .clone();
+        let mut descriptor = json!({"kind":"boundary","id":owner,"construct":"markdownBlock","profile":"canonicalNote","profileVersion":1,"entryPath":"markdown","sourceRange":range_value(&raw),"nativeRef":format!("d:{}",ids[&node]),"attributesRef":native["attributesRef"]});
+        entries
+            .rows
+            .push((format!("d:{owner}"), 0, descriptor.clone()));
+        descriptor["sourceMapRef"] = json!(format!("h:{owner}"));
+        descriptors.push((units[raw.start], units[raw.end], owner.clone(), descriptor));
+        group.sort_by_key(|(_, map)| (map.raw.start, map.raw.end));
+        let mut compact: Vec<(Option<usize>, TextMapping)> = Vec::with_capacity(group.len());
+        for (leaf, map) in group {
+            if let Some((prior_leaf, prior)) = compact.last_mut() {
+                // Only collapse scalar-preserving identity runs within this owner
+                // and native leaf. Native provenance/source pieces were recorded
+                // independently above and are deliberately left intact.
+                if leaf.is_some()
+                    && *prior_leaf == leaf
+                    && prior.mapping == "identity"
+                    && map.mapping == "identity"
+                    && prior.raw.end == map.raw.start
+                    && prior.rendered.end == map.rendered.start
+                    && prior.text.len() + map.text.len() <= crate::note_page_index::PIECE_BYTES
+                {
+                    prior.raw.end = map.raw.end;
+                    prior.rendered.end = map.rendered.end;
+                    prior.text.push_str(&map.text);
+                    continue;
+                }
+            }
+            compact.push((leaf, map));
+        }
+        for (position, (leaf, map)) in compact.into_iter().enumerate() {
+            let id = entries.id();
+            let text_ref =
+                (!map.text.is_empty()).then(|| entries.fragment("renderedText", &map.text));
+            entries.rows.push((format!("h:{owner}"),position,json!({"kind":"sourceMap","id":id,"profile":"canonicalNote","profileVersion":1,"ownerRef":format!("d:{owner}"),"textNodeId":leaf.map(|id|ids[&id].clone()),"textNodeRef":leaf.map(|id|format!("d:{}",ids[&id])),"sourceRange":range_value(&map.raw),"renderedRange":{"start":map.rendered.start,"end":map.rendered.end},"mapping":map.mapping,"textRef":text_ref})));
         }
     }
 }

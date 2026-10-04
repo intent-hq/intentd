@@ -809,8 +809,34 @@ async fn indexed_html_far_cells_follow_canonical_unit_grid() {
     }
 }
 
+// Exact protocol9b886 invariants apply to every captured native map, including
+// huge-table omitted syntax and Markdown entity/line-break endpoint probes.
+fn assert_source_map_ranges(map: &Value) {
+    if map["kind"] != "sourceMap" {
+        return;
+    }
+    if map["mapping"] != "projection" {
+        assert!(
+            map["sourceRange"]["end"].as_u64().unwrap()
+                > map["sourceRange"]["start"].as_u64().unwrap(),
+            "non-projection map has empty raw range: {map}"
+        );
+    }
+    if map["mapping"] != "omitted" {
+        assert!(
+            map["renderedRange"]["end"].as_u64().unwrap()
+                > map["renderedRange"]["start"].as_u64().unwrap(),
+            "non-omitted map has empty rendered range: {map}"
+        );
+        assert!(map["textRef"].is_string());
+    }
+}
+
 async fn record_page(store: &Store, request: Value, transcript: &mut Vec<Value>) -> Value {
     let response = page(store, request.clone()).await;
+    for item in response["items"].as_array().into_iter().flatten() {
+        assert_source_map_ranges(item);
+    }
     let limit = usize::try_from(request["maxWireBytes"].as_u64().unwrap_or(65_536)).unwrap();
     assert!(
         serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"result":response}))
@@ -1221,6 +1247,10 @@ async fn indexed_inline_code_uses_canonical_ranges_marks_and_bounded_delimiters(
             Some("x `` y ` z"),
         ),
         ("before `   ` after".to_owned(), None),
+        (
+            "before `a \"quoted\" and 'single' & <x>` after".to_owned(),
+            Some("a \"quoted\" and 'single' & <x>"),
+        ),
         (format!("before {giant}TARGET{giant} after"), Some("TARGET")),
     ] {
         let (store, _tmp, _) = setup(&source).await;
@@ -1504,6 +1534,311 @@ async fn indexed_html_entry_preserves_literal_markdown_tail() {
         && item["text"]
             .as_str()
             .is_some_and(|text| text.contains("**After**"))));
+}
+
+#[tokio::test]
+async fn indexed_markdown_inside_escaped_html_retains_native_paragraph_semantics() {
+    // Frozen production FE oracle 7d735045: tags are literal, but Markdown
+    // marks/entities/escapes and LF/CRLF hard breaks inside them remain native.
+    for (name, source, expected) in [
+        (
+            "marks",
+            "## Before\n\n<div>**bold** `code` &amp; \\* </div>",
+            "<div>bold code & * </div>",
+        ),
+        (
+            "lf",
+            "## Before\n\n<div>one\ntwo</div>",
+            "<div>onetwo</div>",
+        ),
+        (
+            "crlf",
+            "## Before\r\n\r\n<div>one\r\ntwo</div>",
+            "<div>onetwo</div>",
+        ),
+    ] {
+        let at = source.find("<div>").unwrap();
+        let (store, _temporary, _) = setup(source).await;
+        let mut transcript = Vec::new();
+        let first = record_page(&store, json!({"kind":"source","at":at,"maxSourceBytes":4096,"maxWireBytes":8192,"maxItems":64}), &mut transcript).await;
+        let context = record_page(&store, json!({"kind":"context","contextRef":first["contextRef"],"maxWireBytes":8192,"maxItems":64}), &mut transcript).await;
+        record_fixture_closure(&store, &context["items"], &mut transcript).await;
+        if let Ok(directory) = std::env::var("NOTE_PAGE_TRANSCRIPT_DIR") {
+            std::fs::write(
+                std::path::Path::new(&directory).join(format!("markdown-html-{name}.json")),
+                serde_json::to_vec_pretty(&json!({"source":source,"at":at,"calls":transcript}))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        let items: Vec<_> = transcript
+            .iter()
+            .filter_map(|call| call["response"]["items"].as_array())
+            .flatten()
+            .collect();
+        let owner = context["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["construct"] == "markdownBlock")
+            .expect("escaped HTML requires a canonical Markdown paragraph owner");
+        assert_eq!(owner["entryPath"], "markdown");
+        assert!(!items.iter().any(|item| item["construct"] == "htmlDocument"));
+        let native = page(
+            &store,
+            json!({"kind":"context","contextRef":owner["nativeRef"]}),
+        )
+        .await;
+        assert_eq!(native["items"][0]["nodeType"], "paragraph");
+        assert_eq!(native["items"][0]["childIndex"], 1);
+        let mut texts = std::collections::BTreeMap::new();
+        for item in &items {
+            if item["kind"] == "sourceMap" && item["textRef"].is_string() {
+                let text = page(
+                    &store,
+                    json!({"kind":"context","contextRef":item["textRef"]}),
+                )
+                .await;
+                texts.insert(
+                    (
+                        item["sourceRange"]["start"].as_u64().unwrap(),
+                        item["textNodeId"].to_string(),
+                        item["renderedRange"]["start"].as_u64().unwrap(),
+                    ),
+                    text["items"][0]["text"].as_str().unwrap().to_owned(),
+                );
+            }
+        }
+        assert_eq!(
+            texts.values().cloned().collect::<String>(),
+            expected,
+            "{name}"
+        );
+        let mut identity_maps = std::collections::BTreeMap::new();
+        for item in &items {
+            if item["kind"] == "sourceMap" && item["mapping"] == "identity" {
+                identity_maps.insert(item["id"].as_str().unwrap(), *item);
+            }
+        }
+        let mut identity_maps: Vec<_> = identity_maps.into_values().collect();
+        identity_maps.sort_by_key(|item| item["sourceRange"]["start"].as_u64().unwrap());
+        for pair in identity_maps.windows(2) {
+            assert!(
+                pair[0]["ownerRef"] != pair[1]["ownerRef"]
+                    || pair[0]["textNodeId"] != pair[1]["textNodeId"]
+                    || pair[0]["sourceRange"]["end"] != pair[1]["sourceRange"]["start"]
+                    || pair[0]["renderedRange"]["end"] != pair[1]["renderedRange"]["start"],
+                "{name}: adjacent identity pieces in one native leaf must share one bounded map"
+            );
+        }
+
+        if name == "marks" {
+            for mark in ["bold", "code"] {
+                assert!(items
+                    .iter()
+                    .any(|item| item["kind"] == "fragment" && item["text"] == mark));
+            }
+            assert!(
+                items
+                    .iter()
+                    .filter(|item| item["nodeType"] == "text" && item["marksRef"].is_string())
+                    .count()
+                    >= 2,
+                "bold and code marks survive"
+            );
+        } else {
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item["nodeType"] == "hardBreak" && item["nodeClass"] == "atom"),
+                "{name}: native hard break survives"
+            );
+        }
+    }
+}
+
+async fn record_source_window_closure(
+    store: &Store,
+    request: Value,
+    calls: &mut Vec<Value>,
+) -> Value {
+    let source = record_page(store, request, calls).await;
+    let mut context = json!({"kind":"context","contextRef":source["contextRef"],"maxWireBytes":8192,"maxItems":64});
+    loop {
+        let result = record_page(store, context.clone(), calls).await;
+        record_fixture_closure(store, &result["items"], calls).await;
+        if result["nextCursor"].is_null() {
+            break;
+        }
+        context["cursor"] = result["nextCursor"].clone();
+    }
+    source
+}
+
+#[tokio::test]
+async fn indexed_markdown_small_windows_keep_one_snapshot_and_exact_seams() {
+    for (name, source) in [
+        (
+            "marks",
+            "## Before\n\n<div>**bold** `code` &amp; \\* </div>",
+        ),
+        ("lf", "## Before\n\n<div>one\ntwo</div>"),
+        ("crlf", "## Before\r\n\r\n<div>one\r\ntwo</div>"),
+    ] {
+        // These frozen oracle sources are ASCII, so byte and UTF-16 indices agree.
+        assert!(source.is_ascii());
+        let at = source.find("<div>").unwrap();
+        let (store, _temporary, _) = setup(source).await;
+        let mut calls = Vec::new();
+        let first = record_source_window_closure(&store, json!({"kind":"source","at":at,"maxSourceBytes":4096,"maxWireBytes":8192,"maxItems":64}), &mut calls).await;
+        let mut request = json!({"kind":"source","at":at,"maxSourceBytes":16,"maxWireBytes":8192,"maxItems":64,"snapshotId":first["snapshotId"],"sourceRevision":first["sourceRevision"],"noteInstanceId":first["scope"]["noteInstanceId"]});
+        let mut windows = Vec::new();
+        let mut assembled = String::new();
+        let mut position = at;
+        while position < source.len() {
+            request["at"] = json!(position);
+            if position != at {
+                // Ordinary navigation retries its default request at each new
+                // position. Capture that actual response on the same snapshot,
+                // not a cropped or synthesized answer from the previous page.
+                let mut wide = request.clone();
+                wide["maxSourceBytes"] = json!(4096);
+                let next = record_source_window_closure(&store, wide, &mut calls).await;
+                assert_eq!(next["snapshotId"], first["snapshotId"]);
+                assert_eq!(next["sourceRevision"], first["sourceRevision"]);
+                assert_eq!(next["scope"], first["scope"]);
+                assert_eq!(next["range"]["start"], position);
+                assert_eq!(next["text"], source[position..]);
+            }
+            let next = record_source_window_closure(&store, request.clone(), &mut calls).await;
+            assert_eq!(next["snapshotId"], first["snapshotId"]);
+            assert_eq!(next["sourceRevision"], first["sourceRevision"]);
+            assert_eq!(next["scope"], first["scope"]);
+            assert_eq!(next["range"]["start"], position);
+            let end = usize::try_from(next["range"]["end"].as_u64().unwrap()).unwrap();
+            assert!(end > position && end <= source.len());
+            let text = next["text"].as_str().unwrap();
+            assert!(text.len() <= 16);
+            assert_eq!(text, &source[position..end]);
+            assembled.push_str(text);
+            windows.push(next["range"].clone());
+            position = end;
+        }
+        assert_eq!(assembled, &source[at..]);
+        let mut probes = Vec::new();
+        for needle in ["&amp;", "**", "\\*", "\r\n", "\n"] {
+            if let Some(offset) = source[at..].find(needle) {
+                request["at"] = json!(at + offset + 1);
+                request["maxSourceBytes"] = json!(4);
+                let next = record_source_window_closure(&store, request.clone(), &mut calls).await;
+                assert_eq!(next["snapshotId"], first["snapshotId"]);
+                probes.push(json!({"needle":needle,"request":request,"range":next["range"]}));
+            }
+        }
+        if let Ok(directory) = std::env::var("NOTE_PAGE_TRANSCRIPT_DIR") {
+            std::fs::write(std::path::Path::new(&directory).join(format!("markdown-html-{name}-windows.json")), serde_json::to_vec_pretty(&json!({"source":source,"at":at,"calls":calls,"windows":windows,"probes":probes})).unwrap()).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn indexed_markdown_paragraph_far_seek_uses_bounded_native_maps() {
+    let mut costs = Vec::new();
+    for length in [32_768, 2_000_000] {
+        let source = format!("## Before\r\n\r\n<div data-label=\"é😀\">{} **TARGET** &amp; `quoted \"value\"`\r\nEND</div>", "x".repeat(length));
+        let at = source[..source.find("TARGET").unwrap()]
+            .encode_utf16()
+            .count();
+        let started = std::time::Instant::now();
+        let (mut store, temporary, _) = setup(&source).await;
+        let build_ms = started.elapsed().as_millis();
+        // A single connection ensures the request uses the instrumented SQLite
+        // handle. A zero count is an instrumentation failure, never a proof.
+        store.read_pool.close().await;
+        store.read_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&temporary.path)
+                    .read_only(true),
+            )
+            .await
+            .unwrap();
+        let first = page(
+            &store,
+            json!({"kind":"source","at":at,"maxSourceBytes":6,"maxWireBytes":8192}),
+        )
+        .await;
+        let context = page(
+            &store,
+            json!({"kind":"context","contextRef":first["contextRef"],"maxItems":128}),
+        )
+        .await;
+        let owner = context["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["construct"] == "markdownBlock")
+            .unwrap();
+        let request =
+            json!({"kind":"context","contextRef":owner["sourceMapRef"],"maxWireBytes":8192});
+        let _warm = page(&store, request.clone()).await;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let count = counter.clone();
+        {
+            let mut conn = store.read_pool.acquire().await.unwrap();
+            conn.lock_handle()
+                .await
+                .unwrap()
+                .set_progress_handler(1, move || {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    true
+                });
+        }
+        let maps = page(&store, request).await;
+        let cost = counter.load(Ordering::Relaxed);
+        {
+            let mut conn = store.read_pool.acquire().await.unwrap();
+            conn.lock_handle().await.unwrap().remove_progress_handler();
+        }
+        costs.push(cost);
+        assert!(cost > 0 && cost < 500, "actual SQL work: {cost}");
+        let visible: Vec<_> = maps["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["textRef"].is_string())
+            .collect();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0]["sourceRange"], first["range"]);
+        let text = page(
+            &store,
+            json!({"kind":"context","contextRef":visible[0]["textRef"]}),
+        )
+        .await;
+        assert_eq!(text["items"][0]["text"], "TARGET");
+        let leaf = page(
+            &store,
+            json!({"kind":"context","contextRef":visible[0]["textNodeRef"]}),
+        )
+        .await;
+        assert!(leaf["items"][0]["marksRef"].is_string());
+        let direct = page(
+            &store,
+            json!({"kind":"context","contextRef":visible[0]["ownerRef"]}),
+        )
+        .await;
+        for field in ["sourceMapRef", "continuationBefore", "continuationAfter"] {
+            assert!(direct["items"][0].get(field).is_none());
+        }
+        assert_eq!(direct["items"][0]["nativeRef"], owner["nativeRef"]);
+        let rows=sqlx::query("SELECT count(*) AS count,sum(length(CAST(value AS BLOB))) AS bytes FROM note_page_entry").fetch_one(store.read_pool()).await.unwrap();
+        eprintln!("markdown_bytes={} build_and_migrations_ms={build_ms} warm_map_vm_steps={cost} map_rows={} entry_rows={} entry_bytes={}",source.len(),maps["items"].as_array().unwrap().len(),rows.get::<i64,_>("count"),rows.get::<i64,_>("bytes"));
+    }
+    assert!(
+        costs[1] <= costs[0] + 30,
+        "far seek grew with unloaded prefix: {costs:?}"
+    );
 }
 
 #[tokio::test]

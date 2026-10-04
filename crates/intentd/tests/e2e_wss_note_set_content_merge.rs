@@ -1309,3 +1309,90 @@ async fn bounded_note_document_owner_and_native_primitive_values_over_wss() {
     let stale = wss_rpc_raw(&mut rpc, 16, "note.get", json!({"workspaceId":ws,"noteId":primitive_id,"page":{"kind":"context","contextRef":code["valueRef"]}})).await;
     assert_eq!(stale["error"]["data"]["code"], "note-page-stale");
 }
+
+#[tokio::test]
+async fn bounded_note_markdown_paragraph_maps_and_breaks_over_wss() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"title":"Markdown paragraph","path":"."}),
+    )
+    .await;
+    let ws = workspace["workspace"]["id"].as_str().unwrap();
+    let text = format!(
+        "## Before\r\n\r\n<div>{} **TARGET** &amp; `code`\r\nEND</div>",
+        "é😀".repeat(10_000)
+    );
+    let at = text[..text.find("TARGET").unwrap()].encode_utf16().count();
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({"workspaceId":ws,"title":"Escaped tags","content":text}),
+    )
+    .await;
+    let note = created["note"]["id"].as_str().unwrap();
+    let source=wss_rpc(&mut rpc,3,"note.get",json!({"workspaceId":ws,"noteId":note,"page":{"kind":"source","at":at,"maxSourceBytes":6,"maxWireBytes":8192}})).await;
+    assert_eq!(source["text"], "TARGET");
+    let frame=wss_rpc_raw(&mut rpc,4,"note.get",json!({"workspaceId":ws,"noteId":note,"page":{"kind":"context","contextRef":source["contextRef"],"maxWireBytes":8192}})).await;
+    assert!(frame.to_string().len() <= 8192);
+    let owner = frame["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["construct"] == "markdownBlock")
+        .unwrap();
+    assert_eq!(owner["entryPath"], "markdown");
+    assert!(owner.get("parentRef").is_none());
+    let maps=wss_rpc(&mut rpc,5,"note.get",json!({"workspaceId":ws,"noteId":note,"page":{"kind":"context","contextRef":owner["sourceMapRef"],"maxWireBytes":8192}})).await;
+    let map = maps["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["textRef"].is_string())
+        .unwrap();
+    assert_eq!(map["sourceRange"], source["range"]);
+    let leaf=wss_rpc(&mut rpc,6,"note.get",json!({"workspaceId":ws,"noteId":note,"page":{"kind":"context","contextRef":map["textNodeRef"]}})).await;
+    assert!(leaf["items"][0]["marksRef"].is_string());
+    assert_eq!(leaf["items"][0]["parentRef"], owner["nativeRef"]);
+    let value=wss_rpc(&mut rpc,7,"note.get",json!({"workspaceId":ws,"noteId":note,"page":{"kind":"context","contextRef":map["textRef"]}})).await;
+    assert_eq!(value["items"][0]["text"], "TARGET");
+    let direct=wss_rpc(&mut rpc,8,"note.get",json!({"workspaceId":ws,"noteId":note,"page":{"kind":"context","contextRef":map["ownerRef"]}})).await;
+    assert_eq!(direct["items"][0]["id"], owner["id"]);
+    assert!(direct["items"][0].get("sourceMapRef").is_none());
+    let newline = text[..text.find("\r\nEND").unwrap()].encode_utf16().count();
+    let line=wss_rpc(&mut rpc,9,"note.get",json!({"workspaceId":ws,"noteId":note,"page":{"kind":"source","at":newline,"maxSourceBytes":4,"snapshotId":source["snapshotId"],"sourceRevision":source["sourceRevision"],"noteInstanceId":source["scope"]["noteInstanceId"]}})).await;
+    let context=wss_rpc(&mut rpc,10,"note.get",json!({"workspaceId":ws,"noteId":note,"page":{"kind":"context","contextRef":line["contextRef"],"maxItems":128}})).await;
+    let hard_break = context["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["nodeType"] == "hardBreak")
+        .unwrap();
+    assert_eq!(hard_break["nodeClass"], "atom");
+    assert_eq!(
+        hard_break["sourceRange"],
+        json!({"start":newline,"end":newline+2})
+    );
+    assert_eq!(hard_break["parentRef"], owner["nativeRef"]);
+    let second = context["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["construct"] == "markdownBlock")
+        .unwrap();
+    assert_eq!(second["id"], owner["id"]);
+    assert_ne!(second["sourceMapRef"], owner["sourceMapRef"]);
+    wss_rpc(
+        &mut rpc,
+        11,
+        "note.updateMetadata",
+        json!({"workspaceId":ws,"noteId":note,"title":"New revision"}),
+    )
+    .await;
+    let stale=wss_rpc_raw(&mut rpc,12,"note.get",json!({"workspaceId":ws,"noteId":note,"page":{"kind":"context","contextRef":owner["sourceMapRef"]}})).await;
+    assert_eq!(stale["error"]["data"]["code"], "note-page-stale");
+}

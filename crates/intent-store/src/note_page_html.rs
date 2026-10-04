@@ -4,6 +4,7 @@
 //! parenting must never turn a DOM ancestor into a fabricated literal range.
 mod index;
 mod markdown;
+mod markdown_source;
 mod primitive;
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, Tracer, TreeSink};
 use html5ever::tendril::StrTendril;

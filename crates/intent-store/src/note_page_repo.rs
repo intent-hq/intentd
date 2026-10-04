@@ -590,14 +590,19 @@ impl Store {
         let window = matches!(context_range.first().copied(), Some("c" | "d" | "h"))
             && context_range.len() == 4;
         let context_window = window && context_range[0] == "c";
+        let map_window = window && context_range[0] == "h";
         let sql = if fragment {
             "SELECT position,value FROM note_page_entry WHERE workspace_id=? AND note_id=? AND collection=? AND position<=? ORDER BY position DESC LIMIT 1"
         } else if context_window {
             "SELECT position,value FROM note_page_entry WHERE workspace_id=? AND note_id=? AND collection=? AND position>=? AND ((source_start<? AND source_end>?) OR (source_start=source_end AND source_start>=? AND source_start<=?)) ORDER BY position LIMIT ?"
+        } else if map_window {
+            // Identity/omitted runs need positive half-open overlap. Keep the
+            // separately indexed projection and non-bijective seam candidates,
+            // but never turn an endpoint-only identity into an empty wire map.
+            "SELECT position,value FROM note_page_entry WHERE workspace_id=? AND note_id=? AND collection=? AND position>=? AND position<=? AND ((source_start<? AND source_end>?) OR json_extract(value,'$.mapping') NOT IN ('identity','omitted')) ORDER BY position LIMIT ?"
         } else {
             "SELECT position,value FROM note_page_entry WHERE workspace_id=? AND note_id=? AND collection=? AND position>=? ORDER BY position LIMIT ?"
         };
-        let map_window = window && context_range[0] == "h";
         let clip_fragment = fragment && context_range.len() == 4;
         let bounds = if window || clip_fragment {
             Some((
@@ -651,6 +656,13 @@ impl Store {
                 .bind(signed(start)?)
                 .bind(signed(start)?)
                 .bind(signed(end)?);
+        }
+        if map_window {
+            let (start, end) = bounds.expect("map bounds");
+            query = query
+                .bind(signed(last)?)
+                .bind(signed(end)?)
+                .bind(signed(start)?);
         }
         if !fragment {
             query = query.bind(i64::try_from(max_items + 1).expect("validated item budget"));
@@ -782,9 +794,8 @@ impl Store {
                         .expect("rendered start");
                     item["renderedRange"] =
                         json!({"start":rendered_start+local_start,"end":rendered_start+local_end});
-                    if local_start == local_end {
-                        item["textRef"] = Value::Null;
-                    } else if let Some(reference) = item["textRef"].as_str() {
+                    debug_assert!(local_start < local_end, "identity SQL overlap is positive");
+                    if let Some(reference) = item["textRef"].as_str() {
                         item["textRef"] = json!(format!("{reference}:{local_start}:{local_end}"));
                     }
                 }

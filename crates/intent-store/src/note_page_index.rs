@@ -22,6 +22,7 @@ pub(crate) fn profile_revision() -> &'static str {
             include_str!("note_page_html.rs"),
             include_str!("note_page_html/index.rs"),
             include_str!("note_page_html/markdown.rs"),
+            include_str!("note_page_html/markdown_source.rs"),
             include_str!("note_page_html/primitive.rs"),
             include_str!("tests/fixtures/note_html_native.json"),
             include_str!("tests/fixtures/note_primitive_native.json"),
