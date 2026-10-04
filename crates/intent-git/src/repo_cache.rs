@@ -1549,9 +1549,11 @@ pub(crate) fn provision_plain_clone_checkout(
                     Err(error) if error.code() == git2::ErrorCode::NotFound => {
                         let tip = source_branch.get().peel_to_commit().map_err(map_git_err)?;
                         let commit = destination.find_commit(tip.id()).map_err(map_git_err)?;
-                        destination
+                        let mut materialized = destination
                             .branch(branch, &commit, false)
                             .map_err(map_git_err)?;
+                        // Preserve Direct checkout's best-effort tracking setup.
+                        let _ = materialized.set_upstream(Some(&format!("origin/{branch}")));
                     }
                     Err(error) => return Err(map_git_err(error)),
                 };
@@ -2878,6 +2880,15 @@ mod tests {
             let checkout = checkout_root.path().join(label);
             let actual = provision_direct_checkout(&cache, &checkout, &url, "topic", None).unwrap();
             assert_eq!(actual, expected);
+            let destination = Repository::open(&checkout).unwrap();
+            let branch = destination
+                .find_branch("topic", git2::BranchType::Local)
+                .unwrap();
+            assert_eq!(
+                branch.upstream().unwrap().get().name(),
+                Some("refs/remotes/origin/topic"),
+                "Direct checkout retains upstream tracking"
+            );
             assert_eq!(
                 std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
                 label
