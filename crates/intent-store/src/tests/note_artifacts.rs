@@ -25,6 +25,159 @@ async fn setup() -> (Store, TempDb) {
 }
 
 #[tokio::test]
+async fn artifact_payload_purge_is_bounded_scoped_and_never_refunds_charges() {
+    let (store, _temporary) = setup().await;
+    append(&store, 0, &"0".repeat(64), &"1".repeat(64), false)
+        .await
+        .unwrap();
+    append(&store, 1, &"1".repeat(64), &"2".repeat(64), true)
+        .await
+        .unwrap();
+    let status = store
+        .note_artifact_journal_status("alice", "workspace", "job", &"0".repeat(64))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(store
+        .purge_note_artifact_journal_records("alice", "workspace", &status.job_ref, 1)
+        .await
+        .is_err());
+    store.expire_note_artifact_journals(1).await.unwrap();
+    for (principal, workspace, limit) in [
+        ("bob", "workspace", 1),
+        ("alice", "other", 1),
+        ("alice", "workspace", 0),
+        ("alice", "workspace", 129),
+    ] {
+        assert!(store
+            .purge_note_artifact_journal_records(principal, workspace, &status.job_ref, limit)
+            .await
+            .is_err());
+    }
+    let pool = store.artifact_pool().unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_record")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        2
+    );
+    let first = store
+        .purge_note_artifact_journal_records("alice", "workspace", &status.job_ref, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        crate::ArtifactJournalPurge {
+            deleted_records: 1,
+            more_records: true
+        }
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT sequence FROM note_artifact_record")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT sequence FROM note_artifact_ack")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        1
+    );
+    let second = store
+        .purge_note_artifact_journal_records("alice", "workspace", &status.job_ref, 128)
+        .await
+        .unwrap();
+    assert_eq!(
+        second,
+        crate::ArtifactJournalPurge {
+            deleted_records: 1,
+            more_records: false
+        }
+    );
+    assert_eq!(
+        store
+            .purge_note_artifact_journal_records("alice", "workspace", &status.job_ref, 1)
+            .await
+            .unwrap(),
+        crate::ArtifactJournalPurge {
+            deleted_records: 0,
+            more_records: false
+        }
+    );
+    let retained = store
+        .note_artifact_journal_status("alice", "workspace", "job", &"0".repeat(64))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.state, "expired");
+    assert_eq!(retained.next_sequence, 2);
+    assert!(!retained.cleanup_complete);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT sum(storage_reserved) FROM note_artifact_capacity")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        3 * 4096
+    );
+    let plan = sqlx::query("EXPLAIN QUERY PLAN SELECT sequence FROM note_artifact_record WHERE generation=? ORDER BY sequence LIMIT ?")
+        .bind(&status.generation).bind(1).fetch_all(pool).await.unwrap();
+    let details = plan
+        .iter()
+        .map(|r| r.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+    assert!(
+        details
+            .iter()
+            .any(|s| s.contains("SEARCH note_artifact_record USING COVERING INDEX")),
+        "{details:?}"
+    );
+    assert!(
+        !details.iter().any(|s| s.contains("TEMP B-TREE")),
+        "{details:?}"
+    );
+}
+
+#[tokio::test]
+async fn artifact_payload_purge_preserves_unelapsed_receipt_retention() {
+    let (store, _temporary) = setup().await;
+    let pool = store.artifact_pool().unwrap();
+    sqlx::query("UPDATE note_artifact_capacity SET payload_limit=2048,record_limit=4,index_limit=4,storage_limit=8192,job_limit=2")
+        .execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO note_artifact_job(principal,workspace_id,job_id,generation,runtime_id,header_digest,header,source_snapshot,source_revision,note_id,note_instance_id,source_collection,state,expires_at,status_until,payload_limit,record_limit,index_limit,storage_limit,current_digest) SELECT principal,workspace_id,'retained','00000000000000000000000000000003',runtime_id,header_digest,header,source_snapshot,source_revision,note_id,note_instance_id,source_collection,'building',100,9007199254740991,payload_limit,record_limit,index_limit,storage_limit,header_digest FROM note_artifact_job WHERE job_id='job'")
+        .execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO note_artifact_record(generation,sequence,previous_digest,digest,record,index_charge,storage_charge,is_manifest) VALUES ('00000000000000000000000000000003',0,?,?,'{}',0,1024,1)")
+        .bind("0".repeat(64)).bind("1".repeat(64)).execute(pool).await.unwrap();
+    let status = store
+        .note_artifact_journal_status("alice", "workspace", "retained", &"0".repeat(64))
+        .await
+        .unwrap()
+        .unwrap();
+    store.expire_note_artifact_journals(128).await.unwrap();
+    assert!(store
+        .purge_note_artifact_journal_records("alice", "workspace", &status.job_ref, 128)
+        .await
+        .is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_record")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_ack")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn artifact_expiry_is_batched_and_keeps_storage_charged() {
     let (store, _temporary) = setup().await;
     sqlx::query("UPDATE note_artifact_capacity SET payload_limit=4096,record_limit=8,index_limit=8,storage_limit=16384,job_limit=4")
