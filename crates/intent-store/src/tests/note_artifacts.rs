@@ -20,6 +20,84 @@ async fn setup() -> (Store, TempDb) {
     (store, temporary)
 }
 
+#[tokio::test]
+async fn artifact_cancelled_abort_does_not_poison_writer_transaction() {
+    let (store, _temporary) = setup().await;
+    let status = store
+        .note_artifact_journal_status("alice", "workspace", "job", &"0".repeat(64))
+        .await
+        .unwrap()
+        .unwrap();
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let mut reached_tx = Some(reached_tx);
+    let mut connection = store.write_pool().acquire().await.unwrap();
+    connection
+        .lock_handle()
+        .await
+        .unwrap()
+        .set_progress_handler(1, move || {
+            if let Some(sender) = reached_tx.take() {
+                let _ = sender.send(());
+                // Pause the SQLite worker at an observable instruction while the
+                // caller cancels its pending BEGIN. The timeout is only a deadlock
+                // guard; the test resumes it explicitly, without timing sleeps.
+                return resume_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .is_ok();
+            }
+            true
+        });
+    drop(connection);
+    let mut abort =
+        Box::pin(store.abort_note_artifact_journal("alice", "workspace", &status.job_ref));
+    let reached = tokio::select! {
+        result = tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx) => matches!(result, Ok(Ok(()))),
+        _ = &mut abort => false,
+    };
+    drop(abort);
+    let _ = resume_tx.send(());
+    assert!(
+        reached,
+        "abort did not reach the instrumented SQLite instruction"
+    );
+    let mut connection = store.write_pool().acquire().await.unwrap();
+    connection
+        .lock_handle()
+        .await
+        .unwrap()
+        .remove_progress_handler();
+    drop(connection);
+    let tx = store
+        .write_pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("cancelled abort must not leave a transaction on the pooled writer");
+    tx.rollback().await.unwrap();
+    let current = store
+        .note_artifact_journal_status("alice", "workspace", "job", &"0".repeat(64))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.state, "building");
+    assert!(!current.cleanup_complete);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT sum(storage_reserved) FROM note_artifact_capacity")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap(),
+        3 * 4096
+    );
+    assert_eq!(
+        store
+            .abort_note_artifact_journal("alice", "workspace", &status.job_ref)
+            .await
+            .unwrap()
+            .state,
+        "aborted"
+    );
+}
+
 async fn append(
     store: &Store,
     sequence: i64,

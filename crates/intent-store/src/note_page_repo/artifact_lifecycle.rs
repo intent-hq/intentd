@@ -119,28 +119,37 @@ impl Store {
         if token.1 != "r" || token.3 != 0 || uuid::Uuid::parse_str(generation).is_err() {
             return Err(invalid());
         }
-        let mut connection = self.write_pool().acquire().await.map_err(db_error)?;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *connection)
+        // The guard rolls back even if cancellation interrupts BEGIN or a later
+        // SQL await; a raw BEGIN can leave the sole pooled writer in a transaction.
+        let mut connection = self
+            .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_error)?;
-        let result = async {
-            let query = format!("SELECT {STATUS_COLUMNS} FROM note_artifact_job WHERE generation=? AND principal=? AND workspace_id=? AND source_snapshot=?");
-            let row = sqlx::query(&query).bind(generation).bind(principal).bind(workspace_id).bind(&token.0)
-                .fetch_optional(&mut *connection).await.map_err(db_error)?
-                .ok_or_else(|| Error::NotFound("Artifact job not found".into()))?;
-            let mut current = status(&self.note_pages, &row)?;
-            if matches!(current.state.as_str(), "building" | "sealed" | "admitted") {
-                sqlx::query("UPDATE note_artifact_job SET state='aborted' WHERE generation=?")
-                    .bind(generation).execute(&mut *connection).await.map_err(db_error)?;
-                current.state = "aborted".into();
-                current.private_artifact_ref = None;
-            }
-            // The state trigger atomically retires any provisional lease. This
-            // same transaction retains counters and immutable replay identity.
-            Ok(current)
-        }.await;
-        crate::commit_with_rollback_guard(connection, result, "artifact abort commit failed").await
+        let query = format!("SELECT {STATUS_COLUMNS} FROM note_artifact_job WHERE generation=? AND principal=? AND workspace_id=? AND source_snapshot=?");
+        let row = sqlx::query(&query)
+            .bind(generation)
+            .bind(principal)
+            .bind(workspace_id)
+            .bind(&token.0)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| Error::NotFound("Artifact job not found".into()))?;
+        let mut current = status(&self.note_pages, &row)?;
+        if matches!(current.state.as_str(), "building" | "sealed" | "admitted") {
+            sqlx::query("UPDATE note_artifact_job SET state='aborted' WHERE generation=?")
+                .bind(generation)
+                .execute(&mut *connection)
+                .await
+                .map_err(db_error)?;
+            current.state = "aborted".into();
+            current.private_artifact_ref = None;
+        }
+        // The state trigger atomically retires any provisional lease. This
+        // same transaction retains counters and immutable replay identity.
+        connection.commit().await.map_err(db_error)?;
+        Ok(current)
     }
 }
 
