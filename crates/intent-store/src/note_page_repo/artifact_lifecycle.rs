@@ -208,7 +208,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .configure_note_artifact_arena(&directory.path().join("arena.sqlite"), 1024)
+            .configure_test_note_artifact_arena(&directory.path().join("arena.sqlite"), 1024)
             .await
             .unwrap();
         for (kind, id) in [("global", ""), ("principal", "alice"), ("workspace", "ws")] {

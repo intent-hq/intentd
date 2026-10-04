@@ -53,7 +53,7 @@ async fn artifact_arena_statement_journal_worker() {
         .unwrap();
     let arena_path = directory.path().join("arena.sqlite");
     store
-        .configure_note_artifact_arena(&arena_path, 512)
+        .configure_test_note_artifact_arena(&arena_path, 512)
         .await
         .unwrap();
     let mut connection = store.artifact_pool().unwrap().acquire().await.unwrap();

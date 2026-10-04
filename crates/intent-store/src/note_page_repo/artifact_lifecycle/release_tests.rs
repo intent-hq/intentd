@@ -38,7 +38,7 @@ async fn artifact_release_does_not_materialize_other_snapshot_jobs() {
         .await
         .unwrap();
     store
-        .configure_note_artifact_arena(&directory.path().join("arena.sqlite"), 4096)
+        .configure_test_note_artifact_arena(&directory.path().join("arena.sqlite"), 4096)
         .await
         .unwrap();
     let pool = store.artifact_pool().unwrap();

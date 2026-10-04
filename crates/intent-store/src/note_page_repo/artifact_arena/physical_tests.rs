@@ -33,7 +33,7 @@ async fn artifact_arena_measures_retained_journal_and_allocated_page_reuse() {
     let arena_path = directory.path().join("arena.sqlite");
     let store = Store::open(&main_path).await.unwrap();
     store
-        .configure_note_artifact_arena(&arena_path, 64)
+        .configure_test_note_artifact_arena(&arena_path, 64)
         .await
         .unwrap();
     let pool = store.artifact_pool().unwrap();

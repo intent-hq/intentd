@@ -2308,7 +2308,10 @@ async fn artifact_begin_fixture() -> (
 ) {
     let (store, temporary, note) = setup("```diff\n-old\n+new\n```\n").await;
     store
-        .configure_note_artifact_arena(&temporary.path.with_extension("artifacts.sqlite"), 1024)
+        .configure_test_note_artifact_arena(
+            &temporary.path.with_extension("artifacts.sqlite"),
+            1024,
+        )
         .await
         .unwrap();
     let first = page(&store, json!({"kind":"source"})).await;
@@ -2676,7 +2679,10 @@ async fn artifact_begin_rejects_bad_integrity_and_source_deadline_without_chargi
     store.close().await;
     let restarted = Store::open(&temporary.path).await.unwrap();
     restarted
-        .configure_note_artifact_arena(&temporary.path.with_extension("artifacts.sqlite"), 1024)
+        .configure_test_note_artifact_arena(
+            &temporary.path.with_extension("artifacts.sqlite"),
+            1024,
+        )
         .await
         .unwrap();
     assert!(restarted
@@ -3048,7 +3054,7 @@ async fn artifact_record_reads_reject_abort_source_change_and_restart() {
                 store.close().await;
                 let restarted = crate::Store::open(&temporary.path).await.unwrap();
                 restarted
-                    .configure_note_artifact_arena(
+                    .configure_test_note_artifact_arena(
                         &temporary.path.with_extension("artifacts.sqlite"),
                         1024,
                     )
@@ -3286,7 +3292,10 @@ async fn artifact_publication_revalidates_source_after_private_seal() {
     store.close().await;
     let restarted = Store::open(&temporary.path).await.unwrap();
     restarted
-        .configure_note_artifact_arena(&temporary.path.with_extension("artifacts.sqlite"), 1024)
+        .configure_test_note_artifact_arena(
+            &temporary.path.with_extension("artifacts.sqlite"),
+            1024,
+        )
         .await
         .unwrap();
     assert!(restarted

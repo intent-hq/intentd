@@ -124,7 +124,7 @@ async fn artifact_arena_crash_preserves_atomic_records_ack_and_reservations() {
         assert!(main_path.starts_with(root.path()));
         let reopened = Store::open(&main_path).await.unwrap();
         reopened
-            .configure_note_artifact_arena(&main_path.with_extension("artifacts.sqlite"), 1024)
+            .configure_test_note_artifact_arena(&main_path.with_extension("artifacts.sqlite"), 1024)
             .await
             .unwrap();
         let status = reopened

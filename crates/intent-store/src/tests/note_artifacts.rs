@@ -8,7 +8,10 @@ async fn setup() -> (Store, TempDb) {
     let temporary = TempDb::new();
     let store = Store::open(&temporary.path).await.unwrap();
     store
-        .configure_note_artifact_arena(&temporary.path.with_extension("artifacts.sqlite"), 1024)
+        .configure_test_note_artifact_arena(
+            &temporary.path.with_extension("artifacts.sqlite"),
+            1024,
+        )
         .await
         .unwrap();
     for (kind, id) in [

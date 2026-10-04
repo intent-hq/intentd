@@ -12,6 +12,7 @@ use sqlx::{
 };
 use std::path::{Path, PathBuf};
 
+mod allocation;
 mod ownership;
 mod schema;
 use ownership::SourceOwners;
@@ -25,6 +26,7 @@ pub(crate) struct ArtifactArena {
     pub(super) sources: std::sync::Arc<SourceOwners>,
     path: PathBuf,
     max_pages: u32,
+    allocation: allocation::OpenAdmission,
 }
 
 impl Store {
@@ -50,17 +52,41 @@ impl Store {
         .map_err(|error| Error::Internal(format!("artifact commit settlement: {error}")))?
     }
 
-    /// Install one trusted application-owned artifact arena, shared by Store
-    /// clones. This prepared seam requires an explicit finite database page cap;
-    /// it does not authorize artifacts or prove a physical allocation reservation.
-    /// All artifact journal tables/transactions live here, not in the main DB.
-    /// The caller must separately reserve journal/temp/cache/constructor headroom
-    /// before exposing this through a production service. No default is enabled.
+    /// Prepared production arena entry. It currently refuses before arena open:
+    /// no available backing authority proves physical allocation coverage.
+    /// A path/page cap or test fixture is insufficient authority. Internal tests
+    /// use an explicitly separate modeled entry; no production default is enabled.
     ///
     /// # Errors
-    /// Rejects main-database aliasing, changed configuration, invalid page caps,
-    /// schema mismatch, an arena already exceeding the cap, and database failures.
+    /// Rejects absent physical backing authority before creating/opening an arena.
     pub async fn configure_note_artifact_arena(&self, path: &Path, max_pages: u32) -> Result<()> {
+        let admission = allocation::OpenAdmission::production()?;
+        self.configure_admitted_artifact_arena(path, max_pages, admission)
+            .await
+    }
+
+    /// Explicit fixture-only entry. It exercises real `SQLite` with a modeled
+    /// pre-open authority, not real physical admission or an available service.
+    #[cfg(test)]
+    pub(crate) async fn configure_test_note_artifact_arena(
+        &self,
+        path: &Path,
+        max_pages: u32,
+    ) -> Result<()> {
+        let admission = self.artifact_arena.get().map_or_else(
+            || allocation::OpenAdmission::test_only(path),
+            |arena| arena.allocation.clone(),
+        );
+        self.configure_admitted_artifact_arena(path, max_pages, admission)
+            .await
+    }
+
+    async fn configure_admitted_artifact_arena(
+        &self,
+        path: &Path,
+        max_pages: u32,
+        admission: allocation::OpenAdmission,
+    ) -> Result<()> {
         if max_pages == 0 || max_pages > 0x7fff_fffe || !path.is_absolute() {
             return Err(invalid());
         }
@@ -98,6 +124,7 @@ impl Store {
         let arena = self
             .artifact_arena
             .get_or_try_init(|| async {
+                admission.before_open()?;
                 let options = SqliteConnectOptions::new()
                     .filename(&normalized)
                     .create_if_missing(true)
@@ -172,11 +199,16 @@ impl Store {
                     pool.close().await;
                     return Err(error);
                 }
+                if let Err(error) = admission.opened() {
+                    pool.close().await;
+                    return Err(error);
+                }
                 Ok(ArtifactArena {
                     pool,
                     sources: std::sync::Arc::default(),
                     path: normalized.clone(),
                     max_pages,
+                    allocation: admission,
                 })
             })
             .await?;
@@ -223,6 +255,7 @@ impl ArtifactArena {
     pub(crate) async fn close(&self) {
         self.pool.close().await;
         self.sources.clear();
+        self.allocation.closed();
     }
 }
 
@@ -241,28 +274,52 @@ mod tests {
             let main_path = directory.path().join("main.sqlite");
             let arena_path = directory.path().join("arena.sqlite");
             let store = Store::open(&main_path).await.unwrap();
-            store.configure_note_artifact_arena(&arena_path, 64).await.unwrap();
+            store
+                .configure_test_note_artifact_arena(&arena_path, 64)
+                .await
+                .unwrap();
             store.close().await;
-            let outside = SqlitePoolOptions::new().max_connections(1).connect_with(
-                SqliteConnectOptions::new().filename(&arena_path)
-            ).await.unwrap();
+            let outside = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(SqliteConnectOptions::new().filename(&arena_path))
+                .await
+                .unwrap();
             if change == "replace-same-length-trigger-body" {
-                let original: String = sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE name='note_artifact_record_account'")
-                    .fetch_one(&outside).await.unwrap();
-                let modified = original.replace("current_digest=new.digest", "current_digest=new.record");
+                let original: String = sqlx::query_scalar(
+                    "SELECT sql FROM sqlite_schema WHERE name='note_artifact_record_account'",
+                )
+                .fetch_one(&outside)
+                .await
+                .unwrap();
+                let modified =
+                    original.replace("current_digest=new.digest", "current_digest=new.record");
                 assert_ne!(modified, original);
                 assert_eq!(modified.len(), original.len());
-                sqlx::query("DROP TRIGGER note_artifact_record_account").execute(&outside).await.unwrap();
+                sqlx::query("DROP TRIGGER note_artifact_record_account")
+                    .execute(&outside)
+                    .await
+                    .unwrap();
                 sqlx::query(&modified).execute(&outside).await.unwrap();
             } else {
                 sqlx::query(change).execute(&outside).await.unwrap();
             }
-            assert_eq!(sqlx::query_scalar::<_, i64>("PRAGMA user_version").fetch_one(&outside).await.unwrap(), 1);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                    .fetch_one(&outside)
+                    .await
+                    .unwrap(),
+                1
+            );
             outside.close().await;
             let reopened = Store::open(&main_path).await.unwrap();
-            let result = reopened.configure_note_artifact_arena(&arena_path, 64).await;
+            let result = reopened
+                .configure_test_note_artifact_arena(&arena_path, 64)
+                .await;
             reopened.close().await;
-            assert!(result.is_err(), "arena accepted same-version schema drift: {change}");
+            assert!(
+                result.is_err(),
+                "arena accepted same-version schema drift: {change}"
+            );
         }
     }
 
@@ -273,11 +330,13 @@ mod tests {
         let arena_path = directory.path().join("arena.sqlite");
         let first = Store::open(&main_path).await.unwrap();
         first
-            .configure_note_artifact_arena(&arena_path, 64)
+            .configure_test_note_artifact_arena(&arena_path, 64)
             .await
             .unwrap();
         let second = Store::open(&main_path).await.unwrap();
-        let duplicate = second.configure_note_artifact_arena(&arena_path, 64).await;
+        let duplicate = second
+            .configure_test_note_artifact_arena(&arena_path, 64)
+            .await;
         first.close().await;
         assert!(
             duplicate.is_err(),
@@ -285,7 +344,7 @@ mod tests {
         );
         // A failed acquisition must not poison OnceCell or retain a file lock.
         second
-            .configure_note_artifact_arena(&arena_path, 64)
+            .configure_test_note_artifact_arena(&arena_path, 64)
             .await
             .unwrap();
         second.close().await;
@@ -299,7 +358,7 @@ mod tests {
             let arena_path = directory.path().join("arena.sqlite");
             let first = Store::open(&main_path).await.unwrap();
             first
-                .configure_note_artifact_arena(&arena_path, 64)
+                .configure_test_note_artifact_arena(&arena_path, 64)
                 .await
                 .unwrap();
             first.close().await;
@@ -321,7 +380,7 @@ mod tests {
             outside.close().await;
             let reopened = Store::open(&main_path).await.unwrap();
             let result = reopened
-                .configure_note_artifact_arena(&arena_path, 64)
+                .configure_test_note_artifact_arena(&arena_path, 64)
                 .await;
             reopened.close().await;
             assert!(
@@ -338,7 +397,7 @@ mod tests {
         let arena_path = directory.path().join("arena.sqlite");
         let store = Store::open(&main_path).await.unwrap();
         store
-            .configure_note_artifact_arena(&arena_path, 64)
+            .configure_test_note_artifact_arena(&arena_path, 64)
             .await
             .unwrap();
         store.close().await;
@@ -362,7 +421,7 @@ mod tests {
         outside.close().await;
         let reopened = Store::open(&main_path).await.unwrap();
         let changed = reopened
-            .configure_note_artifact_arena(&arena_path, 64)
+            .configure_test_note_artifact_arena(&arena_path, 64)
             .await;
         reopened.close().await;
         assert!(
@@ -379,7 +438,7 @@ mod tests {
         let store = Store::open(&main_path).await.unwrap();
         assert!(store.artifact_pool().is_err());
         assert!(store
-            .configure_note_artifact_arena(&main_path, 64)
+            .configure_test_note_artifact_arena(&main_path, 64)
             .await
             .is_err());
         #[cfg(unix)]
@@ -387,21 +446,21 @@ mod tests {
             let alias = directory.path().join("alias.sqlite");
             std::fs::hard_link(&main_path, &alias).unwrap();
             assert!(store
-                .configure_note_artifact_arena(&alias, 64)
+                .configure_test_note_artifact_arena(&alias, 64)
                 .await
                 .is_err());
         }
         store
-            .configure_note_artifact_arena(&arena_path, 64)
+            .configure_test_note_artifact_arena(&arena_path, 64)
             .await
             .unwrap();
         store
             .clone()
-            .configure_note_artifact_arena(&arena_path, 64)
+            .configure_test_note_artifact_arena(&arena_path, 64)
             .await
             .unwrap();
         assert!(store
-            .configure_note_artifact_arena(&arena_path, 65)
+            .configure_test_note_artifact_arena(&arena_path, 65)
             .await
             .is_err());
         for table in [
@@ -458,7 +517,7 @@ mod tests {
             .unwrap();
         assert!(
             other
-                .configure_note_artifact_arena(&arena_path, 64)
+                .configure_test_note_artifact_arena(&arena_path, 64)
                 .await
                 .is_err(),
             "an arena must not be adopted by a different main-store backend"
@@ -472,7 +531,7 @@ mod tests {
         let arena_path = directory.path().join("arena.sqlite");
         let store = Store::open(&main_path).await.unwrap();
         store
-            .configure_note_artifact_arena(&arena_path, 64)
+            .configure_test_note_artifact_arena(&arena_path, 64)
             .await
             .unwrap();
         let pool = store.artifact_pool().unwrap();
@@ -492,7 +551,7 @@ mod tests {
                 match result {
                     Ok(_) => count += 1,
                     Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("13") => {
-                        break
+                        break;
                     }
                     other => panic!("unexpected arena write result: {other:?}"),
                 }
@@ -536,7 +595,7 @@ mod tests {
         store.close().await;
         let reopened = Store::open(&main_path).await.unwrap();
         reopened
-            .configure_note_artifact_arena(&arena_path, 64)
+            .configure_test_note_artifact_arena(&arena_path, 64)
             .await
             .unwrap();
         assert_eq!(std::fs::metadata(&arena_path).unwrap().len(), high_water);
@@ -551,4 +610,38 @@ mod tests {
         // filesystem blocks, temp memory, or prove a full physical reservation.
         reopened.close().await;
     }
+}
+#[tokio::test]
+async fn artifact_arena_refuses_missing_allocation_authority_before_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(&directory.path().join("source.sqlite"))
+        .await
+        .unwrap();
+    let arena = directory.path().join("unadmitted-arena.sqlite");
+    let result = store.configure_note_artifact_arena(&arena, 64).await;
+    assert!(
+        result.is_err(),
+        "page cap alone admitted an arena without backing authority"
+    );
+    assert!(
+        !arena.exists(),
+        "authority refusal happened after arena creation"
+    );
+    // Refusing an artifact arena must not quarantine unrelated source work.
+    sqlx::query("CREATE TABLE source_progress(id INTEGER PRIMARY KEY)")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    store
+        .configure_test_note_artifact_arena(&arena, 64)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .configure_note_artifact_arena(&arena, 64)
+            .await
+            .is_err(),
+        "an installed test authority activated production admission"
+    );
+    store.close().await;
 }
