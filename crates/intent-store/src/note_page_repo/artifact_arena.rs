@@ -13,6 +13,7 @@ use sqlx::{
 use std::path::{Path, PathBuf};
 
 mod ownership;
+mod schema;
 use ownership::SourceOwners;
 #[cfg(all(test, unix))]
 mod physical_tests;
@@ -162,6 +163,7 @@ impl Store {
                     let owner: (String, i64) = sqlx::query_as("SELECT backend_id,max_pages FROM note_artifact_arena_owner WHERE singleton=1")
                         .fetch_one(&mut *tx).await.map_err(db_error)?;
                     if owner != (self.note_pages.backend.clone(), i64::from(max_pages)) { return Err(invalid()); }
+                    schema::verify(&mut tx).await?;
                     tx.commit().await.map_err(db_error)?;
                     Ok(())
                 }
@@ -227,6 +229,42 @@ impl ArtifactArena {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn artifact_arena_rejects_same_version_trigger_drift() {
+        for change in [
+            "DROP TRIGGER note_artifact_record_account",
+            "CREATE TRIGGER unexpected_record_work AFTER INSERT ON note_artifact_record BEGIN SELECT length(new.record); END",
+            "replace-same-length-trigger-body",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let main_path = directory.path().join("main.sqlite");
+            let arena_path = directory.path().join("arena.sqlite");
+            let store = Store::open(&main_path).await.unwrap();
+            store.configure_note_artifact_arena(&arena_path, 64).await.unwrap();
+            store.close().await;
+            let outside = SqlitePoolOptions::new().max_connections(1).connect_with(
+                SqliteConnectOptions::new().filename(&arena_path)
+            ).await.unwrap();
+            if change == "replace-same-length-trigger-body" {
+                let original: String = sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE name='note_artifact_record_account'")
+                    .fetch_one(&outside).await.unwrap();
+                let modified = original.replace("current_digest=new.digest", "current_digest=new.record");
+                assert_ne!(modified, original);
+                assert_eq!(modified.len(), original.len());
+                sqlx::query("DROP TRIGGER note_artifact_record_account").execute(&outside).await.unwrap();
+                sqlx::query(&modified).execute(&outside).await.unwrap();
+            } else {
+                sqlx::query(change).execute(&outside).await.unwrap();
+            }
+            assert_eq!(sqlx::query_scalar::<_, i64>("PRAGMA user_version").fetch_one(&outside).await.unwrap(), 1);
+            outside.close().await;
+            let reopened = Store::open(&main_path).await.unwrap();
+            let result = reopened.configure_note_artifact_arena(&arena_path, 64).await;
+            reopened.close().await;
+            assert!(result.is_err(), "arena accepted same-version schema drift: {change}");
+        }
+    }
 
     #[tokio::test]
     async fn artifact_arena_rejects_second_live_connection_owner() {
@@ -488,6 +526,13 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // Restore the fixed production schema before reopening. Removing this
+        // diagnostic table returns pages to the freelist, not to the filesystem.
+        sqlx::query("DROP TABLE arena_test_payload")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::metadata(&arena_path).unwrap().len(), high_water);
         store.close().await;
         let reopened = Store::open(&main_path).await.unwrap();
         reopened
