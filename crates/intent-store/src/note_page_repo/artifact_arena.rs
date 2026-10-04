@@ -16,6 +16,8 @@ mod ownership;
 use ownership::SourceOwners;
 #[cfg(all(test, unix))]
 mod physical_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod statement_journal_tests;
 
 pub(crate) struct ArtifactArena {
     pub pool: SqlitePool,
