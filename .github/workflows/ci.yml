@@ -467,10 +467,10 @@ jobs:
       # This target requires explicit cold mock authority. Ordinary/default
       # daemon builds never register these transports; keep the feature lane
       # mandatory so default target selection cannot hide auth coverage.
-      - name: GitLab auth and invitations over real sockets with explicit test transports
+      - name: GitLab auth, invitations and checkout over real sockets with explicit test transports
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth --test e2e_wss_invite_join_gitlab -- --test-threads=2
+        run: cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth --test e2e_wss_invite_join_gitlab --test e2e_repository_resource_read -- --test-threads=2
 
       # Per-slot HOME for install-action — see the coverage-e2e job's comment
       # for the full rationale (shared ~/.install-action tmp/bin race across

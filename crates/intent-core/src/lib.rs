@@ -44,6 +44,7 @@ pub mod repo_ref;
 pub mod script_monitor;
 pub mod script_output;
 pub use script_monitor::{ScriptMonitor, ScriptMonitorTrigger};
+pub mod repository_checkout;
 pub mod repository_context;
 #[doc(hidden)]
 pub mod repository_request;

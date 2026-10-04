@@ -1515,7 +1515,8 @@ async fn native_review_consumed_packet_faults_never_replay_primitive_or_reply() 
 #[test]
 fn native_review_companion_capability_is_explicit_and_versioned() {
     let server = crate::client::server_json(false, "linux", "fixture", "fixture", None, true);
-    assert_eq!(server["protocolVersion"], "13.4");
+    assert_eq!(server["protocolVersion"], "13.5");
+    assert_eq!(server["capabilities"]["gitlabCheckout"], 1);
     assert_eq!(server["capabilities"]["submissionCorrelation"], 1);
     assert_eq!(server["capabilities"]["repositoryResourceRead"], 1);
     assert_eq!(server["capabilities"]["nativeReview"], 1);

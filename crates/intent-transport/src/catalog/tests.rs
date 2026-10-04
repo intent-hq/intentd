@@ -186,14 +186,14 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// (`script.archive`, `script.restore`).
 /// Durable script monitors (protocol 12.1): +3 router methods.
 /// Protocol 13.0 removes the deprecated git.commit router method.
-// GitLab repository reads and actions (13.3), plus owner-only invitation account search.
-const EXPECTED_TOTAL_METHODS: usize = 418;
+// GitLab repository reads/actions (13.3), invitation search, and checkout (13.5).
+const EXPECTED_TOTAL_METHODS: usize = 424;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
-const EXPECTED_ROUTER_METHODS: usize = 363;
+const EXPECTED_ROUTER_METHODS: usize = 369;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 55;

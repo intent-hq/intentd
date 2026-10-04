@@ -727,7 +727,9 @@ use std::time::{Duration, Instant};
 // Version 13.4 adds trusted, persisted submission correlation for optimistic
 // display. Support requires exactly submissionCorrelation: 1; discover other
 // extensions through their independent capabilities and permission checks.
-pub const PROTOCOL_VERSION: &str = "13.4";
+// Version 13.5 adds original-socket GitLab checkout discovery and native
+// private checkout. Clients require gitlabCheckout: 1 before using it.
+pub const PROTOCOL_VERSION: &str = "13.5";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

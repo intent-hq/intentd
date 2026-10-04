@@ -67,6 +67,12 @@ pub(crate) fn clear_workspace_unread_if_all_seen_sql() -> String {
     )
 }
 
+struct HostWorkspaceAdmission<'a> {
+    expected: &'a crate::RepositoryHostAuthoritySnapshot,
+    token_hash: Option<&'a str>,
+    admit: Box<dyn FnOnce() -> Result<()> + Send + 'a>,
+}
+
 impl Store {
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     ///
@@ -92,7 +98,51 @@ impl Store {
         ws: &Workspace,
         auto_commit: Option<bool>,
     ) -> Result<()> {
+        self.insert_workspace_inner(ws, auto_commit, None).await
+    }
+
+    /// Insert from an original pre-workspace host admission. The durable facts
+    /// are compared while authority writers are serialized; the synchronous
+    /// callback admits the already-prepared insert after all pool waits.
+    ///
+    /// # Errors
+    /// Refuses changed original authority or a retired caller/source callback.
+    pub async fn insert_workspace_with_host_admission(
+        &self,
+        ws: &Workspace,
+        auto_commit: Option<bool>,
+        expected: &crate::RepositoryHostAuthoritySnapshot,
+        token_hash: Option<&str>,
+        admit: impl FnOnce() -> Result<()> + Send,
+    ) -> Result<()> {
+        self.insert_workspace_inner(
+            ws,
+            auto_commit,
+            Some(HostWorkspaceAdmission {
+                expected,
+                token_hash,
+                admit: Box::new(admit),
+            }),
+        )
+        .await
+    }
+
+    async fn insert_workspace_inner(
+        &self,
+        ws: &Workspace,
+        auto_commit: Option<bool>,
+        admission: Option<HostWorkspaceAdmission<'_>>,
+    ) -> Result<()> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
+        let expected = admission.as_ref().map(|a| (a.expected, a.token_hash));
+        if let Some((expected, token_hash)) = expected {
+            let actual = self
+                .repository_host_authority_snapshot(&expected.principal_id, token_hash)
+                .await?;
+            if actual != *expected {
+                return Err(Error::Forbidden("Repository checkout unavailable".into()));
+            }
+        }
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
              (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
@@ -134,10 +184,22 @@ impl Store {
             .bind(ws.browser_client_id.as_ref().map(|c| c.0.clone()))
             .bind(auto_commit.map(i64::from));
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(ws.id.clone())])?;
-        query
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
+        if let Some(admission) = admission {
+            let mut connection =
+                self.write_pool().acquire().await.map_err(|e| {
+                    Error::Internal(format!("insert workspace connection failed: {e}"))
+                })?;
+            (admission.admit)()?;
+            query
+                .execute(&mut *connection)
+                .await
+                .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
+        } else {
+            query
+                .execute(self.write_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
+        }
         lifecycle.settle();
         Ok(())
     }

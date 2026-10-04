@@ -154,7 +154,7 @@ pub enum ContextLinkKind {
     Pr,
 }
 
-/// A GitHub issue/PR context link persisted on a [`Workspace`] as
+/// A repository issue/PR context link persisted on a [`Workspace`] as
 /// `contextLinks` (§5.1). Supplied by clients on `workspace.create` from the
 /// initializer's issue/PR context mentions and returned on the `Workspace`
 /// wire shape so any client opening the workspace can seed its layout from
@@ -1300,6 +1300,9 @@ pub struct WorkspaceDiffSummary {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceCreate {
+    /// Original native pre-workspace checkout selection. Mutually exclusive
+    /// with caller-supplied repository/clone/worktree paths and legacy URLs.
+    pub repository_checkout: Option<crate::repository_checkout::CheckoutSelection>,
     pub title: Option<String>,
     pub status_message: Option<String>,
     pub branch: Option<String>,

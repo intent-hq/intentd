@@ -3522,11 +3522,66 @@ async fn dispatch(
         }
         // `host` names the forge, never an intentd routing destination.
         // Optional `workspaceId` leaves provider/host credential selection intact.
+        "sourceControl.checkout.capture" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_capture(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.projects" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_projects(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.project" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_project(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.branches" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_branches(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.warm" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_warm(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.release" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_release(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
         "sourceControl.authStatus" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let r = api
-                .source_control_auth_status(provider, host)
+                .source_control_auth_status_for_instance(provider, host, instance_base_url)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3534,10 +3589,17 @@ async fn dispatch(
         "sourceControl.connect" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let method = opt_str_strict(params, "method")?;
             let token = opt_str_strict(params, "token")?;
             let r = api
-                .source_control_connect(provider, host, method, token)
+                .source_control_connect_for_instance(
+                    provider,
+                    host,
+                    method,
+                    token,
+                    instance_base_url,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3545,8 +3607,9 @@ async fn dispatch(
         "sourceControl.cancelAuth" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let r = api
-                .source_control_cancel_auth(provider, host)
+                .source_control_cancel_auth_for_instance(provider, host, instance_base_url)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3554,8 +3617,9 @@ async fn dispatch(
         "sourceControl.revoke" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let r = api
-                .source_control_revoke(provider, host)
+                .source_control_revoke_for_instance(provider, host, instance_base_url)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3563,8 +3627,9 @@ async fn dispatch(
         "sourceControl.getUser" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let r = api
-                .source_control_get_user(provider, host)
+                .source_control_get_user_for_instance(provider, host, instance_base_url)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
