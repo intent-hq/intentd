@@ -1053,8 +1053,12 @@ async fn administrator_checked_revoke_route_clears_the_pair_and_pending_startup(
     let f = Fixture::new(&server, true).await;
     f.pat(&server, "pat-first").await;
     f.device_expiry("9999999999");
+    let Target::Gitlab { host } = f.svc.resolve_source_control_target("gitlab", None).unwrap()
+    else {
+        panic!("expected the public GitLab revoke target");
+    };
     f.svc.gitlab_auth.lock().await.starting = Some(GitlabStartupIntent {
-        host: server.host.host().into(),
+        host: host.logical_base_url().into(),
         id: github_auth_ops::next_flow_id(),
     });
     assert_eq!(
