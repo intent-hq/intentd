@@ -177,12 +177,14 @@ impl Store {
         }
         // One atomic UPDATE both authorizes the captured principal/scope and
         // retires only this lease. Repeated release matches the retained row.
+        // Correlate the unique generation: an uncorrelated IN subquery would
+        // materialize every other job sharing this source snapshot.
         let mut tx = self
             .artifact_pool()?
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_error)?;
-        let generation = sqlx::query_scalar::<_, String>("UPDATE note_artifact_lease SET released=1 WHERE lease_id=? AND generation IN (SELECT generation FROM note_artifact_job WHERE principal=? AND workspace_id=? AND source_snapshot=?) RETURNING generation")
+        let generation = sqlx::query_scalar::<_, String>("UPDATE note_artifact_lease SET released=1 WHERE lease_id=? AND EXISTS (SELECT 1 FROM note_artifact_job j WHERE j.generation=note_artifact_lease.generation AND j.principal=? AND j.workspace_id=? AND j.source_snapshot=?) RETURNING generation")
             .bind(lease).bind(principal).bind(workspace_id).bind(&token.0)
             .fetch_optional(&mut *tx).await.map_err(db_error)?
             .ok_or_else(|| Error::NotFound("Artifact lease not found".into()))?;
@@ -191,6 +193,9 @@ impl Store {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod release_tests;
 
 #[cfg(test)]
 mod tests {
