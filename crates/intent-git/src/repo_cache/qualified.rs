@@ -14,6 +14,8 @@ use crate::native_checkout::{
 /// The caller's original lifetime/credential/project guard. Exactly one pure
 /// transfer under its existing locks, never a network/file operation or await.
 pub trait NativeCacheAuthority: Send + Sync {
+    /// # Errors
+    /// Refuses the original caller/connection or a failed one-use transfer.
     fn with_current(&self, transfer: &mut (dyn FnMut() -> Result<()> + Send)) -> Result<()>;
 }
 

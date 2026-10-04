@@ -74,6 +74,9 @@ impl NativeCheckoutSelection {
 
 /// Operation-local credential and original response attribution. No raw token API.
 pub trait NativeCheckoutCredentials: Send {
+    /// Legacy local-fixture callback, never used by native HTTPS transport.
+    /// # Errors
+    /// Refuses callers that do not provide a legacy credential implementation.
     fn credential(&mut self, _url: &str) -> std::result::Result<Cred, git2::Error> {
         Err(git2::Error::from_str(
             "Native HTTPS requires request admission",
@@ -81,12 +84,16 @@ pub trait NativeCheckoutCredentials: Send {
     }
     /// Admit one local ref/publication effect, without holding metadata locks
     /// during filesystem IO. Already admitted effects cannot be recalled.
+    /// # Errors
+    /// Returns the original connection/authority refusal without performing the action.
     fn with_current(&self, _transfer: &mut (dyn FnMut() -> Result<()> + Send)) -> Result<()> {
         Err(unavailable())
     }
     /// Borrow credentials only inside the original consuming admission. The
     /// callback prepares one request; it must not perform IO or retain a borrow.
     /// An implementation without this admission cannot use HTTPS checkout.
+    /// # Errors
+    /// Returns the original admission or request preparation error without sending.
     fn with_basic_auth(
         &mut self,
         _url: &str,
@@ -108,7 +115,7 @@ fn unavailable() -> Error {
     Error::Internal("Qualified native HTTPS checkout unavailable".into())
 }
 #[cfg(test)]
-fn transport_error(error: git2::Error) -> Error {
+fn transport_error(error: &git2::Error) -> Error {
     if error.code() == git2::ErrorCode::Auth {
         Error::GitAuthorization("The selected repository connection was refused".into())
     } else {
@@ -212,7 +219,7 @@ pub fn clone_exact(
                 if error.code() == git2::ErrorCode::Auth {
                     credential.rejected();
                 }
-                transport_error(error)
+                transport_error(&error)
             })?;
             verify_remote(&repo, source, selection)?;
             let actual = repo.head().map_err(|_| unavailable())?;
@@ -271,7 +278,7 @@ pub fn fetch_exact(
             if error.code() == git2::ErrorCode::Auth {
                 credential.rejected();
             }
-            transport_error(error)
+            transport_error(&error)
         })?;
         verify_remote(&repo, source, selection)?;
         Ok(selection.clone())

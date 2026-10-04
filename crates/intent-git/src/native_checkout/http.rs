@@ -24,16 +24,22 @@ struct Advertisement {
 }
 
 fn client() -> Result<Client> {
-    Client::builder()
+    let mut builder = Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .referer(false)
         .no_proxy()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(300))
-        .build()
-        .map_err(|_| unavailable())
+        .timeout(Duration::from_secs(300));
+    // Scope platform trust to this native client. A reqwest feature would
+    // silently alter unrelated clients through Cargo feature unification.
+    for certificate in rustls_native_certs::load_native_certs().certs {
+        builder = builder.add_root_certificate(
+            reqwest::Certificate::from_der(certificate.as_ref()).map_err(|_| unavailable())?,
+        );
+    }
+    builder.build().map_err(|_| unavailable())
 }
 
 fn backoff(headers: &HeaderMap, status: u16) -> Option<Instant> {
@@ -88,6 +94,7 @@ fn send(
         429 => Err(Error::Internal(
             "The original repository connection is rate limited".into(),
         )),
+        500..=599 if push => Err(uncertain()),
         // No response body/location can become another URL, credential or retry.
         _ => Err(unavailable()),
     }

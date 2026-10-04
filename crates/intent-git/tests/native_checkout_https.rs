@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use intent_git::native_checkout::{
-    clone_exact, fetch_exact, NativeCheckoutCredentials, NativeCheckoutSelection,
-    NativeCheckoutSource,
+    clone_exact, fetch_exact, fetch_original, push_original, NativeCheckoutCredentials,
+    NativeCheckoutSelection, NativeCheckoutSource,
 };
 use intentd_test_support::GuardedChild;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
@@ -29,13 +29,15 @@ struct Credential {
     bad: bool,
     retired: bool,
     url: String,
+    mode: String,
+    responses: std::cell::Cell<u32>,
 }
 impl NativeCheckoutCredentials for Credential {
     fn with_current(
         &self,
         transfer: &mut (dyn FnMut() -> intent_core::Result<()> + Send),
     ) -> intent_core::Result<()> {
-        if self.retired {
+        if self.retired || (self.mode == "retire_before_refs" && self.responses.get() >= 2) {
             return Err(intent_core::Error::Internal(
                 "original fixture retired".into(),
             ));
@@ -57,8 +59,13 @@ impl NativeCheckoutCredentials for Credential {
         )
     }
     fn rejected(&self) {
-        // The mutable callback result is not a general credential cache.
         REJECTED.with(|v| v.set(true));
+    }
+    fn observe(&self, status: u16, _: Option<std::time::Instant>) {
+        self.responses.set(self.responses.get() + 1);
+        if matches!(status, 401 | 403 | 404) {
+            self.rejected();
+        }
     }
     fn with_basic_auth(
         &mut self,
@@ -69,6 +76,11 @@ impl NativeCheckoutCredentials for Credential {
         if self.retired {
             return Err(intent_core::Error::Internal(
                 "original fixture retired".into(),
+            ));
+        }
+        if self.mode == "retire_before_post" && self.responses.get() > 0 {
+            return Err(intent_core::Error::Internal(
+                "original fixture retired before POST".into(),
             ));
         }
         prepare(
@@ -88,7 +100,11 @@ fn child(mode: &str) {
     let directory = PathBuf::from(std::env::var_os("INTENT_NATIVE_DEST").unwrap());
     let selection = NativeCheckoutSelection::new(
         "feature/beyond-page-one",
-        &std::env::var("INTENT_NATIVE_SHA").unwrap(),
+        &if mode == "sha_mismatch" {
+            "1111111111111111111111111111111111111111".into()
+        } else {
+            std::env::var("INTENT_NATIVE_SHA").unwrap()
+        },
     )
     .unwrap();
     let source = NativeCheckoutSource::https(&url).unwrap();
@@ -96,10 +112,19 @@ fn child(mode: &str) {
         bad: mode == "bad",
         retired: mode == "retired",
         url,
+        mode: mode.into(),
+        responses: std::cell::Cell::new(0),
     };
     let result = clone_exact(&source, &directory, &selection, &mut credential);
     match mode {
-        "success" => {
+        "success"
+        | "push"
+        | "push_lost_response"
+        | "fetch_redirect"
+        | "push_redirect"
+        | "push_post_redirect"
+        | "push_post_foreign_origin_redirect"
+        | "push_post_port_redirect" => {
             assert_eq!(result.unwrap(), selection);
             let repo = git2::Repository::open(&directory).unwrap();
             assert_eq!(
@@ -110,16 +135,79 @@ fn child(mode: &str) {
                 repo.head().unwrap().target().unwrap().to_string(),
                 selection.commit_sha
             );
-            std::fs::write(directory.join("keep-local"), "local").unwrap();
             assert_eq!(
-                fetch_exact(&source, &directory, &selection, &mut credential).unwrap(),
-                selection
+                std::fs::read_to_string(directory.join("README")).unwrap(),
+                "private checked out bytes\n"
             );
+            std::fs::write(directory.join("keep-local"), "local").unwrap();
+            if mode == "fetch_redirect" {
+                assert!(
+                    fetch_original(&directory, &source, &selection.branch, &mut credential)
+                        .is_err()
+                );
+            } else {
+                assert_eq!(
+                    fetch_exact(&source, &directory, &selection, &mut credential).unwrap(),
+                    selection
+                );
+                assert_eq!(
+                    fetch_original(&directory, &source, &selection.branch, &mut credential)
+                        .unwrap(),
+                    selection
+                );
+            }
             assert_eq!(
                 std::fs::read_to_string(directory.join("keep-local")).unwrap(),
                 "local"
             );
+            if mode.starts_with("push") {
+                let head = commit(&repo, false);
+                let pushed = push_original(
+                    &directory,
+                    &source,
+                    &selection.branch,
+                    false,
+                    &mut credential,
+                );
+                if mode == "push" {
+                    assert_eq!(pushed.unwrap().commit_sha, head.to_string());
+                    let orphan = commit(&repo, true);
+                    assert!(matches!(
+                        push_original(
+                            &directory,
+                            &source,
+                            &selection.branch,
+                            false,
+                            &mut credential
+                        ),
+                        Err(intent_core::Error::InvalidParams(_))
+                    ));
+                    assert_eq!(
+                        push_original(
+                            &directory,
+                            &source,
+                            &selection.branch,
+                            true,
+                            &mut credential
+                        )
+                        .unwrap()
+                        .commit_sha,
+                        orphan.to_string()
+                    );
+                    assert_eq!(repo.head().unwrap().target(), Some(orphan));
+                } else {
+                    assert!(pushed.is_err());
+                    if mode == "push_lost_response" {
+                        assert!(pushed.unwrap_err().to_string().contains("unknown"));
+                    }
+                    assert_eq!(repo.head().unwrap().target(), Some(head));
+                }
+            }
             assert!(!REJECTED.with(std::cell::Cell::get));
+            assert_eq!(
+                repo.find_remote("origin").unwrap().url().unwrap(),
+                source.url()
+            );
         }
         "bad" => {
             assert!(
@@ -129,25 +217,57 @@ fn child(mode: &str) {
             assert!(REJECTED.with(std::cell::Cell::get));
             assert!(!directory.exists());
         }
-        "redirect" | "redirect_authenticated" | "retired" => {
+        _ => {
             assert!(result.is_err(), "{mode} must refuse");
             assert!(!directory.exists());
             assert!(
                 !REJECTED.with(std::cell::Cell::get),
-                "local or redirect refusal is not an upstream denial"
+                "local/redirect/parse refusal is not upstream denial"
             );
         }
-        _ => panic!("invalid fixture mode"),
     }
+}
+
+fn commit(repo: &git2::Repository, orphan: bool) -> git2::Oid {
+    let old = repo.head().unwrap().peel_to_commit().unwrap();
+    let signature = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+    let tree = old.tree().unwrap();
+    let parents = if orphan { vec![] } else { vec![&old] };
+    let new = repo
+        .commit(
+            None,
+            &signature,
+            &signature,
+            if orphan {
+                "forced independent history"
+            } else {
+                "authorized next commit"
+            },
+            &tree,
+            &parents,
+        )
+        .unwrap();
+    repo.reference(
+        "refs/heads/feature/beyond-page-one",
+        new,
+        true,
+        "fixture commit",
+    )
+    .unwrap();
+    new
 }
 
 fn repository(root: &Path) -> String {
     let path = root.join("forge/team/project.git");
     std::fs::create_dir_all(&path).unwrap();
     let repo = git2::Repository::init_bare(&path).unwrap();
+    repo.config()
+        .unwrap()
+        .set_bool("http.receivepack", true)
+        .unwrap();
     let blob = repo.blob(b"private checked out bytes\n").unwrap();
     let mut builder = repo.treebuilder(None).unwrap();
-    builder.insert("README", blob, 0o100644).unwrap();
+    builder.insert("README", blob, 0o100_644).unwrap();
     let tree = repo.find_tree(builder.write().unwrap()).unwrap();
     let signature = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
     let first = repo
@@ -185,7 +305,7 @@ fn tls() -> (String, Arc<rustls::ServerConfig>) {
     let key = KeyPair::generate().unwrap();
     let ca = params.self_signed(&key).unwrap().pem();
     let issuer = Issuer::new(params, key);
-    let mut params = CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+    let mut params = CertificateParams::new(vec!["127.0.0.1".into(), "localhost".into()]).unwrap();
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "Native checkout fixture server");
@@ -217,7 +337,14 @@ fn backend(root: &Path, method: &str, target: &str, body: &[u8]) -> Vec<u8> {
         .env("REQUEST_METHOD", method)
         .env("PATH_INFO", path)
         .env("QUERY_STRING", query)
-        .env("CONTENT_TYPE", "application/x-git-upload-pack-request")
+        .env(
+            "CONTENT_TYPE",
+            if path.ends_with("git-receive-pack") {
+                "application/x-git-receive-pack-request"
+            } else {
+                "application/x-git-upload-pack-request"
+            },
+        )
         .env("CONTENT_LENGTH", body.len().to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -275,13 +402,26 @@ async fn run(name: &str, mode: &str) {
     std::fs::create_dir(&ca_dir).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let forbidden = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let forbidden_port = forbidden.local_addr().unwrap().port();
+    let forbidden_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = forbidden_connections.clone();
+    let forbidden_server = Server(tokio::spawn(async move {
+        loop {
+            let (stream, _) = forbidden.accept().await.unwrap();
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(stream);
+        }
+    }));
     let url = format!("https://127.0.0.1:{port}/forge/team/project.git");
     let requests = Arc::new(Mutex::new(Vec::<(String, bool)>::new()));
     let observed = requests.clone();
     let root = scratch.path().to_path_buf();
     let redirect = mode == "redirect";
     let redirect_authenticated = mode == "redirect_authenticated";
+    let mode_owned = mode.to_owned();
     let server = Server(tokio::spawn(async move {
+        let mut request_count = 0;
         loop {
             let (socket, _) = listener.accept().await.unwrap();
             let Ok(mut stream) = TlsAcceptor::from(tls.clone()).accept(socket).await else {
@@ -300,19 +440,40 @@ async fn run(name: &str, mode: &str) {
                 let target = first[1].to_string();
                 let authenticated = header.lines().any(|line| line.split_once(':').is_some_and(|(key, value)| key.eq_ignore_ascii_case("authorization") && value.trim() == BASIC));
                 observed.lock().unwrap().push((target.clone(), authenticated));
+                request_count += 1;
                 let length = header.lines().find_map(|line| line.split_once(':').and_then(|(key, value)| key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap()))).unwrap_or(0);
                 assert!(length < 65536);
                 let mut body = vec![0; length];
                 stream.read_exact(&mut body).await.unwrap();
-                let response = if redirect || (redirect_authenticated && authenticated) {
+                let should_redirect = redirect || (redirect_authenticated && authenticated)
+                    || mode_owned == "foreign_origin_redirect" || mode_owned == "port_redirect"
+                    || (mode_owned.starts_with("upload_post_") && target.ends_with("/git-upload-pack"))
+                    || (mode_owned == "fetch_redirect" && request_count > 2)
+                    || (mode_owned == "push_redirect" && target.contains("git-receive-pack"))
+                    || (mode_owned.starts_with("push_post_") && target.ends_with("/git-receive-pack"));
+                let mut response = if should_redirect {
+                    if mode_owned.ends_with("foreign_origin_redirect") || mode_owned.ends_with("port_redirect") {
+                        let location = if mode_owned.ends_with("foreign_origin_redirect") { format!("https://localhost:{forbidden_port}/forge/team/project.git") } else { format!("https://127.0.0.1:{forbidden_port}/forge/team/project.git") };
+                        let response = format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
                     format!("HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:{port}/another-prefix/private.git\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
                 } else if !authenticated {
                     b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"fixture\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                } else if mode_owned == "malformed_pack" && target.ends_with("/git-upload-pack") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-result\r\nContent-Length: 25\r\nConnection: close\r\n\r\n0008NAK\n000d\x01bad-pack0000".to_vec()
                 } else {
                     let root = root.clone();
                     let method = first[0].to_string();
+                    let target = target.clone();
                     tokio::task::spawn_blocking(move || backend(&root, &method, &target, &body)).await.unwrap()
                 };
+                if mode_owned == "truncated_pack" && target.ends_with("/git-upload-pack") {
+                    response.truncate(response.len() - 16);
+                }
+                if mode_owned == "push_lost_response" && target.ends_with("/git-receive-pack") { return; }
                 stream.write_all(&response).await.unwrap();
                 let _ = stream.shutdown().await;
             }).await.expect("fixture connection timed out");
@@ -320,10 +481,13 @@ async fn run(name: &str, mode: &str) {
     }));
     let log = scratch.path().join("child.log");
     let out = std::fs::File::create(&log).unwrap();
+    let empty_path = scratch.path().join("empty-bin");
+    std::fs::create_dir(&empty_path).unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args(["--exact", name, "--nocapture", "--test-threads=1"])
         .env_clear()
+        .env("PATH", empty_path)
         .env("HOME", scratch.path())
         .env("XDG_CONFIG_HOME", scratch.path())
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -332,7 +496,7 @@ async fn run(name: &str, mode: &str) {
         .env("SSL_CERT_DIR", ca_dir)
         .env(CHILD, mode)
         .env("INTENT_NATIVE_URL", url)
-        .env("INTENT_NATIVE_SHA", sha)
+        .env("INTENT_NATIVE_SHA", &sha)
         .env("INTENT_NATIVE_DEST", scratch.path().join("checkout"))
         .stdin(Stdio::null())
         .stdout(out.try_clone().unwrap())
@@ -346,6 +510,12 @@ async fn run(name: &str, mode: &str) {
         .unwrap()
         .expect("native checkout child timed out");
     drop(server);
+    drop(forbidden_server);
+    assert_eq!(
+        forbidden_connections.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no connection to redirect origin/port"
+    );
     let output = std::fs::read_to_string(log).unwrap();
     assert!(result.success(), "{output}");
     assert!(!output.contains("checkout-fixture-secret"));
@@ -361,7 +531,35 @@ async fn run(name: &str, mode: &str) {
         return;
     }
     assert!(!requests.is_empty());
-    if mode == "success" {
+    if mode == "bad" || mode == "retire_before_post" || mode == "sha_mismatch" {
+        assert_eq!(requests.len(), 1);
+    }
+    if mode == "retire_before_refs" {
+        assert_eq!(requests.len(), 2);
+    }
+    if mode == "push" || mode == "push_lost_response" {
+        let repo =
+            git2::Repository::open_bare(scratch.path().join("forge/team/project.git")).unwrap();
+        let remote = repo
+            .refname_to_id("refs/heads/feature/beyond-page-one")
+            .unwrap();
+        assert_ne!(
+            remote.to_string(),
+            sha,
+            "the actual remote effect is retained"
+        );
+    }
+    if matches!(
+        mode,
+        "success"
+            | "push"
+            | "push_lost_response"
+            | "fetch_redirect"
+            | "push_redirect"
+            | "push_post_redirect"
+            | "push_post_foreign_origin_redirect"
+            | "push_post_port_redirect"
+    ) {
         assert!(requests.iter().any(|(_, auth)| *auth));
         assert!(requests
             .iter()
@@ -412,6 +610,155 @@ async fn authenticated_redirect_never_sends_a_token_to_another_prefix() {
     run(
         "authenticated_redirect_never_sends_a_token_to_another_prefix",
         "redirect_authenticated",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_native_fetch_push_preserve_head_and_force() {
+    run(
+        "authenticated_native_fetch_push_preserve_head_and_force",
+        "push",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admitted_native_push_with_lost_response_retains_uncertain_effect() {
+    run(
+        "admitted_native_push_with_lost_response_retains_uncertain_effect",
+        "push_lost_response",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_advertisement_redirect_never_reuses_private_connection() {
+    run(
+        "fetch_advertisement_redirect_never_reuses_private_connection",
+        "fetch_redirect",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_advertisement_redirect_never_reuses_private_connection() {
+    run(
+        "push_advertisement_redirect_never_reuses_private_connection",
+        "push_redirect",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_pack_redirect_never_reuses_private_connection() {
+    run(
+        "push_pack_redirect_never_reuses_private_connection",
+        "push_post_redirect",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_pack_redirect_never_reuses_private_connection() {
+    run(
+        "upload_pack_redirect_never_reuses_private_connection",
+        "upload_post_redirect",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_foreign_origin_redirect_is_refused() {
+    run(
+        "native_foreign_origin_redirect_is_refused",
+        "foreign_origin_redirect",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_port_redirect_is_refused() {
+    run("native_port_redirect_is_refused", "port_redirect").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_malformed_pack_never_publishes_checkout() {
+    run(
+        "native_malformed_pack_never_publishes_checkout",
+        "malformed_pack",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_retirement_before_post_sends_no_pack_request() {
+    run(
+        "native_retirement_before_post_sends_no_pack_request",
+        "retire_before_post",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_retirement_after_pack_refuses_ref_publication() {
+    run(
+        "native_retirement_after_pack_refuses_ref_publication",
+        "retire_before_refs",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_upload_post_foreign_origin_redirect_is_refused() {
+    run(
+        "native_upload_post_foreign_origin_redirect_is_refused",
+        "upload_post_foreign_origin_redirect",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_upload_post_port_redirect_is_refused() {
+    run(
+        "native_upload_post_port_redirect_is_refused",
+        "upload_post_port_redirect",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_receive_post_foreign_origin_redirect_is_refused() {
+    run(
+        "native_receive_post_foreign_origin_redirect_is_refused",
+        "push_post_foreign_origin_redirect",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_receive_post_port_redirect_is_refused() {
+    run(
+        "native_receive_post_port_redirect_is_refused",
+        "push_post_port_redirect",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_truncated_valid_pack_never_publishes_checkout() {
+    run(
+        "native_truncated_valid_pack_never_publishes_checkout",
+        "truncated_pack",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_moved_selected_sha_refuses_before_pack_request() {
+    run(
+        "native_moved_selected_sha_refuses_before_pack_request",
+        "sha_mismatch",
     )
     .await;
 }

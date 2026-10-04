@@ -32,24 +32,53 @@ pub(crate) struct GitlabCheckoutConnection {
     cursor_scope: String,
 }
 
+/// Credential-free observation captured before the caller's first await. It is
+/// not authority and cannot switch to a later connection or secret revision.
+pub(crate) struct GitlabCheckoutCapture {
+    original: Arc<RepositorySettledConnection>,
+    reader: Arc<dyn RepositorySecretReader>,
+}
+
 fn local(error: RepositoryCredentialError) -> Error {
     crate::pr_ops::map_sc_err(error.into())
 }
 
 impl crate::Services {
+    pub(crate) fn capture_gitlab_checkout_connection(&self) -> Result<GitlabCheckoutCapture> {
+        Ok(GitlabCheckoutCapture {
+            original: Arc::new(self.gitlab_repository_settled_connection().map_err(local)?),
+            reader: self.gitlab_repository_secret_reader().map_err(local)?,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn gitlab_checkout_connection(
         &self,
         authority: Arc<dyn CheckoutAuthority>,
     ) -> Result<Arc<GitlabCheckoutConnection>> {
-        let original = self.gitlab_repository_settled_connection().map_err(local)?;
-        let reader = self.gitlab_repository_secret_reader().map_err(local)?;
+        self.capture_gitlab_checkout_connection()?.admit(authority)
+    }
+}
+
+impl GitlabCheckoutCapture {
+    /// Consume the original metadata beneath the caller's newly established
+    /// fence. A pending capture never silently adopts even a same-binding refresh.
+    pub(crate) fn admit(
+        self,
+        authority: Arc<dyn CheckoutAuthority>,
+    ) -> Result<Arc<GitlabCheckoutConnection>> {
         let result = Arc::new(GitlabCheckoutConnection {
-            original: Arc::new(original),
-            reader,
+            original: self.original,
+            reader: self.reader,
             authority,
             cursor_scope: uuid::Uuid::new_v4().to_string(),
         });
-        result.with_current(&mut || Ok(()))?;
+        result.with_project(
+            None,
+            Some(result.original.selected()),
+            false,
+            &mut || Ok(()),
+        )?;
         Ok(result)
     }
 }
@@ -197,26 +226,29 @@ impl GitlabCheckoutConnection {
             return Err(RepositoryCredentialError::BoundaryMismatch.into());
         }
         let project = context.checkout_project()?;
-        let snapshot = self.load(None).await?;
+        let snapshot = self.load(project.as_deref()).await?;
+        let projects: Vec<_> = project.as_deref().into_iter().collect();
         let selected = snapshot.request;
         let mut pending = Some(prepared.authenticate(snapshot.token)?);
         let mut admitted = None;
         let mut local_error = None;
         self.authority
             .dispatch(&mut || {
-                let result =
-                    self.original
-                        .with_checkout_current(Some(&selected), &[], true, |_, stamp| {
-                            let request =
-                                pending.take().ok_or(RepositoryCredentialError::Retired)?;
-                            admitted = Some(request.admit(Some(Box::new(CheckoutReceipt {
-                                original: self.original.clone(),
-                                selected: selected.clone(),
-                                stamp,
-                                project: project.clone(),
-                            }))));
-                            Ok(())
-                        });
+                let result = self.original.with_checkout_current(
+                    Some(&selected),
+                    &projects,
+                    true,
+                    |_, stamp| {
+                        let request = pending.take().ok_or(RepositoryCredentialError::Retired)?;
+                        admitted = Some(request.admit(Some(Box::new(CheckoutReceipt {
+                            original: self.original.clone(),
+                            selected: selected.clone(),
+                            stamp,
+                            project: project.clone(),
+                        }))));
+                        Ok(())
+                    },
+                );
                 if let Err(error) = result {
                     local_error = Some(error);
                 }
