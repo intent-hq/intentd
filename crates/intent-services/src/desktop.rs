@@ -881,10 +881,12 @@ impl Services {
         } else {
             DesktopState::Inactive
         };
-        let message = if outcome == "granted" {
-            RELEASE_HINT.to_string()
-        } else {
-            format!("Desktop permission {outcome}; control is not active.")
+        let message = match (outcome, failure) {
+            ("granted", _) => RELEASE_HINT.to_string(),
+            ("failed", Some(failure)) => format!(
+                "Desktop permission failed; control is not active. Request {request}: {failure}"
+            ),
+            _ => format!("Desktop permission {outcome}; control is not active."),
         };
         let mut payload = json!({"type":"desktop_control","requestId":request,"outcome":outcome,"state":state,"message":message});
         if let Phase::Active { session_id, .. } = &live.phase {
