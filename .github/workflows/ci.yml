@@ -439,6 +439,8 @@ jobs:
       - name: Acquire the shared transfer selection contract
         uses: ./.github/actions/transfer-selection-fixtures
       - name: Real import and public session contract
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
         run: "cargo test -p intent-services --lib transfer_selection_contract::"
       # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on the
       # tinybox slots rust-lld has failed to open objects rustc had just
@@ -819,6 +821,7 @@ jobs:
         timeout-minutes: 20
         shell: bash
         env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_TUNNEL_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
           INTENTD_TUNNEL_TARGET: ${{ matrix.target }}
           CARGO_BUILD_JOBS: "2"
@@ -874,6 +877,7 @@ jobs:
         if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'Windows'
         shell: bash
         env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_DIAGNOSTIC_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
         run: |
           set -euo pipefail
@@ -892,6 +896,7 @@ jobs:
         if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'macOS'
         shell: bash
         env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_DIAGNOSTIC_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
         run: |
           set -euo pipefail
@@ -917,13 +922,15 @@ jobs:
         timeout-minutes: 20
         shell: bash
         env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_COW_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
           INTENTD_TEST_REQUIRE_COW: "1"
           CARGO_BUILD_JOBS: "2"
         run: |
           set -euo pipefail
-          # Preserve ordinary Forbidden errors and unwind fixture guards on red.
-          unset INTENTD_ASSERT_BOUND_CALLER INTENTD_TEST_KEEP_TMP
+          # Keep fixtures armed; the capability probe removes the guard only
+          # in its exact child. Retain scratch cleanup assertions for every case.
+          unset INTENTD_TEST_KEEP_TMP
           tests=(
             tests::worktree_provisioning::create_provisions_cow_checkout_when_isolation_enabled
             tests::worktree_provisioning::duplicate_provisions_cow_checkout_when_isolation_enabled
@@ -1583,10 +1590,9 @@ jobs:
         uses: ./.github/actions/transfer-selection-fixtures
       - name: Run changed tests under llvm-cov
         if: steps.select.outputs.has_selection == 'true'
-        # Armed bound-caller seam — see coverage-e2e's run step. The plan
-        # lines the script echoes name only the env it prepends itself
-        # (INTENTD_TEST_TIMEOUT_MULTIPLIER); this variable reaches cargo
-        # through the step environment.
+        # Armed bound-caller seam — see coverage-e2e's run step. The
+        # script also enforces the same policy at its test launch boundary.
+        # test-ci-test-policy.py checks parity with this explicit CI setting.
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: ./scripts/changed-tests.sh --instrumented --base "$BASE_SHA"
@@ -1814,6 +1820,10 @@ jobs:
           python3 -m pip install PyYAML==6.0.2
           python3 -B scripts/test-prerelease-cleanup-workflow.py
           python3 -B scripts/test-release-rust-cache.py
+      - name: Test local and CI caller policy
+        run: |
+          python3 -S scripts/test-test-policy.py
+          python3 -I -B scripts/test-ci-test-policy.py
       - name: Install release cache regression compiler
         shell: bash
         run: |

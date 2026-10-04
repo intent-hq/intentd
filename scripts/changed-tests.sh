@@ -9,6 +9,8 @@
 # CARGO_TERM_PROGRESS_WHEN are inherited as-is (the monorepo Makefile sets
 # them). The script works from any cwd: it changes to the repo root itself.
 #
+# All test children (including a custom runner) use with-test-policy.sh to
+# enforce INTENTD_ASSERT_BOUND_CALLER=1, even when inherited env disables it.
 # Without a runner every plan runs as its own `cargo nextest run` from the repo
 # root. With one, the runner (a shell-quoted command line, exec'd once from the
 # caller's working directory) receives every plan instead:
@@ -65,6 +67,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+test_policy="$repo_root/scripts/with-test-policy.sh"
 caller_dir=$PWD
 base=${BASE:-origin/main}
 build_jobs=${BUILD_JOBS:-}
@@ -314,7 +317,7 @@ if [[ -n "$runner" ]]; then
   [[ -n "$build_jobs" ]] && set -- "$@" --build-jobs "$build_jobs"
   [[ -n "$test_threads" ]] && set -- "$@" --test-threads "$test_threads"
   cd "$caller_dir"
-  exec "$@"
+  exec "$BASH" "$test_policy" "$@"
 fi
 
 # The plans are read from fd 3 so cargo keeps the caller's stdin.
@@ -325,9 +328,9 @@ while IFS= read -r -u 3 plan; do
   set -- $plan $extra
   set +e
   if [[ -n "$instrumented" ]]; then
-    INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest "$@" -E "$cov_filter"
+    INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "$BASH" "$test_policy" cargo llvm-cov --no-report nextest "$@" -E "$cov_filter"
   else
-    cargo nextest run "$@"
+    "$BASH" "$test_policy" cargo nextest run "$@"
   fi
   status=$?
   set -e
