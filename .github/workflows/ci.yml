@@ -439,6 +439,8 @@ jobs:
       - name: Acquire the shared transfer selection contract
         uses: ./.github/actions/transfer-selection-fixtures
       - name: Real import and public session contract
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
         run: "cargo test -p intent-services --lib transfer_selection_contract::"
       # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on the
       # tinybox slots rust-lld has failed to open objects rustc had just
@@ -1583,10 +1585,9 @@ jobs:
         uses: ./.github/actions/transfer-selection-fixtures
       - name: Run changed tests under llvm-cov
         if: steps.select.outputs.has_selection == 'true'
-        # Armed bound-caller seam — see coverage-e2e's run step. The plan
-        # lines the script echoes name only the env it prepends itself
-        # (INTENTD_TEST_TIMEOUT_MULTIPLIER); this variable reaches cargo
-        # through the step environment.
+        # Armed bound-caller seam — see coverage-e2e's run step. The
+        # script also enforces the same policy at its test launch boundary.
+        # test-ci-test-policy.py checks parity with this explicit CI setting.
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: ./scripts/changed-tests.sh --instrumented --base "$BASE_SHA"
@@ -1814,6 +1815,10 @@ jobs:
           python3 -m pip install PyYAML==6.0.2
           python3 -B scripts/test-prerelease-cleanup-workflow.py
           python3 -B scripts/test-release-rust-cache.py
+      - name: Test local and CI caller policy
+        run: |
+          python3 -S scripts/test-test-policy.py
+          python3 -I -B scripts/test-ci-test-policy.py
       - name: Install release cache regression compiler
         shell: bash
         run: |
