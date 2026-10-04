@@ -238,6 +238,118 @@ async fn installed_cli_auth_and_config_changes_do_not_reuse_last_good_identity()
     assert!(!after.key(&identity).unwrap().contains("token"));
 }
 
+async fn claude_catalog_key(
+    context: &InstalledContext,
+    identity: &InstalledCliIdentity,
+    state: &str,
+) -> String {
+    std::fs::write(
+        PathBuf::from(context.env.get(std::ffi::OsStr::new("HOME")).unwrap()).join(".claude.json"),
+        state,
+    )
+    .unwrap();
+    InstalledContext::from_inputs(
+        context.runtime.clone(),
+        &BTreeMap::new(),
+        context.env.clone(),
+        &context.names,
+    )
+    .unwrap()
+    .with_catalog_fingerprint()
+    .await
+    .unwrap()
+    .key(identity)
+    .unwrap()
+}
+
+#[tokio::test]
+async fn installed_cli_claude_state_churn_keeps_catalog_identity() {
+    let (root, context) = fixture(InstalledCli::Claude, "#!/bin/sh\nprintf '2.0.0\\n'\n");
+    let context = context.with_catalog_fingerprint().await.unwrap();
+    let (identity, _) = context
+        .observe(&launch(&context, root.path()))
+        .await
+        .unwrap();
+    let base = claude_catalog_key(
+        &context,
+        &identity,
+        r#"{"numStartups":1,"cachedGrowthBookFeaturesAt":1,"oauthAccount":{"accountUuid":"a","organizationUuid":"o","profileFetchedAt":1},"modelAccessCache":[]}"#,
+    )
+    .await;
+    // Claude Code rewrites these during ordinary runs, including model discovery.
+    let churned = claude_catalog_key(
+        &context,
+        &identity,
+        r#"{"oauthAccount":{"profileFetchedAt":2,"organizationUuid":"o","accountUuid":"a"},"cachedGrowthBookFeaturesAt":2,"numStartups":2,"modelAccessCache":["x"],"tipsHistory":{"t":3}}"#,
+    )
+    .await;
+    assert_eq!(base, churned);
+
+    for meaningful in [
+        r#"{"oauthAccount":{"accountUuid":"b","organizationUuid":"o"}}"#,
+        r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"p"}}"#,
+        r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"o"},"primaryApiKey":"k"}"#,
+        r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"o"},"customApiKeyResponses":{"approved":["k"]}}"#,
+        "{}",
+        "not json",
+    ] {
+        let changed = claude_catalog_key(&context, &identity, meaningful).await;
+        assert_ne!(base, changed, "{meaningful} must invalidate the catalog");
+    }
+    let unparseable = claude_catalog_key(&context, &identity, "not json").await;
+    assert_ne!(
+        unparseable,
+        claude_catalog_key(&context, &identity, "not json either").await
+    );
+
+    let before_settings = claude_catalog_key(
+        &context,
+        &identity,
+        r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"o"}}"#,
+    )
+    .await;
+    assert_eq!(base, before_settings);
+    std::fs::create_dir(root.path().join(".claude")).unwrap();
+    std::fs::write(
+        root.path().join(".claude/settings.json"),
+        r#"{"model":"opus"}"#,
+    )
+    .unwrap();
+    let after_settings = claude_catalog_key(
+        &context,
+        &identity,
+        r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"o"}}"#,
+    )
+    .await;
+    assert_ne!(base, after_settings);
+
+    // Explicit credential-file inputs keep raw bytes even when named `.claude.json`.
+    let credential = root.path().join("credentials/.claude.json");
+    std::fs::create_dir(credential.parent().unwrap()).unwrap();
+    let mut env = context.env.clone();
+    env.insert(
+        "GOOGLE_APPLICATION_CREDENTIALS".into(),
+        credential.clone().into_os_string(),
+    );
+    let credential_key = |json: &'static str| {
+        std::fs::write(&credential, json).unwrap();
+        let (runtime, env, names) = (context.runtime.clone(), env.clone(), &context.names);
+        let identity = &identity;
+        async move {
+            InstalledContext::from_inputs(runtime, &BTreeMap::new(), env, names)
+                .unwrap()
+                .with_catalog_fingerprint()
+                .await
+                .unwrap()
+                .key(identity)
+                .unwrap()
+        }
+    };
+    let first = credential_key(r#"{"client_email":"a@example.com"}"#).await;
+    let second = credential_key(r#"{"client_email":"b@example.com"}"#).await;
+    assert_ne!(first, second);
+}
+
 #[tokio::test]
 async fn installed_cli_disappearing_never_runs_adapter_or_bundled_cli() {
     let (root, context) = fixture(
