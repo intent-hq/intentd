@@ -12,8 +12,12 @@ use sqlx::{
 };
 use std::path::{Path, PathBuf};
 
+mod ownership;
+use ownership::SourceOwners;
+
 pub(crate) struct ArtifactArena {
     pub pool: SqlitePool,
+    pub(super) sources: std::sync::Arc<SourceOwners>,
     path: PathBuf,
     max_pages: u32,
 }
@@ -157,6 +161,7 @@ impl Store {
                 }
                 Ok(ArtifactArena {
                     pool,
+                    sources: std::sync::Arc::default(),
                     path: normalized.clone(),
                     max_pages,
                 })
@@ -173,6 +178,38 @@ impl Store {
             .get()
             .map(|arena| &arena.pool)
             .ok_or_else(|| Error::InvalidParams("Artifact arena is not configured".into()))
+    }
+
+    pub(super) fn artifact_sources(&self) -> Result<std::sync::Arc<SourceOwners>> {
+        self.artifact_arena
+            .get()
+            .map(|arena| arena.sources.clone())
+            .ok_or_else(invalid)
+    }
+
+    /// A cancelled response must not strand a committed retirement's source pin.
+    /// The sole arena connection settles prior readers before this commit; each
+    /// operation also retains its own grant until its physical I/O settles.
+    pub(super) async fn commit_artifact_retirement(
+        &self,
+        tx: Transaction<'static, Sqlite>,
+        generations: Vec<String>,
+    ) -> Result<()> {
+        let sources = self.artifact_sources()?;
+        tokio::spawn(async move {
+            tx.commit().await.map_err(db_error)?;
+            sources.retire(&generations);
+            Ok(())
+        })
+        .await
+        .map_err(|error| Error::Internal(format!("artifact retirement settlement: {error}")))?
+    }
+}
+
+impl ArtifactArena {
+    pub(crate) async fn close(&self) {
+        self.pool.close().await;
+        self.sources.clear();
     }
 }
 

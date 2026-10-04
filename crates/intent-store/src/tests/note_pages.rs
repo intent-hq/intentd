@@ -12,6 +12,7 @@ use std::sync::{
 };
 
 mod artifact_crash;
+mod artifact_pins;
 
 fn request(value: Value) -> NotePageRequest {
     serde_json::from_value(value).unwrap()

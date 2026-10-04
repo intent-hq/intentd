@@ -72,7 +72,7 @@ impl Store {
             if let Some(row) = existing {
                 // Preserve the original state/receipt and reservation. In
                 // particular, aborted/released jobs never become building again.
-                return status(&self.note_pages, &row).map(|state| (state, source));
+                return status(&self.note_pages, &row).map(|state| (state, source, false));
             }
             let generation = uuid::Uuid::new_v4().simple().to_string();
             let reservation = &request.header.reservation;
@@ -93,9 +93,16 @@ impl Store {
             if intent_core::now_epoch_ms() >= u64::try_from(expires_at).map_err(|_| invalid())? {
                 return Err(invalid());
             }
-            status(&self.note_pages, &row).map(|state| (state, source))
+            status(&self.note_pages, &row).map(|state| (state, source, true))
         }.await;
-        let (state, source) = result?;
+        let (state, source, created) = result?;
+        if created {
+            self.artifact_sources()?.register(
+                &state.generation,
+                source.clone(),
+                state.expires_at,
+            )?;
+        }
         Self::commit_artifact_with_source_guard(source_guard, connection, source).await?;
         Ok(state)
     }

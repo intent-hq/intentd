@@ -100,7 +100,8 @@ impl Store {
              (SELECT generation FROM note_artifact_job WHERE state IN ('building','sealed','admitted') \
              AND expires_at<=? ORDER BY expires_at,generation LIMIT ?) RETURNING generation",
         ).bind(now).bind(max_jobs).fetch_all(&mut *tx).await.map_err(db_error)?;
-        tx.commit().await.map_err(db_error)?;
+        self.commit_artifact_retirement(tx, generations.clone())
+            .await?;
         Ok(generations)
     }
 }

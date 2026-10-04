@@ -614,7 +614,7 @@ impl Store {
     /// (regression: persisted settings must survive app relaunches in sidecar mode).
     pub async fn close(&self) {
         if let Some(arena) = self.artifact_arena.get() {
-            arena.pool.close().await;
+            arena.close().await;
         }
         let started = std::time::Instant::now();
         self.log_close_phase("wal_checkpoint", "started", 0);

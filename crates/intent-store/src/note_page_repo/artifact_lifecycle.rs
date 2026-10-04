@@ -148,7 +148,8 @@ impl Store {
         }
         // The state trigger atomically retires any provisional lease. This
         // same transaction retains counters and immutable replay identity.
-        connection.commit().await.map_err(db_error)?;
+        self.commit_artifact_retirement(connection, vec![generation.into()])
+            .await?;
         Ok(current)
     }
 }
@@ -176,12 +177,17 @@ impl Store {
         }
         // One atomic UPDATE both authorizes the captured principal/scope and
         // retires only this lease. Repeated release matches the retained row.
-        let changed = sqlx::query("UPDATE note_artifact_lease SET released=1 WHERE lease_id=? AND generation IN (SELECT generation FROM note_artifact_job WHERE principal=? AND workspace_id=? AND source_snapshot=?)")
+        let mut tx = self
+            .artifact_pool()?
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_error)?;
+        let generation = sqlx::query_scalar::<_, String>("UPDATE note_artifact_lease SET released=1 WHERE lease_id=? AND generation IN (SELECT generation FROM note_artifact_job WHERE principal=? AND workspace_id=? AND source_snapshot=?) RETURNING generation")
             .bind(lease).bind(principal).bind(workspace_id).bind(&token.0)
-            .execute(self.artifact_pool()?).await.map_err(db_error)?;
-        if changed.rows_affected() == 0 {
-            return Err(Error::NotFound("Artifact lease not found".into()));
-        }
+            .fetch_optional(&mut *tx).await.map_err(db_error)?
+            .ok_or_else(|| Error::NotFound("Artifact lease not found".into()))?;
+        self.commit_artifact_retirement(tx, vec![generation])
+            .await?;
         Ok(())
     }
 }
