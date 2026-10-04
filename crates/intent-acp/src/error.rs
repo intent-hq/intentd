@@ -250,19 +250,14 @@ const TERMINAL_MESSAGE_MARKERS: &[&str] = &[
 /// plain-English wordings the CLI bridges echo out of the upstream response
 /// body.
 ///
-/// This list is a **narrowing of** [`TERMINAL_MESSAGE_MARKERS`], never a
-/// competitor to it: every phrasing here is already terminal today (several
-/// are literally the same strings), and adding it changes no retry, resume, or
-/// transient verdict anywhere. The only new thing is the OBSERVATION — the
-/// daemon can now say *why* a terminal failure was terminal, so the FE can
-/// offer "retry on another provider" instead of string-matching prose out of
-/// the rendered `error`.
+/// Complements [`TERMINAL_MESSAGE_MARKERS`]: provider quotas remain terminal
+/// even when a bridge also reports a transient fetch/disconnect marker and no
+/// HTTP status (intent-hq/intent#6750). [`message_is_quota_exceeded`] applies
+/// the local-resource exclusion before these markers can veto a retry.
 ///
-/// Deliberately broad, because the cost of a wrong verdict is one unhelpful
-/// retry affordance on an already-failed turn — not a retry storm, a demoted
-/// auth verdict, or a swallowed error. Bare `"429"` in particular can collide
-/// with an unrelated number in a provider payload; that is accepted here and
-/// bounded by [`is_quota_exceeded`]'s variant filter below.
+/// Broad provider wordings (including bare `"429"`) are intentionally
+/// conservative: a false positive can suppress an automatic retry, but cannot
+/// swallow a terminal rejection or start a retry storm.
 const QUOTA_MESSAGE_MARKERS: &[&str] = &[
     // HTTP 429, bare (status codes, JSON `"status":429`) and in prose.
     "429",
@@ -318,6 +313,13 @@ const TRANSIENT_PROVIDER_FETCH_MARKERS: &[&str] = &[
     "econnrefused",
     "etimedout",
     "socket hang up",
+    // AbortSignal.timeout and undici body-stream aborts (intent-hq/intent#6750).
+    // Do not match bare "terminated": unrelated process exits stay terminal.
+    "aborted due to timeout",
+    "timeouterror",
+    "\"details\":\"terminated\"",
+    "\"details\": \"terminated\"",
+    "typeerror: terminated",
 ];
 
 /// Classify a rendered error message: does it describe a transient upstream
@@ -333,7 +335,7 @@ const TRANSIENT_PROVIDER_FETCH_MARKERS: &[&str] = &[
 /// connection.
 pub(crate) fn message_is_transient_upstream_disconnect(message: &str) -> bool {
     let msg = message.to_ascii_lowercase();
-    if TERMINAL_MESSAGE_MARKERS.iter().any(|m| msg.contains(m)) {
+    if TERMINAL_MESSAGE_MARKERS.iter().any(|m| msg.contains(m)) || message_is_quota_exceeded(&msg) {
         return false;
     }
     TRANSIENT_DISCONNECT_MARKERS.iter().any(|m| msg.contains(m))
@@ -369,10 +371,10 @@ pub fn is_transient_upstream_disconnect(err: &AcpError) -> bool {
 /// in-place `session/prompt` retry can recover from
 /// (intent-hq/monorepo#3007): the provider bridge answered the prompt with a
 /// JSON-RPC error whose rendered text describes a transient upstream fault —
-/// a connect-level fetch failure (EPIPE/ECONNRESET/ECONNREFUSED/timeout) or
-/// an explicit provider `apiStatus: unavailable`/`overloaded` payload.
+/// a fetch failure (EPIPE/ECONNRESET/ECONNREFUSED/timeout/body-stream abort)
+/// or an explicit provider `apiStatus: unavailable`/`overloaded` payload.
 ///
-/// Deliberately narrower than [`is_transient_upstream_disconnect`]:
+/// Variant scope is narrower than [`is_transient_upstream_disconnect`]:
 /// only [`AcpError::Rpc`] qualifies. A provider bridge that answered with an
 /// error is alive and can serve a retried prompt on the same connection;
 /// transport-shaped failures (closed pipe, dead child — including the
@@ -399,7 +401,7 @@ pub fn is_transient_provider_fetch_failure(err: &AcpError) -> bool {
 /// [`message_is_transient_upstream_disconnect`].
 pub(crate) fn message_is_transient_provider_fetch_failure(message: &str) -> bool {
     let msg = message.to_ascii_lowercase();
-    if TERMINAL_MESSAGE_MARKERS.iter().any(|m| msg.contains(m)) {
+    if TERMINAL_MESSAGE_MARKERS.iter().any(|m| msg.contains(m)) || message_is_quota_exceeded(&msg) {
         return false;
     }
     TRANSIENT_PROVIDER_FETCH_MARKERS
@@ -446,12 +448,10 @@ pub fn message_is_quota_exceeded(message: &str) -> bool {
 /// `rate_limit_error`, an exhausted plan quota), not because the request was
 /// wrong.
 ///
-/// Purely an OBSERVATION layered on top of the existing verdicts: quota
-/// failures were terminal before this classifier existed and remain terminal
-/// after it. Nothing here feeds a retry, resume, or auth decision — the sole
-/// consumer stamps a machine-readable `errorCode` on the `agent:failed` event
-/// so clients can offer "retry on another provider" without pattern-matching
-/// the rendered prose.
+/// The terminal-failure publisher uses this to stamp a machine-readable
+/// `errorCode` on `agent:failed`, so clients can offer "retry on another
+/// provider". Its shared message classifier also vetoes transient retry/resume
+/// classification when a provider quota rejection accompanies a network error.
 ///
 /// Classifies against the FULL rendered Display, so the bounded
 /// [`MAX_RENDERED_DATA_BYTES`] slice of a [`JsonRpcError`]'s `data` is covered:
@@ -594,6 +594,11 @@ mod classifier_tests {
             "JSON-RPC error -32603: Internal error: {\"apiStatus\": \"overloaded\"}",
             "JSON-RPC error -32603: Internal error: socket hang up",
             "JSON-RPC error -32603: Internal error: connect ETIMEDOUT 1.2.3.4:443",
+            "JSON-RPC error -32603: Internal error: The operation was aborted due to timeout",
+            "JSON-RPC error -32603: Internal error: TimeoutError: request timed out",
+            "JSON-RPC error -32603: Internal error: {\"details\":\"terminated\"}",
+            "JSON-RPC error -32603: Internal error: {\"details\": \"terminated\"}",
+            "JSON-RPC error -32603: Internal error: TypeError: terminated",
         ] {
             assert!(
                 message_is_transient_provider_fetch_failure(msg),
@@ -615,6 +620,17 @@ mod classifier_tests {
             // JSON status rendering (no space after the colon).
             "JSON-RPC error -32603: Internal error: fetch failed: {\"status\":404,\"error\":\"not found\"}",
             "JSON-RPC error -32603: Internal error: invalid api key",
+            "HTTP 400 Bad Request: The operation was aborted due to timeout",
+            "401 Unauthorized: TimeoutError",
+            "HTTP 429 Too Many Requests: {\"details\":\"terminated\"}",
+            "invalid api key: TypeError: terminated",
+            "terminated",
+            "process terminated by user",
+            "Internal error: process: terminated by signal",
+            "Internal error: subprocess: terminated",
+            "Internal error: {\"details\":\"terminated by user\"}",
+            "Internal error: unterminated string",
+            "The operation was aborted by the user",
             "some unrelated failure",
         ] {
             assert!(
@@ -622,6 +638,16 @@ mod classifier_tests {
                 "expected terminal: {msg:?}"
             );
         }
+    }
+
+    #[test]
+    fn classifies_undici_termination_in_rpc_data_as_transient() {
+        let err = AcpError::Rpc(JsonRpcError {
+            code: -32603,
+            message: "Internal error".to_string(),
+            data: Some(serde_json::json!({ "details": "terminated" })),
+        });
+        assert!(is_transient_provider_fetch_failure(&err));
     }
 
     #[test]
@@ -675,22 +701,35 @@ mod classifier_tests {
         assert!(!message_is_quota_exceeded("Internal error"));
     }
 
-    /// Quota classification is an OBSERVATION only: it must not move any
-    /// existing transient/terminal verdict. A 429 was terminal before and
-    /// stays terminal, on both transient classifiers.
+    /// Provider quota rejections win over transient markers even without a
+    /// rendered HTTP status (intent-hq/intent#6750).
     #[test]
     fn quota_errors_stay_terminal_for_the_transient_classifiers() {
-        let err = AcpError::Rpc(JsonRpcError {
-            code: -32603,
-            message: "Internal error".to_string(),
-            data: Some(serde_json::Value::String(
-                "fetch failed: 429 Too Many Requests (rate_limit_error), connection closed"
-                    .to_string(),
-            )),
-        });
-        assert!(is_quota_exceeded(&err));
-        assert!(!is_transient_upstream_disconnect(&err));
-        assert!(!is_transient_provider_fetch_failure(&err));
+        for quota in [
+            "429 Too Many Requests",
+            "rate_limit_error",
+            "insufficient_quota",
+            "rate limit reached",
+            "monthly quota exhausted",
+            "usage limit reached",
+        ] {
+            for transient in ["{\"details\":\"terminated\"}", "fetch failed", "ECONNRESET"] {
+                let err = AcpError::Rpc(JsonRpcError {
+                    code: -32603,
+                    message: "Internal error".to_string(),
+                    data: Some(serde_json::Value::String(format!("{quota}: {transient}"))),
+                });
+                assert!(is_quota_exceeded(&err), "expected quota: {err}");
+                assert!(
+                    !is_transient_upstream_disconnect(&err),
+                    "expected terminal: {err}"
+                );
+                assert!(
+                    !is_transient_provider_fetch_failure(&err),
+                    "expected terminal: {err}"
+                );
+            }
+        }
     }
 
     /// The STRING classifier carries the same disk-quota exclusion, because
@@ -710,6 +749,11 @@ mod classifier_tests {
                 !message_is_quota_exceeded(msg),
                 "local-resource failure misread as a provider quota: {msg}"
             );
+            // Local quota wording must not become a provider-quota veto on
+            // an otherwise transient network error.
+            let network_error = format!("{msg}; ECONNRESET");
+            assert!(message_is_transient_upstream_disconnect(&network_error));
+            assert!(message_is_transient_provider_fetch_failure(&network_error));
         }
         // The provider phrasings it exists to catch still classify.
         for msg in [

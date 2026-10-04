@@ -4748,16 +4748,25 @@ fn connect_with_failing_prompts_then_success(
 const FETCH_EPIPE_UNAVAILABLE: &str = "fetch failed (EPIPE: connect EPIPE 34.36.229.120:443): \
     {\"apiStatus\":\"unavailable\",\"message\":\"fetch failed (EPIPE: connect EPIPE 34.36.229.120:443)\"}";
 
-/// Regression for monorepo#3007: a transient provider-fetch failure (`-32603`
-/// wrapping an EPIPE connect + `apiStatus: unavailable`) on an output-free
+/// Regression for monorepo#3007 / intent#6750: a transient provider-fetch failure
+/// (including timeout and undici body-stream termination) on an output-free
 /// attempt is retried in place — the turn completes normally instead of
 /// failing terminally, and no Error status is persisted.
 #[tokio::test]
 async fn transient_provider_fetch_failure_retries_and_turn_completes() {
-    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let _env = EnvGuard::set_all(&[("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10")]);
+    for error_message in
+        std::iter::once(FETCH_EPIPE_UNAVAILABLE).chain(SUSPEND_TRANSIENT_ERRORS.iter().copied())
+    {
+        assert_output_free_fetch_failure_retries(error_message).await;
+    }
+}
+
+async fn assert_output_free_fetch_failure_retries(error_message: &str) {
     let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(None)));
     let (conn, mut note_rx, _agent, prompt_calls) =
-        connect_with_failing_prompts_then_success(2, FETCH_EPIPE_UNAVAILABLE, prompt_updates());
+        connect_with_failing_prompts_then_success(2, error_message, prompt_updates());
 
     let stop = timeout(
         Duration::from_secs(10),
@@ -5451,7 +5460,16 @@ fn suspend_chunk(text: &str) -> String {
     .to_string()
 }
 
-/// Task C happy path: a transient upstream disconnect whose active window
+// Include fetch-only shapes: disconnect classification alone must not gate
+// suspend enrollment (intent-hq/intent#6750).
+const SUSPEND_TRANSIENT_ERRORS: &[&str] = &[
+    "Connection reset by peer",
+    "Internal error: The operation was aborted due to timeout: {\"apiStatus\":\"unavailable\"}",
+    "Internal error: The operation was aborted due to timeout",
+    "Internal error: {\"details\":\"terminated\"}",
+];
+
+/// A transient upstream disconnect or provider-fetch failure whose active window
 /// overlapped a detected host suspend is ENROLLED as interrupted, not surfaced
 /// terminally. `run_prompt_turn` returns the suspend-interrupt marker error,
 /// emits the interrupted terminal `agent:stream:end` (`stopReason:
@@ -5460,13 +5478,20 @@ fn suspend_chunk(text: &str) -> String {
 /// `interrupted_agent` row for the wake orchestrator (Task D).
 #[tokio::test]
 async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_failure() {
+    for error_message in SUSPEND_TRANSIENT_ERRORS {
+        assert_suspend_interrupt_enrolled(error_message).await;
+    }
+}
+
+async fn assert_suspend_interrupt_enrolled(error_message: &str) {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
         Duration::from_secs(120),
     ))));
-    // Stream a partial chunk, then fail with a connection-reset RPC error.
+    // Partial output rules out in-place retry; suspend enrollment must also
+    // take precedence over the post-output blocker path.
     let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], error_message);
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let capture = LifecycleCapture::default();
     let _capture_guard = capture.set_as_default();
@@ -5499,6 +5524,12 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
     assert!(
         !events.iter().any(|e| e.event_type == "agent:failed"),
         "no agent:failed for a sleep-induced interruption"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.event_type == "agent:attention-requested"),
+        "no terminal blocker for a sleep-induced interruption: {error_message}"
     );
     let end = events
         .iter()
@@ -5555,7 +5586,9 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
     // The interrupted_agent row is written for the wake orchestrator (Task D).
     let interrupted = bus.store().list_interrupted_agents().await.unwrap();
     assert!(
-        interrupted.iter().any(|ia| ia.agent_id == agent_id),
+        interrupted
+            .iter()
+            .any(|ia| ia.agent_id == agent_id && ia.reason.as_deref() == Some("system_suspend")),
         "interrupted_agent row enrolled for wake-resume"
     );
 }
@@ -5566,10 +5599,16 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
 /// no `interrupted_agent` row).
 #[tokio::test]
 async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
+    for error_message in SUSPEND_TRANSIENT_ERRORS {
+        assert_awake_transient_failure(error_message).await;
+    }
+}
+
+async fn assert_awake_transient_failure(error_message: &str) {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(None)));
     let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], error_message);
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
@@ -5600,6 +5639,12 @@ async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
         events.iter().any(|e| e.event_type == "agent:failed"),
         "awake-time failure surfaces agent:failed"
     );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_type == "agent:attention-requested"),
+        "awake-time post-output failure still raises blocker attention: {error_message}"
+    );
     let interrupted = bus.store().list_interrupted_agents().await.unwrap();
     assert!(
         interrupted.is_empty(),
@@ -5607,7 +5652,7 @@ async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
     );
 }
 
-/// Task C boundary: a NON-transient error (a terminal 4xx) is NOT enrolled even
+/// A NON-transient error (4xx, quota, or unrelated termination) is NOT enrolled even
 /// when a suspend overlapped — the classifier rejects it, so the turn surfaces
 /// terminally with `agent:failed` and no `interrupted_agent` row. (A 404, not
 /// a 401: an auth-flavored 4xx now takes the auth-required mapping instead of
@@ -5615,12 +5660,24 @@ async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
 /// `map_acp_session_error_maps_auth_and_demotes_verdict`.)
 #[tokio::test]
 async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
+    for error_message in [
+        "HTTP 404 Not Found",
+        "Internal error: process: terminated by signal",
+        "Internal error: rate_limit_error: {\"details\":\"terminated\"}",
+        "Internal error: insufficient_quota: fetch failed",
+        "Internal error: monthly quota exhausted: ECONNRESET",
+    ] {
+        assert_suspend_rejects_terminal_failure(error_message).await;
+    }
+}
+
+async fn assert_suspend_rejects_terminal_failure(error_message: &str) {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
         Duration::from_secs(120),
     ))));
     let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error(Vec::new(), "HTTP 404 Not Found");
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], error_message);
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
@@ -5634,7 +5691,7 @@ async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
             None,
         )
         .await
-        .expect_err("a terminal 4xx fails the turn");
+        .expect_err("a terminal rejection fails the turn");
     assert!(
         matches!(
             &err,
@@ -5731,14 +5788,20 @@ async fn suspend_late_enrollment_persists_after_early_close() {
 /// the row resolved (no longer pending).
 #[intent_test_macros::daemon_test]
 async fn wake_resume_resumes_turn_enrolled_by_suspend_classifier() {
+    for error_message in SUSPEND_TRANSIENT_ERRORS {
+        assert_wake_resumes_enrolled_turn(error_message).await;
+    }
+}
+
+async fn assert_wake_resumes_enrolled_turn(error_message: &str) {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
         Duration::from_secs(120),
     ))));
 
-    // Task C: a transient disconnect overlapping a suspend enrolls the turn.
+    // A transient failure overlapping a suspend enrolls the turn.
     let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], error_message);
     services
         .run_connection_prompt_turn(
             &conn,
