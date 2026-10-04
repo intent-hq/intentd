@@ -103,6 +103,7 @@ impl Store {
                     .journal_mode(SqliteJournalMode::Delete)
                     .synchronous(SqliteSynchronous::Full)
                     .pragma("page_size", "4096")
+                    .pragma("auto_vacuum", "NONE")
                     .pragma("max_page_count", max_pages.to_string())
                     .pragma("mmap_size", "0");
                 // One connection serializes both reads and writes. No parked arena
@@ -122,6 +123,12 @@ impl Store {
                     let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
                         .fetch_one(&mut *tx).await.map_err(db_error)?;
                     if page_size != 4096 { return Err(invalid()); }
+                    // Existing files cannot change this geometry by pragma
+                    // alone. Reject relocation modes rather than silently run
+                    // extra page-move/journaling work or VACUUM user storage.
+                    let auto_vacuum: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+                        .fetch_one(&mut *tx).await.map_err(db_error)?;
+                    if auto_vacuum != 0 { return Err(invalid()); }
                     let actual: i64 = sqlx::query_scalar("PRAGMA max_page_count")
                         .fetch_one(&mut *tx)
                         .await
@@ -242,6 +249,46 @@ mod tests {
             .await
             .unwrap();
         second.close().await;
+    }
+
+    #[tokio::test]
+    async fn artifact_arena_rejects_existing_auto_vacuum_relocation() {
+        for mode in ["FULL", "INCREMENTAL"] {
+            let directory = tempfile::tempdir().unwrap();
+            let main_path = directory.path().join("main.sqlite");
+            let arena_path = directory.path().join("arena.sqlite");
+            let first = Store::open(&main_path).await.unwrap();
+            first
+                .configure_note_artifact_arena(&arena_path, 64)
+                .await
+                .unwrap();
+            first.close().await;
+            let outside = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(SqliteConnectOptions::new().filename(&arena_path))
+                .await
+                .unwrap();
+            sqlx::query(&format!("PRAGMA auto_vacuum={mode}"))
+                .execute(&outside)
+                .await
+                .unwrap();
+            sqlx::query("VACUUM").execute(&outside).await.unwrap();
+            let actual: i64 = sqlx::query_scalar("PRAGMA auto_vacuum")
+                .fetch_one(&outside)
+                .await
+                .unwrap();
+            assert_ne!(actual, 0, "fixture must actually enable relocation");
+            outside.close().await;
+            let reopened = Store::open(&main_path).await.unwrap();
+            let result = reopened
+                .configure_note_artifact_arena(&arena_path, 64)
+                .await;
+            reopened.close().await;
+            assert!(
+                result.is_err(),
+                "arena accepted existing {mode} auto-vacuum configuration"
+            );
+        }
     }
 
     #[tokio::test]
