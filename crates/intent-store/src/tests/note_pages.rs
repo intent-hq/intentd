@@ -2809,6 +2809,132 @@ async fn artifact_publication_requests(
 }
 
 #[tokio::test]
+async fn artifact_lease_record_read_is_scoped_indexed_and_revocable() {
+    let (store, _temporary, _note, begin) = artifact_begin_fixture().await;
+    let (seal, admit) = artifact_publication_requests(&store, &begin).await;
+    let sealed = store
+        .seal_note_artifact_journal("alice", "pages", &seal)
+        .await
+        .unwrap();
+    for reference in [&seal.job_ref, sealed.private_artifact_ref.as_ref().unwrap()] {
+        assert!(store
+            .read_note_artifact_journal_record("alice", "pages", reference, 0)
+            .await
+            .is_err());
+    }
+    let lease = store
+        .admit_note_artifact_journal("alice", "pages", &admit)
+        .await
+        .unwrap();
+    // Drop construction-side request objects. This checks stored record backing,
+    // not physical renderer retirement or a source-lease transfer implementation.
+    drop(seal);
+    drop(begin);
+    let record = store
+        .read_note_artifact_journal_record("alice", "pages", &lease.artifact_ref, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.sequence, 0);
+    assert_eq!(record.record, r#"{"kind":"diff.manifest","value":{}}"#);
+    assert_eq!(record.digest, lease.final_digest);
+    assert!(store
+        .read_note_artifact_journal_record("alice", "pages", &lease.artifact_ref, 1)
+        .await
+        .unwrap()
+        .is_none());
+    for (principal, workspace) in [("bob", "pages"), ("alice", "other")] {
+        assert!(store
+            .read_note_artifact_journal_record(principal, workspace, &lease.artifact_ref, 0)
+            .await
+            .is_err());
+    }
+    assert!(store
+        .read_note_artifact_journal_record("alice", "pages", &lease.artifact_ref, u64::MAX)
+        .await
+        .is_err());
+    let plan = sqlx::query("EXPLAIN QUERY PLAN SELECT previous_digest,digest,record FROM note_artifact_record WHERE generation=? AND sequence=?")
+        .bind(&lease.generation).bind(0_i64).fetch_all(store.read_pool()).await.unwrap();
+    let details = plan
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+    assert!(
+        details
+            .iter()
+            .any(|s| s.contains("SEARCH note_artifact_record")
+                && s.contains("generation=? AND sequence=?")),
+        "{details:?}"
+    );
+    store
+        .release_note_artifact_lease("alice", "pages", &lease.artifact_ref)
+        .await
+        .unwrap();
+    assert!(store
+        .read_note_artifact_journal_record("alice", "pages", &lease.artifact_ref, 0)
+        .await
+        .is_err());
+    let replay = store
+        .admit_note_artifact_journal("alice", "pages", &admit)
+        .await
+        .unwrap();
+    assert_eq!(replay, lease);
+    assert!(store
+        .read_note_artifact_journal_record("alice", "pages", &replay.artifact_ref, 0)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn artifact_record_reads_reject_abort_source_change_and_restart() {
+    for transition in ["abort", "source", "restart"] {
+        let (store, temporary, mut note, begin) = artifact_begin_fixture().await;
+        let (seal, admit) = artifact_publication_requests(&store, &begin).await;
+        store
+            .seal_note_artifact_journal("alice", "pages", &seal)
+            .await
+            .unwrap();
+        let lease = store
+            .admit_note_artifact_journal("alice", "pages", &admit)
+            .await
+            .unwrap();
+        assert!(store
+            .read_note_artifact_journal_record("alice", "pages", &lease.artifact_ref, 0)
+            .await
+            .unwrap()
+            .is_some());
+        match transition {
+            "abort" => {
+                store
+                    .abort_note_artifact_journal("alice", "pages", &seal.job_ref)
+                    .await
+                    .unwrap();
+            }
+            "source" => {
+                note.title = "revoked source revision".into();
+                store.update_note(&note).await.unwrap();
+            }
+            "restart" => {
+                let restarted = crate::Store::open(&temporary.path).await.unwrap();
+                assert!(restarted
+                    .read_note_artifact_journal_record("alice", "pages", &lease.artifact_ref, 0)
+                    .await
+                    .is_err());
+                continue;
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            store
+                .read_note_artifact_journal_record("alice", "pages", &lease.artifact_ref, 0)
+                .await
+                .is_err(),
+            "{transition}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn artifact_seal_and_admit_replay_cannot_revive_released_lease() {
     let (store, _temporary, _note, begin) = artifact_begin_fixture().await;
     let (seal, admit) = artifact_publication_requests(&store, &begin).await;
