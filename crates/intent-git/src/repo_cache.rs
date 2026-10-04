@@ -2885,8 +2885,8 @@ mod tests {
                 .find_branch("topic", git2::BranchType::Local)
                 .unwrap();
             assert_eq!(
-                branch.upstream().unwrap().get().name(),
-                Some("refs/remotes/origin/topic"),
+                branch.upstream().unwrap().get().name().unwrap(),
+                "refs/remotes/origin/topic",
                 "Direct checkout retains upstream tracking"
             );
             assert_eq!(
