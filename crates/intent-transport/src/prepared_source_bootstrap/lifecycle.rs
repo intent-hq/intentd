@@ -1,7 +1,7 @@
 //! Isolated source lifecycle dispatcher. No Store access, generic router or String queue.
 use super::{
-    cancelled, internal, watch, AsyncWriteExt, Context, CountedTcp, Duration, Error, Future,
-    Message, Result, Revocations, Shared, SinkExt, StreamExt, WebSocketStream,
+    cancelled, internal, watch, Context, CountedTcp, Duration, Error, Future, Message, Result,
+    Revocations, Shared, SinkExt, StreamExt, WebSocketStream,
 };
 #[cfg(test)]
 use super::{io, Arc, Ordering};

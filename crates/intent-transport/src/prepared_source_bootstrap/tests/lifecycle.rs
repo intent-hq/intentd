@@ -358,20 +358,21 @@ async fn source_lifecycle_real_wss_incremental_raw_code_and_replacement_cleanup(
             >= 2
     })
     .await;
-    let observations = f.shared.observe.lock().unwrap();
-    let source = observations
-        .iter()
-        .find(|o| o.written > 65536)
-        .expect("legitimate traversal exceeds handshake lifetime output ceiling");
-    assert!(source.read > 65536);
-    assert!(source.closed);
-    eprintln!(
-        "source-lifecycle real TLS: fragments={fragments} read={} written={} bytes={}",
-        source.read,
-        source.written,
-        raw.len()
-    );
-    drop(observations);
+    {
+        let observations = f.shared.observe.lock().unwrap();
+        let source = observations
+            .iter()
+            .find(|o| o.written > 65536)
+            .expect("legitimate traversal exceeds handshake lifetime output ceiling");
+        assert!(source.read > 65536);
+        assert!(source.closed);
+        eprintln!(
+            "source-lifecycle real TLS: fragments={fragments} read={} written={} bytes={}",
+            source.read,
+            source.written,
+            raw.len()
+        );
+    }
     f.finish().await;
 }
 
@@ -496,7 +497,7 @@ async fn cleanup_receipt(f: &Fixture, op: &Operation) -> Value {
     drop(cleanup);
     result
 }
-fn raw_request(id: Value, method: &str, params: Value, bytes: usize) -> String {
+fn raw_request(id: &Value, method: &str, params: &Value, bytes: usize) -> String {
     let mut raw = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string();
     if bytes > raw.len() {
         raw.extend(std::iter::repeat_n(' ', bytes - raw.len()));
@@ -509,7 +510,7 @@ fn masked_frame(opcode: u8, final_frame: bool, payload: &[u8]) -> Vec<u8> {
     if payload.len() < 126 {
         out.push(128 | u8::try_from(payload.len()).unwrap());
     } else if payload.len() <= 65535 {
-        out.push(128 | 126);
+        out.push(0x80 | 0x7e);
         out.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
     } else {
         out.push(128 | 127);
@@ -534,8 +535,8 @@ async fn response(ws: &mut Client) -> Option<Value> {
                     assert!(raw.len() <= 8192);
                     return Some(serde_json::from_str(&raw).unwrap());
                 }
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return None,
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return None,
                 Some(Ok(other)) => panic!("unexpected source frame: {other:?}"),
             }
         }
@@ -543,7 +544,11 @@ async fn response(ws: &mut Client) -> Option<Value> {
     .await
     .expect("text response or explicit local connection termination; Ping/Pong are not terminal")
 }
-fn error_response(value: &Value, id: Value, error: intent_core::note_source_session::SessionError) {
+fn error_response(
+    value: &Value,
+    id: &Value,
+    error: intent_core::note_source_session::SessionError,
+) {
     assert_eq!(
         value,
         &json!({"jsonrpc":"2.0","id":id,"error":{"code":error.number(),"message":error.code(),"data":{"code":error.code()}}})
@@ -617,9 +622,9 @@ async fn source_lifecycle_fragmented_hello_and_request_aggregate_boundaries() {
             .await;
             let mut ws = ready(&f, Mode::Read).await;
             let raw = raw_request(
-                json!("bounded-open"),
+                &json!("bounded-open"),
                 "note.sourceSession.open",
-                serde_json::to_value(&op).unwrap(),
+                &serde_json::to_value(&op).unwrap(),
                 65536 + extra,
             );
             if fragmented_input {
@@ -687,7 +692,7 @@ async fn source_lifecycle_duplicate_epoch_sequence_and_cleanup_mode_are_terminal
     let request = json!({"workspaceId":op.descriptor.workspace_id,"operationId":op.operation_id,"sequence":0,"request":{"kind":"context","contextRef":binding.owner_ref,"maxItems":1,"maxWireBytes":8192}});
     replacement
         .send(Message::Text(
-            raw_request(json!(4), "note.sourceSession.read", request.clone(), 0).into(),
+            raw_request(&json!(4), "note.sourceSession.read", &request, 0).into(),
         ))
         .await
         .unwrap();
@@ -708,27 +713,27 @@ async fn source_lifecycle_duplicate_epoch_sequence_and_cleanup_mode_are_terminal
     let mut next = json!({"workspaceId":op.descriptor.workspace_id,"operationId":op.operation_id,"sequence":0,"request":{"kind":"metadata","ref":owner_page["items"][0]["attributesRef"],"maxItems":1,"maxWireBytes":8192}});
     original
         .send(Message::Text(
-            raw_request(json!(6), "note.sourceSession.read", next.clone(), 0).into(),
+            raw_request(&json!(6), "note.sourceSession.read", &next, 0).into(),
         ))
         .await
         .unwrap();
     error_response(
         &response(&mut original).await.unwrap(),
-        json!(6),
+        &json!(6),
         intent_core::note_source_session::SessionError::Sequence,
     );
     next["sequence"] = json!(1);
     // An otherwise-valid continuation cannot revive this same terminal connection.
     let sent = original
         .send(Message::Text(
-            raw_request(json!(9), "note.sourceSession.read", next, 0).into(),
+            raw_request(&json!(9), "note.sourceSession.read", &next, 0).into(),
         ))
         .await;
     if let Some(value) = response(&mut original).await {
         assert!(sent.is_ok());
         error_response(
             &value,
-            json!(9),
+            &json!(9),
             intent_core::note_source_session::SessionError::Unavailable,
         );
         assert!(response(&mut original).await.is_none());
@@ -742,9 +747,9 @@ async fn source_lifecycle_duplicate_epoch_sequence_and_cleanup_mode_are_terminal
     cleanup
         .send(Message::Text(
             raw_request(
-                json!(7),
+                &json!(7),
                 "note.sourceSession.open",
-                serde_json::to_value(&op).unwrap(),
+                &serde_json::to_value(&op).unwrap(),
                 0,
             )
             .into(),
@@ -754,7 +759,7 @@ async fn source_lifecycle_duplicate_epoch_sequence_and_cleanup_mode_are_terminal
     assert!(response(&mut cleanup).await.unwrap().get("error").is_some());
     cleanup
         .send(Message::Text(
-            raw_request(json!(8), "note.sourceSession.read", request, 0).into(),
+            raw_request(&json!(8), "note.sourceSession.read", &request, 0).into(),
         ))
         .await
         .unwrap();
@@ -791,9 +796,9 @@ async fn source_lifecycle_pending_input_observer_preserves_partial_frame_without
     let pending = f.shared.source_pending.load(Ordering::Acquire);
     ws.send(Message::Text(
         raw_request(
-            json!(2),
+            &json!(2),
             "note.sourceSession.read",
-            owner_request(&op, &binding, 0),
+            &owner_request(&op, &binding, 0),
             0,
         )
         .into(),
@@ -813,9 +818,9 @@ async fn source_lifecycle_pending_input_observer_preserves_partial_frame_without
     assert_eq!(owner["id"], 2);
     let attrs = owner["result"]["items"][0]["attributesRef"].clone();
     let next = raw_request(
-        json!(3),
+        &json!(3),
         "note.sourceSession.read",
-        json!({"workspaceId":op.descriptor.workspace_id,"operationId":op.operation_id,"sequence":1,"request":{"kind":"metadata","ref":attrs,"maxItems":1,"maxWireBytes":8192}}),
+        &json!({"workspaceId":op.descriptor.workspace_id,"operationId":op.operation_id,"sequence":1,"request":{"kind":"metadata","ref":attrs,"maxItems":1,"maxWireBytes":8192}}),
         0,
     );
     let frame = masked_frame(1, true, next.as_bytes());
@@ -857,9 +862,9 @@ async fn source_lifecycle_completed_ping_during_held_store_read_revokes_and_wait
     let pending = f.shared.source_pending.load(Ordering::Acquire);
     ws.send(Message::Text(
         raw_request(
-            json!(2),
+            &json!(2),
             "note.sourceSession.read",
-            owner_request(&op, &binding, 0),
+            &owner_request(&op, &binding, 0),
             0,
         )
         .into(),
@@ -914,16 +919,16 @@ async fn source_lifecycle_guest_revocation_during_actual_pool_wait_blocks_disclo
         0,
     )
     .await;
-    let mut held = Vec::new();
+    let mut pool_connections = Vec::new();
     for _ in 0..32 {
-        held.push(f.store.read_pool().acquire().await.unwrap());
+        pool_connections.push(f.store.read_pool().acquire().await.unwrap());
     }
     let pending = f.shared.source_pending.load(Ordering::Acquire);
     ws.send(Message::Text(
         raw_request(
-            json!(2),
+            &json!(2),
             "note.sourceSession.read",
-            owner_request(&op, &binding, 0),
+            &owner_request(&op, &binding, 0),
             0,
         )
         .into(),
@@ -935,11 +940,11 @@ async fn source_lifecycle_guest_revocation_during_actual_pool_wait_blocks_disclo
         .remove_workspace_member(&workspace, &guest)
         .await
         .unwrap();
-    drop(held);
+    drop(pool_connections);
     let denied = response(&mut ws).await.unwrap();
     error_response(
         &denied,
-        json!(2),
+        &json!(2),
         intent_core::note_source_session::SessionError::NotFound,
     );
     drop(ws);
@@ -1015,9 +1020,9 @@ async fn source_lifecycle_final_control_auth_retains_writer_without_input_poll()
         }
         ws.send(Message::Text(
             raw_request(
-                json!(2),
+                &json!(2),
                 "note.sourceSession.open",
-                serde_json::to_value(&op).unwrap(),
+                &serde_json::to_value(&op).unwrap(),
                 0,
             )
             .into(),
@@ -1082,9 +1087,9 @@ async fn source_lifecycle_final_page_auth_retains_exact_cancelled_continuation()
         *f.shared.page_auth_gate.lock().unwrap() = Some(gate.clone());
         ws.send(Message::Text(
             raw_request(
-                json!(2),
+                &json!(2),
                 "note.sourceSession.read",
-                owner_request(&op, &binding, 0),
+                &owner_request(&op, &binding, 0),
                 0,
             )
             .into(),
@@ -1158,9 +1163,9 @@ async fn source_lifecycle_recovery_source_validation_rejects_mutation_and_recrea
         *f.shared.page_auth_gate.lock().unwrap() = Some(gate.clone());
         ws.send(Message::Text(
             raw_request(
-                json!(2),
+                &json!(2),
                 "note.sourceSession.read",
-                owner_request(&op, &binding, 0),
+                &owner_request(&op, &binding, 0),
                 0,
             )
             .into(),
@@ -1184,7 +1189,7 @@ async fn source_lifecycle_recovery_source_validation_rejects_mutation_and_recrea
         gate.release.notify_one();
         error_response(
             &response(&mut ws).await.unwrap(),
-            json!(2),
+            &json!(2),
             intent_core::note_source_session::SessionError::Stale,
         );
         drop(ws);
@@ -1210,9 +1215,9 @@ async fn source_lifecycle_recovery_discarded_replies_reconcile_only_by_original_
         original
             .send(Message::Text(
                 raw_request(
-                    json!(1),
+                    &json!(1),
                     "note.sourceSession.open",
-                    serde_json::to_value(&op).unwrap(),
+                    &serde_json::to_value(&op).unwrap(),
                     0,
                 )
                 .into(),
@@ -1229,9 +1234,9 @@ async fn source_lifecycle_recovery_discarded_replies_reconcile_only_by_original_
             original
                 .send(Message::Text(
                     raw_request(
-                        json!(2),
+                        &json!(2),
                         "note.sourceSession.read",
-                        owner_request(&op, &binding, 0),
+                        &owner_request(&op, &binding, 0),
                         0,
                     )
                     .into(),
@@ -1247,9 +1252,9 @@ async fn source_lifecycle_recovery_discarded_replies_reconcile_only_by_original_
             original
                 .send(Message::Text(
                     raw_request(
-                        json!(3),
+                        &json!(3),
                         "note.sourceSession.close",
-                        serde_json::to_value(&op).unwrap(),
+                        &serde_json::to_value(&op).unwrap(),
                         0,
                     )
                     .into(),
@@ -1275,9 +1280,9 @@ async fn source_lifecycle_recovery_discarded_replies_reconcile_only_by_original_
         replacement
             .send(Message::Text(
                 raw_request(
-                    json!(5),
+                    &json!(5),
                     "note.sourceSession.read",
-                    owner_request(&op, &binding, 0),
+                    &owner_request(&op, &binding, 0),
                     0,
                 )
                 .into(),
@@ -1286,7 +1291,7 @@ async fn source_lifecycle_recovery_discarded_replies_reconcile_only_by_original_
             .unwrap();
         error_response(
             &response(&mut replacement).await.unwrap(),
-            json!(5),
+            &json!(5),
             intent_core::note_source_session::SessionError::Unavailable,
         );
         drop(replacement);
@@ -1356,9 +1361,9 @@ async fn source_lifecycle_capacity_retains_cleanup_and_finite_cancellation_histo
         let mut ws = ready(&f, Mode::Read).await;
         ws.send(Message::Text(
             raw_request(
-                json!(1000),
+                &json!(1000),
                 "note.sourceSession.open",
-                serde_json::to_value(&over).unwrap(),
+                &serde_json::to_value(&over).unwrap(),
                 0,
             )
             .into(),
@@ -1367,7 +1372,7 @@ async fn source_lifecycle_capacity_retains_cleanup_and_finite_cancellation_histo
         .unwrap();
         error_response(
             &response(&mut ws).await.unwrap(),
-            json!(1000),
+            &json!(1000),
             intent_core::note_source_session::SessionError::Capacity,
         );
         drop(ws);
@@ -1394,9 +1399,9 @@ async fn source_lifecycle_capacity_retains_cleanup_and_finite_cancellation_histo
         cleanup
             .send(Message::Text(
                 raw_request(
-                    json!(1001),
+                    &json!(1001),
                     "note.sourceSession.close",
-                    serde_json::to_value(&over).unwrap(),
+                    &serde_json::to_value(&over).unwrap(),
                     0,
                 )
                 .into(),
@@ -1405,7 +1410,7 @@ async fn source_lifecycle_capacity_retains_cleanup_and_finite_cancellation_histo
             .unwrap();
         error_response(
             &response(&mut cleanup).await.unwrap(),
-            json!(1001),
+            &json!(1001),
             intent_core::note_source_session::SessionError::Capacity,
         );
         assert_eq!(
@@ -1448,9 +1453,9 @@ async fn source_lifecycle_capacity_unknown_incarnation_and_signed_deadline_refus
         let mut ws = ready(&f, Mode::Read).await;
         ws.send(Message::Text(
             raw_request(
-                json!(-1),
+                &json!(-1),
                 "note.sourceSession.open",
-                serde_json::to_value(&op).unwrap(),
+                &serde_json::to_value(&op).unwrap(),
                 0,
             )
             .into(),
@@ -1459,7 +1464,7 @@ async fn source_lifecycle_capacity_unknown_incarnation_and_signed_deadline_refus
         .unwrap();
         error_response(
             &response(&mut ws).await.unwrap(),
-            json!(-1),
+            &json!(-1),
             intent_core::note_source_session::SessionError::Expired,
         );
         drop(ws);
