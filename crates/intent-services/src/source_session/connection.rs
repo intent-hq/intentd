@@ -308,6 +308,10 @@ impl SourceConnection {
     /// # Errors
     /// Rejects stale contexts, wrong identities, invalid requests or sequences,
     /// unavailable read credit, and uncertain source/registry ownership.
+    ///
+    /// # Panics
+    /// In test builds, the spawned worker asserts that its task-local caller
+    /// matches the original admitted caller.
     pub fn read(
         &self,
         read: Read,

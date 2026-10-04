@@ -219,6 +219,10 @@ async fn real_open_duplicate_delivery_and_replacement_cleanup_do_not_rebind() {
         op.descriptor.accept_until
     );
     let read:Read=serde_json::from_value(json!({"workspaceId":ws.0,"operationId":op.operation_id,"sequence":0,"request":{"kind":"context","contextRef":binding.owner_ref,"maxItems":1,"maxWireBytes":8192}})).unwrap();
+    #[expect(
+        clippy::async_yields_async,
+        reason = "Admit under the ambient daemon scope, then await outside it to verify the worker's original caller"
+    )]
     let pending = intent_core::with_caller(Caller::Daemon, async {
         original.read(read, json!(1)).unwrap()
     })
