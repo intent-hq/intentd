@@ -821,6 +821,7 @@ jobs:
         timeout-minutes: 20
         shell: bash
         env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_TUNNEL_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
           INTENTD_TUNNEL_TARGET: ${{ matrix.target }}
           CARGO_BUILD_JOBS: "2"
@@ -921,13 +922,15 @@ jobs:
         timeout-minutes: 20
         shell: bash
         env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_COW_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
           INTENTD_TEST_REQUIRE_COW: "1"
           CARGO_BUILD_JOBS: "2"
         run: |
           set -euo pipefail
-          # Preserve ordinary Forbidden errors and unwind fixture guards on red.
-          unset INTENTD_ASSERT_BOUND_CALLER INTENTD_TEST_KEEP_TMP
+          # Keep fixtures armed; the capability probe removes the guard only
+          # in its exact child. Retain scratch cleanup assertions for every case.
+          unset INTENTD_TEST_KEEP_TMP
           tests=(
             tests::worktree_provisioning::create_provisions_cow_checkout_when_isolation_enabled
             tests::worktree_provisioning::duplicate_provisions_cow_checkout_when_isolation_enabled

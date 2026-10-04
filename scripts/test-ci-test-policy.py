@@ -3,16 +3,20 @@
 
 Reads real YAML (PyYAML, already installed in release-scripts). The command
 scan covers current bare and rustup-run test commands, not echoed plans or
-command-substitution discovery lists; it is not a general shell parser.
+command-substitution discovery lists. Current indirect routes have explicit
+registration plus actual stub-child probes below, not a general shell parser.
 Mutation tests ensure removed/disabled step policy and missing wiring fail.
 """
 
 import copy
+import json
 import os
 from pathlib import Path
 import re
 import shlex
 import subprocess
+import sys
+import tempfile
 import unittest
 
 import yaml
@@ -20,6 +24,13 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 JOBS = ("check", "build", "coverage-e2e", "coverage-all", "coverage-changed")
+# These required steps launch through Python or a Bash array; scanning shell
+# command prefixes cannot discover their runtime children. Execute their real
+# workflow bodies with a stub rustup in test_indirect_workflow_child_environments.
+INDIRECT_TEST_STEPS = {
+    ("build", "Tunnel deadline and TLS controls (macOS runtime)"),
+    ("build", "Retained workspace CoW fixtures (macOS runtime)"),
+}
 COMMAND = re.compile(
     r"^(?:[A-Z_]+=\S+\s+)*(?:(?:rustup\s+run\s+\S+\s+)?cargo\s+(?:test\b|nextest\s+run\b|llvm-cov\b[^\n]*\bnextest\b)"
     r"|\./scripts/(?:coverage-e2e|coverage-all|changed-tests)\.sh\b)"
@@ -31,7 +42,7 @@ def test_steps(workflow):
         job = workflow["jobs"][name]
         for step in job["steps"]:
             run = str(step.get("run", ""))
-            if any(COMMAND.search(line.strip()) and "--dry-run" not in line for line in run.splitlines()):
+            if (name, step.get("name")) in INDIRECT_TEST_STEPS or any(COMMAND.search(line.strip()) and "--dry-run" not in line for line in run.splitlines()):
                 yield name, job, step
 
 
@@ -41,7 +52,10 @@ def violations(workflow, policy):
     for name, job, step in test_steps(workflow):
         found.add(name)
         env = {**workflow.get("env", {}), **job.get("env", {}), **step.get("env", {})}
-        command_policies = []
+        command_policies = [str(env.get("INTENTD_ASSERT_BOUND_CALLER", ""))]
+        # A step-wide unset previously disabled every retained CoW fixture.
+        if re.search(r"^\s*unset\b[^\n]*\bINTENTD_ASSERT_BOUND_CALLER\b", str(step.get("run", "")), re.M):
+            command_policies.append("")
         for line in str(step.get("run", "")).splitlines():
             if COMMAND.search(line.strip()) and "--dry-run" not in line:
                 command_env = dict(env)
@@ -79,6 +93,9 @@ REQUIRED_TEST_STEPS = {
     ("check", "GitLab auth and invitations over real sockets with explicit test transports"): 1,
     ("check", "Coverage-skipped tests (STAB-40/43)"): 2,
     ("check", "Installer guard tests (install_ps1_owner)"): 1,
+    # None: indirect Python/Bash-array routes are executed with a stub below.
+    ("build", "Tunnel deadline and TLS controls (macOS runtime)"): None,
+    ("build", "Retained workspace CoW fixtures (macOS runtime)"): None,
     ("build", "Codex diagnostic process ownership (Windows runtime)"): 1,
     ("build", "Codex focused diagnostics (macOS runtime)"): 2,
     ("coverage-e2e", "Run e2e coverage"): 1,
@@ -124,8 +141,58 @@ class CiPolicyTests(unittest.TestCase):
             discovered[(name, step["name"])] = sum(
                 bool(COMMAND.search(line.strip())) and "--dry-run" not in line
                 for line in step["run"].splitlines()
-            )
+            ) or None
         self.assertEqual(discovered, REQUIRED_TEST_STEPS)
+
+    def test_indirect_route_cannot_unset_policy(self):
+        for step_name in ("Tunnel deadline and TLS controls (macOS runtime)",
+                          "Retained workspace CoW fixtures (macOS runtime)"):
+            with self.subTest(step=step_name):
+                workflow = copy.deepcopy(self.workflow)
+                step = next(s for s in workflow['jobs']['build']['steps'] if s.get('name') == step_name)
+                step['run'] = 'unset INTENTD_ASSERT_BOUND_CALLER\n' + step['run']
+                self.assertIn(f"build: {step_name} must arm INTENTD_ASSERT_BOUND_CALLER=1", violations(workflow, "1"))
+
+    def test_indirect_workflow_child_environments(self):
+        for step_name, expected_tests in (
+            ("Tunnel deadline and TLS controls (macOS runtime)", 8),
+            ("Retained workspace CoW fixtures (macOS runtime)", 6),
+        ):
+            with self.subTest(step=step_name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                stub = root / "rustup"
+                stub.write_text(
+                    f"#!{sys.executable} -S\n"
+                    "import json,os,sys\n"
+                    "args=sys.argv[1:]\n"
+                    "with open(os.environ['POLICY_CHILD_LOG'],'a') as log:\n"
+                    " log.write(json.dumps([args,os.environ.get('INTENTD_ASSERT_BOUND_CALLER')])+'\\n')\n"
+                    "if '--no-run' in args: sys.exit(0)\n"
+                    "test=args[args.index('--')-1]\n"
+                    "if '--list' in args:\n"
+                    " print(test+': test'); print('1 test, 0 benchmarks'); sys.exit(0)\n"
+                    "print('running 1 test')\n"
+                    "print('test result: ok. 1 passed; 0 failed; 0 ignored;')\n"
+                    "print('CoW fixture clone and independent contents verified')\n"
+                    "print('CoW fixture proof scratch cleaned')\n"
+                    "print('CoW fixture assertions passed: '+test.split('::')[-1])\n"
+                )
+                stub.chmod(0o755)
+                step = next(s for s in self.workflow['jobs']['build']['steps'] if s.get('name') == step_name)
+                env = {**os.environ, 'INTENTD_ASSERT_BOUND_CALLER': '0', **step.get('env', {})}
+                env = {k: re.sub(r'\$\{\{.*?\}\}', 'fixture', str(v)) for k, v in env.items()}
+                env.update(PATH=str(root)+os.pathsep+os.environ['PATH'], RUNNER_TEMP=str(root), POLICY_CHILD_LOG=str(root/'children.jsonl'))
+                run = step['run'].replace('${{ matrix.target }}', 'fixture')
+                result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', run], cwd=root, env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+                calls = [json.loads(line) for line in (root/'children.jsonl').read_text().splitlines()]
+                runtime = [(args, policy) for args, policy in calls if '--nocapture' in args]
+                self.assertEqual(len(runtime), expected_tests)
+                for args, policy in runtime:
+                    self.assertEqual(policy, '1', args)
+                    self.assertIn('--exact', args)
+                    self.assertIn('--test-threads=1', args)
+                self.assertEqual(len([args for args, _ in calls if '--list' in args]), expected_tests)
 
     def test_rustup_runtime_commands_are_discovered(self):
         for command in (
