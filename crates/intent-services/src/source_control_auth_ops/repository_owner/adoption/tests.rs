@@ -1486,13 +1486,17 @@ async fn completed_descriptor_change_quarantines_all_stored_consumers_without_re
             );
             assert_eq!(std::fs::read(source.path()).unwrap(), original_bytes);
         }
+        let recovery_host = GitlabHost::parse("gitlab.test")
+            .unwrap()
+            .with_api_origin(server.host.base_url())
+            .unwrap();
         f.services
-            .gitlab_connect_pat(server.host.clone(), "fresh-pat".into())
+            .gitlab_connect_pat(recovery_host.clone(), "fresh-pat".into())
             .await
             .unwrap();
         assert!(f.directory.binding().is_ok());
         assert_eq!(
-            f.services.own_gitlab_token(&server.host).await.as_deref(),
+            f.services.own_gitlab_token(&recovery_host).await.as_deref(),
             Some("fresh-pat")
         );
     }
