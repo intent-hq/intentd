@@ -283,6 +283,7 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
 /// is replaced the same way), an object is merged into — so EVERY drained
 /// row names its entry.
 pub(crate) fn stamp_queued_message_id(msg: &mut QueuedMessage) {
+    msg.stamp_correlation();
     if crate::script_monitor::monitor_id(msg.message_metadata.as_ref()).is_some() {
         return;
     }
@@ -501,6 +502,10 @@ async fn cancel_and_settle_idle_prompt(
 /// options; queue-drained follow-up turns run with [`TurnOptions::default`]
 /// since a `QueuedMessage` has no per-turn hints of its own.
 #[derive(Debug, Default, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Shutdown, prompt, priority and queue provenance are independent per-turn flags"
+)]
 pub struct TurnOptions {
     /// Resume recovery must retain its pending interruption when shutdown
     /// refuses admission, rather than hiding it behind an ordinary queue.
@@ -543,7 +548,10 @@ pub struct TurnOptions {
     pub queued_at: Option<String>,
     /// Submission IDs absorbed by a queued row, retained through failed drains.
     pub queued_submission_ids: Vec<String>,
+    pub(crate) recovery_sources: Vec<crate::agent_ops::RecoverySource>,
     pub queued_submission_order: u64,
+    /// Explicit provenance: legacy rehydration may assign a synthetic positive order.
+    pub queued_correlation_order_known: bool,
     pub latest_human_submission_at: Option<String>,
     /// STAB-114 / monorepo#1014: text of the user message preempted by a
     /// zero-output interrupt, delivered AHEAD of this turn's own `content` in
@@ -652,7 +660,9 @@ fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
         suppress_report_clear: stale,
         queued_at: Some(entry.queued_at.clone()),
         queued_submission_ids: entry.submission_ids(),
+        recovery_sources: entry.recovery_sources.clone(),
         queued_submission_order: entry.submission_order,
+        queued_correlation_order_known: entry.correlation_order_known,
         latest_human_submission_at: entry.latest_human_submission_at.clone(),
         prepend_content: entry.prepend_content.clone(),
         prepend_image_blocks: entry.prepend_image_blocks.clone(),
@@ -7152,6 +7162,7 @@ impl AgentManager {
         message_id: Option<String>,
         mut options: TurnOptions,
     ) -> Result<Value> {
+        crate::agent_ops::validate_submission_id(message_id.as_deref())?;
         if options.reject_on_shutdown && self.is_shutting_down() {
             return Err(Error::Internal("daemon is shutting down".into()));
         }
@@ -7173,6 +7184,7 @@ impl AgentManager {
                 .queue_submission_order
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
+            options.queued_correlation_order_known = true;
         }
         // A2A sender header (intent-hq/intent#3721, monorepo#1015): the runtime front door — gated
         // on the daemon-stamped `fromAgentId`, applied BEFORE every branch
@@ -7201,6 +7213,16 @@ impl AgentManager {
         // the target lives in, not the caller's.
         let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
         let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
+        if let Some(result) = self.services.submission_replay(
+            &agent_id,
+            &message_id,
+            options.message_metadata.as_ref(),
+        )? {
+            return Ok(result);
+        }
+        options.queued_submission_ids = vec![message_id.clone()];
+        crate::agent_ops::stamp_direct_correlation(&mut options.message_metadata, &message_id);
+
         // Quarantine gate (monorepo#840): a provably-poisoned session (parked
         // in Error with a session-fatal provider block, or a streak of
         // identical terminal failures) must NOT be redriven by message
@@ -7215,7 +7237,7 @@ impl AgentManager {
                 stop_reason = session.stop_reason.as_deref().unwrap_or(""),
                 "session is quarantined (poisoned); parking message in queue instead of driving a turn"
             );
-            let (queued, position) = self.services.enqueue_message_with_id(
+            let (queued, position) = self.services.enqueue_submission(
                 &agent_id,
                 Some(message_id.clone()),
                 content,
@@ -7225,14 +7247,15 @@ impl AgentManager {
                 options.queued_prepend(),
                 options.interrupt_priority,
                 options.origin,
-            );
-            let result = json!({
+            )?;
+            let mut result = json!({
                 "success": true,
                 "queued": true,
                 "quarantined": true,
                 "queuedMessage": queued.to_value(position),
                 "turnId": queued.turn_id,
             });
+            queued.attach_correlation(&mut result);
             self.services.publish_queue_updated(&agent_id).await;
             // Close the check-then-park race: a concurrent `agent.retry` may
             // have cleared the Error + streak and finished its drain between
@@ -7267,7 +7290,7 @@ impl AgentManager {
         if !options.origin.is_user() && !workspace_id.is_chief() {
             match self.services.store.get_workspace(&workspace_id).await {
                 Ok(ws) if ws.archived => {
-                    let (queued, position) = self.services.enqueue_message_with_id(
+                    let (queued, position) = self.services.enqueue_submission(
                         &agent_id,
                         Some(message_id.clone()),
                         content,
@@ -7277,14 +7300,15 @@ impl AgentManager {
                         options.queued_prepend(),
                         options.interrupt_priority,
                         options.origin,
-                    );
-                    let result = json!({
+                    )?;
+                    let mut result = json!({
                         "success": true,
                         "queued": true,
                         "archivedParked": true,
                         "queuedMessage": queued.to_value(position),
                         "turnId": queued.turn_id,
                     });
+                    queued.attach_correlation(&mut result);
                     self.services.publish_queue_updated(&agent_id).await;
                     // Race close (archived-check → enqueue vs a concurrent
                     // `workspace.unarchive`): the unarchive's own drain kick
@@ -7340,7 +7364,7 @@ impl AgentManager {
                 Ok(ws) if ws.archived
             )
         {
-            let (queued, position) = self.services.enqueue_message_with_id(
+            let (queued, position) = self.services.enqueue_submission(
                 &agent_id,
                 Some(message_id.clone()),
                 content,
@@ -7350,13 +7374,14 @@ impl AgentManager {
                 options.queued_prepend(),
                 options.interrupt_priority,
                 options.origin,
-            );
-            let result = json!({
+            )?;
+            let mut result = json!({
                 "success": true,
                 "queued": true,
                 "queuedMessage": queued.to_value(position),
                 "turnId": queued.turn_id,
             });
+            queued.attach_correlation(&mut result);
             self.services.publish_queue_updated(&agent_id).await;
             self.clone()
                 .try_drain_queue(agent_id.clone(), workspace_id.clone())
@@ -7402,9 +7427,9 @@ impl AgentManager {
                     options.queued_prepend(),
                     options.interrupt_priority,
                     options.origin,
-                )
+                )?
             } else {
-                self.services.enqueue_message_with_id(
+                self.services.enqueue_submission(
                     &agent_id,
                     Some(message_id.clone()),
                     content,
@@ -7414,14 +7439,15 @@ impl AgentManager {
                     options.queued_prepend(),
                     options.interrupt_priority,
                     options.origin,
-                )
+                )?
             };
-            let result = json!({
+            let mut result = json!({
                 "success": true,
                 "queued": true,
                 "queuedMessage": queued.to_value(position),
                 "turnId": queued.turn_id,
             });
+            queued.attach_correlation(&mut result);
             self.services.publish_queue_updated(&agent_id).await;
             // Opposite interleaving: the worker released (and ran its exit
             // re-check) between the failed claim and the insert above, so
@@ -7517,7 +7543,7 @@ impl AgentManager {
                         agent_id.0
                     )));
                 }
-                let (queued, position) = self.services.enqueue_message_with_id(
+                let (queued, position) = self.services.enqueue_submission(
                     &agent_id,
                     Some(message_id.clone()),
                     content,
@@ -7527,13 +7553,14 @@ impl AgentManager {
                     options.queued_prepend(),
                     options.interrupt_priority,
                     options.origin,
-                );
-                let result = json!({
+                )?;
+                let mut result = json!({
                     "success": true,
                     "queued": true,
                     "queuedMessage": queued.to_value(position),
                     "turnId": queued.turn_id,
                 });
+                queued.attach_correlation(&mut result);
                 self.services.publish_queue_updated(&agent_id).await;
                 self.clone().try_drain_queue(agent_id, workspace_id).await;
                 return Ok(result);
@@ -7587,6 +7614,7 @@ impl AgentManager {
             "success": true,
             "queued": false,
             "messageId": message.id,
+            "submissionIds": [message.id],
             "turnId": turn_id,
         }))
     }
@@ -7992,7 +8020,9 @@ impl AgentManager {
             suppress_report_clear: stale,
             queued_at: Some(next.queued_at.clone()),
             queued_submission_ids: next.submission_ids(),
+            recovery_sources: next.recovery_sources.clone(),
             queued_submission_order: next.submission_order,
+            queued_correlation_order_known: next.correlation_order_known,
             latest_human_submission_at: next.latest_human_submission_at.clone(),
             prepend_content: next.prepend_content.clone(),
             prepend_image_blocks: next.prepend_image_blocks.clone(),
@@ -8158,7 +8188,9 @@ impl AgentManager {
             suppress_report_clear: stale,
             queued_at: Some(entry.queued_at.clone()),
             queued_submission_ids: entry.submission_ids(),
+            recovery_sources: entry.recovery_sources.clone(),
             queued_submission_order: entry.submission_order,
+            queued_correlation_order_known: entry.correlation_order_known,
             latest_human_submission_at: entry.latest_human_submission_at.clone(),
             prepend_content: entry.prepend_content.clone(),
             prepend_image_blocks: entry.prepend_image_blocks.clone(),
@@ -8567,6 +8599,7 @@ impl AgentManager {
                         "success": true,
                         "queued": false,
                         "messageId": mid,
+                        "submissionIds": [mid],
                         "deduplicated": true,
                     }));
                 }
@@ -12908,7 +12941,9 @@ async fn run_message_worker(
                 suppress_report_clear: stale,
                 queued_at: Some(next.queued_at.clone()),
                 queued_submission_ids,
+                recovery_sources: next.recovery_sources.clone(),
                 queued_submission_order: next.submission_order,
+                queued_correlation_order_known: next.correlation_order_known,
                 latest_human_submission_at: next.latest_human_submission_at.clone(),
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
@@ -13110,7 +13145,9 @@ async fn run_message_worker(
                 suppress_report_clear: stale,
                 queued_at: Some(next.queued_at.clone()),
                 queued_submission_ids,
+                recovery_sources: next.recovery_sources.clone(),
                 queued_submission_order: next.submission_order,
+                queued_correlation_order_known: next.correlation_order_known,
                 latest_human_submission_at: next.latest_human_submission_at.clone(),
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
@@ -13420,6 +13457,20 @@ async fn prepare_flush_turn(
         prepend_image_blocks,
         prepend_file_blocks,
         turn_id: Some(entries[0].turn_id.clone()),
+        // A plural flush may contain just one ordinary merged queue row.
+        // Keep its aliases and arrival order for the ordinary retry path;
+        // multi-row recovery derives source-scoped leaves from flushed_entries.
+        queued_submission_ids: if entries.len() == 1 {
+            entries[0].submission_ids()
+        } else {
+            Vec::new()
+        },
+        queued_submission_order: if entries.len() == 1 {
+            entries[0].submission_order
+        } else {
+            0
+        },
+        queued_correlation_order_known: entries.len() == 1 && entries[0].correlation_order_known,
         interrupt_priority: entries[0].interrupt_priority,
         origin: origin_from_user_flag(entries.iter().any(|m| m.user_origin)),
         // Every entry is `persisted: true` here (the loop above either set
@@ -13513,6 +13564,8 @@ async fn persist_user(
     let block_md = message_metadata.and_then(|md| match md {
         Value::Object(m) => {
             let mut m = m.clone();
+            m.remove("submissionIds");
+            m.remove("recoverySources");
             m.remove(intent_core::USER_APP_MESSAGE_ID_KEY);
             m.remove(intent_core::FROM_PRINCIPAL_ID_KEY);
             (!m.is_empty()).then_some(Value::Object(m))
@@ -13627,6 +13680,11 @@ async fn persist_user(
     }
     mgr.services
         .publish_agent_message_events(workspace_id, agent_id, &message, turn_id)
+        .await;
+    // A durable row settles its provisional arrival barrier while the
+    // draining guard can remain visible during the rest of a batch.
+    mgr.services
+        .publish_queue_updated_after_drain_persist(agent_id, workspace_id)
         .await;
     // Answer intake (PROTOCOL §5.5, pending questions): same contract as the
     // direct-send persist — a `question_answers` tag naming the marked
@@ -14435,7 +14493,7 @@ async fn publish_error_status_and_requeue(
             )
         };
         let id = new_message_id();
-        let queued = crate::agent_ops::QueuedMessage {
+        let mut queued = crate::agent_ops::QueuedMessage {
             turn_id: options.turn_id.clone().unwrap_or_else(|| id.clone()),
             id,
             content,
@@ -14455,13 +14513,26 @@ async fn publish_error_status_and_requeue(
             hold_until: None,
             child_agent_id: None,
             merged_submission_ids: options.queued_submission_ids.clone(),
+            recovery_sources: if let Some(entries) =
+                options.flushed_entries.as_ref().filter(|entries| {
+                    entries.len() > 1
+                        || entries
+                            .iter()
+                            .any(|entry| !entry.recovery_sources.is_empty())
+                }) {
+                mgr.services.recovery_sources(workspace_id, entries).await
+            } else {
+                options.recovery_sources.clone()
+            },
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
             provisional: false,
             submission_order: options.queued_submission_order,
+            correlation_order_known: options.queued_correlation_order_known,
             latest_human_submission_at: options.latest_human_submission_at.clone(),
         };
+        queued.stamp_correlation();
         mgr.services.requeue_front(agent_id, queued);
     }
 

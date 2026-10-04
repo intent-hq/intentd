@@ -724,7 +724,10 @@ use std::time::{Duration, Instant};
 // non-idempotent contract; MCP ws.git.commit is unchanged.
 // Version 13.3 adds qualified repository context, selection, native review,
 // companion confirmation, and explicit MR/issue detail-read capabilities.
-pub const PROTOCOL_VERSION: &str = "13.3";
+// Version 13.4 adds trusted, persisted submission correlation for optimistic
+// display. Support requires exactly submissionCorrelation: 1; discover other
+// extensions through their independent capabilities and permission checks.
+pub const PROTOCOL_VERSION: &str = "13.4";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

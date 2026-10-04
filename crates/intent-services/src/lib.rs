@@ -30183,6 +30183,14 @@ impl WorkspaceApi for Services {
             } else {
                 crate::principal_ops::strip_principal_attribution(message_metadata)
             };
+            crate::agent_ops::validate_submission_id(message_id.as_deref())?;
+            if let Some(id) = message_id.as_deref() {
+                if let Some(result) =
+                    self.submission_replay(&agent_id, id, message_metadata.as_ref())?
+                {
+                    return Ok(result);
+                }
+            }
             // Collaborator sender preamble (multiplayer): the content-level
             // counterpart of the stamp, applied once here so the runtime
             // path and the store-only fallback persist what the model sees.
@@ -30433,6 +30441,25 @@ impl WorkspaceApi for Services {
     fn agent_queue_message(
         &self,
         agent_id: AgentId,
+        content: String,
+        image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.agent_queue_submission(
+            agent_id,
+            None,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+        )
+    }
+
+    fn agent_queue_submission(
+        &self,
+        agent_id: AgentId,
+        message_id: Option<String>,
         mut content: String,
         image_blocks: Option<serde_json::Value>,
         file_blocks: Option<serde_json::Value>,
@@ -30449,8 +30476,9 @@ impl WorkspaceApi for Services {
             // entry's content, so the drain persists what the model sees.
             self.annotate_collaborator_sender_for_agent(&agent_id, &mut content)
                 .await?;
-            self.agent_queue_message_op(
+            self.agent_queue_submission_op(
                 agent_id,
+                message_id,
                 content,
                 image_blocks,
                 file_blocks,

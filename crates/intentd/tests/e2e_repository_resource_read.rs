@@ -585,7 +585,11 @@ async fn repository_resource_real_owner_uds_and_member_tls_wss_contract() {
             h.uds().await
         };
         let hello = c.rpc("client.hello", json!({})).await;
-        assert_eq!(success(&hello)["protocolVersion"], "13.3");
+        assert_eq!(success(&hello)["protocolVersion"], "13.4");
+        assert_eq!(
+            hello["result"]["server"]["capabilities"]["submissionCorrelation"],
+            1
+        );
         assert_eq!(
             hello["result"]["server"]["capabilities"]["repositoryResourceRead"],
             1

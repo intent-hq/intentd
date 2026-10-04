@@ -2186,6 +2186,11 @@ async fn dispatch(
         }
         "agent.queueMessage" => {
             let agent_id = require_agent_id(params)?;
+            let message_id = match params.get("messageId") {
+                None => None,
+                Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+                Some(_) => return Err(invalid_params("messageId must be a nonempty string")),
+            };
             let content = require_str_param(params, "content")?;
             let image_blocks = opt_value(params, "imageBlocks");
             let file_blocks = opt_value(params, "fileBlocks");
@@ -2202,8 +2207,9 @@ async fn dispatch(
                 Some(_) => return Err(invalid_params("messageMetadata must be an object")),
             };
             let result = api
-                .agent_queue_message(
+                .agent_queue_submission(
                     agent_id,
+                    message_id,
                     content,
                     image_blocks,
                     file_blocks,
