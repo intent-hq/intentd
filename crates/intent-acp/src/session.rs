@@ -48,9 +48,9 @@ use crate::IncomingNotification;
 // directly (§3.2 keeps that crate an `intent-acp` implementation detail).
 pub use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeResponse, LoadSessionResponse, McpServer, Meta, NewSessionResponse,
-    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
-    SessionConfigSelectOption, SessionConfigSelectOptions, SessionMode, SessionModeState,
-    SessionUpdate, StopReason, Usage,
+    Notice, NoticeSeverity, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelect, SessionConfigSelectOption, SessionConfigSelectOptions, SessionMode,
+    SessionModeState, SessionUpdate, StopReason, Usage,
 };
 
 /// Timeout for session setup requests (`session/new`, `session/load`). Generous
@@ -452,6 +452,8 @@ pub enum MappedUpdate {
     /// (never folded into token tallies), and the cumulative per-ACP-session
     /// `cost`, when reported, feeds the workspace `TokenUsage` tally (§5.23).
     Usage(MappedUsage),
+    /// Live advisory diagnostic only: no transcript content or chat event.
+    Notice(Notice),
 }
 
 /// The context-window occupancy and optional cumulative cost carried by an
@@ -537,6 +539,7 @@ pub(crate) fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate>
         SessionUpdate::ToolCallUpdate(update) => {
             Some(MappedUpdate::ToolCall(map_tool_call_update(update)))
         }
+        SessionUpdate::Notice(notice) => Some(MappedUpdate::Notice(notice.clone())),
         SessionUpdate::UsageUpdate(usage) => Some(MappedUpdate::Usage(MappedUsage {
             used: usage.used,
             size: usage.size,
@@ -551,7 +554,8 @@ pub(crate) fn map_session_update(update: &SessionUpdate) -> Option<MappedUpdate>
 
 /// Parse a `session/update` notification and map it. Returns `None` when the
 /// method is not `session/update`, the params fail to parse, or the variant has
-/// no canonical event. Keeps schema parsing inside `intent-acp`.
+/// no consumer. Notices map to diagnostics, never assistant text.
+/// Keeps schema parsing inside `intent-acp`.
 #[must_use]
 pub fn map_notification(note: &IncomingNotification) -> Option<MappedUpdate> {
     if note.method != "session/update" {

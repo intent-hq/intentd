@@ -43,6 +43,43 @@ use crate::repository_admission::lifecycle::physical_owner::{
 };
 use crate::{file_ops, token_usage, usage_stats, Services};
 
+/// Preserve live provider diagnostics without adding assistant content or
+/// changing turn/failure state. Also used when a notice arrives while idle.
+pub(crate) fn log_provider_notice(
+    notice: &session::Notice,
+    acp_session_id: Option<&str>,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+) {
+    use session::NoticeSeverity;
+    let severity = match &notice.severity {
+        NoticeSeverity::Info => "info",
+        NoticeSeverity::Warning => "warning",
+        NoticeSeverity::Error => "error",
+        NoticeSeverity::Other(value) => value.as_str(),
+        _ => "unknown",
+    };
+    macro_rules! log_notice {
+        ($level:expr) => {
+            tracing::event!(
+                $level,
+                agent = %agent_id,
+                workspace = %workspace_id,
+                acp_session_id,
+                severity,
+                title = %notice.title,
+                description = notice.description.as_deref(),
+                "ACP provider notice"
+            )
+        };
+    }
+    match notice.severity {
+        NoticeSeverity::Info => log_notice!(tracing::Level::INFO),
+        NoticeSeverity::Error => log_notice!(tracing::Level::ERROR),
+        _ => log_notice!(tracing::Level::WARN),
+    }
+}
+
 /// Derive the cross-layer, content-free stream correlation value used only in
 /// diagnostics. The input is an existing wire `turnId` (or the assistant
 /// `messageId` on interruption paths that have no turn id); the raw id is never
@@ -5562,6 +5599,16 @@ impl Services {
                     )
                     .await;
                 }
+            }
+            MappedUpdate::Notice(notice) => {
+                log_provider_notice(
+                    &notice,
+                    note.params["sessionId"].as_str(),
+                    agent_id,
+                    workspace_id,
+                );
+                // Diagnostics are not output: preserve silent-redrive eligibility.
+                return false;
             }
             MappedUpdate::Usage(usage) => {
                 // Context-window occupancy (intent-hq/intent#3797): recorded

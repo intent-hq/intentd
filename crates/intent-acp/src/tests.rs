@@ -163,6 +163,76 @@ async fn handshake_completes() {
 }
 
 #[tokio::test]
+async fn structured_notices_are_negotiated_with_and_without_callbacks() {
+    use crate::callback_registration::CallbackOffer;
+    for offer in [CallbackOffer::Disabled, CallbackOffer::V1] {
+        let (conn, responder, _stderr) = connect_mock(ConnectionHooks::default());
+        crate::handshake::handshake_with_callbacks(
+            std::sync::Arc::new(conn),
+            intent_providers::find_provider("codex").unwrap(),
+            offer,
+        )
+        .await
+        .unwrap();
+        let seen = responder.await.unwrap();
+        assert_eq!(
+            seen[0]["params"]["clientCapabilities"]["session"]["notices"],
+            json!({})
+        );
+        assert_eq!(seen[0]["params"]["clientCapabilities"]["terminal"], true);
+        assert_eq!(
+            seen[0]["params"]["clientCapabilities"]["fs"]["readTextFile"],
+            true
+        );
+    }
+}
+
+#[test]
+fn structured_notices_are_consumed_without_becoming_chunks() {
+    for severity in ["info", "warning", "error", "_custom"] {
+        let note = crate::IncomingNotification {
+            method: "session/update".into(),
+            params: json!({"sessionId": "notice-session", "update": {
+                "sessionUpdate": "notice", "severity": severity,
+                "title": "Diagnostic title", "description": "Exact detail\n第二行"
+            }}),
+        };
+        let mapped = crate::session::map_notification(&note).expect("notice must be consumed");
+        let crate::session::MappedUpdate::Notice(notice) = mapped else {
+            panic!("notice must remain a diagnostic");
+        };
+        assert_eq!(serde_json::to_value(notice.severity).unwrap(), severity);
+        assert_eq!(notice.title, "Diagnostic title");
+        assert_eq!(notice.description.as_deref(), Some("Exact detail\n第二行"));
+    }
+}
+
+#[test]
+fn structured_notices_without_description_and_legacy_text_remain_distinct() {
+    let mut note = crate::IncomingNotification {
+        method: "session/update".into(),
+        params: json!({"sessionId": "s", "update": {
+            "sessionUpdate": "notice", "severity": "warning", "title": "Warning: exact text\n\n"
+        }}),
+    };
+    let Some(crate::session::MappedUpdate::Notice(notice)) =
+        crate::session::map_notification(&note)
+    else {
+        panic!("notice without optional description must map");
+    };
+    assert_eq!(notice.description, None);
+    note.params["update"] = json!({"sessionUpdate": "agent_message_chunk",
+        "content": {"type": "text", "text": notice.title}});
+    let Some(crate::session::MappedUpdate::Chunk { text, thought, .. }) =
+        crate::session::map_notification(&note)
+    else {
+        panic!("legacy assistant content must stay text");
+    };
+    assert_eq!(text.as_deref(), Some("Warning: exact text\n\n"));
+    assert!(!thought);
+}
+
+#[tokio::test]
 async fn antigravity_auth_marker_fails_pending_and_future_requests_without_url() {
     let (client_write, mut agent_read) = tokio::io::duplex(4096);
     let (mut agent_write, client_read) = tokio::io::duplex(4096);

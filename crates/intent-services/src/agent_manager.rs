@@ -9044,7 +9044,8 @@ impl AgentManager {
         // emit a phantom `stream:start`/`stream:end` pair with no content
         // and pin the busy slot for the settle window.
         //
-        // A `usage_update` is the one exception: providers commonly emit
+        // Notices are logged without opening a turn. A `usage_update` also
+        // needs handling: providers commonly emit
         // the final usage report after the response, so it can lead a
         // buffered burst. It materializes no transcript content, so its
         // context occupancy is recorded in-memory and any cost is persisted
@@ -9057,6 +9058,15 @@ impl AgentManager {
             Some(intent_acp::session::MappedUpdate::Chunk { .. }) => {}
             Some(intent_acp::session::MappedUpdate::ToolCall(ref tc))
                 if !tc.tool_name.trim().is_empty() => {}
+            Some(intent_acp::session::MappedUpdate::Notice(notice)) => {
+                crate::agent_session::log_provider_notice(
+                    &notice,
+                    first.params["sessionId"].as_str(),
+                    agent_id,
+                    workspace_id,
+                );
+                return true;
+            }
             Some(intent_acp::session::MappedUpdate::Usage(usage)) => {
                 drop(guard);
                 // Context occupancy (intent-hq/intent#3797): latest-wins

@@ -2433,6 +2433,32 @@ fn tool_call_notification(update: &Value) -> IncomingNotification {
     }
 }
 
+#[tokio::test]
+async fn structured_notices_do_not_count_as_output_or_block_silent_redrive() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("notice-turn".into());
+    for severity in ["info", "warning", "error", "_future"] {
+        let update = tool_call_notification(&json!({
+            "sessionUpdate": "notice", "severity": severity,
+            "title": "Runtime diagnostic", "description": "Provider detail"
+        }));
+        assert!(
+            !services
+                .route_notification(&update, &agent_id, &workspace_id, &mut transcript)
+                .await
+        );
+    }
+    assert!(transcript.blocks.is_empty());
+    assert!(transcript.text_block_strings().is_empty());
+    assert!(
+        timeout(Duration::from_millis(50), sub.recv())
+            .await
+            .is_err(),
+        "no chat or activity events"
+    );
+}
+
 /// A binding can successfully create a proposal before its enclosing JS
 /// fails. Preserve registered cards on failure, but never trust an error's
 /// echoed proposal payload to create a new actionable card.

@@ -2,7 +2,7 @@
 //! (§6.4).
 //!
 //! `initialize` negotiates protocol version 1 and advertises the client
-//! capabilities `{ fs: { readTextFile, writeTextFile }, terminal: true }`.
+//! filesystem, terminal, and structured session-notice capabilities.
 //! `authenticate` is sent only when the provider implements it; on failure the
 //! provider's auth-error patterns are matched against the error text and
 //! captured stderr, surfacing a provider-specific login hint. `set_session_mode`
@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    AuthMethodId, AuthenticateRequest, ClientCapabilities, FileSystemCapabilities, Implementation,
-    InitializeRequest, InitializeResponse, SessionModeState, SetSessionModeRequest,
+    AuthMethodId, AuthenticateRequest, ClientCapabilities, ClientSessionCapabilities,
+    FileSystemCapabilities, Implementation, InitializeRequest, InitializeResponse,
+    NoticeCapabilities, SessionModeState, SetSessionModeRequest,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use intent_providers::{auth_error_message, is_provider_authentication_error, ProviderConfig};
@@ -131,7 +132,8 @@ async fn initialize_with_offer(
                 .fs(FileSystemCapabilities::new()
                     .read_text_file(true)
                     .write_text_file(true))
-                .terminal(true),
+                .terminal(true)
+                .session(ClientSessionCapabilities::new().notices(NoticeCapabilities::new())),
         )
         .client_info(Implementation::new(CLIENT_NAME, env!("CARGO_PKG_VERSION")));
 

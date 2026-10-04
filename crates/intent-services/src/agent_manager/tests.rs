@@ -21222,6 +21222,56 @@ mod harness_wake_tests {
         assert!(!mgr.is_busy(&id), "slot never claimed");
     }
 
+    #[tokio::test]
+    async fn structured_notices_while_idle_open_no_turn() {
+        use std::io::{Read, Seek};
+
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let mut log = tempfile::tempfile().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(log.try_clone().unwrap())
+            .finish();
+        let _capture = crate::test_tracing::set_capture_default(subscriber);
+        note_tx
+            .send(intent_acp::IncomingNotification {
+                method: "session/update".into(),
+                params: json!({"sessionId": "idle-session", "update": {
+                    "sessionUpdate": "notice", "severity": "warning", "title": "Idle warning"
+                }}),
+            })
+            .unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        assert!(timeout(Duration::from_millis(50), sub.recv())
+            .await
+            .is_err());
+        assert!(mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!mgr.is_busy(&id));
+        log.rewind().unwrap();
+        let mut diagnostics = String::new();
+        log.read_to_string(&mut diagnostics).unwrap();
+        for expected in [
+            "WARN",
+            "Idle warning",
+            "idle-session",
+            id.as_str(),
+            ws.as_str(),
+        ] {
+            assert!(
+                diagnostics.contains(expected),
+                "missing {expected} in {diagnostics}"
+            );
+        }
+    }
+
     /// A title-less `tool_call_update` first-sight (STAB-124 late echo) maps
     /// to `MappedUpdate::ToolCall` but produces no transcript content, so it
     /// must not open a phantom turn: no `stream:start`/`stream:end` pair, no
