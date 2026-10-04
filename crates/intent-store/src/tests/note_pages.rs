@@ -2295,3 +2295,272 @@ async fn indexed_native_primitives_match_all_frozen_entry_values() {
         }
     }
 }
+
+async fn artifact_begin_fixture() -> (
+    Store,
+    TempDb,
+    intent_core::Note,
+    intent_core::note_artifact::request::ArtifactBegin,
+) {
+    let (store, temporary, note) = setup("```diff\n-old\n+new\n```\n").await;
+    let first = page(&store, json!({"kind":"source"})).await;
+    let context = page(
+        &store,
+        json!({"kind":"context","contextRef":first["contextRef"]}),
+    )
+    .await;
+    let atom = context["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["nodeType"] == "diffBlock")
+        .unwrap();
+    let root = page(
+        &store,
+        json!({"kind":"metadata","ref":atom["attributesRef"]}),
+    )
+    .await;
+    let fields = page(
+        &store,
+        json!({"kind":"metadata","ref":root["items"][0]["childrenRef"]}),
+    )
+    .await;
+    let code = fields["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["key"] == "code")
+        .unwrap();
+    let mut request: intent_core::note_artifact::request::ArtifactBegin = serde_json::from_value(json!({
+        "jobId":"job", "expiresAt":first["expiresAt"], "headerDigest":"",
+        "header":{
+            "scope":first["scope"],
+            "source":{"kind":"snapshot","snapshotId":first["snapshotId"],"sourceRevision":first["sourceRevision"],"ownerRef":atom["nativeRef"],"sourceRef":code["valueRef"]},
+            "primitive":"diff","profile":"journal-test-not-registered",
+            "environment":{"width":800.5,"height":600,"theme":"light","fontRef":"test-only","fontSize":14,"devicePixelRatio":1.25},
+            "reservation":{"payloadBytes":1024,"records":2,"indexEntries":2,"storageChargeBytes":4096}
+        }
+    })).unwrap();
+    sign_artifact_begin(&mut request);
+    for (kind, id) in [
+        ("global", ""),
+        ("principal", "alice"),
+        ("workspace", "pages"),
+    ] {
+        sqlx::query("INSERT INTO note_artifact_capacity(scope_kind,scope_id,payload_limit,record_limit,index_limit,storage_limit,job_limit) VALUES (?,?,1024,2,2,4096,1)")
+            .bind(kind).bind(id).execute(store.write_pool()).await.unwrap();
+    }
+    (store, temporary, note, request)
+}
+
+fn sign_artifact_begin(request: &mut intent_core::note_artifact::request::ArtifactBegin) {
+    request.header_digest = intent_core::note_artifact::canonical::digest(
+        &json!({
+            "domain":"note.artifact.begin.v1", "jobId":request.job_id,
+            "expiresAt":request.expires_at, "header":request.header
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+fn artifact_retention(request: &intent_core::note_artifact::request::ArtifactBegin) -> i64 {
+    i64::try_from(
+        intent_core::parse_iso(&request.expires_at)
+            .unwrap()
+            .unix_timestamp_nanos()
+            / 1_000_000,
+    )
+    .unwrap()
+        + 60_000
+}
+
+#[tokio::test]
+async fn artifact_begin_reserves_once_and_preserves_retired_replay() {
+    let (store, _temporary, _note, request) = artifact_begin_fixture().await;
+    let retention = artifact_retention(&request);
+    assert!(store
+        .begin_note_artifact_journal("bob", "pages", &request, retention)
+        .await
+        .is_err());
+    let first = store
+        .begin_note_artifact_journal("alice", "pages", &request, retention)
+        .await
+        .unwrap();
+    let second = store
+        .begin_note_artifact_journal("alice", "pages", &request, retention + 1)
+        .await
+        .unwrap();
+    assert_eq!(first.generation, second.generation);
+    assert_eq!(first.job_ref, second.job_ref);
+    assert_eq!(first.status_until, second.status_until);
+    assert_eq!(first.state, "building");
+    let mut changed = request.clone();
+    changed.expires_at = intent_core::iso_ms_from_now(120_000);
+    sign_artifact_begin(&mut changed);
+    assert!(store
+        .begin_note_artifact_journal("alice", "pages", &changed, retention)
+        .await
+        .is_err());
+    let mut another = request.clone();
+    another.job_id = "second-job".into();
+    sign_artifact_begin(&mut another);
+    assert!(store
+        .begin_note_artifact_journal("alice", "pages", &another, retention)
+        .await
+        .is_err());
+    store
+        .abort_note_artifact_journal("alice", "pages", &first.job_ref)
+        .await
+        .unwrap();
+    let replay = store
+        .begin_note_artifact_journal("alice", "pages", &request, retention)
+        .await
+        .unwrap();
+    assert_eq!(replay.state, "aborted");
+    assert_eq!(replay.generation, first.generation);
+    let rows = sqlx::query("SELECT jobs_reserved,payload_reserved,records_reserved,indexes_reserved,storage_reserved FROM note_artifact_capacity")
+        .fetch_all(store.read_pool()).await.unwrap();
+    for row in rows {
+        assert_eq!(row.get::<i64, _>("jobs_reserved"), 1);
+        assert_eq!(row.get::<i64, _>("payload_reserved"), 1024);
+        assert_eq!(row.get::<i64, _>("records_reserved"), 2);
+        assert_eq!(row.get::<i64, _>("indexes_reserved"), 2);
+        assert_eq!(row.get::<i64, _>("storage_reserved"), 4096);
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_job")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn artifact_begin_revalidates_source_after_waiting_for_writer() {
+    use std::future::Future as _;
+    let (store, _temporary, mut note, request) = artifact_begin_fixture().await;
+    // A valid read grant is deliberately obtained before the source advances.
+    store
+        .authorize_note_artifact_source("pages", "alice", &request.header)
+        .await
+        .unwrap();
+    let mut writer = store.write_pool().acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let admission =
+        store.begin_note_artifact_journal("alice", "pages", &request, artifact_retention(&request));
+    tokio::pin!(admission);
+    // Poll to the pending writer acquisition, without a timing sleep.
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(admission.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    sqlx::query("UPDATE note_page_head SET current_rev=current_rev+1 WHERE workspace_id='pages' AND note_id='spec'")
+        .execute(&mut *writer).await.unwrap();
+    sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
+    drop(writer);
+    assert!(admission.await.is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_job")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT sum(jobs_reserved) FROM note_artifact_capacity")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap(),
+        0
+    );
+    note.content = "replacement".into();
+    store.update_note(&note).await.unwrap();
+    assert!(store
+        .begin_note_artifact_journal("alice", "pages", &request, artifact_retention(&request))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn artifact_begin_rejects_bad_integrity_and_source_deadline_without_charging() {
+    let (store, temporary, _note, request) = artifact_begin_fixture().await;
+    for mode in 0..5 {
+        let mut changed = request.clone();
+        match mode {
+            0 => changed.job_id = "changed-without-new-digest".into(),
+            1 => changed.header.environment.width += 1.0,
+            2 => {
+                changed.expires_at = intent_core::iso_ms_from_now(600_000);
+                sign_artifact_begin(&mut changed);
+            }
+            3 => {
+                changed.expires_at = "2000-01-01T00:00:00Z".into();
+                sign_artifact_begin(&mut changed);
+            }
+            _ => {
+                changed.header.source =
+                    intent_core::note_artifact::request::ArtifactSource::SessionLive {
+                        frozen_view_ref: "fake".into(),
+                        editor_session_id: "fake".into(),
+                        local_edit_sequence: 0,
+                        live_generation: "fake".into(),
+                        owner_ref: "fake".into(),
+                        source_ref: "fake".into(),
+                    };
+                sign_artifact_begin(&mut changed);
+            }
+        }
+        assert!(
+            store
+                .begin_note_artifact_journal(
+                    "alice",
+                    "pages",
+                    &changed,
+                    artifact_retention(&changed)
+                )
+                .await
+                .is_err(),
+            "mode {mode}"
+        );
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_artifact_job")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT sum(jobs_reserved) FROM note_artifact_capacity")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap(),
+        0
+    );
+    let admitted = store
+        .begin_note_artifact_journal("alice", "pages", &request, artifact_retention(&request))
+        .await
+        .unwrap();
+    drop(store);
+    let restarted = Store::open(&temporary.path).await.unwrap();
+    assert!(restarted
+        .begin_note_artifact_journal("alice", "pages", &request, artifact_retention(&request))
+        .await
+        .is_err());
+    let old = restarted
+        .note_artifact_journal_status("alice", "pages", &request.job_id, &request.header_digest)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.generation, admitted.generation);
+    restarted
+        .abort_note_artifact_journal("alice", "pages", &old.job_ref)
+        .await
+        .unwrap();
+}

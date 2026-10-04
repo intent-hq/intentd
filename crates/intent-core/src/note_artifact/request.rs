@@ -77,6 +77,48 @@ pub struct ArtifactHeader {
     pub reservation: Reservation,
 }
 
+/// Immutable begin identity. Validation does not authorize a renderer or source.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArtifactBegin {
+    pub job_id: String,
+    pub expires_at: String,
+    pub header: ArtifactHeader,
+    pub header_digest: String,
+}
+
+impl ArtifactBegin {
+    /// Verify the exact job, expiry and header integrity envelope.
+    ///
+    /// # Errors
+    /// Rejects malformed fields, non-UTC expiry, or a mismatched digest.
+    pub fn validate(&self, workspace_id: &str) -> Result<(), RequestError> {
+        bounded_text(&self.job_id, 256)?;
+        bounded_text(&self.expires_at, 64)?;
+        self.header.validate(workspace_id)?;
+        let expiry = crate::parse_iso(&self.expires_at).ok_or(RequestError::Invalid)?;
+        if !expiry.offset().is_utc()
+            || self.header_digest.len() != 64
+            || !self
+                .header_digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(RequestError::Invalid);
+        }
+        let envelope = serde_json::json!({
+            "domain":"note.artifact.begin.v1", "jobId":self.job_id,
+            "expiresAt":self.expires_at, "header":self.header
+        });
+        let digest =
+            super::canonical::digest(&envelope.to_string()).map_err(|_| RequestError::Invalid)?;
+        if digest != self.header_digest {
+            return Err(RequestError::Invalid);
+        }
+        Ok(())
+    }
+}
+
 fn bounded_text(value: &str, maximum: usize) -> Result<(), RequestError> {
     if value.is_empty() || value.contains('\0') {
         return Err(RequestError::Invalid);
@@ -282,6 +324,51 @@ mod tests {
         let value: ArtifactHeader = serde_json::from_value(header()).unwrap();
         assert!(value.validate("w").is_ok());
         assert_eq!(value.validate("other"), Err(RequestError::Invalid));
+    }
+
+    #[test]
+    fn begin_identity_matches_frozen_fractional_header_digest() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/native_artifact_canonicalization.json"
+        ))
+        .unwrap();
+        let vector = &fixture["canonicalization"]["header"];
+        let mut raw: Value = serde_json::from_str(vector["rawJson"].as_str().unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("domain");
+        raw["headerDigest"] = vector["sha256"].clone();
+        let request: ArtifactBegin = serde_json::from_value(raw).unwrap();
+        assert!(request.validate("ws-a").is_ok());
+        assert!(request.validate("another-workspace").is_err());
+        for field in 0..4 {
+            let mut changed = request.clone();
+            match field {
+                0 => changed.job_id.push('x'),
+                1 => changed.expires_at = "2026-10-04T01:00:01Z".into(),
+                2 => changed.header.environment.width += 0.25,
+                _ => changed.header_digest.make_ascii_uppercase(),
+            }
+            assert!(changed.validate("ws-a").is_err());
+        }
+    }
+
+    #[test]
+    fn begin_rejects_signed_non_utc_or_malformed_expiry() {
+        for expiry in ["not-a-date", "2026-10-04T02:00:00+01:00"] {
+            let header = header();
+            let digest = super::super::canonical::digest(
+                &json!({
+                    "domain":"note.artifact.begin.v1","jobId":"job",
+                    "expiresAt":expiry,"header":header
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let request: ArtifactBegin = serde_json::from_value(json!({
+                "jobId":"job","expiresAt":expiry,"header":header,"headerDigest":digest
+            }))
+            .unwrap();
+            assert!(request.validate("w").is_err());
+        }
     }
 
     #[test]

@@ -21,9 +21,9 @@ pub struct ArtifactJournalStatus {
     pub cleanup_complete: bool,
 }
 
-const STATUS_COLUMNS: &str = "job_id,generation,source_snapshot,header_digest,state,next_sequence,accepted_bytes,current_digest,expires_at,status_until,cleanup_complete";
+pub(super) const STATUS_COLUMNS: &str = "job_id,generation,source_snapshot,header_digest,state,next_sequence,accepted_bytes,current_digest,expires_at,status_until,cleanup_complete";
 
-fn status(runtime: &super::Runtime, row: &SqliteRow) -> Result<ArtifactJournalStatus> {
+pub(super) fn status(runtime: &super::Runtime, row: &SqliteRow) -> Result<ArtifactJournalStatus> {
     let snapshot: String = row.try_get("source_snapshot").map_err(db_error)?;
     let generation: String = row.try_get("generation").map_err(db_error)?;
     if uuid::Uuid::parse_str(&snapshot).is_err() || uuid::Uuid::parse_str(&generation).is_err() {
@@ -44,7 +44,7 @@ fn status(runtime: &super::Runtime, row: &SqliteRow) -> Result<ArtifactJournalSt
     })
 }
 
-fn identifier(value: &str) -> Result<()> {
+pub(super) fn identifier(value: &str) -> Result<()> {
     if value.is_empty() || value.len() > 256 || value.contains('\0') {
         return Err(invalid());
     }

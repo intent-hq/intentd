@@ -7,7 +7,7 @@ use intent_core::{
     note_page::{NotePageError, NoteScope},
     Result,
 };
-use sqlx::Row;
+use sqlx::{Row, SqliteConnection};
 
 /// Verified source binding at one read transaction. Mutating lifecycle transitions
 /// must revalidate this source under their own transaction before publication.
@@ -30,6 +30,21 @@ impl Store {
     /// live sources, and database failures.
     pub async fn authorize_note_artifact_source(
         &self,
+        workspace_id: &str,
+        principal: &str,
+        header: &ArtifactHeader,
+    ) -> Result<ArtifactSourceGrant> {
+        let mut tx = self.read_pool().begin().await.map_err(db_error)?;
+        let grant = self
+            .authorize_artifact_source_in(&mut tx, workspace_id, principal, header)
+            .await?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(grant)
+    }
+
+    pub(super) async fn authorize_artifact_source_in(
+        &self,
+        connection: &mut SqliteConnection,
         workspace_id: &str,
         principal: &str,
         header: &ArtifactHeader,
@@ -72,10 +87,9 @@ impl Store {
         if snapshot.scope != header.scope || snapshot.revision != *source_revision {
             return Err(failure(NotePageError::Stale));
         }
-        let mut tx = self.read_pool().begin().await.map_err(db_error)?;
         let head = sqlx::query("SELECT instance_id,indexed_rev,current_rev,generation,profile_revision FROM note_page_head WHERE workspace_id=? AND note_id=?")
             .bind(workspace_id).bind(&header.scope.note_id)
-            .fetch_optional(&mut *tx).await.map_err(db_error)?
+            .fetch_optional(&mut *connection).await.map_err(db_error)?
             .ok_or_else(|| failure(NotePageError::Stale))?;
         let revision: i64 = head.try_get("current_rev").map_err(db_error)?;
         let generation: String = head.try_get("generation").map_err(db_error)?;
@@ -100,7 +114,7 @@ impl Store {
         };
         let found = sqlx::query("SELECT 1 FROM note_artifact_source WHERE workspace_id=? AND note_id=? AND native_collection=? AND source_collection=? AND primitive=?")
             .bind(workspace_id).bind(&header.scope.note_id).bind(&owner.2).bind(&source.2).bind(primitive)
-            .fetch_optional(&mut *tx).await.map_err(db_error)?;
+            .fetch_optional(&mut *connection).await.map_err(db_error)?;
         if found.is_none() {
             return Err(failure(NotePageError::CursorInvalid));
         }
@@ -108,7 +122,6 @@ impl Store {
         // granted source after its original runtime lease has been retired.
         self.note_pages
             .snapshot(snapshot_id, workspace_id, &header.scope.note_id, principal)?;
-        tx.commit().await.map_err(db_error)?;
         Ok(ArtifactSourceGrant {
             scope: snapshot.scope,
             snapshot_id: snapshot_id.clone(),

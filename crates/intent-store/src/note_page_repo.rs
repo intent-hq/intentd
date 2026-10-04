@@ -1,6 +1,7 @@
 //! Bounded reads over write-maintained indexes. Tokens are authenticated with a
 //! persistent database secret, while bounded snapshot leases are process-local.
 mod artifact;
+mod artifact_begin;
 mod token;
 pub use artifact::ArtifactSourceGrant;
 mod artifact_lifecycle;
@@ -33,6 +34,7 @@ struct Snapshot {
 
 #[cfg_attr(test, derive(Default))]
 pub(crate) struct Runtime {
+    id: String,
     backend: String,
     key: Vec<u8>,
     snapshots: Mutex<BTreeMap<String, Snapshot>>,
@@ -88,6 +90,7 @@ impl Runtime {
                 .await
                 .map_err(db_error)?;
         Ok(Self {
+            id: uuid::Uuid::new_v4().simple().to_string(),
             backend: row.try_get("backend_id").map_err(db_error)?,
             key: row.try_get("token_key").map_err(db_error)?,
             snapshots: Mutex::new(BTreeMap::new()),
@@ -861,6 +864,7 @@ mod lifetime_tests {
     #[tokio::test]
     async fn authenticated_snapshot_expiry_eviction_and_principal_scope() {
         let runtime = Runtime {
+            id: "test-runtime".into(),
             backend: "db".into(),
             key: vec![7; 32],
             snapshots: Mutex::new(BTreeMap::new()),
@@ -910,6 +914,7 @@ mod lifetime_tests {
                 ));
             }
             let restarted = Runtime {
+                id: "restarted-runtime".into(),
                 backend: runtime.backend.clone(),
                 key: runtime.key.clone(),
                 snapshots: Mutex::new(BTreeMap::new()),
