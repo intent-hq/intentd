@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.12] - 2026-10-04
+
+### 🐛 Bug Fixes
+
+- Allow admitted guests to read global rules safely ([#6728](https://github.com/intent-hq/intentd/pull/6728)) ([#2286](https://github.com/intent-hq/intentd/pull/2286))
+
+
 ## [0.10.11] - 2026-10-04
 
 ### 🚀 Features
