@@ -838,6 +838,7 @@ async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: Some(root.to_string_lossy().into_owned()),
         repository_path: None,

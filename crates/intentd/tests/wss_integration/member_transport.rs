@@ -401,6 +401,18 @@ async fn member_transport_live_events_upgrade_and_workspace_deltas() {
         guest_raw.event(NOTE_UPDATED).await["workspaceId"],
         shared.as_str()
     );
+    // The shared note invalidates its workspace row; the hidden note must not
+    // disclose a row before promotion. Consume this before changing access.
+    let content_update = channel.push(&sub).await;
+    assert_eq!(content_update["seq"], 1);
+    let mut expected_shared = initial["snapshot"][0].clone();
+    // Live row refreshes include activity and agent details omitted by lite snapshots.
+    expected_shared["lastActivity"] = expected_shared["updatedAt"].clone();
+    expected_shared["agentSummary"] = json!({"count":0,"agents":[],"agentIds":[]});
+    assert_eq!(
+        content_update["delta"],
+        json!({"updated": [expected_shared]})
+    );
     promote(&srv, &member).await;
     publish(
         &srv,
@@ -414,7 +426,7 @@ async fn member_transport_live_events_upgrade_and_workspace_deltas() {
         member.id.as_str()
     );
     let upgraded = channel.push(&sub).await;
-    assert_eq!(upgraded["seq"], 1);
+    assert_eq!(upgraded["seq"], 2);
     let rows = upgraded["delta"]["updated"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "{upgraded}");
     assert!(rows
@@ -470,6 +482,15 @@ async fn member_transport_live_events_upgrade_and_workspace_deltas() {
     assert_eq!(
         raw.event(NOTE_UPDATED).await["workspaceId"],
         hidden.as_str()
+    );
+    let visible_content_update = channel.push(&sub).await;
+    assert_eq!(visible_content_update["seq"], 4);
+    let mut expected_hidden = upgraded["delta"]["added"][0].clone();
+    expected_hidden["lastActivity"] = expected_hidden["updatedAt"].clone();
+    expected_hidden["agentSummary"] = json!({"count":0,"agents":[],"agentIds":[]});
+    assert_eq!(
+        visible_content_update["delta"],
+        json!({"updated": [expected_hidden]})
     );
     publish(
         &srv,

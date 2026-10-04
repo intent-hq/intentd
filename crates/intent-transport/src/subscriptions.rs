@@ -705,6 +705,11 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             AGENT_DELETED,
         ],
         Channel::Workspace => &[
+            // These events are published after persistence, including content
+            // activity triggers. Reuse the authorized workspace row projection.
+            NOTE_CREATED,
+            NOTE_UPDATED,
+            AGENT_MESSAGE,
             intent_core::events::HOST_MEMBERS_CHANGED,
             WORKSPACE_CREATED,
             WORKSPACE_UPDATED,
@@ -2278,7 +2283,18 @@ pub(crate) async fn workspace_delta(
             }
             Some(json!({ "added": [workspace_list_row(ws)?] }))
         }
-        WORKSPACE_UPDATED
+        AGENT_MESSAGE
+            if !matches!(
+                event.data.get("role").and_then(Value::as_str),
+                Some("user" | "assistant")
+            ) =>
+        {
+            None
+        }
+        NOTE_CREATED
+        | NOTE_UPDATED
+        | AGENT_MESSAGE
+        | WORKSPACE_UPDATED
         | WORKSPACE_ACTIVITY_CHANGED
         | WORKSPACE_ATTENTION_CHANGED
         | WORKSPACE_DISPLAY_STATUS_CHANGED

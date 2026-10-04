@@ -342,6 +342,71 @@ fn recording(
     })
 }
 
+#[tokio::test]
+async fn org_pr_search_uses_one_org_scope_and_sanitizes_free_text() {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mock =
+        spawn_mock_with(recording(seen.clone(), |target| {
+            assert!(
+                target.starts_with("/search/issues?"),
+                "no repository enumeration: {target}"
+            );
+            (200, json!({"total_count":2,"incomplete_results":false,"items":[
+            search_hit("intent-hq","outside-home",7), search_hit("intent-hq","another-repo",8)
+        ]}).to_string())
+        }))
+        .await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri)).unwrap();
+    let page = sc
+        .list_org_prs(
+            "intent-hq",
+            PrQuery {
+                state: Some(intent_sourcecontrol::PrState::Closed),
+                involvement: Some(intent_sourcecontrol::PrInvolvement::Assigned),
+                search: Some("fix OR org:elsewhere".into()),
+                limit: Some(2),
+                cursor: Some("3".into()),
+                ..PrQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.next_cursor.as_deref(), Some("4"));
+    sc.list_org_prs("Wattenberger", PrQuery::default())
+        .await
+        .unwrap();
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("q=is:pr user:Wattenberger"));
+    assert!(
+        requests[0]
+            .contains("q=is:pr user:intent-hq is:closed assignee:@me fix \"OR\" \"org:elsewhere\""),
+        "{}",
+        requests[0]
+    );
+    assert!(requests[0].contains("sort=updated") && requests[0].contains("order=desc"));
+    assert!(requests[0].contains("page=3") && requests[0].contains("per_page=2"));
+    assert!(!requests[0].contains("repo:"));
+}
+
+#[tokio::test]
+async fn org_pr_search_does_not_present_incomplete_results_as_complete() {
+    let mock = spawn_mock_with(Arc::new(|_| {
+        (
+            200,
+            json!({
+                "total_count":20,"incomplete_results":true,"items":[search_hit("o","hidden",7)]
+            })
+            .to_string(),
+        )
+    }))
+    .await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri)).unwrap();
+    let error = sc.list_org_prs("o", PrQuery::default()).await.unwrap_err();
+    assert!(error.to_string().contains("incomplete"), "{error}");
+}
+
 /// A multi-repo scope naming repos the token cannot read: the first search
 /// (`repo:a/b repo:c/d repo:e/f`) is rejected 422, each scoped repo is probed
 /// once, the not-found (`c/d`) and forbidden (`e/f`) ones are dropped, and the

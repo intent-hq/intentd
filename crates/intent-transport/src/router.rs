@@ -3180,6 +3180,38 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "github.pulls.checks" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let number = require_u64(params, "number")?;
+            api.github_pulls_checks(owner, repo, number)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "github.pulls.reviews" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let number = require_u64(params, "number")?;
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let next_token = opt_str(params, "nextToken");
+            api.github_pulls_reviews(owner, repo, number, limit, next_token)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "github.pulls.files" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let number = require_u64(params, "number")?;
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let next_token = opt_str(params, "nextToken");
+            api.github_pulls_files(
+                owner,
+                repo,
+                number,
+                limit,
+                next_token,
+                opt_str(params, "expectedHeadSha"),
+            )
+            .await
+            .map_err(domain_to_rpc)
+        }
         "github.pulls.get" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
@@ -3236,13 +3268,29 @@ async fn dispatch(
             Ok(r)
         }
         "github.pulls.search" => {
-            let (owner, repo) = require_repo_slug(params)?;
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
             let query = opt_str(params, "query");
-            let repos = opt_repo_refs(params, "repos")?;
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
+            if params.contains_key("org") {
+                let org = require_str_param(params, "org")?;
+                validate_repo_slug_part("org", &org, true)?;
+                if ["owner", "repo", "repos"]
+                    .iter()
+                    .any(|key| params.contains_key(*key))
+                {
+                    return Err(invalid_params(
+                        "org cannot be combined with owner, repo, or repos".to_string(),
+                    ));
+                }
+                return api
+                    .github_org_pulls_search(org, filter, state, query, limit, next_token)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
+            let (owner, repo) = require_repo_slug(params)?;
+            let repos = opt_repo_refs(params, "repos")?;
             let r = api
                 .github_pulls_search(owner, repo, filter, state, query, repos, limit, next_token)
                 .await

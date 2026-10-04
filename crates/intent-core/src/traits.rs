@@ -4147,6 +4147,56 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Read-only explicitly addressed PR checks (PROTOCOL §5.27).
+    fn github_pulls_checks(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_checks not implemented".into(),
+            ))
+        })
+    }
+
+    /// Read-only explicitly addressed PR reviews (PROTOCOL §5.27).
+    fn github_pulls_reviews(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number, limit, next_token);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_reviews not implemented".into(),
+            ))
+        })
+    }
+
+    /// Read-only explicitly addressed PR files (PROTOCOL §5.27).
+    fn github_pulls_files(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+        next_token: Option<String>,
+        expected_head_sha: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number, limit, next_token, expected_head_sha);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_files not implemented".into(),
+            ))
+        })
+    }
+
     /// `github.pulls.list`: `GET /repos/{owner}/{repo}/pulls` → `{ pulls, nextToken }`.
     #[expect(clippy::too_many_arguments)]
     fn github_pulls_list(
@@ -4211,6 +4261,24 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_pulls_search not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Owner-wide form of `github.pulls.search` (organization or personal account).
+    fn github_org_pulls_search(
+        &self,
+        org: String,
+        filter: Option<String>,
+        state: Option<String>,
+        query: Option<String>,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (org, filter, state, query, limit, next_token);
+        Box::pin(async {
+            Err(Error::InvalidParams(
+                "organization PR search is not supported".into(),
             ))
         })
     }

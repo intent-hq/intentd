@@ -698,6 +698,9 @@
 //! An omitted filter preserves the legacy all-definitions list. The
 //! `scriptLifecycle: 1` capability includes atomic command results, one-off
 //! retirement for every settled outcome, and durable admission recovery.
+//!
+//! Version 13.2 adds explicitly addressed read-only PR checks, reviews, and
+//! changed-file pages, including head guards and forge truncation reporting.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};

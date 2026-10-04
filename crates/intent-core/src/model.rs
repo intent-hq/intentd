@@ -261,6 +261,11 @@ pub struct Workspace {
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
+    /// Persisted high-water mark of recorded user/assistant message timestamps
+    /// and note update timestamps. Excludes metadata/usage maintenance. Historical
+    /// backfill uses retained content only; absent when no valid content exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_content_activity: Option<String>,
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -755,6 +760,7 @@ pub fn chief_workspace() -> Workspace {
         created_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
         updated_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
         last_activity: Some(CHIEF_WORKSPACE_TIMESTAMP.to_string()),
+        last_content_activity: None,
         tags: Vec::new(),
         path: None,
         repository_path: None,
@@ -7268,6 +7274,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
