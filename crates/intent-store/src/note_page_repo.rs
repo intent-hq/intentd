@@ -7,6 +7,7 @@ mod artifact_begin;
 mod token;
 pub use artifact::ArtifactSourceGrant;
 mod artifact_lifecycle;
+mod artifact_maintenance;
 mod artifact_publication;
 mod artifact_read;
 use crate::Store;

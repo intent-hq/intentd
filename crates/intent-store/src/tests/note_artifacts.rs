@@ -21,6 +21,118 @@ async fn setup() -> (Store, TempDb) {
 }
 
 #[tokio::test]
+async fn artifact_expiry_is_batched_and_keeps_storage_charged() {
+    let (store, _temporary) = setup().await;
+    sqlx::query("UPDATE note_artifact_capacity SET payload_limit=4096,record_limit=8,index_limit=8,storage_limit=16384,job_limit=4")
+        .execute(store.write_pool()).await.unwrap();
+    for (id, expiry) in [(2, 100_i64), (3, 100), (4, 9_007_199_254_740_991)] {
+        sqlx::query("INSERT INTO note_artifact_job(principal,workspace_id,job_id,generation,runtime_id,header_digest,header,source_snapshot,source_revision,note_id,note_instance_id,source_collection,state,expires_at,status_until,payload_limit,record_limit,index_limit,storage_limit,current_digest) SELECT principal,workspace_id,?,?,runtime_id,header_digest,header,source_snapshot,source_revision,note_id,note_instance_id,source_collection,'building',?,?,payload_limit,record_limit,index_limit,storage_limit,header_digest FROM note_artifact_job WHERE job_id='job'")
+            .bind(format!("job{id}")).bind(format!("{id:032x}")).bind(expiry).bind(expiry)
+            .execute(store.write_pool()).await.unwrap();
+    }
+    for limit in [0, 129, u32::MAX] {
+        assert!(store.expire_note_artifact_journals(limit).await.is_err());
+    }
+    let first = store.expire_note_artifact_journals(1).await.unwrap();
+    assert_eq!(first, vec!["00000000000000000000000000000001"]);
+    assert_eq!(
+        store.expire_note_artifact_journals(1).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        store
+            .expire_note_artifact_journals(128)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(store
+        .expire_note_artifact_journals(128)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM note_artifact_job WHERE state='expired' AND cleanup_complete=0"
+        )
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap(),
+        3
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT sum(storage_reserved) FROM note_artifact_capacity")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap(),
+        3 * 4 * 4096
+    );
+    let plan = sqlx::query("EXPLAIN QUERY PLAN SELECT generation FROM note_artifact_job WHERE state IN ('building','sealed','admitted') AND expires_at<=? ORDER BY expires_at,generation LIMIT ?")
+        .bind(100_i64).bind(1_i64).fetch_all(store.read_pool()).await.unwrap();
+    let detail = plan
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+    assert!(
+        detail
+            .iter()
+            .any(|s| s.contains("SEARCH note_artifact_job USING INDEX note_artifact_job_expiry")),
+        "{detail:?}"
+    );
+}
+
+#[tokio::test]
+async fn artifact_expiry_retires_lease_but_preserves_records_and_ack() {
+    let (store, _temporary) = setup().await;
+    append(&store, 0, &"0".repeat(64), &"1".repeat(64), true)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE note_artifact_job SET state='sealed'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO note_artifact_lease(generation,admission_id,lease_id,final_digest,expires_at) VALUES ('00000000000000000000000000000001','admission','lease',?,100)")
+        .bind("1".repeat(64)).execute(store.write_pool()).await.unwrap();
+    assert_eq!(
+        store.expire_note_artifact_journals(1).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT released FROM note_artifact_lease")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap(),
+        1
+    );
+    for table in ["note_artifact_record", "note_artifact_ack"] {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM {table}"))
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+    assert_eq!(
+        store
+            .note_artifact_journal_status("alice", "workspace", "job", &"0".repeat(64))
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "expired"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT sum(storage_reserved) FROM note_artifact_capacity")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap(),
+        3 * 4096
+    );
+}
+
+#[tokio::test]
 async fn artifact_cancelled_abort_does_not_poison_writer_transaction() {
     let (store, _temporary) = setup().await;
     let status = store
