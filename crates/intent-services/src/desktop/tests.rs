@@ -10,6 +10,7 @@ struct Executor {
     extra_connections: Mutex<Vec<DesktopConnection>>,
     calls: Mutex<Vec<Value>>,
     fail: Mutex<Option<String>>,
+    failure: Mutex<Option<DesktopError>>,
     hold_start: std::sync::atomic::AtomicBool,
     start_seen: tokio::sync::Notify,
     release_start: tokio::sync::Notify,
@@ -65,7 +66,12 @@ impl AgentReverseDispatch for Executor {
             }
             self.calls.lock().unwrap().push(params.clone());
             if self.fail.lock().unwrap().as_deref() == params["operation"].as_str() {
-                return Err(error("desktop-execution-failed", "Native failure"));
+                return Err(self
+                    .failure
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| error("desktop-execution-failed", "Native failure")));
             }
             if params["operation"] == "startControl"
                 && self.hold_start.load(std::sync::atomic::Ordering::Relaxed)
@@ -125,6 +131,7 @@ impl Harness {
             calls: Mutex::new(vec![]),
             extra_connections: Mutex::new(vec![]),
             fail: Mutex::new(None),
+            failure: Mutex::new(None),
             hold_start: std::sync::atomic::AtomicBool::default(),
             start_seen: tokio::sync::Notify::default(),
             release_start: tokio::sync::Notify::default(),
@@ -583,6 +590,188 @@ async fn readiness_failure_is_a_correlated_failure_not_a_grant() {
     assert_eq!(events[0].data["outcome"], "failed");
     assert_eq!(events[0].data["state"], json!({"status":"inactive"}));
     assert_eq!(events[0].data["error"]["code"], "desktop-execution-failed");
+}
+
+#[tokio::test]
+async fn activation_failure_diagnostics_survive_outbox_and_conversation() {
+    for execution in [Some("not_started"), None] {
+        let h = Harness::new().await;
+        let failure = DesktopError {
+            code: "desktop-os-permission-required".into(),
+            detail: "Screen Recording permission is required.".into(),
+            execution: execution.map(str::to_string),
+        };
+        *h.executor.fail.lock().unwrap() = Some("startControl".into());
+        *h.executor.failure.lock().unwrap() = Some(failure.clone());
+        let mut events = h
+            .services
+            .event_bus
+            .as_ref()
+            .unwrap()
+            .subscribe(SubscriptionFilter {
+                workspace_id: Some(h.workspace.0.clone()),
+                event_types: vec![DESKTOP_PERMISSION_RESOLVED.into()],
+                ..Default::default()
+            });
+        let pending = h.agent("startControl", json!({})).await.unwrap();
+        let request = pending["requestId"].as_str().unwrap();
+        let accepted = h
+            .client(
+                "respondPermission",
+                json!({
+                    "requestId":request,"decision":"allow_once"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted, json!({"accepted":true,"requestId":request}));
+        let batch = tokio::time::timeout(Duration::from_secs(10), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch[0].data["outcome"], "failed");
+        assert_eq!(batch[0].data["requestId"], request);
+        assert_eq!(batch[0].data["error"], value(&failure));
+        let gate = h.services.desktop.gate(&h.agent);
+        let _guard = gate.lock().await;
+        h.services.desktop_flush_outbox().await;
+        h.services.desktop_flush_outbox().await;
+        let raw: String = sqlx::query_scalar(
+            "SELECT json_extract(value,'$.payload') FROM settings WHERE key GLOB 'desktop.v1/outbox/*' AND json_extract(value,'$.payload.requestId')=?",
+        ).bind(request).fetch_one(h.services.store.read_pool()).await.unwrap();
+        let payload: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(payload["requestId"], request);
+        assert_eq!(payload["outcome"], "failed");
+        assert_eq!(payload["state"], json!({"status":"inactive"}));
+        assert_eq!(payload["error"], value(&failure));
+        let conversation = intent_core::with_caller(
+            h.owner.clone(),
+            h.services.agent_get_conversation(
+                h.agent.clone(),
+                Some(30),
+                Some(h.workspace.clone()),
+                None,
+                None,
+                None,
+                Some(intent_core::ConversationProjection::Slim),
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        let messages: Vec<_> = conversation["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["metadata"]["requestId"] == request)
+            .collect();
+        assert_eq!(
+            messages.len(),
+            1,
+            "outbox delivery must remain deduplicated"
+        );
+        assert_eq!(messages[0]["metadata"]["error"], value(&failure));
+        let content = messages[0]["contentBlocks"].to_string();
+        assert!(
+            content.contains(&failure.code),
+            "missing failure code: {content}"
+        );
+        assert!(
+            content.contains(&failure.detail),
+            "missing failure detail: {content}"
+        );
+        assert!(
+            content.contains(request),
+            "missing request correlation: {content}"
+        );
+        if let Some(execution) = execution {
+            assert!(
+                content.contains(execution),
+                "missing execution status: {content}"
+            );
+        } else {
+            assert!(
+                !content.contains("execution:"),
+                "must not invent execution status"
+            );
+        }
+        let calls = h.executor.calls.lock().unwrap();
+        let start = calls
+            .iter()
+            .find(|p| p["operation"] == "startControl")
+            .unwrap();
+        assert!(!content.contains(start["stopReportToken"].as_str().unwrap()));
+        assert!(!content.contains("stopReportToken"));
+        assert!(!content.contains("connectionEpoch"));
+        assert!(!calls.iter().any(|p| p["operation"] == "execute"));
+        assert_eq!(h.services.desktop.state(&h.agent), DesktopState::Inactive);
+    }
+}
+
+#[tokio::test]
+async fn permission_nonfailure_wakes_keep_distinct_outcomes() {
+    for outcome in ["denied", "expired", "invalidated"] {
+        let h = Harness::new().await;
+        let mut events = h
+            .services
+            .event_bus
+            .as_ref()
+            .unwrap()
+            .subscribe(SubscriptionFilter {
+                workspace_id: Some(h.workspace.0.clone()),
+                event_types: vec![DESKTOP_PERMISSION_RESOLVED.into()],
+                ..Default::default()
+            });
+        let pending = h.agent("startControl", json!({})).await.unwrap();
+        if outcome == "denied" {
+            h.client(
+                "respondPermission",
+                json!({"requestId":pending["requestId"],"decision":"deny"}),
+            )
+            .await
+            .unwrap();
+        } else {
+            if outcome == "expired" {
+                let mut live = h.services.desktop.get(&h.agent).unwrap();
+                if let Phase::Pending { expires, .. } = &mut live.phase {
+                    *expires = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+                }
+                h.services.desktop.put(live);
+            } else {
+                h.executor.connection.lock().unwrap().connection_epoch = "replacement".into();
+            }
+            assert_eq!(
+                h.services.desktop_current_state(&h.agent).await,
+                DesktopState::Inactive
+            );
+        }
+        let batch = tokio::time::timeout(Duration::from_secs(10), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch[0].data["outcome"], outcome);
+        assert!(batch[0].data.get("error").is_none());
+        let gate = h.services.desktop.gate(&h.agent);
+        let _guard = gate.lock().await;
+        h.services.desktop_flush_outbox().await;
+        let raw: String = sqlx::query_scalar(
+            "SELECT json_extract(value,'$.payload') FROM settings WHERE key GLOB 'desktop.v1/outbox/*' AND json_extract(value,'$.payload.requestId')=?",
+        ).bind(pending["requestId"].as_str().unwrap()).fetch_one(h.services.store.read_pool()).await.unwrap();
+        let payload: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(payload["outcome"], outcome);
+        assert!(payload.get("error").is_none());
+        assert_eq!(
+            payload["message"],
+            format!("Desktop permission {outcome}; control is not active.")
+        );
+        assert!(!h
+            .executor
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p["operation"] == "startControl"));
+    }
 }
 #[tokio::test]
 async fn restart_retains_stop_credential_and_permission_but_never_execution() {
