@@ -50,7 +50,7 @@ async fn invalidations(store: &Store, note: &mut intent_core::Note, header: &Val
     store.update_note(note).await.unwrap();
     let old_read = rejected_read(store, header).await;
     let old_grant = rejected_grant(store, "after-metadata-edit", header.clone(), "alice").await;
-    let (calls, sources) = capture_sources(store, true).await;
+    let (calls, sources) = capture_sources(store, true, false).await;
     let fresh = sources[0]["header"].clone();
     assert_ne!(
         fresh["source"]["sourceRevision"],
@@ -64,7 +64,7 @@ async fn invalidations(store: &Store, note: &mut intent_core::Note, header: &Val
     store.update_note(note).await.unwrap();
     let old_read = rejected_read(store, &fresh).await;
     let old_grant = rejected_grant(store, "after-code-edit", fresh, "alice").await;
-    let (calls, sources) = capture_sources(store, true).await;
+    let (calls, sources) = capture_sources(store, true, false).await;
     assert_eq!(sources[0]["code"], "-old\n+changed😀");
     let before = sources[0]["header"].clone();
     output.push(json!({"mutation":"canonical-code-value","source":note.content,"oldRead":old_read,"oldGrant":old_grant,"calls":calls,"sources":sources}));
@@ -76,7 +76,7 @@ async fn invalidations(store: &Store, note: &mut intent_core::Note, header: &Val
     store.insert_note(note).await.unwrap();
     let old_read = rejected_read(store, &before).await;
     let old_grant = rejected_grant(store, "after-note-recreation", before.clone(), "alice").await;
-    let (calls, sources) = capture_sources(store, true).await;
+    let (calls, sources) = capture_sources(store, true, false).await;
     assert_ne!(
         sources[0]["header"]["scope"]["noteInstanceId"],
         before["scope"]["noteInstanceId"]
@@ -127,7 +127,7 @@ async fn indexed_diff_source_capture_preserves_empty_titled_scalar_and_invalidat
     ];
     for (id, raw, expected, provenance) in cases {
         let (store, _temporary, mut note) = setup(&raw).await;
-        let (calls, sources) = capture_sources(&store, id != "longScalarDiff").await;
+        let (calls, sources) = capture_sources(&store, id != "longScalarDiff", false).await;
         assert!(!sources.is_empty());
         assert_eq!(sources[0]["node"]["nodeType"], "diffBlock");
         assert_eq!(sources[0]["code"], expected);
@@ -157,4 +157,46 @@ async fn indexed_diff_source_capture_preserves_empty_titled_scalar_and_invalidat
         }
         store.close().await;
     }
+}
+
+#[tokio::test]
+async fn indexed_diff_source_direct_next_ref_capture() {
+    let code = format!("-old\n+{}END", "é😀e\u{301}\"\t".repeat(1800));
+    let raw = format!("```diff title\n{code}\n```");
+    let (store, _temporary, _note) = setup(&raw).await;
+    let (calls, sources) = capture_sources(&store, false, true).await;
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["code"], code);
+    let mut reference = sources[0]["codeField"]["valueRef"].clone();
+    let mut offset = 0_u64;
+    let mut fragments = 0;
+    for call in &calls {
+        let Some(items) = call["response"]["items"].as_array() else {
+            continue;
+        };
+        if items.first().is_none_or(|item| item["kind"] != "fragment") {
+            continue;
+        }
+        assert_eq!(call["request"]["contextRef"], reference);
+        assert!(call["request"].get("cursor").is_none());
+        assert_eq!(items[0]["offset"], offset);
+        offset += u64::try_from(items[0]["text"].as_str().unwrap().encode_utf16().count()).unwrap();
+        reference = items[0]["nextRef"].clone();
+        fragments += 1;
+    }
+    assert!(fragments > 1);
+    assert!(reference.is_null());
+    assert_eq!(offset, u64::try_from(code.encode_utf16().count()).unwrap());
+    if let Ok(directory) = std::env::var("NOTE_PAGE_TRANSCRIPT_DIR") {
+        let output = json!({"caseId":"longScalarDiffDirectNextRef","source":raw,"calls":calls,"sources":sources,
+            "scalarFragments":fragments,"continuation":"actual direct nextRef requests, no cursor request relabeling",
+            "readiness":"test-only-real-store-capture","limitations":"Fresh actual Store requests/responses before transport; no native-editor oracle/profile/renderer/backing/provider readiness. Original cursor capture remains unchanged."});
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(std::path::Path::new(&directory).join("diff-longScalarDirectNextRef.json"))
+            .unwrap();
+        serde_json::to_writer_pretty(file, &output).unwrap();
+    }
+    store.close().await;
 }

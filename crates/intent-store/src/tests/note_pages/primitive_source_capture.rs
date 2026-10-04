@@ -19,7 +19,11 @@ async fn resources(store: &Store, mut input: Value, calls: &mut Vec<Value>) -> V
     panic!("small fixture resource pagination did not terminate");
 }
 
-async fn capture_sources(store: &Store, require_complete_source: bool) -> (Vec<Value>, Vec<Value>) {
+async fn capture_sources(
+    store: &Store,
+    require_complete_source: bool,
+    direct_fragments: bool,
+) -> (Vec<Value>, Vec<Value>) {
     let mut calls = Vec::new();
     let first = record_page(
         store,
@@ -52,7 +56,11 @@ async fn capture_sources(store: &Store, require_complete_source: bool) -> (Vec<V
             code["valueRef"].is_string(),
             "empty/short code needs a value ref"
         );
-        let fragments = resources(store, json!({"kind":"context","contextRef":code["valueRef"],"maxItems":1,"maxWireBytes":8192}), &mut calls).await;
+        let fragments = if direct_fragments {
+            direct_value_fragments(store, code["valueRef"].clone(), &mut calls).await
+        } else {
+            resources(store, json!({"kind":"context","contextRef":code["valueRef"],"maxItems":1,"maxWireBytes":8192}), &mut calls).await
+        };
         let text: String = fragments
             .iter()
             .map(|item| item["text"].as_str().unwrap())
@@ -125,7 +133,7 @@ async fn indexed_mermaid_source_capture_preserves_exact_values_and_invalidation(
     {
         let source = case["source"].as_str().unwrap();
         let (store, _temporary, mut note) = setup(source).await;
-        let (calls, sources) = capture_sources(&store, true).await;
+        let (calls, sources) = capture_sources(&store, true, false).await;
         assert_eq!(sources.len(), case["atoms"].as_array().unwrap().len());
         for (actual, expected) in sources.iter().zip(case["atoms"].as_array().unwrap()) {
             assert_eq!(actual["node"]["nodeType"], expected["type"]);
@@ -171,7 +179,7 @@ async fn indexed_mermaid_source_capture_preserves_exact_values_and_invalidation(
             let old_read = rejected_read(&store, header).await;
             let old_grant =
                 rejected_grant(&store, "after-metadata-edit", header.clone(), "alice").await;
-            let (fresh_calls, fresh_sources) = capture_sources(&store, true).await;
+            let (fresh_calls, fresh_sources) = capture_sources(&store, true, false).await;
             let fresh = &fresh_sources
                 .iter()
                 .find(|item| item["header"]["primitive"] == "mermaid")
@@ -185,7 +193,7 @@ async fn indexed_mermaid_source_capture_preserves_exact_values_and_invalidation(
             store.update_note(&note).await.unwrap();
             let old_read = rejected_read(&store, fresh).await;
             let old_grant = rejected_grant(&store, "after-code-edit", fresh.clone(), "alice").await;
-            let (changed_calls, changed_sources) = capture_sources(&store, true).await;
+            let (changed_calls, changed_sources) = capture_sources(&store, true, false).await;
             assert_eq!(changed_sources[0]["code"], "graph TD\n B[Beta]");
             invalidations.push(json!({"mutation":"canonical-code-value","source":note.content,"oldRead":old_read,"oldGrant":old_grant,"calls":changed_calls,"sources":changed_sources}));
             let before = changed_sources[0]["header"].clone();
@@ -221,4 +229,29 @@ async fn indexed_mermaid_source_capture_preserves_exact_values_and_invalidation(
         captured += 1;
     }
     assert_eq!(captured, ids.len());
+}
+
+async fn direct_value_fragments(
+    store: &Store,
+    mut reference: Value,
+    calls: &mut Vec<Value>,
+) -> Vec<Value> {
+    let mut fragments = Vec::new();
+    for _ in 0..128 {
+        let response = record_page(
+            store,
+            json!({"kind":"context","contextRef":reference,"maxItems":1,"maxWireBytes":8192}),
+            calls,
+        )
+        .await;
+        let items = response["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "fragment");
+        reference = items[0]["nextRef"].clone();
+        fragments.push(items[0].clone());
+        if reference.is_null() {
+            return fragments;
+        }
+    }
+    panic!("direct nextRef fragment capture did not terminate");
 }
