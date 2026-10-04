@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.11] - 2026-10-04
+
+### 🚀 Features
+
+- Add Home backend prerequisites ([#2256](https://github.com/intent-hq/intentd/pull/2256))
+
+
 ## [0.10.10] - 2026-10-04
 
 ### 🚀 Features
