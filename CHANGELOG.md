@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.9] - 2026-10-04
+
+### 🚀 Features
+
+- Add guarded GitLab repository workflows ([#2261](https://github.com/intent-hq/intentd/pull/2261))
+
+### 🐛 Bug Fixes
+
+- Ignore Claude state churn in installed CLI catalog fingerprint ([#2275](https://github.com/intent-hq/intentd/pull/2275))
+- Bind daemon callers in retained workspace CoW fixtures ([#2273](https://github.com/intent-hq/intentd/pull/2273))
+
+### 🧪 Testing
+
+- Warm host-member query-cost fixture ([#6694](https://github.com/intent-hq/intentd/pull/6694)) ([#2277](https://github.com/intent-hq/intentd/pull/2277))
+- Isolate Tailcat discovery in no-tunnel invitation fixture ([#2272](https://github.com/intent-hq/intentd/pull/2272))
+- Make tunnel connect deadline coverage deterministic ([#2274](https://github.com/intent-hq/intentd/pull/2274))
+
+
 ## [0.10.8] - 2026-10-03
 
 ### 🚀 Features
