@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 
 pub const SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
+#[cfg(test)]
+#[path = "request/timestamp_capture.rs"]
+mod timestamp_capture;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestError {
     Invalid,
