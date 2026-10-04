@@ -31,13 +31,18 @@ impl Mode {
 struct Cell {
     bytes: Box<[u8; 4096]>,
     guest: bool,
+    generation: u64,
+    source_claimed: bool,
 }
 
 /// Process-local context root. Construction/replacement is owned by Services.
 pub struct Contexts {
     incarnation: String,
+    next_generation: std::sync::atomic::AtomicU64,
     slots: Mutex<Vec<Option<Cell>>>,
     changed: [Notify; 2],
+    #[cfg(test)]
+    phase_blocked: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
 
 /// Observation of retained contexts, not physical allocation or remote delivery.
@@ -57,8 +62,11 @@ impl Services {
             .get_or_init(|| {
                 Arc::new(Contexts {
                     incarnation: self.daemon_boot_id.clone(),
+                    next_generation: std::sync::atomic::AtomicU64::new(0),
                     slots: Mutex::new((0..256).map(|_| None).collect()),
                     changed: [Notify::new(), Notify::new()],
+                    #[cfg(test)]
+                    phase_blocked: Mutex::new(None),
                 })
             })
             .clone()
@@ -79,6 +87,15 @@ impl Contexts {
     pub fn try_admit(self: &Arc<Self>, mode: Mode) -> Option<Context> {
         let mut slots = self.slots.lock().expect("source context registry poisoned");
         let index = mode.range().find(|&i| slots[i].is_none())?;
+        let generation = self
+            .next_generation
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| n.checked_add(1),
+            )
+            .ok()?
+            .checked_add(1)?;
         let mut bytes = Box::new([0; 4096]);
         bytes[0] = 1;
         bytes[1] = if mode == Mode::Read { 1 } else { 2 };
@@ -88,6 +105,8 @@ impl Contexts {
         slots[index] = Some(Cell {
             bytes,
             guest: false,
+            generation,
+            source_claimed: false,
         });
         Some(Context {
             root: self.clone(),
@@ -212,6 +231,17 @@ impl Context {
     /// Panics for an invalid phase tag, poisoned registry, or missing owned cell.
     pub fn phase(&mut self, phase: u8) {
         assert!(phase <= 7);
+        #[cfg(test)]
+        if phase >= 6 {
+            if let Some(observe) = self.root.phase_blocked.lock().unwrap().clone() {
+                if matches!(
+                    self.root.slots.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ) {
+                    let _ = observe.try_send(());
+                }
+            }
+        }
         let mut slots = self
             .root
             .slots
@@ -248,5 +278,100 @@ impl Drop for Context {
                 }
             }
         }
+    }
+}
+
+/// Captured ready-cell identity. Construction requires the actual admitted context.
+#[derive(Clone)]
+pub(crate) struct SourceIdentity {
+    root: Arc<Contexts>,
+    index: usize,
+    pub(crate) epoch: [u8; 16],
+    generation: u64,
+    pub(crate) mode: Mode,
+}
+impl Context {
+    pub(crate) fn source_identity(&self, principal: &str) -> Option<SourceIdentity> {
+        let mut slots = self.root.slots.lock().ok()?;
+        let cell = slots.get_mut(self.index)?.as_mut()?;
+        if cell.bytes[2] != 5 || cell.source_claimed {
+            return None;
+        }
+        let n = usize::try_from(u32::from_be_bytes(cell.bytes[8..12].try_into().ok()?)).ok()?;
+        if cell.bytes.get(12..12 + n)? != principal.as_bytes() {
+            return None;
+        }
+        let offset = 20 + n + self.root.incarnation.len();
+        let epoch = cell.bytes.get(offset + 32..offset + 48)?.try_into().ok()?;
+        cell.source_claimed = true;
+        Some(SourceIdentity {
+            root: self.root.clone(),
+            index: self.index,
+            epoch,
+            generation: cell.generation,
+            mode: self.mode,
+        })
+    }
+}
+impl SourceIdentity {
+    #[cfg(test)]
+    pub(crate) fn observe_current_lock(&self, sender: &std::sync::mpsc::SyncSender<()>) {
+        if matches!(
+            self.root.slots.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ) {
+            let _ = sender.try_send(());
+        }
+    }
+    pub(crate) fn current(&self, principal: &str) -> bool {
+        let Ok(slots) = self.root.slots.lock() else {
+            return false;
+        };
+        let Some(cell) = slots.get(self.index).and_then(Option::as_ref) else {
+            return false;
+        };
+        if cell.bytes[2] != 5 || cell.generation != self.generation || !cell.source_claimed {
+            return false;
+        }
+        let Ok(length) = <[u8; 4]>::try_from(&cell.bytes[8..12]) else {
+            return false;
+        };
+        let Ok(n) = usize::try_from(u32::from_be_bytes(length)) else {
+            return false;
+        };
+        let offset = 20 + n + self.root.incarnation.len();
+        cell.bytes.get(12..12 + n) == Some(principal.as_bytes())
+            && cell.bytes.get(offset + 32..offset + 48) == Some(self.epoch.as_slice())
+    }
+}
+
+impl SourceIdentity {
+    // Private integration seam. Lock order is context -> operation directory;
+    // callback is supplied only by the typed delivery writer, never wire/user code.
+    pub(crate) fn while_current<T>(
+        &self,
+        principal: &str,
+        enqueue: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let slots = self.root.slots.lock().ok()?;
+        let cell = slots.get(self.index)?.as_ref()?;
+        if cell.bytes[2] != 5 || cell.generation != self.generation || !cell.source_claimed {
+            return None;
+        }
+        let n = usize::try_from(u32::from_be_bytes(cell.bytes[8..12].try_into().ok()?)).ok()?;
+        let offset = 20 + n + self.root.incarnation.len();
+        if cell.bytes.get(12..12 + n) != Some(principal.as_bytes())
+            || cell.bytes.get(offset + 32..offset + 48) != Some(self.epoch.as_slice())
+        {
+            return None;
+        }
+        Some(enqueue())
+    }
+}
+
+#[cfg(test)]
+impl Context {
+    pub(crate) fn observe_phase_lock(&self, sender: std::sync::mpsc::SyncSender<()>) {
+        *self.root.phase_blocked.lock().unwrap() = Some(sender);
     }
 }

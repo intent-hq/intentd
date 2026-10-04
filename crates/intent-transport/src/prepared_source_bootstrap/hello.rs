@@ -78,10 +78,7 @@ fn strict(raw: &str) -> intent_core::Result<Value> {
 
 pub(super) fn validate(raw: &str, mode: Mode) -> intent_core::Result<Value> {
     let f = strict(raw)?;
-    let id_ok = f["id"].as_str().is_some_and(|s| s.len() <= 64)
-        || f["id"]
-            .as_i64()
-            .is_some_and(|v| v.unsigned_abs() <= 9_007_199_254_740_991);
+    let id_ok = intent_core::note_source_session::validate_id(&f["id"]).is_ok();
     let p = &f["params"];
     if !exact(&f, &["jsonrpc", "id", "method", "params"], &[])
         || f["jsonrpc"] != "2.0"
@@ -100,7 +97,7 @@ pub(super) fn validate(raw: &str, mode: Mode) -> intent_core::Result<Value> {
             ],
         )
         || !exact(&p["sourceSession"], &["version", "mode"], &[])
-        || p["sourceSession"]["version"] != 1
+        || intent_core::note_source_session::safe_integer(&p["sourceSession"]["version"]) != Ok(1)
         || p["sourceSession"]["mode"] != mode.as_str()
     {
         return Err(invalid());

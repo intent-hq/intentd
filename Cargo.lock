@@ -5148,7 +5148,7 @@ dependencies = [
 [[package]]
 name = "tokio-tungstenite"
 version = "0.30.0"
-source = "git+https://github.com/intent-hq/tokio-tungstenite-fork?branch=deflate#79abf1c8d20309fbd2649d008d05b456bdc748d2"
+source = "git+https://github.com/intent-hq/tokio-tungstenite-fork?rev=14c4c2e7f343f543b713226383eadd5a1b5adfbf#14c4c2e7f343f543b713226383eadd5a1b5adfbf"
 dependencies = [
  "futures-util",
  "log",

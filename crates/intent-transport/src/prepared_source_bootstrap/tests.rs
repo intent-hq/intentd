@@ -1,4 +1,5 @@
 //! Real loopback TLS/auth/Store witnesses. Synthetic faults are named explicitly.
+mod lifecycle;
 use super::*;
 use intent_core::{now_iso, Principal, PrincipalId};
 use intent_core::{Caller, WorkspaceApi};
@@ -61,6 +62,13 @@ impl Fixture {
             hello_pending: tokio::sync::Notify::new(),
             validation_pending: tokio::sync::Notify::new(),
             partial_hello: std::sync::atomic::AtomicBool::new(false),
+            control_pending: tokio::sync::Notify::new(),
+            source_pending: std::sync::atomic::AtomicUsize::new(0),
+            source_partial: std::sync::atomic::AtomicUsize::new(0),
+            partial_control: std::sync::atomic::AtomicBool::new(false),
+            auth_io: std::sync::Mutex::new(Vec::new()),
+            page_auth_gate: std::sync::Mutex::new(None),
+            page_auth_pending: tokio::sync::Notify::new(),
         });
         let server = PreparedBootstrap::start_shared(shared.clone())
             .await

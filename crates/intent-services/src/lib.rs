@@ -237,6 +237,7 @@ mod sentry_ops;
 mod settings;
 mod settings_registry;
 mod shell;
+pub mod source_session;
 pub(crate) mod stack_sample;
 mod task_effort;
 mod terminal_ops;
@@ -1191,6 +1192,7 @@ pub struct Services {
     daemon_boot_id: String,
     /// Lazy, isolated source-bootstrap contexts; clones retain one root and debt.
     prepared_source_contexts: Arc<OnceLock<Arc<prepared_source_bootstrap::Contexts>>>,
+    prepared_source_operations: Arc<OnceLock<Arc<source_session::registry::Registry>>>,
     /// Exact ordinary API allocation; clones cannot bind replacement owners.
     repository_wire_owner: Arc<OnceLock<Weak<Services>>>,
     repository_review_capacity: Arc<repository_native_wire::review::Capacity>,
@@ -1656,6 +1658,7 @@ impl Services {
             pty: Arc::new(intent_pty::PtyHost::new()),
             daemon_boot_id,
             prepared_source_contexts: Arc::new(OnceLock::new()),
+            prepared_source_operations: Arc::new(OnceLock::new()),
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_locks: script_ops::ScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,

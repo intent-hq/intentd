@@ -13,6 +13,8 @@ use std::{
 use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit};
 
 mod closure;
+mod delivery;
+pub(crate) use delivery::DeliveryHold;
 pub(crate) mod ownership;
 use closure::Step;
 use ownership::{OpenGuard, OwnedRead, Retained, WorkGuard};
@@ -36,6 +38,7 @@ struct State {
     closed: bool,
     busy: bool,
     in_flight: bool,
+    delivery: bool,
     quarantined: bool,
     step: Step,
     grant: Option<ArtifactSourceGrant>,
@@ -75,7 +78,7 @@ impl Inner {
     fn revoke(&self) {
         let mut state = self.state.lock().expect("source state");
         state.closed = true;
-        if !state.in_flight && !state.quarantined {
+        if !state.in_flight && !state.delivery && !state.quarantined {
             state.grant.take();
             self.retained
                 .release(&self.services.canonical_source_owners);
@@ -84,7 +87,7 @@ impl Inner {
     fn quarantine(&self) {
         let mut state = self.state.lock().expect("source state");
         state.closed = true;
-        if state.in_flight {
+        if state.in_flight || state.delivery {
             self.retained
                 .uncertain
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -111,7 +114,7 @@ impl Inner {
         let mut state = self.state.lock().expect("source state");
         if !state.quarantined {
             state.in_flight = false;
-            if state.closed {
+            if state.closed && !state.delivery {
                 state.grant.take();
                 self.retained
                     .release(&self.services.canonical_source_owners);
@@ -227,13 +230,22 @@ impl CanonicalSourceSession {
         request: NotePageRequest,
         rpc_id: Value,
     ) -> Result<impl Future<Output = Result<Value>> + Send + 'static> {
+        self.read_owned(request, rpc_id, false)
+    }
+
+    fn read_owned(
+        &self,
+        request: NotePageRequest,
+        rpc_id: Value,
+        delivery: bool,
+    ) -> Result<impl Future<Output = Result<Value>> + Send + 'static> {
         self.inner.current()?;
         let step = {
             let mut state = self.inner.state.lock().expect("source state");
             if state.closed {
                 return Err(expired());
             }
-            if state.busy {
+            if state.busy || (state.delivery && !delivery) {
                 return Err(budget());
             }
             state.step.check(&request)?;
@@ -334,7 +346,7 @@ impl CanonicalSourceSession {
                     if state.quarantined {
                         return Err(uncertain());
                     }
-                    if !state.in_flight {
+                    if !state.in_flight && !state.delivery {
                         return Ok(());
                     }
                 }
@@ -447,6 +459,7 @@ impl Services {
                             closed: false,
                             busy: false,
                             in_flight: false,
+                            delivery: false,
                             quarantined: false,
                             step,
                             grant: Some(grant),

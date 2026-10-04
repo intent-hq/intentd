@@ -1,5 +1,5 @@
 //! Isolated authenticated bootstrap test composition. Never installed by shipping listeners.
-//! Only strict `client.hello` is served; source lifecycle operations remain unavailable.
+//! Strict authenticated hello precedes the prepared source-only lifecycle dispatcher.
 //!
 //! Each Services root lazily reserves at most240 read and16 cleanup context cells.
 //! A pending accept owns one cell before TLS task spawn. Read guest limits are
@@ -18,8 +18,10 @@
 //! The TCP wrapper admits at most65536 actual bytes per direction; HTTP headers
 //! including start line and delimiter fit16384 per direction, and complete escaped
 //! hello JSON fits8192 per direction. No compression is negotiated. This bootstrap
-//! has no lifecycle traffic: any later message closes it. The TCP counter remains
-//! conservative through that terminal close; it is not a source-stream quota.
+//! transfers its SAME TLS/parser owner after successful hello flush. Checked TCP
+//! totals remain monotonic with bootstrap end marks; active IO chunks are8192.
+//! Active WS input frame/message limits are65536 and output remains8192+256.
+//! The cumulative handshake ceiling is not a source-stream quota.
 //! WS frame/message/read buffers are8192 and write buffering is8192+256. Rustls,
 //! parsed Values/strings, auth results, Store pools, allocator overhead and kernel
 //! buffers are separate from the fixed4096-byte encoded context cell and are not
@@ -31,6 +33,7 @@
 //! latest-database-state at send. A local flush is not remote consumption.
 mod hello;
 mod io;
+mod lifecycle;
 #[cfg(test)]
 mod tests;
 
@@ -102,6 +105,27 @@ struct Shared {
     validation_pending: tokio::sync::Notify,
     #[cfg(test)]
     partial_hello: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    control_pending: tokio::sync::Notify,
+    #[cfg(test)]
+    source_pending: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    source_partial: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    partial_control: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    auth_io: std::sync::Mutex<Vec<(usize, usize, usize, usize)>>,
+    #[cfg(test)]
+    page_auth_gate: std::sync::Mutex<Option<Arc<AuthGate>>>,
+    #[cfg(test)]
+    page_auth_pending: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct AuthGate {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -143,6 +167,20 @@ impl PreparedBootstrap {
             validation_pending: tokio::sync::Notify::new(),
             #[cfg(test)]
             partial_hello: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            control_pending: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            source_pending: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            source_partial: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            partial_control: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            auth_io: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            page_auth_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            page_auth_pending: tokio::sync::Notify::new(),
         });
         Self::start_shared(shared).await
     }
@@ -615,9 +653,33 @@ async fn handshake(
     }
     meter.ready.store(true, Ordering::Release);
     context.phase(5);
-    // Bootstrap-only connection holds its admission until close. Any further data
-    // terminalizes; no lifecycle methods become available from this context.
-    tokio::select! { biased; ()=cancelled(stop)=>{}, ()=revoke.wait()=>{}, _=ws.as_mut().expect("WS").next()=>{} }
-    drop(ws.take());
-    Ok(())
+    let source = shared
+        .api
+        .prepared_source_connection(context, caller.clone())
+        .map_err(|e| Error::InvalidParams(e.code().into()))?;
+    // Complete authenticated Text hello, successful owned flush and final local
+    // checks precede this SAME-stream update. No next() lookahead or reconstruction.
+    // Only input limits change; known-valid output thresholds remain untouched.
+    ws.as_mut().expect("WS").set_config(|config| {
+        config.max_message_size = Some(65536);
+        config.max_frame_size = Some(65536);
+    });
+    ws.as_mut()
+        .expect("WS")
+        .get_mut()
+        .get_mut()
+        .1
+        .set_buffer_limit(Some(65536));
+    meter.activate().map_err(internal)?;
+    lifecycle::run(
+        shared,
+        context,
+        &mut ws,
+        caller.clone(),
+        &admitted,
+        stop,
+        &mut revoke,
+        source,
+    )
+    .await
 }

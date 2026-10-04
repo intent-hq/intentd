@@ -1,0 +1,182 @@
+{
+  "head": "f72519f1c9ed57afb0496ce0b7ade695d70ce0ba",
+  "scope": "Exact frozen prepared checker execution; synthetic raw frames, not Rust/WSS evidence",
+  "files": {
+    "source-sessions.mjs": "0022e75850d3217a746fc46488d4da99f1674f94a8091a40be4da12f7b96b821",
+    "source-sessions.json": "3db41d4f6709363673c5ad2262620982e3978db08f25d492855561d10b0a19dd",
+    "contract.mjs": "e957964c1664c79debb9ca931de2b1cbbaeb03258ceeba4659732f8e72dcd78e"
+  },
+  "results": [
+    {
+      "field": "id",
+      "spelling": "1.0",
+      "expected": true,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":1.0,\"method\":\"client.hello\",\"params\":{\"clientId\":\"client-a\",\"name\":\"Source fixture\",\"capabilities\":{\"sourceFixture\":true},\"sourceSession\":{\"version\":1,\"mode\":\"read\"}}}",
+      "bytes": 189,
+      "accepted": true,
+      "error": null
+    },
+    {
+      "field": "id",
+      "spelling": "1e0",
+      "expected": true,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":1e0,\"method\":\"client.hello\",\"params\":{\"clientId\":\"client-a\",\"name\":\"Source fixture\",\"capabilities\":{\"sourceFixture\":true},\"sourceSession\":{\"version\":1,\"mode\":\"read\"}}}",
+      "bytes": 189,
+      "accepted": true,
+      "error": null
+    },
+    {
+      "field": "id",
+      "spelling": "-0",
+      "expected": true,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":-0,\"method\":\"client.hello\",\"params\":{\"clientId\":\"client-a\",\"name\":\"Source fixture\",\"capabilities\":{\"sourceFixture\":true},\"sourceSession\":{\"version\":1,\"mode\":\"read\"}}}",
+      "bytes": 188,
+      "accepted": true,
+      "error": null
+    },
+    {
+      "field": "id",
+      "spelling": "9007199254740991.0",
+      "expected": true,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":9007199254740991.0,\"method\":\"client.hello\",\"params\":{\"clientId\":\"client-a\",\"name\":\"Source fixture\",\"capabilities\":{\"sourceFixture\":true},\"sourceSession\":{\"version\":1,\"mode\":\"read\"}}}",
+      "bytes": 204,
+      "accepted": true,
+      "error": null
+    },
+    {
+      "field": "id",
+      "spelling": "-9007199254740991.0",
+      "expected": true,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":-9007199254740991.0,\"method\":\"client.hello\",\"params\":{\"clientId\":\"client-a\",\"name\":\"Source fixture\",\"capabilities\":{\"sourceFixture\":true},\"sourceSession\":{\"version\":1,\"mode\":\"read\"}}}",
+      "bytes": 205,
+      "accepted": true,
+      "error": null
+    },
+    {
+      "field": "id",
+      "spelling": "1.5",
+      "expected": false,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"client.hello\",\"params\":{\"clientId\":\"client-a\",\"name\":\"Source fixture\",\"capabilities\":{\"sourceFixture\":true},\"sourceSession\":{\"version\":1,\"mode\":\"read\"}}}",
+      "bytes": 189,
+      "accepted": false,
+      "error": "The expression evaluated to a falsy value:\n\n  assert.ok(Number.isSafeInteger(id) || (typeof id === 'string' && utf8(id) <= policy.idBytes))\n"
+    },
+    {
+      "field": "id",
+      "spelling": "9007199254740992",
+      "expected": false,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":9007199254740992,\"method\":\"client.hello\",\"params\":{\"clientId\":\"client-a\",\"name\":\"Source fixture\",\"capabilities\":{\"sourceFixture\":true},\"sourceSession\":{\"version\":1,\"mode\":\"read\"}}}",
+      "bytes": 202,
+      "accepted": false,
+      "error": "The expression evaluated to a falsy value:\n\n  assert.ok(Number.isSafeInteger(id) || (typeof id === 'string' && utf8(id) <= policy.idBytes))\n"
+    },
+    {
+      "field": "id",
+      "spelling": "-9007199254740992",
+      "expected": false,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":-9007199254740992,\"method\":\"client.hello\",\"params\":{\"clientId\":\"client-a\",\"name\":\"Source fixture\",\"capabilities\":{\"sourceFixture\":true},\"sourceSession\":{\"version\":1,\"mode\":\"read\"}}}",
+      "bytes": 203,
+      "accepted": false,
+      "error": "The expression evaluated to a falsy value:\n\n  assert.ok(Number.isSafeInteger(id) || (typeof id === 'string' && utf8(id) <= policy.idBytes))\n"
+    },
+    {
+      "field": "sequence",
+      "spelling": "0.0",
+      "expected": true,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"source-1\",\"method\":\"note.sourceSession.read\",\"params\":{\"workspaceId\":\"ws-a\",\"operationId\":\"a84b998eb663eb05b6d94e1202c4bae1810a77a7d8f26e1eb8a2b33868060c03\",\"sequence\":0.0,\"request\":{\"kind\":\"context\",\"contextRef\":\"fixture-signed-d:owner\",\"maxItems\":1,\"maxWireBytes\":8192}}}",
+      "bytes": 296,
+      "accepted": true,
+      "error": null
+    },
+    {
+      "field": "sequence",
+      "spelling": "0e0",
+      "expected": true,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"source-1\",\"method\":\"note.sourceSession.read\",\"params\":{\"workspaceId\":\"ws-a\",\"operationId\":\"a84b998eb663eb05b6d94e1202c4bae1810a77a7d8f26e1eb8a2b33868060c03\",\"sequence\":0e0,\"request\":{\"kind\":\"context\",\"contextRef\":\"fixture-signed-d:owner\",\"maxItems\":1,\"maxWireBytes\":8192}}}",
+      "bytes": 296,
+      "accepted": true,
+      "error": null
+    },
+    {
+      "field": "sequence",
+      "spelling": "-0",
+      "expected": true,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"source-1\",\"method\":\"note.sourceSession.read\",\"params\":{\"workspaceId\":\"ws-a\",\"operationId\":\"a84b998eb663eb05b6d94e1202c4bae1810a77a7d8f26e1eb8a2b33868060c03\",\"sequence\":-0,\"request\":{\"kind\":\"context\",\"contextRef\":\"fixture-signed-d:owner\",\"maxItems\":1,\"maxWireBytes\":8192}}}",
+      "bytes": 295,
+      "accepted": true,
+      "error": null
+    },
+    {
+      "field": "sequence",
+      "spelling": "1.5",
+      "expected": false,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"source-1\",\"method\":\"note.sourceSession.read\",\"params\":{\"workspaceId\":\"ws-a\",\"operationId\":\"a84b998eb663eb05b6d94e1202c4bae1810a77a7d8f26e1eb8a2b33868060c03\",\"sequence\":1.5,\"request\":{\"kind\":\"context\",\"contextRef\":\"fixture-signed-d:owner\",\"maxItems\":1,\"maxWireBytes\":8192}}}",
+      "bytes": 296,
+      "accepted": false,
+      "error": "The expression evaluated to a falsy value:\n\n  assert.ok(token(p.workspaceId) && hash(p.operationId) && uint(p.sequence))\n"
+    },
+    {
+      "field": "sequence",
+      "spelling": "-1",
+      "expected": false,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"source-1\",\"method\":\"note.sourceSession.read\",\"params\":{\"workspaceId\":\"ws-a\",\"operationId\":\"a84b998eb663eb05b6d94e1202c4bae1810a77a7d8f26e1eb8a2b33868060c03\",\"sequence\":-1,\"request\":{\"kind\":\"context\",\"contextRef\":\"fixture-signed-d:owner\",\"maxItems\":1,\"maxWireBytes\":8192}}}",
+      "bytes": 295,
+      "accepted": false,
+      "error": "The expression evaluated to a falsy value:\n\n  assert.ok(token(p.workspaceId) && hash(p.operationId) && uint(p.sequence))\n"
+    },
+    {
+      "field": "maxItems",
+      "spelling": "1.0",
+      "expected": true,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"source-1\",\"method\":\"note.sourceSession.read\",\"params\":{\"workspaceId\":\"ws-a\",\"operationId\":\"a84b998eb663eb05b6d94e1202c4bae1810a77a7d8f26e1eb8a2b33868060c03\",\"sequence\":0,\"request\":{\"kind\":\"context\",\"contextRef\":\"fixture-signed-d:owner\",\"maxItems\":1.0,\"maxWireBytes\":8192}}}",
+      "bytes": 296,
+      "accepted": true,
+      "error": null
+    },
+    {
+      "field": "maxItems",
+      "spelling": "1e0",
+      "expected": true,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"source-1\",\"method\":\"note.sourceSession.read\",\"params\":{\"workspaceId\":\"ws-a\",\"operationId\":\"a84b998eb663eb05b6d94e1202c4bae1810a77a7d8f26e1eb8a2b33868060c03\",\"sequence\":0,\"request\":{\"kind\":\"context\",\"contextRef\":\"fixture-signed-d:owner\",\"maxItems\":1e0,\"maxWireBytes\":8192}}}",
+      "bytes": 296,
+      "accepted": true,
+      "error": null
+    },
+    {
+      "field": "maxItems",
+      "spelling": "1.5",
+      "expected": false,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"source-1\",\"method\":\"note.sourceSession.read\",\"params\":{\"workspaceId\":\"ws-a\",\"operationId\":\"a84b998eb663eb05b6d94e1202c4bae1810a77a7d8f26e1eb8a2b33868060c03\",\"sequence\":0,\"request\":{\"kind\":\"context\",\"contextRef\":\"fixture-signed-d:owner\",\"maxItems\":1.5,\"maxWireBytes\":8192}}}",
+      "bytes": 296,
+      "accepted": false,
+      "error": "Expected values to be strictly equal:\n\n1.5 !== 1\n"
+    },
+    {
+      "field": "maxWireBytes",
+      "spelling": "8192.0",
+      "expected": true,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"source-1\",\"method\":\"note.sourceSession.read\",\"params\":{\"workspaceId\":\"ws-a\",\"operationId\":\"a84b998eb663eb05b6d94e1202c4bae1810a77a7d8f26e1eb8a2b33868060c03\",\"sequence\":0,\"request\":{\"kind\":\"context\",\"contextRef\":\"fixture-signed-d:owner\",\"maxItems\":1,\"maxWireBytes\":8192.0}}}",
+      "bytes": 296,
+      "accepted": true,
+      "error": null
+    },
+    {
+      "field": "maxWireBytes",
+      "spelling": "8.192e3",
+      "expected": true,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"source-1\",\"method\":\"note.sourceSession.read\",\"params\":{\"workspaceId\":\"ws-a\",\"operationId\":\"a84b998eb663eb05b6d94e1202c4bae1810a77a7d8f26e1eb8a2b33868060c03\",\"sequence\":0,\"request\":{\"kind\":\"context\",\"contextRef\":\"fixture-signed-d:owner\",\"maxItems\":1,\"maxWireBytes\":8.192e3}}}",
+      "bytes": 297,
+      "accepted": true,
+      "error": null
+    },
+    {
+      "field": "maxWireBytes",
+      "spelling": "8192.5",
+      "expected": false,
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":\"source-1\",\"method\":\"note.sourceSession.read\",\"params\":{\"workspaceId\":\"ws-a\",\"operationId\":\"a84b998eb663eb05b6d94e1202c4bae1810a77a7d8f26e1eb8a2b33868060c03\",\"sequence\":0,\"request\":{\"kind\":\"context\",\"contextRef\":\"fixture-signed-d:owner\",\"maxItems\":1,\"maxWireBytes\":8192.5}}}",
+      "bytes": 296,
+      "accepted": false,
+      "error": "The expression evaluated to a falsy value:\n\n  assert.ok(uint(r.maxWireBytes) && r.maxWireBytes >= 4096 && r.maxWireBytes <= 8192)\n"
+    }
+  ]
+}

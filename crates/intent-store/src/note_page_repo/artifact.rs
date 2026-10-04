@@ -47,7 +47,16 @@ impl CanonicalSourceBinding {
 /// Held across source authorization and any uncertain connection cleanup.
 #[derive(Clone, Debug)]
 pub struct CanonicalSourceHold {
+    expires_at: String,
     _pin: std::sync::Arc<super::SnapshotPin>,
+}
+
+impl CanonicalSourceHold {
+    /// Original signed snapshot deadline. Retention does not renew it or grant current source authority.
+    #[must_use]
+    pub fn expires_at(&self) -> &str {
+        &self.expires_at
+    }
 }
 
 /// Verified source binding at one read transaction. Mutating lifecycle transitions
@@ -149,6 +158,7 @@ impl Store {
             return Err(failure(NotePageError::Stale));
         }
         Ok(CanonicalSourceHold {
+            expires_at: snapshot.expires,
             _pin: self.note_pages.pin_snapshot(&binding.snapshot_id)?,
         })
     }

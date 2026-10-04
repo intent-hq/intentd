@@ -15,6 +15,7 @@ use tokio::{
 
 pub(super) const CIPHER_LIMIT: usize = 65536;
 pub(super) const HTTP_LIMIT: usize = 16384;
+const ACTIVE_IO_CHUNK: usize = 8192;
 
 #[derive(Default)]
 pub(super) struct Meter {
@@ -22,12 +23,39 @@ pub(super) struct Meter {
     pub written: AtomicUsize,
     pub closed: AtomicBool,
     pub ready: AtomicBool,
+    active: AtomicBool,
+    pub bootstrap_read: AtomicUsize,
+    pub bootstrap_written: AtomicUsize,
     pub hello_in: AtomicUsize,
     pub hello_out: AtomicUsize,
     #[cfg(test)]
     pub fail_write_at: AtomicUsize,
     pub http_in: AtomicUsize,
     pub http_out: AtomicUsize,
+}
+
+impl Meter {
+    /// Transfer the existing TLS/parser owner after authenticated hello flush.
+    /// Totals and buffered read-ahead are never reset or declared consumed.
+    pub fn activate(&self) -> io::Result<()> {
+        if self.active.load(Ordering::Acquire) {
+            return Err(io::Error::other("duplicate source transition"));
+        }
+        self.bootstrap_read
+            .store(self.read.load(Ordering::Acquire), Ordering::Release);
+        self.bootstrap_written
+            .store(self.written.load(Ordering::Acquire), Ordering::Release);
+        self.active.store(true, Ordering::Release);
+        Ok(())
+    }
+    fn remaining(&self, counter: &AtomicUsize) -> usize {
+        let observed = counter.load(Ordering::Acquire);
+        if self.active.load(Ordering::Acquire) {
+            ACTIVE_IO_CHUNK.min(usize::MAX - observed)
+        } else {
+            CIPHER_LIMIT.saturating_sub(observed)
+        }
+    }
 }
 
 pub(super) struct CountedTcp {
@@ -51,7 +79,7 @@ impl AsyncRead for CountedTcp {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        let left = CIPHER_LIMIT.saturating_sub(self.meter.read.load(Ordering::Acquire));
+        let left = self.meter.remaining(&self.meter.read);
         if left == 0 {
             return Poll::Ready(Err(io::Error::other("bootstrap ciphertext read budget")));
         }
@@ -61,7 +89,10 @@ impl AsyncRead for CountedTcp {
             Poll::Ready(Ok(())) => {
                 let n = bounded.filled().len();
                 buf.advance(n);
-                self.meter.read.fetch_add(n, Ordering::Release);
+                self.meter
+                    .read
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(n))
+                    .map_err(|_| io::Error::other("ciphertext counter overflow"))?;
                 Poll::Ready(Ok(()))
             }
             other => other,
@@ -77,13 +108,14 @@ impl AsyncWrite for CountedTcp {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let limit = CIPHER_LIMIT;
+        let left = self.meter.remaining(&self.meter.written);
         #[cfg(test)]
-        let limit = match self.meter.fail_write_at.load(Ordering::Acquire) {
-            0 => limit,
-            injected => limit.min(injected),
+        let left = match self.meter.fail_write_at.load(Ordering::Acquire) {
+            0 => left,
+            injected => {
+                left.min(injected.saturating_sub(self.meter.written.load(Ordering::Acquire)))
+            }
         };
-        let left = limit.saturating_sub(self.meter.written.load(Ordering::Acquire));
         if left == 0 {
             return Poll::Ready(Err(io::Error::other("bootstrap ciphertext write budget")));
         }
@@ -91,7 +123,10 @@ impl AsyncWrite for CountedTcp {
             .poll_write(cx, &buf[..left.min(buf.len())])
         {
             Poll::Ready(Ok(n)) => {
-                self.meter.written.fetch_add(n, Ordering::Release);
+                self.meter
+                    .written
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(n))
+                    .map_err(|_| io::Error::other("ciphertext counter overflow"))?;
                 Poll::Ready(Ok(n))
             }
             other => other,
