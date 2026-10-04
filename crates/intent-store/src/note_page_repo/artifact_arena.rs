@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 mod ownership;
 use ownership::SourceOwners;
+#[cfg(all(test, unix))]
+mod physical_tests;
 
 pub(crate) struct ArtifactArena {
     pub pool: SqlitePool,
