@@ -824,6 +824,9 @@ async fn host_member_list_authority_cost_does_not_grow_per_workspace() {
         .insert_workspace(&workspace(&WorkspaceId::from("first")))
         .await
         .unwrap();
+    // A single list call can leave lazy read connections whose setup PRAGMAs
+    // would otherwise enter a later measured span.
+    crate::test_tracing::warm_sqlx_pool(svc.store.read_pool()).await;
     with_caller(caller(&member), async {
         svc.list_workspaces_lite(true).await.unwrap();
         let (first, small) =
