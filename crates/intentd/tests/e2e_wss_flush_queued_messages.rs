@@ -2291,3 +2291,185 @@ async fn explicit_batch_over_wss(fail_second_append: bool) {
         json!({"partialPersistence":fail_second_append,"response":response,"prompts":prompts,"remainingQueue":remaining,"conversation":conv})
     );
 }
+
+/// An agent reads its own queue through real MCP while humans read it over
+/// WSS, then ends its turn so the original entries drain normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_queue_reads_do_not_reveal_or_consume_pending_messages_over_wss() {
+    let Some(script) = gate("WSS self queue visibility E2E") else {
+        return;
+    };
+    let tmp = temp_data_dir();
+    let data_dir = tmp.path();
+    let (ws_id, _) = seed_workspace_with_guest(data_dir).await;
+    let release = data_dir.join("release-self-read");
+    let code = r"
+        const secret = ['PENDING', 'WSS', 'SECRET'].join('-');
+        const target = (await ws.agent.list(true)).find(a => a.name === 'SELF-QUEUE-READER');
+        const status = await ws.agent.status(target.id);
+        const queue = await ws.agent.getQueue(target.id);
+        const diagnostics = await ws.agent.diagnostics();
+        const filtered = await ws.agent.diagnostics({agentId: target.id});
+        const events = await ws.event.query({eventType: 'agent:queue:*', paginate: true});
+        const activity = await ws.event.agentActivity(target.id);
+        const output = JSON.stringify({status, queue, diagnostics, filtered, events, activity});
+        if (output.includes(secret)) throw new Error('self queue leaked: ' + output);
+        if (status.queueLength !== 2 || status.queue.length !== 0 || queue.queueLength !== 2 || !queue.refused)
+            throw new Error('self counts/refusal wrong: ' + output);
+        const row = diagnostics.diagnostics.queues.find(q => q.agentId === target.id);
+        if (row.queueLength !== 2 || row.entries.length !== 0) throw new Error('diagnostics wrong');
+        if (!status.queueNotice.includes('after the current turn') || !diagnostics.text.includes('contents hidden'))
+            throw new Error('missing visibility explanation');
+        const hook = await ws.hook.schedule({name:'Self queue read probe', delayMs:10000, ttlMs:10000,
+            code: `const q = await ws.agent.getQueue('${target.id}');
+                const d = await ws.agent.diagnostics();
+                const row = d.diagnostics.queues.find(q => q.agentId === '${target.id}');
+                if (row.queueLength !== 2 || row.entries.length !== 0 || !d.text.includes('contents hidden'))
+                    throw new Error('hook diagnostics lost count or visibility notice');
+                if (d.diagnostics.stuckRisks.some(r => r.type === 'stale-queue-entry' && r.agentId === '${target.id}'))
+                    throw new Error('fresh active owner queue incorrectly flagged stale');
+                const e = await ws.event.query({eventType:'agent:queue:*'});
+                if (!q.refused || q.queueLength !== 2 || JSON.stringify({q,d,e}).includes(['PENDING','WSS','SECRET'].join('-')))
+                    throw new Error('hook self queue leaked');
+                return {dispatch:false};`});
+        await ws.hook.cancel(hook.hook.hookId);
+        return {__mcpContentItems:[{type:'text',text:JSON.stringify({proof:'SELF-QUEUE-READS-PASSED'})}]};
+    ";
+    let rule = json!({"ifPromptContains":KICKOFF_MSG,"releaseFile":release,
+        "toolCall":{"name":"workspace_api","arguments":{"code":code,"summary":"Check self queue visibility"}},
+        "responseFromToolResultField":"proof"});
+    let delivered_rule = json!({
+        "ifPromptContains":"PENDING-WSS-SECRET-owner",
+        "toolCall":{"name":"workspace_api","arguments":{
+            "code":"const a=(await ws.agent.list(true)).find(a=>a.name==='SELF-QUEUE-READER'); const c=await ws.agent.readConversation(a.id); if(!JSON.stringify(c).includes('PENDING-WSS-SECRET-owner')) throw new Error('delivered transcript hidden'); return {__mcpContentItems:[{type:'text',text:JSON.stringify({proof:'DELIVERED-TRANSCRIPT-READ-PASSED'})}]};",
+            "summary":"Read the normally delivered message"
+        }},
+        "responseFromToolResultField":"proof"
+    });
+    let Booted {
+        daemon: _daemon,
+        port,
+        cfg,
+        prompt_log,
+    } = boot_daemon(data_dir, &script, 0, None, &[rule, delivered_rule]).await;
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({"workspaceId":ws_id,"eventTypes":["agent:*"]}),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut guest = connect_ws_as(port, cfg, GUEST_TOKEN).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({"workspaceId":ws_id,"name":"SELF-QUEUE-READER","provider":"mock","model":"default"}),
+    )
+    .await;
+    let agent = created["agent"]["id"].as_str().unwrap();
+    let started = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent,"content":KICKOFF_MSG}),
+    )
+    .await;
+    assert_eq!(started["queued"], false, "{started}");
+    await_prompts(&prompt_log, 1).await;
+    for (socket, content) in [
+        (&mut rpc, "PENDING-WSS-SECRET-owner"),
+        (&mut guest, "PENDING-WSS-SECRET-guest"),
+    ] {
+        let q = wss_rpc(
+            socket,
+            4,
+            "agent.queueMessage",
+            json!({"workspaceId":ws_id,"agentId":agent,"content":content}),
+        )
+        .await;
+        assert_eq!(q["success"], true, "{q}");
+    }
+    for socket in [&mut rpc, &mut guest] {
+        let envelope = wss_rpc_envelope(
+            socket,
+            5,
+            "agent.getQueue",
+            json!({"workspaceId":ws_id,"agentId":agent}),
+        )
+        .await;
+        assert_eq!(envelope["jsonrpc"], "2.0");
+        assert_eq!(envelope["id"], 5);
+        let entries = envelope["result"]["queue"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["content"], "PENDING-WSS-SECRET-owner");
+        let guest_content = entries[1]["content"].as_str().unwrap();
+        assert!(
+            guest_content.starts_with(GUEST_PREAMBLE)
+                && guest_content.ends_with("PENDING-WSS-SECRET-guest"),
+            "guest attribution remains intact: {guest_content}"
+        );
+    }
+    std::fs::write(&release, "go").unwrap();
+    let observed = observe_drain(&mut sub, agent, 2).await;
+    assert_eq!(observed.processing_frames.len(), 1, "one batch delivered");
+    assert_eq!(
+        observed.processing_frames[0]["queuedMessages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "both original entries delivered"
+    );
+    let prompts = await_prompts(&prompt_log, 2).await;
+    assert_eq!(prompts.len(), 2, "one initial turn and one queued batch");
+    let batch = &prompts[1];
+    assert!(
+        batch.find("PENDING-WSS-SECRET-owner").unwrap()
+            < batch.find("PENDING-WSS-SECRET-guest").unwrap()
+    );
+    for content in ["PENDING-WSS-SECRET-owner", "PENDING-WSS-SECRET-guest"] {
+        assert_eq!(
+            batch.matches(content).count(),
+            1,
+            "each entry delivered once"
+        );
+    }
+    let conv = wss_rpc(
+        &mut rpc,
+        6,
+        "agent.getConversation",
+        json!({"agentId":agent}),
+    )
+    .await;
+    assert!(
+        conv["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "assistant" && m.to_string().contains("SELF-QUEUE-READS-PASSED")),
+        "MCP assertions completed: {conv}"
+    );
+    assert!(
+        conv["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "assistant"
+                && m.to_string().contains("DELIVERED-TRANSCRIPT-READ-PASSED")),
+        "agent can read its delivered transcript: {conv}"
+    );
+    assert_eq!(user_row(&conv, "PENDING-WSS-SECRET-owner")["role"], "user");
+    assert!(
+        conv["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "user" && m.to_string().contains("PENDING-WSS-SECRET-guest")),
+        "delivered guest transcript remains readable: {conv}"
+    );
+    let queue = wss_rpc(&mut rpc, 7, "agent.getQueue", json!({"agentId":agent})).await;
+    assert_eq!(queue["queue"], json!([]));
+}
