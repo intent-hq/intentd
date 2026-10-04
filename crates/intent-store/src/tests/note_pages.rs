@@ -14,6 +14,7 @@ use std::sync::{
 mod artifact_crash;
 mod artifact_pins;
 mod artifact_response;
+mod canonical_source;
 mod primitive_source_capture;
 
 fn request(value: Value) -> NotePageRequest {

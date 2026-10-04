@@ -7,7 +7,7 @@ mod artifact_append;
 pub use artifact_append::ArtifactJournalRecordCost;
 mod artifact_begin;
 mod token;
-pub use artifact::ArtifactSourceGrant;
+pub use artifact::{ArtifactSourceGrant, CanonicalSourceBinding, CanonicalSourceHold};
 mod artifact_lifecycle;
 mod artifact_maintenance;
 mod artifact_publication;
@@ -27,7 +27,7 @@ use intent_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
-use sqlx::{Row, SqliteConnection, SqlitePool};
+use sqlx::{Acquire, Row, SqliteConnection, SqlitePool};
 use std::{collections::BTreeMap, sync::Mutex, time::Instant};
 
 const MAX_SNAPSHOTS: usize = 256;
@@ -234,6 +234,24 @@ impl Runtime {
 }
 
 impl Store {
+    /// Prepared source-session read requiring observable connection settlement.
+    ///
+    /// # Errors
+    /// Returns the same indexed page errors as `read_note_page`. Cleanup failures
+    /// are Internal; source-session owners must retain uncertain IO ownership.
+    /// This internal path awaits connection close, sacrificing pool reuse.
+    pub async fn read_note_page_settled(
+        &self,
+        ws: &str,
+        note: &str,
+        principal: &str,
+        request: NotePageRequest,
+        rpc_id: &Value,
+    ) -> Result<Value> {
+        self.read_note_page_inner(ws, note, principal, request, rpc_id, true)
+            .await
+    }
+
     /// Read indexed source or descriptor rows at a single `SQLite` read snapshot.
     /// Authorization is checked by Services before entering this repository.
     ///
@@ -246,6 +264,19 @@ impl Store {
         principal: &str,
         request: NotePageRequest,
         rpc_id: &Value,
+    ) -> Result<Value> {
+        self.read_note_page_inner(ws, note, principal, request, rpc_id, false)
+            .await
+    }
+
+    async fn read_note_page_inner(
+        &self,
+        ws: &str,
+        note: &str,
+        principal: &str,
+        request: NotePageRequest,
+        rpc_id: &Value,
+        settled: bool,
     ) -> Result<Value> {
         let source_bytes = request.max_source_bytes.unwrap_or(16384);
         let wire_bytes = request.max_wire_bytes.unwrap_or(65536);
@@ -377,7 +408,10 @@ impl Store {
         {
             return Err(invalid());
         }
-        let mut tx = self.read_pool().begin().await.map_err(db_error)?;
+        let mut connection = self.read_pool().acquire().await.map_err(db_error)?;
+        let outcome = async {
+        let mut tx = connection.begin().await.map_err(db_error)?;
+        let outcome = async {
         let head = sqlx::query("SELECT instance_id,indexed_rev,profile_revision,source_length,task_count,current_rev AS rev,generation FROM note_page_head WHERE workspace_id=? AND note_id=?")
             .bind(ws).bind(note).fetch_optional(&mut *tx).await.map_err(db_error)?.ok_or_else(||Error::NotFound("Note not found".into()))?;
         if head
@@ -487,8 +521,24 @@ impl Store {
             )
             .await?
         };
-        tx.commit().await.map_err(db_error)?;
         Ok(result)
+        }.await;
+        match outcome {
+            Ok(value) => { tx.commit().await.map_err(db_error)?; Ok(value) }
+            Err(error) => {
+                if settled { tx.rollback().await.map_err(db_error)?; }
+                // Generic pages retain their existing pooled cleanup behavior.
+                Err(error)
+            }
+        }
+        }.await;
+        if settled {
+            // Own the connection outside Transaction: queued fallback rollback
+            // after a failed commit/rollback precedes Shutdown on this worker.
+            // Unlike pool-return cleanup, close exposes acknowledgement failure.
+            connection.close().await.map_err(db_error)?;
+        }
+        outcome
     }
 
     #[expect(clippy::too_many_arguments)] // Explicit immutable request and read snapshot fields.

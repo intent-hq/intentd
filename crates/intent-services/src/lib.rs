@@ -185,6 +185,7 @@ mod repository_read_source;
 
 mod agent_list_cache;
 pub mod artifact_recovery;
+pub mod artifact_source;
 pub mod checkpoint;
 mod direct_secret_ops;
 mod fast_mode;
@@ -503,6 +504,10 @@ struct WorkspaceAggregateSnapshot {
 #[derive(Clone)]
 pub struct Services {
     store: Store,
+    canonical_source_admission: Arc<tokio::sync::Semaphore>,
+    canonical_source_owners: artifact_source::ownership::Registry,
+    #[cfg(test)]
+    canonical_source_open_test: artifact_source::ownership::OpenControl,
     /// Root directory for note assets, laid out as `<root>/<workspaceId>/<assetId>`.
     /// `None` until configured by the composition root; `note.readAsset` errors
     /// when unset.
@@ -1582,6 +1587,10 @@ impl Services {
         );
         let services = Self {
             store,
+            canonical_source_admission: Arc::new(tokio::sync::Semaphore::new(256)),
+            canonical_source_owners: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            canonical_source_open_test: Arc::new(std::sync::Mutex::new(None)),
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,

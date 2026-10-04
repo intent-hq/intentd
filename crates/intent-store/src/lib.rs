@@ -13,7 +13,7 @@ use sqlx::{Row, SqlitePool};
 pub use intent_core::{Error, Result};
 pub use note_page_repo::{
     ArtifactJournalLease, ArtifactJournalPurge, ArtifactJournalRecord, ArtifactJournalRecordCost,
-    ArtifactJournalStatus, ArtifactSourceGrant,
+    ArtifactJournalStatus, ArtifactSourceGrant, CanonicalSourceBinding, CanonicalSourceHold,
 };
 
 mod advisory_wake_delivery_repo;
