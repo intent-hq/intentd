@@ -187,13 +187,14 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// (`script.archive`, `script.restore`).
 /// Durable script monitors (protocol 12.1): +3 router methods.
 /// Protocol 13.0 removes the deprecated git.commit router method.
-const EXPECTED_TOTAL_METHODS: usize = 407;
+// GitLab repository reads and actions (13.3), plus owner-only invitation account search.
+const EXPECTED_TOTAL_METHODS: usize = 421;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
-const EXPECTED_ROUTER_METHODS: usize = 352;
+const EXPECTED_ROUTER_METHODS: usize = 366;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 55;
@@ -202,7 +203,7 @@ const EXPECTED_FASTPATH_METHODS: usize = 55;
 const EXPECTED_ALIASES: usize = 0;
 
 /// Golden count: server→client notifications.
-const EXPECTED_NOTIFICATIONS: usize = 1;
+const EXPECTED_NOTIFICATIONS: usize = 5;
 
 /// Golden count: client-served reverse RPCs.
 const EXPECTED_REVERSE_METHODS: usize = 5;
@@ -517,6 +518,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "accept-changes.getStatus",
     "accept-changes.mergePR",
     "accept-changes.prepare",
+    "accept-changes.reconcile",
+    "accept-changes.release",
     "agent.cancelDelete",
     "agent.cancelSubscriptions",
     "agent.completeOnce",
@@ -684,6 +687,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "host.invite.create",
     "host.invite.list",
     "host.invite.revoke",
+    "host.invite.searchAccounts",
     "host.listDirectory",
     "host.listInstalledEditors",
     "host.members.list",
@@ -822,6 +826,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "sourceControl.getUser",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
+    "sourceControl.read.capture",
+    "sourceControl.read.detail",
+    "sourceControl.read.release",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -898,6 +905,14 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
+    "workspace.repositoryContext",
+    "workspace.repositoryContext.capture",
+    "workspace.repositoryContext.release",
+    "workspace.repositorySelection.capture",
+    "workspace.repositorySelection.reconcile",
+    "workspace.repositorySelection.release",
+    "workspace.repositorySelection.reset",
+    "workspace.repositorySelection.save",
     "workspace.restore",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
@@ -1174,6 +1189,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "accept-changes.getStatus",
     "accept-changes.mergePR",
     "accept-changes.prepare",
+    "accept-changes.reconcile",
+    "accept-changes.release",
     "agent.cancelDelete",
     "agent.completeOnce",
     "agent.create",
@@ -1252,6 +1269,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "host.invite.create",
     "host.invite.list",
     "host.invite.revoke",
+    "host.invite.searchAccounts",
     "host.listDirectory",
     "host.listInstalledEditors",
     "host.members.list",
@@ -1765,6 +1783,14 @@ mod unbound_owner_only_methods {
                 "accept-changes.prepare",
                 json!({ "workspaceId": ws, "action": "a" }),
             ),
+            (
+                "accept-changes.reconcile",
+                json!({"workspaceId":ws,"operationId":"held-operation","root":{"workspaceId":ws,"kind":"primary"}}),
+            ),
+            (
+                "accept-changes.release",
+                json!({"workspaceId":ws,"operationId":"held-operation","root":{"workspaceId":ws,"kind":"primary"}}),
+            ),
             ("agent.cancelDelete", json!({ "agentId": "a1" })),
             (
                 "agent.completeOnce",
@@ -1863,6 +1889,10 @@ mod unbound_owner_only_methods {
             ("hook.runNow", json!({ "workspaceId": ws, "hookId": "h1" })),
             ("host.executionContext", json!({})),
             ("host.invite.list", json!({})),
+            (
+                "host.invite.searchAccounts",
+                json!({"provider":"github","query":"ab"}),
+            ),
             ("host.invite.revoke", json!({ "inviteId": "missing" })),
             ("host.members.list", json!({})),
             ("host.members.remove", json!({"principalId":"missing"})),
@@ -2476,6 +2506,7 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "host.invite.create",
         "host.invite.list",
         "host.invite.revoke",
+        "host.invite.searchAccounts",
         "host.listDirectory",
         "host.listInstalledEditors",
         "host.members.list",

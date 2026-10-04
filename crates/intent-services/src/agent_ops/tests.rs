@@ -4821,6 +4821,7 @@ async fn app_agents_send_persists_chief_attribution_and_source_link() {
             "fromWorkspaceId": chief_ws.0,
             "sourceMessageId": source_id,
             "sourceUrl": source_url,
+            "submissionIds": [delivered.id],
         }))
     );
 }
@@ -4884,6 +4885,7 @@ async fn app_agents_send_delivers_despite_target_pending_questions() {
         "fromWorkspaceId": chief_ws.0,
         "sourceMessageId": source_id,
         "sourceUrl": source_url,
+        "submissionIds": [result["messageId"]],
     });
     let target_session = svc
         .store()
@@ -15020,7 +15022,7 @@ async fn send_message_delivers_when_agent_exists() {
 async fn send_message_op_persists_message_metadata() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "MetaRecv").await;
-    let metadata = json!({
+    let mut metadata = json!({
         "type": "agent_message",
         "fromAgentId": "agent-11111111-1111-1111-1111-111111111111",
         "fromAgentName": "Coordinator"
@@ -15039,10 +15041,11 @@ async fn send_message_op_persists_message_metadata() {
     assert_eq!(r["queued"], false);
     let session = svc.store().get_agent_session(&id).await.expect("session");
     assert_eq!(session.messages.len(), 1);
+    metadata["submissionIds"] = json!([session.messages[0].id]);
     assert_eq!(
         session.messages[0].metadata.as_ref(),
         Some(&metadata),
-        "store-only send must persist messageMetadata verbatim"
+        "store-only send must preserve messageMetadata alongside submission identity"
     );
 }
 
@@ -15057,7 +15060,7 @@ async fn send_to_task_store_only_fallback_persists_message_metadata() {
     svc.assign_agent(ws.clone(), note_id.clone(), agent_id.0.clone(), None)
         .await
         .expect("assign");
-    let metadata = json!({
+    let mut metadata = json!({
         "type": "agent_message",
         "fromAgentId": "agent-22222222-2222-2222-2222-222222222222",
         "fromAgentName": "Sender"
@@ -15079,10 +15082,11 @@ async fn send_to_task_store_only_fallback_persists_message_metadata() {
         .await
         .expect("session");
     assert_eq!(session.messages.len(), 1);
+    metadata["submissionIds"] = json!([session.messages[0].id]);
     assert_eq!(
         session.messages[0].metadata.as_ref(),
         Some(&metadata),
-        "store-only sendToTask fallback must persist messageMetadata verbatim"
+        "store-only sendToTask fallback must preserve messageMetadata alongside submission identity"
     );
 }
 
@@ -17056,7 +17060,7 @@ async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
     )
     .await
     .expect("first send");
-    let metadata = answer_metadata(&asked_id);
+    let mut metadata = answer_metadata(&asked_id);
     let r = svc
         .agent_send_message_op(
             id.clone(),
@@ -17069,6 +17073,7 @@ async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
         .await
         .expect("send");
     assert_eq!(r["queued"], true);
+    metadata["submissionIds"] = json!(["dup-id"]);
     assert_eq!(r["queuedMessage"]["messageMetadata"], metadata);
     assert!(
         svc.questions_pending(&id).await,
@@ -17079,9 +17084,22 @@ async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
         .as_str()
         .expect("queued id")
         .to_string();
-    svc.agent_send_queued_message_now_op(id.clone(), queued_id)
+    let drained = svc
+        .agent_send_queued_message_now_op(id.clone(), queued_id.clone())
         .await
         .expect("drain queued answer");
+    assert_ne!(drained["messageId"], "dup-id");
+    let session = svc.store().get_agent_session(&id).await.unwrap();
+    let answer = session.messages.last().unwrap();
+    assert_eq!(json!(answer.id), drained["messageId"]);
+    let answer_metadata = answer.metadata.as_ref().unwrap();
+    assert_eq!(answer_metadata["submissionIds"], json!(["dup-id"]));
+    assert_eq!(answer_metadata["queueInfo"]["queuedMessageId"], queued_id);
+    assert_eq!(
+        session.messages.len(),
+        3,
+        "question, first send, and answer"
+    );
     assert!(
         !svc.questions_pending(&id).await,
         "the drained answer must clear the marker"
@@ -27400,6 +27418,123 @@ async fn status_list_and_diagnostics_surface_waiting_on_hooks() {
     );
 }
 
+/// The internal decoration must not hydrate retired history or active payloads.
+/// `SQLx` reports actual fetched rows, independently of the final wire projection.
+async fn assert_waiting_hooks_read_cost(batched: bool) {
+    use crate::test_tracing::{capture_sqlx_queries, warm_sqlx_pool};
+    use intent_core::{HookId, HookState};
+
+    let (_t, svc, ws) = setup().await;
+    let owner = create_agent(&svc, &ws, "Owner").await;
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    let bare = create_agent(&svc, &ws, "Bare").await;
+    let other_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other_ws))
+        .await
+        .unwrap();
+    let other = create_agent(&svc, &other_ws, "Other workspace").await;
+    let mut later = seed_active_hook(&svc, &ws, &owner, "Later").await;
+    later.created_at = "2026-08-02T13:00:02Z".into();
+    later.code = "c".repeat(16_384);
+    later.last_logs = Some("l".repeat(16_384));
+    later.last_state = Some("s".repeat(16_384));
+    // Replace the seed to control insertion order independently of creation time.
+    sqlx::query("DELETE FROM hook")
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    let mut earlier = later.clone();
+    earlier.hook_id = HookId::new();
+    earlier.name = "Earlier".into();
+    earlier.created_at = "2026-08-02T13:00:01Z".into();
+    earlier.state = HookState::Running;
+    earlier.next_run_at = None;
+    earlier.expires_at = None;
+    let mut peer_hook = later.clone();
+    peer_hook.hook_id = HookId::new();
+    peer_hook.agent_id = peer.clone();
+    let mut foreign_hook = later.clone();
+    foreign_hook.hook_id = HookId::new();
+    foreign_hook.workspace_id = other_ws;
+    foreign_hook.agent_id = other;
+    for hook in [&later, &peer_hook, &foreign_hook, &earlier] {
+        svc.store().insert_hook(hook).await.unwrap();
+    }
+    let expected = vec![
+        json!({"hookId": earlier.hook_id, "name": "Earlier"}),
+        json!({"hookId": later.hook_id, "name": "Later",
+            "nextRunAt": later.next_run_at, "expiresAt": later.expires_at}),
+    ];
+    warm_sqlx_pool(svc.store().read_pool()).await;
+    // Grow retired history twice; neither growth may increase fetched rows.
+    let mut cost_failures = Vec::new();
+    for retired_count in [0, 256, 512] {
+        if retired_count != 0 {
+            let mut tx = svc.store().write_pool().begin().await.unwrap();
+            for n in 0..256 {
+                let state = ["dispatched", "cancelled", "expired", "evicted"][n % 4];
+                sqlx::query("INSERT INTO hook (hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at, last_logs, last_state) VALUES (?, ?, ?, 'Retired', ?, 10000, ?, '2026-01-01', ?, ?)")
+                    .bind(format!("retired-{retired_count}-{n}"))
+                    .bind(&ws.0).bind(&owner.0).bind(&later.code).bind(state)
+                    .bind(&later.last_logs).bind(&later.last_state)
+                    .execute(&mut *tx).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        let ((), queries) = capture_sqlx_queries(async {
+            if batched {
+                let listed = svc.agent_list_op(ws.clone()).await.unwrap();
+                assert_eq!(listed.len(), 3, "other workspace excluded");
+                let row = |id: &AgentId| listed.iter().find(|a| &a.id == id).unwrap();
+                assert_eq!(row(&owner).waiting_on_hooks, expected);
+                assert_eq!(row(&peer).waiting_on_hooks.len(), 1);
+                assert!(serde_json::to_value(row(&bare))
+                    .unwrap()
+                    .get("waitingOnHooks")
+                    .is_none());
+            } else {
+                let row = svc
+                    .agent_get_op(owner.clone(), Some(ws.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(row.waiting_on_hooks, expected);
+            }
+        })
+        .await;
+        let hook_queries: Vec<_> = queries
+            .iter()
+            .filter(|q| q.sql.contains("FROM hook "))
+            .collect();
+        assert_eq!(hook_queries.len(), 1, "one hook read: {queries:?}");
+        let query = hook_queries[0];
+        if query.rows_returned != if batched { 3 } else { 2 } {
+            cost_failures.push(format!("retired history={retired_count}: {query:?}"));
+        }
+        let columns = query.sql.split("FROM").next().unwrap();
+        for heavy in ["code", "last_logs", "last_state"] {
+            if columns.contains(heavy) {
+                cost_failures.push(format!("active {heavy} payload hydration: {query:?}"));
+            }
+        }
+    }
+    assert!(cost_failures.is_empty(), "{}", cost_failures.join("\n"));
+    // Visibility remains best-effort if the store read fails.
+    svc.store().read_pool().close().await;
+    assert!(svc.active_hooks_for_agent(&owner).await.is_empty());
+    assert!(svc.active_hooks_by_agent(&ws).await.is_empty());
+}
+
+#[tokio::test]
+async fn agent_get_waiting_hooks_does_not_hydrate_history_or_payloads() {
+    assert_waiting_hooks_read_cost(false).await;
+}
+
+#[tokio::test]
+async fn agent_list_waiting_hooks_does_not_hydrate_history_or_payloads() {
+    assert_waiting_hooks_read_cost(true).await;
+}
+
 /// Idle-visibility on the read surfaces (unified external-wait, mirrors
 /// `status_list_and_diagnostics_surface_waiting_on_hooks`): `agent.get`/
 /// `agent.list` overlay `waitingOnPrMonitors` for monitor-owning agents
@@ -34024,6 +34159,8 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
         hold_until: None,
         child_agent_id: None,
         merged_submission_ids: Vec::new(),
+        recovery_sources: Vec::new(),
+        correlation_order_known: true,
         edit_appended: String::new(),
         edit_prepended: String::new(),
         editing_message_id: None,
@@ -34609,6 +34746,8 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
             hold_until: None,
             child_agent_id: None,
             merged_submission_ids: Vec::new(),
+            recovery_sources: Vec::new(),
+            correlation_order_known: true,
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
@@ -35066,6 +35205,8 @@ fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
         hold_until: None,
         child_agent_id: None,
         merged_submission_ids: Vec::new(),
+        recovery_sources: Vec::new(),
+        correlation_order_known: true,
         edit_appended: String::new(),
         edit_prepended: String::new(),
         editing_message_id: None,
@@ -47774,7 +47915,7 @@ async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
 
 #[tokio::test]
 async fn send_queued_message_now_store_only_processing_requires_successful_persistence() {
-    for outcome in ["new", "persisted", "failure"] {
+    for outcome in ["new", "persisted", "collision", "failure"] {
         let (_tmp, svc, ws, _bus) = setup_with_bus().await;
         let agent = create_agent(&svc, &ws, "Processing").await;
         let queued = svc
@@ -47788,7 +47929,7 @@ async fn send_queued_message_now_store_only_processing_requires_successful_persi
             .await
             .unwrap();
         let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
-        if outcome != "new" {
+        if matches!(outcome, "persisted" | "collision") {
             svc.store
                 .append_agent_message_with_id(
                     &agent,
@@ -47804,10 +47945,25 @@ async fn send_queued_message_now_store_only_processing_requires_successful_persi
         if outcome == "persisted" {
             svc.agent_queues.lock().unwrap().get_mut(&agent).unwrap()[0].persisted = true;
         }
+        if outcome == "failure" {
+            sqlx::query("CREATE TRIGGER fail_queue_delivery BEFORE INSERT ON agent_message BEGIN SELECT RAISE(FAIL, 'queue delivery fault'); END")
+                .execute(svc.store.write_pool())
+                .await
+                .unwrap();
+        }
         let result = svc
             .agent_send_queued_message_now_op(agent.clone(), entry_id.clone())
             .await;
         assert_eq!(result.is_ok(), outcome != "failure");
+        if outcome == "collision" {
+            assert_ne!(result.as_ref().unwrap()["messageId"], entry_id);
+            let session = svc.store.get_agent_session(&agent).await.unwrap();
+            assert_eq!(session.messages.len(), 2);
+            assert_eq!(
+                session.messages[1].metadata.as_ref().unwrap()["submissionIds"],
+                json!([entry_id])
+            );
+        }
         let events: Vec<_> = svc
             .store
             .query_events(&intent_store::EventQuery::default())

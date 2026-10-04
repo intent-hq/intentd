@@ -239,6 +239,7 @@ async fn transfer_human_trust_migration_cleans_legacy_keys_once_and_fences_downg
         read_pool: crate::connect_read(&tmp.path).await.unwrap(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
         export_author_barrier: Arc::default(),
+        repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
     };
     // Seed the historical schema directly: current workspace inserts include
     // content activity, which did not exist at migration 0134.

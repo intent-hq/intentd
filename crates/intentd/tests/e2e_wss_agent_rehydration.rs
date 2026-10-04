@@ -60,6 +60,9 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         common::enable_ws_api(data_dir);
     }
     let mut cmd = common::serve_command();
+    // Author projections must not race the developer's boot-time GitHub refresh.
+    common::hermetic_github_identity(&mut cmd, data_dir);
+    cmd.env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"));
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")

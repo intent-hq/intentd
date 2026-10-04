@@ -89,7 +89,7 @@ async fn content_activity_backfill_and_writes_are_truthful_over_wss() {
                 ('content-invalid-note','content-empty','Invalid','','not-a-date','not-a-date');",
     ).execute(srv.store.write_pool()).await.unwrap();
     sqlx::raw_sql(include_str!(
-        "../../../intent-store/migrations/0143_workspace_content_activity.sql"
+        "../../../intent-store/migrations/0147_workspace_content_activity.sql"
     ))
     .execute(srv.store.write_pool())
     .await

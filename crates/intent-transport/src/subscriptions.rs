@@ -38,8 +38,9 @@ use std::time::{Duration, Instant};
 
 use crate::events::IdInfo;
 
-/// Chat snapshots have a smaller window than generic paginated RPCs.
-const CHAT_SNAPSHOT_MESSAGE_LIMIT: usize = 5;
+/// Chat snapshots default to a smaller window than generic paginated RPCs.
+const CHAT_SNAPSHOT_MESSAGE_LIMIT: usize = 20;
+const CHAT_SNAPSHOT_MAX_MESSAGE_LIMIT: u64 = 200;
 
 /// A subscription channel selected by the `*.subscribe` method (TB-0 §3). TB-4
 /// wires the `note` collection channel end-to-end; TB-5 adds `task`, `agent`,
@@ -61,6 +62,7 @@ pub(crate) enum Channel {
     /// frames. Subscribing is itself the "I am viewing" signal (the
     /// subscription holds a viewer lease released on unsubscribe / close).
     NotePresence,
+    PresenceFocus,
 }
 
 /// A classified subscription fast-path request awaiting handling by the
@@ -121,6 +123,7 @@ pub(crate) struct CommentSubscribeParams {
 /// (§5.5) — no frame class is exempt.
 #[derive(Debug)]
 pub(crate) struct ChatSubscribeParams {
+    pub limit: usize,
     pub agent_id: String,
     pub since_message_id: Option<String>,
     pub delta_encoding: DeltaEncoding,
@@ -195,6 +198,11 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
             channel: Channel::Chat,
             params,
         }),
+        "presence.focus.subscribe" => Some(SubFastPath::Subscribe {
+            id,
+            channel: Channel::PresenceFocus,
+            params,
+        }),
         "note.presence.subscribe" => Some(SubFastPath::Subscribe {
             id,
             channel: Channel::NotePresence,
@@ -219,6 +227,7 @@ pub(crate) fn classify(value: &Value) -> Option<SubFastPath> {
         | "workspace.unsubscribe"
         | "comment.unsubscribe"
         | "chat.unsubscribe"
+        | "presence.focus.unsubscribe"
         | "note.presence.unsubscribe" => Some(SubFastPath::Unsubscribe { id, params }),
         "agent.unsubscribe" if !params.contains_key("workspaceId") => {
             Some(SubFastPath::Unsubscribe { id, params })
@@ -304,12 +313,22 @@ pub(crate) fn parse_comment_subscribe_params(
 /// full-text encoding, `"incremental"` selects append-only text deltas; any
 /// other value is a `-32602` error (a silently ignored typo would leave the
 /// client appending fragments the daemon never sends as fragments).
+/// `limit` defaults to twenty for absent/null; otherwise it must be an integer
+/// in 1–200 and is retained for every snapshot on the subscription.
 pub(crate) fn parse_chat_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<ChatSubscribeParams, String> {
     let agent_id = match params.get("agentId").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return Err("agentId is required".to_string()),
+    };
+    let limit = match params.get("limit") {
+        None | Some(Value::Null) => CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        Some(value) => value
+            .as_u64()
+            .filter(|limit| (1..=CHAT_SNAPSHOT_MAX_MESSAGE_LIMIT).contains(limit))
+            .and_then(|limit| usize::try_from(limit).ok())
+            .ok_or_else(|| "limit must be an integer between 1 and 200".to_string())?,
     };
     let since_message_id = match params.get("sinceMessageId") {
         None | Some(Value::Null) => None,
@@ -334,6 +353,7 @@ pub(crate) fn parse_chat_subscribe_params(
         Some(_) => return Err("projection must be \"slim\"".to_string()),
     };
     Ok(ChatSubscribeParams {
+        limit,
         agent_id,
         since_message_id,
         delta_encoding,
@@ -456,6 +476,7 @@ pub(crate) fn channel_name(channel: Channel) -> &'static str {
         Channel::Comment => "comment",
         Channel::Chat => "chat",
         Channel::NotePresence => "note.presence",
+        Channel::PresenceFocus => "presence.focus",
     }
 }
 
@@ -720,6 +741,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
         // Transient only: the forwarder narrows the workspace-wide stream to
         // one note by `data.noteId` ([`note_presence_delta`]).
         Channel::NotePresence => &[NOTE_PRESENCE],
+        Channel::PresenceFocus => &[],
     };
     types.iter().map(std::string::ToString::to_string).collect()
 }
@@ -780,7 +802,7 @@ pub(crate) async fn channel_snapshot(
         // snapshot, CS-0 D3), so this generic arm is unreachable. The
         // note-presence channel's snapshot is the join's return value
         // (`note_presence_join`, served by `forward_note_presence_subscription`).
-        Channel::Chat | Channel::NotePresence => empty(),
+        Channel::Chat | Channel::NotePresence | Channel::PresenceFocus => empty(),
     }
 }
 
@@ -792,7 +814,7 @@ pub(crate) async fn channel_snapshot(
 /// `chat.subscribe` arriving mid-turn reconstructs a coherent in-flight message.
 ///
 /// **Bounded** (monorepo#958): exactly ONE conversation read, with no
-/// `nextToken` follow-up and an explicit chat-only limit of five messages,
+/// `nextToken` follow-up and the validated subscription limit (default twenty),
 /// so the snapshot fetches/decodes only its
 /// bounded newest page regardless of transcript length — the paginated op
 /// selects just that page SQL-side and never re-hydrates the full history.
@@ -822,11 +844,12 @@ pub(crate) async fn chat_snapshot(
     agent_id: &AgentId,
     since_message_id: Option<&str>,
     projection: Option<ConversationProjection>,
+    limit: usize,
 ) -> Value {
     let (mut snapshot, overlay) = match api
         .agent_get_conversation(
             agent_id.clone(),
-            Some(i64::try_from(CHAT_SNAPSHOT_MESSAGE_LIMIT).expect("chat limit fits in i64")),
+            Some(i64::try_from(limit).expect("chat limit fits in i64")),
             None,
             None,
             None,
@@ -863,7 +886,7 @@ pub(crate) async fn chat_snapshot(
         apply_resume_filter(&mut snapshot, since);
     }
     if overlay {
-        overlay_live_state(api, agent_id, &mut snapshot, projection).await;
+        overlay_live_state(api, agent_id, &mut snapshot, projection, limit).await;
     }
     snapshot
 }
@@ -882,11 +905,12 @@ pub(crate) async fn chat_recovery_snapshot(
     api: &dyn WorkspaceApi,
     agent_id: &AgentId,
     projection: Option<ConversationProjection>,
+    limit: usize,
 ) -> Option<Value> {
     let read = || {
         api.agent_get_conversation(
             agent_id.clone(),
-            Some(i64::try_from(CHAT_SNAPSHOT_MESSAGE_LIMIT).expect("chat limit fits in i64")),
+            Some(i64::try_from(limit).expect("chat limit fits in i64")),
             None,
             None,
             None,
@@ -899,7 +923,7 @@ pub(crate) async fn chat_recovery_snapshot(
         Ok(v) => v,
         Err(_) => read().await.ok()?,
     };
-    overlay_live_state(api, agent_id, &mut snapshot, projection).await;
+    overlay_live_state(api, agent_id, &mut snapshot, projection, limit).await;
     Some(snapshot)
 }
 
@@ -915,6 +939,7 @@ async fn overlay_live_state(
     agent_id: &AgentId,
     snapshot: &mut Value,
     projection: Option<ConversationProjection>,
+    limit: usize,
 ) {
     // Read busy BEFORE the slot, never after. The two reads are separate lock
     // acquisitions, so a turn can claim `busy` between them; `try_begin` clears a
@@ -927,7 +952,7 @@ async fn overlay_live_state(
     // content labelled settled, which the next delta or snapshot corrects.
     let is_streaming = api.agent_is_busy(agent_id.clone());
     if let Some(live) = api.agent_live_turn(agent_id.clone()) {
-        merge_live_turn(snapshot, agent_id, &live, is_streaming, projection);
+        merge_live_turn(snapshot, agent_id, &live, is_streaming, projection, limit);
     }
     // Overlay the daemon-owned activity flags (PROTOCOL §7.1) so a client
     // arriving mid-turn renders the same `isResponding`/`isWaitingOnTool`/
@@ -997,7 +1022,7 @@ fn apply_resume_filter(snapshot: &mut Value, since: &str) {
 /// against.
 ///
 /// **Chat count and slim page budget (§5.5).** The live row counts inside the
-/// five-message snapshot window. Under `projection: "slim"` the merged page is
+/// requested snapshot window. Under `projection: "slim"` the merged page is
 /// re-budgeted after the append: the persisted page arrived within
 /// [`SLIM_PAGE_BUDGET_BYTES`], but `slim_message_blocks` caps block *bodies*,
 /// not block *count*, so a streaming turn with hundreds of capped blocks can
@@ -1016,6 +1041,7 @@ fn merge_live_turn(
     live: &Value,
     is_streaming: bool,
     projection: Option<ConversationProjection>,
+    limit: usize,
 ) {
     let Some(message_id) = live.get("messageId").and_then(Value::as_str) else {
         return;
@@ -1064,13 +1090,13 @@ fn merge_live_turn(
         "isStreaming": is_streaming,
     }));
     obj.insert("totalMessages".to_string(), json!(total + 1));
-    rebudget_merged_page(obj, projection);
+    rebudget_merged_page(obj, projection, limit);
 }
 
 /// Re-apply the §5.5 slim page budget to a chat snapshot's `messages` page
 /// after the live-turn append (see [`merge_live_turn`]'s budget note). The
 /// newest row — the just-appended live turn — is the anchor and always
-/// serves; oldest rows are evicted until the page fits the five-message limit
+/// serves; oldest rows are evicted until the page fits the requested message limit
 /// and, for slim projection, [`SLIM_PAGE_BUDGET_BYTES`], with
 /// `truncated`/`nextToken` re-minted at the
 /// oldest kept row's global position (its `seq`, contiguous from 0) so the
@@ -1080,11 +1106,15 @@ fn merge_live_turn(
 /// so both sides of the budget agree on what a row weighs. No-op when the
 /// merged page already fits — the common case, since the persisted page
 /// arrived within budget and a typical live turn is small.
-fn rebudget_merged_page(obj: &mut Map<String, Value>, projection: Option<ConversationProjection>) {
+fn rebudget_merged_page(
+    obj: &mut Map<String, Value>,
+    projection: Option<ConversationProjection>,
+    limit: usize,
+) {
     let Some(arr) = obj.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
-    let mut lo = arr.len().saturating_sub(CHAT_SNAPSHOT_MESSAGE_LIMIT);
+    let mut lo = arr.len().saturating_sub(limit);
     if projection == Some(ConversationProjection::Slim) {
         let sizes: Vec<usize> = arr[lo..]
             .iter()
@@ -1563,46 +1593,46 @@ impl ChatDeltaState {
                     res_added,
                     self.entity(&message_id, result_block, None, None, false),
                 );
-                // §7.1: the same standalone resource block(s) the persisted
-                // transcript appends right after the `tool_result`. The
-                // registry-claimed canonical batch carried on the event
-                // (`registeredAttachments`, deterministic attach) wins;
-                // otherwise fall back to lifting a proposal-MIME resource
-                // item out of the echoed output. Gated on `completed` only
-                // (matching `record_tool`) — an errored tool must not surface
-                // an actionable ProposalCard. Each item is paired positionally
-                // with the id `record_tool` gave the block it wrote for that
-                // same item; an item without an id (the event carried none —
-                // nothing was materialized for it) is skipped.
-                if status == "completed" {
-                    let items: Vec<Value> = d
-                        .get("registeredAttachments")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            intent_services::tool_block::lift_proposal_resource(output)
-                                .into_iter()
-                                .collect()
-                        });
-                    let attach_ids: Vec<&str> = d
-                        .get("proposalBlockIds")
-                        .and_then(Value::as_array)
-                        .map(|ids| ids.iter().filter_map(Value::as_str).collect())
-                        .unwrap_or_default();
-                    for (item, attach_id) in items.iter().zip(attach_ids) {
-                        let attach_block =
-                            intent_services::tool_block::build_proposal_resource_block(
-                                attach_id, item,
-                            );
-                        let attach_added = self.note_block(attach_id);
-                        self.remember_block(attach_id, &attach_block);
-                        push_entity(
-                            &mut added,
-                            &mut updated,
-                            attach_added,
-                            self.entity(&message_id, attach_block, None, None, false),
-                        );
-                    }
+            }
+            // §7.1: the same standalone resource block(s) the persisted
+            // transcript appends, even without a `tool_result`. The
+            // registry-claimed canonical batch carried on the event
+            // (`registeredAttachments`, deterministic attach) wins;
+            // otherwise fall back to lifting a proposal-MIME resource
+            // item out of a successful call's echoed output. A failed
+            // call may still carry a trusted card registered before a
+            // later JS error (matching `record_tool`). Each item is paired positionally
+            // with the id `record_tool` gave the block it wrote for that
+            // same item; an item without an id (the event carried none —
+            // nothing was materialized for it) is skipped.
+            let registered = d.get("registeredAttachments").and_then(Value::as_array);
+            if status == "completed" || registered.is_some_and(|items| !items.is_empty()) {
+                let items: Vec<Value> = d
+                    .get("registeredAttachments")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        d.get("output")
+                            .and_then(intent_services::tool_block::lift_proposal_resource)
+                            .into_iter()
+                            .collect()
+                    });
+                let attach_ids: Vec<&str> = d
+                    .get("proposalBlockIds")
+                    .and_then(Value::as_array)
+                    .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                for (item, attach_id) in items.iter().zip(attach_ids) {
+                    let attach_block =
+                        intent_services::tool_block::build_proposal_resource_block(attach_id, item);
+                    let attach_added = self.note_block(attach_id);
+                    self.remember_block(attach_id, &attach_block);
+                    push_entity(
+                        &mut added,
+                        &mut updated,
+                        attach_added,
+                        self.entity(&message_id, attach_block, None, None, false),
+                    );
                 }
             }
         }
@@ -1923,7 +1953,7 @@ pub(crate) async fn channel_delta(
         // spec-body edit can refresh flipped `specLinked` flags
         // (monorepo#2407) — so this generic stateless arm is unreachable for
         // `Task`.
-        Channel::Task | Channel::Chat | Channel::NotePresence => None,
+        Channel::Task | Channel::Chat | Channel::NotePresence | Channel::PresenceFocus => None,
         // The chat channel uses the dedicated, stateful [`ChatDeltaState`] mapper
         // on the `forward_chat_subscription` path (CS-3) — its deltas are
         // event-payload-driven, not re-read — so this generic re-read arm is

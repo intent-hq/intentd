@@ -22,9 +22,13 @@ mod human_attribution;
 mod imported_queue_authorization;
 #[path = "wss_integration/integration_context.rs"]
 mod integration_context;
+#[path = "wss_integration/invitation_client.rs"]
+mod invitation_client;
 #[cfg(unix)]
 #[path = "wss_integration/linked_skills.rs"]
 mod linked_skills;
+#[path = "wss_integration/presence_focus.rs"]
+mod presence_focus;
 #[cfg(unix)]
 #[path = "wss_integration/removed_rpc.rs"]
 mod removed_rpc;
@@ -17360,7 +17364,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let agent = AgentId::from(agent_id.as_str());
 
     // Seed a 120-message transcript — well past the 50-message default page.
-    // Capture the id at seq 117 (inside the newest-five snapshot 115..=119) for
+    // Capture the id at seq 117 (inside the newest-twenty snapshot 100..=119) for
     // the `chat.subscribe` resume path below.
     let mut newest_message_id = String::new();
     let mut seq_117_message_id = String::new();
@@ -17799,7 +17803,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     );
 
     // chat.subscribe — the seq-0 snapshot over WSS is the bounded newest
-    // five-message page (PROTOCOL §7.1), independent of the generic default 50.
+    // twenty-message page (PROTOCOL §7.1), independent of the generic default 50.
     let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
     sub.send(Message::Text(
         format!(
@@ -17843,11 +17847,11 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let snap_msgs = snapshot["messages"].as_array().expect("snapshot messages");
     assert_eq!(
         snap_msgs.len(),
-        5,
-        "seq-0 snapshot is the newest-five page, not all 120"
+        20,
+        "seq-0 snapshot is the newest-twenty page, not all 120"
     );
-    assert_eq!(snap_msgs[0]["seq"], 115);
-    assert_eq!(snap_msgs[4]["seq"], 119);
+    assert_eq!(snap_msgs[0]["seq"], 100);
+    assert_eq!(snap_msgs[19]["seq"], 119);
     assert_eq!(snapshot["truncated"], true);
     assert_eq!(snapshot["totalMessages"], 120);
     assert!(
@@ -17860,7 +17864,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     );
     drop(sub);
 
-    // The snapshot cursor continues immediately before seq 115, without
+    // The snapshot cursor continues immediately before seq 100, without
     // repeating its oldest row or skipping any history.
     let snapshot_cursor = snapshot["nextToken"].as_str().unwrap();
     let older = wss_call(
@@ -17877,7 +17881,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         .iter()
         .map(|message| message["seq"].as_i64().unwrap())
         .collect();
-    assert_eq!(older_seqs, (110..=114).collect::<Vec<i64>>());
+    assert_eq!(older_seqs, (95..=99).collect::<Vec<i64>>());
 
     // chat.subscribe resume (PROTOCOL §7.1): `sinceMessageId` inside the
     // bounded page yields only the messages AFTER it, `resumed: true`, and no
@@ -17919,9 +17923,13 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     )
     .await;
     let msgs = fallback["messages"].as_array().expect("fallback messages");
-    assert_eq!(msgs.len(), 5, "newest-five page on unknown id: {fallback}");
-    assert_eq!(msgs[0]["seq"], 115);
-    assert_eq!(msgs[4]["seq"], 119);
+    assert_eq!(
+        msgs.len(),
+        20,
+        "newest-twenty page on unknown id: {fallback}"
+    );
+    assert_eq!(msgs[0]["seq"], 100);
+    assert_eq!(msgs[19]["seq"], 119);
     assert_eq!(fallback["resumed"], false);
     assert_eq!(fallback["truncated"], true);
     assert!(
@@ -17929,6 +17937,40 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         "fallback keeps the older-pages cursor"
     );
     assert_eq!(fallback["nextToken"], snapshot["nextToken"]);
+
+    // An explicit subscription limit selects the newest requested window.
+    for (limit, count) in [
+        (json!(50), 50),
+        (json!(1), 1),
+        (json!(5), 5),
+        (json!(200), 120),
+        (Value::Null, 20),
+    ] {
+        let request = json!({"jsonrpc":"2.0", "id":42, "method":"chat.subscribe",
+            "params":{"agentId":agent_id, "limit":limit}});
+        let configured =
+            chat_subscribe_snapshot(srv.port, srv.cfg.clone(), &request.to_string(), 42).await;
+        let messages = configured["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), count, "limit={limit}: {configured}");
+        assert_eq!(messages[0]["seq"], 120 - count);
+        assert_eq!(messages[count - 1]["seq"], 119);
+        assert_eq!(configured["truncated"], count < 120);
+    }
+    for limit in [
+        json!(0),
+        json!(-1),
+        json!(201),
+        json!(1.5),
+        json!("50"),
+        json!(true),
+    ] {
+        let request = json!({"jsonrpc":"2.0", "id":43, "method":"chat.subscribe",
+            "params":{"agentId":agent_id, "limit":limit}});
+        let invalid = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+        assert_eq!(invalid["jsonrpc"], "2.0");
+        assert_eq!(invalid["id"], 43);
+        assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    }
 
     // Hydration regression: corrupt every row OLDER than the newest bounded
     // page — any path that fetches/decodes them now fails hard.
@@ -18329,7 +18371,7 @@ async fn wss_slim_conversation_pages_are_byte_budgeted() {
         srv.port,
         srv.cfg.clone(),
         &format!(
-            r#"{{"jsonrpc":"2.0","id":4,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","projection":"slim"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":4,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","projection":"slim","limit":50}}}}"#
         ),
         4,
     )

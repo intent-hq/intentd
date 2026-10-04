@@ -18,6 +18,278 @@ async fn monitor_owner(h: &Harness, name: &str) -> intent_core::AgentId {
     intent_core::AgentId::from(value["agent"]["id"].as_str().unwrap())
 }
 
+// Use the real process owner and finalizer, but drive maintenance explicitly.
+// Drain both one-shot finalizers before releasing the write fault so a late
+// original attempt cannot accidentally make the retry regression pass.
+async fn monitor_failed_settlement() -> (Harness, ScriptManager, intent_core::ScriptMonitor) {
+    let h = harness().await;
+    let owner = monitor_owner(&h, "retry owner").await;
+    let id = create_simple(&h, "failed settlement", "exit 7", ScriptMode::Command).await;
+    let mut mgr = h.services.script_manager();
+    mgr.owner_services = None;
+    mgr.tasks = Arc::default();
+    sqlx::query("CREATE TRIGGER refuse_result BEFORE UPDATE OF latest_run_result ON script WHEN NEW.latest_run_result IS NOT NULL BEGIN SELECT RAISE(FAIL,'injected'); END")
+        .execute(h.services.store.write_pool()).await.unwrap();
+    assert_eq!(
+        mgr.run(&h.ws, &id, None, Some(5)).await.unwrap()["exitCode"],
+        7
+    );
+    tokio::time::timeout(LIVENESS, mgr.tasks.drain_finite())
+        .await
+        .unwrap();
+    mgr.tasks = Arc::default();
+    let watch = mgr
+        .monitor(&h.ws, &owner, &id, json!({"ttlMs":60000}))
+        .await
+        .unwrap();
+    let row: intent_core::ScriptMonitor = serde_json::from_value(watch["monitor"].clone()).unwrap();
+    assert_eq!(row.state, "active");
+    assert!(h
+        .services
+        .store
+        .latest_script_run(&h.ws, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+        .is_none());
+    sqlx::query("DROP TRIGGER refuse_result")
+        .execute(h.services.store.write_pool())
+        .await
+        .unwrap();
+    (h, mgr, row)
+}
+
+#[intent_test_macros::daemon_test]
+async fn monitor_retries_pending_result_after_write_and_pre_settlement_failure() {
+    let (h, mgr, row) = monitor_failed_settlement().await;
+    // A corrupt deadline makes pre-settlement reconciliation fail before the
+    // script UPDATE. Neither that failure nor repeated maintenance may discard
+    // the observed result. Repair the isolated fault and retry the same run.
+    sqlx::query(
+        "UPDATE script_monitor SET row_json=json_set(row_json,'$.expiresAt','invalid') WHERE id=?",
+    )
+    .bind(&row.monitor_id)
+    .execute(h.services.store.write_pool())
+    .await
+    .unwrap();
+    assert!(mgr.reconcile_monitor(&h.ws, &row.monitor_id).await.is_err());
+    assert!(mgr
+        .scripts
+        .lock()
+        .unwrap()
+        .get(&(h.ws.clone(), row.script_id.clone()))
+        .unwrap()
+        .pending_result
+        .is_some());
+    assert!(h
+        .services
+        .store
+        .latest_script_run(&h.ws, &row.script_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+        .is_none());
+    sqlx::query("UPDATE script_monitor SET row_json=? WHERE id=?")
+        .bind(serde_json::to_string(&row).unwrap())
+        .bind(&row.monitor_id)
+        .execute(h.services.store.write_pool())
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        mgr.reconcile_monitor(&h.ws, &row.monitor_id).await.unwrap();
+    }
+    let completed = h
+        .services
+        .store
+        .script_monitor(&h.ws, &row.monitor_id)
+        .await
+        .unwrap();
+    assert_eq!(completed.state, "completed");
+    assert_eq!(completed.run_id, row.run_id);
+    assert_eq!(completed.result.unwrap().exit_code, Some(7));
+    assert!(mgr
+        .scripts
+        .lock()
+        .unwrap()
+        .get(&(h.ws.clone(), row.script_id))
+        .unwrap()
+        .pending_result
+        .is_none());
+}
+
+#[intent_test_macros::daemon_test]
+async fn monitor_pending_retry_preserves_ttl_and_cleanup() {
+    for scenario in ["ttl", "cancel", "retired", "deleted", "archived"] {
+        let (h, mut mgr, row) = monitor_failed_settlement().await;
+        match scenario {
+            "ttl" => {
+                let deadline = chrono::DateTime::parse_from_rfc3339(&row.expires_at)
+                    .unwrap()
+                    .timestamp_millis();
+                mgr.parks.monitor_clock =
+                    Some(Arc::new(std::sync::atomic::AtomicI64::new(deadline)));
+            }
+            "cancel" => {
+                mgr.cancel_monitor(&h.ws, &row.monitor_id, None, false)
+                    .await
+                    .unwrap();
+            }
+            "retired" => {
+                h.services
+                    .store
+                    .set_agent_session_retired_at(
+                        &h.ws,
+                        &row.agent_id,
+                        Some(&now_iso()),
+                        &now_iso(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            "deleted" => {
+                h.services
+                    .store
+                    .delete_agent_session(&h.ws, &row.agent_id)
+                    .await
+                    .unwrap();
+            }
+            "archived" => {
+                sqlx::query("UPDATE workspace SET archived=1 WHERE id=?")
+                    .bind(h.ws.as_str())
+                    .execute(h.services.store.write_pool())
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        mgr.reconcile_monitor(&h.ws, &row.monitor_id).await.unwrap();
+        let terminal = h
+            .services
+            .store
+            .script_monitor(&h.ws, &row.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            terminal.state,
+            if scenario == "ttl" {
+                "expired"
+            } else {
+                "cancelled"
+            },
+            "{scenario}"
+        );
+        assert!(terminal.result.is_none(), "{scenario}");
+        mgr.reconcile_monitor(&h.ws, &row.monitor_id).await.unwrap();
+        assert_eq!(
+            h.services
+                .store
+                .script_monitor(&h.ws, &row.monitor_id)
+                .await
+                .unwrap(),
+            terminal
+        );
+        if scenario != "ttl" {
+            assert!(
+                !h.services
+                    .store
+                    .script_monitor_wake_pending(&row.monitor_id)
+                    .await
+                    .unwrap(),
+                "{scenario}"
+            );
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn monitor_pending_retry_does_not_settle_replacement_or_wait_for_definition() {
+    let (h, mgr, row) = monitor_failed_settlement().await;
+    let definition = mgr.locks.definition_lock(&row.script_id);
+    let guard = definition.lock().await;
+    // Busy definition operations cannot stall the global maintenance sweep.
+    tokio::time::timeout(LIVENESS, mgr.reconcile_monitor(&h.ws, &row.monitor_id))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(guard);
+    h.services
+        .store
+        .admit_script_run(&h.ws, &row.script_id, "replacement")
+        .await
+        .unwrap();
+    {
+        let mut scripts = mgr.scripts.lock().unwrap();
+        let managed = scripts
+            .get_mut(&(h.ws.clone(), row.script_id.clone()))
+            .unwrap();
+        managed.generation += 1;
+        managed.run_generation = Some(managed.generation);
+        managed.run_id = Some("replacement".into());
+        managed.pending_result.as_mut().unwrap().run_id = Some("replacement".into());
+    }
+    mgr.reconcile_monitor(&h.ws, &row.monitor_id).await.unwrap();
+    let latest = h
+        .services
+        .store
+        .latest_script_run(&h.ws, &row.script_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.0, "replacement");
+    assert!(
+        latest.1.is_none(),
+        "an old monitor must not finalize a different run"
+    );
+    assert_eq!(
+        h.services
+            .store
+            .script_monitor(&h.ws, &row.monitor_id)
+            .await
+            .unwrap()
+            .state,
+        "active"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn monitor_reconciles_durable_result_without_notification_and_after_restart() {
+    for restart in [false, true] {
+        let (h, mut mgr, row) = monitor_failed_settlement().await;
+        let result = mgr
+            .scripts
+            .lock()
+            .unwrap()
+            .get(&(h.ws.clone(), row.script_id.clone()))
+            .unwrap()
+            .pending_result
+            .clone()
+            .unwrap();
+        // Persist directly: no completion event or finalizer notification.
+        h.services
+            .store
+            .settle_script_run(&h.ws, &row.script_id, &row.run_id, &result, false)
+            .await
+            .unwrap();
+        if restart {
+            mgr.locks = ScriptLocks::default();
+            mgr.scripts = Arc::default();
+            mgr.recover_monitors().await.unwrap();
+        }
+        mgr.reconcile_monitor(&h.ws, &row.monitor_id).await.unwrap();
+        let terminal = h
+            .services
+            .store
+            .script_monitor(&h.ws, &row.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(terminal.state, "completed");
+        assert_eq!(terminal.result.unwrap().exit_code, Some(7));
+        assert_eq!(terminal.run_id, row.run_id);
+    }
+}
+
 async fn monitor_row(h: &Harness, id: &str, state: &str) -> intent_core::ScriptMonitor {
     tokio::time::timeout(LIVENESS, async {
         loop {
@@ -514,15 +786,25 @@ async fn monitor_restart_spawn_failure_does_not_reuse_predecessor_timing() {
     let owner = monitor_owner(&h, "owner").await;
     let id = create_simple(&h, "controlled", "read value", ScriptMode::Command).await;
     let mut sub = subscribe(&h);
-    let prior = h.services.script_start(h.ws.clone(), id.clone()).await.unwrap();
+    let prior = h
+        .services
+        .script_start(h.ws.clone(), id.clone())
+        .await
+        .unwrap();
     await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
     let park = Arc::new(SupervisePark::default());
     let mut mgr = h.services.script_manager();
     mgr.parks.before_spawn = Some(park.clone());
     let successor = mgr.restart(&h.ws, &id).await.unwrap();
     assert_ne!(successor["runId"], prior["runId"]);
-    tokio::time::timeout(LIVENESS, park.entered.notified()).await.unwrap();
-    let row = mgr.monitor(&h.ws, &owner, &id, json!({"ttlMs":60000})).await.unwrap()["monitor"].clone();
+    tokio::time::timeout(LIVENESS, park.entered.notified())
+        .await
+        .unwrap();
+    let row = mgr
+        .monitor(&h.ws, &owner, &id, json!({"ttlMs":60000}))
+        .await
+        .unwrap()["monitor"]
+        .clone();
     let mid = row["monitorId"].as_str().unwrap();
     // Closing the isolated PTY host forces spawn to fail before a process exists.
     h.services.pty().kill_all_sync();
@@ -535,7 +817,9 @@ async fn monitor_restart_spawn_failure_does_not_reuse_predecessor_timing() {
             }
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert_eq!(result["runId"], successor["runId"]);
     assert_eq!(result["result"]["outcome"], "failed");
     assert!(result["result"].get("startedAt").is_none());

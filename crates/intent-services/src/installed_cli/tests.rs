@@ -238,6 +238,118 @@ async fn installed_cli_auth_and_config_changes_do_not_reuse_last_good_identity()
     assert!(!after.key(&identity).unwrap().contains("token"));
 }
 
+async fn claude_catalog_key(
+    context: &InstalledContext,
+    identity: &InstalledCliIdentity,
+    state: &str,
+) -> String {
+    std::fs::write(
+        PathBuf::from(context.env.get(std::ffi::OsStr::new("HOME")).unwrap()).join(".claude.json"),
+        state,
+    )
+    .unwrap();
+    InstalledContext::from_inputs(
+        context.runtime.clone(),
+        &BTreeMap::new(),
+        context.env.clone(),
+        &context.names,
+    )
+    .unwrap()
+    .with_catalog_fingerprint()
+    .await
+    .unwrap()
+    .key(identity)
+    .unwrap()
+}
+
+#[tokio::test]
+async fn installed_cli_claude_state_churn_keeps_catalog_identity() {
+    let (root, context) = fixture(InstalledCli::Claude, "#!/bin/sh\nprintf '2.0.0\\n'\n");
+    let context = context.with_catalog_fingerprint().await.unwrap();
+    let (identity, _) = context
+        .observe(&launch(&context, root.path()))
+        .await
+        .unwrap();
+    let base = claude_catalog_key(
+        &context,
+        &identity,
+        r#"{"numStartups":1,"cachedGrowthBookFeaturesAt":1,"oauthAccount":{"accountUuid":"a","organizationUuid":"o","profileFetchedAt":1},"modelAccessCache":[]}"#,
+    )
+    .await;
+    // Claude Code rewrites these during ordinary runs, including model discovery.
+    let churned = claude_catalog_key(
+        &context,
+        &identity,
+        r#"{"oauthAccount":{"profileFetchedAt":2,"organizationUuid":"o","accountUuid":"a"},"cachedGrowthBookFeaturesAt":2,"numStartups":2,"modelAccessCache":["x"],"tipsHistory":{"t":3}}"#,
+    )
+    .await;
+    assert_eq!(base, churned);
+
+    for meaningful in [
+        r#"{"oauthAccount":{"accountUuid":"b","organizationUuid":"o"}}"#,
+        r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"p"}}"#,
+        r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"o"},"primaryApiKey":"k"}"#,
+        r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"o"},"customApiKeyResponses":{"approved":["k"]}}"#,
+        "{}",
+        "not json",
+    ] {
+        let changed = claude_catalog_key(&context, &identity, meaningful).await;
+        assert_ne!(base, changed, "{meaningful} must invalidate the catalog");
+    }
+    let unparseable = claude_catalog_key(&context, &identity, "not json").await;
+    assert_ne!(
+        unparseable,
+        claude_catalog_key(&context, &identity, "not json either").await
+    );
+
+    let before_settings = claude_catalog_key(
+        &context,
+        &identity,
+        r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"o"}}"#,
+    )
+    .await;
+    assert_eq!(base, before_settings);
+    std::fs::create_dir(root.path().join(".claude")).unwrap();
+    std::fs::write(
+        root.path().join(".claude/settings.json"),
+        r#"{"model":"opus"}"#,
+    )
+    .unwrap();
+    let after_settings = claude_catalog_key(
+        &context,
+        &identity,
+        r#"{"oauthAccount":{"accountUuid":"a","organizationUuid":"o"}}"#,
+    )
+    .await;
+    assert_ne!(base, after_settings);
+
+    // Explicit credential-file inputs keep raw bytes even when named `.claude.json`.
+    let credential = root.path().join("credentials/.claude.json");
+    std::fs::create_dir(credential.parent().unwrap()).unwrap();
+    let mut env = context.env.clone();
+    env.insert(
+        "GOOGLE_APPLICATION_CREDENTIALS".into(),
+        credential.clone().into_os_string(),
+    );
+    let credential_key = |json: &'static str| {
+        std::fs::write(&credential, json).unwrap();
+        let (runtime, env, names) = (context.runtime.clone(), env.clone(), &context.names);
+        let identity = &identity;
+        async move {
+            InstalledContext::from_inputs(runtime, &BTreeMap::new(), env, names)
+                .unwrap()
+                .with_catalog_fingerprint()
+                .await
+                .unwrap()
+                .key(identity)
+                .unwrap()
+        }
+    };
+    let first = credential_key(r#"{"client_email":"a@example.com"}"#).await;
+    let second = credential_key(r#"{"client_email":"b@example.com"}"#).await;
+    assert_ne!(first, second);
+}
+
 #[tokio::test]
 async fn installed_cli_disappearing_never_runs_adapter_or_bundled_cli() {
     let (root, context) = fixture(
@@ -389,25 +501,101 @@ async fn installed_cli_prepared_catalog_rechecks_wrapper_before_launch() {
 }
 
 #[cfg(target_os = "linux")]
-async fn detached_version_children(mode: &str) {
-    struct Cleanup(i32);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
+const DETACHED_VERSION_FIXTURE: &str = r"#!/usr/bin/python3
+import subprocess,os,pathlib,time
+child=subprocess.Popen(['/bin/sleep','120'],start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+root=pathlib.Path(os.environ['HOME'])
+controlled=(root/'hold-publication').exists()
+staging=root/'detached-pid.staging'
+with staging.open('w') as output:
+    if controlled:
+        (root/'publication-entered').touch()
+        deadline=time.monotonic()+2
+        while not (root/'publication-release').exists():
+            if time.monotonic()>=deadline: raise RuntimeError('publication barrier expired')
+            time.sleep(0.005)
+    output.write(str(child.pid))
+os.replace(staging,root/'detached-pid')
+if controlled: (root/'publication-finished').touch()
+if os.environ['VERSION_MODE']!='success':time.sleep(120)
+print('2.0.0 (Claude Code)')
+";
+
+// A pidfd can only signal the process we inspected, even if its numeric PID
+// has since been reused. The unique fixture HOME excludes unrelated processes.
+#[cfg(target_os = "linux")]
+struct DetachedCleanup(Option<std::os::fd::OwnedFd>);
+
+#[cfg(target_os = "linux")]
+impl DetachedCleanup {
+    fn capture(pid: i32, root: &Path) -> Result<Self, String> {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        if pid <= 1 {
+            return Err(format!("invalid detached PID: {pid}"));
+        }
+        // SAFETY: pidfd_open has no pointer arguments and returns an owned fd.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(Self(None))
+            } else {
+                Err(format!("open detached pidfd: {error}"))
+            };
+        }
+        // Linux returns descriptors in the C int range; reject an invalid
+        // syscall result before assigning ownership rather than truncating it.
+        let fd = i32::try_from(fd).map_err(|error| format!("invalid detached pidfd: {error}"))?;
+        // SAFETY: a successful pidfd_open returned a new descriptor.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        let identity = std::fs::read(format!("/proc/{pid}/environ"));
+        match identity {
+            Ok(bytes) if bytes.is_empty() => Ok(Self(None)), // Already a zombie.
+            Ok(bytes) => {
+                let mut home = b"HOME=".to_vec();
+                home.extend_from_slice(root.as_os_str().as_bytes());
+                if bytes.split(|byte| *byte == 0).any(|entry| entry == home) {
+                    Ok(Self(Some(fd)))
+                } else {
+                    Err(format!(
+                        "PID {pid} does not belong to fixture {}",
+                        root.display()
+                    ))
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self(None)),
+            Err(error) => Err(format!("inspect detached child identity: {error}")),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DetachedCleanup {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        if let Some(fd) = &self.0 {
+            // SAFETY: the fd owns the verified child identity; null siginfo
+            // requests ordinary signal delivery, including if the PID changed.
             unsafe {
-                libc::kill(self.0, libc::SIGKILL);
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
             }
         }
     }
-    let (root, context) = fixture(
-        InstalledCli::Claude,
-        r"#!/usr/bin/python3
-import subprocess,os,pathlib,time
-child=subprocess.Popen(['/bin/sleep','120'],start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-pathlib.Path(os.environ['HOME'],'detached-pid').write_text(str(child.pid))
-if os.environ['VERSION_MODE']!='success':time.sleep(120)
-print('2.0.0 (Claude Code)')
-",
-    );
+}
+
+#[cfg(target_os = "linux")]
+async fn detached_version_children(mode: &str, controlled: bool) {
+    let (root, context) = fixture(InstalledCli::Claude, DETACHED_VERSION_FIXTURE);
+    if controlled {
+        std::fs::write(root.path().join("hold-publication"), "").unwrap();
+    }
     let mut unrelated = Command::new("/bin/sleep")
         .arg("120")
         .kill_on_drop(true)
@@ -417,59 +605,120 @@ print('2.0.0 (Claude Code)')
     command.env("VERSION_MODE", mode);
     let mut operation = tokio::spawn(async move { context.observe(&command).await.map(|_| ()) });
     let file = root.path().join("detached-pid");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !file.exists() {
+    // Save failures until the barrier is released and the process owner joined.
+    // In particular, the deliberately failing baseline must not panic while held.
+    let publication = if controlled {
+        let entered = tokio::time::timeout(Duration::from_secs(2), async {
+            while !root.path().join("publication-entered").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let observed =
+            entered
+                .map_err(|e| e.to_string())
+                .and_then(|()| match std::fs::read(&file) {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error.to_string()),
+                });
+        // Unconditional, including failed arrival/read. Python also has a
+        // bounded hold, below the unchanged production three-second timeout.
+        let released = std::fs::write(root.path().join("publication-release"), "");
+        Some(released.map_err(|e| e.to_string()).and(observed))
+    } else {
+        None
+    };
+    let ready = tokio::time::timeout(Duration::from_secs(5), async {
+        // The control waits for close after releasing, so the baseline fails
+        // on the held-state oracle rather than racing a second empty read.
+        while !file.exists() || (controlled && !root.path().join("publication-finished").exists()) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .unwrap();
-    let pid: i32 = std::fs::read_to_string(file).unwrap().parse().unwrap();
-    let emergency = Cleanup(pid);
-    if mode == "cancel" {
+    .await;
+    let child = ready.map_err(|e| e.to_string()).and_then(|()| {
+        let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
+        let pid = text
+            .parse::<i32>()
+            .map_err(|e| format!("PID {text:?}: {e}"))?;
+        DetachedCleanup::capture(pid, root.path()).map(|guard| (pid, guard))
+    });
+    // Readiness/read/parse failures still join observe, which owns bounded
+    // descendant cleanup. Aborting the caller alone would detach that owner.
+    let cancelled = mode == "cancel" && child.is_ok();
+    if cancelled {
         operation.abort();
-        assert!(operation.await.unwrap_err().is_cancelled());
+    }
+    let result = (&mut operation).await;
+    let cleaned = if let Ok((pid, _)) = &child {
+        tokio::time::timeout(Duration::from_secs(7), async {
+            while std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+                !s.rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with('Z'))
+            }) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok()
     } else {
-        let result = (&mut operation).await.unwrap();
+        false
+    };
+    let unrelated_alive = unrelated.try_wait().map(|status| status.is_none());
+    let unrelated_reaped = unrelated.kill().await;
+    let identity = child.map(|(pid, emergency)| {
+        drop(emergency);
+        pid
+    });
+    eprintln!(
+        "detached fixture: mode={mode} controlled={controlled} pid={identity:?} held={publication:?} owner={result:?} retired={cleaned} unrelated_alive={unrelated_alive:?} unrelated_reaped={unrelated_reaped:?}"
+    );
+    // All assertions are after release, owner completion, emergency cleanup,
+    // and unrelated kill/reap, including the original pre-parse failure path.
+    let _pid = identity.expect("detached child PID readiness and identity");
+    if cancelled {
+        assert!(result.unwrap_err().is_cancelled());
+    } else {
+        let result = result.unwrap();
         if mode == "success" {
             assert!(result.is_ok(), "{result:?}");
         } else {
             assert!(result.unwrap_err().contains("timed out"));
         }
     }
-    let cleaned = tokio::time::timeout(Duration::from_secs(7), async {
-        while std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
-            !s.rsplit_once(") ")
-                .is_some_and(|(_, rest)| rest.starts_with('Z'))
-        }) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .is_ok();
-    assert!(
-        unrelated.try_wait().unwrap().is_none(),
-        "unrelated process was killed"
-    );
-    unrelated.kill().await.unwrap();
-    drop(emergency);
+    assert!(unrelated_alive.unwrap(), "unrelated process was killed");
+    unrelated_reaped.unwrap();
     assert!(cleaned, "{mode} left detached version child alive");
+    if let Some(publication) = publication {
+        assert!(
+            publication
+                .expect("publication barrier/read/release")
+                .is_none(),
+            "detached PID was published before its contents were complete"
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn installed_cli_successful_version_reaps_detached_children() {
-    detached_version_children("success").await;
+    detached_version_children("success", false).await;
 }
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn installed_cli_timed_out_version_reaps_detached_children() {
-    detached_version_children("timeout").await;
+    detached_version_children("timeout", false).await;
 }
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn installed_cli_cancelled_version_reaps_detached_children() {
-    detached_version_children("cancel").await;
+    detached_version_children("cancel", false).await;
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn installed_cli_detached_pid_is_published_only_when_complete() {
+    detached_version_children("success", true).await;
 }
 
 // Exercise the macOS fallback on Unix CI too. This only promises ownership of

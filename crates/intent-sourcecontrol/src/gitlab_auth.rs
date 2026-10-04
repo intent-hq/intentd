@@ -290,6 +290,39 @@ pub async fn refresh_access_token(
 /// A caller-owned persistence lock retained by blocking writes even on timeout.
 pub type PersistenceLease = std::sync::Arc<dyn std::any::Any + Send + Sync>;
 
+/// The actual secret writer's completion, including all token siblings. A
+/// failed or panicked write may have changed part of the pair; it is not a
+/// rollback. Caller timeout is not a completion and never emits this outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitlabWriteOutcome {
+    Persisted,
+    Uncertain,
+}
+
+/// An owner fence around the existing persistence operation. Comparison material
+/// is borrowed within that operation; observers perform no persistence or compensation.
+pub trait GitlabWriteObserver: Send + Sync {
+    /// Validate original ownership and retire admissions before the first write.
+    ///
+    /// # Errors
+    /// Rejects a retired original writer, before any secret effect.
+    fn before_write(&self) -> Result<()>;
+    /// Account evidence from the newly exchanged refresh token, when available.
+    fn verified_user(&self, user: Option<GitlabUser>);
+    /// Borrow the exact selected tuple after ALL original sibling writes succeed.
+    /// This is candidate comparison material, not a settlement or authority grant.
+    /// Implementations must not retain or expose the borrowed credentials.
+    fn persisted_credential(
+        &self,
+        _access: &str,
+        _refresh: Option<&str>,
+        _expires_at: Option<u64>,
+    ) {
+    }
+    /// Called by the actual blocking writer while its persistence lease is held.
+    fn settled(&self, outcome: GitlabWriteOutcome);
+}
+
 /// Refresh while retaining a caller's persistence lock until all writes finish.
 ///
 /// # Errors
@@ -316,6 +349,50 @@ pub async fn refresh_grant(
     client_id: &str,
     store: FileSecretStore,
 ) -> Result<GitlabGrant> {
+    refresh_grant_inner(host, client_id, store, None, None).await
+}
+
+/// Exchange the exact operand attested by the original repository owner.
+/// No credential reload or persistence occurs in this exchange.
+///
+/// # Errors
+/// Returns the original owner fence or provider exchange error.
+pub async fn refresh_grant_observed(
+    host: &GitlabHost,
+    client_id: &str,
+    store: FileSecretStore,
+    observer: std::sync::Arc<dyn GitlabWriteObserver>,
+    refresh_token: SecretString,
+) -> Result<GitlabGrant> {
+    refresh_grant_inner(host, client_id, store, Some(observer), Some(refresh_token)).await
+}
+
+/// Refresh and persist through the original owner for standalone engine callers.
+/// Service callers retain the opaque grant in their registered completion owner.
+///
+/// # Errors
+/// Returns the original owner, exchange, or persistence error.
+pub async fn refresh_access_token_observed(
+    host: &GitlabHost,
+    client_id: &str,
+    store: FileSecretStore,
+    lease: PersistenceLease,
+    observer: std::sync::Arc<dyn GitlabWriteObserver>,
+    refresh_token: SecretString,
+) -> Result<()> {
+    refresh_grant_observed(host, client_id, store, observer.clone(), refresh_token)
+        .await?
+        .commit_observed(lease, observer)
+        .await
+}
+
+async fn refresh_grant_inner(
+    host: &GitlabHost,
+    client_id: &str,
+    store: FileSecretStore,
+    observer: Option<std::sync::Arc<dyn GitlabWriteObserver>>,
+    refresh_operand: Option<SecretString>,
+) -> Result<GitlabGrant> {
     let client_id = client_id.trim();
     if client_id.is_empty() {
         return Err(Error::Config(
@@ -324,7 +401,12 @@ pub async fn refresh_grant(
                 .to_string(),
         ));
     }
-    let refresh_token = {
+    // Observed repository refresh receives the exact operand attested by its
+    // original owner. Never reload another value after that admission. The
+    // independent legacy/collaboration API retains its existing store read.
+    let refresh_token = if let Some(token) = refresh_operand {
+        token
+    } else {
         let store = store.clone();
         let handle = tokio::task::spawn_blocking(move || store.load(REFRESH_SECRET_ACCOUNT));
         match timeout(SECRET_WRITE_TIMEOUT, handle).await {
@@ -352,6 +434,9 @@ pub async fn refresh_grant(
             }
         }
     };
+    if let Some(observer) = &observer {
+        observer.before_write()?;
+    }
     let client = http_client()?;
     let response = client
         .post(format!("{}/oauth/token", host.base_url()))
@@ -392,6 +477,9 @@ pub async fn refresh_grant(
         } => {
             // Doorkeeper always rotates; keep the old one only if the body
             // somehow omitted a replacement so the next refresh can still try.
+            if let Some(observer) = &observer {
+                observer.verified_user(validate_pat(host, access_token.expose_secret()).await.ok());
+            }
             Ok(GitlabGrant {
                 store,
                 access_token,
@@ -537,6 +625,22 @@ impl GitlabGrant {
         )
     }
 
+    /// Retain the same observer and lease inside a registered physical writer.
+    pub fn into_persistence_observed(
+        self,
+        lease: PersistenceLease,
+        observer: std::sync::Arc<dyn GitlabWriteObserver>,
+    ) -> impl FnOnce() -> intent_core::Result<()> + Send + 'static {
+        token_persistence_observed(
+            self.store,
+            self.access_token,
+            self.refresh_token,
+            self.expires_at,
+            lease,
+            observer,
+        )
+    }
+
     /// Persist the pair into the flow's secret store (replacing whatever it
     /// held, clearing a stale refresh token / expiry when the grant has none).
     ///
@@ -568,6 +672,26 @@ impl GitlabGrant {
             self.refresh_token,
             self.expires_at,
             lease,
+        )
+        .await
+    }
+
+    /// Commit through the existing blocking writer with original-owner fencing.
+    ///
+    /// # Errors
+    /// Returns a stale-owner or bounded secret-write error.
+    pub async fn commit_observed(
+        self,
+        lease: PersistenceLease,
+        observer: std::sync::Arc<dyn GitlabWriteObserver>,
+    ) -> Result<()> {
+        persist_tokens_observed(
+            self.store,
+            self.access_token,
+            self.refresh_token,
+            self.expires_at,
+            Some(lease),
+            Some(observer),
         )
         .await
     }
@@ -1128,6 +1252,74 @@ pub fn token_revocation(
     }
 }
 
+/// A validated PAT write registered by the caller before any physical effect.
+pub fn pat_persistence_observed(
+    store: FileSecretStore,
+    token: SecretString,
+    lease: PersistenceLease,
+    observer: std::sync::Arc<dyn GitlabWriteObserver>,
+) -> impl FnOnce() -> intent_core::Result<()> + Send + 'static {
+    token_persistence_observed(store, token, None, None, lease, observer)
+}
+
+/// An original owner's revocation inside the caller's completion record.
+pub fn token_revocation_observed(
+    store: FileSecretStore,
+    lease: PersistenceLease,
+    observer: std::sync::Arc<dyn GitlabWriteObserver>,
+) -> impl FnOnce() -> intent_core::Result<()> + Send + 'static {
+    observed_persistence(token_revocation(store, None), lease, observer)
+}
+
+fn token_persistence_observed(
+    store: FileSecretStore,
+    token: SecretString,
+    refresh_token: Option<SecretString>,
+    expires_at: Option<u64>,
+    lease: PersistenceLease,
+    observer: std::sync::Arc<dyn GitlabWriteObserver>,
+) -> impl FnOnce() -> intent_core::Result<()> + Send + 'static {
+    let credential_observer = observer.clone();
+    observed_persistence(
+        move || {
+            write_token_material(
+                &store,
+                &token,
+                refresh_token.as_ref(),
+                expires_at,
+                Some(credential_observer.as_ref()),
+            )
+        },
+        lease,
+        observer,
+    )
+}
+
+fn observed_persistence(
+    write: impl FnOnce() -> intent_core::Result<()> + Send + 'static,
+    lease: PersistenceLease,
+    observer: std::sync::Arc<dyn GitlabWriteObserver>,
+) -> impl FnOnce() -> intent_core::Result<()> + Send + 'static {
+    move || {
+        let _lease = lease;
+        observer
+            .before_write()
+            .map_err(|error| intent_core::Error::Internal(error.to_string()))?;
+        let mut completion = ObservedWrite {
+            observer: Some(observer),
+        };
+        let result = write();
+        if let Some(observer) = completion.observer.take() {
+            observer.settled(if result.is_ok() {
+                GitlabWriteOutcome::Persisted
+            } else {
+                GitlabWriteOutcome::Uncertain
+            });
+        }
+        result
+    }
+}
+
 async fn persist_tokens_with_lease(
     store: FileSecretStore,
     token: SecretString,
@@ -1135,9 +1327,45 @@ async fn persist_tokens_with_lease(
     expires_at: Option<u64>,
     lease: Option<PersistenceLease>,
 ) -> Result<()> {
-    run_blocking(
-        token_persistence(store, token, refresh_token, expires_at, lease),
+    persist_tokens_observed(store, token, refresh_token, expires_at, lease, None).await
+}
+
+/// Persist a validated PAT through the existing writer and its settled callback.
+///
+/// # Errors
+/// As [`persist_gitlab_token`], or the original writer's fence error.
+pub async fn persist_gitlab_token_observed(
+    store: FileSecretStore,
+    token: SecretString,
+    lease: PersistenceLease,
+    observer: std::sync::Arc<dyn GitlabWriteObserver>,
+) -> Result<()> {
+    persist_tokens_observed(store, token, None, None, Some(lease), Some(observer)).await
+}
+
+async fn persist_tokens_observed(
+    store: FileSecretStore,
+    token: SecretString,
+    refresh_token: Option<SecretString>,
+    expires_at: Option<u64>,
+    lease: Option<PersistenceLease>,
+    observer: Option<std::sync::Arc<dyn GitlabWriteObserver>>,
+) -> Result<()> {
+    let credential_observer = observer.clone();
+    run_blocking_observed(
+        move || {
+            write_token_material(
+                &store,
+                &token,
+                refresh_token.as_ref(),
+                expires_at,
+                credential_observer.as_deref(),
+            )
+        },
         "persist",
+        SECRET_WRITE_TIMEOUT,
+        lease,
+        observer,
     )
     .await
 }
@@ -1151,16 +1379,35 @@ fn token_persistence(
 ) -> impl FnOnce() -> intent_core::Result<()> + Send + 'static {
     move || {
         let _lease = lease;
-        store.store(SECRET_ACCOUNT, token.expose_secret())?;
-        match refresh_token {
-            Some(refresh) => store.store(REFRESH_SECRET_ACCOUNT, refresh.expose_secret())?,
-            None => store.delete(REFRESH_SECRET_ACCOUNT)?,
-        }
-        match expires_at {
-            Some(at) => store.store(EXPIRES_AT_SECRET_ACCOUNT, &at.to_string()),
-            None => store.delete(EXPIRES_AT_SECRET_ACCOUNT),
-        }
+        write_token_material(&store, &token, refresh_token.as_ref(), expires_at, None)
     }
+}
+
+/// One physical sibling sequence for standalone and retained service writers.
+fn write_token_material(
+    store: &FileSecretStore,
+    token: &SecretString,
+    refresh_token: Option<&SecretString>,
+    expires_at: Option<u64>,
+    observer: Option<&dyn GitlabWriteObserver>,
+) -> intent_core::Result<()> {
+    store.store(SECRET_ACCOUNT, token.expose_secret())?;
+    match refresh_token {
+        Some(refresh) => store.store(REFRESH_SECRET_ACCOUNT, refresh.expose_secret())?,
+        None => store.delete(REFRESH_SECRET_ACCOUNT)?,
+    }
+    match expires_at {
+        Some(at) => store.store(EXPIRES_AT_SECRET_ACCOUNT, &at.to_string()),
+        None => store.delete(EXPIRES_AT_SECRET_ACCOUNT),
+    }?;
+    if let Some(observer) = observer {
+        observer.persisted_credential(
+            token.expose_secret(),
+            refresh_token.map(ExposeSecret::expose_secret),
+            expires_at,
+        );
+    }
+    Ok(())
 }
 
 /// Delete the stored `sourceControl.gitlab.token` (and refresh token +
@@ -1172,16 +1419,91 @@ fn token_persistence(
 ///
 /// Returns [`Error::Api`] when the delete fails or times out.
 pub async fn revoke_gitlab_token(store: FileSecretStore) -> Result<()> {
-    run_blocking(token_revocation(store, None), "delete").await
+    revoke_gitlab_token_inner(store, None, None).await
 }
 
-async fn run_blocking<F>(write: F, what: &str) -> Result<()>
+/// Delete the stored pair while retaining the existing persistence lock.
+///
+/// # Errors
+/// As [`revoke_gitlab_token`].
+pub async fn revoke_gitlab_token_with_lease(
+    store: FileSecretStore,
+    lease: PersistenceLease,
+) -> Result<()> {
+    revoke_gitlab_token_inner(store, Some(lease), None).await
+}
+
+/// Delete the pair through the existing writer with original-owner fencing.
+///
+/// # Errors
+/// As [`revoke_gitlab_token`], or the original writer's fence error.
+pub async fn revoke_gitlab_token_observed(
+    store: FileSecretStore,
+    lease: PersistenceLease,
+    observer: std::sync::Arc<dyn GitlabWriteObserver>,
+) -> Result<()> {
+    revoke_gitlab_token_inner(store, Some(lease), Some(observer)).await
+}
+
+async fn revoke_gitlab_token_inner(
+    store: FileSecretStore,
+    lease: Option<PersistenceLease>,
+    observer: Option<std::sync::Arc<dyn GitlabWriteObserver>>,
+) -> Result<()> {
+    run_blocking_observed(
+        move || {
+            store.delete(SECRET_ACCOUNT)?;
+            store.delete(REFRESH_SECRET_ACCOUNT)?;
+            store.delete(EXPIRES_AT_SECRET_ACCOUNT)
+        },
+        "delete",
+        SECRET_WRITE_TIMEOUT,
+        lease,
+        observer,
+    )
+    .await
+}
+
+struct ObservedWrite {
+    observer: Option<std::sync::Arc<dyn GitlabWriteObserver>>,
+}
+impl Drop for ObservedWrite {
+    fn drop(&mut self) {
+        if let Some(observer) = self.observer.take() {
+            observer.settled(GitlabWriteOutcome::Uncertain);
+        }
+    }
+}
+
+async fn run_blocking_observed<F>(
+    write: F,
+    what: &'static str,
+    budget: std::time::Duration,
+    lease: Option<PersistenceLease>,
+    observer: Option<std::sync::Arc<dyn GitlabWriteObserver>>,
+) -> Result<()>
 where
     F: FnOnce() -> intent_core::Result<()> + Send + 'static,
 {
-    match timeout(SECRET_WRITE_TIMEOUT, tokio::task::spawn_blocking(write)).await {
+    let task = tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        if let Some(observer) = &observer {
+            observer.before_write()?;
+        }
+        let mut completion = ObservedWrite { observer };
+        let result = write();
+        if let Some(observer) = completion.observer.take() {
+            observer.settled(if result.is_ok() {
+                GitlabWriteOutcome::Persisted
+            } else {
+                GitlabWriteOutcome::Uncertain
+            });
+        }
+        result.map_err(|e| Error::Api(format!("could not {what} gitlab token: {e}")))
+    });
+    match timeout(budget, task).await {
         Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(e))) => Err(Error::Api(format!("could not {what} gitlab token: {e}"))),
+        Ok(Ok(Err(e))) => Err(e),
         Ok(Err(join_err)) => Err(Error::Api(format!(
             "secret-store {what} task failed: {join_err}"
         ))),
@@ -1202,6 +1524,10 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
+
+    mod write_observer_tests {
+        include!("gitlab_auth/write_observer_tests.rs");
+    }
 
     // ---- host normalization -------------------------------------------------
 
@@ -1944,5 +2270,117 @@ mod tests {
         assert_eq!(store.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
         assert_eq!(store.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
         assert_eq!(store.load(crate::token::SECRET_ACCOUNT).unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod persisted_credential_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex, Weak};
+
+    struct Observer {
+        store: FileSecretStore,
+        lease: Weak<()>,
+        events: Mutex<Vec<&'static str>>,
+    }
+    impl GitlabWriteObserver for Observer {
+        fn before_write(&self) -> Result<()> {
+            self.events.lock().unwrap().push("before");
+            Ok(())
+        }
+        fn verified_user(&self, _: Option<GitlabUser>) {}
+        fn persisted_credential(&self, access: &str, refresh: Option<&str>, expiry: Option<u64>) {
+            assert!(
+                self.lease.upgrade().is_some(),
+                "original persistence lease is held"
+            );
+            let tuple = self
+                .store
+                .load_many(&[
+                    SECRET_ACCOUNT,
+                    REFRESH_SECRET_ACCOUNT,
+                    EXPIRES_AT_SECRET_ACCOUNT,
+                ])
+                .unwrap();
+            assert_eq!(
+                tuple,
+                [
+                    Some(access.into()),
+                    refresh.map(str::to_string),
+                    expiry.map(|value| value.to_string())
+                ]
+            );
+            self.events.lock().unwrap().push("candidate");
+        }
+        fn settled(&self, outcome: GitlabWriteOutcome) {
+            assert!(self.lease.upgrade().is_some());
+            self.events.lock().unwrap().push(match outcome {
+                GitlabWriteOutcome::Persisted => "persisted",
+                GitlabWriteOutcome::Uncertain => "uncertain",
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_tuple_callback_follows_all_effects_and_precedes_settlement() {
+        for oauth in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FileSecretStore::with_path(dir.path().join("secrets.json"));
+            store
+                .store(REFRESH_SECRET_ACCOUNT, "stale-sibling")
+                .unwrap();
+            store.store(EXPIRES_AT_SECRET_ACCOUNT, "1").unwrap();
+            let lease = Arc::new(());
+            let observer = Arc::new(Observer {
+                store: store.clone(),
+                lease: Arc::downgrade(&lease),
+                events: Mutex::new(Vec::new()),
+            });
+            persist_tokens_observed(
+                store.clone(),
+                SecretString::from("exact-access"),
+                oauth.then(|| SecretString::from("exact-refresh")),
+                oauth.then_some(42),
+                Some(lease.clone()),
+                Some(observer.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                *observer.events.lock().unwrap(),
+                ["before", "candidate", "persisted"]
+            );
+            revoke_gitlab_token_observed(store, lease, observer.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                *observer.events.lock().unwrap(),
+                ["before", "candidate", "persisted", "before", "persisted"],
+                "deletion has no credential candidate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_tuple_callback_is_absent_when_original_store_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-file");
+        std::fs::create_dir(&path).unwrap();
+        let store = FileSecretStore::with_path(path);
+        let lease = Arc::new(());
+        let observer = Arc::new(Observer {
+            store: store.clone(),
+            lease: Arc::downgrade(&lease),
+            events: Mutex::new(Vec::new()),
+        });
+        assert!(persist_gitlab_token_observed(
+            store,
+            SecretString::from("unwritten"),
+            lease,
+            observer.clone()
+        )
+        .await
+        .is_err());
+        assert_eq!(*observer.events.lock().unwrap(), ["before", "uncertain"]);
     }
 }

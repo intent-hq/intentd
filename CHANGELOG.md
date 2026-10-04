@@ -2,6 +2,83 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.10] - 2026-10-04
+
+### 🚀 Features
+
+- Expose authoritative submission correlation for optimistic display ([#2271](https://github.com/intent-hq/intentd/pull/2271))
+
+
+## [0.10.9] - 2026-10-04
+
+### 🚀 Features
+
+- Add guarded GitLab repository workflows ([#2261](https://github.com/intent-hq/intentd/pull/2261))
+
+### 🐛 Bug Fixes
+
+- Ignore Claude state churn in installed CLI catalog fingerprint ([#2275](https://github.com/intent-hq/intentd/pull/2275))
+- Bind daemon callers in retained workspace CoW fixtures ([#2273](https://github.com/intent-hq/intentd/pull/2273))
+
+### 🧪 Testing
+
+- Warm host-member query-cost fixture ([#6694](https://github.com/intent-hq/intentd/pull/6694)) ([#2277](https://github.com/intent-hq/intentd/pull/2277))
+- Isolate Tailcat discovery in no-tunnel invitation fixture ([#2272](https://github.com/intent-hq/intentd/pull/2272))
+- Make tunnel connect deadline coverage deterministic ([#2274](https://github.com/intent-hq/intentd/pull/2274))
+
+
+## [0.10.8] - 2026-10-03
+
+### 🚀 Features
+
+- Resolve authorized cross-workspace presence focus ([#2266](https://github.com/intent-hq/intentd/pull/2266))
+- Search GitHub and GitLab invitation accounts ([#2267](https://github.com/intent-hq/intentd/pull/2267))
+
+### 🐛 Bug Fixes
+
+- Cancel watcher lock waits and keep invitation clients responsive ([#2263](https://github.com/intent-hq/intentd/pull/2263))
+- Lease default-port WSS fixture lifecycles ([#2265](https://github.com/intent-hq/intentd/pull/2265))
+- Retry pending script completion settlement ([#2269](https://github.com/intent-hq/intentd/pull/2269))
+- Increase default chat subscription history to 20 ([#2270](https://github.com/intent-hq/intentd/pull/2270))
+
+
+## [0.10.7] - 2026-10-03
+
+### 🚀 Features
+
+- Add configurable chat subscription snapshot limit ([#2262](https://github.com/intent-hq/intentd/pull/2262))
+
+### 🐛 Bug Fixes
+
+- Suppress PR monitor wakes for ancestry-only changes ([#2260](https://github.com/intent-hq/intentd/pull/2260))
+
+
+## [0.10.6] - 2026-10-03
+
+### 🐛 Bug Fixes
+
+- Bound active hook metadata reads ([#2253](https://github.com/intent-hq/intentd/pull/2253))
+- Preserve replacement workers during stale turn cleanup ([#2254](https://github.com/intent-hq/intentd/pull/2254))
+
+### 🧪 Testing
+
+- Fix transfer CLI discovery and PID publication fixtures ([#2258](https://github.com/intent-hq/intentd/pull/2258))
+
+
+## [0.10.5] - 2026-10-03
+
+### 🚀 Features
+
+- Propose assistant project transfers for inline approval ([#2138](https://github.com/intent-hq/intentd/pull/2138))
+
+
+## [0.10.4] - 2026-10-03
+
+### 🐛 Bug Fixes
+
+- Use installed provider CLIs for sessions and models ([#2241](https://github.com/intent-hq/intentd/pull/2241))
+
+
 ## [0.10.3] - 2026-10-02
 
 ### 🧪 Testing

@@ -1981,7 +1981,12 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
     let mut expected = store.list_workspaces(true).await.unwrap();
     for row in &mut expected {
         row.activity = svc.workspace_activity(&row.id);
-        row.pending_delete_at = svc.pending_workspace_deletes.deadline(row.id.as_str());
+        row.pending_delete_at = svc
+            .pending_workspace_deletes
+            .deadline(&crate::delete_grace::PendingDeleteSubject::Workspace(
+                row.id.clone(),
+            ))
+            .unwrap();
         svc.enrich_workspace_aggregates_with_unread(
             row,
             Some(unread.contains(row.id.as_str())),
@@ -19538,9 +19543,57 @@ pub(crate) mod pr {
 
     // ---- ws.pr.snapshot engine (`pr_state`, MCP-only) --------------------
 
+    /// Actual local Git facts for implicit GitHub snapshot routing. Kept local
+    /// to this family so unrelated forge/metadata fixtures remain unchanged.
+    async fn snapshot_git_root(svc: &Services, id: &WorkspaceId) -> tempfile::TempDir {
+        let dir = test_tempdir("snapshot-github-root-");
+        {
+            let repo = git2::Repository::init(dir.path()).unwrap();
+            repo.remote("origin", "https://github.com/o/r").unwrap();
+        }
+        let mut ws = svc.store().get_workspace(id).await.unwrap();
+        ws.worktree_path = Some(dir.path().to_string_lossy().into_owned());
+        svc.store().update_workspace(&ws).await.unwrap();
+        // Make a fresh explicit fixture choice after root setup; current Git
+        // is not evidence of a migrated historical selection.
+        let root = intent_core::RepositoryRootId {
+            workspace_id: id.clone(),
+            kind: intent_core::RepositoryRootKind::Primary,
+        };
+        let original = svc
+            .store()
+            .repository_selection_snapshot(&root)
+            .await
+            .unwrap();
+        let result = svc
+            .store()
+            .write_repository_selection(
+                &original,
+                intent_store::RepositorySelectionChange::Automatic,
+            )
+            .await;
+        assert!(matches!(
+            result.result.unwrap(),
+            intent_store::RepositorySelectionWriteResult::Applied(_)
+        ));
+        let stored = svc
+            .store()
+            .repository_selection_snapshot(&root)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.selection(),
+            Some(&intent_store::RepositoryStoredSelection::Saved(
+                intent_core::SavedReviewSelection::Automatic
+            ))
+        );
+        dir
+    }
+
     #[intent_test_macros::daemon_test]
     async fn state_snapshot_shape_and_counts() {
         let (_t, svc, ws) = setup(false, true).await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["repo"], "o/r");
         assert_eq!(v["prNumber"], 42);
@@ -19591,6 +19644,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
@@ -19609,6 +19663,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeable"], false);
         assert_eq!(v["mergeableState"], "dirty");
@@ -19626,6 +19681,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["state"], "merged");
         assert_eq!(v["isMerged"], true);
@@ -19651,6 +19707,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeableState"], "blocked");
         assert_eq!(v["reviews"]["decision"], "none");
@@ -19672,6 +19729,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeableState"], "clean");
         assert_eq!(v["reviews"]["decision"], "review_required");
@@ -19690,6 +19748,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["reviews"]["decision"], "approved");
         assert_eq!(v["reviews"]["approvals"], 1);
@@ -19705,17 +19764,18 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let err = svc.pr_state(ws, 999, None).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found in o/r")));
     }
 
     #[intent_test_macros::daemon_test]
-    async fn state_snapshot_requires_workspace_repo() {
-        // No repository on the workspace: same "No active PR" guard as the
-        // other pr.* methods (the required prNumber does not bypass it).
+    async fn state_snapshot_unknown_root_uses_fixed_discovery_refusal() {
+        // An absent original Git root cannot infer a provider from metadata or
+        // expose new discovery details through the snapshot error.
         let (_t, svc, ws) = setup(false, false).await;
         let err = svc.pr_state(ws, 42, None).await.unwrap_err();
-        assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+        assert!(matches!(err, Error::Forbidden(m) if m == crate::repository_read_source::REFUSAL));
     }
 
     #[intent_test_macros::daemon_test]
@@ -19747,6 +19807,7 @@ pub(crate) mod pr {
         *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
             assert!(gate.pause_for(std::time::Duration::from_secs(3600), true));
         }));
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws.clone(), 42, None).await.expect("snapshot");
         let until = svc
             .sweep_rate_limit_paused_until()
@@ -23309,6 +23370,7 @@ pub(crate) mod pr {
     async fn pr_state_folds_a_queue_signal_served_from_the_cache() {
         let forge = queue_signal_forge(true);
         let (_t, _root, svc, ws_id) = cached_hover_setup(forge.clone(), None).await;
+        let _git = snapshot_git_root(&svc, &ws_id).await;
         assert_eq!(
             seed_display_status(&svc, &ws_id).await,
             Some(intent_core::WorkspaceDisplayStatus::PrReady)
@@ -32984,6 +33046,51 @@ mod known_repo {
     }
 }
 
+/// Keep the caller regression observable even on hosts that skip `CoW` tests.
+/// Native acceptance additionally requires a real clone and independent contents
+/// on the same volume pair used by the workspace fixture.
+fn cow_fixture_supported(source: &std::path::Path, root: &std::path::Path) -> bool {
+    let support = intent_git::cow_probe(source, root).expect("probe fixture CoW support");
+    eprintln!("CoW fixture probe: {support:?}; source={source:?}; root={root:?}");
+    if support == intent_git::CowSupport::Supported {
+        let src = crate::test_support::test_tempdir_in(
+            source.to_str().expect("fixture source path"),
+            "cow-proof-source-",
+        );
+        let dst = crate::test_support::test_tempdir_in(
+            root.to_str().expect("fixture root path"),
+            "cow-proof-destination-",
+        );
+        let original = src.path().join("payload");
+        let cloned = dst.path().join("clone");
+        std::fs::write(&original, b"original").unwrap();
+        intent_git::cow_clone(src.path(), &cloned).expect("real fixture CoW clone");
+        let copy = cloned.join("payload");
+        assert_eq!(std::fs::read(&copy).unwrap(), b"original");
+        std::fs::write(&copy, b"clone changed").unwrap();
+        assert_eq!(std::fs::read(&original).unwrap(), b"original");
+        std::fs::write(&original, b"source changed").unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), b"clone changed");
+        dst.close().expect("remove CoW proof destination");
+        src.close().expect("remove CoW proof source");
+        eprintln!("CoW fixture clone and independent contents verified");
+        eprintln!("CoW fixture proof scratch cleaned");
+    } else {
+        assert!(
+            std::env::var_os("INTENTD_TEST_REQUIRE_COW").is_none(),
+            "native CoW acceptance requires a supported fixture volume"
+        );
+        // Supplemental regression on unsupported hosts only. Supported-volume
+        // baselines must reach the original service gate and its real refusal.
+        assert_eq!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Daemon),
+            "workspace CoW fixture must bind its daemon caller"
+        );
+    }
+    support == intent_git::CowSupport::Supported
+}
+
 mod worktree_provisioning {
     use super::*;
     use intent_core::WorkspaceCreate;
@@ -33646,7 +33753,7 @@ mod worktree_provisioning {
     /// workspace branch from `baseRef`, with `worktreePath`/`baseCommitSha`
     /// populated, `checkoutMode: "cow"` persisted, and untracked source files
     /// carried over.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_provisions_cow_checkout_when_isolation_enabled() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -33654,10 +33761,7 @@ mod worktree_provisioning {
         // Untracked build artifact in the source repo — CoW carries it over.
         std::fs::write(repo_dir.0.join("untracked.log"), "artifact\n").unwrap();
         let root = unique_dir("intentd-cowprov-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -33705,6 +33809,9 @@ mod worktree_provisioning {
         assert_eq!(
             persisted.checkout_mode,
             Some(intent_core::CheckoutMode::Cow)
+        );
+        eprintln!(
+            "CoW fixture assertions passed: create_provisions_cow_checkout_when_isolation_enabled"
         );
     }
 
@@ -33888,16 +33995,13 @@ mod worktree_provisioning {
     /// mirrors the create decision matrix — the duplicate gets a standalone
     /// `CoW` clone with `checkoutMode: "cow"` persisted, and the source repo
     /// gains no branch for the duplicate (the branch lives in the clone).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_provisions_cow_checkout_when_isolation_enabled() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, head_branch) = seed_repo("intentd-cowdup-repo");
         let root = unique_dir("intentd-cowdup-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -33945,6 +34049,7 @@ mod worktree_provisioning {
             persisted.checkout_mode,
             Some(intent_core::CheckoutMode::Cow)
         );
+        eprintln!("CoW fixture assertions passed: duplicate_provisions_cow_checkout_when_isolation_enabled");
     }
 
     /// cowIsolation on + CoW-incapable filesystem: `workspace.duplicate`
@@ -34000,16 +34105,13 @@ mod worktree_provisioning {
     /// unresolvable `baseRef`), the create fails without inserting a row and
     /// without leaving the empty `<root>/<wsId>` dir the probe created behind
     /// — the workspaces root ends up clean.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowfail-repo");
         let root = unique_dir("intentd-cowfail-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -34038,6 +34140,7 @@ mod worktree_provisioning {
                 .is_none(),
             "workspaces root must have no leftover empty <root>/<wsId> dir"
         );
+        eprintln!("CoW fixture assertions passed: create_cleans_up_empty_ws_dir_when_cow_provisioning_fails");
     }
 
     /// monorepo#774, `workspace.duplicate` path: a `CoW` provisioning failure
@@ -34052,16 +34155,13 @@ mod worktree_provisioning {
     /// flow, not a mutation-killing regression test. The #774 regression
     /// coverage lives in the create-path test above and the
     /// `remove_workspace_dir_if_empty` unit test below.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowdupfail-repo");
         let root = unique_dir("intentd-cowdupfail-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -34093,6 +34193,7 @@ mod worktree_provisioning {
             vec![".workspace".to_string()],
             "duplicate ws dir holds only the metadata dir"
         );
+        eprintln!("CoW fixture assertions passed: duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails");
     }
 
     /// The #774 cleanup helper only ever removes *empty* dirs: a non-empty
@@ -39439,13 +39540,11 @@ mod clone_orchestration {
     /// `workspace.cowIsolation` on and a CoW-capable filesystem, the local
     /// create streams the `cow-copy 30` milestone (not `worktree`) with the
     /// echoed `progressId` and one terminal done.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn progress_id_cow_create_streams_cow_copy_milestone() {
         let repo = seed_repo("intentd-prog-cow-src");
         let root = unique_dir("intentd-prog-cow-root");
-        if intent_git::cow_probe(&repo.0, &root.0).unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -39496,6 +39595,9 @@ mod clone_orchestration {
         assert!(
             !frames.iter().any(|f| f.data["phase"] == "worktree"),
             "no worktree milestone on the CoW path: {frames:?}"
+        );
+        eprintln!(
+            "CoW fixture assertions passed: progress_id_cow_create_streams_cow_copy_milestone"
         );
     }
 
@@ -47430,7 +47532,7 @@ mod bulk_delete_pool_pressure {
         let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
         drop(guard);
 
-        assert!(trash.is_none(), "nothing to detach");
+        assert!(trash.0.is_none(), "nothing to detach");
         let loud = capture.at_or_above(tracing::Level::WARN);
         assert!(
             loud.is_empty(),
@@ -47482,7 +47584,7 @@ mod bulk_delete_pool_pressure {
         let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
         drop(guard);
 
-        assert!(trash.is_none(), "nothing detached");
+        assert!(trash.0.is_none(), "nothing detached");
         let loud = capture.at_or_above(tracing::Level::WARN);
         assert!(
             loud.iter()
@@ -47703,7 +47805,11 @@ mod agent_delete_grace_window {
             while h
                 .services
                 .pending_agent_deletes
-                .deadline(h.agent.as_str())
+                .deadline(&crate::delete_grace::PendingDeleteSubject::Agent {
+                    workspace_id: h.ws.clone(),
+                    agent_id: h.agent.clone(),
+                })
+                .unwrap()
                 .is_some()
             {
                 tokio::task::yield_now().await;
@@ -48186,6 +48292,7 @@ mod harness_versioning {
         let (_tmp, svc, ws) = setup().await;
         let created = create_agent(&svc, &ws, None).await;
         let agent = &created["agent"];
+        assert_eq!(agent["harnessVersion"], "3.0");
         assert_eq!(
             agent["harnessVersion"],
             intent_core::CURRENT_HARNESS_VERSION,
@@ -48210,6 +48317,50 @@ mod harness_versioning {
         let persisted = session.harness_features.expect("persisted snapshot");
         assert_eq!(persisted["taskGraph"], serde_json::json!(true));
         assert_eq!(persisted["peerAgents"], serde_json::json!(true));
+        let full = svc.agent_get_session_op(id).await.expect("getSession");
+        assert_eq!(full.harness_version, "3.0");
+        assert_eq!(full.harness_features.as_ref(), Some(&persisted));
+        assert_eq!(agent["harnessFeatures"], persisted);
+    }
+
+    #[tokio::test]
+    async fn child_of_saved_2_9_keeps_parent_stamp_and_snapshot() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let parent_id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let mut saved_features = created["agent"]["harnessFeatures"].clone();
+        saved_features["hostExec"] = serde_json::json!(false);
+        saved_features["peerAgents"] = serde_json::json!(false);
+        sqlx::query(
+            "UPDATE agent_session SET harness_version = '2.9', harness_features = ? WHERE id = ?",
+        )
+        .bind(saved_features.to_string())
+        .bind(&parent_id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+        let child = create_agent(&svc, &ws, Some(parent_id.clone())).await;
+        assert_eq!(child["agent"]["harnessVersion"], "3.0");
+        assert_eq!(child["agent"]["harnessFeatures"]["hostExec"], true);
+        assert_eq!(child["agent"]["harnessFeatures"]["peerAgents"], true);
+        let child_id = AgentId::from(child["agent"]["id"].as_str().unwrap());
+        let child_row = svc.store().get_agent_session(&child_id).await.unwrap();
+        assert_eq!(child_row.harness_version, "3.0");
+        assert_eq!(child_row.parent_agent_id.as_ref(), Some(&parent_id));
+        assert_eq!(
+            child_row.harness_features.as_ref(),
+            Some(&child["agent"]["harnessFeatures"])
+        );
+        let child_full = svc.agent_get_session_op(child_id).await.unwrap();
+        assert_eq!(child_full.harness_version, "3.0");
+        assert_eq!(child_full.harness_features, child_row.harness_features);
+        let parent = svc.store().get_agent_session(&parent_id).await.unwrap();
+        assert_eq!(parent.harness_version, "2.9");
+        assert_eq!(parent.harness_features.as_ref(), Some(&saved_features));
+        assert!(!svc.session_agent_features(&parent).peer_agents);
+        let parent_full = svc.agent_get_session_op(parent_id).await.unwrap();
+        assert_eq!(parent_full.harness_version, "2.9");
+        assert_eq!(parent_full.harness_features.as_ref(), Some(&saved_features));
     }
 
     /// Delegation mints LATEST, never inherits: a child created by a parent

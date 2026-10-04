@@ -72,6 +72,31 @@ fn snapshot(value: &Value) -> Result<HumanAuthor> {
     Ok(author)
 }
 
+fn unbind_recovery_sources(object: &mut Map<String, Value>) -> Result<()> {
+    if let Some(raw) = object.get_mut("recoverySources") {
+        let mut sources: Vec<crate::agent_ops::RecoverySource> =
+            serde_json::from_value(raw.clone()).map_err(invalid)?;
+        for source in &mut sources {
+            if !source.author.is_null() {
+                let author = source
+                    .author
+                    .as_object_mut()
+                    .ok_or_else(|| invalid("recovery author must be an object or null"))?;
+                author.insert("principalId".into(), Value::Null);
+            }
+        }
+        *raw = json!(crate::agent_ops::RecoverySource::normalize(sources));
+    }
+    if let Some(Value::Array(contributions)) = object.get_mut("mergedMessageMetadata") {
+        for contribution in contributions {
+            if let Some(object) = contribution.as_object_mut() {
+                unbind_recovery_sources(object)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn metadata(value: Option<Value>, version: u32, user: bool) -> Result<Option<Value>> {
     let human = user
         && (lift_from_principal_id(value.as_ref()).is_some()
@@ -87,6 +112,7 @@ fn metadata(value: Option<Value>, version: u32, user: bool) -> Result<Option<Val
         Some(value) if !human => return Ok(Some(value)),
         Some(original) => Map::from_iter([("humanAuthorOriginalMetadata".into(), original)]),
     };
+    unbind_recovery_sources(&mut object)?;
     object.remove(FROM_PRINCIPAL_ID_KEY);
     let raw = object.remove(HUMAN_AUTHOR_KEY);
     if human {
@@ -128,6 +154,7 @@ pub(crate) fn prepare_import(rows: &mut [(String, Vec<Value>)], version: u32) ->
                     let object = payload
                         .as_object_mut()
                         .ok_or_else(|| invalid("queued payload must be an object"))?;
+                    unbind_recovery_sources(object)?;
                     let author_metadata =
                         metadata(object.remove("messageMetadata"), version, true)?;
                     if let Some(metadata) = author_metadata {
@@ -303,6 +330,47 @@ mod tests {
                 assert!(extra.get("authorIdentity").is_none());
                 assert!(extra.get("sourceAuthorPrincipalId").is_none());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod correlation_tests {
+    use super::*;
+
+    #[test]
+    fn submission_correlation_import_unbinds_each_recovery_source() {
+        let sources = json!([
+            {"messageId":"a","submissionIds":["a1","a"],"author":{"principalId":"foreign-a","login":"a","displayName":null,"avatarUrl":null},"origin":"user"},
+            {"messageId":"b","submissionIds":["b"],"author":{"principalId":"foreign-b","login":"b","displayName":null,"avatarUrl":null},"origin":"automatic"},
+            {"messageId":"system","submissionIds":["system"],"author":null,"origin":"automatic"}
+        ]);
+        let mut rows = vec![
+            (
+                "agent_message".into(),
+                vec![
+                    json!({"role":"user","metadata":json!({"recoverySources":sources}).to_string()}),
+                ],
+            ),
+            (
+                "agent_queue".into(),
+                vec![
+                    json!({"payload":json!({"recoverySources":sources,"messageMetadata":{"recoverySources":sources}}).to_string()}),
+                ],
+            ),
+        ];
+        prepare_import(&mut rows, 2).unwrap();
+        let metadata: Value =
+            serde_json::from_str(rows[0].1[0]["metadata"].as_str().unwrap()).unwrap();
+        let queue: Value = serde_json::from_str(rows[1].1[0]["payload"].as_str().unwrap()).unwrap();
+        for value in [&metadata, &queue, &queue["messageMetadata"]] {
+            let leaves = value["recoverySources"].as_array().unwrap();
+            assert_eq!(leaves.len(), 3);
+            assert!(leaves[0]["author"]["principalId"].is_null());
+            assert!(leaves[1]["author"]["principalId"].is_null());
+            assert_eq!(leaves[0]["author"]["login"], "a");
+            assert_eq!(leaves[1]["origin"], "automatic");
+            assert!(leaves[2]["author"].is_null());
         }
     }
 }

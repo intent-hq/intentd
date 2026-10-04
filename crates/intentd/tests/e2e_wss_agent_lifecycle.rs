@@ -8724,6 +8724,7 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     let me = wss_rpc(&mut rpc, 15, "principal.me", json!({})).await;
     let mut stamped = metadata.clone();
     stamped["fromPrincipalId"] = me["id"].clone();
+    stamped["submissionIds"] = json!([send2["queuedMessage"]["id"]]);
     assert_eq!(
         send2["queuedMessage"]["messageMetadata"], stamped,
         "queued entry must carry messageMetadata: {send2}"
@@ -8794,9 +8795,10 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     // Both direct-delivery placements are covered: the row-level `metadata`
     // column (direct `agent.sendMessage` parity) and the in-block fold
     // (`deliver_wake_message` parity) — the fold carries queueInfo too, but
-    // the `fromPrincipalId` stamp stays row-level only.
+    // principal and submission-correlation stamps stay row-level only.
     let mut folded = tagged["metadata"].clone();
     folded.as_object_mut().unwrap().remove("fromPrincipalId");
+    folded.as_object_mut().unwrap().remove("submissionIds");
     assert_eq!(
         tagged["contentBlocks"][0]["messageMetadata"], folded,
         "drained user block must fold the same messageMetadata: {tagged}"
@@ -13287,7 +13289,9 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
                 saw_settle_idle = true;
             }
             Some("agent:status-changed")
-                if saw_settle_idle && event["data"]["status"] == "idle" =>
+                if saw_settle_idle
+                    && event["data"]["agentId"].as_str() == Some(agent_id.as_str())
+                    && event["data"]["status"] == "idle" =>
             {
                 // The earlier idle event precedes end_turn's durable status
                 // write. Ignore the preemption's idle status before this turn.
@@ -14028,10 +14032,10 @@ fn assert_no_file_data(v: &Value, surface: &str) {
     }
 }
 
-/// Real TLS/WebSocket coverage for the chat-only five-row snapshot policy:
+/// Real TLS/WebSocket coverage for the chat-only twenty-row snapshot policy:
 /// fresh/stale/recent subscriptions, cursor continuation and invalidation reset.
 #[intent_test_macros::daemon_test]
-async fn five_message_chat_snapshots_and_invalidation_over_wss() {
+async fn twenty_message_chat_snapshots_and_invalidation_over_wss() {
     use intent_core::{now_iso, AgentId, WorkspaceApi, WorkspaceId};
     use intent_services::Services;
     use intent_store::Store;
@@ -14054,7 +14058,7 @@ async fn five_message_chat_snapshots_and_invalidation_over_wss() {
         let created = services
             .agent_create(
                 ws.clone(),
-                Some("Five messages".into()),
+                Some("Twenty messages".into()),
                 None,
                 None,
                 None,
@@ -14065,7 +14069,7 @@ async fn five_message_chat_snapshots_and_invalidation_over_wss() {
             .expect("agent");
         let agent = AgentId::from(created["agent"]["id"].as_str().unwrap());
         let mut ids = Vec::new();
-        for seq in 0..12 {
+        for seq in 0..27 {
             ids.push(
                 store
                     .append_agent_message(
@@ -14089,7 +14093,7 @@ async fn five_message_chat_snapshots_and_invalidation_over_wss() {
     let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
     let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
     let mut rpc = connect_ws(port, cfg.clone()).await;
-    // Generic conversation paging keeps its existing default (all 12 here).
+    // Generic conversation paging keeps its existing default (all 27 here).
     let generic = wss_rpc(
         &mut rpc,
         1,
@@ -14097,12 +14101,12 @@ async fn five_message_chat_snapshots_and_invalidation_over_wss() {
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
     )
     .await;
-    assert_eq!(generic["messages"].as_array().unwrap().len(), 12);
+    assert_eq!(generic["messages"].as_array().unwrap().len(), 27);
 
     for (since, expected_start, resumed) in [
         (None, 7, None),
         (Some(ids[3].as_str()), 7, Some(false)),
-        (Some(ids[9].as_str()), 10, Some(true)),
+        (Some(ids[10].as_str()), 11, Some(true)),
     ] {
         let mut chat = connect_ws(port, cfg.clone()).await;
         let mut params = json!({ "agentId": agent_id });
@@ -14144,15 +14148,15 @@ async fn five_message_chat_snapshots_and_invalidation_over_wss() {
         assert_eq!(push["params"]["seq"], 0);
         let snapshot = &push["params"]["snapshot"];
         let rows = snapshot["messages"].as_array().unwrap();
-        assert_eq!(rows.len(), 12 - expected_start);
+        assert_eq!(rows.len(), 27 - expected_start);
         for (row, expected_id) in rows.iter().zip(&ids[expected_start..]) {
             assert_eq!(row["id"], expected_id.as_str());
         }
         assert_eq!(snapshot.get("resumed").and_then(Value::as_bool), resumed);
-        assert_eq!(snapshot["totalMessages"], 12);
+        assert_eq!(snapshot["totalMessages"], 27);
         assert_eq!(snapshot["truncated"], resumed != Some(true));
         eprintln!(
-            "WSS five-message snapshot: resumed={resumed:?} rows={} bytes={}",
+            "WSS twenty-message snapshot: resumed={resumed:?} rows={} bytes={}",
             rows.len(),
             serde_json::to_vec(snapshot).unwrap().len()
         );
@@ -14187,9 +14191,9 @@ async fn five_message_chat_snapshots_and_invalidation_over_wss() {
             assert_eq!(oldest["messages"][1]["id"], ids[1].as_str());
             assert!(oldest["nextToken"].is_null());
         }
-        // An active recent-resume connection must reset to five on replacement.
+        // An active recent-resume connection must reset to twenty on replacement.
         if resumed == Some(true) {
-            let messages: Vec<Value> = (0..9)
+            let messages: Vec<Value> = (0..24)
                 .map(|seq| {
                     json!({ "role": "user",
                 "contentBlocks": [{ "type": "text", "text": format!("replacement {seq}") }] })
@@ -14209,10 +14213,10 @@ async fn five_message_chat_snapshots_and_invalidation_over_wss() {
             assert_eq!(reset["params"]["seq"], 1);
             let snapshot = &reset["params"]["snapshot"];
             assert_eq!(snapshot["resumed"], false);
-            assert_eq!(snapshot["totalMessages"], 9);
-            assert_eq!(snapshot["messages"].as_array().unwrap().len(), 5);
+            assert_eq!(snapshot["totalMessages"], 24);
+            assert_eq!(snapshot["messages"].as_array().unwrap().len(), 20);
             assert_eq!(snapshot["messages"][0]["seq"], 4);
-            assert_eq!(snapshot["messages"][4]["seq"], 8);
+            assert_eq!(snapshot["messages"][19]["seq"], 23);
             assert!(snapshot["nextToken"].is_string());
         }
         chat.close(None).await.expect("close chat");
@@ -14535,6 +14539,7 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
             "type": "agent_message",
             "fromAgentId": sender_id,
             "fromAgentName": "SenderA",
+            "submissionIds": [tagged["id"]],
         }),
         "agent-originated send must carry sender attribution: {tagged}"
     );
@@ -14789,7 +14794,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         "explicit-metadata child turn completed: {done:?}"
     );
 
-    let expected_tag = json!({
+    let mut expected_tag = json!({
         "type": "agent_message",
         "fromAgentId": sender_id,
         "fromAgentName": "SenderA",
@@ -14820,6 +14825,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     )
     .await;
     let row = user_row(&conv, "task hello");
+    expected_tag["submissionIds"] = json!([row["id"]]);
     assert_eq!(
         row["metadata"], expected_tag,
         "sendToTask must carry sender attribution: {row}"
@@ -14834,6 +14840,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     )
     .await;
     let row = user_row(&conv, "kickoff hello");
+    expected_tag["submissionIds"] = json!([row["id"]]);
     assert_eq!(
         row["metadata"], expected_tag,
         "create kickoff must carry sender attribution: {row}"
@@ -14855,6 +14862,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         json!({
             "type": "custom_tag",
             "note": "explicit wins",
+            "submissionIds": [row["id"]],
             "fromAgentId": sender_id,
             "fromAgentName": "SenderA",
         }),
@@ -15222,13 +15230,14 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         md["fromPrincipalId"].is_string(),
         "a human row carries the principal stamp: {lean}"
     );
+    assert_eq!(md["submissionIds"], human["submissionIds"]);
     let extra: Vec<&String> = md
         .keys()
-        .filter(|k| *k != "fromPrincipalId" && *k != "queueInfo")
+        .filter(|k| *k != "fromPrincipalId" && *k != "queueInfo" && *k != "submissionIds")
         .collect();
     assert!(
         extra.is_empty(),
-        "a human row carries at most the principal + queueInfo stamps: {lean}"
+        "a human row carries only principal, queueInfo and correlation stamps: {lean}"
     );
 
     // Contrast: a parentless BYSTANDER sending to the CHILD — a created

@@ -363,18 +363,73 @@ pub(crate) fn check_envelope(value: &Value) -> EnvelopeCheck<'_> {
 /// Handle one JSON-RPC frame. Returns `Some(response)` for requests and `None`
 /// for notifications (including unknown / failed ones, per §3.4).
 pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<String> {
+    prepare_message(api, message)
+        .await
+        .map(PreparedReply::into_frame)
+}
+
+/// Classification comes from dispatch/encoding, never from response JSON.
+pub(crate) struct PreparedReply {
+    pub(crate) frame: String,
+    pub(crate) service: Option<(
+        intent_core::repository_request::RepositoryReadReplyKind,
+        Value,
+    )>,
+}
+
+impl PreparedReply {
+    pub(crate) fn transport(frame: String) -> Self {
+        Self {
+            frame,
+            service: None,
+        }
+    }
+
+    pub(crate) fn into_frame(self) -> String {
+        self.frame
+    }
+}
+
+fn prepared_error(id: &Value, code: i32, message: &str, data: Option<Value>) -> PreparedReply {
+    PreparedReply::transport(error_string(id, code, message, data))
+}
+
+/// A final local refusal uses the existing domain-error encoder and size cap.
+pub(crate) fn delivery_error(id: &Value, error: Error) -> String {
+    encode_dispatch_result(
+        id,
+        "",
+        false,
+        Err(domain_to_rpc(error)),
+        crate::MAX_OUTBOUND_MESSAGE_BYTES,
+    )
+    .frame
+    .expect("a request error has a frame")
+}
+
+pub(crate) async fn prepare_message(
+    api: &dyn WorkspaceApi,
+    message: &str,
+) -> Option<PreparedReply> {
     let value: Value = match serde_json::from_str(message) {
         Ok(v) => v,
         // Parse errors are always answered with id null (§9), even for
         // would-be notifications — notification status is not yet known.
-        Err(_) => return Some(error_string(&Value::Null, PARSE_ERROR, "Parse error", None)),
+        Err(_) => {
+            return Some(prepared_error(
+                &Value::Null,
+                PARSE_ERROR,
+                "Parse error",
+                None,
+            ))
+        }
     };
 
     // Envelope validation (-32600). Answered even for notification-shaped
     // frames: notification status is not trusted until the envelope is valid.
     let (echo_id, method, is_notification) = match check_envelope(&value) {
         EnvelopeCheck::NotObject => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &Value::Null,
                 INVALID_REQUEST,
                 "Invalid Request: expected an object",
@@ -382,7 +437,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             ))
         }
         EnvelopeCheck::BadJsonRpc { echo_id } => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &echo_id,
                 INVALID_REQUEST,
                 "Invalid Request: jsonrpc must be \"2.0\"",
@@ -390,7 +445,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             ))
         }
         EnvelopeCheck::BadMethod { echo_id } => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &echo_id,
                 INVALID_REQUEST,
                 "Invalid Request: method must be a non-empty string",
@@ -398,7 +453,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             ))
         }
         EnvelopeCheck::BadId => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &Value::Null,
                 INVALID_REQUEST,
                 "Invalid Request: id must be a string, number, or null",
@@ -421,7 +476,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             if is_notification {
                 return None;
             }
-            return Some(error_string(
+            return Some(prepared_error(
                 &echo_id,
                 INVALID_PARAMS,
                 "Invalid params",
@@ -449,6 +504,11 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
     let profile_span = span.clone();
     async move {
         let result = dispatch(api, method, &params).await;
+        let kind = if result.is_ok() {
+            intent_core::repository_request::RepositoryReadReplyKind::Result
+        } else {
+            intent_core::repository_request::RepositoryReadReplyKind::ServiceError
+        };
         let encode_started = Instant::now();
         let encoded = encode_dispatch_result(
             &echo_id,
@@ -469,7 +529,16 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         profile_span.record("encode_elapsed_ms", encode_elapsed_ms);
         profile_span.record("oversized_replacement", encoded.oversized_replacement);
         profile_span.record("encode_failed", encoded.encode_failed);
-        encoded.frame
+        encoded.frame.map(|frame| {
+            if encoded.oversized_replacement || encoded.encode_failed {
+                PreparedReply::transport(frame)
+            } else {
+                PreparedReply {
+                    frame,
+                    service: Some((kind, echo_id)),
+                }
+            }
+        })
     }
     .instrument(span)
     .await
@@ -537,6 +606,104 @@ async fn dispatch(
     params: &Map<String, Value>,
 ) -> Result<Value, RpcErr> {
     match method {
+        "workspace.repositorySelection.capture" => {
+            let input: intent_core::repository_request::RepositorySelectionQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_capture(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.save" => {
+            let input: intent_core::repository_request::RepositorySelectionSaveQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_save(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.reset" => {
+            let input: intent_core::repository_request::RepositorySelectionBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_reset(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.reconcile" => {
+            let input: intent_core::repository_request::RepositorySelectionBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_reconcile(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.release" => {
+            let input: intent_core::repository_request::RepositorySelectionBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_release(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "sourceControl.read.capture" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_capture(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.detail" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_detail(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.release" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_release(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "workspace.repositoryContext.capture" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_context_capture(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "workspace.repositoryContext" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_context(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "workspace.repositoryContext.release" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_context_release(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
         "workspace.list" => {
             let include_archived = params
                 .get("includeArchived")
@@ -776,6 +943,24 @@ async fn dispatch(
             .await
             .map_err(domain_to_rpc),
         "host.executionContext" => api.host_execution_context().await.map_err(domain_to_rpc),
+        "host.invite.searchAccounts" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let query = require_str_param(params, "query")?;
+            let limit = params
+                .get("limit")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .filter(|n| (1..=10).contains(n))
+                        .map(|n| u8::try_from(n).expect("bounded limit"))
+                        .ok_or_else(|| invalid_params("limit must be an integer from 1 to 10"))
+                })
+                .transpose()?;
+            api.host_invite_search_accounts(provider, host, query, limit)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
         "host.invite.revoke" => api
             .host_invite_revoke(require_str_param(params, "inviteId")?)
@@ -2001,6 +2186,11 @@ async fn dispatch(
         }
         "agent.queueMessage" => {
             let agent_id = require_agent_id(params)?;
+            let message_id = match params.get("messageId") {
+                None => None,
+                Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+                Some(_) => return Err(invalid_params("messageId must be a nonempty string")),
+            };
             let content = require_str_param(params, "content")?;
             let image_blocks = opt_value(params, "imageBlocks");
             let file_blocks = opt_value(params, "fileBlocks");
@@ -2017,8 +2207,9 @@ async fn dispatch(
                 Some(_) => return Err(invalid_params("messageMetadata must be an object")),
             };
             let result = api
-                .agent_queue_message(
+                .agent_queue_submission(
                     agent_id,
+                    message_id,
                     content,
                     image_blocks,
                     file_blocks,
@@ -3799,6 +3990,15 @@ async fn dispatch(
             Ok(r)
         }
         "accept-changes.prepare" => {
+            if params.contains_key("review") {
+                let input: intent_core::repository_request::NativeReviewPrepareQuery =
+                    serde_json::from_value(Value::Object(params.clone()))
+                        .map_err(|_| invalid_params("Invalid native review parameters"))?;
+                return api
+                    .native_review_prepare(input)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
             let ws = require_ws_note(params)?;
             let action = require_str_param(params, "action")?;
             let files = opt_str_array(params, "files");
@@ -3809,6 +4009,15 @@ async fn dispatch(
             Ok(r)
         }
         "accept-changes.execute" => {
+            if params.contains_key("review") {
+                let input: intent_core::repository_request::NativeReviewExecuteQuery =
+                    serde_json::from_value(Value::Object(params.clone()))
+                        .map_err(|_| invalid_params("Invalid native review parameters"))?;
+                return api
+                    .native_review_execute(input)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
             let ws = require_ws_note(params)?;
             require_str_param(params, "action")?;
             let r = api
@@ -3816,6 +4025,22 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
+        }
+        "accept-changes.reconcile" => {
+            let input: intent_core::repository_request::NativeReviewBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid native review parameters"))?;
+            api.native_review_reconcile(input)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "accept-changes.release" => {
+            let input: intent_core::repository_request::NativeReviewBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid native review parameters"))?;
+            api.native_review_release(input)
+                .await
+                .map_err(domain_to_rpc)
         }
         "accept-changes.mergePR" => {
             let ws = require_ws_note(params)?;

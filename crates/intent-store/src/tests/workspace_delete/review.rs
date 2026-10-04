@@ -454,6 +454,7 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
         read_pool: crate::connect_read(&tmp.path).await.unwrap(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
         export_author_barrier: std::sync::Arc::default(),
+        repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
     };
     // This fixture deliberately stops at schema 0130. Current workspace
     // inserts require newer columns, so seed only the historical columns.

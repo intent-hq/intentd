@@ -257,6 +257,7 @@ impl Default for Viewer {
 
 #[derive(Debug, Default)]
 struct State {
+    focus_generation: u64,
     conns: HashMap<String, Conn>,
     profiles: HashMap<PrincipalId, Profile>,
     /// Bumped by every [`Services::presence_profile_changed`], cached entry
@@ -381,6 +382,8 @@ pub struct PresenceRegistry {
     /// Test seam: parks the next profile/role read between its store
     /// fetch and its cache install so a test can interleave an identity
     /// change deterministically. Consumed by the first read that hits it.
+    #[cfg(test)]
+    pub(crate) focus_fetch_pause: Mutex<Option<std::sync::Arc<ProfileFetchPause>>>,
     #[cfg(test)]
     pub(crate) profile_fetch_pause: Mutex<Option<std::sync::Arc<ProfileFetchPause>>>,
 }
@@ -737,6 +740,7 @@ impl Services {
         }
         let (affected, typing_source): (HashSet<String>, String) = {
             let mut state = self.presence.lock();
+            state.focus_generation = state.focus_generation.wrapping_add(1);
             let Some(conn) = state.conns.get_mut(&connection_id) else {
                 return Err(Error::InvalidParams(
                     "presence.update: the connection is no longer registered".to_string(),
@@ -772,6 +776,49 @@ impl Services {
         Ok(json!({ "ok": true, "typingSource": typing_source }))
     }
 
+    /// The store checks caller, person, every destination and resource in one
+    /// statement. Focus changes during that await invalidate the collected set.
+    pub(crate) async fn presence_focus_snapshot_op(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+    ) -> Result<Value> {
+        let viewer = wire_principal("presence.focus.subscribe")?;
+        for _ in 0..4 {
+            let (generation, candidates) = {
+                let state = self.presence.lock();
+                let candidates: Vec<Value> = state
+                    .conns
+                    .values()
+                    .filter(|conn| conn.hello && conn.principal == principal_id)
+                    .flat_map(|conn| conn.focus.iter().map(Focus::to_json))
+                    .collect();
+                (state.focus_generation, candidates)
+            };
+            let target = self
+                .store
+                .authorized_presence_focus(&workspace_id, &viewer, &principal_id, &candidates)
+                .await?;
+            #[cfg(test)]
+            {
+                let pause = self.presence.focus_fetch_pause.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    pause.fetched.notify_one();
+                    pause.resume.notified().await;
+                }
+            }
+            if self.presence.lock().focus_generation != generation {
+                continue;
+            }
+            return Ok(
+                json!({"workspaceId":workspace_id,"principalId":principal_id,"target":target}),
+            );
+        }
+        // Sustained focus churn is neutral rather than an unbounded read. The
+        // queued invalidation will retry the channel once the writer catches up.
+        Ok(json!({"workspaceId":workspace_id,"principalId":principal_id,"target":null}))
+    }
+
     /// See [`intent_core::WorkspaceApi::presence_snapshot`].
     pub(crate) async fn presence_snapshot_op(&self, workspace_id: WorkspaceId) -> Result<Value> {
         self.require_member(&workspace_id).await?;
@@ -788,6 +835,7 @@ impl Services {
     pub(crate) async fn presence_disconnect_op(&self, connection_id: String) {
         let (conn, left, went_offline) = {
             let mut state = self.presence.lock();
+            state.focus_generation = state.focus_generation.wrapping_add(1);
             let Some(conn) = state.conns.remove(&connection_id) else {
                 return;
             };

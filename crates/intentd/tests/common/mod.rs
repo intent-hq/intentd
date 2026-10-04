@@ -20,6 +20,46 @@ use std::sync::{Arc, Mutex, Once};
 use std::thread::ThreadId;
 use std::time::Duration;
 
+/// The four repository retirement feeds share the response connection. Their
+/// typed, nonsecret envelopes are notifications, never an RPC acknowledgment.
+pub fn is_repository_retirement_notification(value: &serde_json::Value) -> bool {
+    let Some(frame) = value.as_object() else {
+        return false;
+    };
+    if frame.len() != 3 || value["jsonrpc"] != "2.0" {
+        return false;
+    }
+    let ids = match value["method"].as_str() {
+        Some("workspace.repositoryContext.retired") => "lifetimeIds",
+        Some("workspace.repositorySelection.retired") => "selectionIds",
+        Some("accept-changes.retired") => "operationIds",
+        Some("sourceControl.read.retired") => "readLifetimeIds",
+        _ => return false,
+    };
+    let Some(params) = value["params"].as_object() else {
+        return false;
+    };
+    params.len() == 4
+        && params
+            .get(ids)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|ids| ids.iter().all(serde_json::Value::is_string))
+        && params
+            .get("sequence")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|sequence| {
+                sequence
+                    .parse::<u64>()
+                    .is_ok_and(|n| n.to_string() == sequence)
+            })
+        && params
+            .get("allRetired")
+            .is_some_and(serde_json::Value::is_boolean)
+        && params
+            .get("terminal")
+            .is_some_and(serde_json::Value::is_boolean)
+}
+
 /// Force the hermetic-root guard on for every integration-test binary that
 /// compiles this module. Runs before `main()` — and therefore before any test
 /// threads exist, making `set_var` race-free — so any in-process code path

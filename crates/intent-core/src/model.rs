@@ -3649,11 +3649,11 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// (`agent.create` and everything funneling through it — delegate,
 /// wakeOrCreate) stamps exactly this value, and a new session ALWAYS gets the
 /// current version — the stamp depends only on creation time, never on the
-/// creating parent's pinned version. Bump when doctrine text or feature
-/// defaults change materially; existing sessions keep their stamped version
+/// creating parent's pinned version. Bump when versioned guidance behavior,
+/// doctrine text or feature defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "2.10";
+pub const CURRENT_HARNESS_VERSION: &str = "3.0";
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
 /// exported before harness versioning existed deserialize as "1.0", matching
@@ -3776,7 +3776,8 @@ pub fn chief_prompt_version(metadata: &serde_json::Value) -> Option<u32> {
 /// an answer-tagged row, `agent.dismissQuestions`, or a newer question turn,
 /// never by delivery order. `Automatic` is the `Default` so unmarked internal
 /// paths fail closed (never mistaken for a user action).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MessageOrigin {
     /// FE-originated user action: `agent.sendMessage` (typed message or
     /// wizard answers), a drained `agent.queueMessage` entry,
@@ -8516,6 +8517,41 @@ mod tests {
             assert!(v["metadata"].get(CHIEF_PROMPT_VERSION_KEY).is_none());
         }
         assert!(legacy["metadata"].get(CHIEF_PROMPT_VERSION_KEY).is_none());
+    }
+
+    #[test]
+    fn harness_stamps_preserve_missing_and_saved_versions() {
+        for stamp in [
+            None,
+            Some("1.0"),
+            Some("2.9"),
+            Some("future-unknown"),
+            Some("3.0"),
+        ] {
+            let mut payload = json!({
+                "id":"agent-legacy", "workspaceId":"ws-legacy", "name":"Saved",
+                "status":"idle", "createdAt":"t0", "updatedAt":"t0",
+                "harnessFeatures":{"peerAgents":false}
+            });
+            if let Some(stamp) = stamp {
+                payload["harnessVersion"] = json!(stamp);
+            }
+            let session: AgentSession = serde_json::from_value(payload).unwrap();
+            let expected = stamp.unwrap_or("1.0");
+            assert_eq!(session.harness_version, expected);
+            assert_eq!(session.harness_features, Some(json!({"peerAgents":false})));
+            let round_trip: AgentSession =
+                serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+            assert_eq!(round_trip, session);
+            let lite = AgentLite::from_session(session, 0, None, None, None, None, None);
+            let mut payload = serde_json::to_value(lite).unwrap();
+            if stamp.is_none() {
+                payload.as_object_mut().unwrap().remove("harnessVersion");
+            }
+            let lite: AgentLite = serde_json::from_value(payload).unwrap();
+            assert_eq!(lite.harness_version, expected);
+            assert_eq!(lite.harness_features, Some(json!({"peerAgents":false})));
+        }
     }
 
     /// `AgentSession` serializes to the camelCase `agent-session.ts` wire shape:

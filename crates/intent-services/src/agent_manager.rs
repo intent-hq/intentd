@@ -34,12 +34,12 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use intent_acp::handshake::try_bypass_permissions_mode;
+use intent_acp::handshake::{handshake_with_callbacks, try_bypass_permissions_mode};
 use intent_acp::session::{
     ContentBlock, McpServer, SessionConfigOption, SessionModeState, StopReason,
 };
 use intent_acp::{
-    apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process, handshake,
+    apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process,
     normalize_mcp_servers, normalize_spaced_bridge_command, serve_workspace_mcp_tcp,
     spawn_provider, to_acp_session_mcp_servers, to_auggie_mcp_config, to_opencode_mcp_config,
     ClientRequestHandler, Connection, ConnectionHooks, EnvMap, EventSink, FileService,
@@ -71,6 +71,45 @@ use crate::agent_session::{
 };
 use crate::events::EventBus;
 use crate::Services;
+
+/// The initialized transport and its captured prompt authority travel together.
+/// Returning an ACP string never permits reconstructing this tuple from an ID.
+struct StartedSession {
+    session_id: String,
+    turn: OriginalTurn,
+}
+struct OriginalTurn {
+    runtime: Arc<runtime::Runtime<'static>>,
+    connection: Option<Arc<Connection>>,
+    notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
+    origin: Arc<RepositoryOrigin>,
+    prompt: Option<RepositoryPromptInput>,
+}
+impl OriginalTurn {
+    fn capture(
+        runtime: Arc<runtime::Runtime<'static>>,
+        connection: Option<Arc<Connection>>,
+        notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
+        origin: Arc<RepositoryOrigin>,
+    ) -> Self {
+        let prompt = connection
+            .as_ref()
+            .and_then(|connection| origin.capture_prompt(connection));
+        Self {
+            runtime,
+            connection,
+            notifications,
+            origin,
+            prompt,
+        }
+    }
+}
+
+mod repository_origin;
+use crate::repository_admission::lifecycle::physical_owner::RepositoryCreationIntent;
+pub(crate) use repository_origin::callback_delivery::RepositoryPromptInput;
+use repository_origin::callback_delivery::{deliver_captured, EndpointBlueprint, ServerBlueprint};
+use repository_origin::RepositoryOrigin;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -244,6 +283,7 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
 /// is replaced the same way), an object is merged into — so EVERY drained
 /// row names its entry.
 pub(crate) fn stamp_queued_message_id(msg: &mut QueuedMessage) {
+    msg.stamp_correlation();
     if crate::script_monitor::monitor_id(msg.message_metadata.as_ref()).is_some() {
         return;
     }
@@ -462,6 +502,10 @@ async fn cancel_and_settle_idle_prompt(
 /// options; queue-drained follow-up turns run with [`TurnOptions::default`]
 /// since a `QueuedMessage` has no per-turn hints of its own.
 #[derive(Debug, Default, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Shutdown, prompt, priority and queue provenance are independent per-turn flags"
+)]
 pub struct TurnOptions {
     /// Resume recovery must retain its pending interruption when shutdown
     /// refuses admission, rather than hiding it behind an ordinary queue.
@@ -504,7 +548,10 @@ pub struct TurnOptions {
     pub queued_at: Option<String>,
     /// Submission IDs absorbed by a queued row, retained through failed drains.
     pub queued_submission_ids: Vec<String>,
+    pub(crate) recovery_sources: Vec<crate::agent_ops::RecoverySource>,
     pub queued_submission_order: u64,
+    /// Explicit provenance: legacy rehydration may assign a synthetic positive order.
+    pub queued_correlation_order_known: bool,
     pub latest_human_submission_at: Option<String>,
     /// STAB-114 / monorepo#1014: text of the user message preempted by a
     /// zero-output interrupt, delivered AHEAD of this turn's own `content` in
@@ -613,7 +660,9 @@ fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
         suppress_report_clear: stale,
         queued_at: Some(entry.queued_at.clone()),
         queued_submission_ids: entry.submission_ids(),
+        recovery_sources: entry.recovery_sources.clone(),
         queued_submission_order: entry.submission_order,
+        queued_correlation_order_known: entry.correlation_order_known,
         latest_human_submission_at: entry.latest_human_submission_at.clone(),
         prepend_content: entry.prepend_content.clone(),
         prepend_image_blocks: entry.prepend_image_blocks.clone(),
@@ -2383,6 +2432,7 @@ struct AppliedEffort {
 /// and respawn the child with the new model before the next turn.
 struct AgentHandle {
     execution: RuntimeHandle,
+    repository_origin: Arc<RepositoryOrigin>,
     antigravity_profile: Option<crate::antigravity::SessionProfile>,
     /// MCP servers (workspace bridge + user servers) delivered via the ACP
     /// `session/new` / `session/load` `mcpServers` field for providers that
@@ -2416,6 +2466,7 @@ struct AgentHandle {
 
 impl Drop for AgentHandle {
     fn drop(&mut self) {
+        self.repository_origin.retire();
         if let Some(listener) = &self.wake_listener {
             listener.abort();
         }
@@ -2565,6 +2616,7 @@ pub struct AgentManager {
     // Lock order: admission_closed → retired/busy/stopping/workers. Never
     // held across awaits; claims, worker registration, and closure serialize.
     admission_closed: Mutex<bool>,
+    shutdown_retirement: Mutex<()>,
     turn_admissions: Mutex<HashMap<AgentId, TurnAdmission>>,
     next_admission: AtomicUsize,
     /// Claimed startup side effects must finish before retirement detaches.
@@ -2727,6 +2779,8 @@ pub struct AgentManager {
     shutdown_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
     #[cfg(test)]
     user_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
+    #[cfg(test)]
+    worker_finish_pause: Mutex<Option<Arc<TurnStartPause>>>,
 }
 
 fn spawn_unsloth_status_publisher(
@@ -2806,6 +2860,7 @@ impl AgentManager {
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
             admission_closed: Mutex::new(false),
+            shutdown_retirement: Mutex::new(()),
             turn_admissions: Mutex::new(HashMap::new()),
             next_admission: AtomicUsize::new(0),
             turn_start_gates: crate::agent_ops::AgentRetirementGates::default(),
@@ -2834,6 +2889,8 @@ impl AgentManager {
             shutdown_persist_pause: Mutex::new(None),
             #[cfg(test)]
             user_persist_pause: Mutex::new(None),
+            #[cfg(test)]
+            worker_finish_pause: Mutex::new(None),
         }
     }
 
@@ -3156,39 +3213,64 @@ impl AgentManager {
         // restart) keeps the surface the session was created with — matching
         // what `harnessFeatures` reports on the wire.
         let agent_features = self.services.session_agent_features(&session);
+        // Allocate before exposing a listener/config/callback to this child.
+        // Its pending callback is permanently unavailable, even after ACP
+        // initialization confirms a distinct physical owner.
+        let original_services = Arc::new(self.services.clone());
+        let repository_origin = RepositoryOrigin::allocate(&original_services, &session).await;
+        let read_owner = crate::repository_admission::read_request::RepositoryReadOwner::capture(
+            original_services.clone(),
+        );
 
         // Per-agent in-process MCP server over the SAME services surface the FE
         // uses, with the §18.4 denylist for this agent type applied, served over
         // a loopback bridge a real spawned child reaches via `--mcp-config`.
-        let api: Arc<dyn WorkspaceApi> = Arc::new(self.services.clone());
-        let server = Arc::new(
-            WorkspaceMcpServer::for_agent_type(api, workspace_id.clone(), agent_type)
-                // Caller-aware tools attribute back to this spawning agent.
-                .with_caller_agent_id(Some(agent_id.clone()))
-                // §7.1 deterministic attach: tool dispatch registers resource
-                // payloads into the same registry the transcript writer claims.
-                .with_turn_attachments(Some(self.services.turn_attachments()))
-                // The session's captured `[agentFeatures]` snapshot: settings
-                // changes after creation never mutate this session's surface,
-                // across respawns included.
-                .with_agent_features(agent_features.clone())
-                // Sub-agent bridges prune/deny `ws.app.question.*` (top-level
-                // agents only own a user-facing chat turn).
-                .with_sub_agent(is_sub_agent)
-                // Specialist `modelOptions` (PROTOCOL §5.11) resolved once
-                // at bridge creation, same snapshot semantics as the
-                // feature toggles: the delegate docs in this agent's
-                // `workspace_api` description list them per specialist.
-                .with_specialist_model_options(
-                    self.services
-                        .specialist_model_options_for_workspace(&workspace_id)
-                        .await,
-                )
-                // Truncating providers (claude-code cuts tool descriptions
-                // at ~2k chars) get the compact `workspace_api` description;
-                // the full reference rides the system prompt below.
-                .with_compact_tool_descriptions(opts.provider.truncates_tool_descriptions),
-        );
+        let api: Arc<dyn WorkspaceApi> = original_services.clone();
+        let specialist_model_options = self
+            .services
+            .specialist_model_options_for_workspace(&workspace_id)
+            .await;
+        let server_blueprint = {
+            let workspace_id = workspace_id.clone();
+            let agent_id = agent_id.clone();
+            let agent_type = agent_type.to_string();
+            let attachments = self.services.turn_attachments();
+            let features = agent_features.clone();
+            let compact = opts.provider.truncates_tool_descriptions;
+            ServerBlueprint::new(read_owner, move || {
+                WorkspaceMcpServer::for_agent_type(api.clone(), workspace_id.clone(), &agent_type)
+                    .with_caller_agent_id(Some(agent_id.clone()))
+                    .with_turn_attachments(Some(attachments.clone()))
+                    .with_agent_features(features.clone())
+                    .with_sub_agent(is_sub_agent)
+                    .with_specialist_model_options(
+                        specialist_model_options
+                            .iter()
+                            .map(|options| intent_acp::SpecialistModelOptions {
+                                specialist: options.specialist.clone(),
+                                default_model: options.default_model.clone(),
+                                options: options
+                                    .options
+                                    .iter()
+                                    .map(|option| intent_acp::SpecialistModelOption {
+                                        provider: option.provider.clone(),
+                                        model: option.model.clone(),
+                                        hint: option.hint.clone(),
+                                        reasoning_effort: option.reasoning_effort.clone(),
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                    )
+                    .with_compact_tool_descriptions(compact)
+            })
+            .with_original_services(original_services, session.clone())
+        };
+        let mut server = server_blueprint.server();
+        if let Some(context) = repository_origin.pending_callback() {
+            server = server.with_request_context(Arc::new(context));
+        }
+        let server = Arc::new(server);
         let antigravity_profile = if opts.provider.id == "antigravity" {
             let root = self.antigravity_state_root.as_deref().ok_or_else(|| {
                 Error::InvalidInput(
@@ -3273,6 +3355,11 @@ impl AgentManager {
         let mut session_mcp_servers: Vec<McpServer> = Vec::new();
         if opts.provider.supports_session_mcp_servers {
             let servers = self.normalized_mcp_servers(bridge.connect_addr()).await?;
+            if let Some(blueprint) = servers.get("workspace-mcp").and_then(|original| {
+                EndpointBlueprint::from_original(server_blueprint, original, &bridge.connect_addr())
+            }) {
+                repository_origin.configure_callbacks(blueprint);
+            }
             session_mcp_servers = to_acp_session_mcp_servers(&servers);
         }
 
@@ -3495,9 +3582,8 @@ impl AgentManager {
             }
         });
 
-        self.registry
-            .register(agent_id.clone(), self.make_kill(agent_id.clone()));
         let handle = AgentHandle {
+            repository_origin: repository_origin.clone(),
             execution: RuntimeHandle::local(LocalResources {
                 connection,
                 notifications: Arc::new(TokioMutex::new(note_rx)),
@@ -3534,7 +3620,9 @@ impl AgentManager {
         // fresh `handle` above drops with its child still inside: its `Drop`
         // hands that child to the owned cleanup too, so neither tree is
         // orphaned and neither launch dir is removed early.
-        let stale = self.handles.lock().unwrap().remove(&agent_id);
+        let stale = repository_origin::capture(&self.handles, &agent_id).and_then(|original| {
+            repository_origin::take(&self.handles, &agent_id, &original, Some(&self.registry))
+        });
         if let Some(mut stale) = stale {
             if let Some(child) = RuntimeTeardown::take(&mut stale) {
                 child.kill_tree().await;
@@ -3556,15 +3644,26 @@ impl AgentManager {
             if *closed || retired.contains(&agent_id) || stopping.contains(&agent_id) {
                 Some(handle)
             } else {
-                self.handles
-                    .lock()
-                    .unwrap()
-                    .insert(agent_id.clone(), handle);
-                None
+                let mut slots = self.handles.lock().unwrap();
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    slots.entry(agent_id.clone())
+                {
+                    entry.insert(handle);
+                    self.registry.register(
+                        agent_id.clone(),
+                        self.make_original_kill(
+                            agent_id.clone(),
+                            Arc::downgrade(&repository_origin),
+                        ),
+                    );
+                    None
+                } else {
+                    Some(handle)
+                }
             }
         };
         if let Some(mut handle) = fenced {
-            self.registry.deregister(&agent_id);
+            handle.repository_origin.retire();
             if let Some(child) = RuntimeTeardown::take(&mut handle) {
                 child.kill_tree().await;
             }
@@ -3798,7 +3897,26 @@ impl AgentManager {
         cwd: PathBuf,
         provider: &ProviderConfig,
     ) -> Result<String> {
-        let (conn, session_mcp_servers, wake_gate, antigravity_profile) = {
+        self.start_session_owned(agent_id, cwd, provider)
+            .await
+            .map(|started| started.session_id)
+    }
+
+    async fn start_session_owned(
+        &self,
+        agent_id: &AgentId,
+        cwd: PathBuf,
+        provider: &ProviderConfig,
+    ) -> Result<StartedSession> {
+        let (
+            conn,
+            runtime,
+            notes,
+            repository_origin,
+            session_mcp_servers,
+            wake_gate,
+            antigravity_profile,
+        ) = {
             let map = self.handles.lock().unwrap();
             let handle = map
                 .get(agent_id)
@@ -3807,6 +3925,9 @@ impl AgentManager {
                 handle.execution.connection().ok_or_else(|| {
                     Error::Internal("session initialization requires a local runtime".into())
                 })?,
+                handle.execution.runtime.clone(),
+                handle.execution.runtime.notifications(),
+                handle.repository_origin.clone(),
                 handle.session_mcp_servers.clone(),
                 handle.wake_gate.clone(),
                 handle.antigravity_profile.clone(),
@@ -3835,9 +3956,15 @@ impl AgentManager {
                 "info",
             )
             .await;
-        let handshake = handshake(conn.as_ref(), provider)
-            .await
-            .map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
+        let negotiated = handshake_with_callbacks(
+            conn.clone(),
+            provider,
+            repository_origin.callback_offer(&session_record, provider),
+        )
+        .await
+        .map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
+        let callbacks = negotiated.callbacks;
+        let handshake = negotiated.ordinary;
 
         // Per the ACP schema, http/sse `McpServer` entries are only valid when
         // the agent advertised `mcpCapabilities.http`/`sse` in `initialize` —
@@ -3907,6 +4034,24 @@ impl AgentManager {
         // 1) Try to resume the persisted session (gated on stored id + capability).
         match if forced {
             Ok(None)
+        } else if let Some((creation, attempt)) = stored_id.as_ref().and_then(|session_id| {
+            repository_origin.begin_session(RepositoryCreationIntent::Loaded {
+                session_id: session_id.clone(),
+            })
+        }) {
+            self.services
+                .resume_repository_acp_session(
+                    (conn.as_ref(), callbacks.as_ref()),
+                    &handshake.initialize,
+                    agent_id,
+                    cwd.clone(),
+                    session_mcp_servers.clone(),
+                    creation,
+                )
+                .await
+                .map(|opened| {
+                    opened.map(|outcome| repository_origin.accept_session(attempt, &conn, outcome))
+                })
         } else {
             self.services
                 .resume_acp_session(
@@ -3917,21 +4062,16 @@ impl AgentManager {
                     session_mcp_servers.clone(),
                 )
                 .await
+                .map(|opened| opened.map(|response| (response, None)))
         } {
-            Ok(Some(opened)) => {
+            Ok(Some((opened, delivery))) => {
                 // `session/load` replays the prior conversation as a buffered
                 // `session/update` burst; discard it before the first turn so it
                 // is neither re-published as events nor re-accumulated into the
                 // transcript (parity with TS's "no active streaming handler ⇒
                 // drop"). Only the resume path needs this settle-window drain —
                 // new/recreate sessions have no buffered replay.
-                let notes = self
-                    .handles
-                    .lock()
-                    .unwrap()
-                    .get(agent_id)
-                    .map(|h| h.execution.runtime.notifications());
-                if let Some(notes) = notes {
+                {
                     let mut guard = notes.lock().await;
                     Services::drain_replay_notifications(&mut guard).await;
                 }
@@ -3968,7 +4108,17 @@ impl AgentManager {
                     Some(&default),
                 )
                 .await;
-                return Ok(opened.session_id);
+                let captured = deliver_captured(delivery).await;
+                return Ok(StartedSession {
+                    session_id: opened.session_id,
+                    turn: OriginalTurn {
+                        runtime,
+                        connection: Some(conn),
+                        notifications: notes,
+                        origin: repository_origin,
+                        prompt: captured,
+                    },
+                });
             }
             Ok(None) => {}
             // Auth-required resume failure (intent-hq/intent#3941): the
@@ -3989,23 +4139,72 @@ impl AgentManager {
         // becomes resumable. A failed attempt leaves the prior stored ID and
         // transcript intact, including across a daemon restart.
         if provider.id == "antigravity" {
-            let prepared = self
-                .services
-                .prepare_acp_session(conn.as_ref(), agent_id, cwd, session_mcp_servers)
-                .await?;
-            let model_response = self
-                .maybe_apply_session_model(
-                    conn.as_ref(),
-                    agent_id,
-                    provider,
-                    &prepared.response.session_id.0,
-                    stored_model.as_deref(),
+            let creation = repository_origin.begin_session(RepositoryCreationIntent::Replace {
+                // Preserve the legacy first-set empty expectation without
+                // claiming that it was a strict NULL-to-value winner.
+                expected: Some(stored_id.clone().unwrap_or_default()),
+            });
+            let prepare = || async {
+                let prepared = self
+                    .services
+                    .prepare_acp_session_with_callbacks(
+                        conn.as_ref(),
+                        callbacks.as_ref(),
+                        agent_id,
+                        cwd,
+                        session_mcp_servers,
+                    )
+                    .await?;
+                let model_response = self
+                    .maybe_apply_session_model(
+                        conn.as_ref(),
+                        agent_id,
+                        provider,
+                        &prepared.response.session_id.0,
+                        stored_model.as_deref(),
+                    )
+                    .await?;
+                let candidate = prepared.response.session_id.0.to_string();
+                if candidate.is_empty() {
+                    return Err(Error::InvalidParams(
+                        "Antigravity returned an empty session ID".into(),
+                    ));
+                }
+                Ok::<_, Error>((candidate, (prepared, model_response)))
+            };
+            let ((opened, delivery), model_response) = if let Some((creation, attempt)) = creation {
+                let outcome = creation.initialize_compatible(prepare).await;
+                let (mut prepared, model_response) = outcome.producer?;
+                let query = prepared.query.take();
+                let canonical = crate::agent_session::compatibility_session_id(outcome.result?);
+                let opened = self
+                    .services
+                    .finish_antigravity_acp_session(prepared, stored_id.as_deref(), canonical)
+                    .await?;
+                (
+                    repository_origin.accept_session(
+                        attempt,
+                        &conn,
+                        crate::agent_session::RepositorySessionOutcome {
+                            response: opened,
+                            owner: outcome.owner,
+                            query,
+                        },
+                    ),
+                    model_response,
                 )
-                .await?;
-            let opened = self
-                .services
-                .commit_antigravity_acp_session(prepared, stored_id.as_deref())
-                .await?;
+            } else {
+                let (_, (prepared, model_response)) = prepare().await?;
+                (
+                    (
+                        self.services
+                            .commit_antigravity_acp_session(prepared, stored_id.as_deref())
+                            .await?,
+                        None,
+                    ),
+                    model_response,
+                )
+            };
             self.force_recreate.lock().unwrap().remove(agent_id);
             if stored_id.is_some() {
                 self.recreated.lock().unwrap().insert(agent_id.clone());
@@ -4020,7 +4219,17 @@ impl AgentManager {
                 None,
             )
             .await;
-            return Ok(opened.session_id);
+            let captured = deliver_captured(delivery).await;
+            return Ok(StartedSession {
+                session_id: opened.session_id,
+                turn: OriginalTurn {
+                    runtime,
+                    connection: Some(conn),
+                    notifications: notes,
+                    origin: repository_origin,
+                    prompt: captured,
+                },
+            });
         }
 
         // 2) Resume impossible but a session existed → recreate + flag for resend.
@@ -4031,16 +4240,38 @@ impl AgentManager {
         // replace keeps the id canonical, swapping only the exact id we failed to
         // load.
         if let Some(expected_old) = stored_id {
-            let opened = self
-                .services
-                .recreate_acp_session(
-                    conn.as_ref(),
-                    agent_id,
-                    &expected_old,
-                    cwd,
-                    session_mcp_servers.clone(),
+            let (opened, delivery) = if let Some((creation, attempt)) = repository_origin
+                .begin_session(RepositoryCreationIntent::Replace {
+                    expected: Some(expected_old.clone()),
+                }) {
+                repository_origin.accept_session(
+                    attempt,
+                    &conn,
+                    self.services
+                        .create_repository_acp_session(
+                            (conn.as_ref(), callbacks.as_ref()),
+                            agent_id,
+                            cwd,
+                            session_mcp_servers.clone(),
+                            creation,
+                            true,
+                        )
+                        .await?,
                 )
-                .await?;
+            } else {
+                (
+                    self.services
+                        .recreate_acp_session(
+                            conn.as_ref(),
+                            agent_id,
+                            &expected_old,
+                            cwd,
+                            session_mcp_servers.clone(),
+                        )
+                        .await?,
+                    None,
+                )
+            };
             self.force_recreate.lock().unwrap().remove(agent_id);
             self.recreated.lock().unwrap().insert(agent_id.clone());
             self.arm_first_turn_prepend(agent_id, provider);
@@ -4069,14 +4300,45 @@ impl AgentManager {
                 None,
             )
             .await;
-            return Ok(opened.session_id);
+            let captured = deliver_captured(delivery).await;
+            return Ok(StartedSession {
+                session_id: opened.session_id,
+                turn: OriginalTurn {
+                    runtime,
+                    connection: Some(conn),
+                    notifications: notes,
+                    origin: repository_origin,
+                    prompt: captured,
+                },
+            });
         }
 
         // 3) Brand-new agent → open and persist the first session (write-once).
-        let opened = self
-            .services
-            .open_acp_session(conn.as_ref(), agent_id, cwd, session_mcp_servers)
-            .await?;
+        let (opened, delivery) = if let Some((creation, attempt)) =
+            repository_origin.begin_session(RepositoryCreationIntent::FirstSet)
+        {
+            repository_origin.accept_session(
+                attempt,
+                &conn,
+                self.services
+                    .create_repository_acp_session(
+                        (conn.as_ref(), callbacks.as_ref()),
+                        agent_id,
+                        cwd,
+                        session_mcp_servers,
+                        creation,
+                        false,
+                    )
+                    .await?,
+            )
+        } else {
+            (
+                self.services
+                    .open_acp_session(conn.as_ref(), agent_id, cwd, session_mcp_servers)
+                    .await?,
+                None,
+            )
+        };
         self.force_recreate.lock().unwrap().remove(agent_id);
         self.arm_first_turn_prepend(agent_id, provider);
         self.maybe_bypass_permissions(
@@ -4104,7 +4366,17 @@ impl AgentManager {
             None,
         )
         .await;
-        Ok(opened.session_id)
+        let captured = deliver_captured(delivery).await;
+        Ok(StartedSession {
+            session_id: opened.session_id,
+            turn: OriginalTurn {
+                runtime,
+                connection: Some(conn),
+                notifications: notes,
+                origin: repository_origin,
+                prompt: captured,
+            },
+        })
     }
 
     /// A loaded session reports its current value, which may be a prior
@@ -4244,12 +4516,21 @@ impl AgentManager {
         agent_id: &AgentId,
         session_id: &str,
         provider: &str,
+        original: &OriginalTurn,
     ) -> Result<()> {
-        let Some((conn, mut options)) = self.handles.lock().unwrap().get(agent_id).and_then(|h| {
-            h.execution
-                .connection()
-                .map(|conn| (conn, h.config_options.clone()))
-        }) else {
+        let Some((conn, mut options)) = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .filter(|h| Arc::ptr_eq(&h.repository_origin, &original.origin))
+            .and_then(|h| {
+                original
+                    .connection
+                    .clone()
+                    .map(|conn| (conn, h.config_options.clone()))
+            })
+        else {
             return Ok(());
         };
         let enabled = self
@@ -4261,7 +4542,13 @@ impl AgentManager {
             .copied()
             .unwrap_or(false);
         crate::fast_mode::apply(&conn, session_id, provider, enabled, &mut options).await?;
-        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+        if let Some(handle) = self
+            .handles
+            .lock()
+            .unwrap()
+            .get_mut(agent_id)
+            .filter(|h| Arc::ptr_eq(&h.repository_origin, &original.origin))
+        {
             handle.config_options = options;
         }
         Ok(())
@@ -4291,29 +4578,36 @@ impl AgentManager {
         let requested = stored_effort.map(str::trim).filter(|e| !e.is_empty());
         let Some((config_id, value, current, default_value)) = ({
             let mut handles = self.handles.lock().unwrap();
-            handles.get_mut(agent_id).and_then(|h| {
-                h.confirmed_effort = None;
-                h.thought_level.as_ref().and_then(|t| {
-                    let value = match requested {
-                        Some(effort) => {
-                            match t.values.iter().find(|v| v.eq_ignore_ascii_case(effort)) {
-                                Some(v) => v.clone(),
-                                None if t.values.is_empty() => effort.to_string(),
-                                None => return None,
+            handles
+                .get_mut(agent_id)
+                .filter(|h| {
+                    h.execution
+                        .connection()
+                        .is_some_and(|c| std::ptr::eq(c.as_ref(), conn))
+                })
+                .and_then(|h| {
+                    h.confirmed_effort = None;
+                    h.thought_level.as_ref().and_then(|t| {
+                        let value = match requested {
+                            Some(effort) => {
+                                match t.values.iter().find(|v| v.eq_ignore_ascii_case(effort)) {
+                                    Some(v) => v.clone(),
+                                    None if t.values.is_empty() => effort.to_string(),
+                                    None => return None,
+                                }
                             }
-                        }
-                        None => t.initial_value.clone(),
-                    };
-                    (!value.is_empty()).then(|| {
-                        (
-                            t.config_id.clone(),
-                            value,
-                            t.current_value.clone(),
-                            t.initial_value.clone(),
-                        )
+                            None => t.initial_value.clone(),
+                        };
+                        (!value.is_empty()).then(|| {
+                            (
+                                t.config_id.clone(),
+                                value,
+                                t.current_value.clone(),
+                                t.initial_value.clone(),
+                            )
+                        })
                     })
                 })
-            })
         }) else {
             return;
         };
@@ -4327,7 +4621,13 @@ impl AgentManager {
             .await
             {
                 Ok(response) => {
-                    if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+                    if let Some(handle) =
+                        self.handles.lock().unwrap().get_mut(agent_id).filter(|h| {
+                            h.execution
+                                .connection()
+                                .is_some_and(|c| std::ptr::eq(c.as_ref(), conn))
+                        })
+                    {
                         crate::fast_mode::refresh_options(
                             &mut handle.config_options,
                             Some(&response),
@@ -4347,6 +4647,11 @@ impl AgentManager {
                                 .lock()
                                 .unwrap()
                                 .get_mut(agent_id)
+                                .filter(|h| {
+                                    h.execution
+                                        .connection()
+                                        .is_some_and(|c| std::ptr::eq(c.as_ref(), conn))
+                                })
                                 .and_then(|h| h.thought_level.as_mut())
                             {
                                 t.current_value = actual.to_string();
@@ -4364,7 +4669,11 @@ impl AgentManager {
                 }
             }
         }
-        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id).filter(|h| {
+            h.execution
+                .connection()
+                .is_some_and(|c| std::ptr::eq(c.as_ref(), conn))
+        }) {
             if let Some(t) = handle.thought_level.as_mut() {
                 t.current_value.clone_from(&value);
             }
@@ -5056,28 +5365,67 @@ impl AgentManager {
         prompt: Vec<ContentBlock>,
         turn_id: Option<&str>,
     ) -> Result<StopReason> {
-        let (conn, notes) = {
+        let original = self.capture_turn(agent_id)?;
+        self.run_turn_owned(
+            agent_id,
+            workspace_id,
+            acp_session_id,
+            prompt,
+            turn_id,
+            original,
+        )
+        .await
+    }
+
+    fn capture_turn(&self, agent_id: &AgentId) -> Result<OriginalTurn> {
+        let (runtime, conn, notes, origin) = {
             let map = self.handles.lock().unwrap();
             let handle = map
                 .get(agent_id)
                 .ok_or_else(|| Error::NotFound(format!("agent {agent_id}")))?;
             (
                 handle.execution.runtime.clone(),
+                handle.execution.connection(),
                 handle.execution.runtime.notifications(),
+                handle.repository_origin.clone(),
             )
         };
+        Ok(OriginalTurn::capture(runtime, conn, notes, origin))
+    }
+
+    async fn run_turn_owned(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        acp_session_id: &str,
+        prompt: Vec<ContentBlock>,
+        turn_id: Option<&str>,
+        original: OriginalTurn,
+    ) -> Result<StopReason> {
+        let OriginalTurn {
+            runtime,
+            connection: conn,
+            notifications: notes,
+            origin: _origin,
+            prompt: captured,
+        } = original;
         self.registry.mark_active(agent_id);
         let mut guard = notes.lock().await;
         let result = self
             .services
-            .run_prompt_turn(
-                conn.as_ref(),
+            .run_prompt_turn_captured(
+                runtime.as_ref(),
                 &mut guard,
                 agent_id,
                 workspace_id,
                 acp_session_id,
                 prompt,
                 turn_id,
+                conn.as_deref()
+                    .map(|connection| crate::agent_session::LocalPromptInput {
+                        connection,
+                        captured,
+                    }),
             )
             .await;
         self.registry.mark_idle_slot_held(agent_id);
@@ -5203,6 +5551,13 @@ impl AgentManager {
         redelivery: Option<crate::agent_ops::QueuedPrepend>,
         sync_store: bool,
     ) -> (bool, Option<RuntimeTeardown>) {
+        let original = repository_origin::capture(&self.handles, agent_id);
+        if let Some(original) = &original {
+            original.retire();
+            if !repository_origin::is_current(&self.handles, agent_id, original) {
+                return (false, None);
+            }
+        }
         // Pin the live-turn slot BEFORE aborting the worker (the abort drops
         // LiveTurnGuard; the pin keeps the slot published until the flush
         // below persists the row — monorepo#2056), then flush the partial
@@ -5269,10 +5624,11 @@ impl AgentManager {
             self.sync_stop_redelivery(agent_id).await;
         }
         self.end_turn(agent_id).await;
-        let handle = self.handles.lock().unwrap().remove(agent_id);
+        let handle = original.as_ref().and_then(|original| {
+            repository_origin::take(&self.handles, agent_id, original, Some(&self.registry))
+        });
         let removed = handle.is_some();
         let child = handle.and_then(|mut h| RuntimeTeardown::take(&mut h));
-        self.registry.deregister(agent_id);
         (removed, child)
     }
 
@@ -5330,15 +5686,16 @@ impl AgentManager {
         interrupted_by: Option<InterruptedBy>,
     ) -> InterruptOutcome {
         let suppress_idle_emit = reason == InterruptReason::PreemptedByMessage;
-        // The runtime is the interrupt capability; grab it WITHOUT removing
-        // the handle so execution stays available for resume.
-        let conn = self
-            .handles
-            .lock()
-            .unwrap()
-            .get(agent_id)
-            .map(|h| h.execution.runtime.clone());
-        let Some(conn) = conn else {
+        // The live connection is the interrupt capability; grab it WITHOUT
+        // removing the handle so the child stays alive for resume.
+        let original = self.handles.lock().unwrap().get(agent_id).map(|h| {
+            (
+                h.execution.runtime.clone(),
+                h.execution.runtime.notifications(),
+                h.repository_origin.clone(),
+            )
+        });
+        let Some((conn, notes, repository_origin)) = original else {
             // No live session to interrupt → keep-alive is a no-op; fall back to
             // the hard kill path (itself a no-op when the agent is already gone).
             return InterruptOutcome::killed(self.stop_with_redelivery_arm(agent_id, reason).await);
@@ -5347,6 +5704,14 @@ impl AgentManager {
         // `acpSessionId` to cancel. Without an `acpSessionId` there is no
         // in-flight turn to interrupt, so fall back to the kill path.
         let session = self.services.store.get_agent_session(agent_id).await.ok();
+        if !repository_origin::is_current(&self.handles, agent_id, &repository_origin) {
+            repository_origin.retire();
+            return InterruptOutcome {
+                agent_found: false,
+                preempted: false,
+                interrupted_row_id: None,
+            };
+        }
         let acp_session_id = session.as_ref().and_then(|s| s.acp_session_id.clone());
         let Some(acp_session_id) = acp_session_id else {
             return InterruptOutcome::killed(self.stop_with_redelivery_arm(agent_id, reason).await);
@@ -5375,6 +5740,7 @@ impl AgentManager {
             };
         }
         let turn_in_flight = self.is_busy(agent_id);
+        repository_origin.interrupt_requests();
         // Abort the in-flight worker so it stops draining the turn/queue; the
         // child is kept alive (unlike `stop`, which also kills the child).
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
@@ -5493,7 +5859,7 @@ impl AgentManager {
                     timeout = ?SESSION_CANCEL_WRITE_TIMEOUT,
                     "session/cancel undeliverable (transport wedged) — killing the child so the stop settles (monorepo#3039)"
                 );
-                self.kill_child_only(agent_id).await;
+                self.kill_original_child(agent_id, &repository_origin).await;
             }
         }
         // Provider quirk teardown (intent-hq/monorepo#2763): providers with
@@ -5530,7 +5896,7 @@ impl AgentManager {
                 agent = %agent_id,
                 "provider kills_child_on_interrupt quirk: tearing the child down after session/cancel (monorepo#2763)"
             );
-            self.kill_child_only(agent_id).await;
+            self.kill_original_child(agent_id, &repository_origin).await;
         }
         // STAB-124: the cancelled child echoes `tool_call_update`s for the
         // aborted tool call (title-less, status failed). With the worker gone,
@@ -5540,13 +5906,7 @@ impl AgentManager {
         // Discard them with the same bounded settle-window drain the resume
         // path uses for the `session/load` replay burst. The aborted worker's
         // channel lock is released when its task drops, so this cannot deadlock.
-        let notes = self
-            .handles
-            .lock()
-            .unwrap()
-            .get(agent_id)
-            .map(|h| h.execution.runtime.notifications());
-        if let Some(notes) = notes {
+        {
             let mut guard = notes.lock().await;
             Services::drain_replay_notifications(&mut guard).await;
         }
@@ -6730,7 +7090,16 @@ impl AgentManager {
 
     /// Release per-agent ownership while retaining the task's persistence tail.
     fn clear_worker(&self, agent_id: &AgentId) {
-        if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
+        let mut workers = self.workers.lock().unwrap();
+        // A finishing worker may already have released its admission, allowing
+        // a new send to replace its handle. Only deregister the calling task:
+        // removing its replacement would leave that turn unabortable, racing
+        // its final append against an interruption flush (intent#6594).
+        if workers
+            .get(agent_id)
+            .is_some_and(|worker| Some(worker.id()) == tokio::task::try_id())
+        {
+            let worker = workers.remove(agent_id).expect("checked worker identity");
             self.retain_finishing_worker(worker);
         }
     }
@@ -6793,6 +7162,7 @@ impl AgentManager {
         message_id: Option<String>,
         mut options: TurnOptions,
     ) -> Result<Value> {
+        crate::agent_ops::validate_submission_id(message_id.as_deref())?;
         if options.reject_on_shutdown && self.is_shutting_down() {
             return Err(Error::Internal("daemon is shutting down".into()));
         }
@@ -6814,6 +7184,7 @@ impl AgentManager {
                 .queue_submission_order
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
+            options.queued_correlation_order_known = true;
         }
         // A2A sender header (intent-hq/intent#3721, monorepo#1015): the runtime front door — gated
         // on the daemon-stamped `fromAgentId`, applied BEFORE every branch
@@ -6842,6 +7213,16 @@ impl AgentManager {
         // the target lives in, not the caller's.
         let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
         let _mutation = self.services.workspace_mutations.enter(&workspace_id)?;
+        if let Some(result) = self.services.submission_replay(
+            &agent_id,
+            &message_id,
+            options.message_metadata.as_ref(),
+        )? {
+            return Ok(result);
+        }
+        options.queued_submission_ids = vec![message_id.clone()];
+        crate::agent_ops::stamp_direct_correlation(&mut options.message_metadata, &message_id);
+
         // Quarantine gate (monorepo#840): a provably-poisoned session (parked
         // in Error with a session-fatal provider block, or a streak of
         // identical terminal failures) must NOT be redriven by message
@@ -6856,7 +7237,7 @@ impl AgentManager {
                 stop_reason = session.stop_reason.as_deref().unwrap_or(""),
                 "session is quarantined (poisoned); parking message in queue instead of driving a turn"
             );
-            let (queued, position) = self.services.enqueue_message_with_id(
+            let (queued, position) = self.services.enqueue_submission(
                 &agent_id,
                 Some(message_id.clone()),
                 content,
@@ -6866,14 +7247,15 @@ impl AgentManager {
                 options.queued_prepend(),
                 options.interrupt_priority,
                 options.origin,
-            );
-            let result = json!({
+            )?;
+            let mut result = json!({
                 "success": true,
                 "queued": true,
                 "quarantined": true,
                 "queuedMessage": queued.to_value(position),
                 "turnId": queued.turn_id,
             });
+            queued.attach_correlation(&mut result);
             self.services.publish_queue_updated(&agent_id).await;
             // Close the check-then-park race: a concurrent `agent.retry` may
             // have cleared the Error + streak and finished its drain between
@@ -6908,7 +7290,7 @@ impl AgentManager {
         if !options.origin.is_user() && !workspace_id.is_chief() {
             match self.services.store.get_workspace(&workspace_id).await {
                 Ok(ws) if ws.archived => {
-                    let (queued, position) = self.services.enqueue_message_with_id(
+                    let (queued, position) = self.services.enqueue_submission(
                         &agent_id,
                         Some(message_id.clone()),
                         content,
@@ -6918,14 +7300,15 @@ impl AgentManager {
                         options.queued_prepend(),
                         options.interrupt_priority,
                         options.origin,
-                    );
-                    let result = json!({
+                    )?;
+                    let mut result = json!({
                         "success": true,
                         "queued": true,
                         "archivedParked": true,
                         "queuedMessage": queued.to_value(position),
                         "turnId": queued.turn_id,
                     });
+                    queued.attach_correlation(&mut result);
                     self.services.publish_queue_updated(&agent_id).await;
                     // Race close (archived-check → enqueue vs a concurrent
                     // `workspace.unarchive`): the unarchive's own drain kick
@@ -6981,7 +7364,7 @@ impl AgentManager {
                 Ok(ws) if ws.archived
             )
         {
-            let (queued, position) = self.services.enqueue_message_with_id(
+            let (queued, position) = self.services.enqueue_submission(
                 &agent_id,
                 Some(message_id.clone()),
                 content,
@@ -6991,13 +7374,14 @@ impl AgentManager {
                 options.queued_prepend(),
                 options.interrupt_priority,
                 options.origin,
-            );
-            let result = json!({
+            )?;
+            let mut result = json!({
                 "success": true,
                 "queued": true,
                 "queuedMessage": queued.to_value(position),
                 "turnId": queued.turn_id,
             });
+            queued.attach_correlation(&mut result);
             self.services.publish_queue_updated(&agent_id).await;
             self.clone()
                 .try_drain_queue(agent_id.clone(), workspace_id.clone())
@@ -7043,9 +7427,9 @@ impl AgentManager {
                     options.queued_prepend(),
                     options.interrupt_priority,
                     options.origin,
-                )
+                )?
             } else {
-                self.services.enqueue_message_with_id(
+                self.services.enqueue_submission(
                     &agent_id,
                     Some(message_id.clone()),
                     content,
@@ -7055,14 +7439,15 @@ impl AgentManager {
                     options.queued_prepend(),
                     options.interrupt_priority,
                     options.origin,
-                )
+                )?
             };
-            let result = json!({
+            let mut result = json!({
                 "success": true,
                 "queued": true,
                 "queuedMessage": queued.to_value(position),
                 "turnId": queued.turn_id,
             });
+            queued.attach_correlation(&mut result);
             self.services.publish_queue_updated(&agent_id).await;
             // Opposite interleaving: the worker released (and ran its exit
             // re-check) between the failed claim and the insert above, so
@@ -7158,7 +7543,7 @@ impl AgentManager {
                         agent_id.0
                     )));
                 }
-                let (queued, position) = self.services.enqueue_message_with_id(
+                let (queued, position) = self.services.enqueue_submission(
                     &agent_id,
                     Some(message_id.clone()),
                     content,
@@ -7168,13 +7553,14 @@ impl AgentManager {
                     options.queued_prepend(),
                     options.interrupt_priority,
                     options.origin,
-                );
-                let result = json!({
+                )?;
+                let mut result = json!({
                     "success": true,
                     "queued": true,
                     "queuedMessage": queued.to_value(position),
                     "turnId": queued.turn_id,
                 });
+                queued.attach_correlation(&mut result);
                 self.services.publish_queue_updated(&agent_id).await;
                 self.clone().try_drain_queue(agent_id, workspace_id).await;
                 return Ok(result);
@@ -7228,6 +7614,7 @@ impl AgentManager {
             "success": true,
             "queued": false,
             "messageId": message.id,
+            "submissionIds": [message.id],
             "turnId": turn_id,
         }))
     }
@@ -7633,7 +8020,9 @@ impl AgentManager {
             suppress_report_clear: stale,
             queued_at: Some(next.queued_at.clone()),
             queued_submission_ids: next.submission_ids(),
+            recovery_sources: next.recovery_sources.clone(),
             queued_submission_order: next.submission_order,
+            queued_correlation_order_known: next.correlation_order_known,
             latest_human_submission_at: next.latest_human_submission_at.clone(),
             prepend_content: next.prepend_content.clone(),
             prepend_image_blocks: next.prepend_image_blocks.clone(),
@@ -7799,7 +8188,9 @@ impl AgentManager {
             suppress_report_clear: stale,
             queued_at: Some(entry.queued_at.clone()),
             queued_submission_ids: entry.submission_ids(),
+            recovery_sources: entry.recovery_sources.clone(),
             queued_submission_order: entry.submission_order,
+            queued_correlation_order_known: entry.correlation_order_known,
             latest_human_submission_at: entry.latest_human_submission_at.clone(),
             prepend_content: entry.prepend_content.clone(),
             prepend_image_blocks: entry.prepend_image_blocks.clone(),
@@ -8208,6 +8599,7 @@ impl AgentManager {
                         "success": true,
                         "queued": false,
                         "messageId": mid,
+                        "submissionIds": [mid],
                         "deduplicated": true,
                     }));
                 }
@@ -8582,7 +8974,7 @@ impl AgentManager {
         let Ok(_mutation) = self.services.workspace_mutations.enter(workspace_id) else {
             return false;
         };
-        let (notes, gate) = {
+        let (notes, gate, callback_routes) = {
             let map = self.handles.lock().unwrap();
             let Some(handle) = map.get(agent_id) else {
                 return false;
@@ -8590,6 +8982,11 @@ impl AgentManager {
             (
                 handle.execution.runtime.notifications(),
                 handle.wake_gate.clone(),
+                handle
+                    .execution
+                    .connection()
+                    .map(|conn| conn.callback_tool_routes())
+                    .unwrap_or_default(),
             )
         };
         if gate.load(AtomicOrdering::SeqCst) > 0 {
@@ -8700,12 +9097,13 @@ impl AgentManager {
                 // here needs no redrive/attention (monorepo#3262).
                 let _ = self
                     .services
-                    .run_harness_wake_turn(
+                    .run_harness_wake_turn_with_routes(
                         &mut guard,
                         first,
                         agent_id,
                         workspace_id,
                         Duration::ZERO,
+                        callback_routes,
                     )
                     .await;
                 return true;
@@ -8738,7 +9136,14 @@ impl AgentManager {
         let drive = intent_core::spawn_daemon(async move {
             let outcome = mgr
                 .services
-                .run_harness_wake_turn(&mut guard, first, &id, &ws, HARNESS_WAKE_SETTLE)
+                .run_harness_wake_turn_with_routes(
+                    &mut guard,
+                    first,
+                    &id,
+                    &ws,
+                    HARNESS_WAKE_SETTLE,
+                    callback_routes,
+                )
                 .await;
             // Idle without waking a queued spawn: the busy slot is still held
             // here, so the `end_turn` below performs the wake (#5253).
@@ -8824,6 +9229,10 @@ impl AgentManager {
         if session.status != AgentStatus::Error {
             return Ok(json!({ "ok": false }));
         }
+        let original = repository_origin::capture(&self.handles, &agent_id);
+        if let Some(original) = &original {
+            original.retire();
+        }
 
         // Use the session's persisted workspace_id for safety (cross-workspace guard)
         let workspace_id = &session.workspace_id;
@@ -8885,7 +9294,9 @@ impl AgentManager {
 
         // Tear down any stale child handle (use kill_child_only to avoid
         // overwriting the status we just set)
-        self.kill_child_only(&agent_id).await;
+        if let Some(original) = original {
+            self.kill_original_child(&agent_id, &original).await;
+        }
 
         // Close the check-then-flip race: a message enqueued between the queue
         // check above and the status flip had its own drain attempt suppressed
@@ -9501,11 +9912,22 @@ impl AgentManager {
     /// session otherwise. When the session's model/provider has changed (via
     /// `agent.setModel`), tears down the existing child and respawns with the
     /// new model before the next turn. Returns the `acpSessionId` to drive the turn.
+    #[cfg(test)]
     async fn ensure_started(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<String> {
+        self.ensure_started_owned(agent_id, workspace_id)
+            .await
+            .map(|started| started.session_id)
+    }
+
+    async fn ensure_started_owned(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<StartedSession> {
         // Teardown fence (ghost-agent race): refuse to (re)spawn an agent a
         // `workspace.delete` batch stop (`stop_many`) is tearing down — its
         // session row is about to be cascade-deleted, so a lazy spawn here
@@ -9596,6 +10018,7 @@ impl AgentManager {
                 self.kill_child_only(agent_id).await;
             } else if let Some(acp) = session.acp_session_id.clone() {
                 if self.handle_is_live(agent_id) {
+                    let original = self.capture_turn(agent_id)?;
                     // Model unchanged and child is live — reuse the existing
                     // session. The notice/commit still runs: the live child may
                     // predate a same-provider model change the reuse tolerates,
@@ -9608,13 +10031,7 @@ impl AgentManager {
                     // for the turn about to run (PROTOCOL §5.5). A no-op when
                     // the effort is unchanged or the provider advertised no
                     // such option.
-                    let conn = self
-                        .handles
-                        .lock()
-                        .unwrap()
-                        .get(agent_id)
-                        .and_then(|h| h.execution.connection());
-                    if let Some(conn) = conn {
+                    if let Some(conn) = &original.connection {
                         let effort = Self::session_model_effort(
                             &resolved.provider,
                             session.model.as_deref(),
@@ -9625,9 +10042,12 @@ impl AgentManager {
                     }
                     self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
                         .await;
-                    self.apply_fast_mode(agent_id, &acp, resolved.provider.id)
+                    self.apply_fast_mode(agent_id, &acp, resolved.provider.id, &original)
                         .await?;
-                    return Ok(acp);
+                    return Ok(StartedSession {
+                        session_id: acp,
+                        turn: original,
+                    });
                 }
                 // The child/transport died while the agent sat idle
                 // (monorepo#764): clear the stale handle + registry entry and
@@ -9816,7 +10236,7 @@ impl AgentManager {
             .await?;
         }
         let session_result = self
-            .start_session(agent_id, resolved.cwd.clone(), &resolved.provider)
+            .start_session_owned(agent_id, resolved.cwd.clone(), &resolved.provider)
             .await;
         let acp_session_id = match session_result {
             Ok(id) => id,
@@ -9842,8 +10262,13 @@ impl AgentManager {
             .await;
         self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
             .await;
-        self.apply_fast_mode(agent_id, &acp_session_id, resolved.provider.id)
-            .await?;
+        self.apply_fast_mode(
+            agent_id,
+            &acp_session_id.session_id,
+            resolved.provider.id,
+            &acp_session_id.turn,
+        )
+        .await?;
         self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
         Ok(acp_session_id)
     }
@@ -9856,6 +10281,7 @@ impl AgentManager {
     /// # Panics
     /// Panics if an internal mutex is poisoned.
     pub fn begin_shutdown(&self) {
+        let _retiring = self.shutdown_retirement.lock().unwrap();
         let mut closed = self.admission_closed.lock().unwrap();
         if *closed {
             return;
@@ -9868,10 +10294,24 @@ impl AgentManager {
         }
         let mut stopping = self.stopping.lock().unwrap();
         stopping.extend(in_flight.into_iter().map(|(id, _)| id));
-        stopping.extend(self.handles.lock().unwrap().keys().cloned());
-        let workers = self.workers.lock().unwrap();
-        stopping.extend(workers.keys().cloned());
-        for worker in workers.values() {
+        let originals = {
+            let handles = self.handles.lock().unwrap();
+            stopping.extend(handles.keys().cloned());
+            handles
+                .values()
+                .map(|handle| handle.repository_origin.clone())
+                .collect::<Vec<_>>()
+        };
+        stopping.extend(self.workers.lock().unwrap().keys().cloned());
+        drop(stopping);
+        drop(closed);
+        // Join original authority before cancellation can drop its producer.
+        // The separate shutdown mutex makes repeated callers join this same
+        // boundary; admission/map locks are free while stages finish.
+        for original in originals {
+            original.retire();
+        }
+        for worker in self.workers.lock().unwrap().values() {
             worker.abort();
         }
         self.services.delivery_tasks.close();
@@ -10280,19 +10720,32 @@ impl AgentManager {
     /// worker or busy flag. Safe to call from within the worker itself (e.g.,
     /// retry loop). Use `stop()` for full teardown from external callers.
     async fn kill_child_only(&self, agent_id: &AgentId) {
-        let handle = self.handles.lock().unwrap().remove(agent_id);
+        if let Some(original) = repository_origin::capture(&self.handles, agent_id) {
+            self.kill_original_child(agent_id, &original).await;
+        }
+    }
+
+    async fn kill_original_child(&self, agent_id: &AgentId, original: &Arc<RepositoryOrigin>) {
+        let handle =
+            repository_origin::take(&self.handles, agent_id, original, Some(&self.registry));
         if let Some(mut handle) = handle {
             if let Some(child) = RuntimeTeardown::take(&mut handle) {
                 child.kill_tree().await;
             }
         }
-        self.registry.deregister(agent_id);
     }
 
     /// Build the kill callback for `agent_id`: removing the handle signals the
     /// child's whole process group (SIGTERM→SIGKILL) and aborts its request
     /// loop, so no orphaned grandchildren linger.
+    #[cfg(test)]
     fn make_kill(&self, agent_id: AgentId) -> KillFn {
+        let original = repository_origin::capture(&self.handles, &agent_id)
+            .map_or_else(Weak::new, |origin| Arc::downgrade(&origin));
+        self.make_original_kill(agent_id, original)
+    }
+
+    fn make_original_kill(&self, agent_id: AgentId, original: Weak<RepositoryOrigin>) -> KillFn {
         let handles: Weak<Mutex<HashMap<AgentId, AgentHandle>>> = Arc::downgrade(&self.handles);
         #[cfg(test)]
         let services = self.services.clone();
@@ -10301,10 +10754,12 @@ impl AgentManager {
             let id = agent_id.clone();
             #[cfg(test)]
             let services = services.clone();
+            let original = original.clone();
             Box::pin(async move {
-                let removed = handles
-                    .upgrade()
-                    .and_then(|h| h.lock().unwrap().remove(&id));
+                let removed = handles.upgrade().and_then(|handles| {
+                    let original = original.upgrade()?;
+                    repository_origin::take(&handles, &id, &original, None)
+                });
                 if let Some(mut handle) = removed {
                     if let Some(child) = RuntimeTeardown::take(&mut handle) {
                         #[cfg(test)]
@@ -10343,6 +10798,8 @@ impl AgentManager {
         agent_id: AgentId,
         child_pid: Option<u32>,
     ) -> JoinHandle<bool> {
+        let original = repository_origin::capture(&self.handles, &agent_id)
+            .map_or_else(Weak::new, |origin| Arc::downgrade(&origin));
         let handles = Arc::downgrade(&self.handles);
         let registry = Arc::downgrade(&self.registry);
         let busy = Arc::downgrade(&self.busy);
@@ -10350,9 +10807,12 @@ impl AgentManager {
         intent_core::spawn_daemon(async move {
             loop {
                 tokio::time::sleep(CHILD_EXIT_POLL_INTERVAL).await;
-                let (Some(handles), Some(registry), Some(busy)) =
-                    (handles.upgrade(), registry.upgrade(), busy.upgrade())
-                else {
+                let (Some(handles), Some(registry), Some(busy), Some(original)) = (
+                    handles.upgrade(),
+                    registry.upgrade(),
+                    busy.upgrade(),
+                    original.upgrade(),
+                ) else {
                     return false; // manager torn down
                 };
                 // Snapshot busy membership BEFORE the handles lock (no nested
@@ -10367,6 +10827,9 @@ impl AgentManager {
                     let Some(handle) = map.get_mut(&agent_id) else {
                         return false;
                     };
+                    if !Arc::ptr_eq(&handle.repository_origin, &original) {
+                        return false;
+                    }
                     match handle.execution.child_exit(child_pid) {
                         ChildState::Absent => return false,
                         ChildState::Alive => None,
@@ -10387,20 +10850,20 @@ impl AgentManager {
                             if is_busy {
                                 None
                             } else {
-                                let dead = map.remove(&agent_id);
-                                registry.deregister(&agent_id);
-                                Some((
-                                    status,
-                                    dead.map(|mut h| {
-                                        (RuntimeTeardown::take(&mut h), h.execution.connection())
-                                    }),
-                                ))
+                                Some(status)
                             }
                         }
                     }
                 };
-                if let Some((status, dead)) = exited {
-                    let (dead_child, dead_conn) = dead.unwrap_or((None, None));
+                if let Some(status) = exited {
+                    let Some(mut dead) =
+                        repository_origin::take(&handles, &agent_id, &original, Some(&registry))
+                    else {
+                        return false;
+                    };
+                    let dead_child = RuntimeTeardown::take(&mut dead);
+                    let dead_conn = dead.execution.connection();
+                    drop(dead);
                     // The direct child is already reaped (`try_wait` above),
                     // but same-group descendants can survive it: sweep the
                     // process group via the spawn-time pid. Swept BEFORE the
@@ -11641,7 +12104,7 @@ fn inject_git_credential_env(
     cwd: Option<&Path>,
     expose: bool,
 ) {
-    if !expose {
+    if !expose || intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
         return;
     }
     let Some(intentd) = crate::daemon_exe_path() else {
@@ -11814,8 +12277,11 @@ async fn run_message_worker(
                 .await;
             return;
         }
-        match retry_spawn(&mgr, &agent_id, &workspace_id).await {
-            Ok(acp_session_id) => {
+        match retry_spawn_owned(&mgr, &agent_id, &workspace_id).await {
+            Ok(StartedSession {
+                session_id: acp_session_id,
+                turn,
+            }) => {
                 // Clear any persisted completion report at the start of this turn
                 // (including queue-drained turns). Skip the store write when no
                 // report is set; the `agent:idle` wake for a prior turn that set a
@@ -11879,12 +12345,13 @@ async fn run_message_worker(
                     return;
                 }
                 match mgr
-                    .run_turn(
+                    .run_turn_owned(
                         &agent_id,
                         &workspace_id,
                         &acp_session_id,
                         prompt,
                         options.turn_id.as_deref(),
+                        turn,
                     )
                     .await
                 {
@@ -12474,7 +12941,9 @@ async fn run_message_worker(
                 suppress_report_clear: stale,
                 queued_at: Some(next.queued_at.clone()),
                 queued_submission_ids,
+                recovery_sources: next.recovery_sources.clone(),
                 queued_submission_order: next.submission_order,
+                queued_correlation_order_known: next.correlation_order_known,
                 latest_human_submission_at: next.latest_human_submission_at.clone(),
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
@@ -12676,7 +13145,9 @@ async fn run_message_worker(
                 suppress_report_clear: stale,
                 queued_at: Some(next.queued_at.clone()),
                 queued_submission_ids,
+                recovery_sources: next.recovery_sources.clone(),
                 queued_submission_order: next.submission_order,
+                queued_correlation_order_known: next.correlation_order_known,
                 latest_human_submission_at: next.latest_human_submission_at.clone(),
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
@@ -12708,6 +13179,14 @@ async fn run_message_worker(
         mgr.services.requeue_front_batch(&agent_id, raced);
         drop(raced_draining);
         break 'outer;
+    }
+    #[cfg(test)]
+    {
+        let pause = mgr.worker_finish_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
     }
     mgr.clear_worker(&agent_id);
     // Parked recovery send (intent-hq/intent#4962): a `send_message` that
@@ -12978,6 +13457,20 @@ async fn prepare_flush_turn(
         prepend_image_blocks,
         prepend_file_blocks,
         turn_id: Some(entries[0].turn_id.clone()),
+        // A plural flush may contain just one ordinary merged queue row.
+        // Keep its aliases and arrival order for the ordinary retry path;
+        // multi-row recovery derives source-scoped leaves from flushed_entries.
+        queued_submission_ids: if entries.len() == 1 {
+            entries[0].submission_ids()
+        } else {
+            Vec::new()
+        },
+        queued_submission_order: if entries.len() == 1 {
+            entries[0].submission_order
+        } else {
+            0
+        },
+        queued_correlation_order_known: entries.len() == 1 && entries[0].correlation_order_known,
         interrupt_priority: entries[0].interrupt_priority,
         origin: origin_from_user_flag(entries.iter().any(|m| m.user_origin)),
         // Every entry is `persisted: true` here (the loop above either set
@@ -13071,6 +13564,8 @@ async fn persist_user(
     let block_md = message_metadata.and_then(|md| match md {
         Value::Object(m) => {
             let mut m = m.clone();
+            m.remove("submissionIds");
+            m.remove("recoverySources");
             m.remove(intent_core::USER_APP_MESSAGE_ID_KEY);
             m.remove(intent_core::FROM_PRINCIPAL_ID_KEY);
             (!m.is_empty()).then_some(Value::Object(m))
@@ -13185,6 +13680,11 @@ async fn persist_user(
     }
     mgr.services
         .publish_agent_message_events(workspace_id, agent_id, &message, turn_id)
+        .await;
+    // A durable row settles its provisional arrival barrier while the
+    // draining guard can remain visible during the rest of a batch.
+    mgr.services
+        .publish_queue_updated_after_drain_persist(agent_id, workspace_id)
         .await;
     // Answer intake (PROTOCOL §5.5, pending questions): same contract as the
     // direct-send persist — a `question_answers` tag naming the marked
@@ -13413,15 +13913,26 @@ fn is_retryable_spawn_error(err: &Error) -> bool {
 /// nothing terminal is ever surfaced. The final / non-retryable attempt keeps
 /// the plain WARN: its handle is left installed for the caller's terminal
 /// "failed after all retries" hint.
+#[cfg(test)]
 async fn retry_spawn(
     mgr: &AgentManager,
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
 ) -> Result<String> {
+    retry_spawn_owned(mgr, agent_id, workspace_id)
+        .await
+        .map(|started| started.session_id)
+}
+
+async fn retry_spawn_owned(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+) -> Result<StartedSession> {
     let mut last_error: Option<Error> = None;
 
     for attempt in 1..=MAX_SPAWN_ATTEMPTS {
-        match mgr.ensure_started(agent_id, workspace_id).await {
+        match mgr.ensure_started_owned(agent_id, workspace_id).await {
             Ok(session_id) => return Ok(session_id),
             Err(e) => {
                 let retryable = is_retryable_spawn_error(&e);
@@ -13982,7 +14493,7 @@ async fn publish_error_status_and_requeue(
             )
         };
         let id = new_message_id();
-        let queued = crate::agent_ops::QueuedMessage {
+        let mut queued = crate::agent_ops::QueuedMessage {
             turn_id: options.turn_id.clone().unwrap_or_else(|| id.clone()),
             id,
             content,
@@ -14002,13 +14513,26 @@ async fn publish_error_status_and_requeue(
             hold_until: None,
             child_agent_id: None,
             merged_submission_ids: options.queued_submission_ids.clone(),
+            recovery_sources: if let Some(entries) =
+                options.flushed_entries.as_ref().filter(|entries| {
+                    entries.len() > 1
+                        || entries
+                            .iter()
+                            .any(|entry| !entry.recovery_sources.is_empty())
+                }) {
+                mgr.services.recovery_sources(workspace_id, entries).await
+            } else {
+                options.recovery_sources.clone()
+            },
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
             provisional: false,
             submission_order: options.queued_submission_order,
+            correlation_order_known: options.queued_correlation_order_known,
             latest_human_submission_at: options.latest_human_submission_at.clone(),
         };
+        queued.stamp_correlation();
         mgr.services.requeue_front(agent_id, queued);
     }
 
@@ -17359,6 +17883,7 @@ mod dead_child_respawn_tests {
         let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
         let child_pid = child.as_ref().and_then(tokio::process::Child::id);
         AgentHandle {
+            repository_origin: RepositoryOrigin::unavailable(),
             execution: RuntimeHandle::local(LocalResources {
                 connection,
                 notifications: Arc::new(TokioMutex::new(note_rx)),

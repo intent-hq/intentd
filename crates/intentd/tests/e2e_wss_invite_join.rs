@@ -29,6 +29,8 @@
 mod common;
 #[path = "common/invitation_fixture_lifecycle.rs"]
 mod fixture_lifecycle;
+#[path = "common/invitation_client.rs"]
+mod invitation_client;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -38,8 +40,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use intentd_test_support::GuardedChild;
+use invitation_client::{await_workspace_updated, from_raw, wss_rpc, Ws};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
@@ -52,7 +54,6 @@ use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
 
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
@@ -118,7 +119,10 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     .expect("seed config.toml with server.tunnel.enabled");
     common::enable_ws_api(data_dir);
     let mut cmd = common::serve_command();
-    cmd.env("INTENTD_DATA_DIR", data_dir)
+    // Model an ambient installation with the local protocol fake. Individual
+    // fixtures must override this when their oracle requires no tunnel.
+    cmd.env("INTENTD_TAILCAT_BIN", write_fake_tailcat(data_dir))
+        .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         // Keep heartbeat-reaper evidence in retained failure logs: a provider
@@ -221,44 +225,15 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-type Ws = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
-
 async fn connect_ws(port: u16, cfg: Arc<ClientConfig>, token: &str) -> Ws {
     let url = format!("wss://localhost:{port}/ws?token={token}");
-    common::wss_connect_with_retry(port, cfg, &url).await
+    from_raw(common::wss_connect_with_retry(port, cfg, &url).await)
 }
 
 /// The unauthenticated invite endpoint: no token anywhere.
 async fn connect_invite(port: u16, cfg: Arc<ClientConfig>) -> Ws {
     let url = format!("wss://localhost:{port}/invite");
-    common::wss_connect_with_retry(port, cfg, &url).await
-}
-
-/// One WSS JSON-RPC round-trip returning the full envelope (so callers can
-/// assert on `result` OR `error`). Out-of-band notifications are skipped.
-async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
-    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string().into()))
-        .await
-        .expect("send rpc frame");
-    loop {
-        let next = timeout(Duration::from_secs(30), ws.next())
-            .await
-            .unwrap_or_else(|_| panic!("wss rpc {method} timed out"));
-        match next {
-            Some(Ok(Message::Text(text))) => {
-                let v: Value = serde_json::from_str(&text).expect("json frame");
-                if v["id"] == json!(id) {
-                    return v;
-                }
-            }
-            Some(Ok(Message::Ping(p))) => {
-                let _ = ws.send(Message::Pong(p)).await;
-            }
-            Some(Ok(_)) => {}
-            other => panic!("{method}: expected text frame, got {other:?}"),
-        }
-    }
+    from_raw(common::wss_connect_with_retry(port, cfg, &url).await)
 }
 
 /// Listener readiness does not imply that the detached startup identity refresh
@@ -337,37 +312,6 @@ async fn prove(
         }),
     )
     .await
-}
-
-/// Pump a subscriber until a `workspace:updated` event whose `changes`
-/// satisfy `pred` arrives (bounded).
-async fn await_workspace_updated(ws: &mut Ws, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
-    eprintln!("await workspace:updated ({what})");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let remaining = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .unwrap_or_else(|| panic!("timed out waiting for workspace:updated ({what})"));
-        let next = timeout(remaining, ws.next())
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for workspace:updated ({what})"));
-        match next {
-            Some(Ok(Message::Text(text))) => {
-                let v: Value = serde_json::from_str(&text).expect("json frame");
-                if v["method"] == json!("events.event")
-                    && v["params"]["event"]["type"] == json!("workspace:updated")
-                    && pred(&v["params"]["event"]["data"]["changes"])
-                {
-                    return v["params"]["event"].clone();
-                }
-            }
-            Some(Ok(Message::Ping(p))) => {
-                let _ = ws.send(Message::Pong(p)).await;
-            }
-            Some(Ok(_)) => {}
-            other => panic!("workspace:updated ({what}): expected text frame, got {other:?}"),
-        }
-    }
 }
 
 /// Wait for a `github:auth-changed` event carrying `status`.
@@ -1868,13 +1812,21 @@ async fn members_list_attaches_the_owner_identity_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_s = data_dir.join("secrets.json").to_string_lossy().to_string();
-    let env: [(&str, &str); 6] = [
+    // A nonempty override bypasses bundled, sibling and PATH discovery even
+    // when the path is absent. Never let this negative fixture start Tailcat.
+    let no_tailcat = data_dir
+        .join("absent-tailcat")
+        .to_string_lossy()
+        .to_string();
+    assert!(!Path::new(&no_tailcat).exists());
+    let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_SECRETS_FILE", &secrets_s),
         ("INTENTD_GITHUB_LOGIN_BASE_URI", &mock.base_uri),
         ("INTENTD_GITHUB_API_BASE_URI", &mock.base_uri),
         ("GITHUB_TOKEN", OWNER_TOKEN),
+        ("INTENTD_TAILCAT_BIN", &no_tailcat),
     ];
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon { child };
@@ -1903,7 +1855,28 @@ async fn members_list_attaches_the_owner_identity_over_wss() {
         .expect("workspace id")
         .to_string();
 
-    // This daemon has no tunnel sidecar (no INTENTD_TAILCAT_BIN), so an
+    // UDS/WSS readiness alone does not establish completion of tunnel startup.
+    // Wait for either terminal boot outcome before testing the same refusal.
+    timeout(common::daemon_startup_timeout(), async {
+        loop {
+            let log = std::fs::read_to_string(data_dir.join("daemon.log"))
+                .expect("read tunnel startup receipt");
+            if log.contains("tailcat tunnel auto-started at boot") {
+                eprintln!("fixture tunnel startup: ready");
+                break;
+            }
+            if log.contains("INTENTD_TAILCAT_BIN override points at a missing binary") {
+                eprintln!("fixture tunnel startup: absent override");
+                break;
+            }
+            // timing-guard: poll the daemon's terminal tunnel startup receipt
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("tunnel startup did not settle");
+
+    // This daemon explicitly selects an absent tunnel sidecar, so an
     // invite link is not mintable: `workspace.invite.create` is refused with
     // the dedicated `tunnel-down` error and nothing is stored. This is NOT
     // the listener-down error (the listener IS up — we are talking to it).
@@ -1916,7 +1889,10 @@ async fn members_list_attaches_the_owner_identity_over_wss() {
     .await;
     assert_eq!(v["jsonrpc"], json!("2.0"));
     assert_eq!(v["id"], json!(20));
-    assert!(v.get("result").is_none(), "invite.create must fail: {v}");
+    assert!(
+        v.get("result").is_none(),
+        "invite.create must fail (response payload withheld)"
+    );
     assert_eq!(v["error"]["code"], json!(-32603), "{v}");
     assert_eq!(v["error"]["data"]["code"], json!("tunnel-down"), "{v}");
     let msg = v["error"]["message"].as_str().expect("error message");
