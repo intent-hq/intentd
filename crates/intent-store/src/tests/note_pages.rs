@@ -2669,7 +2669,7 @@ async fn artifact_begin_rejects_bad_integrity_and_source_deadline_without_chargi
         .begin_note_artifact_journal("alice", "pages", &request, artifact_retention(&request))
         .await
         .unwrap();
-    drop(store);
+    store.close().await;
     let restarted = Store::open(&temporary.path).await.unwrap();
     restarted
         .configure_note_artifact_arena(&temporary.path.with_extension("artifacts.sqlite"), 1024)
@@ -3041,6 +3041,7 @@ async fn artifact_record_reads_reject_abort_source_change_and_restart() {
                 store.update_note(&note).await.unwrap();
             }
             "restart" => {
+                store.close().await;
                 let restarted = crate::Store::open(&temporary.path).await.unwrap();
                 restarted
                     .configure_note_artifact_arena(
@@ -3278,7 +3279,7 @@ async fn artifact_publication_revalidates_source_after_private_seal() {
             .unwrap(),
         0
     );
-    drop(store);
+    store.close().await;
     let restarted = Store::open(&temporary.path).await.unwrap();
     restarted
         .configure_note_artifact_arena(&temporary.path.with_extension("artifacts.sqlite"), 1024)

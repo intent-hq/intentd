@@ -4,7 +4,10 @@ use super::{db_error, invalid, ArtifactSourceGrant};
 use crate::Store;
 use intent_core::{Error, Result};
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode, SqlitePoolOptions,
+        SqliteSynchronous,
+    },
     Sqlite, SqlitePool, Transaction,
 };
 use std::path::{Path, PathBuf};
@@ -90,6 +93,7 @@ impl Store {
                     .filename(&normalized)
                     .create_if_missing(true)
                     .foreign_keys(true)
+                    .locking_mode(SqliteLockingMode::Exclusive)
                     .journal_mode(SqliteJournalMode::Delete)
                     .synchronous(SqliteSynchronous::Full)
                     .pragma("page_size", "4096")
@@ -99,26 +103,34 @@ impl Store {
                 // readers can extend rollback-journal lifetimes behind the owner.
                 let pool = SqlitePoolOptions::new()
                     .max_connections(1)
+                    .idle_timeout(None)
+                    .max_lifetime(None)
                     .connect_with(options)
                     .await
                     .map_err(db_error)?;
                 let initialize = async {
+                    // Retain the physical file lock for this connection's
+                    // lifetime. A second Store/process cannot install another
+                    // reader/writer owner behind the single-connection budget.
+                    let mut tx = pool.begin_with("BEGIN EXCLUSIVE").await.map_err(db_error)?;
+                    let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+                        .fetch_one(&mut *tx).await.map_err(db_error)?;
+                    if page_size != 4096 { return Err(invalid()); }
                     let actual: i64 = sqlx::query_scalar("PRAGMA max_page_count")
-                        .fetch_one(&pool)
+                        .fetch_one(&mut *tx)
                         .await
                         .map_err(db_error)?;
                     if actual != i64::from(max_pages) {
                         return Err(invalid());
                     }
                     let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-                        .fetch_one(&pool)
+                        .fetch_one(&mut *tx)
                         .await
                         .map_err(db_error)?;
                     if version == 0 {
                         let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-                            .fetch_one(&pool).await.map_err(db_error)?;
+                            .fetch_one(&mut *tx).await.map_err(db_error)?;
                         if tables != 0 { return Err(invalid()); }
-                        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(db_error)?;
                         sqlx::raw_sql(include_str!("artifact_arena.sql"))
                             .execute(&mut *tx)
                             .await
@@ -129,13 +141,13 @@ impl Store {
                             .execute(&mut *tx)
                             .await
                             .map_err(db_error)?;
-                        tx.commit().await.map_err(db_error)?;
                     } else if version != 1 {
                         return Err(Error::Internal("Unsupported artifact arena schema".into()));
                     }
                     let owner: (String, i64) = sqlx::query_as("SELECT backend_id,max_pages FROM note_artifact_arena_owner WHERE singleton=1")
-                        .fetch_one(&pool).await.map_err(db_error)?;
+                        .fetch_one(&mut *tx).await.map_err(db_error)?;
                     if owner != (self.note_pages.backend.clone(), i64::from(max_pages)) { return Err(invalid()); }
+                    tx.commit().await.map_err(db_error)?;
                     Ok(())
                 }
                 .await;
@@ -167,6 +179,71 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn artifact_arena_rejects_second_live_connection_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let main_path = directory.path().join("main.sqlite");
+        let arena_path = directory.path().join("arena.sqlite");
+        let first = Store::open(&main_path).await.unwrap();
+        first
+            .configure_note_artifact_arena(&arena_path, 64)
+            .await
+            .unwrap();
+        let second = Store::open(&main_path).await.unwrap();
+        let duplicate = second.configure_note_artifact_arena(&arena_path, 64).await;
+        first.close().await;
+        assert!(
+            duplicate.is_err(),
+            "two independent arena pools admitted against one physical file"
+        );
+        // A failed acquisition must not poison OnceCell or retain a file lock.
+        second
+            .configure_note_artifact_arena(&arena_path, 64)
+            .await
+            .unwrap();
+        second.close().await;
+    }
+
+    #[tokio::test]
+    async fn artifact_arena_rejects_changed_database_page_geometry() {
+        let directory = tempfile::tempdir().unwrap();
+        let main_path = directory.path().join("main.sqlite");
+        let arena_path = directory.path().join("arena.sqlite");
+        let store = Store::open(&main_path).await.unwrap();
+        store
+            .configure_note_artifact_arena(&arena_path, 64)
+            .await
+            .unwrap();
+        store.close().await;
+        let outside = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&arena_path)
+                    .pragma("page_size", "8192"),
+            )
+            .await
+            .unwrap();
+        sqlx::query("VACUUM").execute(&outside).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA page_size")
+                .fetch_one(&outside)
+                .await
+                .unwrap(),
+            8192
+        );
+        outside.close().await;
+        let reopened = Store::open(&main_path).await.unwrap();
+        let changed = reopened
+            .configure_note_artifact_arena(&arena_path, 64)
+            .await;
+        reopened.close().await;
+        assert!(
+            changed.is_err(),
+            "page-count allowance silently accepted twice the database bytes"
+        );
+    }
 
     #[tokio::test]
     async fn artifact_arena_owns_journals_without_capping_main() {
