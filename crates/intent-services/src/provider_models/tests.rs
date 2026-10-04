@@ -2088,7 +2088,7 @@ fn exit_attribution_rewrites_generic_errors_on_unsuccessful_exit() {
 async fn probe_preserves_npm_missing_package_cause_before_boilerplate() {
     use super::probe::{run_acp_probe, AcpProbeCommand};
     // Reproduce the captured npm output without invoking npm or touching a cache.
-    let script = r#"cat >&2 <<'STDERR'
+    let script = r"cat >&2 <<'STDERR'
 npm error code ENOENT
 npm error syscall open
 npm error path /Users/clement/.npm/_npx/39d488c67d3fe4d0/package.json
@@ -2098,7 +2098,7 @@ npm error enoent This is related to npm not being able to find a file.
 npm error enoent
 npm error A complete log of this run can be found in: /Users/clement/.npm/_logs/2026-10-04T23_21_43_314Z-debug-0.log
 STDERR
-exit 254"#;
+exit 254";
     let cmd = AcpProbeCommand::binary("/bin/sh".into(), vec!["-c".into(), script.into()]);
     let fetch = finish("codex", run_acp_probe(cmd, |_| Vec::new()).await);
     assert!(fetch.models.is_none());

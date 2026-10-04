@@ -893,6 +893,7 @@ pub(crate) fn exited_detail(
 /// This is an excerpt of the connection's recent stderr, not a diagnosis: npm
 /// ENOENT can mean a missing shell, package file, or many other things.
 fn stderr_excerpt(stderr: &[String]) -> Option<String> {
+    const TRUNCATED: &str = "\n[stderr truncated]\n";
     let joined = stderr
         .iter()
         .map(|line| line.trim())
@@ -906,7 +907,6 @@ fn stderr_excerpt(stderr: &[String]) -> Option<String> {
     if count <= STDERR_EXCERPT_MAX_CHARS {
         return Some(joined);
     }
-    const TRUNCATED: &str = "\n[stderr truncated]\n";
     let available = STDERR_EXCERPT_MAX_CHARS - TRUNCATED.chars().count();
     let head_chars = available / 2;
     let tail_chars = available - head_chars;
@@ -975,7 +975,7 @@ mod diagnostic_tests {
     #[test]
     fn excerpts_within_budget_preserve_all_lines_and_unicode() {
         assert_eq!(
-            stderr_excerpt(&["  first  ".into(), "".into(), "最後 🦀".into()]),
+            stderr_excerpt(&["  first  ".into(), String::new(), "最後 🦀".into()]),
             Some("first\n最後 🦀".into())
         );
         for length in [4_095, 4_096] {
