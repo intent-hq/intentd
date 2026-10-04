@@ -876,6 +876,7 @@ jobs:
         if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'Windows'
         shell: bash
         env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_DIAGNOSTIC_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
         run: |
           set -euo pipefail
@@ -894,6 +895,7 @@ jobs:
         if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'macOS'
         shell: bash
         env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_DIAGNOSTIC_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
         run: |
           set -euo pipefail
