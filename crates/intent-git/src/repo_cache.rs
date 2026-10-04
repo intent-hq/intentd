@@ -27,6 +27,8 @@
 //! offered via the env-backed github.com-scoped credential helper
 //! ([`crate::auth::token_helper_config`]) — never argv.
 
+pub mod qualified;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

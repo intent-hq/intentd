@@ -1497,3 +1497,179 @@ async fn completed_descriptor_change_quarantines_all_stored_consumers_without_re
         );
     }
 }
+
+async fn checkout_full_instance_fixture(server: &Server) -> Fixture {
+    let f = Fixture::uninstalled(server).await;
+    f.registry
+        .apply(&[
+            (
+                "sourceControl.gitlab.host".into(),
+                json!("gitlab.test:8443"),
+            ),
+            (
+                "sourceControl.gitlab.instanceBaseUrl".into(),
+                json!("https://gitlab.test:8443/Forge"),
+            ),
+        ])
+        .unwrap();
+    let fixtures = [
+        "https://gitlab.test:8443/Forge",
+        "https://gitlab.test:8443/Other",
+    ]
+    .map(|root| {
+        GitlabDescriptor::with_loopback_endpoint(
+            GitlabInstance::parse(root).unwrap(),
+            server.host.base_url(),
+        )
+        .unwrap()
+    });
+    f.services
+        .initialize_repository_test_fixtures(fixtures.into())
+        .await
+        .unwrap();
+    f
+}
+
+fn checkout_target(f: &Fixture, root: &str) -> GitlabHost {
+    let crate::source_control_auth_ops::Target::Gitlab { host } = f
+        .services
+        .resolve_source_control_target_for_instance("gitlab", Some("gitlab.test:8443"), Some(root))
+        .unwrap()
+    else {
+        panic!("GitLab target");
+    };
+    host
+}
+
+#[intent_test_macros::daemon_test]
+async fn checkout_public_full_instance_replacement_retires_previous_prefix() {
+    let server = Server::new().await;
+    let f = checkout_full_instance_fixture(&server).await;
+    let original = f.services.gitlab_repository_settled_connection().unwrap();
+    let target = checkout_target(&f, "https://gitlab.test:8443/Other");
+    assert_eq!(target.logical_base_url(), "https://gitlab.test:8443/Other");
+    assert_eq!(
+        target.base_url(),
+        server.host.base_url(),
+        "transport mapping does not replace identity"
+    );
+    f.services
+        .gitlab_connect_pat(target.clone(), "pat-second".into())
+        .await
+        .unwrap();
+    assert!(original.reobserve().is_err());
+    let current = f.services.gitlab_repository_settled_connection().unwrap();
+    assert_eq!(
+        current.descriptor().instance().as_str(),
+        target.logical_base_url()
+    );
+    assert_eq!(current.selected().binding.account.account_id, "43");
+    assert_eq!(
+        f.registry.get("sourceControl.gitlab.instanceBaseUrl"),
+        Some(json!("https://gitlab.test:8443/Other"))
+    );
+    assert_eq!(
+        f.registry.get("sourceControl.gitlab.host"),
+        Some(json!("gitlab.test:8443"))
+    );
+    let old = checkout_target(&f, "https://gitlab.test:8443/Forge");
+    assert!(
+        f.services.own_gitlab_token(&old).await.is_none(),
+        "old prefix cannot borrow the new token"
+    );
+    assert_eq!(
+        f.services.own_gitlab_token(&target).await.as_deref(),
+        Some("pat-second")
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn checkout_late_pat_cannot_publish_after_same_host_prefix_settings_change() {
+    let server = Server::new().await;
+    let f = checkout_full_instance_fixture(&server).await;
+    let old = checkout_target(&f, "https://gitlab.test:8443/Forge");
+    let before = std::fs::read(f.services.gitlab_secret_store.path()).unwrap();
+    *server.control.pause.lock().unwrap() = Some("/api/v4/user");
+    let connect = f.services.gitlab_connect_pat(old, "late-pat".into());
+    tokio::pin!(connect);
+    tokio::select! { result = &mut connect => panic!("expected pending validation: {result:?}"), () = server.entered() => {} }
+    f.services.settings_update(json!([{"path":"sourceControl.gitlab.instanceBaseUrl","value":"https://gitlab.test:8443/Other"}])).await.unwrap();
+    server.control.release.notify_one();
+    assert!(connect.await.is_err());
+    assert_eq!(
+        std::fs::read(f.services.gitlab_secret_store.path()).unwrap(),
+        before
+    );
+    assert!(
+        f.services.gitlab_repository_settled_connection().is_err(),
+        "metadata transition does not adopt old credential"
+    );
+    assert_eq!(
+        f.registry.get("sourceControl.gitlab.instanceBaseUrl"),
+        Some(json!("https://gitlab.test:8443/Other"))
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn checkout_device_start_and_cancel_keep_full_instance_identity() {
+    let server = Server::new().await;
+    let f = checkout_full_instance_fixture(&server).await;
+    let first = checkout_target(&f, "https://gitlab.test:8443/Forge");
+    let other = checkout_target(&f, "https://gitlab.test:8443/Other");
+    *server.control.pause.lock().unwrap() = Some("/oauth/authorize_device");
+    let start = f.services.gitlab_connect_device(first.clone());
+    tokio::pin!(start);
+    tokio::select! { result = &mut start => panic!("expected pending startup: {result:?}"), () = server.entered() => {} }
+    assert_eq!(
+        f.services.gitlab_cancel_auth(&other).await.unwrap()["cancelled"],
+        false
+    );
+    assert_eq!(
+        f.services.gitlab_cancel_auth(&first).await.unwrap()["cancelled"],
+        true
+    );
+    server.control.release.notify_one();
+    assert!(start.await.is_err());
+    assert!(f.services.gitlab_auth.lock().await.flow.is_none());
+    assert_eq!(
+        f.services
+            .gitlab_secret_store
+            .load(SECRET_ACCOUNT)
+            .unwrap()
+            .as_deref(),
+        Some("stored-pat")
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn checkout_explicit_root_rejects_identity_substitution_before_http() {
+    let server = Server::new().await;
+    let f = checkout_full_instance_fixture(&server).await;
+    let before = server.control.requests.lock().unwrap().len();
+    for root in [
+        "http://gitlab.test:8443/Forge",
+        "https://other.test:8443/Forge",
+        "https://user@gitlab.test:8443/Forge",
+        "https://gitlab.test:8443/Forge/../Other",
+    ] {
+        assert!(
+            f.services
+                .resolve_source_control_target_for_instance(
+                    "gitlab",
+                    Some("gitlab.test:8443"),
+                    Some(root)
+                )
+                .is_err(),
+            "{root}"
+        );
+    }
+    assert!(f
+        .services
+        .resolve_source_control_target_for_instance(
+            "github",
+            None,
+            Some("https://gitlab.test:8443/Forge")
+        )
+        .is_err());
+    assert_eq!(server.control.requests.lock().unwrap().len(), before);
+}
