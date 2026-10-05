@@ -123,7 +123,9 @@ pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 pub use transfer_repo::TRANSFER_TABLES;
 pub use usage_rate_repo::{UsageRateDelta, UsageRateRow};
 pub use usage_stats_repo::{LocalStamp, UsageStatsDelta, UsageStatsRow};
-pub use workspace_repo::{RepositoryWorkspaceDeleteDisposition, RepositoryWorkspaceDeleteOutcome};
+pub use workspace_repo::{
+    RepositoryWorkspaceDeleteDisposition, RepositoryWorkspaceDeleteOutcome, WorkspaceContentClock,
+};
 
 /// Total retry window for the `SQLITE_BUSY` retry helpers (monorepo#1139).
 const BUSY_RETRY_DEADLINE: Duration = Duration::from_secs(30);

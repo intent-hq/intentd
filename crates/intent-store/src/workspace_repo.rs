@@ -7,6 +7,7 @@ use intent_core::{
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
+use std::collections::{HashMap, HashSet};
 
 use crate::agent_repo::{
     delete_in_bounded_batches, fetch_agent_usage_rows, DELETE_CASCADE_BATCH,
@@ -67,7 +68,57 @@ pub(crate) fn clear_workspace_unread_if_all_seen_sql() -> String {
     )
 }
 
+/// Timestamp-only projection for automatic workspace checks. Kept independent
+/// of mutable workspace/PR bookkeeping and content payloads.
+pub struct WorkspaceContentClock {
+    pub created_at: String,
+    pub last_content_activity: Option<String>,
+}
+
 impl Store {
+    /// Read content clocks for distinct requested IDs in bounded SQL batches.
+    ///
+    /// # Errors
+    /// Returns an internal error if the metadata query fails.
+    pub async fn workspace_content_clocks(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<HashMap<WorkspaceId, WorkspaceContentClock>> {
+        let ids: Vec<_> = workspace_ids
+            .iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut clocks = HashMap::with_capacity(ids.len());
+        for batch in ids.chunks(400) {
+            let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT id, created_at, last_content_activity FROM workspace WHERE id IN (",
+            );
+            let mut separated = query.separated(", ");
+            for id in batch {
+                separated.push_bind(&id.0);
+            }
+            separated.push_unseparated(")");
+            let rows = query
+                .build()
+                .fetch_all(&self.read_pool)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("workspace content clocks read failed: {e}"))
+                })?;
+            for row in rows {
+                clocks.insert(
+                    WorkspaceId(col(&row, "id")?),
+                    WorkspaceContentClock {
+                        created_at: col(&row, "created_at")?,
+                        last_content_activity: col(&row, "last_content_activity")?,
+                    },
+                );
+            }
+        }
+        Ok(clocks)
+    }
+
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     ///
     /// # Errors

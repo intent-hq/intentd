@@ -2534,11 +2534,11 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "prMonitor.pollSeconds",
             "PR monitor poll seconds",
-            "Tick cadence (in seconds) of the centralized loop and the per-PR poll interval floor (minimum 10)",
+            "Tick cadence (in seconds) of the centralized loop and the active PR poll interval floor (minimum 10). Idle workspaces back off to 2/5/10/15 minutes after 15 minutes/1 hour/6 hours/24 hours without content work; slower configured intervals still apply",
             "prMonitor",
             Some(10.0),
             Some(3_600.0),
-            30.0,
+            60.0,
         ),
         number(
             "prMonitor.hourlyRequestBudget",
@@ -7031,7 +7031,7 @@ mod tests {
 
     /// `[prMonitor]` exposes five TOML-backed numbers: `maxPerAgent`
     /// (default 5, floor 1, max 100), `debounceSeconds`
-    /// (default 60, floor 10), `pollSeconds` (default 30, floor 10),
+    /// (default 60, floor 10), `pollSeconds` (default 60, floor 10),
     /// `hourlyRequestBudget` (default 1500, floor 60, max 5000) and
     /// `quotaSharePercent` (default 50, floor 1, max 100) — the latter
     /// three are config-file keys the Settings UI does not surface. All
@@ -7042,7 +7042,7 @@ mod tests {
         for (path, default, floor) in [
             ("prMonitor.maxPerAgent", 5.0, 1.0),
             ("prMonitor.debounceSeconds", 60.0, 10.0),
-            ("prMonitor.pollSeconds", 30.0, 10.0),
+            ("prMonitor.pollSeconds", 60.0, 10.0),
             ("prMonitor.hourlyRequestBudget", 1500.0, 60.0),
             ("prMonitor.quotaSharePercent", 50.0, 1.0),
         ] {
@@ -7131,7 +7131,7 @@ mod tests {
         for (path, default, updated, rejected) in [
             ("prMonitor.maxPerAgent", 5.0, 55, 0),
             ("prMonitor.debounceSeconds", 60.0, 120, 5),
-            ("prMonitor.pollSeconds", 30.0, 120, 5),
+            ("prMonitor.pollSeconds", 60.0, 120, 5),
             ("prMonitor.hourlyRequestBudget", 1500.0, 120, 5),
             ("prMonitor.quotaSharePercent", 50.0, 25, 0),
         ] {
