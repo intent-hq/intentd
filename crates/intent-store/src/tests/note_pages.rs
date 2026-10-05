@@ -16,6 +16,8 @@ mod artifact_crash;
 mod artifact_pins;
 mod artifact_response;
 mod canonical_source;
+mod marker_source_capture;
+mod marker_upload_capture;
 mod mutation;
 mod plain_far_capture;
 mod plain_source_capture;

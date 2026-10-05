@@ -1,6 +1,6 @@
 //! Explicit fresh lexical capture. The frontend supplies native capture later.
 use super::{record_source_window_closure, setup};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::io::Write as _;
 
 #[tokio::test]

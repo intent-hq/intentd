@@ -5,7 +5,7 @@ use intent_core::{
     note_stage::{NoteStageBegin, NoteStageSeal},
     note_stage_read::NoteStageRead,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{collections::BTreeSet, io::Write as _};
 
 #[tokio::test]
@@ -52,16 +52,9 @@ async fn replay_actual_frontend_marker_upload_and_capture_source_lifecycle() {
                 let lexical = &source["calls"][0]["response"];
                 assert_eq!(json!(typed.scope()), lexical["scope"]);
                 assert_eq!(typed.header.base_revision, lexical["sourceRevision"]);
-                let original_expiry = time::OffsetDateTime::parse(
-                    lexical["expiresAt"].as_str().unwrap(),
-                    &time::format_description::well_known::Rfc3339,
-                )
-                .unwrap();
-                let staged_expiry = time::OffsetDateTime::parse(
-                    &typed.expires_at,
-                    &time::format_description::well_known::Rfc3339,
-                )
-                .unwrap();
+                let original_expiry =
+                    intent_core::parse_iso(lexical["expiresAt"].as_str().unwrap()).unwrap();
+                let staged_expiry = intent_core::parse_iso(&typed.expires_at).unwrap();
                 assert!(
                     staged_expiry <= original_expiry,
                     "stage must not extend original lexical lifetime; shorter/truncated deadlines are allowed"
