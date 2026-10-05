@@ -340,6 +340,13 @@ fn classify(src: &str) -> Vec<Offense> {
                 });
                 active = Some(name);
             }
+            // GuardedChild owns most real fixture launches; a later reset must
+            // not retroactively sanitize the environment that was already spawned.
+            if matches_at(&tokens, i, &["spawn", "(", "&", "mut"]) {
+                if let Some(command) = tokens.get(i + 4).and_then(|t| commands.get(&t.text)) {
+                    command.report(&mut offenses);
+                }
+            }
             if matches_at(&tokens, i, &["spawn_command", "("]) {
                 if let Some(command) = tokens.get(i + 2).and_then(|t| commands.get(&t.text)) {
                     command.report(&mut offenses);
@@ -879,6 +886,14 @@ cmd.env("GH_TOKEN", "synthetic").env_clear();"##;
 cmd.env("INTENTD_BIN", env!("CARGO_BIN_EXE_intentd"));
 pair.slave.spawn_command(cmd);
 common::hermetic_pty_fixture_identity(&mut cmd, &d);"#;
+        assert_eq!(classify(src), vec![Offense::IncompleteIdentity { line: 2 }]);
+    }
+    #[test]
+    fn guarded_spawn_must_observe_identity_before_a_later_reset() {
+        let src = r#"let mut cmd = common::hermetic_serve_command(&d);
+cmd.env_clear();
+let child = GuardedChild::spawn(&mut cmd);
+common::hermetic_fixture_identity(&mut cmd, &d);"#;
         assert_eq!(classify(src), vec![Offense::IncompleteIdentity { line: 2 }]);
     }
 }
