@@ -434,3 +434,132 @@ async fn staged_real_commit_accepts_large_logical_replacement_across_upload_chun
             .unwrap();
     assert!(pieces > 1);
 }
+
+async fn provenance_tree(store: &Store, receipt: &Value, reference: &str) -> (Value, Vec<Value>) {
+    fn resolve(node: &Value, nodes: &std::collections::BTreeMap<String, Value>) -> Value {
+        if node["type"] != "object" {
+            assert!(matches!(node["type"].as_str(), Some("string" | "number")));
+            return node["value"].clone();
+        }
+        let mut out = serde_json::Map::new();
+        for child in nodes
+            .values()
+            .filter(|child| child["parentId"] == node["id"])
+        {
+            assert!(out
+                .insert(child["key"].as_str().unwrap().into(), resolve(child, nodes))
+                .is_none());
+        }
+        Value::Object(out)
+    }
+    let mut pending = vec![reference.to_owned()];
+    let mut nodes = std::collections::BTreeMap::new();
+    let mut transcript = Vec::new();
+    while let Some(reference) = pending.pop() {
+        let mut request = query(receipt, ReceiptDetailKind::Detail, &reference);
+        loop {
+            let page = read(store, &request).await;
+            assert_eq!(page["headerDigest"], receipt["headerDigest"]);
+            assert_eq!(page["viewId"], receipt["viewId"]);
+            for item in page["items"].as_array().unwrap() {
+                assert!(item.get("valueRef").is_none(), "fixture scalars are inline");
+                if let Some(children) = item["childrenRef"].as_str() {
+                    pending.push(children.into());
+                }
+                assert!(nodes
+                    .insert(item["id"].as_str().unwrap().to_owned(), item.clone())
+                    .is_none());
+            }
+            transcript.push(json!({"normalizedRequest":request,"cursor":request.cursor,"offset":request.offset,"response":page}));
+            let Some(next) = page["nextCursor"].as_str() else {
+                break;
+            };
+            assert_ne!(request.cursor.as_deref(), Some(next));
+            request.cursor = Some(next.into());
+        }
+    }
+    assert_eq!(nodes.len(), 15, "complete expected provenance graph");
+    let roots: Vec<_> = nodes
+        .values()
+        .filter(|node| node["parentId"].is_null())
+        .collect();
+    assert_eq!(roots.len(), 1);
+    (resolve(roots[0], &nodes), transcript)
+}
+
+#[tokio::test]
+async fn staged_receipt_noncontiguous_groups_reconstruct_complete_provenance() {
+    let (store, _tmp, _note) = setup("ab😀cd").await;
+    let request = capture(
+        &store,
+        3,
+        &[("upper-b", "B"), ("upper-c", "C"), ("bang", "!")],
+        vec![
+            dirty(1, 0, 1, 2, &reference("upper-b", "B")),
+            dirty(3, 0, 4, 5, &reference("upper-c", "C")),
+            dirty(3, 1, 6, 6, &reference("bang", "!")),
+        ],
+        vec![],
+    )
+    .await;
+    let mut write = writer(&store, &request).await;
+    assert_eq!(write.source(), "aB😀Cd!");
+    write
+        .persist_source(
+            &NoteVersionAuthor {
+                id: "alice".into(),
+                name: "Alice".into(),
+                author_type: "user".into(),
+            },
+            &intent_core::now_iso(),
+        )
+        .await
+        .unwrap();
+    write.publish_annotation_anchors(&[]).await.unwrap();
+    let receipt = write.commit().await.unwrap();
+    let rows = undo_groups(&store, &receipt, "aB😀Cd!", &["aB😀cd", "ab😀cd"]).await;
+    assert_eq!(rows.len(), 3);
+    let mut transcripts = Vec::new();
+    for (index, (group, ordinal, start, end, prior_start, prior_end, text)) in [
+        ("3", 0, 4, 5, 4, 5, "c"),
+        ("3", 1, 6, 7, 6, 6, ""),
+        ("1", 0, 1, 2, 1, 2, "b"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let row = &rows[index];
+        assert_eq!(row["historyGroup"], group);
+        assert_eq!(row["ordinal"], ordinal);
+        assert_eq!(row["start"], start);
+        assert_eq!(row["end"], end);
+        assert_eq!(
+            inverse_text(&store, &receipt, &row["replacement"]).await,
+            text
+        );
+        let (tree, pages) =
+            provenance_tree(&store, &receipt, row["provenanceRef"].as_str().unwrap()).await;
+        assert_eq!(
+            tree,
+            json!({"kind":"sourceProvenance","inputState":row["inputState"],"outputState":row["outputState"],"baseRange":{"start":prior_start,"end":prior_end},"finalRange":{"start":start,"end":end},"replacement":row["replacement"]})
+        );
+        transcripts
+            .push(json!({"inverse":row,"rawReplacement":text,"provenance":tree,"pages":pages}));
+    }
+    let effects = read(
+        &store,
+        &query(
+            &receipt,
+            ReceiptDetailKind::Effects,
+            receipt["effectsRef"].as_str().unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(effects["nextCursor"], Value::Null);
+    assert_eq!(effects["items"].as_array().unwrap().len(), 1);
+    assert_eq!(effects["items"][0]["kind"], "annotationInvalidation");
+    eprintln!(
+        "STAGED_RECEIPT_PRODUCER_CAPTURE={}",
+        json!({"base":"ab😀cd","capturedGroups":[1,3],"final":"aB😀Cd!","receipt":receipt,"effects":effects,"transcripts":transcripts})
+    );
+}
