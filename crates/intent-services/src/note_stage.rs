@@ -191,6 +191,44 @@ impl Services {
         self.stage_authorize(&workspace).await?;
         state_at_return(result?)
     }
+    pub(crate) async fn read_stage_source(
+        &self,
+        request: intent_core::note_stage_read::NoteStageRead,
+        rpc_id: Value,
+    ) -> Result<Value> {
+        request.validate().map_err(Error::NoteMutation)?;
+        let workspace = WorkspaceId(request.workspace_id.clone());
+        let _workspace = self.workspace_mutations.enter(&workspace)?;
+        let principal = principal()?;
+        let _admission = self.stage_request_admission.enter(
+            &principal,
+            &request.scope(),
+            &request.operation_id,
+            None,
+        )?;
+        self.stage_authorize(&workspace).await?;
+        let result = self
+            .store
+            .read_note_stage_source(&principal, &request, &rpc_id)
+            .await;
+        #[cfg(test)]
+        boundary_tests::after_store(&result).await;
+        self.stage_authorize(&workspace).await?;
+        let value = result?;
+        let expiry = value["expiresAt"]
+            .as_str()
+            .and_then(intent_core::parse_iso)
+            .ok_or_else(|| Error::NotePage(intent_core::note_page::NotePageError::CursorInvalid))?;
+        let now = time::OffsetDateTime::now_utc();
+        #[cfg(test)]
+        let now = boundary_tests::return_now(now);
+        if expiry <= now {
+            return Err(Error::NotePage(
+                intent_core::note_page::NotePageError::Expired,
+            ));
+        }
+        Ok(value)
+    }
     pub(crate) async fn cancel_note_stage(&self, request: NoteStageCancel) -> Result<Value> {
         request.validate().map_err(Error::NoteMutation)?;
         let workspace = WorkspaceId(request.workspace_id.clone());

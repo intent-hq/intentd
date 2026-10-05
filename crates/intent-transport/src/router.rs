@@ -859,6 +859,18 @@ async fn dispatch_note_receipt(
             .await
             .map_err(bounded_note_operation_error);
     }
+    if method == "note.operation.read" && params.contains_key("headerDigest") {
+        let request: intent_core::note_stage_read::NoteStageRead =
+            serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|_| invalid_params("Invalid staged output request"))?;
+        request
+            .validate()
+            .map_err(|e| domain_to_rpc(Error::NoteMutation(e)))?;
+        return api
+            .read_note_stage_source(request, id.clone())
+            .await
+            .map_err(bounded_note_operation_error);
+    }
     let query = match method {
         "note.operation.read" => {
             let request: intent_core::note_receipt_detail::NoteOperationReceiptRead =

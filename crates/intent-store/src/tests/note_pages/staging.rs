@@ -588,3 +588,176 @@ async fn stage_seal_incomplete_reference_can_be_completed_without_partial_view()
     assert_eq!(retained[1].1, Some(0));
     assert!(retained[1].2.is_some());
 }
+
+fn source_request(begin: &NoteStageBegin) -> intent_core::note_stage_read::NoteStageRead {
+    serde_json::from_value(json!({"backendId":begin.backend_id,"workspaceId":begin.workspace_id,"noteId":begin.note_id,"noteInstanceId":begin.note_instance_id,"operationId":begin.operation_id,"headerDigest":begin.header_digest,"kind":"source","maxSourceBytes":8192,"maxWireBytes":4096})).unwrap()
+}
+
+#[tokio::test]
+async fn staged_source_output_is_exact_bounded_immutable_and_cursor_owned() {
+    use intent_core::note_page::NotePageError;
+    let source = "A😀\r\n\"\\\u{1}".repeat(2048);
+    let (store, tmp, mut note) = setup(&source).await;
+    let begin = request(&store).await;
+    store.begin_note_stage("alice", &begin).await.unwrap();
+    let seal = seal_request(&store, &begin).await;
+    store.seal_note_stage("alice", &seal).await.unwrap();
+    let mut query = source_request(&begin);
+    let id = json!("\u{1}".repeat(64));
+    let first = store
+        .read_note_stage_source("alice", &query, &id)
+        .await
+        .unwrap();
+    let cursor = first["nextCursor"].as_str().unwrap().to_owned();
+    assert!(!cursor.is_empty());
+    for change in 0..5 {
+        let mut foreign = query.clone();
+        foreign.cursor = Some(cursor.clone());
+        match change {
+            0 => foreign.max_source_bytes = Some(4096),
+            1 => foreign.max_wire_bytes = Some(8192),
+            2 => foreign.max_items = Some(2),
+            3 => foreign.operation_id = uuid::Uuid::new_v4().to_string(),
+            _ => foreign.header_digest = "f".repeat(64),
+        }
+        assert!(matches!(
+            store.read_note_stage_source("alice", &foreign, &id).await,
+            Err(Error::NotePage(NotePageError::CursorInvalid))
+        ));
+    }
+    assert!(matches!(
+        store.read_note_stage_source("bob", &query, &id).await,
+        Err(Error::NotePage(NotePageError::CursorInvalid))
+    ));
+    note.content = "remote replacement".into();
+    store.update_note(&note).await.unwrap();
+    drop(store);
+    let store = Store::open(&tmp.path).await.unwrap();
+    let mut text = String::new();
+    let mut offset = 0_u64;
+    loop {
+        let value = store
+            .read_note_stage_source("alice", &query, &id)
+            .await
+            .unwrap();
+        assert!(
+            json!({"jsonrpc":"2.0","id":id,"result":value})
+                .to_string()
+                .len()
+                <= 4096
+        );
+        assert_eq!(
+            value["sourceLength"],
+            u64::try_from(source.encode_utf16().count()).unwrap()
+        );
+        assert_eq!(value["headerDigest"], begin.header_digest);
+        assert_eq!(value["payloadDigest"], seal.payload_digest);
+        assert_eq!(value["expiresAt"], begin.expires_at);
+        let items = value["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["offset"], offset);
+        let part = items[0]["text"].as_str().unwrap();
+        assert!(!part.is_empty());
+        assert!(part.len() <= 8192);
+        offset += u64::try_from(part.encode_utf16().count()).unwrap();
+        text.push_str(part);
+        query.cursor = value["nextCursor"].as_str().map(str::to_owned);
+        if query.cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(text, source);
+    let cancel = serde_json::from_value(json!({"backendId":begin.backend_id,"workspaceId":begin.workspace_id,"noteId":begin.note_id,"noteInstanceId":begin.note_instance_id,"operationId":begin.operation_id,"headerDigest":begin.header_digest})).unwrap();
+    store.cancel_note_stage("alice", &cancel).await.unwrap();
+    query.cursor = Some(cursor);
+    assert!(matches!(
+        store.read_note_stage_source("alice", &query, &id).await,
+        Err(Error::NotePage(NotePageError::Expired))
+    ));
+}
+
+#[tokio::test]
+async fn staged_source_output_empty_expired_and_missing_pieces_do_not_fake_completion() {
+    use intent_core::note_page::NotePageError;
+    for source in ["", "not empty"] {
+        let (store, _tmp, _note) = setup(source).await;
+        let begin = request(&store).await;
+        store.begin_note_stage("alice", &begin).await.unwrap();
+        let query = source_request(&begin);
+        assert!(store
+            .read_note_stage_source("alice", &query, &json!(1))
+            .await
+            .is_err());
+        let seal = seal_request(&store, &begin).await;
+        store.seal_note_stage("alice", &seal).await.unwrap();
+        let page = store
+            .read_note_stage_source("alice", &query, &json!(1))
+            .await
+            .unwrap();
+        assert!(page["nextCursor"].is_null());
+        assert_eq!(
+            page["items"].as_array().unwrap().is_empty(),
+            source.is_empty()
+        );
+        sqlx::query("DELETE FROM note_stage_view_piece")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        if !source.is_empty() {
+            assert!(store
+                .read_note_stage_source("alice", &query, &json!(1))
+                .await
+                .is_err());
+        }
+        sqlx::query("UPDATE note_operation SET outcome=json_set(outcome,'$.expiresAt','2000-01-01T00:00:00.000Z')").execute(store.write_pool()).await.unwrap();
+        assert!(matches!(
+            store
+                .read_note_stage_source("alice", &query, &json!(1))
+                .await,
+            Err(Error::NotePage(NotePageError::Expired))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn staged_source_output_requires_captured_output_before_hydration() {
+    use intent_core::{
+        note_page::NotePageError,
+        note_stage::{NoteStageOutput, NoteStageSearch, NoteStageSearchMode},
+    };
+    for mode in [NoteStageOutput::SelectionMarkdown, NoteStageOutput::Search] {
+        let (store, _tmp, _note) = setup("must not fall back to whole source").await;
+        let mut begin = request(&store).await;
+        begin.header.output = mode;
+        if mode == NoteStageOutput::Search {
+            begin.header.query = Some(NoteStageSearch {
+                text: "source".into(),
+                case_sensitive: false,
+                mode: NoteStageSearchMode::Source,
+            });
+        }
+        begin.header_digest = begin.computed_digest().unwrap();
+        store.begin_note_stage("alice", &begin).await.unwrap();
+        let seal = seal_request(&store, &begin).await;
+        store.seal_note_stage("alice", &seal).await.unwrap();
+        let query = source_request(&begin);
+        assert!(matches!(
+            store
+                .read_note_stage_source("alice", &query, &json!(1))
+                .await,
+            Err(Error::NotePage(NotePageError::CursorInvalid))
+        ));
+        // Corrupt backing pieces to distinguish pre-hydration selector rejection
+        // from reading source and only then deciding which output was requested.
+        sqlx::query("DELETE FROM note_stage_view_piece")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .read_note_stage_source("alice", &query, &json!(1))
+                .await,
+            Err(Error::NotePage(NotePageError::CursorInvalid))
+        ));
+    }
+}

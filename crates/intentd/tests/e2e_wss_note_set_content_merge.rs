@@ -1777,6 +1777,29 @@ async fn bounded_staged_upload_cancel_and_status_over_wss() {
         wss_rpc(&mut rpc, 22, "note.operationStatus", identity.clone()).await,
         sealed["result"]
     );
+    let mut read = identity.clone();
+    read["kind"] = json!("source");
+    read["maxSourceBytes"] = json!(4);
+    let mut rebuilt = String::new();
+    loop {
+        let frame = wss_rpc_raw(&mut rpc, 23, "note.operation.read", read.clone()).await;
+        assert!(frame.to_string().len() <= 4096);
+        let result = &frame["result"];
+        assert_eq!(result["kind"], "noteOperationPage");
+        assert_eq!(result["sourceLength"], 13);
+        assert_eq!(result["outputKind"], "source");
+        assert_eq!(result["headerDigest"], identity["headerDigest"]);
+        assert_eq!(result["expiresAt"], begin["expiresAt"]);
+        assert_eq!(result["items"][0]["offset"], rebuilt.encode_utf16().count());
+        let text = result["items"][0]["text"].as_str().unwrap();
+        assert!(!text.is_empty() && text.len() <= 4);
+        rebuilt.push_str(text);
+        if result["nextCursor"].is_null() {
+            break;
+        }
+        read["cursor"] = result["nextCursor"].clone();
+    }
+    assert_eq!(rebuilt, page["text"].as_str().unwrap());
     let cancelled = wss_rpc_raw(&mut rpc, 8, "note.operation.cancel", identity.clone()).await;
     assert!(cancelled.to_string().len() <= 4096);
     assert_eq!(cancelled["result"]["phase"], "cancelled");

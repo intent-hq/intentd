@@ -141,6 +141,14 @@ async fn call(service: &Services, method: u8, begin: NoteStageBegin) -> Result<V
             request.payload_digest = request.computed_digest().unwrap();
             service.seal_note_stage(request).await
         }
+        5 => {
+            let mut request = serde_json::to_value(query).unwrap();
+            request.as_object_mut().unwrap().remove("payloadDigest");
+            request["kind"] = json!("source");
+            service
+                .read_stage_source(serde_json::from_value(request).unwrap(), json!(1))
+                .await
+        }
         _ => service.read_note_stage_status(query).await,
     }
 }
@@ -244,7 +252,7 @@ pub(super) async fn before_authorize() {
 }
 #[tokio::test]
 async fn staged_service_admits_before_pending_authorization_and_releases_on_denial() {
-    for method in 0..5 {
+    for method in 0..6 {
         let (_tmp, service, workspace, note) = setup("source").await;
         let caller = guest(&service, &workspace).await;
         let request = begin_request(&service, &workspace, &note).await;
@@ -358,5 +366,77 @@ async fn staged_service_observes_original_expiry_after_store_result() {
             if method == 4 { "sealed" } else { "staging" },
             "only this response clock advanced, no global time or retained state mutation"
         );
+    }
+}
+
+#[tokio::test]
+async fn staged_source_service_rechecks_after_result_and_original_expiry() {
+    for mode in 0..3 {
+        let (_tmp, service, workspace, note) = setup("frozen😀").await;
+        let caller = guest(&service, &workspace).await;
+        let begin = begin_request(&service, &workspace, &note).await;
+        with_caller(caller.clone(), service.begin_note_stage(begin.clone()))
+            .await
+            .unwrap();
+        with_caller(caller.clone(), call(&service, 4, begin.clone()))
+            .await
+            .unwrap();
+        let mut query = serde_json::to_value(query(&begin)).unwrap();
+        query.as_object_mut().unwrap().remove("payloadDigest");
+        query["kind"] = json!("source");
+        if mode == 1 {
+            query["headerDigest"] = json!("f".repeat(64));
+        }
+        let query = serde_json::from_value(query).unwrap();
+        let boundary = Arc::new(Boundary {
+            now: Mutex::new(None),
+            expiry: Mutex::new(None),
+            observed: AtomicU8::new(0),
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let read = BOUNDARY.scope(
+            boundary.clone(),
+            with_caller(caller.clone(), service.read_stage_source(query, json!(1))),
+        );
+        let change = async {
+            boundary.reached.notified().await;
+            assert_eq!(
+                boundary.observed.load(Ordering::SeqCst),
+                if mode == 1 { 3 } else { 1 },
+                "Store result captured before authorization/expiry change"
+            );
+            if mode == 2 {
+                let expiry = boundary.expiry.lock().unwrap().unwrap();
+                assert_eq!(expiry, intent_core::parse_iso(&begin.expires_at).unwrap());
+                *boundary.now.lock().unwrap() = Some(expiry);
+            } else {
+                let Caller::Wire { principal_id, .. } = &caller else {
+                    panic!("wire required")
+                };
+                service
+                    .store
+                    .remove_workspace_member(&workspace, principal_id)
+                    .await
+                    .unwrap();
+            }
+            boundary.release.notify_one();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            tokio::join!(read, change)
+        })
+        .await
+        .unwrap();
+        if mode == 2 {
+            assert!(matches!(
+                result,
+                Err(Error::NotePage(
+                    intent_core::note_page::NotePageError::Expired
+                ))
+            ));
+        } else {
+            assert!(matches!(result, Err(Error::NotFound(_))));
+        }
+        assert!(service.stage_request_admission.0.lock().unwrap().is_empty());
     }
 }

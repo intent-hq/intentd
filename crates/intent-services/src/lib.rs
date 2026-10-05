@@ -25077,6 +25077,13 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(self.seal_note_stage(request))
     }
+    fn read_note_stage_source(
+        &self,
+        request: intent_core::note_stage_read::NoteStageRead,
+        rpc_id: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.read_stage_source(request, rpc_id))
+    }
     fn note_operation_cancel(
         &self,
         request: intent_core::note_stage::NoteStageCancel,

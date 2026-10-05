@@ -9,10 +9,12 @@ use serde_json::{json, Value};
 use sqlx::Row;
 mod append;
 mod freeze;
+mod output;
 mod read;
 mod seal;
 mod source;
 mod status;
+mod view_read;
 mod write;
 fn db(error: impl std::fmt::Display) -> Error {
     Error::Internal(format!("note stage storage: {error}"))
