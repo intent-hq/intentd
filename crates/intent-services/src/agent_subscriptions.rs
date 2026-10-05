@@ -2063,7 +2063,7 @@ impl Services {
         // No-advisory variant: registration-time / boot reconciliation must
         // never fire the monitoring-idle advisory — a deferred idle here
         // leaves the watch armed, exactly as before the advisory existed.
-        self.deliver_completion_to_watches_inner(child_id, &event, false, true, watch_ids)
+        self.deliver_completion_to_watches_inner(child_id, &event, false, true, watch_ids, None)
             .await;
     }
 
