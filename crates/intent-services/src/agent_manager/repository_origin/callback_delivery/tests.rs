@@ -6002,10 +6002,14 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                 .trim(),
             launch_cwd.to_str().unwrap()
         );
-        assert_eq!(
-            std::fs::read_to_string(h.scratch.path().join("cli-versions")).unwrap(),
-            "version\n"
-        );
+        // Launch revalidation observes the selected CLI. On supported hosts,
+        // managed acquisition observes it once more before deferring this
+        // unverified fixture version to the same pinned adapter.
+        let observations = std::fs::read_to_string(h.scratch.path().join("cli-versions")).unwrap();
+        assert!(matches!(
+            observations.as_str(),
+            "version\n" | "version\nversion\n"
+        ));
         let name = h.confirmed(0).await;
         let a = h.call(0, &name, "const a=await ws.mr.snapshot(4); const b=await ws.pr.snapshot(4); if(JSON.stringify(a)!==JSON.stringify(b)) throw Error('alias mismatch'); return a;").await;
         assert!(

@@ -1432,7 +1432,7 @@ while IFS= read -r unexpected; do exit 95; done
         let calls = std::fs::read_to_string(root.join("cli-calls")).unwrap();
         let observations = calls.strip_prefix("auth\nauth\nauth\n").unwrap();
         let observations: Vec<_> = observations.lines().collect();
-        assert!(observations.len() >= 2);
+        assert!((2..=3).contains(&observations.len()));
         assert!(observations.iter().all(|call| *call == "version"));
         assert!(
             !root.join("legacy-ran").exists(),
