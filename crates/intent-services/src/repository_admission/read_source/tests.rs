@@ -585,10 +585,7 @@ impl ReadServer {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         // Only select the disposable endpoint BEFORE original Services creation.
         // Auth/adoption still forwards to the unchanged original owner fixture.
-        fixture.host = intent_sourcecontrol::GitlabHost::parse("gitlab.test")
-            .unwrap()
-            .with_api_origin(&endpoint)
-            .unwrap();
+        fixture.host = fixture.host.clone().with_api_origin(&endpoint).unwrap();
         fixture.descriptor = GitlabDescriptor::with_loopback_endpoint(
             fixture.descriptor.instance().clone(),
             &endpoint,

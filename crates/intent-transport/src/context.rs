@@ -57,6 +57,7 @@ tokio::task_local! {
     /// Queried by `ServerControl::is_tcp_connection()` to enforce safety guards.
     static IS_TCP: RefCell<bool>;
     static READ_CONNECTION: Option<Arc<dyn RepositoryReadConnection>>;
+    static CHECKOUT_FRAME: Option<intent_core::repository_checkout::CheckoutFrame>;
     static RESOURCE_FRAME: Option<intent_core::repository_request::RepositoryResourceFrame>;
     static REVIEW_FRAME: Option<intent_core::repository_request::NativeReviewFrame>;
     static SELECTION_FRAME: Option<intent_core::repository_request::RepositorySelectionFrame>;
@@ -149,9 +150,55 @@ pub(crate) fn with_repository_frame<T>(raw: &str, construct: impl FnOnce() -> T)
                 _ => None,
             }
         });
-    RESOURCE_FRAME.sync_scope(resource, || {
-        REVIEW_FRAME.sync_scope(review, || {
-            SELECTION_FRAME.sync_scope(selection, || REPOSITORY_FRAME.sync_scope(query, construct))
+    let checkout = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| {
+            use intent_core::repository_checkout::CheckoutFrame as Frame;
+            let params = value.get("params")?.clone();
+            match value.get("method")?.as_str()? {
+                "sourceControl.checkout.capture" => {
+                    serde_json::from_value(params).ok().map(Frame::Capture)
+                }
+                "sourceControl.checkout.projects" => {
+                    serde_json::from_value(params).ok().map(Frame::Projects)
+                }
+                "sourceControl.checkout.project" => {
+                    serde_json::from_value(params).ok().map(Frame::Project)
+                }
+                "sourceControl.checkout.branches" => {
+                    serde_json::from_value(params).ok().map(Frame::Branches)
+                }
+                "sourceControl.checkout.warm" => {
+                    serde_json::from_value(params).ok().map(Frame::Warm)
+                }
+                "sourceControl.checkout.release" => {
+                    serde_json::from_value(params).ok().map(Frame::Release)
+                }
+                "git.fetch" => Some(Frame::Fetch(
+                    serde_json::from_value(params.get("workspaceId")?.clone()).ok()?,
+                )),
+                "git.push" => Some(Frame::Push {
+                    workspace_id: serde_json::from_value(params.get("workspaceId")?.clone())
+                        .ok()?,
+                    force: params
+                        .get("force")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                }),
+                "workspace.create" => {
+                    serde_json::from_value(params.get("repositoryCheckout")?.clone())
+                        .ok()
+                        .map(Frame::Create)
+                }
+                _ => None,
+            }
+        });
+    CHECKOUT_FRAME.sync_scope(checkout, || {
+        RESOURCE_FRAME.sync_scope(resource, || {
+            REVIEW_FRAME.sync_scope(review, || {
+                SELECTION_FRAME
+                    .sync_scope(selection, || REPOSITORY_FRAME.sync_scope(query, construct))
+            })
         })
     })
 }
@@ -351,6 +398,11 @@ impl CapturedFrame {
             completion: READ_CONNECTION
                 .try_with(|owner| {
                     owner.as_ref().and_then(|owner| {
+                        if let Some(frame) = CHECKOUT_FRAME.try_with(Clone::clone).ok().flatten() {
+                            return owner
+                                .capture_checkout(&frame)
+                                .map(|scope| Arc::new(RequestCompletion(scope)));
+                        }
                         if let Some(frame) = RESOURCE_FRAME.try_with(Clone::clone).ok().flatten() {
                             return owner
                                 .capture_resource(&frame)

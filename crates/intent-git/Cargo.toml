@@ -1,6 +1,6 @@
 [package]
 name = "intent-git"
-version = "0.10.12"
+version = "0.10.16"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -9,8 +9,11 @@ description = "Git wrappers: status/stage/commit/branches and worktree create + 
 
 [dependencies]
 sha2 = "0.11"
-intent-core = { path = "../intent-core", version = "0.10.12" }
+intent-core = { path = "../intent-core", version = "0.10.16" }
 git2 = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+rustls-native-certs = "0.8"
+tempfile = "3"
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

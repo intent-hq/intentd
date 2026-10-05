@@ -18,7 +18,7 @@ fn configure(mock: &qwen::MockQwen) {
     });
 }
 
-async fn browser_connect(
+pub(super) async fn browser_connect(
     fx: &Fixture,
     origin: &str,
     token: &str,

@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.16] - 2026-10-05
+
+### 🚀 Features
+
+- Prepare detected provider adapters before first launch ([#2292](https://github.com/intent-hq/intentd/pull/2292))
+- Back off GitHub checks for idle workspaces ([#2294](https://github.com/intent-hq/intentd/pull/2294))
+
+### 🐛 Bug Fixes
+
+- Resolve transfer consumer fixtures by physical path ([#2296](https://github.com/intent-hq/intentd/pull/2296))
+- Retain native driver startup failure evidence ([#2295](https://github.com/intent-hq/intentd/pull/2295))
+
+
+## [0.10.15] - 2026-10-05
+
+### 🚀 Features
+
+- Add host-bound GitLab checkout ([#2281](https://github.com/intent-hq/intentd/pull/2281))
+
+### 🐛 Bug Fixes
+
+- Preserve useful adapter failure diagnostics ([#2290](https://github.com/intent-hq/intentd/pull/2290))
+
+
+## [0.10.14] - 2026-10-05
+
+### 🐛 Bug Fixes
+
+- Resume suspend-interrupted turns that fail with provider timeout/terminated errors ([#2288](https://github.com/intent-hq/intentd/pull/2288))
+
+
+## [0.10.13] - 2026-10-04
+
+### 🐛 Bug Fixes
+
+- Avoid transcript reads for chat snapshot activity ([#2282](https://github.com/intent-hq/intentd/pull/2282))
+- Keep structured ACP notices out of assistant replies ([#2285](https://github.com/intent-hq/intentd/pull/2285))
+- Hide agents own pending queue contents ([#2284](https://github.com/intent-hq/intentd/pull/2284))
+
+
 ## [0.10.12] - 2026-10-04
 
 ### 🐛 Bug Fixes

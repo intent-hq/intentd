@@ -2706,6 +2706,7 @@ fn mock_handle() -> AgentHandle {
             _pi_extension: None,
             npx_launch_dir: None,
             managed_profile: None,
+            preparation_guard: None,
             cleanup_lease: None,
             cleanup_services: None,
         }),
@@ -5024,6 +5025,7 @@ fn track_mock_agent_inner(
                 _pi_extension: None,
                 npx_launch_dir: None,
                 managed_profile: None,
+                preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
@@ -5182,6 +5184,7 @@ fn track_mock_agent_prompt_rpc_error_inner(
                 _pi_extension: None,
                 npx_launch_dir: None,
                 managed_profile: None,
+                preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
@@ -9007,6 +9010,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
                 _pi_extension: None,
                 npx_launch_dir: None,
                 managed_profile: None,
+                preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
@@ -20960,6 +20964,7 @@ mod harness_wake_tests {
                 _pi_extension: None,
                 npx_launch_dir: None,
                 managed_profile: None,
+                preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
@@ -21225,6 +21230,56 @@ mod harness_wake_tests {
             "no assistant row persisted"
         );
         assert!(!mgr.is_busy(&id), "slot never claimed");
+    }
+
+    #[tokio::test]
+    async fn structured_notices_while_idle_open_no_turn() {
+        use std::io::{Read, Seek};
+
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let mut log = tempfile::tempfile().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(log.try_clone().unwrap())
+            .finish();
+        let _capture = crate::test_tracing::set_capture_default(subscriber);
+        note_tx
+            .send(intent_acp::IncomingNotification {
+                method: "session/update".into(),
+                params: json!({"sessionId": "idle-session", "update": {
+                    "sessionUpdate": "notice", "severity": "warning", "title": "Idle warning"
+                }}),
+            })
+            .unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        assert!(timeout(Duration::from_millis(50), sub.recv())
+            .await
+            .is_err());
+        assert!(mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!mgr.is_busy(&id));
+        log.rewind().unwrap();
+        let mut diagnostics = String::new();
+        log.read_to_string(&mut diagnostics).unwrap();
+        for expected in [
+            "WARN",
+            "Idle warning",
+            "idle-session",
+            id.as_str(),
+            ws.as_str(),
+        ] {
+            assert!(
+                diagnostics.contains(expected),
+                "missing {expected} in {diagnostics}"
+            );
+        }
     }
 
     /// A title-less `tool_call_update` first-sight (STAB-124 late echo) maps
@@ -21499,7 +21554,7 @@ mod harness_wake_tests {
         };
         {
             let mut guard = notes.lock().await;
-            Services::drain_replay_notifications(&mut guard).await;
+            Services::drain_replay_notifications(&mut guard, &id, Some(&ws)).await;
             assert!(guard.try_recv().is_err(), "replay burst drained");
         }
         gate.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -26653,4 +26708,53 @@ async fn managed_selection_never_falls_back_after_profile_loss() {
         "unmanaged imported history must retain legacy behavior"
     );
     mgr.shutdown().await;
+}
+
+/// A foreground npm process held before ACP initialize, using the real manager
+/// spawn and resource ownership paths. Pi's extension is irrelevant to this race.
+#[cfg(unix)]
+pub(crate) async fn held_preparation_foreground(
+    root: &std::path::Path,
+) -> (AgentManager, AgentId, Services) {
+    use std::os::unix::fs::PermissionsExt;
+    let store = Store::open(&root.join("foreground.db")).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let services = Services::new_with_file_secrets(
+        store,
+        intent_core::FileSecretStore::with_path(root.join("secrets.json")),
+    )
+    .with_event_bus(bus.clone());
+    let mgr = AgentManager::new(services.clone(), Arc::new(BusEventSink::new(bus)), 4);
+    let ws = WorkspaceId::from("held-npm-workspace");
+    let id = AgentId::from("held-npm-agent");
+    seed_agent(&mgr, &ws, &id).await;
+    let npx = root.join("foreground-npx");
+    std::fs::write(
+        &npx,
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$FOREGROUND_STARTED\"\nread -r request\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut provider = *intent_providers::find_provider("pi").unwrap();
+    provider.mcp_via_pi_extension = false;
+    let mut opts = intent_acp::spawn::SpawnOptions::new(&provider);
+    opts.npx_fallback_binary = Some(&npx);
+    opts.npx_fallback_package = provider.npx_only_package;
+    opts.extra_env.insert(
+        "FOREGROUND_STARTED".into(),
+        root.join("foreground-started")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    mgr.create_agent(
+        id.clone(),
+        ws,
+        "Held npm",
+        "implementor",
+        root.to_owned(),
+        &opts,
+    )
+    .await
+    .unwrap();
+    (mgr, id, services)
 }

@@ -149,6 +149,7 @@ pub(super) fn spawn(
     cmd: &AcpAdapterCommand,
     prepared: Prepared,
     slot: OwnedSemaphorePermit,
+    preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
 ) -> Result<SpawnedAdapter, String> {
     let cwd = cmd.working_dir();
     let opts = options(cmd, &cwd).ok_or("managed ephemeral launch changed after selection")?;
@@ -175,6 +176,7 @@ pub(super) fn spawn(
                 npx_launch_dir: npx_dir.map(Arc::new),
                 slot,
                 installed: cmd.installed.clone(),
+                preparation_guard,
                 managed: Some(ProfileGuard {
                     _directory: profile.directory,
                     _parent: parent,
@@ -270,6 +272,7 @@ mod tests {
                 slot: slots.acquire(Duration::from_secs(1)).await.unwrap(),
                 npx_launch_dir: None,
                 installed: None,
+                preparation_guard: None,
                 managed: Some(ProfileGuard {
                     _directory: directory,
                     _parent: parent,
@@ -427,6 +430,16 @@ mod tests {
                 .await
                 .unwrap();
                 let mut adapter = spawn_adapter(&cmd, Duration::from_secs(20)).await.unwrap();
+                assert!(
+                    adapter
+                        .child
+                        .held
+                        .as_ref()
+                        .unwrap()
+                        .preparation_guard
+                        .is_some(),
+                    "managed and deferred npm launches must retain preparation exclusion"
+                );
                 assert_eq!(
                     adapter.profile_meta.is_some(),
                     mode == "inventory",

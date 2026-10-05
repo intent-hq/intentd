@@ -18,6 +18,8 @@ mod creation_preferences;
 
 #[path = "e2e_wss_agent_lifecycle/managed_provider.rs"]
 mod managed_provider;
+#[path = "e2e_wss_agent_lifecycle/structured_notices.rs"]
+mod structured_notices;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

@@ -17583,6 +17583,7 @@ mod drafts_events {
 
 pub(crate) mod pr {
     mod accept_member;
+    mod automatic_refresh;
     mod discovery_http;
 
     use std::path::PathBuf;
@@ -20396,86 +20397,9 @@ pub(crate) mod pr {
     }
 
     #[tokio::test]
-    async fn sweep_skips_idle_workspace_between_full_ticks() {
-        // Sweep trimming (§7.7): a workspace with no recent activity is not
-        // refreshed on an in-between tick — only on every
-        // `SWEEP_IDLE_TICK_MULTIPLE`-th (full-sweep) tick.
-        let forge = StubForge {
-            discover: true,
-            ..Default::default()
-        };
-        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
-
-        // Age the workspace well past the active window.
-        let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
-        ws.updated_at =
-            intent_core::iso_minutes_ago(2 * crate::pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES);
-        ws.last_activity = None;
-        svc.store().update_workspace(&ws).await.unwrap();
-
-        // In-between tick: the idle workspace is skipped (no link, no event).
-        svc.refresh_all_workspace_prs(1).await;
-        let after = svc.store().get_workspace(&ws_id).await.unwrap();
-        assert_eq!(after.pr_number, None);
-        let evs = svc.store().events_by_workspace(&ws_id, 10).await.unwrap();
-        assert!(evs.is_empty());
-
-        // Full-sweep tick (multiple of SWEEP_IDLE_TICK_MULTIPLE): refreshed.
-        svc.refresh_all_workspace_prs(crate::pr_ops::SWEEP_IDLE_TICK_MULTIPLE)
-            .await;
-        let after = svc.store().get_workspace(&ws_id).await.unwrap();
-        assert_eq!(after.pr_number, Some(42));
-    }
-
-    #[test]
-    fn sweep_due_tiers_by_recency_and_tick() {
-        use crate::pr_ops::{sweep_due, SWEEP_ACTIVE_WINDOW_MINUTES, SWEEP_IDLE_TICK_MULTIPLE};
-        let cutoff_str = intent_core::iso_minutes_ago(SWEEP_ACTIVE_WINDOW_MINUTES);
-        let cutoff = intent_core::parse_iso(&cutoff_str);
-        assert!(cutoff.is_some());
-        let ws_id = WorkspaceId::new();
-
-        // Recently active (updated_at = now): due on every tick.
-        let active = workspace(&ws_id);
-        assert!(sweep_due(&active, cutoff, 1));
-
-        // Idle (updated_at past the window, no last_activity): due only on
-        // full-sweep ticks (multiples of SWEEP_IDLE_TICK_MULTIPLE, incl. 0).
-        let mut idle = workspace(&ws_id);
-        idle.updated_at = intent_core::iso_minutes_ago(2 * SWEEP_ACTIVE_WINDOW_MINUTES);
-        assert!(!sweep_due(&idle, cutoff, 1));
-        assert!(!sweep_due(&idle, cutoff, SWEEP_IDLE_TICK_MULTIPLE - 1));
-        assert!(sweep_due(&idle, cutoff, 0));
-        assert!(sweep_due(&idle, cutoff, SWEEP_IDLE_TICK_MULTIPLE));
-        assert!(sweep_due(&idle, cutoff, 3 * SWEEP_IDLE_TICK_MULTIPLE));
-
-        // Exact boundary: `ts == cutoff` counts as active (inclusive `>=`).
-        let mut boundary = workspace(&ws_id);
-        boundary.updated_at = cutoff_str.clone();
-        assert!(sweep_due(&boundary, cutoff, 1));
-
-        // A recent last_activity revives an otherwise-idle workspace.
-        let mut revived = idle.clone();
-        revived.last_activity = Some(now_iso());
-        assert!(sweep_due(&revived, cutoff, 1));
-
-        // Malformed timestamps fail open (count as active), on either field.
-        let mut malformed = idle.clone();
-        malformed.updated_at = "not-a-timestamp".to_string();
-        assert!(sweep_due(&malformed, cutoff, 1));
-        let mut malformed_la = idle.clone();
-        malformed_la.last_activity = Some(String::new());
-        assert!(sweep_due(&malformed_la, cutoff, 1));
-
-        // An unparseable cutoff fails open too.
-        assert!(sweep_due(&idle, None, 1));
-    }
-
-    #[tokio::test]
     async fn sweep_refreshes_recently_active_workspace_every_tick() {
-        // Sweep trimming (§7.7): a workspace active within the window is
-        // refreshed even on an in-between tick. `refresh_setup` seeds
-        // `updated_at = now`, i.e. inside `SWEEP_ACTIVE_WINDOW_MINUTES`.
+        // A workspace without a previous attempt is refreshed on its first
+        // sweep, irrespective of the loop tick number.
         let forge = StubForge {
             discover: true,
             ..Default::default()
@@ -21570,7 +21494,8 @@ pub(crate) mod pr {
         std::fs::remove_dir_all(&gone_dir).unwrap();
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1, "{roots:?}");
@@ -21597,7 +21522,8 @@ pub(crate) mod pr {
 
         // Re-sweeping is idempotent: the tracked submodule is not re-upserted
         // (no `gitRoot:registered`/`gitRoot:updated` churn).
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
         let registered = svc
             .store()
             .events_by_type(&ws.id, "gitRoot:registered", 10)
@@ -21652,7 +21578,8 @@ pub(crate) mod pr {
             .unwrap();
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let a = svc
             .store()
@@ -21689,7 +21616,8 @@ pub(crate) mod pr {
             repo.commit(Some("HEAD"), &sig, &sig, "move", &tree, &[&parent])
                 .unwrap();
         }
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
         let a = svc
             .store()
             .get_workspace_git_root(&root_a.id)
@@ -21721,7 +21649,7 @@ pub(crate) mod pr {
         let root = sweep_root(&ws.id, &with_head.dir, None);
         svc.store().upsert_workspace_git_root(&root).await.unwrap();
 
-        svc.sweep_workspace_git_roots(&ws, None).await;
+        svc.sweep_workspace_git_roots(&ws, None, 60, true).await;
 
         let stamped = svc.store().get_workspace_git_root(&root.id).await.unwrap();
         assert_eq!(
@@ -21754,7 +21682,8 @@ pub(crate) mod pr {
 
         let (_t, svc, ws) = sweep_setup(&parent.dir).await;
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1, "{roots:?}");
@@ -21800,7 +21729,8 @@ pub(crate) mod pr {
         );
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         // Restore permissions so the tempdir can be cleaned up.
         std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -21831,7 +21761,8 @@ pub(crate) mod pr {
             discover: true,
             ..Default::default()
         });
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1);
@@ -21855,7 +21786,8 @@ pub(crate) mod pr {
         assert_eq!(updated[0].data["gitRoot"]["prNumber"], 42);
 
         // Identical forge state on the next sweep: no new event.
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
         let updated = svc
             .store()
             .events_by_type(&ws.id, "gitRoot:updated", 10)
@@ -22213,7 +22145,8 @@ pub(crate) mod pr {
             merged_linked: true,
             ..Default::default()
         });
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         let list = roots[0].pull_requests.as_ref().expect("pull_requests");
@@ -23724,7 +23657,7 @@ pub(crate) mod pr {
         let traffic = Traffic::default();
         with_traffic(
             traffic.clone(),
-            svc.sweep_workspace_git_roots(&ws, Some(&sc)),
+            svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true),
         )
         .await;
         assert!(svc.sweeps_rate_limited());
@@ -23740,7 +23673,7 @@ pub(crate) mod pr {
             .all(|(caller, _)| *caller == Caller::GitRootRefresh));
         with_traffic(
             traffic.clone(),
-            svc.sweep_workspace_git_roots(&ws, Some(&sc)),
+            svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true),
         )
         .await;
         assert_eq!(
@@ -23812,7 +23745,8 @@ pub(crate) mod pr {
             ..Default::default()
         });
         let sc_dyn: Arc<dyn SourceControl> = sc.clone();
-        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn), 60, true)
+            .await;
 
         assert_eq!(
             sc.seen_get_pr.lock().unwrap().len(),
@@ -23823,7 +23757,8 @@ pub(crate) mod pr {
 
         // A whole follow-up sweep while paused performs no forge calls and
         // no further reset probes — the condition was reported once.
-        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn), 60, true)
+            .await;
         assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
     }
@@ -23907,6 +23842,18 @@ pub(crate) mod pr {
             ..Default::default()
         });
         let svc = svc.with_source_control(recovered.clone());
+        svc.refresh_all_workspace_prs(1).await;
+        assert!(
+            !svc.sweeps_rate_limited(),
+            "the recovered quota lifts the pause"
+        );
+        assert!(
+            recovered.seen_get_pr.lock().unwrap().is_empty(),
+            "recovery does not bypass automatic retry admission"
+        );
+        // Tick 1 is one minute later in production; quota recovery does not
+        // bypass the new per-workspace automatic attempt cadence.
+        svc.age_automatic_pr_refresh(&ws_id, 60);
         svc.refresh_all_workspace_prs(1).await;
         assert_eq!(
             *recovered.seen_get_pr.lock().unwrap(),
@@ -24042,7 +23989,8 @@ pub(crate) mod pr {
             ..Default::default()
         });
         let sc_dyn: Arc<dyn SourceControl> = sc.clone();
-        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn), 60, true)
+            .await;
 
         assert_eq!(
             sc.seen_get_pr.lock().unwrap().len(),

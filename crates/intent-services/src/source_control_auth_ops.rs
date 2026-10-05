@@ -34,6 +34,7 @@ use crate::events::EventBus;
 use crate::github_auth_ops::{self, FlowPhase, FlowSlot, MAX_CONSECUTIVE_POLL_ERRORS};
 use crate::{publish_event, system_actor};
 
+pub(crate) mod checkout;
 mod probe_owner;
 pub(crate) mod repository_owner;
 use crate::repository_credentials::RepositoryMutationKind;
@@ -187,6 +188,7 @@ pub(crate) struct GitlabStartupIntent {
 pub(crate) struct GitlabAuthState {
     pub(crate) flow: Option<GitlabFlowSlot>,
     pub(crate) starting: Option<GitlabStartupIntent>,
+    pending_pat: Option<(String, std::sync::Weak<RepositoryWrite>)>,
     pub(crate) unsupported_hosts: HashSet<String>,
     #[cfg(test)]
     pub(crate) persistence_test_lease: Option<intent_sourcecontrol::gitlab_auth::PersistenceLease>,
@@ -1067,6 +1069,49 @@ pub(crate) fn pat_connect_response() -> Value {
 }
 
 impl crate::Services {
+    /// Resolve an explicit HTTPS logical root without treating an API transport
+    /// override as identity. An omitted root retains the existing configured root.
+    pub(crate) fn resolve_source_control_target_for_instance(
+        &self,
+        provider: &str,
+        host: Option<&str>,
+        instance_base_url: Option<&str>,
+    ) -> Result<Target> {
+        let Some(root) = instance_base_url else {
+            return self.resolve_source_control_target(provider, host);
+        };
+        if Provider::parse(provider)? != Provider::Gitlab {
+            return Err(Error::InvalidParams(
+                "instanceBaseUrl is only accepted for GitLab".into(),
+            ));
+        }
+        let instance = intent_sourcecontrol::GitlabInstance::parse(root)
+            .map_err(|_| Error::InvalidParams("invalid HTTPS GitLab instanceBaseUrl".into()))?;
+        let mut target = GitlabHost::parse(instance.as_str()).map_err(crate::pr_ops::map_sc_err)?;
+        if let Some(host) = host {
+            if parse_gitlab_host(host)?.host() != target.host() {
+                return Err(Error::InvalidParams(
+                    "GitLab host and instanceBaseUrl must name the same authority".into(),
+                ));
+            }
+        }
+        let config = self.effective_settings().source_control.gitlab;
+        if parse_gitlab_host(&config.host).is_ok_and(|bound| bound.host() == target.host()) {
+            let env = std::env::var(GITLAB_API_BASE_URI_ENV).ok();
+            if let Some(endpoint) = config
+                .api_base_url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .or(env.as_deref())
+            {
+                target = target
+                    .with_api_origin(endpoint)
+                    .map_err(crate::pr_ops::map_sc_err)?;
+            }
+        }
+        Ok(Target::Gitlab { host: target })
+    }
+
     /// Parse + resolve the `(provider, host)` of a `sourceControl.*` call
     /// against the effective `sourceControl.gitlab.*` settings.
     pub(crate) fn resolve_source_control_target(
@@ -1307,25 +1352,76 @@ impl crate::Services {
         let write = self
             .gitlab_credential_gate
             .prepare_connect(self.settings_registry.as_deref(), &mut host)?;
-        let user = match validate_pat(&host, &token).await {
-            Ok(user) => user,
-            Err(intent_sourcecontrol::Error::Auth(_)) => {
-                return Err(Error::SourceControlUnauthorized {
-                    provider: Provider::Gitlab.as_wire().to_string(),
-                    host: host.host().to_string(),
-                })
-            }
-            Err(e) => return Err(crate::pr_ops::map_sc_err(e)),
-        };
         if let Some(write) = &write {
-            write.verified_user(Some(user));
+            self.gitlab_auth.lock().await.pending_pat =
+                Some((host.logical_base_url().into(), Arc::downgrade(write)));
         }
-        self.owned_direct_secret_mutation(crate::direct_secret_ops::Mutation::GitlabPat(
-            host,
-            intent_sourcecontrol::SecretString::from(token),
-            write,
-        ))
-        .await
+        let result = async {
+            let validated = validate_pat(&host, &token).await;
+            if let Some(write) = &write {
+                write.check_preflight().map_err(crate::pr_ops::map_sc_err)?;
+            }
+            let user = match validated {
+                Ok(user) => user,
+                Err(intent_sourcecontrol::Error::Auth(_)) => {
+                    return Err(Error::SourceControlUnauthorized {
+                        provider: Provider::Gitlab.as_wire().to_string(),
+                        host: host.host().to_string(),
+                    });
+                }
+                Err(error) => return Err(crate::pr_ops::map_sc_err(error)),
+            };
+            if let Some(write) = &write {
+                write.verified_user(Some(user));
+            }
+            self.owned_direct_secret_mutation(crate::direct_secret_ops::Mutation::GitlabPat(
+                host,
+                intent_sourcecontrol::SecretString::from(token),
+                write.clone(),
+            ))
+            .await
+        }
+        .await;
+        if let Some(write) = &write {
+            let mut state = self.gitlab_auth.lock().await;
+            if state
+                .pending_pat
+                .as_ref()
+                .is_some_and(|(_, pending)| pending.ptr_eq(&Arc::downgrade(write)))
+            {
+                state.pending_pat = None;
+            }
+        }
+        result
+    }
+
+    /// Cancel only the selected full logical instance. A prepared PAT can be
+    /// retired before its first effect; a begun persistence owner remains settled.
+    pub(crate) async fn gitlab_cancel_auth(&self, host: &GitlabHost) -> Result<Value> {
+        let mut state = self.gitlab_auth.lock().await;
+        let starting = state
+            .starting
+            .as_ref()
+            .is_some_and(|s| s.host == host.logical_base_url());
+        let device = state.flow.as_ref().is_some_and(|f| {
+            f.host == host.logical_base_url() && f.slot.phase == FlowPhase::Pending
+        });
+        let pat = state
+            .pending_pat
+            .as_ref()
+            .filter(|(root, _)| root == host.logical_base_url())
+            .and_then(|(_, write)| write.upgrade())
+            .is_some_and(|write| write.cancel_preflight());
+        if starting {
+            state.starting = None;
+        }
+        if device {
+            state.flow = None;
+        }
+        if pat {
+            state.pending_pat = None;
+        }
+        Ok(json!({"ok":true,"cancelled":starting || device || pat}))
     }
 
     pub(crate) async fn gitlab_pat_with_owner(
@@ -1389,14 +1485,14 @@ impl crate::Services {
             if state
                 .flow
                 .as_ref()
-                .is_some_and(|flow| flow.host == host.host())
+                .is_some_and(|flow| flow.host == host.logical_base_url())
             {
                 state.flow = None;
             }
             if state
                 .starting
                 .as_ref()
-                .is_some_and(|intent| intent.host == host.host())
+                .is_some_and(|intent| intent.host == host.logical_base_url())
             {
                 state.starting = None;
             }
@@ -1468,13 +1564,13 @@ impl crate::Services {
                 return Err(Error::Internal("daemon is shutting down".into()));
             }
             if let Some(f) = guard.flow.as_ref() {
-                if f.host == host.host() && f.slot.is_live() {
+                if f.host == host.logical_base_url() && f.slot.is_live() {
                     return Ok(github_auth_ops::connect_response(&f.slot));
                 }
             }
             guard.flow = None;
             guard.starting = None;
-            if guard.unsupported_hosts.contains(host.host()) {
+            if guard.unsupported_hosts.contains(host.logical_base_url()) {
                 return Err(unsupported());
             }
             let Some(client_id) = self.gitlab_client_id(&host) else {
@@ -1485,7 +1581,7 @@ impl crate::Services {
                 .prepare_connect(self.settings_registry.as_deref(), &mut host)?;
             let flow_id = github_auth_ops::next_flow_id();
             guard.starting = Some(GitlabStartupIntent {
-                host: host.host().to_string(),
+                host: host.logical_base_url().to_string(),
                 id: flow_id,
             });
             (flow_id, client_id, write)
@@ -1507,7 +1603,7 @@ impl crate::Services {
             // Keep same-host reuse when a concurrent request already installed
             // its live flow, but never resurrect a superseded startup.
             if let Some(f) = guard.flow.as_ref() {
-                if f.host == host.host() && f.slot.is_live() {
+                if f.host == host.logical_base_url() && f.slot.is_live() {
                     return Ok(github_auth_ops::connect_response(&f.slot));
                 }
             }
@@ -1524,7 +1620,9 @@ impl crate::Services {
                     reason,
                     "gitlab device grant unsupported"
                 );
-                guard.unsupported_hosts.insert(host.host().to_string());
+                guard
+                    .unsupported_hosts
+                    .insert(host.logical_base_url().to_string());
                 return Err(unsupported());
             }
             Err(e) => return Err(crate::pr_ops::map_sc_err(e)),
@@ -1563,7 +1661,7 @@ impl crate::Services {
         };
         let resp = github_auth_ops::connect_response(&slot);
         guard.flow = Some(GitlabFlowSlot {
-            host: host.host().to_string(),
+            host: host.logical_base_url().to_string(),
             slot,
         });
         tracing::info!(host = host.host(), "gitlab device grant started");

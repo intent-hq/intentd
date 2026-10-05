@@ -103,6 +103,7 @@ pub(super) fn handle(
                     _pi_extension: None,
                     npx_launch_dir: None,
                     managed_profile: None,
+                    preparation_guard: None,
                     cleanup_lease: None,
                     cleanup_services: None,
                 },

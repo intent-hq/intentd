@@ -154,7 +154,7 @@ pub const MAX_PR_MONITORS_PER_AGENT: u32 = 100;
 
 /// Default poll cadence for the centralized PR-monitor loop
 /// (`prMonitor.pollSeconds`).
-pub const DEFAULT_PR_MONITOR_POLL_SECONDS: u64 = 30;
+pub const DEFAULT_PR_MONITOR_POLL_SECONDS: u64 = 60;
 
 /// Floor for `prMonitor.pollSeconds` — a tighter interval would hammer the
 /// forge. Sub-minimum values (notably `0`) are clamped up at read time.
