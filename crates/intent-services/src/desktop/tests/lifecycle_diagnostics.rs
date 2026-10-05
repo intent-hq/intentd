@@ -283,3 +283,46 @@ async fn desktop_lifecycle_invalid_native_result_reports_outcome_unknown_reason(
         assert!(visible_text(&message).contains("outcome_unknown"));
     }
 }
+
+#[test]
+fn desktop_screenshot_save_asset_response_requires_public_field_projection() {
+    let workspace = WorkspaceId::from("workspace");
+    let asset = intent_core::SaveAssetResult {
+        asset_id: "asset".into(),
+        path: "/private/workspace/assets/asset.png".into(),
+        url: "workspace-asset://workspace/asset".into(),
+    };
+    let asset_wire = serde_json::to_value(&asset).unwrap();
+    assert_eq!(asset_wire.as_object().unwrap().len(), 3);
+    let geometry = json!({"displayId":"screen","width":1920,"height":1080,"originX":-1920,"originY":0,"scaleFactor":2.0});
+    // listDisplay never receives an asset object; the helper's six geometry
+    // fields remain valid independently of the screenshot projection defect.
+    validate_result(
+        &json!({"layoutId":"layout","displays":[geometry.clone()]}),
+        &json!({"kind":"listDisplay"}),
+        &workspace,
+    )
+    .unwrap();
+    let mut leaked = geometry.clone();
+    leaked
+        .as_object_mut()
+        .unwrap()
+        .extend(asset_wire.as_object().unwrap().clone());
+    leaked["mimeType"] = "image/png".into();
+    assert_eq!(leaked.as_object().unwrap().len(), 10);
+    let mut screenshot =
+        json!({"capturedAt":"2026-10-05T14:00:00Z","layoutId":"layout","displays":[leaked]});
+    let action = json!({"kind":"screenshot","displayId":"screen","layoutId":"layout"});
+    let error = validate_result(&screenshot, &action, &workspace).unwrap_err();
+    assert_eq!(error.code, "desktop-execution-failed");
+    assert_eq!(error.detail, "Invalid native desktop result");
+    assert_eq!(error.execution.as_deref(), Some("unknown"));
+    assert!(!error.to_string().contains(&asset.path));
+    let mut public = geometry;
+    public["assetId"] = asset.asset_id.into();
+    public["url"] = asset.url.into();
+    public["mimeType"] = "image/png".into();
+    screenshot["displays"] = json!([public]);
+    assert_eq!(screenshot["displays"][0].as_object().unwrap().len(), 9);
+    validate_result(&screenshot, &action, &workspace).unwrap();
+}

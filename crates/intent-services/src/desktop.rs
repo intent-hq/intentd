@@ -1840,6 +1840,7 @@ fn annotate_wake_reason(payload: &mut Value, reason: &str) {
         "os_permission_lost",
         "lease_expired",
         "executor_failed",
+        "outcome_unknown",
         "unsupported_environment",
         "owner_changed",
         "agent_terminated",
