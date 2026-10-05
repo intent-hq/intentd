@@ -8,6 +8,15 @@ use crate::Store;
 use intent_core::{Error, Result};
 use sqlx::{Row, SqliteConnection};
 
+#[cfg(test)]
+tokio::task_local! {
+    // Scoped only to the actual wrapper future being cancelled, never a global
+    // barrier that could stall a parallel retention test.
+    static BEFORE_RECLAIM_COMMIT: tokio::sync::mpsc::UnboundedSender<(
+        NoteOperationReclaimStats, serde_json::Value
+    )>;
+}
+
 const CHILD_BATCH: i64 = 64;
 const STAGE_STEPS: usize = 8;
 // All child FK access paths have operation_key as their leading primary-key
@@ -68,6 +77,16 @@ impl Store {
             .await
             .map_err(db)?;
         let stats = reclaim_batch(&mut tx, now).await?;
+        #[cfg(test)]
+        if let Ok(observer) = BEFORE_RECLAIM_COMMIT.try_with(Clone::clone) {
+            let state = tests::snapshot(&mut tx).await;
+            observer
+                .send((stats, state))
+                .expect("cleanup observer alive");
+            // The test must drop the actual public wrapper future here. No
+            // alternative success/commit path exists in this test seam.
+            std::future::pending::<()>().await;
+        }
         tx.commit().await.map_err(db)?;
         Ok(stats)
     }

@@ -375,3 +375,175 @@ async fn copy_on_write_uses_live_pins_and_does_not_regenerate_expired_root_piece
             .unwrap();
     assert_eq!(phase, "staging");
 }
+
+// Bounded test-only observation from the SAME writer snapshot immediately before
+// the real Store wrapper would commit. This never changes production behavior.
+pub(super) async fn snapshot(conn: &mut SqliteConnection) -> serde_json::Value {
+    let row=sqlx::query("SELECT s.phase,o.outcome,q.due_ms,q.mode,q.step FROM note_stage s JOIN note_operation o USING(operation_key) JOIN note_operation_reclaim q USING(operation_key) WHERE s.operation_key='op'")
+        .fetch_one(&mut *conn).await.unwrap();
+    let mut value = serde_json::json!({
+        "phase":row.get::<String,_>("phase"),"outcome":row.get::<String,_>("outcome"),
+        "dueMs":row.get::<i64,_>("due_ms"),"mode":row.get::<i64,_>("mode"),"step":row.get::<i64,_>("step")
+    });
+    for table in [
+        "note_stage_record",
+        "note_stage_base_piece",
+        "note_stage_root_pin",
+        "note_stage_root_reclaim",
+        "note_operation",
+        "note_stage_root",
+    ] {
+        value[table] = serde_json::json!(count(conn, table).await);
+    }
+    value
+}
+
+async fn cancel_actual_wrapper(
+    store: &Store,
+    now: u64,
+) -> (NoteOperationReclaimStats, serde_json::Value) {
+    let before = {
+        let mut conn = store.write_pool().acquire().await.unwrap();
+        snapshot(&mut conn).await
+    };
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut future =
+        Box::pin(BEFORE_RECLAIM_COMMIT.scope(sender, store.reclaim_note_operations_batch(now)));
+    let observed=tokio::time::timeout(std::time::Duration::from_secs(5),async {
+        tokio::select! {
+            result=&mut future=>panic!("wrapper unexpectedly settled before cancellation: {result:?}"),
+            state=receiver.recv()=>state.expect("actual wrapper reached precommit boundary"),
+        }
+    }).await.unwrap();
+    drop(future);
+    // This is the Store writer pool, not an independent connection-level helper.
+    // Acquiring and reading under IMMEDIATE waits for the dropped transaction's
+    // rollback to settle before proving every observed partial change disappeared.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut tx = store
+            .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .unwrap();
+        assert_eq!(snapshot(&mut tx).await, before);
+        tx.rollback().await.unwrap();
+    })
+    .await
+    .unwrap();
+    observed
+}
+
+#[tokio::test]
+async fn actual_store_wrapper_cancellation_rolls_back_fence_progress_and_reopens() {
+    use intent_core::note_mutation::{NoteMutationError, NoteOperationStatusQuery};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store-reclaim.db");
+    // Full Store bootstrap and registered migrations, with no test-local DDL.
+    let store = Store::open(&path).await.unwrap();
+    let deadline = format!("{}.123Z", &intent_core::iso_ms_from_now(3_600_000)[..19]);
+    let parsed = intent_core::parse_iso(&deadline).unwrap();
+    let at = u64::try_from(parsed.unix_timestamp_nanos() / 1_000_000).unwrap();
+    let retain = parsed.unix_timestamp() + 86400;
+    {
+        let mut tx = store
+            .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspace(id,title,branch,created_at,updated_at) VALUES('w','Cleanup','test',?,?)")
+            .bind(intent_core::now_iso()).bind(intent_core::now_iso()).execute(&mut *tx).await.unwrap();
+        operation(&mut tx, "op", retain).await;
+        let state = serde_json::json!({"kind":"noteStageState","phase":"staging","expiresAt":deadline,"streams":[]});
+        sqlx::query("UPDATE note_operation SET admission_expires=?,outcome=?,method_kind='staged',operation_id='00000000-0000-4000-8000-000000000001' WHERE operation_key='op'")
+            .bind(parsed.unix_timestamp()).bind(state.to_string()).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO note_stage_root VALUES('root','w','n','i','generation',130,130)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO note_stage(operation_key,root_key,header_digest,header,base_revision,phase) VALUES('op','root',?,'{}','base','staging')")
+            .bind("a".repeat(64)).execute(&mut *tx).await.unwrap();
+        records(&mut tx, "op", 145).await;
+        pieces(&mut tx, "root", 130).await;
+        tx.commit().await.unwrap();
+    }
+    let query = NoteOperationStatusQuery {
+        backend_id: "b".into(),
+        workspace_id: "w".into(),
+        note_id: "n".into(),
+        note_instance_id: "i".into(),
+        operation_id: "00000000-0000-4000-8000-000000000001".into(),
+        header_digest: Some("a".repeat(64)),
+        payload_digest: None,
+    };
+    // The real wall-clock deadline is still in the future. Reading succeeds
+    // before simulated expiry and must fail from the persisted phase afterward.
+    assert_eq!(
+        store
+            .read_note_stage_base_piece("p", &query, 0)
+            .await
+            .unwrap(),
+        (0, 1, "a".into())
+    );
+    let (stats, pending) = cancel_actual_wrapper(&store, at).await;
+    assert_eq!((stats.child_rows, stats.root_pieces), (64, 64));
+    assert_eq!(pending["phase"], "expired");
+    assert_eq!(pending["note_stage_record"], 81);
+    assert_eq!(pending["note_stage_base_piece"], 66);
+    assert_eq!(pending["note_stage_root_pin"], 0);
+    assert_eq!(pending["dueMs"], 0);
+    assert!(store
+        .read_note_stage_base_piece("p", &query, 0)
+        .await
+        .is_ok());
+    let stats = store.reclaim_note_operations_batch(at).await.unwrap();
+    assert_eq!((stats.child_rows, stats.root_pieces), (64, 64));
+    assert!(matches!(
+        store.read_note_stage_base_piece("p", &query, 0).await,
+        Err(Error::NoteMutation(NoteMutationError::Expired))
+    ));
+    let status = store.note_stage_status("p", &query).await.unwrap();
+    assert_eq!(status["phase"], "expired");
+    assert_eq!(status["expiresAt"], deadline);
+    let partial = {
+        let mut conn = store.write_pool().acquire().await.unwrap();
+        snapshot(&mut conn).await
+    };
+    assert_eq!(partial["note_operation"], 1);
+    assert_eq!(partial["step"], 0);
+    store.close().await;
+    drop(store);
+    let store = Store::open(&path).await.unwrap();
+    {
+        let mut conn = store.write_pool().acquire().await.unwrap();
+        assert_eq!(snapshot(&mut conn).await, partial);
+    }
+    let resumed = store.reclaim_note_operations_batch(at).await.unwrap();
+    assert_eq!((resumed.child_rows, resumed.root_pieces), (64, 64));
+    let final_leaves = store.reclaim_note_operations_batch(at).await.unwrap();
+    assert_eq!((final_leaves.child_rows, final_leaves.root_pieces), (17, 2));
+    // Exercise cancellation of a queue STEP advance as well as the prior partial
+    // row/phase/pin writes. Empty root-queue retirement also rolls back here.
+    let (stats, pending) = cancel_actual_wrapper(&store, at).await;
+    assert_eq!((stats.child_rows, stats.root_pieces), (0, 0));
+    assert_eq!(pending["step"], 1);
+    assert_eq!(pending["note_stage_root_reclaim"], 0);
+    for _ in 0..40 {
+        store.reclaim_note_operations_batch(at).await.unwrap();
+    }
+    {
+        let mut conn = store.write_pool().acquire().await.unwrap();
+        let done = snapshot(&mut conn).await;
+        assert_eq!(done["mode"], 1);
+        assert_eq!(done["dueMs"], retain * 1000);
+        assert_eq!(done["note_stage_record"], 0);
+        assert_eq!(done["note_stage_base_piece"], 0);
+        assert_eq!(done["note_operation"], 1);
+        assert_eq!(done["note_stage_root"], 1);
+    }
+    assert_eq!(store.note_stage_status("p", &query).await.unwrap(), status);
+    assert!(matches!(
+        store.read_note_stage_base_piece("p", &query, 0).await,
+        Err(Error::NoteMutation(NoteMutationError::Expired))
+    ));
+    store.close().await;
+}
