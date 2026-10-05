@@ -37,6 +37,7 @@ CREATE TABLE note_attribution_author (
     head_id INTEGER NOT NULL,
     line INTEGER NOT NULL,
     author_json TEXT NOT NULL,
+    byte_length INTEGER GENERATED ALWAYS AS (length(CAST(author_json AS BLOB))) STORED,
     PRIMARY KEY(head_id,line),
     FOREIGN KEY(head_id,line) REFERENCES note_attribution_line(head_id,line) ON DELETE CASCADE
 );
@@ -83,12 +84,12 @@ CREATE TRIGGER note_comment_projection_delete AFTER DELETE ON note_comment_proje
     DELETE FROM note_comment_thread WHERE head_id=old.head_id AND thread_id=old.thread_id AND total_comments=0;
 END;
 INSERT INTO note_comment_projection
-    SELECT c.id,h.id,c.thread_id,c.parent_id,c.status,c.created_at,substr(c.content,1,256),length(c.content)>256
+    SELECT c.id,h.id,c.thread_id,c.parent_id,c.status,c.created_at,substr(c.content,1,256),length(CAST(c.content AS BLOB))>length(CAST(substr(c.content,1,256) AS BLOB))
     FROM comment c JOIN note_annotation_head h ON h.workspace_id=c.workspace_id AND h.note_id=c.note_id;
 
 CREATE TRIGGER note_comment_insert AFTER INSERT ON comment BEGIN
     INSERT INTO note_comment_projection
-        SELECT new.id,h.id,new.thread_id,new.parent_id,new.status,new.created_at,substr(new.content,1,256),length(new.content)>256
+        SELECT new.id,h.id,new.thread_id,new.parent_id,new.status,new.created_at,substr(new.content,1,256),length(CAST(new.content AS BLOB))>length(CAST(substr(new.content,1,256) AS BLOB))
         FROM note_annotation_head h WHERE h.workspace_id=new.workspace_id AND h.note_id=new.note_id;
     UPDATE note_annotation_head SET comment_revision=lower(hex(randomblob(16))),
         anchors_rev=CASE WHEN new.parent_id IS NULL THEN -1 ELSE anchors_rev END
@@ -97,7 +98,7 @@ END;
 CREATE TRIGGER note_comment_update AFTER UPDATE ON comment BEGIN
     DELETE FROM note_comment_projection WHERE comment_id=old.id;
     INSERT INTO note_comment_projection
-        SELECT new.id,h.id,new.thread_id,new.parent_id,new.status,new.created_at,substr(new.content,1,256),length(new.content)>256
+        SELECT new.id,h.id,new.thread_id,new.parent_id,new.status,new.created_at,substr(new.content,1,256),length(CAST(new.content AS BLOB))>length(CAST(substr(new.content,1,256) AS BLOB))
         FROM note_annotation_head h WHERE h.workspace_id=new.workspace_id AND h.note_id=new.note_id;
     UPDATE note_annotation_head SET comment_revision=lower(hex(randomblob(16))),
         anchors_rev=CASE WHEN old.parent_id IS NULL OR new.parent_id IS NULL THEN -1 ELSE anchors_rev END
@@ -217,4 +218,79 @@ CREATE TRIGGER note_page_head_state_update AFTER UPDATE ON note_page_head BEGIN
             source_revision=excluded.source_revision,attribution_generation=excluded.attribution_generation,
             attribution_ready=excluded.attribution_ready,comment_revision=excluded.comment_revision
         WHERE note_annotation_state.deleted=0;
+END;
+
+-- Full fields are fragmented once on writes. Reads seek fixed-size byte pieces;
+-- they never substring or decode an entire comment/author blob. Continuation
+-- tokens carry the running UTF-16 offset, avoiding prefix scans on deep pages.
+CREATE TABLE note_comment_detail (
+    comment_id TEXT NOT NULL REFERENCES comment(id) ON DELETE CASCADE,
+    field TEXT NOT NULL,
+    byte_length INTEGER NOT NULL,
+    is_null INTEGER NOT NULL,
+    PRIMARY KEY(comment_id,field)
+);
+CREATE TABLE note_comment_detail_piece (
+    comment_id TEXT NOT NULL,
+    field TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    data BLOB NOT NULL CHECK(length(data)<=1024),
+    PRIMARY KEY(comment_id,field,position),
+    FOREIGN KEY(comment_id,field) REFERENCES note_comment_detail(comment_id,field) ON DELETE CASCADE
+);
+    INSERT INTO note_comment_detail
+        WITH input AS MATERIALIZED (SELECT c.id AS comment_id,'body' AS field,CAST(COALESCE(c.content,'') AS BLOB) AS data,c.content IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'author' AS field,CAST(COALESCE(c.author,'') AS BLOB) AS data,c.author IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'anchor' AS field,CAST(COALESCE(c.anchor_json,'') AS BLOB) AS data,c.anchor_json IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'anchorText' AS field,CAST(COALESCE(c.anchor_text,'') AS BLOB) AS data,c.anchor_text IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'extra' AS field,CAST(COALESCE(c.extra_json,'') AS BLOB) AS data,c.extra_json IS NULL AS is_null FROM comment c)
+        SELECT comment_id,field,length(data),is_null FROM input;
+    INSERT INTO note_comment_detail_piece
+        WITH RECURSIVE input AS MATERIALIZED (SELECT c.id AS comment_id,'body' AS field,CAST(COALESCE(c.content,'') AS BLOB) AS data,c.content IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'author' AS field,CAST(COALESCE(c.author,'') AS BLOB) AS data,c.author IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'anchor' AS field,CAST(COALESCE(c.anchor_json,'') AS BLOB) AS data,c.anchor_json IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'anchorText' AS field,CAST(COALESCE(c.anchor_text,'') AS BLOB) AS data,c.anchor_text IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'extra' AS field,CAST(COALESCE(c.extra_json,'') AS BLOB) AS data,c.extra_json IS NULL AS is_null FROM comment c),
+        offsets(comment_id,field,position,byte_length) AS (
+            SELECT comment_id,field,0,length(data) FROM input WHERE length(data)>0
+            UNION ALL SELECT comment_id,field,position+1024,byte_length FROM offsets WHERE position+1024<byte_length
+        )
+        SELECT o.comment_id,o.field,o.position,substr(i.data,o.position+1,1024)
+        FROM offsets o JOIN input i ON i.comment_id=o.comment_id AND i.field=o.field;
+CREATE TRIGGER note_comment_detail_insert AFTER INSERT ON comment BEGIN
+    INSERT INTO note_comment_detail
+        WITH input AS MATERIALIZED (SELECT new.id AS comment_id,'body' AS field,CAST(COALESCE(new.content,'') AS BLOB) AS data,new.content IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'author' AS field,CAST(COALESCE(new.author,'') AS BLOB) AS data,new.author IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchor' AS field,CAST(COALESCE(new.anchor_json,'') AS BLOB) AS data,new.anchor_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchorText' AS field,CAST(COALESCE(new.anchor_text,'') AS BLOB) AS data,new.anchor_text IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'extra' AS field,CAST(COALESCE(new.extra_json,'') AS BLOB) AS data,new.extra_json IS NULL AS is_null)
+        SELECT comment_id,field,length(data),is_null FROM input;
+    INSERT INTO note_comment_detail_piece
+        WITH RECURSIVE input AS MATERIALIZED (SELECT new.id AS comment_id,'body' AS field,CAST(COALESCE(new.content,'') AS BLOB) AS data,new.content IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'author' AS field,CAST(COALESCE(new.author,'') AS BLOB) AS data,new.author IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchor' AS field,CAST(COALESCE(new.anchor_json,'') AS BLOB) AS data,new.anchor_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchorText' AS field,CAST(COALESCE(new.anchor_text,'') AS BLOB) AS data,new.anchor_text IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'extra' AS field,CAST(COALESCE(new.extra_json,'') AS BLOB) AS data,new.extra_json IS NULL AS is_null),
+        offsets(comment_id,field,position,byte_length) AS (
+            SELECT comment_id,field,0,length(data) FROM input WHERE length(data)>0
+            UNION ALL SELECT comment_id,field,position+1024,byte_length FROM offsets WHERE position+1024<byte_length
+        )
+        SELECT o.comment_id,o.field,o.position,substr(i.data,o.position+1,1024)
+        FROM offsets o JOIN input i ON i.comment_id=o.comment_id AND i.field=o.field;
+END;
+CREATE TRIGGER note_comment_detail_update AFTER UPDATE OF content,author,anchor_json,anchor_text,extra_json ON comment
+WHEN new.content IS NOT old.content OR new.author IS NOT old.author OR new.anchor_json IS NOT old.anchor_json OR new.anchor_text IS NOT old.anchor_text OR new.extra_json IS NOT old.extra_json
+BEGIN
+    DELETE FROM note_comment_detail WHERE comment_id=old.id;
+    INSERT INTO note_comment_detail
+        WITH input AS MATERIALIZED (SELECT new.id AS comment_id,'body' AS field,CAST(COALESCE(new.content,'') AS BLOB) AS data,new.content IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'author' AS field,CAST(COALESCE(new.author,'') AS BLOB) AS data,new.author IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchor' AS field,CAST(COALESCE(new.anchor_json,'') AS BLOB) AS data,new.anchor_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchorText' AS field,CAST(COALESCE(new.anchor_text,'') AS BLOB) AS data,new.anchor_text IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'extra' AS field,CAST(COALESCE(new.extra_json,'') AS BLOB) AS data,new.extra_json IS NULL AS is_null)
+        SELECT comment_id,field,length(data),is_null FROM input;
+    INSERT INTO note_comment_detail_piece
+        WITH RECURSIVE input AS MATERIALIZED (SELECT new.id AS comment_id,'body' AS field,CAST(COALESCE(new.content,'') AS BLOB) AS data,new.content IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'author' AS field,CAST(COALESCE(new.author,'') AS BLOB) AS data,new.author IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchor' AS field,CAST(COALESCE(new.anchor_json,'') AS BLOB) AS data,new.anchor_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchorText' AS field,CAST(COALESCE(new.anchor_text,'') AS BLOB) AS data,new.anchor_text IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'extra' AS field,CAST(COALESCE(new.extra_json,'') AS BLOB) AS data,new.extra_json IS NULL AS is_null),
+        offsets(comment_id,field,position,byte_length) AS (
+            SELECT comment_id,field,0,length(data) FROM input WHERE length(data)>0
+            UNION ALL SELECT comment_id,field,position+1024,byte_length FROM offsets WHERE position+1024<byte_length
+        )
+        SELECT o.comment_id,o.field,o.position,substr(i.data,o.position+1,1024)
+        FROM offsets o JOIN input i ON i.comment_id=o.comment_id AND i.field=o.field;
+END;
+CREATE TABLE note_attribution_author_piece (
+    head_id INTEGER NOT NULL,
+    line INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    data BLOB NOT NULL CHECK(length(data)<=1024),
+    PRIMARY KEY(head_id,line,position),
+    FOREIGN KEY(head_id,line) REFERENCES note_attribution_author(head_id,line) ON DELETE CASCADE
+);
+CREATE TRIGGER note_attribution_author_fragment AFTER INSERT ON note_attribution_author BEGIN
+    INSERT INTO note_attribution_author_piece
+        WITH RECURSIVE offsets(position,byte_length) AS (
+            SELECT 0,length(CAST(new.author_json AS BLOB)) WHERE length(CAST(new.author_json AS BLOB))>0
+            UNION ALL SELECT position+1024,byte_length FROM offsets WHERE position+1024<byte_length
+        )
+        SELECT new.head_id,new.line,position,substr(CAST(new.author_json AS BLOB),position+1,1024) FROM offsets;
 END;

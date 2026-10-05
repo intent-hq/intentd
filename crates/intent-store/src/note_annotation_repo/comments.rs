@@ -1,5 +1,11 @@
-use super::*;
+use super::{
+    db_error, head, invalid, stale, validate_limit, validate_ranges, AnnotationEpochs,
+    AnnotationPage, SourceRange,
+};
+use crate::Store;
+use intent_core::{Error, NoteId, Result, WorkspaceId};
 use sqlx::QueryBuilder;
+use sqlx::{Row, SqliteConnection};
 
 /// A resolved occurrence of an existing canonical root comment anchor. The
 /// occurrence ID is local to this projection, never a replacement marker ID.
@@ -61,7 +67,7 @@ fn check_epoch(actual: &AnnotationEpochs, expected: &AnnotationEpochs) -> Result
     Ok(())
 }
 
-fn matching_threads<'args>(
+pub(super) fn matching_threads<'args>(
     head_id: i64,
     ranges: &[SourceRange],
     filter: CommentFilter,
@@ -119,6 +125,54 @@ fn matching_threads<'args>(
     query
 }
 
+/// Replace a derived anchor index inside the caller's source/comment transaction.
+/// The caller must roll its transaction back on error and must have completed
+/// canonical marker repair plus source page indexing before calling this.
+pub(crate) async fn publish_anchors_in_transaction(
+    conn: &mut SqliteConnection,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    expected: &AnnotationEpochs,
+    occurrences: &[AnchorOccurrence],
+) -> Result<()> {
+    let (id, epochs) = head(conn, workspace_id, note_id).await?;
+    check_epoch(&epochs, expected)?;
+    if epochs.anchors_ready {
+        return Err(stale());
+    }
+    let source_length: i64 = sqlx::query_scalar("SELECT source_length FROM note_page_head WHERE workspace_id=? AND note_id=? AND indexed_rev=current_rev")
+        .bind(workspace_id.as_str()).bind(note_id.as_str()).fetch_optional(&mut *conn).await.map_err(db_error)?
+        .ok_or_else(stale)?;
+    sqlx::query("DELETE FROM note_comment_anchor WHERE head_id=?")
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_error)?;
+    for occurrence in occurrences {
+        let range = occurrence.source_range;
+        if range.start < 0
+            || range.end < range.start
+            || range.end > source_length
+            || occurrence.occurrence_id.is_empty()
+        {
+            return Err(invalid());
+        }
+        let result = sqlx::query("INSERT INTO note_comment_anchor(head_id,comment_id,occurrence_id,start,end) \
+            SELECT head_id,comment_id,?,?,? FROM note_comment_projection WHERE head_id=? AND comment_id=? AND parent_id IS NULL")
+            .bind(&occurrence.occurrence_id).bind(range.start).bind(range.end).bind(id).bind(&occurrence.comment_id)
+            .execute(&mut *conn).await.map_err(db_error)?;
+        if result.rows_affected() != 1 {
+            return Err(invalid());
+        }
+    }
+    sqlx::query("UPDATE note_annotation_head SET anchors_rev=source_rev WHERE id=?")
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_error)?;
+    Ok(())
+}
+
 impl Store {
     /// Publish resolved marker occurrences after canonical anchor repair.
     /// Caller supplies the source/comment epochs it resolved. A concurrent edit
@@ -139,41 +193,14 @@ impl Store {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_error)?;
-        let (id, epochs) = head(&mut tx, workspace_id, note_id).await?;
-        check_epoch(&epochs, expected)?;
-        if epochs.anchors_ready {
-            return Err(stale());
-        }
-        let source_length: i64 = sqlx::query_scalar("SELECT source_length FROM note_page_head WHERE workspace_id=? AND note_id=? AND indexed_rev=current_rev")
-            .bind(workspace_id.as_str()).bind(note_id.as_str()).fetch_optional(&mut *tx).await.map_err(db_error)?
-            .ok_or_else(stale)?;
-        sqlx::query("DELETE FROM note_comment_anchor WHERE head_id=?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_error)?;
-        for occurrence in occurrences {
-            let range = occurrence.source_range;
-            if range.start < 0
-                || range.end < range.start
-                || range.end > source_length
-                || occurrence.occurrence_id.is_empty()
-            {
-                return Err(invalid());
-            }
-            let result = sqlx::query("INSERT INTO note_comment_anchor(head_id,comment_id,occurrence_id,start,end) \
-                SELECT head_id,comment_id,?,?,? FROM note_comment_projection WHERE head_id=? AND comment_id=? AND parent_id IS NULL")
-                .bind(&occurrence.occurrence_id).bind(range.start).bind(range.end).bind(id).bind(&occurrence.comment_id)
-                .execute(&mut *tx).await.map_err(db_error)?;
-            if result.rows_affected() != 1 {
-                return Err(invalid());
-            }
-        }
-        sqlx::query("UPDATE note_annotation_head SET anchors_rev=source_rev WHERE id=?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_error)?;
+        super::publish_anchors_in_transaction(
+            &mut tx,
+            workspace_id,
+            note_id,
+            expected,
+            occurrences,
+        )
+        .await?;
         tx.commit().await.map_err(db_error)
     }
 
@@ -183,7 +210,6 @@ impl Store {
     /// # Errors
     /// Returns invalid params for bad limits, stale for old epochs, not found
     /// for an absent scoped thread, or a database error.
-    #[expect(clippy::too_many_arguments)]
     pub async fn read_comment_rows(
         &self,
         workspace_id: &WorkspaceId,
@@ -255,7 +281,7 @@ impl Store {
     /// # Errors
     /// Returns invalid params for invalid filters/ranges/limits, stale for
     /// mismatched or unresolved source anchors, or a database error.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)] // Scoped range/keyset/budget inputs stay explicit.
     pub async fn read_comment_threads(
         &self,
         workspace_id: &WorkspaceId,

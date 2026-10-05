@@ -1,6 +1,12 @@
-use super::*;
+use super::{
+    db_error, head, invalid, stale, validate_limit, validate_ranges, AnnotationEpochs,
+    AnnotationPage, SourceRange, MAX_OFFSET,
+};
+use crate::Store;
 use intent_core::LineAttributionData;
+use intent_core::{Error, NoteId, Result, WorkspaceId};
 use sqlx::QueryBuilder;
+use sqlx::Row;
 
 /// A computation ticket is superseded when another computation starts, even
 /// when source revision stays the same. Only its owner may publish that result.
@@ -19,6 +25,29 @@ pub struct AttributionRow {
     pub source_range: SourceRange,
     pub timestamp: i64,
     pub has_author: bool,
+}
+
+pub(super) fn range_query(
+    id: i64,
+    ranges: &[SourceRange],
+    after_line: Option<i64>,
+    take: i64,
+) -> QueryBuilder<'static, sqlx::Sqlite> {
+    let mut sql = QueryBuilder::new("SELECT line,start,end,timestamp,has_author FROM (");
+    for (index, range) in ranges.iter().enumerate() {
+        if index > 0 {
+            sql.push(" UNION ");
+        }
+        sql.push("SELECT * FROM (SELECT line,start,end,timestamp,has_author FROM note_attribution_line WHERE head_id=").push_bind(id)
+            .push(" AND line > ").push_bind(after_line.unwrap_or(0))
+            .push(" AND line >= (SELECT line FROM note_attribution_line WHERE head_id=").push_bind(id)
+            .push(" AND end > ").push_bind(range.start).push(" ORDER BY end,start,line LIMIT 1)")
+            .push(" AND line <= (SELECT line FROM note_attribution_line WHERE head_id=").push_bind(id)
+            .push(" AND start < ").push_bind(range.end).push(" ORDER BY start DESC,line DESC LIMIT 1)")
+            .push(" ORDER BY line LIMIT ").push_bind(take).push(")");
+    }
+    sql.push(") ORDER BY line LIMIT ").push_bind(take);
+    sql
 }
 
 impl Store {
@@ -150,7 +179,6 @@ impl Store {
     /// # Errors
     /// Returns invalid params for bad ranges/limits, stale for mismatched
     /// epochs, or a database error. Pending attribution has an empty page.
-    #[expect(clippy::too_many_arguments)]
     pub async fn read_attribution_rows(
         &self,
         workspace_id: &WorkspaceId,
@@ -174,20 +202,7 @@ impl Store {
         }
         let mut items = Vec::new();
         if epochs.attribution_ready && !ranges.is_empty() {
-            let mut sql = QueryBuilder::new("SELECT line,start,end,timestamp,has_author FROM (");
-            for (index, range) in ranges.iter().enumerate() {
-                if index > 0 {
-                    sql.push(" UNION ");
-                }
-                sql.push("SELECT * FROM (SELECT line,start,end,timestamp,has_author FROM note_attribution_line WHERE head_id=").push_bind(id)
-                    .push(" AND line > ").push_bind(after_line.unwrap_or(0))
-                    .push(" AND line >= (SELECT line FROM note_attribution_line WHERE head_id=").push_bind(id)
-                    .push(" AND end > ").push_bind(range.start).push(" ORDER BY end,start,line LIMIT 1)")
-                    .push(" AND line <= (SELECT line FROM note_attribution_line WHERE head_id=").push_bind(id)
-                    .push(" AND start < ").push_bind(range.end).push(" ORDER BY start DESC,line DESC LIMIT 1)")
-                    .push(" ORDER BY line LIMIT ").push_bind(take).push(")");
-            }
-            sql.push(") ORDER BY line LIMIT ").push_bind(take);
+            let mut sql = range_query(id, ranges, after_line, take);
             let rows = sql.build().fetch_all(&mut *tx).await.map_err(db_error)?;
             items = rows
                 .iter()

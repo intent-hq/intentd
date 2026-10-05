@@ -362,3 +362,294 @@ async fn deletion_tombstone_preserves_last_epochs_and_recreated_note_has_new_sco
         deleted
     );
 }
+
+#[tokio::test]
+async fn legacy_attribution_invalidates_index_and_state_survives_restart() {
+    let (db, store, ws, note) = fixture().await;
+    let epoch = store.note_annotation_epochs(&ws, &note).await.unwrap();
+    let job = store
+        .begin_note_attribution(&ws, &note, epoch.source_revision)
+        .await
+        .unwrap();
+    store
+        .publish_note_attribution(&job, "one\n😀 two\nthree", &attribution(&ws, &note, 1))
+        .await
+        .unwrap();
+    store
+        .upsert_note_line_attribution(&attribution(&ws, &note, 2))
+        .await
+        .unwrap();
+    let updated = store.note_annotation_epochs(&ws, &note).await.unwrap();
+    assert!(!updated.attribution_ready);
+    assert_ne!(
+        updated.attribution_generation,
+        job.epochs.attribution_generation
+    );
+    assert!(store
+        .read_attribution_rows(
+            &ws,
+            &note,
+            &job.epochs,
+            &[SourceRange { start: 0, end: 1 }],
+            None,
+            1
+        )
+        .await
+        .is_err());
+    let state = store.read_note_page_state(&ws, &note, None).await.unwrap();
+    drop(store);
+    let reopened = Store::open(&db.path).await.unwrap();
+    assert_eq!(
+        reopened
+            .read_note_page_state(&ws, &note, None)
+            .await
+            .unwrap(),
+        state
+    );
+    assert_eq!(
+        reopened
+            .get_note_line_attribution(&ws, &note)
+            .await
+            .unwrap()
+            .unwrap()
+            .attributions["1"]
+            .timestamp,
+        2
+    );
+}
+
+#[tokio::test]
+async fn annotation_queries_do_not_cross_workspaces_and_ranges_deduplicate_lines() {
+    let (_db, store, ws, note) = fixture().await;
+    let other = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&other, "Other", false))
+        .await
+        .unwrap();
+    store
+        .insert_note(&stray_note(&other, note.as_str(), "Same ID"))
+        .await
+        .unwrap();
+    let epoch = store.note_annotation_epochs(&ws, &note).await.unwrap();
+    let job = store
+        .begin_note_attribution(&ws, &note, epoch.source_revision)
+        .await
+        .unwrap();
+    store
+        .publish_note_attribution(&job, "one\n😀 two\nthree", &attribution(&ws, &note, 1))
+        .await
+        .unwrap();
+    let page = store
+        .read_attribution_rows(
+            &ws,
+            &note,
+            &job.epochs,
+            &[
+                SourceRange { start: 4, end: 5 },
+                SourceRange { start: 8, end: 9 },
+            ],
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].line, 2);
+    assert!(store
+        .read_attribution_rows(
+            &other,
+            &note,
+            &job.epochs,
+            &[SourceRange { start: 0, end: 1 }],
+            None,
+            1
+        )
+        .await
+        .is_err());
+    store
+        .insert_comment(&ws, &sample_comment(&note, "private-thread", "root"))
+        .await
+        .unwrap();
+    let foreign = store.note_annotation_epochs(&other, &note).await.unwrap();
+    assert!(store
+        .read_comment_rows(&other, &note, &foreign, "private-thread", None, 10)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn anchor_index_participates_in_source_transaction_rollback() {
+    let (_db, store, ws, note) = fixture().await;
+    store
+        .insert_comment(&ws, &sample_comment(&note, "thread", "root"))
+        .await
+        .unwrap();
+    let before = store.read_note_page_state(&ws, &note, None).await.unwrap();
+    let mut tx = store
+        .write_pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE note SET content='replacement',rev=rev+1 WHERE workspace_id=? AND id=?")
+        .bind(ws.as_str())
+        .bind(note.as_str())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // Simulate the source index maintained by the owning mutation transaction.
+    sqlx::query("UPDATE note_page_head SET indexed_rev=current_rev,source_length=11 WHERE workspace_id=? AND note_id=?")
+        .bind(ws.as_str()).bind(note.as_str()).execute(&mut *tx).await.unwrap();
+    let (_, epoch) = crate::note_annotation_repo::head(&mut tx, &ws, &note)
+        .await
+        .unwrap();
+    crate::note_annotation_repo::publish_anchors_in_transaction(
+        &mut tx,
+        &ws,
+        &note,
+        &epoch,
+        &[AnchorOccurrence {
+            comment_id: "root".into(),
+            occurrence_id: "kept".into(),
+            source_range: SourceRange { start: 1, end: 5 },
+        }],
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        store.read_note_page_state(&ws, &note, None).await.unwrap(),
+        before
+    );
+    assert_eq!(
+        store.get_note(&ws, &note).await.unwrap().content,
+        "one\n😀 two\nthree"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_comment_anchor")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    let original = store.note_annotation_epochs(&ws, &note).await.unwrap();
+    // A reply cannot acquire an independent anchor. The successful first insert
+    // in the failed batch is rolled back too, leaving no partially visible index.
+    let mut reply = sample_comment(&note, "thread", "reply");
+    reply.parent_id = Some("root".into());
+    reply.anchor = None;
+    store.insert_comment(&ws, &reply).await.unwrap();
+    let changed = store.note_annotation_epochs(&ws, &note).await.unwrap();
+    assert!(store
+        .publish_comment_anchors(&ws, &note, &original, &[])
+        .await
+        .is_err());
+    assert!(store
+        .publish_comment_anchors(
+            &ws,
+            &note,
+            &changed,
+            &[
+                AnchorOccurrence {
+                    comment_id: "root".into(),
+                    occurrence_id: "good".into(),
+                    source_range: SourceRange { start: 1, end: 2 }
+                },
+                AnchorOccurrence {
+                    comment_id: "reply".into(),
+                    occurrence_id: "bad".into(),
+                    source_range: SourceRange { start: 1, end: 2 }
+                },
+            ]
+        )
+        .await
+        .is_err());
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_comment_anchor")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn huge_comment_fields_reconstruct_from_bounded_scalar_safe_fragments() {
+    let (_db, store, ws, note) = fixture().await;
+    let mut root = sample_comment(&note, "thread", "root");
+    root.content = format!("{}{}\0tail", "a".repeat(1023), "😀界\\\"".repeat(2000));
+    root.author = "huge author".repeat(1000);
+    root.anchor_text = None;
+    store.insert_comment(&ws, &root).await.unwrap();
+    let epoch = store.note_annotation_epochs(&ws, &note).await.unwrap();
+    let mut rebuilt = String::new();
+    let mut offset = 0;
+    let mut utf16 = 0;
+    loop {
+        let fragment = store
+            .read_annotation_fragment(
+                &ws,
+                &note,
+                &epoch,
+                AnnotationDetail::Comment {
+                    comment_id: "root",
+                    field: CommentDetailField::Body,
+                },
+                offset,
+                1024,
+            )
+            .await
+            .unwrap();
+        assert!(fragment.text.len() <= 1024);
+        assert!(fragment.byte_end > offset);
+        rebuilt.push_str(&fragment.text);
+        utf16 += fragment.utf16_length;
+        offset = fragment.byte_end;
+        if offset == fragment.total_bytes {
+            break;
+        }
+    }
+    assert_eq!(rebuilt, root.content);
+    assert_eq!(utf16, root.content.encode_utf16().count());
+    let absent = store
+        .read_annotation_fragment(
+            &ws,
+            &note,
+            &epoch,
+            AnnotationDetail::Comment {
+                comment_id: "root",
+                field: CommentDetailField::AnchorText,
+            },
+            0,
+            4,
+        )
+        .await
+        .unwrap();
+    assert!(absent.is_null);
+    assert!(absent.text.is_empty());
+    assert!(store
+        .read_annotation_fragment(
+            &ws,
+            &note,
+            &epoch,
+            AnnotationDetail::Comment {
+                comment_id: "root",
+                field: CommentDetailField::Body
+            },
+            1024,
+            4
+        )
+        .await
+        .is_err());
+    root.content = "changed".into();
+    store.update_comment(&ws, &root).await.unwrap();
+    assert!(store
+        .read_annotation_fragment(
+            &ws,
+            &note,
+            &epoch,
+            AnnotationDetail::Comment {
+                comment_id: "root",
+                field: CommentDetailField::Body
+            },
+            0,
+            1024
+        )
+        .await
+        .is_err());
+}

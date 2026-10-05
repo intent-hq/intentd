@@ -11,9 +11,12 @@ use crate::Store;
 
 mod attribution;
 mod comments;
+mod detail;
+pub(crate) use comments::publish_anchors_in_transaction;
 
 pub use attribution::{AttributionJob, AttributionRow};
 pub use comments::{AnchorOccurrence, CommentFilter, CommentRow, ReplyRows, ThreadRow, ThreadRows};
+pub use detail::{AnnotationDetail, AnnotationFragment, CommentDetailField};
 
 /// One admitted interval in canonical source coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,7 +79,7 @@ fn validate_limit(limit: usize) -> Result<i64> {
     i64::try_from(limit + 1).map_err(|_| invalid())
 }
 
-async fn head(
+pub(crate) async fn head(
     conn: &mut SqliteConnection,
     workspace_id: &WorkspaceId,
     note_id: &NoteId,
