@@ -414,6 +414,8 @@ async function handlePrompt(id, params) {
         promptLog,
         JSON.stringify({
           turn: promptCount,
+          sessionId: params && params.sessionId,
+          loaded: sessionFromLoad,
           ...(effectiveModel !== null ? { effectiveModel, effectiveEffort } : {}),
           text: extractPromptText(params),
           blockTypes: blocks.map((b) => (b && typeof b.type === 'string' ? b.type : '')),

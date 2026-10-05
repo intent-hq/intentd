@@ -101,7 +101,7 @@ async fn retirement_start_output_events_and_rerun_preserve_previous_result() {
 async fn retirement_startup_failure_stop_and_timeout_have_explicit_outcomes() {
     let h = harness_with_worktree(true).await;
     for use_run in [true, false] {
-        let id = create(
+        let id = hydrate_legacy_script(
             &h,
             ScriptCreateParams {
                 name: "bad cwd".into(),
@@ -824,7 +824,7 @@ async fn retirement_shutdown_preserves_terminal_result_before_marker_persistence
         ("sleep 30", true, false, Cancelled),
     ] {
         let h = harness_with_worktree(true).await;
-        let id = create(
+        let id = hydrate_legacy_script(
             &h,
             ScriptCreateParams {
                 name: "early terminal".into(),
@@ -982,7 +982,7 @@ async fn retirement_cannot_admit_successor_before_predecessor_publication() {
 
 async fn cancelled_observed_failure_retires(bad_cwd: bool) {
     let h = harness_with_worktree(true).await;
-    let id = create(
+    let id = hydrate_legacy_script(
         &h,
         ScriptCreateParams {
             name: "cancelled observed failure".into(),

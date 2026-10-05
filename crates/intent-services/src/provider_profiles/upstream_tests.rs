@@ -1,10 +1,14 @@
-//! Opt-in no-prompt smoke tests against unmodified installed providers.
-//! No real HOME, credentials, model prompts or adapter rewriting.
+//! Opt-in smoke tests against unmodified installed providers.
+//! Isolated profiles, no real credentials or adapter rewriting; prompt tests use a local model fixture.
 use super::*;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, BufReader};
+
+#[cfg(unix)]
+#[path = "upstream_codex_skills_tests.rs"]
+mod codex_skills;
 
 fn write(path: &Path, text: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();

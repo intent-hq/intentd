@@ -425,6 +425,18 @@ impl ScriptManager {
             return Err(Error::NotFound(format!("script {id}")));
         }
 
+        // Reject invalid syntax before persisting or stopping a predecessor.
+        // Keep resolve_cwd's launch-time check for legacy stored definitions.
+        if params
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| !is_safe_relative(cwd))
+        {
+            return Err(Error::InvalidParams(
+                "cwd must be workspace-relative; absolute paths and '..' components are unsupported. Use '.' or omit cwd for the workspace root.".into(),
+            ));
+        }
+
         // Upsert of an existing id (`ws.script.create` with `scriptId`):
         // the definition is replaced with `source`/`createdAt` preserved and
         // `updatedAt` stamped (FE parity), and — unlike the FE, whose manager
@@ -2696,6 +2708,7 @@ fn script_event(workspace_id: &WorkspaceId, event_type: &str, data: Value) -> Ne
 
 #[cfg(test)]
 mod tests {
+    include!("script_ops/cwd_tests.rs");
     include!("script_ops/bootstrap_tests.rs");
     include!("script_ops/lifecycle_tests.rs");
     include!("script_ops/retirement_tests.rs");
@@ -3188,7 +3201,7 @@ mod tests {
         services: Services,
         bus: EventBus,
         ws: WorkspaceId,
-        _worktree: Option<WorktreeDir>,
+        worktree: Option<WorktreeDir>,
     }
 
     /// Reap every PTY the test started, on normal and panicking unwinds
@@ -3228,7 +3241,7 @@ mod tests {
             services,
             bus,
             ws,
-            _worktree: worktree,
+            worktree,
         }
     }
 
@@ -3864,7 +3877,7 @@ mod tests {
         // Exercise both cwd validation and PTY spawn failure, before a process runs.
         for spawn_failure in [false, true] {
             let mut h = harness_with_worktree(true).await;
-            let id = create(
+            let id = seed_legacy_script(
                 &h,
                 ScriptCreateParams {
                     name: "auto-start".into(),
@@ -4309,7 +4322,7 @@ mod tests {
     #[intent_test_macros::daemon_test]
     async fn failed_relaunch_of_lost_command_clears_marker() {
         let h = harness_with_worktree(true).await;
-        let id = create(
+        let id = hydrate_legacy_script(
             &h,
             ScriptCreateParams {
                 name: "cmd".into(),
@@ -4382,7 +4395,7 @@ mod tests {
     #[intent_test_macros::daemon_test]
     async fn failed_relaunch_of_marked_service_keeps_marker() {
         let h = harness_with_worktree(true).await;
-        let id = create(
+        let id = hydrate_legacy_script(
             &h,
             ScriptCreateParams {
                 name: "svc".into(),
@@ -4907,7 +4920,7 @@ mod tests {
     async fn script_start_spawn_failure_surfaces_exited_not_idle() {
         let h = harness_with_worktree(true).await;
         let mut sub = subscribe(&h);
-        let id = create(
+        let id = hydrate_legacy_script(
             &h,
             ScriptCreateParams {
                 name: "bad-cwd".into(),
@@ -5003,7 +5016,7 @@ mod tests {
             "no error on a real code: {ev}"
         );
 
-        let failed = create(
+        let failed = hydrate_legacy_script(
             &h,
             ScriptCreateParams {
                 name: "spawn-failure".into(),
@@ -6206,7 +6219,7 @@ mod tests {
     #[intent_test_macros::daemon_test]
     async fn script_run_cwd_failure_resets_reservation_via_fail() {
         let h = harness_with_worktree(true).await;
-        let id = create(
+        let id = hydrate_legacy_script(
             &h,
             ScriptCreateParams {
                 name: "bad-cwd".into(),
@@ -6948,7 +6961,7 @@ mod tests {
     async fn supervise_records_cwd_escape_error_via_fail_path() {
         let h = harness_with_worktree(true).await;
         let mut sub = subscribe(&h);
-        let id = create(
+        let id = hydrate_legacy_script(
             &h,
             ScriptCreateParams {
                 name: "bad-cwd".into(),
