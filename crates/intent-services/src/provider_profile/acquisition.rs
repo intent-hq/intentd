@@ -131,6 +131,9 @@ impl AcquiredNativeProfile {
     /// Freeze the acquired environment before applying profile.environment last.
     /// Use only for this native launch; the caller owns args, cwd and child reap.
     pub fn apply_environment(&self, command: &mut tokio::process::Command) {
+        // InstalledContext normally retains trusted per-command overrides. This
+        // sealed acquisition must instead retain the exact proven authority route.
+        command.env_clear();
         self.context.apply(command);
     }
 

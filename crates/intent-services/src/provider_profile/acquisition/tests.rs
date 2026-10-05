@@ -115,6 +115,24 @@ async fn installed_capture_acquires_native_route_then_builds_with_policy() {
     )
     .unwrap();
     let acquired = ready(f.acquire(None).await);
+    let mut launch = tokio::process::Command::new(acquired.executable());
+    launch.env("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
+    launch.env("CLAUDE_CODE_REMOTE_SETTINGS_PATH", "unacquired");
+    acquired.apply_environment(&mut launch);
+    let frozen: BTreeMap<_, _> = launch
+        .as_std()
+        .get_envs()
+        .filter_map(|(k, v)| {
+            v.map(|v| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(frozen["ANTHROPIC_BASE_URL"], "http://127.0.0.1:1");
+    assert!(!frozen.contains_key("CLAUDE_CODE_REMOTE_SETTINGS_PATH"));
     let servers =
         intent_acp::normalize_mcp_servers(&json!({"approved":{"command":"fixture-never-run"}}));
     let profile = acquired
