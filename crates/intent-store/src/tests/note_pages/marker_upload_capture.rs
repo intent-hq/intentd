@@ -52,6 +52,20 @@ async fn replay_actual_frontend_marker_upload_and_capture_source_lifecycle() {
                 let lexical = &source["calls"][0]["response"];
                 assert_eq!(json!(typed.scope()), lexical["scope"]);
                 assert_eq!(typed.header.base_revision, lexical["sourceRevision"]);
+                let original_expiry = time::OffsetDateTime::parse(
+                    lexical["expiresAt"].as_str().unwrap(),
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .unwrap();
+                let staged_expiry = time::OffsetDateTime::parse(
+                    &typed.expires_at,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .unwrap();
+                assert!(
+                    staged_expiry <= original_expiry,
+                    "stage must not extend original lexical lifetime; shorter/truncated deadlines are allowed"
+                );
 
                 assert_eq!(params["header"]["action"], "read");
                 assert_eq!(params["header"]["output"], "source");
@@ -112,7 +126,7 @@ async fn replay_actual_frontend_marker_upload_and_capture_source_lifecycle() {
     assert_eq!(normalized.operation_id, begin.operation_id);
     assert_eq!(normalized.header_digest, begin.header_digest);
     let scope = begin.scope();
-    let (operation,view,pin):(String,String,String)=sqlx::query_as("SELECT s.operation_key,s.view_id,s.marker_admission FROM note_stage s JOIN note_operation o USING(operation_key) WHERE o.principal=? AND o.backend_id=? AND o.workspace_id=? AND o.note_id=? AND o.instance_id=? AND o.operation_id=? AND o.method_kind='staged' AND s.header_digest=? AND s.payload_digest=? AND s.phase='sealed'")
+    let (operation,view,pin,root_key):(String,String,String,String)=sqlx::query_as("SELECT s.operation_key,s.view_id,s.marker_admission,s.root_key FROM note_stage s JOIN note_operation o USING(operation_key) WHERE o.principal=? AND o.backend_id=? AND o.workspace_id=? AND o.note_id=? AND o.instance_id=? AND o.operation_id=? AND o.method_kind='staged' AND s.header_digest=? AND s.payload_digest=? AND s.phase='sealed'")
         .bind("alice").bind(&scope.backend_id).bind(&scope.workspace_id).bind(&scope.note_id).bind(&scope.note_instance_id).bind(&begin.operation_id).bind(&begin.header_digest).bind(&seal.payload_digest).fetch_one(store.read_pool()).await.unwrap();
     let rows:Vec<(String,String)>=sqlx::query_as("SELECT id,value FROM note_stage_validation WHERE operation_key=? AND kind='live' ORDER BY CAST(id AS INTEGER)").bind(&operation).fetch_all(store.read_pool()).await.unwrap();
     assert_eq!(rows.len(), 2);
@@ -123,6 +137,14 @@ async fn replay_actual_frontend_marker_upload_and_capture_source_lifecycle() {
     assert_eq!(witness["version"], 1);
     assert_eq!(witness["canonicalId"], source["commentId"]);
     assert_eq!(witness["type"], "point");
+    assert_eq!(
+        witness["threadId"],
+        source["originalRoot"]
+            .get("threadId")
+            .expect("captured root thread")
+    );
+    assert_eq!(witness["rootKey"], root_key);
+
     assert_eq!(witness["rootRange"], json!({"start":12,"end":68}));
     assert_eq!(witness["viewId"], view);
     assert_eq!(
@@ -244,7 +266,7 @@ async fn replay_actual_frontend_marker_upload_and_capture_source_lifecycle() {
         .unwrap();
     let artifact = json!({"claim":"actual Store replay of unchanged native begin/append/seal uploads; real source cursors and EOF cancellation, no native authority inferred from Store",
         "frontendCapture":input,"sourceCapture":captured["sourceCapture"],"clock":intent_core::now_epoch_ms(),"capturedAtMs":source["capturedAtMs"],"calls":calls,"retainedDatabase":retained_database,
-        "internalStoreOracle":{"sealedViewId":view,"markerWitness":witness,"liveLedger":rows,"markerAdmission":serde_json::from_str::<Value>(&pin).unwrap()},
+        "internalStoreOracle":{"sealedViewId":view,"sealedRootKey":root_key,"markerWitness":witness,"liveLedger":rows,"markerAdmission":serde_json::from_str::<Value>(&pin).unwrap()},
         "unchangedSource":final_note.content,
         "refusals":[{"phase":"beforeCancel","params":wrong,"typedStoreError":"NotePage(CursorInvalid)"},{"phase":"afterCancel","params":initial,"typedStoreError":"NotePage(Expired)"}]});
     std::fs::OpenOptions::new()
