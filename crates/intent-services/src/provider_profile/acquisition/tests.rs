@@ -360,3 +360,88 @@ async fn native_environment_expansion_is_not_raw_identity_matching() {
         .await
         .is_err());
 }
+
+fn git_layout(kind: &str) -> (Fixture, PathBuf) {
+    let mut f = Fixture::new();
+    let main = f.workspace.clone();
+    std::fs::create_dir(main.join(".git")).unwrap();
+    std::fs::create_dir(main.join(".claude")).unwrap();
+    if kind == "nested" {
+        f.workspace = main.join("nested");
+        std::fs::create_dir(&f.workspace).unwrap();
+    } else if matches!(kind, "linked" | "legacy") {
+        f.workspace = f.root.path().join("linked");
+        std::fs::create_dir(&f.workspace).unwrap();
+        let gitdir = main.join(".git/worktrees/linked");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(
+            f.workspace.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            gitdir.join("gitdir"),
+            format!("{}\n", f.workspace.join(".git").display()),
+        )
+        .unwrap();
+    }
+    let local = if kind == "legacy" {
+        std::fs::create_dir(f.workspace.join(".claude")).unwrap();
+        f.workspace.join(".claude/settings.local.json")
+    } else {
+        main.join(".claude/settings.local.json")
+    };
+    (f, local)
+}
+
+#[test]
+fn f8_nested_linked_and_legacy_local_settings_are_inspected() {
+    for kind in ["same", "nested", "linked", "legacy"] {
+        let (f, local) = git_layout(kind);
+        assert!(f.inspect().is_ok(), "empty {kind} is supported");
+        std::fs::write(local, r#"{"model":"claude-opus-4-6"}"#).unwrap();
+        assert!(
+            matches!(f.inspect(), Err(DeferredReason::AuthProjection)),
+            "missed {kind} local source"
+        );
+    }
+}
+
+#[tokio::test]
+async fn f8_canonical_local_mutations_invalidate_acquired_profiles() {
+    for kind in ["same", "nested", "linked", "legacy"] {
+        let (f, local) = git_layout(kind);
+        std::fs::write(&local, "{}").unwrap();
+        let acquired = ready(f.acquire(None).await);
+        std::fs::write(local, r#"{"model":"claude-opus-4-6"}"#).unwrap();
+        assert!(
+            acquired
+                .build(
+                    inputs(&BTreeMap::new()),
+                    ProfileDirectory::ephemeral(f.root.path()).unwrap()
+                )
+                .await
+                .is_err(),
+            "missed {kind} mutation"
+        );
+    }
+}
+
+#[test]
+fn f8_unreadable_and_unresolved_git_sources_defer() {
+    let (f, local) = git_layout("linked");
+    std::fs::create_dir(local).unwrap(); // Unreadable as a settings document.
+    assert!(matches!(
+        f.inspect(),
+        Err(DeferredReason::PolicyAcquisition)
+    ));
+    for contents in ["gitdir: /unavailable/intent-fixture-git", "malformed"] {
+        let (f, _) = git_layout("linked");
+        std::fs::write(f.workspace.join(".git"), contents).unwrap();
+        assert!(matches!(
+            f.inspect(),
+            Err(DeferredReason::PolicyAcquisition)
+        ));
+    }
+}
