@@ -121,6 +121,41 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_scripts(&self, scripts: &[Script]) -> Result<()> {
+        self.upsert_scripts_inner(scripts, None).await.map(|_| ())
+    }
+
+    /// Seed defaults only if no definition has ever been persisted in this
+    /// workspace. The initialization claim and inserts commit together, so a
+    /// stale first-use reader cannot undo a concurrent create followed by purge.
+    /// Empty defaults do not initialize the workspace. Returns whether seeded.
+    ///
+    /// # Errors
+    /// Returns `Error::InvalidParams` for a script in another workspace, or
+    /// `Error::Internal` if the transaction fails (the claim is rolled back).
+    pub async fn bootstrap_scripts(
+        &self,
+        workspace_id: &WorkspaceId,
+        scripts: &[Script],
+    ) -> Result<bool> {
+        if scripts.is_empty() {
+            return Ok(false);
+        }
+        if scripts
+            .iter()
+            .any(|s| s.workspace_id != workspace_id.as_str())
+        {
+            return Err(Error::InvalidParams(
+                "bootstrap scripts workspace mismatch".into(),
+            ));
+        }
+        self.upsert_scripts_inner(scripts, Some(workspace_id)).await
+    }
+
+    async fn upsert_scripts_inner(
+        &self,
+        scripts: &[Script],
+        initialize_workspace: Option<&WorkspaceId>,
+    ) -> Result<bool> {
         // Per-row bind count derived from SCRIPT_COLUMNS so the placeholder
         // row and chunk math cannot drift if the persisted set changes.
         // 2048 rows × 12 binds = 24576, well under the 32766 cap; one chunk
@@ -133,6 +168,21 @@ impl Store {
             .begin()
             .await
             .map_err(|e| Error::Internal(format!("bulk upsert scripts begin failed: {e}")))?;
+        if let Some(workspace_id) = initialize_workspace {
+            let claimed = sqlx::query(
+                "UPDATE workspace SET scripts_initialized = 1 WHERE id = ? AND scripts_initialized = 0",
+            )
+            .bind(workspace_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("claim script initialization failed: {e}")))?;
+            if claimed.rows_affected() == 0 {
+                tx.rollback().await.map_err(|e| {
+                    Error::Internal(format!("script initialization rollback failed: {e}"))
+                })?;
+                return Ok(false);
+            }
+        }
         for chunk in scripts.chunks(ROWS_PER_STATEMENT) {
             let placeholders = vec![row.as_str(); chunk.len()].join(",");
             let sql =
@@ -172,7 +222,7 @@ impl Store {
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("bulk upsert scripts commit failed: {e}")))?;
-        Ok(())
+        Ok(true)
     }
 
     /// Delete a script definition by `id` (FE `removeScript`). Returns whether

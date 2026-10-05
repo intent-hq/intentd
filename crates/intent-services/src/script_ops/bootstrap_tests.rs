@@ -1,4 +1,62 @@
 #[intent_test_macros::daemon_test]
+async fn purged_scripts_are_not_reseeded_by_an_inflight_first_list() {
+    for remove_custom in [true, false] {
+        let h = harness().await;
+        let repo = WorktreeDir::new();
+        std::fs::create_dir_all(repo.0.join(".intent")).unwrap();
+        std::fs::write(
+            repo.0.join(".intent/config.json"),
+            r#"{"scripts":[{"name":"default","command":"true","mode":"command"}]}"#,
+        )
+        .unwrap();
+        sqlx::query("UPDATE workspace SET repository_path = ? WHERE id = ?")
+            .bind(repo.0.to_str().unwrap())
+            .bind(h.ws.as_str())
+            .execute(h.services.store.write_pool())
+            .await
+            .unwrap();
+        let park = Arc::new(SupervisePark::default());
+        let mut mgr = h.services.script_manager();
+        mgr.parks.bootstrap_persist = Some(park.clone());
+        let listing = {
+            let ws = h.ws.clone();
+            intent_core::spawn_daemon(async move { mgr.list(&ws).await })
+        };
+        tokio::time::timeout(LIVENESS, park.entered.notified())
+            .await
+            .expect("first list reached persistence after observing no scripts");
+        let id = create_simple(&h, "custom", "true", ScriptMode::Command).await;
+        if remove_custom {
+            h.services
+                .script_remove(h.ws.clone(), id.clone())
+                .await
+                .unwrap();
+        }
+        park.release.notify_one();
+        let listed = tokio::time::timeout(LIVENESS, listing)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if remove_custom {
+            assert_eq!(
+                listed,
+                json!({"scripts": []}),
+                "stale bootstrap undid a purge"
+            );
+        } else {
+            assert_eq!(listed["scripts"].as_array().unwrap().len(), 1);
+            assert_eq!(listed["scripts"][0]["id"], id);
+        }
+        assert_eq!(
+            h.services.store.list_all_scripts().await.unwrap().len(),
+            usize::from(!remove_custom)
+        );
+        assert_eq!(h.services.script_list(h.ws.clone()).await.unwrap(), listed);
+    }
+}
+
+#[intent_test_macros::daemon_test]
 async fn purged_repository_scripts_stay_empty_across_lists_and_restart() {
     use intent_core::ScriptArchiveFilter;
 

@@ -243,6 +243,8 @@ pub(crate) struct SupervisePark {
 /// grouped so the manager constructor stays within arity limits.
 #[derive(Clone, Default)]
 pub(crate) struct ScriptParks {
+    /// Parks a first-use list before its atomic bootstrap claim.
+    pub(crate) bootstrap_persist: Option<Arc<SupervisePark>>,
     pub(crate) monitor_clock: Option<Arc<std::sync::atomic::AtomicI64>>,
     /// Parks before process admission; cancellation must prevent the spawn.
     pub(crate) before_spawn: Option<Arc<SupervisePark>>,
@@ -896,7 +898,16 @@ impl ScriptManager {
                             // Persist in one batched upsert — one INSERT per
                             // script here tripped the per-dispatch statement
                             // budget (intent-hq/monorepo#1778) — then register.
-                            self.store.upsert_scripts(&scripts).await?;
+                            if let Some(park) = &self.parks.bootstrap_persist {
+                                park.entered.notify_one();
+                                park.release.notified().await;
+                            }
+                            let scripts =
+                                if self.store.bootstrap_scripts(workspace_id, &scripts).await? {
+                                    scripts
+                                } else {
+                                    Vec::new()
+                                };
                             for script in scripts {
                                 let id = script.id.clone();
                                 let lock = self.locks.definition_lock(&id);

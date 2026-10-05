@@ -80,23 +80,7 @@ async fn script_initialization_is_atomic_and_workspace_scoped() {
     tx.rollback().await.unwrap();
     assert!(!store.workspace_scripts_initialized(&ws).await.unwrap());
 
-    let mut script = intent_core::Script {
-        id: "saved".into(),
-        workspace_id: ws.to_string(),
-        name: "check".into(),
-        command: "true".into(),
-        cwd: None,
-        env: None,
-        mode: intent_core::ScriptMode::Command,
-        category: None,
-        source: "user".into(),
-        auto_start: None,
-        created_at: now_iso(),
-        updated_at: None,
-        purpose: intent_core::ScriptPurpose::Saved,
-        archived_at: None,
-        last_run: None,
-    };
+    let mut script = initialization_script(&ws, "saved");
     store.upsert_script_in_workspace(&script).await.unwrap();
     assert!(store.workspace_scripts_initialized(&ws).await.unwrap());
     script.workspace_id = other.to_string();
@@ -116,4 +100,99 @@ async fn script_initialization_is_atomic_and_workspace_scoped() {
     assert!(store.workspace_scripts_initialized(&other).await.unwrap());
     store.remove_script("saved").await.unwrap();
     assert!(store.workspace_scripts_initialized(&other).await.unwrap());
+}
+
+#[tokio::test]
+async fn script_initialization_claim_rolls_back_with_failed_bootstrap() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "bootstrap", false))
+        .await
+        .unwrap();
+    assert!(!store.bootstrap_scripts(&ws, &[]).await.unwrap());
+    assert!(!store.workspace_scripts_initialized(&ws).await.unwrap());
+    let script = initialization_script(&ws, "default");
+    sqlx::query("CREATE TRIGGER reject_bootstrap BEFORE INSERT ON script BEGIN SELECT RAISE(ABORT, 'test insert failure'); END")
+        .execute(store.write_pool()).await.unwrap();
+    assert!(store
+        .bootstrap_scripts(&ws, std::slice::from_ref(&script))
+        .await
+        .is_err());
+    assert!(!store.workspace_scripts_initialized(&ws).await.unwrap());
+    assert!(store.list_all_scripts().await.unwrap().is_empty());
+    sqlx::query("DROP TRIGGER reject_bootstrap")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert!(store
+        .bootstrap_scripts(&ws, std::slice::from_ref(&script))
+        .await
+        .unwrap());
+    assert!(store.workspace_scripts_initialized(&ws).await.unwrap());
+    store.remove_script(&script.id).await.unwrap();
+    assert!(!store.bootstrap_scripts(&ws, &[script]).await.unwrap());
+    assert!(store.list_all_scripts().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn script_initialization_survives_transfer_and_legacy_import() {
+    for legacy in [false, true] {
+        let source_db = TempDb::new();
+        let source = Store::open(&source_db.path).await.unwrap();
+        let ws = WorkspaceId::new();
+        source
+            .insert_workspace(&sample_workspace(&ws, "transfer", false))
+            .await
+            .unwrap();
+        let script = initialization_script(&ws, "transferred");
+        source.upsert_script(&script).await.unwrap();
+        if !legacy {
+            source.remove_script(&script.id).await.unwrap();
+        }
+        let mut rows = source.transfer_export_rows(&ws).await.unwrap();
+        rows.retain(|(table, _)| table == "workspace" || table == "script");
+        let (_, workspaces) = rows
+            .iter_mut()
+            .find(|(table, _)| table == "workspace")
+            .unwrap();
+        let workspace = workspaces[0].as_object_mut().unwrap();
+        assert_eq!(workspace["scripts_initialized"], json!(1));
+        // The transfer transform clears source-host authority on arrival.
+        workspace.insert("owner_principal_id".into(), serde_json::Value::Null);
+        workspace.insert("legacy_author_principal_id".into(), serde_json::Value::Null);
+        if legacy {
+            workspace.remove("scripts_initialized");
+        }
+        let target_db = TempDb::new();
+        let target = Store::open(&target_db.path).await.unwrap();
+        target.transfer_import_rows(&rows).await.unwrap();
+        assert!(target.workspace_scripts_initialized(&ws).await.unwrap());
+        if legacy {
+            target.remove_script(&script.id).await.unwrap();
+        }
+        assert!(target.list_all_scripts().await.unwrap().is_empty());
+        assert!(!target.bootstrap_scripts(&ws, &[script]).await.unwrap());
+    }
+}
+
+fn initialization_script(ws: &WorkspaceId, id: &str) -> intent_core::Script {
+    intent_core::Script {
+        id: id.into(),
+        workspace_id: ws.to_string(),
+        name: "check".into(),
+        command: "true".into(),
+        cwd: None,
+        env: None,
+        mode: intent_core::ScriptMode::Command,
+        category: None,
+        source: "user".into(),
+        auto_start: None,
+        created_at: now_iso(),
+        updated_at: None,
+        purpose: intent_core::ScriptPurpose::Saved,
+        archived_at: None,
+        last_run: None,
+    }
 }
