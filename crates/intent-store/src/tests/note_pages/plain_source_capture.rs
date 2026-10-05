@@ -128,8 +128,7 @@ async fn indexed_plain_ab_capture_retains_original_source_context_closure() {
             continue;
         }
         assert!(seen.len() <= 16, "small lexical fixture closure");
-        let mut request =
-            json!({"kind":kind,"maxSourceBytes":4096,"maxWireBytes":8192,"maxItems":64});
+        let mut request = json!({"kind":kind,"maxWireBytes":8192,"maxItems":64});
         request[if kind == "metadata" {
             "ref"
         } else {
@@ -147,7 +146,11 @@ async fn indexed_plain_ab_capture_retains_original_source_context_closure() {
         for field in ["scope", "sourceRevision", "snapshotId", "expiresAt"] {
             assert_eq!(response[field], first[field]);
         }
-        assert_eq!(call["request"]["maxSourceBytes"], 4096);
+        if call["request"]["kind"] == "source" {
+            assert_eq!(call["request"]["maxSourceBytes"], 4096);
+        } else {
+            assert!(call["request"].get("maxSourceBytes").is_none());
+        }
         assert_eq!(call["request"]["maxWireBytes"], 8192);
         assert_eq!(call["request"]["maxItems"], 64);
         for item in response["items"].as_array().into_iter().flatten() {
