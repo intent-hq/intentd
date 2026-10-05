@@ -109,6 +109,24 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
     ("note_operation", "durable retry identities belong to the original backend namespace, principal and note incarnation; never execute or replay them on an imported incarnation"),
     ("note_operation_item", "receipt-owned mappings, effects and inverse references are local to excluded note_operation identities"),
     ("note_operation_source", "retained receipt source belongs to excluded backend-local operations; live note source transfers through note"),
+    ("note_annotation_head", "destination note triggers create fresh annotation epochs; legacy source and comments transfer separately"),
+    ("note_annotation_state", "backend-local incarnation state generations and deletion tombstones do not transfer"),
+    ("note_attribution_line", "derived attribution projection is republished against the destination source revision"),
+    ("note_attribution_author", "derived attribution author projection is republished against destination epochs"),
+    ("note_attribution_author_piece", "bounded fragments of the excluded attribution author projection"),
+    ("note_comment_root", "comment import triggers reconstruct canonical root identity from transferred comment and parent IDs"),
+    ("note_comment_thread", "maintained thread counts are reconstructed by comment import triggers"),
+    ("note_comment_projection", "bounded comment previews and thread ordering are rebuilt by comment import triggers"),
+    ("note_comment_anchor", "source-revision-bound anchor occurrences are republished from canonical markers in the destination"),
+    ("note_comment_anchor_extent", "derived RTree for excluded source-bound anchor occurrences"),
+    ("note_comment_anchor_extent_node", "RTree shadow table of the excluded anchor extent index"),
+    ("note_comment_anchor_extent_parent", "RTree shadow table of the excluded anchor extent index"),
+    ("note_comment_anchor_extent_rowid", "RTree shadow table of the excluded anchor extent index"),
+    ("note_comment_anchor_cover", "derived interval coverage for excluded source-bound anchor occurrences"),
+    ("note_comment_detail", "bounded detail metadata is rebuilt from transferred canonical comment rows"),
+    ("note_comment_detail_piece", "bounded detail fragments are rebuilt by comment import triggers"),
+    ("note_annotation_snapshot", "principal/backend/incarnation-scoped read leases never transfer"),
+    ("note_annotation_match_head", "scalar query totals belong to excluded backend-local annotation leases"),
     ("note_search_ctx", "derived note search identities/context; note import triggers rebuild them"),
     ("note_fts", "derived note full-text index; note import triggers rebuild it"),
     ("note_fts_config", "FTS5 shadow table of the derived note index"),
@@ -1858,11 +1876,58 @@ mod tests {
         }
     }
 
-    /// Schema-parity tripwire: every table in the live post-migration schema
-    /// must appear in exactly one of [`TRANSFER_TABLES`] /
-    /// [`TRANSFER_EXCLUDED_TABLES`], and neither list may name a table that
-    /// no longer exists. A new migration that adds a table fails here until
-    /// its transfer fate is decided explicitly.
+    /// Destination triggers reconstruct deleted-root identity and bounded
+    /// details from canonical rows, while assigning a fresh local incarnation.
+    #[tokio::test]
+    async fn transfer_reconstructs_deleted_comment_roots_with_fresh_annotation_identity() {
+        let source_db = TempDb::new();
+        let source = Store::open(&source_db.path).await.unwrap();
+        for statement in [
+            "INSERT INTO workspace(id,title,branch,created_at,updated_at) VALUES('annotation-transfer','T','main','created','updated')",
+            "INSERT INTO note(id,workspace_id,title,content,created_at,updated_at) VALUES('n','annotation-transfer','N','unchanged😀','created','updated')",
+            "INSERT INTO comment(id,thread_id,note_id,workspace_id,kind,content,author,author_type,anchor_json,created_at,updated_at) VALUES('root','thread','n','annotation-transfer','comment','root body','author','user','{}','created','updated')",
+            "INSERT INTO comment(id,thread_id,note_id,workspace_id,kind,content,author,author_type,parent_id,anchor_json,created_at,updated_at) VALUES('reply','thread','n','annotation-transfer','comment','reply😀','author','user','root','{}','created','updated')",
+            "DELETE FROM comment WHERE id='root'",
+        ] {
+            sqlx::query(statement).execute(source.write_pool()).await.unwrap();
+        }
+        let original_instance: String = sqlx::query_scalar("SELECT instance_id FROM note_page_head WHERE workspace_id='annotation-transfer' AND note_id='n'")
+            .fetch_one(source.read_pool()).await.unwrap();
+        let rows = source
+            .transfer_export_rows(&WorkspaceId("annotation-transfer".into()))
+            .await
+            .unwrap();
+        assert!(rows
+            .iter()
+            .all(|(name, _)| !name.starts_with("note_annotation_")
+                && !name.starts_with("note_comment_")));
+        let target_db = TempDb::new();
+        let target = Store::open(&target_db.path).await.unwrap();
+        target.transfer_import_rows(&rows).await.unwrap();
+        let identity: (String, bool, i64) = sqlx::query_as("SELECT r.root_comment_id,r.root_present,t.total_comments FROM note_comment_root r JOIN note_comment_thread t USING(head_id,thread_id) JOIN note_annotation_head h ON h.id=r.head_id WHERE h.workspace_id='annotation-transfer' AND h.note_id='n' AND r.thread_id='thread'")
+            .fetch_one(target.read_pool()).await.unwrap();
+        assert_eq!(identity, ("root".into(), false, 1));
+        let reply: (String, String) =
+            sqlx::query_as("SELECT parent_id,content FROM comment WHERE id='reply'")
+                .fetch_one(target.read_pool())
+                .await
+                .unwrap();
+        assert_eq!(reply, ("root".into(), "reply😀".into()));
+        let detail: Vec<u8> = sqlx::query_scalar("SELECT data FROM note_comment_detail_piece WHERE comment_id='reply' AND field='body' AND position=0")
+            .fetch_one(target.read_pool()).await.unwrap();
+        assert_eq!(detail, "reply😀".as_bytes());
+        let current_instance: String = sqlx::query_scalar("SELECT instance_id FROM note_page_head WHERE workspace_id='annotation-transfer' AND note_id='n'")
+            .fetch_one(target.read_pool()).await.unwrap();
+        assert_ne!(current_instance, original_instance);
+        let snapshots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_annotation_snapshot")
+            .fetch_one(target.read_pool())
+            .await
+            .unwrap();
+        assert_eq!(snapshots, 0);
+    }
+
+    /// Schema-parity tripwire: every live table has exactly one transfer
+    /// decision, and neither registry may name an absent table.
     #[tokio::test]
     async fn every_live_table_has_an_explicit_transfer_decision() {
         let db = TempDb::new();
