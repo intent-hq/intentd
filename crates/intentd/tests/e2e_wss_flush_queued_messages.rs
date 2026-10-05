@@ -130,9 +130,19 @@ mod fixture_command_tests {
     use super::*;
     use std::ffi::OsStr;
 
-    fn explicit_env<'a>(cmd: &'a std::process::Command, name: &str) -> Option<Option<&'a OsStr>> {
-        cmd.get_envs()
-            .find_map(|(key, value)| (key == OsStr::new(name)).then_some(value))
+    #[derive(Debug, PartialEq, Eq)]
+    enum EnvSetting<'a> {
+        Inherited,
+        Removed,
+        Set(&'a OsStr),
+    }
+
+    fn explicit_env<'a>(cmd: &'a std::process::Command, name: &str) -> EnvSetting<'a> {
+        match cmd.get_envs().find(|(key, _)| *key == OsStr::new(name)) {
+            None => EnvSetting::Inherited,
+            Some((_, None)) => EnvSetting::Removed,
+            Some((_, Some(value))) => EnvSetting::Set(value),
+        }
     }
 
     #[test]
@@ -145,8 +155,8 @@ mod fixture_command_tests {
                 ("GITHUB_TOKEN", "synthetic-github-token"),
             ],
         );
-        assert_eq!(explicit_env(&cmd, "GH_TOKEN"), Some(None));
-        assert_eq!(explicit_env(&cmd, "GITHUB_TOKEN"), Some(None));
+        assert_eq!(explicit_env(&cmd, "GH_TOKEN"), EnvSetting::Removed);
+        assert_eq!(explicit_env(&cmd, "GITHUB_TOKEN"), EnvSetting::Removed);
     }
 
     #[test]
@@ -162,7 +172,7 @@ mod fixture_command_tests {
         let private = dir.path().join("gh-config");
         assert_eq!(
             explicit_env(&cmd, "GH_CONFIG_DIR"),
-            Some(Some(private.as_os_str()))
+            EnvSetting::Set(private.as_os_str())
         );
         assert_eq!(std::fs::read_dir(&private).unwrap().count(), 0);
         assert_eq!(
@@ -185,7 +195,7 @@ mod fixture_command_tests {
         let private = dir.path().join("secrets.json");
         assert_eq!(
             explicit_env(&cmd, "INTENTD_SECRETS_FILE"),
-            Some(Some(private.as_os_str()))
+            EnvSetting::Set(private.as_os_str())
         );
         assert!(
             !private.exists(),
@@ -211,24 +221,24 @@ mod fixture_command_tests {
         );
         assert_eq!(
             explicit_env(&cmd, "INTENTD_DATA_DIR"),
-            Some(Some(dir.path().as_os_str()))
+            EnvSetting::Set(dir.path().as_os_str())
         );
         let workspaces = dir.path().join("workspaces");
         assert_eq!(
             explicit_env(&cmd, "INTENTD_WORKSPACES_DIR"),
-            Some(Some(workspaces.as_os_str()))
+            EnvSetting::Set(workspaces.as_os_str())
         );
         assert_eq!(
             explicit_env(&cmd, "INTENTD_TCP_PORT"),
-            Some(Some(OsStr::new("0")))
+            EnvSetting::Set(OsStr::new("0"))
         );
         assert_eq!(
             explicit_env(&cmd, "MOCK_AGENT_BEHAVIOR"),
-            Some(Some(OsStr::new("synthetic behavior")))
+            EnvSetting::Set(OsStr::new("synthetic behavior"))
         );
         assert_eq!(
             explicit_env(&cmd, "INTENTD_AUTH_TOKEN"),
-            Some(Some(OsStr::new(TOKEN)))
+            EnvSetting::Set(OsStr::new(TOKEN))
         );
     }
 }
