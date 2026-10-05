@@ -146,6 +146,8 @@ async fn install_fake(mgr: &Arc<AgentManager>, id: &AgentId, ws: &WorkspaceId) -
             execution: RuntimeHandle::custom(runtime.clone()),
             repository_origin: crate::agent_manager::RepositoryOrigin::unavailable(),
             antigravity_profile: None,
+            profile_meta: json!({}),
+            provider_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "node".into(),

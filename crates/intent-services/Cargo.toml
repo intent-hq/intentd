@@ -39,7 +39,9 @@ time = { workspace = true, features = ["formatting", "local-offset"] }
 similar = { version = "3.1.1", default-features = false }
 serde_yaml = "0.9"
 toml_edit = "0.25.5"
+toml.workspace = true
 tempfile = "3"
+fs2 = "0.4"
 reqwest.workspace = true
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 sha2 = "0.11"
