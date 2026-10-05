@@ -52,6 +52,8 @@ name = "e2e_wss_gitlab_auth"
 required-features = ["repository-test-fixtures"]
 
 [dev-dependencies]
+# Portable source-lint utilities and Unix process guards; never a runtime dependency.
+intentd-test-support = { path = "../intentd-test-support" }
 uuid = { workspace = true }
 intent-services = { path = "../intent-services", version = "0.10.20", features = ["repository-test-fixtures"] }
 intent-acp = { path = "../intent-acp", version = "0.10.20" }
@@ -97,11 +99,6 @@ nix = { workspace = true, features = ["signal", "process", "fs"] }
 # No-echo terminal input for `intentd settings <sensitive>` prompts
 # (termios); already in the workspace dependency tree via intent-core.
 libc = { workspace = true }
-
-[target."cfg(unix)".dev-dependencies]
-# Shared process-group child guard + release-file barrier for the e2e suites
-# that spawn the real daemon; never a runtime dependency.
-intentd-test-support = { path = "../intentd-test-support" }
 
 # Static musl release targets have no system OpenSSL; macOS has no system OpenSSL
 # headers/dylibs we can rely on either (Homebrew paths break on machines without it).

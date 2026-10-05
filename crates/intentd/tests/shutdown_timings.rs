@@ -211,11 +211,10 @@ async fn busy_checkpoint_is_not_reported_as_completed() {
 fn serve_error_logs_failure_and_still_times_normal_runtime_drop() {
     let dir = common::test_tempdir("shutdown-serve-error-");
     let log_path = dir.path().join("stderr.log");
-    let mut command = common::serve_command();
+    let mut command = common::hermetic_serve_command(dir.path());
     command
         .args(["--mode", "invalid-test-mode"])
         .env("INTENTD_DATA_DIR", dir.path())
-        .env("INTENTD_SECRETS_FILE", dir.path().join("secrets.json"))
         .env("RUST_LOG", "info")
         .stdout(std::process::Stdio::null())
         .stderr(std::fs::File::create(&log_path).unwrap());

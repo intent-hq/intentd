@@ -20,11 +20,9 @@ fn spawn_daemon(data_dir: &PathBuf) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let secrets_file = data_dir.join("secrets.json");
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env_remove("INTENTD_AUTH_TOKEN")
         .stdout(Stdio::null())
@@ -236,12 +234,10 @@ fn spawn_daemon_both_inner(
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let secrets_file = data_dir.join("secrets.json");
     common::enable_ws_api(data_dir);
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));

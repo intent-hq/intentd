@@ -119,7 +119,7 @@ esac
     path
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
+fn mock_gitlab_command(data_dir: &Path, env: &[(&str, &str)]) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -133,9 +133,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     common::enable_ws_api(data_dir);
     // The GitHub resolution chain ends at `gh auth token`; point the CLI at an
     // empty config dir so a developer's own `gh auth login` is never borrowed.
-    let gh_config_dir = data_dir.join("gh-config");
-    std::fs::create_dir_all(&gh_config_dir).expect("mkdir hermetic gh config dir");
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     // The owned mock is a finite test transport, never ambient production authority.
     #[cfg(feature = "repository-test-fixtures")]
     {
@@ -166,13 +164,25 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
         .env_remove("GITLAB_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
-        .env("GH_CONFIG_DIR", &gh_config_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     for (k, v) in env {
         cmd.env(k, v);
     }
-    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
+    if let Some((_, token)) = env.iter().find(|(key, _)| *key == "GITHUB_TOKEN") {
+        assert_eq!(
+            *token, OWNER_GH_TOKEN,
+            "only the fixture-owned GitHub owner token is supported"
+        );
+        // fixture-identity: allow — mixed-forge invites and rekey use OWNER_GH_TOKEN against the local forge mock.
+        common::mock_github_token(&mut cmd, data_dir, token);
+    }
+    cmd
+}
+
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
+    GuardedChild::spawn(&mut mock_gitlab_command(data_dir, env)).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -1804,3 +1814,49 @@ async fn identity_provider_write_rekeys_the_primary_over_wss() {
 
 #[path = "invite_join/host.rs"]
 mod invite_host;
+
+#[test]
+fn mock_gitlab_command_contract_keeps_private_secrets_across_restart() {
+    use std::ffi::OsStr;
+    let dir = temp_data_dir();
+    let secrets = dir.path().join("secrets.json");
+    let state = r#"{"sourceControl.gitlab.token":"synthetic-gitlab-token"}"#;
+    std::fs::write(&secrets, state).unwrap();
+    for _ in 0..2 {
+        let cmd = mock_gitlab_command(
+            dir.path(),
+            &[
+                ("GITHUB_TOKEN", OWNER_GH_TOKEN),
+                ("GH_TOKEN", "synthetic-host-token"),
+                ("GH_CONFIG_DIR", "synthetic-host-config"),
+                ("INTENTD_SECRETS_FILE", "synthetic-host-secrets"),
+                ("INTENTD_GITLAB_API_BASE_URI", "http://127.0.0.1:32123"),
+                ("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:32123"),
+                ("INTENTD_GITHUB_LOGIN_BASE_URI", "http://127.0.0.1:32123"),
+            ],
+        );
+        let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        for key in ["GH_TOKEN", "GITLAB_TOKEN"] {
+            assert_eq!(environment.get(OsStr::new(key)), Some(&None), "{key}");
+        }
+        for (key, path) in [
+            ("GH_CONFIG_DIR", dir.path().join("gh-config")),
+            ("INTENTD_SECRETS_FILE", secrets.clone()),
+        ] {
+            assert_eq!(
+                environment.get(OsStr::new(key)),
+                Some(&Some(path.as_os_str())),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            environment.get(OsStr::new("INTENTD_GITLAB_API_BASE_URI")),
+            Some(&Some(OsStr::new("http://127.0.0.1:32123")))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GITHUB_TOKEN")),
+            Some(&Some(OsStr::new(OWNER_GH_TOKEN)))
+        );
+        assert_eq!(std::fs::read_to_string(&secrets).unwrap(), state);
+    }
+}

@@ -185,7 +185,7 @@ async fn start(root: &Path, home: &Path, bin: &Path) -> (GuardedChild, common::T
         .append(true)
         .open(root.join("daemon.log"))
         .unwrap();
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(root);
     cmd.env_clear()
         .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
         .env("INTENTD_TCP_PORT", "0")
@@ -207,6 +207,7 @@ async fn start(root: &Path, home: &Path, bin: &Path) -> (GuardedChild, common::T
         .env("NODE_DISABLE_COMPILE_CACHE", "1")
         .stdout(Stdio::null())
         .stderr(log);
+    common::hermetic_fixture_identity(&mut cmd, root);
     let child = GuardedChild::spawn(&mut cmd).unwrap();
     let status = common::await_wss_status(&root.join("intentd.sock")).await;
     let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();

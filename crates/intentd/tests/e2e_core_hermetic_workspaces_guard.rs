@@ -54,7 +54,7 @@ fn make_dirs() -> TestDirs {
 /// default workspaces root must refuse instead of falling back to `$HOME`.
 fn spawn_daemon(dirs: &TestDirs, workspaces_dir: Option<&Path>) -> Child {
     let log = std::fs::File::create(dirs.data_dir.join("daemon.log")).expect("create daemon log");
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(&dirs.data_dir);
     cmd.env("HOME", &dirs.home)
         .env("INTENTD_DATA_DIR", &dirs.data_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")

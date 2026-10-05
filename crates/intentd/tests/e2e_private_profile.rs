@@ -20,7 +20,7 @@ const PROFILE: &str = "INTENTD_PRIVATE_TEST_PROFILE";
 fn command(data: &Path) -> Command {
     std::fs::create_dir_all(data.join("workspaces")).unwrap();
     let log = std::fs::File::create(data.join("daemon.log")).unwrap();
-    let mut command = common::serve_command();
+    let mut command = common::hermetic_serve_command(data);
     command
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap())
@@ -29,7 +29,6 @@ fn command(data: &Path) -> Command {
         .env("INTENTD_DATA_DIR", data)
         .env("INTENTD_CONFIG", data.join("config.toml"))
         .env("INTENTD_WORKSPACES_DIR", data.join("workspaces"))
-        .env("INTENTD_SECRETS_FILE", data.join("secrets.json"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_LEGACY_APP_DIR", "")
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -38,6 +37,7 @@ fn command(data: &Path) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
+    common::hermetic_fixture_identity(&mut command, data);
     command
 }
 
@@ -334,6 +334,28 @@ async fn ordinary_and_private_profiles_cannot_enable_fixture_transport_authority
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock,
             "no provider connection may be admitted by the declaration"
+        );
+    }
+}
+
+#[test]
+fn private_profile_command_reapplies_paths_after_clearing_environment() {
+    use std::ffi::OsStr;
+    let dir = common::test_tempdir("private-profile-contract-");
+    let cmd = command(dir.path());
+    let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+    // env_clear means these absent entries are removed, not inherited.
+    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        assert!(environment.get(OsStr::new(key)).is_none_or(Option::is_none));
+    }
+    for (key, path) in [
+        ("GH_CONFIG_DIR", dir.path().join("gh-config")),
+        ("INTENTD_SECRETS_FILE", dir.path().join("secrets.json")),
+    ] {
+        assert_eq!(
+            environment.get(OsStr::new(key)),
+            Some(&Some(path.as_os_str())),
+            "{key}"
         );
     }
 }
