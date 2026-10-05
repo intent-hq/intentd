@@ -7,6 +7,43 @@ use sqlx::{QueryBuilder, Sqlite};
 
 pub(crate) const COMMENT_BATCH: i64 = 32;
 const CHILD_BATCH: i64 = 500;
+const HEAD_CHILDREN: [(&str, &str, i64); 9] = [
+    ("note_attribution_author_piece", "rowid", CHILD_BATCH),
+    ("note_attribution_author", "rowid", CHILD_BATCH),
+    ("note_attribution_line", "rowid", CHILD_BATCH),
+    (
+        "note_comment_anchor_cover",
+        "(head_id,level,bucket,thread_id,anchor_id)",
+        CHILD_BATCH,
+    ),
+    ("note_comment_anchor", "rowid", COMMENT_BATCH),
+    ("note_comment_projection", "rowid", COMMENT_BATCH),
+    ("note_comment_root", "rowid", CHILD_BATCH),
+    ("note_comment_thread", "rowid", COMMENT_BATCH),
+    ("note_annotation_match_head", "rowid", CHILD_BATCH),
+];
+
+/// One scalar statement, nine indexed EXISTS probes, at most 32 owner keys.
+/// Do not COUNT rows or inspect another workspace's preceding head prefix.
+fn presence_query(heads: &[i64]) -> QueryBuilder<'static, Sqlite> {
+    debug_assert!(!heads.is_empty() && heads.len() <= COMMENT_BATCH as usize);
+    let mut query = QueryBuilder::new("SELECT ");
+    for (index, (table, _, _)) in HEAD_CHILDREN.iter().enumerate() {
+        if index != 0 {
+            query.push(" + ");
+        }
+        query
+            .push("EXISTS(SELECT 1 FROM ")
+            .push(*table)
+            .push(" WHERE head_id IN (");
+        let mut values = query.separated(",");
+        for head in heads {
+            values.push_bind(*head);
+        }
+        query.push(")) * ").push(1_i64 << index);
+    }
+    query
+}
 
 fn database_error(error: &sqlx::Error) -> Error {
     Error::Internal(format!("workspace annotation cleanup failed: {error}"))
@@ -218,23 +255,26 @@ pub(crate) async fn drain(store: &Store, workspace_id: &str) -> Result<()> {
             return Ok(());
         }
         let heads: Vec<i64> = owners.iter().map(|(id, _)| *id).collect();
-        for (table, key, batch) in [
-            ("note_attribution_author_piece", "rowid", CHILD_BATCH),
-            ("note_attribution_author", "rowid", CHILD_BATCH),
-            ("note_attribution_line", "rowid", CHILD_BATCH),
-            (
-                "note_comment_anchor_cover",
-                "(head_id,level,bucket,thread_id,anchor_id)",
-                CHILD_BATCH,
-            ),
-            ("note_comment_anchor", "rowid", COMMENT_BATCH),
-            ("note_comment_projection", "rowid", COMMENT_BATCH),
-            ("note_comment_root", "rowid", CHILD_BATCH),
-            ("note_comment_thread", "rowid", COMMENT_BATCH),
-            ("note_annotation_match_head", "rowid", CHILD_BATCH),
-        ] {
-            drain_heads(store, table, key, &heads, batch).await?;
+        // Absence is stable after begin_retirement: note/comment triggers reject
+        // canonical writes; attribution and anchor publication and match-cache
+        // preparation check head() under BEGIN IMMEDIATE before child inserts.
+        // A writer admitted before the fence must finish before fence commit.
+        // Child deletion triggers only update/delete other children, never
+        // recreate them. Keep the fence and existing separately committed order.
+        let present: i64 = presence_query(&heads)
+            .build_query_scalar()
+            .fetch_one(store.read_pool())
+            .await
+            .map_err(|error| database_error(&error))?;
+        for (index, (table, key, batch)) in HEAD_CHILDREN.iter().enumerate() {
+            if present & (1_i64 << index) != 0 {
+                drain_heads(store, table, key, &heads, *batch).await?;
+            }
         }
         after = owners.last().map(|(_, note)| note.clone());
     }
 }
+
+#[cfg(test)]
+#[path = "workspace_annotation_cleanup_tests.rs"]
+mod tests;
