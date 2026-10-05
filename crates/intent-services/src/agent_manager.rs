@@ -6484,20 +6484,13 @@ impl AgentManager {
             .get_agent_messages(agent_id, Some(10))
             .await
             .ok()?;
-        let last_user_idx = messages.iter().rposition(|m| m.role == "user")?;
-        if turn_progressed_after(&messages, last_user_idx, marker_row_id) {
-            return None;
-        }
-        let payload = self
+        let active_groups = self
             .active_delivery_groups
             .lock()
             .unwrap()
             .get(agent_id)
-            .cloned()
-            .map_or_else(
-                || extract_user_prepend(&messages[last_user_idx].content),
-                prepend_from_groups,
-            );
+            .cloned();
+        let payload = redelivery_prepend(&messages, active_groups, marker_row_id)?;
         if payload.content.is_none()
             && payload.image_blocks.is_none()
             && payload.file_blocks.is_none()
@@ -9127,62 +9120,24 @@ impl AgentManager {
             // the interrupt message in ONE combined prompt (original
             // first) instead of re-queueing it behind the interrupt
             // (which inverted the user's intended order, monorepo#1014).
-            // Fetch last 10 transcript messages (bounded work) to find
-            // the user message + its attachments. If any non-user
-            // messages (assistant/tool/system) exist after the last
-            // user message, the turn has already progressed and we
-            // should NOT re-deliver (avoids duplicate tool calls or
-            // re-running side effects). The EMPTY interrupted marker row
-            // the preemption itself just appended is NOT progress —
-            // exclude it by id, but ONLY while it is actually empty:
-            // `has_output` above is snapshotted several awaits before
-            // `interrupt_inner` re-reads the slot, so a first block
-            // streaming in that window lands in the flushed row — a
-            // NON-empty marker row IS progress and must keep blocking
-            // the combined re-delivery.
+            // The pinned marker guards output that arrived after the early
+            // snapshot. Saved live groups may precede unrelated history rows.
             if let Ok(messages) = self
                 .services
                 .store
                 .get_agent_messages(agent_id, Some(10))
                 .await
             {
-                if let Some(last_user_msg) = messages.iter().rev().find(|m| m.role == "user") {
-                    let last_user_idx = messages
-                        .iter()
-                        .rposition(|m| m.id == last_user_msg.id)
-                        .unwrap();
-                    let has_non_user_after = turn_progressed_after(
-                        &messages,
-                        last_user_idx,
-                        interrupted_row_id.as_ref(),
+                if let Some(payload) =
+                    redelivery_prepend(&messages, active_groups, interrupted_row_id.as_ref())
+                {
+                    merge_prepend_payload(
+                        &mut options.prepend_content,
+                        &mut options.prepend_image_blocks,
+                        &mut options.prepend_file_blocks,
+                        &mut options.prepend_delivery_groups,
+                        payload,
                     );
-
-                    if !has_non_user_after {
-                        // Extract the preempted message's text + attachments
-                        // (shared with the zero-output user-stop redelivery
-                        // arm, intent-hq/monorepo#1757).
-                        let payload = active_groups.clone().map_or_else(
-                            || extract_user_prepend(&last_user_msg.content),
-                            prepend_from_groups,
-                        );
-
-                        // Prompt-only prepend: both user rows are
-                        // already persisted, so nothing is appended to
-                        // the transcript and the queue is untouched.
-                        // MERGE with any entry-carried prepend payload
-                        // (a monorepo#1014-requeued entry delivered via
-                        // `send_queued_message_now` already carries its
-                        // own `prepend_*`): the entry's older prepend
-                        // stays first, the just-preempted message follows
-                        // — transcript order, nothing clobbered.
-                        merge_prepend_payload(
-                            &mut options.prepend_content,
-                            &mut options.prepend_image_blocks,
-                            &mut options.prepend_file_blocks,
-                            &mut options.prepend_delivery_groups,
-                            payload,
-                        );
-                    }
                 }
             }
         }
@@ -11706,6 +11661,35 @@ fn turn_progressed_after(
     })
 }
 
+fn redelivery_prepend(
+    messages: &[intent_core::AgentMessage],
+    active_groups: Option<Vec<crate::agent_ops::QueuedDeliveryGroup>>,
+    marker_row_id: Option<&String>,
+) -> Option<crate::agent_ops::QueuedPrepend> {
+    match (active_groups, marker_row_id) {
+        (Some(groups), Some(marker_id)) => {
+            let marker = messages.iter().find(|message| &message.id == marker_id)?;
+            marker
+                .content
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                .then(|| prepend_from_groups(groups))
+        }
+        (groups, _) => {
+            let last_user_idx = messages
+                .iter()
+                .rposition(|message| message.role == "user")?;
+            if turn_progressed_after(messages, last_user_idx, marker_row_id) {
+                return None;
+            }
+            Some(groups.map_or_else(
+                || extract_user_prepend(&messages[last_user_idx].content),
+                prepend_from_groups,
+            ))
+        }
+    }
+}
+
 /// Port of the FE `contextReferences` → `stdinContext` builder
 /// (`agent-backend-handler.service.ts` — the ~3170–3248 block). Iterates the
 /// raw JSON array in order and emits one context entry per reference,
@@ -11899,6 +11883,13 @@ fn merge_prepend_payload(
     prepend_groups: &mut Option<Vec<crate::agent_ops::QueuedDeliveryGroup>>,
     armed: crate::agent_ops::QueuedPrepend,
 ) {
+    if armed.delivery_groups.is_none()
+        && armed.content.is_none()
+        && armed.image_blocks.is_none()
+        && armed.file_blocks.is_none()
+    {
+        return;
+    }
     if prepend_groups.is_some() || armed.delivery_groups.is_some() {
         let mut groups = crate::agent_ops::delivery_prepend_groups(
             prepend_groups.as_ref(),

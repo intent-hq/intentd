@@ -2991,13 +2991,14 @@ async fn failed_attachment_batch_keeps_groups_through_restart_and_retry_over_wss
         json!({"workspaceId":workspace_id,"eventTypes":["agent:*"]}),
     )
     .await;
-    wss_rpc(
+    let sent = wss_rpc(
         &mut rpc,
         12,
-        "agent.retry",
-        json!({"workspaceId":workspace_id,"agentId":agent}),
+        "agent.sendQueuedMessageNow",
+        json!({"workspaceId":workspace_id,"agentId":agent,"messageId":after["queue"][0]["id"]}),
     )
     .await;
+    assert_eq!(sent["queued"], false, "restored retry starts");
     observe_drain(&mut sub, agent, 1).await;
     let prompts = await_prompts(&prompt_log, 3).await;
     assert_eq!(prompts[2].matches("durable first group").count(), 1);
@@ -3404,6 +3405,11 @@ async fn context_recovery_direct_prepend_over_wss() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn context_recovery_stopped_prepend_over_wss() {
+    context_recovery_groups_over_wss("stopped-prepend", false, false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn context_recovery_direct_both_over_wss() {
     context_recovery_groups_over_wss("direct-both", false, true, true).await;
 }
@@ -3550,6 +3556,9 @@ async fn context_recovery_groups_over_wss(
     } else {
         wss_rpc(&mut rpc, 6, "agent.sendQueuedMessageNow", json!({"workspaceId":workspace_id,"agentId":agent,"messageId":original["queue"][0]["id"]})).await;
         await_prompts(&prompt_log, 3).await;
+        if name == "stopped-prepend" {
+            wss_rpc(&mut rpc, 70, "agent.stop", json!({"agentId":agent})).await;
+        }
         let sent = wss_rpc(&mut rpc, 7, "agent.sendMessage", json!({"workspaceId":workspace_id,"agentId":agent,"content":current,"imageBlocks":images,"priority":"interrupt"})).await;
         assert_eq!(sent["queued"], false, "direct interrupt must start");
         direct_message_id = sent["messageId"].clone();
