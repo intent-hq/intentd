@@ -2757,9 +2757,8 @@ async fn attachment_groups_over_wss(explicit: bool) {
             json!({"workspaceId":workspace_id,"agentId":agent,"messageIds":ids}),
         )
         .await;
-    } else {
-        std::fs::write(&release, "go").unwrap();
     }
+    std::fs::write(&release, "go").unwrap();
     let observed = observe_drain(&mut sub, agent, 2).await;
     assert_eq!(observed.processing_frames.len(), 1, "one ACP turn");
     assert_eq!(
