@@ -19,6 +19,7 @@ use crate::{AgentQueueRow, AutoVacuumActivation, EventQuery, NewEvent, Store, MA
 
 mod host_membership;
 mod human_attribution;
+mod script_initialization;
 mod script_monitors;
 mod sharing;
 mod workspace_delete;

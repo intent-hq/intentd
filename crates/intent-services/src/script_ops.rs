@@ -769,8 +769,8 @@ impl ScriptManager {
     }
 
     /// `script.list`: the workspace's scripts with merged runtime state.
-    /// When empty, bootstrap from repo config `scripts[]` (FE parity:
-    /// scripts.ipc.ts L291-320).
+    /// Bootstrap repo config `scripts[]` only for a workspace that has never
+    /// held script definitions. An intentionally emptied workspace stays empty.
     pub(crate) async fn list(&self, workspace_id: &WorkspaceId) -> Result<Value> {
         self.list_filtered(workspace_id, intent_core::ScriptArchiveFilter::All)
             .await
@@ -787,7 +787,7 @@ impl ScriptManager {
             intent_core::ScriptArchiveFilter::Archived => m.def.archived_at.is_some(),
         };
         // Filter the existing registry before serializing full definitions.
-        // Bootstrap eligibility still uses unfiltered workspace membership.
+        // Nonempty registries need no initialization read, even if filtered empty.
         {
             let guard = self.scripts.lock().unwrap();
             let mut scripts: Vec<(String, Value)> = guard
@@ -805,7 +805,7 @@ impl ScriptManager {
             }
         } // guard dropped here
 
-        // Bootstrap from repo config if workspace has no scripts.
+        // Check durable initialization before bootstrapping an empty workspace.
         // Use a per-workspace async lock to prevent concurrent bootstrap attempts
         // from creating duplicate script rows (modeled after intent-git::WorktreeLocks).
         self.locks
@@ -831,6 +831,17 @@ impl ScriptManager {
                         return Ok(json!({ "scripts": scripts }));
                     }
                 } // guard dropped here
+
+                // Membership alone cannot distinguish a new workspace from a purge.
+                // The store marks initialization atomically with script insertion,
+                // so this also fences reseeding while removal is tearing down runtime.
+                if self
+                    .store
+                    .workspace_scripts_initialized(workspace_id)
+                    .await?
+                {
+                    return Ok(json!({ "scripts": [] }));
+                }
 
                 // Now safe to bootstrap
                 if let Ok(ws) = self.store.get_workspace(workspace_id).await {
@@ -2674,6 +2685,7 @@ fn script_event(workspace_id: &WorkspaceId, event_type: &str, data: Value) -> Ne
 
 #[cfg(test)]
 mod tests {
+    include!("script_ops/bootstrap_tests.rs");
     include!("script_ops/lifecycle_tests.rs");
     include!("script_ops/retirement_tests.rs");
     include!("script_ops/monitor_tests.rs");

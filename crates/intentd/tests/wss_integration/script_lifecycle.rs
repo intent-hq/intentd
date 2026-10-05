@@ -37,6 +37,63 @@ async fn rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
 }
 
 #[intent_test_macros::daemon_test]
+async fn purged_repository_scripts_stay_empty_after_wss_reconnect() {
+    let repo = common::test_tempdir("intentd-script-bootstrap-");
+    std::fs::create_dir_all(repo.path().join(".intent")).unwrap();
+    std::fs::write(
+        repo.path().join(".intent/config.json"),
+        r#"{"scripts":[{"name":"check","command":"true","mode":"command"}]}"#,
+    )
+    .unwrap();
+    let srv = start(WsOptions::default()).await;
+    let mut client = connect_ws(srv.port, srv.cfg.clone()).await;
+    let created = rpc(
+        &mut client,
+        1,
+        "workspace.create",
+        json!({"title":"Deliberately empty scripts"}),
+    )
+    .await;
+    let ws = created["result"]["workspace"]["id"].as_str().unwrap();
+    sqlx::query("UPDATE workspace SET repository_path = ? WHERE id = ?")
+        .bind(repo.path().to_str().unwrap())
+        .bind(ws)
+        .execute(srv.store.write_pool())
+        .await
+        .unwrap();
+    let seeded = rpc(&mut client, 2, "script.list", json!({"workspaceId":ws})).await;
+    let scripts = seeded["result"]["scripts"].as_array().unwrap();
+    assert_eq!(scripts.len(), 1, "{seeded}");
+    let id = scripts[0]["id"].as_str().unwrap();
+    let removed = rpc(
+        &mut client,
+        3,
+        "script.remove",
+        json!({"workspaceId":ws,"scriptId":id}),
+    )
+    .await;
+    assert_eq!(removed["result"]["ok"], true, "{removed}");
+    client.close(None).await.unwrap();
+    let mut reconnected = connect_ws(srv.port, srv.cfg.clone()).await;
+    for archive in ["all", "active", "archived"] {
+        let listed = rpc(
+            &mut reconnected,
+            4,
+            "script.list",
+            json!({"workspaceId":ws,"archive":archive}),
+        )
+        .await;
+        assert_eq!(
+            listed,
+            json!({"jsonrpc":"2.0","id":4,"result":{"scripts":[]}}),
+            "reconnecting must not undo an explicit purge"
+        );
+    }
+    assert!(srv.store.list_all_scripts().await.unwrap().is_empty());
+    srv.ws.stop().await;
+}
+
+#[intent_test_macros::daemon_test]
 async fn script_archive_restore_contract_over_wss() {
     let srv = start(WsOptions::default()).await;
     let mut client = connect_ws(srv.port, srv.cfg.clone()).await;

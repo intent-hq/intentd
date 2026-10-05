@@ -18,6 +18,20 @@ const SCRIPT_COLUMNS: &str = "id, workspace_id, name, command, cwd, env, mode, c
     source, auto_start, created_at, updated_at, purpose, archived_at, last_run";
 
 impl Store {
+    /// Whether this workspace has ever held a script definition. Unlike row
+    /// membership, this remains true after the final script is removed.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database read fails.
+    pub async fn workspace_scripts_initialized(&self, workspace_id: &WorkspaceId) -> Result<bool> {
+        sqlx::query_scalar::<_, bool>("SELECT scripts_initialized FROM workspace WHERE id = ?")
+            .bind(workspace_id.as_str())
+            .fetch_optional(self.read_pool())
+            .await
+            .map(|value| value.unwrap_or(false))
+            .map_err(|e| Error::Internal(format!("get scripts initialization failed: {e}")))
+    }
+
     /// Resolve a script's durable scope without reading its command or environment.
     ///
     /// # Errors
