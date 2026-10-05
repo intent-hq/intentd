@@ -1,7 +1,7 @@
 //! Intent-owned provider profile construction, separate from runtime activation.
 //!
 //! Candidates contain useful, tested controls but are not isolation certificates.
-//! Integration must call `ensure_launchable` before spawning. Native loader gaps
+//! Integration must use `staged::select` before spawning. Native loader gaps
 //! are recorded per provider, never disguised by an isolated HOME or empty MCP.
 //! This module does not change any existing production launch path.
 
@@ -16,6 +16,7 @@ pub mod auth;
 pub mod claude_controls;
 pub mod codex_controls;
 pub mod policy;
+pub mod staged;
 mod storage;
 pub use storage::{ProfileDirectory, ProfileIdentity};
 
@@ -160,6 +161,7 @@ pub struct RuntimeIdentity<'a> {
     pub arch: &'a str,
 }
 
+#[cfg(test)]
 pub struct ProfileRequest<'a> {
     pub provider: &'a str,
     pub runtime: RuntimeIdentity<'a>,
@@ -176,31 +178,20 @@ pub struct ProfileRequest<'a> {
 /// # Errors
 /// Unsupported versions/platforms or unresolved delivery/isolation capabilities
 /// return actionable errors. This never returns an ambient fallback command.
+#[cfg(test)]
 pub fn prepare_provider_profile(
     request: ProfileRequest<'_>,
 ) -> ProfileResult<ManagedProviderProfile> {
-    if request.provider == "pi" {
-        if request.runtime.native_version != "0.81.0"
-            || request.runtime.os != "linux"
-            || request.runtime.arch != "x86_64"
-        {
-            return Err(ProfileError::UnsupportedIsolation {provider:"pi".into(), missing:"profile controls verified with Pi 0.81.0 on Linux x86_64 only; verify the installed runtime before activation"});
-        }
-        if request.runtime.adapter_version.is_some() {
-            return Err(ProfileError::UnsupportedIsolation {
-                provider: "pi".into(),
-                missing: "verify ACP wrapper delivery of the owned native arguments and environment before activation",
-            });
-        }
-        if !request.approved_servers.is_empty() {
-            return Err(ProfileError::UnsupportedIsolation {provider:"pi".into(), missing:"attach and verify the Intent-owned gateway extension for interactive MCP delivery"});
-        }
-    } else if let Some(missing) = capability_evidence(request.provider)?.missing.first() {
-        return Err(ProfileError::UnsupportedIsolation {
-            provider: request.provider.into(),
-            missing,
-        });
-    }
+    staged::runtime_decision(
+        request.provider,
+        &request.runtime,
+        None,
+        !request.approved_servers.is_empty(),
+    )
+    .map_err(|reason| ProfileError::UnsupportedIsolation {
+        provider: request.provider.into(),
+        missing: reason.explanation(),
+    })?;
     let mut profile = prepare_profile_candidate(
         request.provider,
         request.purpose,
@@ -231,6 +222,26 @@ pub fn prepare_profile_candidate(
     approved_servers: &NormalizedMcpServers,
     auth_model: &AuthModelContext,
     policy: &policy::HostPolicySnapshot,
+) -> ProfileResult<ManagedProviderProfile> {
+    prepare_candidate_with_instructions(
+        provider,
+        purpose,
+        directory,
+        approved_servers,
+        auth_model,
+        policy,
+        "",
+    )
+}
+
+fn prepare_candidate_with_instructions(
+    provider: &str,
+    purpose: ProfilePurpose,
+    directory: ProfileDirectory,
+    approved_servers: &NormalizedMcpServers,
+    auth_model: &AuthModelContext,
+    policy: &policy::HostPolicySnapshot,
+    instructions: &str,
 ) -> ProfileResult<ManagedProviderProfile> {
     if purpose == ProfilePurpose::Ephemeral && !approved_servers.is_empty() {
         return Err(ProfileError::EphemeralCatalog);
@@ -297,12 +308,26 @@ pub fn prepare_profile_candidate(
                 .map(auth::project_claude_settings)
                 .transpose()?
                 .unwrap_or_else(|| json!({}));
-            session_meta = json!({"claudeCode":{"options":{
-                "strictMcpConfig":true, "settingSources":[], "settings":settings,
-                "extraArgs":{"disable-slash-commands":""}
-            }}});
+            let controls = claude_controls::loader_controls(
+                &settings,
+                &directory.path().join("mcp.json"),
+                instructions,
+            )?;
+            files.replace(
+                "mcp.json",
+                intent_acp::to_auggie_mcp_config(approved_servers)
+                    .to_string()
+                    .as_bytes(),
+            )?;
+            runtime_args = controls.runtime_args;
+            session_meta = controls.session_meta;
+            if let Some(model) = &auth_model.model {
+                runtime_args.extend(["--model".into(), model.clone()]);
+                session_meta["claudeCode"]["options"]["model"] = json!(model);
+            }
             if purpose == ProfilePurpose::Ephemeral {
                 session_meta["claudeCode"]["options"]["tools"] = json!([]);
+                runtime_args.extend(["--tools".into(), String::new()]);
             }
         }
         "codex" => {
@@ -347,6 +372,7 @@ pub fn prepare_profile_candidate(
             environment.remove("PI_PACKAGE_DIR");
             runtime_args.extend(
                 [
+                    "--no-context-files",
                     "--no-skills",
                     "--no-extensions",
                     "--no-prompt-templates",
@@ -358,6 +384,28 @@ pub fn prepare_profile_candidate(
             );
             if purpose == ProfilePurpose::Ephemeral {
                 runtime_args.push("--no-tools".into());
+            }
+            // Empty selects the built-in default without discovering SYSTEM.md.
+            runtime_args.extend(["--system-prompt".into(), String::new()]);
+            files.replace("instructions.txt", instructions.as_bytes())?;
+            runtime_args.extend([
+                "--append-system-prompt".into(),
+                directory
+                    .path()
+                    .join("instructions.txt")
+                    .to_str()
+                    .ok_or(ProfileError::Io)?
+                    .into(),
+            ]);
+            if let Some(endpoint) = &auth_model.endpoint {
+                runtime_args.extend(["--provider".into(), endpoint.provider_id.clone()]);
+            }
+            if let Some(model) = auth_model
+                .model
+                .as_ref()
+                .or_else(|| auth_model.endpoint.as_ref().map(|route| &route.model_id))
+            {
+                runtime_args.extend(["--model".into(), model.clone()]);
             }
             files.replace(
                 "settings.json",

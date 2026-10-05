@@ -2,7 +2,7 @@ use super::*;
 use intent_acp::NormalizedMcpServer;
 use serde_json::json;
 
-fn scratch() -> tempfile::TempDir {
+pub(super) fn scratch() -> tempfile::TempDir {
     let mut builder = tempfile::Builder::new();
     builder.prefix("intent-provider-profile-");
     #[cfg(unix)]
