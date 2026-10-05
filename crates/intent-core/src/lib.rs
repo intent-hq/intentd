@@ -90,6 +90,7 @@ pub use ids::{
 };
 pub use model::asset_extension_from_mime;
 pub use model::extract_spec_task_ids;
+pub use model::harness_supports_repository_guidance;
 pub use model::token_usage_reported;
 pub use model::MessageOrigin;
 pub use model::CURRENT_HARNESS_VERSION;

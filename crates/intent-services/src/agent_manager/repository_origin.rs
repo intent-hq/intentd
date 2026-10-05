@@ -83,7 +83,9 @@ impl RepositoryOrigin {
                 agent: session.id.clone(),
             }),
             state: Mutex::new(State {
-                callback_offer: if intent_core::harness_supports_repository_guidance(&session.harness_version) && session.retired_at.is_none()
+                callback_offer: if intent_core::harness_supports_repository_guidance(
+                    &session.harness_version,
+                ) && session.retired_at.is_none()
                 {
                     CallbackOffer::V1
                 } else {

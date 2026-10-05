@@ -603,7 +603,10 @@ mod tests {
         };
         assert_eq!(member(entry.harness), member(previous.harness));
         assert_ne!(member(entry.harness), member(resolve_entry("2.8").harness));
-        assert!(std::ptr::eq(repository_guidance.doctrine, previous.doctrine));
+        assert!(std::ptr::eq(
+            repository_guidance.doctrine,
+            previous.doctrine
+        ));
         assert_eq!((entry.default_features)(), (previous.default_features)());
         assert_eq!(entry.feature_labels, previous.feature_labels);
         assert_eq!(next_steps(entry.harness), next_steps(&v2_4::V2_4));
