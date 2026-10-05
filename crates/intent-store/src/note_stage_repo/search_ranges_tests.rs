@@ -46,7 +46,7 @@ CREATE TABLE note_stage_search_range (
 "#;
 
 fn header(selection: &str) -> NoteStageHeader {
-    serde_json::from_value(json!({"baseRevision":"base","editorSessionId":"editor","localEditSequence":0,"liveGeneration":0,"selectionGeneration":0,"action":"read","output":"search","selection":selection,"query":{"text":"B","caseSensitive":true,"mode":"source"}})).unwrap()
+    serde_json::from_value(json!({"baseRevision":"base","editorSessionId":"editor","localEditSequence":0,"liveGeneration":0,"selectionGeneration":0,"action":"read","output":"search","selection":selection,"query":{"text":"B","caseSensitive":false,"mode":"source"}})).unwrap()
 }
 fn view() -> PreparedView {
     PreparedView {
@@ -232,6 +232,11 @@ async fn boundaries_scope_generation_and_header_fail_closed() {
     let mut wrong = view();
     wrong.length = 7;
     assert!(normalize(&mut conn, "op", &header("ranges"), &wrong)
+        .await
+        .is_err());
+    let mut case_sensitive = header("ranges");
+    case_sensitive.query.as_mut().unwrap().case_sensitive = true;
+    assert!(normalize(&mut conn, "op", &case_sensitive, &view())
         .await
         .is_err());
     let mut rendered = header("ranges");
