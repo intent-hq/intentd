@@ -277,9 +277,10 @@ jobs:
     if: github.event_name != 'push'
     needs: route
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
-    # Cold burst builds plus the socket suites can use nearly 15 minutes;
-    # leave time for post-job cache saving after the checks finish.
-    timeout-minutes: 20
+    # The cold-cache check job exhausted its 20-minute budget after its tests
+    # passed in run 37305697722. Allow completion/cache margin without changing
+    # individual test timeouts.
+    timeout-minutes: 25
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
