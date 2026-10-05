@@ -238,6 +238,16 @@ pub fn rendered_identity<'text>(
     input: &NoteRenderedInput<'_, 'text>,
 ) -> Result<RenderedIdentity<'text>> {
     input.header.validate().map_err(|_| Invalid)?;
+    // Rendered matching preserves whitespace literally; only empty is invalid.
+    // The shared header currently applies its nonempty check to source mode.
+    if input
+        .header
+        .query
+        .as_ref()
+        .is_some_and(|query| query.text.is_empty())
+    {
+        return Err(Invalid);
+    }
     if input.header.action != NoteStageAction::Read
         || input.header.output != NoteStageOutput::Search
         || input.header.selection != NoteStageSelection::Ranges

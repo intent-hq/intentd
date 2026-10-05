@@ -261,3 +261,15 @@ fn rendered_v2_does_not_change_existing_v1_selection_markdown() {
         }
     }
 }
+
+#[test]
+fn rendered_identity_rejects_empty_query_without_trimming_whitespace() {
+    let mut f = Fixture::new(" a  ");
+    f.header.query.as_mut().unwrap().text = String::new();
+    assert_eq!(f.resolve().unwrap_err(), Invalid);
+    for query in [" ", "  ", "\t", "\n", "\t\n"] {
+        f.header.query.as_mut().unwrap().text = query.into();
+        assert!(f.resolve().is_ok(), "literal whitespace query {query:?}");
+        assert_eq!(f.header.query.as_ref().unwrap().text, query);
+    }
+}
