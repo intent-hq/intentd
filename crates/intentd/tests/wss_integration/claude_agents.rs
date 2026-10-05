@@ -431,7 +431,7 @@ async fn claude_agents_missing_skills_block_creation_and_recover_in_project_scop
         "skills: [code-review, missing-kit]\n",
         "Review.",
     );
-    let installed = home.join(".claude/skills/review/SKILL.md");
+    let installed = home.join(".intent/skills/review/SKILL.md");
     std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
     std::fs::write(
         &installed,
@@ -668,7 +668,15 @@ async fn claude_agents_custom_config_root_discovers_and_watches_agents_and_skill
     ));
     let (daemon, port, cfg) = await_boot(dir.path(), child).await;
     let mut client = connect_ws(port, cfg.clone()).await;
-    let first = wss_rpc(&mut client, 1, "specialist.list", json!({})).await;
+    let native = wss_rpc(&mut client, 1, "specialist.list", json!({})).await;
+    assert_eq!(
+        definition(&native, "configured")["missingSkills"],
+        json!(["config-kit"]),
+        "custom Claude config does not implicitly import personal skills"
+    );
+    std::fs::create_dir_all(home.join(".intent")).unwrap();
+    symlink(target.join("skills"), home.join(".intent/skills")).unwrap();
+    let first = wss_rpc(&mut client, 10, "specialist.list", json!({})).await;
     assert!(
         definition(&first, "configured")
             .get("missingSkills")
