@@ -9169,6 +9169,15 @@ impl AgentManager {
             // here, so the `end_turn` below performs the wake (#5253).
             mgr.registry.mark_idle_slot_held(&id);
             drop(guard);
+            if outcome.failed {
+                // Failure was persisted before its terminal events. Keep Error
+                // and the durable queue intact, dispose of the hung provider,
+                // and never publish a successful idle to completion watchers.
+                mgr.kill_child_only(&id).await;
+                mgr.clear_worker(&id);
+                mgr.release_in_flight_slot(&id);
+                return;
+            }
             // Empty-wake recovery (intent-hq/monorepo#3262): a wake turn
             // that finalized with no meaningful content must not be
             // accepted as a successful completion. Runs while the busy slot

@@ -1428,6 +1428,10 @@ pub(crate) struct HarnessWakeOutcome {
     /// signature of a failed post-interrupt recovery wake (a single bare
     /// newline accepted as `harness_wake_complete`).
     pub empty_response: bool,
+    /// An unfinished native tool exceeded the ordinary open-tool silence
+    /// budget. Error and failure events are already durable/published; the
+    /// manager must dispose of the provider without emitting successful idle.
+    pub failed: bool,
     /// Content-free correlation for the separately published idle stage.
     pub lifecycle: HarnessWakeLifecycle,
 }
@@ -4805,22 +4809,38 @@ impl Services {
         let mut updates_applied = self
             .route_notification(&first, agent_id, workspace_id, &mut transcript)
             .await;
-        // Drain until quiescence: each received notification re-arms the
-        // settle window; the window elapsing (or the channel closing)
-        // finalizes the turn. Polled in short ticks so a user send that
+        // Drain until quiescence, but an unfinished native tool (including
+        // Codex compaction) is still work during silence. Keep its ownership
+        // recoverable until a terminal update or the existing open-tool
+        // silence budget. Every notification resets that budget. A zero
+        // settle window still hands the receiver straight to a prompt owner.
+        // Polled in short ticks so a user send that
         // raced in (queued behind this turn's slot) preempts promptly —
         // finalize first, then the caller hands the receiver off to the
         // drained prompt turn.
         let mut last_update = tokio::time::Instant::now();
+        let open_tool_timeout = Duration::from_millis(open_tool_call_terminal_ms());
+        let mut failure = None;
         loop {
-            if self.has_ready_to_send(agent_id) {
+            if settle.is_zero() || self.has_ready_to_send(agent_id) {
                 break;
             }
+            let tool_open = transcript.open_tool_call_count() > 0;
+            let quiet_window = if tool_open { open_tool_timeout } else { settle };
             let elapsed = last_update.elapsed();
-            if elapsed >= settle {
+            if elapsed >= quiet_window {
+                if tool_open {
+                    failure = Some(
+                        AcpError::ProviderStall {
+                            silent: elapsed,
+                            open_tool_call: transcript.open_tool_call_label(),
+                        }
+                        .to_string(),
+                    );
+                }
                 break;
             }
-            let tick = settle
+            let tick = quiet_window
                 .saturating_sub(elapsed)
                 .min(std::time::Duration::from_millis(50));
             match tokio::time::timeout(tick, notifications.recv()).await {
@@ -4932,6 +4952,23 @@ impl Services {
         }
         // Pin-respecting, same as the prompt-turn end above (monorepo#2110).
         self.clear_unpinned_live_turn(agent_id);
+        if let Some(error) = &failure {
+            crate::agent_manager::persist_terminal_error_status_via_services(
+                self,
+                agent_id,
+                workspace_id,
+                error,
+            )
+            .await;
+            if let Err(raise_error) = self.agent_request_attention_op(
+                workspace_id.clone(),
+                "blocker".to_string(),
+                format!("Unsolicited provider activity stopped: {error}. Retry the agent to continue."),
+                Some(agent_id.clone()),
+            ).await {
+                tracing::warn!(agent = %agent_id, error = %raise_error, "failed to raise attention for stalled native tool");
+            }
+        }
         let mut end_data = json!({ "agentId": agent_id.0 });
         if message_persisted {
             end_data["messageId"] = json!(message_id);
@@ -4945,13 +4982,28 @@ impl Services {
             "agent_stream_end",
             Some(turn_started.elapsed()),
             block_count,
-            "complete",
+            if failure.is_some() {
+                "failed"
+            } else {
+                "complete"
+            },
         );
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
+        if let Some(error) = &failure {
+            self.flush_deferred_attention(agent_id, workspace_id).await;
+            self.publish_agent_event(
+                workspace_id,
+                agent_id,
+                AGENT_FAILED,
+                json!({ "agentId": agent_id.0, "error": error }),
+            )
+            .await;
+        }
         HarnessWakeOutcome {
             message_id: message_persisted.then_some(message_id.clone()),
             empty_response,
+            failed: failure.is_some(),
             lifecycle: HarnessWakeLifecycle {
                 correlation_id: message_id,
                 block_count,
