@@ -241,6 +241,172 @@ async fn note_mutation_conversion_savepoint_retains_initial_canonical_repair_onl
 }
 
 #[tokio::test]
+async fn note_mutation_child_failures_rollback_children_relations_and_conversion_versions() {
+    // The second child's version failure occurs after its row/index insertion;
+    // SQLite ABORT does not undo the first child or earlier conversion writes.
+    for failing_table in ["note", "note_version"] {
+        let (store, _tmp, original) = setup("base").await;
+        let mut dependency = original.clone();
+        dependency.id = NoteId("dependency".into());
+        dependency.metadata.task = Some(intent_core::TaskMetadata::default());
+        store.insert_note(&dependency).await.unwrap();
+        let id_column = if failing_table == "note" {
+            "id"
+        } else {
+            "note_id"
+        };
+        sqlx::query(&format!("CREATE TRIGGER fail_second_child BEFORE INSERT ON {failing_table} WHEN NEW.{id_column}='second-child' BEGIN SELECT RAISE(ABORT,'injected child failure'); END"))
+            .execute(store.write_pool()).await.unwrap();
+        let request = request(&store, vec![edit(0, 4, "caller")]).await;
+        let mut write = begin(&store, request).await;
+        write
+            .persist_source(&author(), &intent_core::now_iso())
+            .await
+            .unwrap();
+        write.begin_conversion().await.unwrap();
+        write
+            .apply_canonical_phase(&[edit(0, 6, "converted")], vec![])
+            .unwrap();
+        write
+            .persist_source(&author(), &intent_core::now_iso())
+            .await
+            .unwrap();
+        let mut child = write.note().clone();
+        child.id = NoteId("first-child".into());
+        child.parent_id = Some(original.id.clone());
+        child.rev = 0;
+        child.metadata.task = Some(intent_core::TaskMetadata {
+            depends_on: vec![dependency.id.clone()],
+            ..Default::default()
+        });
+        write
+            .insert_conversion_child(&child, &author())
+            .await
+            .unwrap();
+        child.id = NoteId("second-child".into());
+        assert!(write
+            .insert_conversion_child(&child, &author())
+            .await
+            .is_err());
+        // Only a successful rollback allows the initial canonical write to commit.
+        write.rollback_conversion().await.unwrap();
+        assert_eq!(write.source(), "caller");
+        write.commit().await.unwrap();
+        assert_eq!(
+            page(&store, json!({"kind":"source"})).await["text"],
+            "caller"
+        );
+        for table in ["note", "note_version", "note_page_head"] {
+            let id_column = if table == "note" { "id" } else { "note_id" };
+            let count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE {id_column} IN ('first-child','second-child')"
+            ))
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+            assert_eq!(count, 0, "{failing_table}: {table}");
+        }
+        let versions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM note_version WHERE note_id='spec'")
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap();
+        assert_eq!(versions, 1);
+        let effects: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM note_operation_item WHERE kind='effects'")
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap();
+        assert_eq!(effects, 0);
+        assert_eq!(
+            store
+                .get_note(&dependency.workspace_id, &dependency.id)
+                .await
+                .unwrap(),
+            dependency
+        );
+    }
+}
+
+#[tokio::test]
+async fn note_mutation_failed_savepoint_rollback_drops_the_outer_write() {
+    let (store, _tmp, original) = setup("base").await;
+    sqlx::query("CREATE TRIGGER fail_child_transaction BEFORE INSERT ON note_version WHEN NEW.note_id='child' BEGIN SELECT RAISE(ROLLBACK,'injected transaction failure'); END")
+        .execute(store.write_pool()).await.unwrap();
+    let request = request(&store, vec![edit(0, 4, "caller")]).await;
+    let mut write = begin(&store, request.clone()).await;
+    write
+        .persist_source(&author(), &intent_core::now_iso())
+        .await
+        .unwrap();
+    write.begin_conversion().await.unwrap();
+    let mut child = write.note().clone();
+    child.id = NoteId("child".into());
+    child.parent_id = Some(original.id.clone());
+    child.rev = 0;
+    assert!(write
+        .insert_conversion_child(&child, &author())
+        .await
+        .is_err());
+    assert!(write.rollback_conversion().await.is_err());
+    drop(write); // Failed recovery is never a reason to commit the outer writer.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_operation")
+        .fetch_one(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(page(&store, json!({"kind":"source"})).await["text"], "base");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_version")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(
+        store
+            .note_mutation_status(
+                "alice",
+                &request.scope(),
+                &request.operation_id,
+                &request.payload_digest
+            )
+            .await
+            .unwrap()["outcome"],
+        "unknown"
+    );
+}
+
+#[tokio::test]
+async fn note_mutation_uncaught_phase_version_failure_drops_all_prior_phases() {
+    let (store, _tmp, _) = setup("base").await;
+    sqlx::query("CREATE TRIGGER fail_second_version BEFORE INSERT ON note_version WHEN NEW.note_id='spec' AND NEW.v>1 BEGIN SELECT RAISE(ABORT,'injected version failure'); END")
+        .execute(store.write_pool()).await.unwrap();
+    let request = request(&store, vec![edit(0, 4, "caller")]).await;
+    let mut write = begin(&store, request).await;
+    write
+        .persist_source(&author(), &intent_core::now_iso())
+        .await
+        .unwrap();
+    // Same source is deliberate: a stale persisted-source equality check alone
+    // cannot detect the row/revision written before version insertion failed.
+    assert!(write
+        .persist_source(&author(), &intent_core::now_iso())
+        .await
+        .is_err());
+    drop(write);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_operation")
+        .fetch_one(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(page(&store, json!({"kind":"source"})).await["text"], "base");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_version")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
 async fn note_mutation_large_deletion_keeps_inverse_text_out_of_receipt_and_rows_bounded() {
     let (store, _tmp, _) = setup(&"😀x".repeat(30_000)).await;
     let request = request(&store, vec![edit(0, 90_000, "")]).await;
