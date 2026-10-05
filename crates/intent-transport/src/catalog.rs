@@ -467,6 +467,7 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "host.listDirectory",
     "host.listInstalledEditors",
     "host.openInEditor",
+    "host.prepareProviderAdapters",
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.providerTestPrompt",

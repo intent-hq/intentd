@@ -576,7 +576,7 @@ fn build_command_with_captured_env(
     captured: &BTreeMap<String, String>,
     nice_increment: i32,
 ) -> Command {
-    build_command_in(opts, captured, nice_increment, None)
+    build_command_in(opts, captured, nice_increment, None, None)
 }
 
 /// [`build_command_with_captured_env`] with the per-spawn [`NpxLaunchDir`]
@@ -586,8 +586,9 @@ fn build_command_in(
     captured: &BTreeMap<String, String>,
     nice_increment: i32,
     npx_launch_dir: Option<&Path>,
+    args: Option<Vec<String>>,
 ) -> Command {
-    let args = build_args(opts);
+    let args = args.unwrap_or_else(|| build_args(opts));
 
     // Decide which binary to spawn: provider_binary > npx_fallback (both fields) > provider.command
     let (_, command) = opts.launch_target();
@@ -781,10 +782,55 @@ pub fn prepare_provider(opts: &SpawnOptions) -> AcpResult<PreparedProvider> {
         None
     };
     let launch_cwd = npx_launch_dir.as_ref().map(NpxLaunchDir::path);
-    let command = build_command_in(opts, captured_credential_env(), nice_increment, launch_cwd);
+    let command = build_command_in(
+        opts,
+        captured_credential_env(),
+        nice_increment,
+        launch_cwd,
+        None,
+    );
     Ok(PreparedProvider {
         command,
         npx_launch_dir,
+    })
+}
+
+/// Prepare an npm package using launch isolation and environment, without running
+/// its entrypoint. `script` is daemon-owned JavaScript, never a caller input.
+/// npm uses the same package-spec cache key for `--package` and positional launches.
+/// # Errors
+/// Returns a spawn error for missing npm inputs or launch-directory I/O errors.
+pub fn prepare_npx_package(opts: &SpawnOptions, script: &str) -> AcpResult<PreparedProvider> {
+    let Some(package) = opts.npx_fallback_package.filter(|_| opts.via_npx()) else {
+        return Err(AcpError::Spawn("package preparation requires npx".into()));
+    };
+    let dir =
+        NpxLaunchDir::create(opts.npx_launch_root).map_err(|e| AcpError::Spawn(e.to_string()))?;
+    let script_path = dir.path().join("prepare.cjs");
+    std::fs::write(&script_path, script).map_err(|e| AcpError::Spawn(e.to_string()))?;
+    let args = vec![
+        NPX_NO_WORKSPACES_ARG.into(),
+        "--yes".into(),
+        "--ignore-scripts".into(),
+        format!("--package={package}"),
+        "--".into(),
+        "node".into(),
+        script_path.to_string_lossy().into_owned(),
+    ];
+    let mut command = build_command_in(
+        opts,
+        captured_credential_env(),
+        agent_nice(),
+        Some(dir.path()),
+        Some(args),
+    );
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Ok(PreparedProvider {
+        command,
+        npx_launch_dir: Some(dir),
     })
 }
 

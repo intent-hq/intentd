@@ -732,7 +732,9 @@ use std::time::{Duration, Instant};
 // extensions through their independent capabilities and permission checks.
 // Version 13.5 adds original-socket GitLab checkout discovery and native
 // private checkout. Clients require gitlabCheckout: 1 before using it.
-pub const PROTOCOL_VERSION: &str = "13.5";
+// Version 13.6 adds best-effort host.prepareProviderAdapters. Acknowledgement
+// promises admission only; clients tolerate -32601 on older daemons.
+pub const PROTOCOL_VERSION: &str = "13.6";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
