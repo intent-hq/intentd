@@ -26249,43 +26249,59 @@ async fn queue_processing_payload_ordinary_drain_retains_recovered_merged_contri
         }
         mgr.services.persist_queue_snapshot(&id).await;
         mgr.services.agent_queues.lock().unwrap().clear();
-        assert_eq!(mgr.services.rehydrate_agent_queues().await.unwrap(), 1);
+        let expected_rows = if attachments { 2 } else { 1 };
+        assert_eq!(
+            mgr.services.rehydrate_agent_queues().await.unwrap(),
+            expected_rows
+        );
         let queued = mgr.services.queue_snapshot(&id);
-        assert_eq!(queued.len(), if attachments { 2 } else { 1 });
+        assert_eq!(queued.len(), expected_rows);
         mgr.clone().try_drain_queue(id.clone(), ws).await;
         let events = queue_processing_payloads(&mgr, &id).await;
-        assert_eq!(events.len(), queued.len());
-        for (index, (event, queued)) in events.iter().zip(&queued).enumerate() {
-            let rows = event["queuedMessages"].as_array().unwrap();
-            assert_eq!(rows.len(), 1);
+        assert_eq!(
+            events.len(),
+            1,
+            "one processing event for the provider turn"
+        );
+        let rows = events[0]["queuedMessages"].as_array().unwrap();
+        assert_eq!(rows.len(), queued.len());
+        let batch_id = rows[0]["messageMetadata"]["queueInfo"]["batchId"].clone();
+        if attachments {
+            assert!(batch_id
+                .as_str()
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()));
+        } else {
+            assert!(batch_id.is_null());
+        }
+        for (index, (row, queued)) in rows.iter().zip(&queued).enumerate() {
             for field in ["id", "turnId", "fileBlocks"] {
-                assert_eq!(rows[0][field], queued[field]);
+                assert_eq!(row[field], queued[field]);
             }
             let mut expected_metadata = queued["messageMetadata"].clone();
             expected_metadata["submissionIds"] = queued["submissionIds"].clone();
             expected_metadata["queueInfo"] = json!({"queuedMessageId": queued["id"]});
-            assert_eq!(rows[0]["messageMetadata"], expected_metadata);
+            if attachments {
+                expected_metadata["queueInfo"]["batchId"] = batch_id.clone();
+            }
+            assert_eq!(row["messageMetadata"], expected_metadata);
             let expected = if attachments {
                 format!("text-{index}")
             } else {
                 "text-0\n\ntext-1".into()
             };
-            assert!(rows[0]["content"].as_str().unwrap().starts_with(&expected));
+            assert!(row["content"].as_str().unwrap().starts_with(&expected));
             if attachments {
-                assert_eq!(
-                    rows[0]["fileBlocks"][0]["uri"],
-                    format!("file:///part-{index}")
-                );
+                assert_eq!(row["fileBlocks"][0]["uri"], format!("file:///part-{index}"));
             } else {
                 assert_eq!(
-                    rows[0]["messageMetadata"]["mergedMessageMetadata"]
+                    row["messageMetadata"]["mergedMessageMetadata"]
                         .as_array()
                         .unwrap()
                         .len(),
                     2
                 );
             }
-            assert_eq!(rows[0]["author"]["principalId"], owner.0);
+            assert_eq!(row["author"]["principalId"], owner.0);
         }
     }
 }
