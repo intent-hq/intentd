@@ -258,3 +258,91 @@ async fn remove_racing_sync_never_publishes_a_stale_opened_after_closed() {
         assert_eq!(final_event, expected, "{id}");
     }
 }
+
+/// Identity changes do not migrate persistent pins, tab hosts or old drafts.
+/// Safe recovery has to be explicit: a common suffix is not ownership proof.
+#[tokio::test]
+async fn identity_drift_preserves_legacy_pins_tab_hosts_and_client_scoped_drafts() {
+    use intent_core::{AgentId, ReverseTarget};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.unwrap();
+    let agent = AgentId::from_string("draft-agent");
+    let services = Services::new(store.clone());
+    for (index, old) in ["desktop", "alice:desktop"].into_iter().enumerate() {
+        let old = ClientId::from_string(old);
+        let drifted = ClientId::from_string(format!("bob:{}", old.as_str()));
+        for id in [&old, &drifted] {
+            store
+                .upsert_client(
+                    id,
+                    Some("Desktop"),
+                    Some(&json!({"browserExec": true})),
+                    &ClientHostInfo::default(),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .set_workspace_browser_client(&ws, Some(&old))
+            .await
+            .unwrap();
+        let tab = services
+            .browser_tab_upsert(old.clone(), input(&ws, &format!("tab-{index}")))
+            .await
+            .unwrap();
+        store
+            .upsert_draft(&ws, &agent, &old, "legacy draft", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            services.driving_client_target(&ws).await.unwrap(),
+            ReverseTarget::Pinned(old.clone())
+        );
+        assert_eq!(
+            services.browser_tab_route_target(&tab).await.unwrap(),
+            ReverseTarget::Client(old.clone())
+        );
+        assert!(store
+            .get_draft(&ws, &agent, &drifted)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .get_draft(&ws, &agent, &old)
+                .await
+                .unwrap()
+                .unwrap()
+                .text,
+            "legacy draft"
+        );
+        assert_eq!(
+            store
+                .get_browser_tab(&tab.tab_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .host_client_id,
+            old
+        );
+        store.set_workspace_browser_client(&ws, None).await.unwrap();
+        let mut claimed = input(&ws, &tab.tab_id);
+        claimed.owner_agent_id = Some(agent.clone());
+        let tab = services
+            .browser_tab_upsert(old.clone(), claimed)
+            .await
+            .unwrap();
+        assert_eq!(
+            services.driving_client_target(&ws).await.unwrap(),
+            ReverseTarget::Client(old.clone())
+        );
+        assert_eq!(
+            services.browser_tab_route_target(&tab).await.unwrap(),
+            ReverseTarget::Client(old.clone())
+        );
+        services.browser_tab_remove(old, tab.tab_id).await.unwrap();
+    }
+}
