@@ -1063,3 +1063,134 @@ fn revision_unsupported_runtime_does_not_mutate_existing_profile() {
         b"previous settings"
     );
 }
+
+fn claude_policy(document: &serde_json::Value) -> policy::HostPolicySnapshot {
+    use policy::{PolicyFormat, PolicyScope, PolicySource};
+    policy::read_host_policy(
+        "claude-code",
+        &[PolicySource::inline(
+            PolicyScope::Host,
+            "fixture",
+            PolicyFormat::ClaudeManagedMcp,
+            &document.to_string(),
+        )],
+    )
+    .unwrap()
+}
+
+#[test]
+fn f5_claude_command_selector_takes_precedence_over_name() {
+    let policy = claude_policy(&json!({"allowedMcpServers":[
+        {"serverName":"approved"}, {"serverCommand":["approved-server","--safe"]}
+    ]}));
+    assert!(policy
+        .validate_server("approved", &server(&["--unsafe"]))
+        .is_err());
+    policy
+        .validate_server("renamed", &server(&["--safe"]))
+        .unwrap();
+}
+
+#[test]
+fn f5_claude_url_selector_takes_precedence_over_name_for_both_remote_transports() {
+    let policy = claude_policy(&json!({"allowedMcpServers":[
+        {"serverName":"approved"}, {"serverUrl":"https://fixture.invalid/good"}
+    ]}));
+    for (url, allowed) in [
+        ("https://fixture.invalid/bad", false),
+        ("https://fixture.invalid/good", true),
+    ] {
+        for remote in [
+            NormalizedMcpServer::Http {
+                url: url.into(),
+                headers: None,
+            },
+            NormalizedMcpServer::Sse {
+                url: url.into(),
+                headers: None,
+            },
+        ] {
+            assert_eq!(policy.validate_server("approved", &remote).is_ok(), allowed);
+            assert_eq!(policy.validate_server("renamed", &remote).is_ok(), allowed);
+        }
+    }
+}
+
+#[test]
+fn f5_transport_precedence_preserves_name_fallback_and_deny_or() {
+    let remote = NormalizedMcpServer::Http {
+        url: "https://fixture.invalid/good".into(),
+        headers: None,
+    };
+    claude_policy(
+        &json!({"allowedMcpServers":[{"serverName":"approved"},{"serverCommand":["other"]}]}),
+    )
+    .validate_server("approved", &remote)
+    .unwrap();
+    claude_policy(&json!({"allowedMcpServers":[{"serverName":"approved"},{"serverUrl":"https://fixture.invalid/good"}]}))
+        .validate_server("approved", &server(&[])).unwrap();
+    for deny in [
+        json!({"serverName":"approved"}),
+        json!({"serverCommand":["approved-server"]}),
+    ] {
+        let policy = claude_policy(
+            &json!({"allowedMcpServers":[{"serverCommand":["approved-server"]}],
+            "deniedMcpServers":[deny,{"serverCommand":["other"]}]}),
+        );
+        assert!(policy.validate_server("approved", &server(&[])).is_err());
+    }
+}
+
+#[test]
+fn f5_intent_or_semantics_and_claude_semantics_have_distinct_identity() {
+    use policy::{PolicyFormat, PolicyScope, PolicySource};
+    let intent = policy::read_host_policy("claude-code", &[PolicySource::inline(
+        PolicyScope::Host, "fixture", PolicyFormat::Intent,
+        r#"{"allowMcp":[{"name":"approved"},{"identity":{"command":{"executable":"approved-server","args":[{"match":"exact","value":"--safe"}]}}}]}"#,
+    )]).unwrap();
+    intent
+        .validate_server("approved", &server(&["--unsafe"]))
+        .unwrap();
+    let native = claude_policy(&json!({"allowedMcpServers":[{"serverName":"approved"},
+        {"serverCommand":["approved-server","--safe"]}]}));
+    assert!(native.identity() != intent.identity());
+}
+
+#[test]
+fn f5_claude_native_policy_matrix() {
+    let cases: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/claude-policy-cases.json")).unwrap();
+    for case in cases.as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let servers = intent_acp::normalize_mcp_servers(&json!({name:case["server"]}));
+        let admitted = claude_policy(&case["policy"])
+            .validate_server(name, &servers[name])
+            .is_ok();
+        assert_eq!(
+            admitted,
+            case["allowed"].as_bool().unwrap(),
+            "{}",
+            case["label"]
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires pinned Claude SDK 0.3.280, native Claude 2.1.280, node and Linux bwrap"]
+fn f5_claude_native_policy_parity() {
+    let modules =
+        std::env::var("INTENT_CLAUDE_FIXTURE_MODULES").expect("set pinned fixture modules");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/provider_profile/fixtures/claude-policy.mjs");
+    let output = std::process::Command::new("node")
+        .arg(fixture)
+        .arg(modules)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "native policy fixture: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("PASS Claude 2.1.280 policy parity"));
+}
