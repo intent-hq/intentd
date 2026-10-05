@@ -17,6 +17,7 @@ async fn replay_actual_frontend_selection_upload_and_capture_output() {
     let store = Store::open(&database).await.unwrap();
     let mut calls = Vec::new();
     let mut read = None;
+    let mut cancel = None;
     for call in captured["requests"].as_array().unwrap() {
         let params = call["params"].clone();
         let response = match call["method"].as_str().unwrap() {
@@ -41,7 +42,10 @@ async fn replay_actual_frontend_selection_upload_and_capture_output() {
                 }
                 continue;
             }
-            "note.operation.cancel" => continue,
+            "note.operation.cancel" => {
+                assert!(cancel.replace(params).is_none());
+                continue;
+            }
             other => panic!("unexpected captured method {other}"),
         };
         calls.push(json!({"method":call["method"],"params":params,"response":response}));
@@ -49,6 +53,7 @@ async fn replay_actual_frontend_selection_upload_and_capture_output() {
     let mut request = read.unwrap();
     assert_eq!(request["maxSourceBytes"], 1024);
     assert_eq!(request["maxWireBytes"], 8192);
+    let initial_read = request.clone();
     let mut output = String::new();
     let mut lengths = Vec::new();
     loop {
@@ -80,12 +85,53 @@ async fn replay_actual_frontend_selection_upload_and_capture_output() {
     }
     assert_eq!(lengths, [1024, 1024, 2]);
     assert_eq!(output, captured["expected"].as_str().unwrap());
+    let mut wrong_selector = initial_read.clone();
+    wrong_selector["kind"] = json!("source");
+    super::assert_error(
+        store
+            .read_note_stage_source(
+                "alice",
+                &serde_json::from_value(wrong_selector.clone()).unwrap(),
+                &json!(1),
+            )
+            .await,
+        intent_core::note_page::NotePageError::CursorInvalid,
+    );
+    let cancel = cancel.unwrap();
+    let cancelled = store
+        .cancel_note_stage("alice", &serde_json::from_value(cancel.clone()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(cancelled["phase"], "cancelled");
+    calls.push(json!({"method":"note.operation.cancel","params":cancel,"response":cancelled}));
+    super::assert_error(
+        store
+            .read_note_stage_source(
+                "alice",
+                &serde_json::from_value(initial_read.clone()).unwrap(),
+                &json!(1),
+            )
+            .await,
+        intent_core::note_page::NotePageError::Expired,
+    );
+    let output_path =
+        std::path::PathBuf::from(std::env::var("NOTE_SELECTION_STORE_CAPTURE").unwrap());
+    let retained_database = output_path.with_extension("db");
+    sqlx::query("VACUUM INTO ?")
+        .bind(retained_database.to_str().unwrap())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
     std::fs::write(
-        std::env::var("NOTE_SELECTION_STORE_CAPTURE").unwrap(),
+        output_path,
         serde_json::to_vec_pretty(&json!({
-            "claim":"actual Store replay of unchanged frontend begin/append/seal; actual Store output cursors",
+            "claim":"actual Store replay of unchanged frontend begin/append/seal/cancel; actual Store output cursors",
             "frontendCapture":input,"sourceCapture":captured["sourceCapture"],
-            "clock":intent_core::now_epoch_ms(),"calls":calls
+            "clock":intent_core::now_epoch_ms(),"calls":calls,"retainedDatabase":retained_database,
+            "refusals":[
+                {"phase":"beforeCancel","params":wrong_selector,"typedStoreError":"NotePage(CursorInvalid)"},
+                {"phase":"afterCancel","params":initial_read,"typedStoreError":"NotePage(Expired)"}
+            ]
         })).unwrap(),
     ).unwrap();
 }
