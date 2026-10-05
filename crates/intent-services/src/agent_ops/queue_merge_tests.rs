@@ -91,7 +91,7 @@ async fn queue_merge_preserves_edit_hold_and_appended_text_on_save() {
 }
 
 #[tokio::test]
-async fn queue_merge_preserves_metadata_attachments_and_restart_deduplication() {
+async fn queue_merge_preserves_metadata_and_restart_deduplication() {
     let (_tmp, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "Merge").await;
     let first_metadata = json!({"fromPrincipalId":"a","type":"question_answers","answeredQuestionsMessageId":"q1","custom":1});
@@ -100,8 +100,8 @@ async fn queue_merge_preserves_metadata_attachments_and_restart_deduplication() 
         &agent,
         Some("first".into()),
         "one".into(),
-        Some(json!([{"imageRef":"one"}])),
-        Some(json!([{"path":"one"}])),
+        None,
+        None,
         Some(first_metadata.clone()),
         None,
         false,
@@ -111,10 +111,11 @@ async fn queue_merge_preserves_metadata_attachments_and_restart_deduplication() 
         &agent,
         Some("second".into()),
         "two".into(),
-        Some(json!([{"imageRef":"two"}])),
-        Some(json!([{"path":"two"}])),
+        None,
+        None,
         Some(second_metadata.clone()),
         Some(QueuedPrepend {
+            delivery_groups: None,
             content: Some("preempted".into()),
             image_blocks: None,
             file_blocks: None,
@@ -125,14 +126,8 @@ async fn queue_merge_preserves_metadata_attachments_and_restart_deduplication() 
     assert_eq!(merged.id, first.id);
     assert_eq!(position, 0);
     assert_eq!(merged.prepend_content.as_deref(), Some("preempted"));
-    assert_eq!(
-        merged.image_blocks,
-        Some(json!([{"imageRef":"one"},{"imageRef":"two"}]))
-    );
-    assert_eq!(
-        merged.file_blocks,
-        Some(json!([{"path":"one"},{"path":"two"}]))
-    );
+    assert!(merged.image_blocks.is_none());
+    assert!(merged.file_blocks.is_none());
     assert_eq!(
         merged.message_metadata.as_ref().unwrap()[MERGED_MESSAGE_METADATA_KEY],
         json!([first_metadata, second_metadata])
@@ -389,6 +384,7 @@ async fn queue_merge_interrupt_retains_position_and_carryover() {
         None,
         Some(json!({"fromPrincipalId":"a"})),
         Some(QueuedPrepend {
+            delivery_groups: None,
             content: Some("carryover".into()),
             image_blocks: Some(json!([{"imageRef":"carryover"}])),
             file_blocks: None,
@@ -396,10 +392,10 @@ async fn queue_merge_interrupt_retains_position_and_carryover() {
         true,
         MessageOrigin::User,
     );
-    assert_eq!(merged.id, first.id);
-    assert_eq!(position, 1);
-    assert!(!merged.interrupt_priority);
-    assert_eq!(merged.content, "one\n\ntwo");
+    assert_ne!(merged.id, first.id);
+    assert_eq!(position, 0);
+    assert!(merged.interrupt_priority);
+    assert_eq!(merged.content, "two");
     assert_eq!(merged.prepend_content.as_deref(), Some("carryover"));
     assert_eq!(
         merged.prepend_image_blocks,
@@ -1157,5 +1153,50 @@ async fn submission_correlation_legacy_order_stays_unknown_across_restarts() {
         assert_eq!(svc.rehydrate_agent_queues().await.unwrap(), 1);
         assert_eq!(svc.queue_snapshot(&agent)[0]["mergeEligible"], false);
         svc.persist_queue_snapshot(&agent).await;
+    }
+}
+
+/// Failure cases: attachments on either side, image-only entries, files,
+/// and zero-output interrupt carry-over merging into an unrelated draft.
+#[tokio::test]
+async fn queue_attachments_and_prepend_attachments_are_merge_barriers() {
+    let (_tmp, svc, ws) = setup().await;
+    for kind in 0..4 {
+        for attachment_first in [false, true] {
+            let agent = create_agent(&svc, &ws, "Attachment barrier").await;
+            let mut entries = Vec::new();
+            for i in 0..2 {
+                let attached = (i == 0) == attachment_first;
+                let images = (attached && kind == 0)
+                    .then(|| json!([{"data":"image","mimeType":"image/png"}]));
+                let files = (attached && kind == 1)
+                    .then(|| json!([{"attachmentId":"att","fileName":"file.txt"}]));
+                let prepend = (attached && kind >= 2).then(|| QueuedPrepend {
+                    delivery_groups: None,
+                    content: Some("older message".into()),
+                    image_blocks: (kind == 2)
+                        .then(|| json!([{"data":"older","mimeType":"image/png"}])),
+                    file_blocks: (kind == 3)
+                        .then(|| json!([{"attachmentId":"old","fileName":"older.txt"}])),
+                });
+                entries.push(
+                    svc.enqueue_message_with_id(
+                        &agent,
+                        Some(format!("entry-{i}")),
+                        format!("text-{i}"),
+                        images,
+                        files,
+                        Some(json!({"fromPrincipalId":"a"})),
+                        prepend,
+                        false,
+                        MessageOrigin::User,
+                    )
+                    .0,
+                );
+            }
+            assert_ne!(entries[0].id, entries[1].id);
+            assert_eq!(svc.queue_snapshot(&agent).len(), 2);
+            assert!(!entries[0].can_merge_pending(&entries[1]));
+        }
     }
 }

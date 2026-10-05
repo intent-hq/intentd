@@ -34285,6 +34285,8 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
     // persisted=true (matching persist_error_and_requeue's behavior).
     let message_id = new_message_id();
     let queued = QueuedMessage {
+        delivery_groups: None,
+        prepend_delivery_groups: None,
         turn_id: message_id.clone(),
         id: message_id,
         content: "failed message".to_string(),
@@ -34872,6 +34874,8 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
     svc.requeue_front(
         &id,
         crate::agent_ops::QueuedMessage {
+            delivery_groups: None,
+            prepend_delivery_groups: None,
             id: requeue_id.clone(),
             turn_id: "turn-before-failure".to_string(),
             content: "requeued".to_string(),
@@ -35331,6 +35335,8 @@ async fn rehydrate_flushes_expired_and_rearms_unexpired_holds() {
 /// resets and preservations are both observable.
 fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
     crate::agent_ops::QueuedMessage {
+        delivery_groups: None,
+        prepend_delivery_groups: None,
         id: id.to_string(),
         turn_id: id.to_string(),
         content: content.to_string(),
@@ -46606,6 +46612,96 @@ mod resume_tail_recap {
         // of the quoting element pair.
         assert_eq!(recap.text.matches("<interrupted_user_message>").count(), 1);
         assert_eq!(recap.text.matches("</interrupted_user_message>").count(), 1);
+    }
+
+    /// Failure case: interrupted tail recap pools images from multiple user
+    /// rows after all recap text, losing which message each image belongs to.
+    #[test]
+    fn recap_preserves_user_attachment_groups_in_tail_order() {
+        let messages = vec![
+            message(
+                "user",
+                json!([
+                    {"type":"text","text":"first tail group"},
+                    {"type":"image","data":"FIRST","mimeType":"image/png"}
+                ]),
+                None,
+            ),
+            message(
+                "user",
+                json!([
+                    {"type":"text","text":"second tail group"},
+                    {"type":"file","attachmentId":"second","fileName":"second.txt"}
+                ]),
+                None,
+            ),
+            interrupted_assistant("unfinished response"),
+        ];
+        let recap = build_resume_tail_recap(&messages).unwrap();
+        let groups = recap.delivery_groups.unwrap();
+        let first = groups
+            .iter()
+            .position(|g| g.content.contains("first tail group"))
+            .unwrap();
+        let second = groups
+            .iter()
+            .position(|g| g.content.contains("second tail group"))
+            .unwrap();
+        assert!(first < second);
+        assert_eq!(
+            groups[first].image_blocks.as_ref().unwrap()[0]["data"],
+            "FIRST"
+        );
+        assert_eq!(
+            groups[second].file_blocks.as_ref().unwrap()[0]["attachmentId"],
+            "second"
+        );
+        let joined: String = groups.iter().map(|g| g.content.as_str()).collect();
+        for text in [
+            "first tail group",
+            "second tail group",
+            "unfinished response",
+        ] {
+            assert_eq!(joined.matches(text).count(), 1);
+        }
+    }
+
+    /// Attachment-only rows must keep a segment even when a different row
+    /// activates grouped delivery for the restart recap.
+    #[test]
+    fn recap_keeps_attachment_only_user_groups() {
+        let messages = vec![
+            user("text before attachment-only rows"),
+            message(
+                "user",
+                json!([{"type":"image","data":"ONLY","mimeType":"image/png"}]),
+                None,
+            ),
+            message(
+                "user",
+                json!([{"type":"file","attachmentId":"only-file","fileName":"only.txt"}]),
+                None,
+            ),
+            message("assistant", json!([]), Some(json!({"interrupted":true}))),
+        ];
+        let recap = build_resume_tail_recap(&messages).unwrap();
+        let groups = recap.delivery_groups.unwrap();
+        let image = groups
+            .iter()
+            .position(|g| g.image_blocks.is_some())
+            .unwrap();
+        let file = groups.iter().position(|g| g.file_blocks.is_some()).unwrap();
+        assert!(image < file);
+        assert_eq!(
+            groups[image].image_blocks.as_ref().unwrap()[0]["data"],
+            "ONLY"
+        );
+        assert_eq!(
+            groups[file].file_blocks.as_ref().unwrap()[0]["attachmentId"],
+            "only-file"
+        );
+        assert!(groups[image].content.contains("interrupted_user_message"));
+        assert!(groups[file].content.contains("interrupted_user_message"));
     }
 
     /// Replayed user rows keep their attachment blocks: the recap carries

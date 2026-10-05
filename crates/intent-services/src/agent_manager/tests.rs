@@ -6469,27 +6469,22 @@ async fn build_turn_prompt_prepends_preempted_content_and_attachments_first() {
     let arr = wire.as_array().unwrap();
     assert_eq!(
         arr.len(),
-        5,
-        "text + orig img + orig file + new img + new file"
+        6,
+        "original text + attachments, then interrupt text + attachments"
     );
-    // The single text block carries both messages, original first.
     assert_eq!(arr[0]["type"], json!("text"));
-    let text = arr[0]["text"].as_str().unwrap();
-    let orig_pos = text.find("original ask").expect("preempted text present");
-    let new_pos = text.find("urgent update").expect("interrupt text present");
-    assert!(
-        orig_pos < new_pos,
-        "preempted text precedes interrupt: {text:?}"
-    );
+    assert!(arr[0]["text"].as_str().unwrap().contains("original ask"));
+    assert!(!arr[0]["text"].as_str().unwrap().contains("urgent update"));
+    assert_eq!(arr[3]["text"], "urgent update");
     // Preempted attachments precede this turn's own.
     assert_eq!(arr[1]["type"], json!("image"));
     assert_eq!(arr[1]["data"], json!("ORIG_IMG"));
     assert_eq!(arr[2]["type"], json!("text"));
     assert!(arr[2]["text"].as_str().unwrap().contains("orig.txt"));
-    assert_eq!(arr[3]["type"], json!("image"));
-    assert_eq!(arr[3]["data"], json!("NEW_IMG"));
-    assert_eq!(arr[4]["type"], json!("text"));
-    assert!(arr[4]["text"].as_str().unwrap().contains("new.txt"));
+    assert_eq!(arr[4]["type"], json!("image"));
+    assert_eq!(arr[4]["data"], json!("NEW_IMG"));
+    assert_eq!(arr[5]["type"], json!("text"));
+    assert!(arr[5]["text"].as_str().unwrap().contains("new.txt"));
 }
 
 /// Recreated-session interaction (monorepo#1014): when the ACP session was
@@ -7279,6 +7274,8 @@ async fn context_size_requeue_retry_sends_marker_to_provider() {
 /// A system-origin queue entry for the combined-flush requeue tests.
 fn flush_entry(suffix: &str, content: String) -> crate::agent_ops::QueuedMessage {
     crate::agent_ops::QueuedMessage {
+        delivery_groups: None,
+        prepend_delivery_groups: None,
         id: format!("qm-413-{suffix}"),
         turn_id: format!("turn-413-{suffix}"),
         content,
@@ -7648,6 +7645,7 @@ async fn stop_redelivery_flush_413_retry(
 
     for (content, prepend) in queued {
         let prepend = prepend.map(|p| crate::agent_ops::QueuedPrepend {
+            delivery_groups: None,
             content: Some(p.to_string()),
             image_blocks: None,
             file_blocks: None,
@@ -15345,6 +15343,8 @@ async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
     // requeue), second entry needs the row append — which fails NotFound
     // against the deleted session.
     let entry = |suffix: &str, persisted: bool| crate::agent_ops::QueuedMessage {
+        delivery_groups: None,
+        prepend_delivery_groups: None,
         id: format!("qm-2762-{suffix}"),
         turn_id: format!("qm-2762-{suffix}"),
         content: format!("entry {suffix}"),
@@ -17130,7 +17130,7 @@ async fn build_turn_body_clears_flag_when_only_current_message_exists() {
         .unwrap();
     mgr.recreated.lock().unwrap().insert(id.clone());
 
-    let body = mgr.build_turn_body(&id, "only message").await;
+    let body = mgr.build_turn_body(&id, "only message", None).await;
 
     assert_eq!(body, "only message", "no prior → live content unchanged");
     assert!(
@@ -19267,6 +19267,8 @@ mod stale_redrive_tests {
 
     fn queued_msg(content: &str, queued_at: &str, persisted: bool) -> QueuedMessage {
         QueuedMessage {
+            delivery_groups: None,
+            prepend_delivery_groups: None,
             id: "qm-stale-test".to_string(),
             turn_id: "qm-stale-test".to_string(),
             content: content.to_string(),
@@ -19725,6 +19727,8 @@ mod dequeue_wait_tests {
 
     pub(super) fn queued_msg(content: &str, queued_at: &str, persisted: bool) -> QueuedMessage {
         QueuedMessage {
+            delivery_groups: None,
+            prepend_delivery_groups: None,
             id: "qm-wait-test".to_string(),
             turn_id: "qm-wait-test".to_string(),
             content: content.to_string(),
@@ -22409,7 +22413,7 @@ mod model_change_notice_tests {
             .await;
         mgr.recreated.lock().unwrap().insert(id.clone());
 
-        let body = mgr.build_turn_body(&id, "current ask").await;
+        let body = mgr.build_turn_body(&id, "current ask", None).await;
 
         assert!(body.contains("first ask") && body.contains("first answer"));
         assert!(
@@ -23765,6 +23769,8 @@ mod flush_queued_messages_tests {
 
     fn queued_msg(content: &str) -> QueuedMessage {
         QueuedMessage {
+            delivery_groups: None,
+            prepend_delivery_groups: None,
             id: "qm-flush-test".to_string(),
             turn_id: "qm-flush-test".to_string(),
             content: content.to_string(),
@@ -26919,4 +26925,192 @@ async fn provider_profile_respawn_releases_previous_lease_and_reuses_directory()
         path.unwrap().is_dir(),
         "stable session profile survives shutdown"
     );
+}
+
+/// Failure cases: pooled batch attachments, duplicate aggregate attachments,
+/// a prepend image after the next entry's text, and recreated-session replay
+/// duplicating the first flushed row. Build coverage before changing assembly.
+#[tokio::test]
+async fn flush_prompt_keeps_prepend_and_entry_attachment_groups_on_recreate() {
+    for recreated in [false, true] {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-grouped"), AgentId::from("a-grouped"));
+        seed_agent(&mgr, &ws, &id).await;
+        mgr.services
+            .store
+            .append_agent_message(
+                &id,
+                "user",
+                &json!([{"type":"text","text":"preempted group"}]),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+        let mut first = flush_entry("first", "first live group".into());
+        first.image_blocks = Some(json!([{"data":"FIRST","mimeType":"image/png"}]));
+        first.prepend_content = Some("preempted group".into());
+        first.prepend_image_blocks = Some(json!([{"data":"PREPEND","mimeType":"image/png"}]));
+        first.prepend_file_blocks =
+            Some(json!([{"attachmentId":"att-prepend","fileName":"prepend.txt"}]));
+        let mut second = flush_entry("second", "second live group".into());
+        second.file_blocks = Some(json!([{"attachmentId":"att-second","fileName":"second.txt"}]));
+        let batch = vec![first, second];
+        let draining = mgr.services.mark_draining(&id, &batch);
+        let super::FlushPrep::Turn { content, options } =
+            super::prepare_flush_turn(&mgr, &id, &ws, batch, draining).await
+        else {
+            panic!("flush prepared");
+        };
+        if recreated {
+            mgr.recreated.lock().unwrap().insert(id.clone());
+        }
+        let prompt = mgr.build_turn_prompt(&id, &ws, &content, &options).await;
+        let wire = serde_json::to_value(prompt).unwrap();
+        let blocks = wire.as_array().unwrap();
+        let text: String = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
+        for needle in ["preempted group", "first live group", "second live group"] {
+            assert_eq!(text.matches(needle).count(), 1, "{wire}");
+        }
+        assert_eq!(text.contains("<supervisor>"), recreated);
+        let pos = |needle: &str| {
+            blocks
+                .iter()
+                .position(|b| b["text"].as_str().is_some_and(|t| t.contains(needle)))
+                .unwrap()
+        };
+        let prepend = blocks.iter().position(|b| b["data"] == "PREPEND").unwrap();
+        let first = pos("first live group");
+        let second = pos("second live group");
+        assert!(pos("preempted group") < prepend && prepend < first);
+        assert!(blocks[prepend + 1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("prepend.txt"));
+        assert_eq!(blocks[first + 1]["data"], "FIRST");
+        assert_eq!(second, first + 2);
+        assert!(blocks[second + 1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("second.txt"));
+        assert_eq!(blocks.iter().filter(|b| b["type"] == "image").count(), 2);
+    }
+}
+
+/// Failure cases: combined retry loses grouping, repeated failures nest groups,
+/// restart drops the payload, no-op editor holds clear groups, or a replacement
+/// edit replays old group text. Keep the existing single retry/head ACL policy.
+#[tokio::test]
+async fn failed_attachment_flush_retains_flat_groups_until_actual_edit() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-retry-groups"),
+        AgentId::from("a-retry-groups"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let mut first = flush_entry("first", "first attachment group".into());
+    first.image_blocks = Some(json!([{"data":"FIRST","mimeType":"image/png"}]));
+    first.prepend_content = Some("older attachment group".into());
+    first.prepend_image_blocks = Some(json!([{"data":"OLDER","mimeType":"image/png"}]));
+    let mut second = flush_entry("second", "second attachment group".into());
+    second.file_blocks = Some(json!([{"attachmentId":"att-second","fileName":"second.txt"}]));
+    let (_, mut restored) = flush_then_fail(&mgr, &ws, &id, vec![first, second], "boom").await;
+    assert_eq!(restored.len(), 1);
+    let retry = restored.remove(0);
+    let groups = retry.delivery_groups.clone().unwrap();
+    assert_eq!(groups.len(), 3);
+    assert_eq!(groups[0].content, "older attachment group");
+    assert!(groups[1].content.contains("first attachment group"));
+    assert!(groups[2].content.contains("second attachment group"));
+    let (_, mut restored) = flush_then_fail(&mgr, &ws, &id, vec![retry], "boom").await;
+    assert_eq!(restored.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&restored[0].delivery_groups).unwrap(),
+        serde_json::to_value(&groups).unwrap()
+    );
+    let retry = restored.remove(0);
+    let retry_id = retry.id.clone();
+    let text = retry.content.clone();
+    mgr.services.requeue_front(&id, retry);
+    mgr.services.persist_queue_snapshot(&id).await;
+    mgr.services.agent_queues.lock().unwrap().clear();
+    assert_eq!(mgr.services.rehydrate_agent_queues().await.unwrap(), 1);
+    let before = mgr.services.queue_snapshot(&id)[0]["deliveryGroups"].clone();
+    mgr.services
+        .agent_edit_queued_message_op(id.clone(), retry_id.clone(), text.clone(), Some(true))
+        .await
+        .unwrap();
+    mgr.services
+        .agent_edit_queued_message_op(id.clone(), retry_id.clone(), text, Some(false))
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.services.queue_snapshot(&id)[0]["deliveryGroups"],
+        before
+    );
+    mgr.services
+        .agent_edit_queued_message_op(
+            id.clone(),
+            retry_id,
+            "replacement request".into(),
+            Some(false),
+        )
+        .await
+        .unwrap();
+    let after = &mgr.services.queue_snapshot(&id)[0];
+    assert!(after.get("deliveryGroups").is_none());
+    assert_eq!(after["content"], "replacement request");
+    assert_eq!(after["imageBlocks"].as_array().unwrap().len(), 2);
+    assert_eq!(after["fileBlocks"].as_array().unwrap().len(), 1);
+}
+
+/// A legacy prepend triple can be added to a grouped retry by an older
+/// carry-over path. It remains an earlier group and is not silently discarded.
+#[tokio::test]
+async fn grouped_retry_keeps_legacy_prepend_and_cleans_up_on_stop() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-legacy-group"),
+        AgentId::from("a-legacy-group"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let mut entry = flush_entry("legacy", "legacy wrapper".into());
+    entry.delivery_groups = Some(vec![crate::agent_ops::QueuedDeliveryGroup {
+        is_prepend: false,
+        content: "grouped current message".into(),
+        image_blocks: Some(json!([{"data":"CURRENT","mimeType":"image/png"}])),
+        file_blocks: None,
+    }]);
+    entry.prepend_content = Some("legacy earlier message".into());
+    entry.prepend_image_blocks = Some(json!([{"data":"EARLIER","mimeType":"image/png"}]));
+    let groups = entry.ordered_delivery_groups();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].content, "legacy earlier message");
+    let options = super::turn_options_for_entry(&entry, false);
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, &entry.content, &options)
+        .await;
+    let wire = serde_json::to_value(prompt).unwrap();
+    let blocks = wire.as_array().unwrap();
+    let earlier = blocks
+        .iter()
+        .position(|b| {
+            b["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("legacy earlier message"))
+        })
+        .unwrap();
+    let current = blocks
+        .iter()
+        .position(|b| {
+            b["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("grouped current message"))
+        })
+        .unwrap();
+    assert_eq!(blocks[earlier + 1]["data"], "EARLIER");
+    assert_eq!(blocks[current + 1]["data"], "CURRENT");
+    assert!(earlier < current);
+    assert!(mgr.active_delivery_groups.lock().unwrap().contains_key(&id));
+    mgr.stop(&id).await;
+    assert!(!mgr.active_delivery_groups.lock().unwrap().contains_key(&id));
 }

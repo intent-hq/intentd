@@ -413,6 +413,18 @@ async fn annotate_unblocked_hints(
 /// never persisted.
 fn flush_combined_prompt(entries: &[QueuedMessage]) -> String {
     use std::fmt::Write as _;
+    if entries.iter().any(|entry| entry.delivery_groups.is_some()) {
+        let groups: Vec<_> = entries
+            .iter()
+            .flat_map(QueuedMessage::ordered_delivery_groups)
+            .filter(|group| !group.is_prepend)
+            .collect();
+        let mut out = format!("{} queued messages while you were working", groups.len());
+        for (i, group) in groups.iter().enumerate() {
+            let _ = write!(out, "\n\nMessage #{}:\n{}", i + 1, group.content);
+        }
+        return out;
+    }
     let mut out = format!("{} queued messages while you were working", entries.len());
     for (i, m) in entries.iter().enumerate() {
         let _ = write!(out, "\n\nMessage #{}:\n{}", i + 1, m.content);
@@ -506,6 +518,8 @@ async fn cancel_and_settle_idle_prompt(
     reason = "Shutdown, prompt, priority and queue provenance are independent per-turn flags"
 )]
 pub struct TurnOptions {
+    pub(crate) delivery_groups: Option<Vec<crate::agent_ops::QueuedDeliveryGroup>>,
+    pub(crate) prepend_delivery_groups: Option<Vec<crate::agent_ops::QueuedDeliveryGroup>>,
     /// Resume recovery must retain its pending interruption when shutdown
     /// refuses admission, rather than hiding it behind an ordinary queue.
     pub reject_on_shutdown: bool,
@@ -607,10 +621,12 @@ impl TurnOptions {
         if self.prepend_content.is_none()
             && self.prepend_image_blocks.is_none()
             && self.prepend_file_blocks.is_none()
+            && self.prepend_delivery_groups.is_none()
         {
             return None;
         }
         Some(crate::agent_ops::QueuedPrepend {
+            delivery_groups: self.prepend_delivery_groups.clone(),
             content: self.prepend_content.clone(),
             image_blocks: self.prepend_image_blocks.clone(),
             file_blocks: self.prepend_file_blocks.clone(),
@@ -653,6 +669,8 @@ fn usage_message_origin(
 /// with the same options a single-entry drain would have used.
 fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
     TurnOptions {
+        delivery_groups: entry.delivery_groups.clone(),
+        prepend_delivery_groups: entry.prepend_delivery_groups.clone(),
         image_blocks: entry.image_blocks.clone(),
         file_blocks: entry.file_blocks.clone(),
         message_metadata: entry.message_metadata.clone(),
@@ -671,6 +689,69 @@ fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
         origin: origin_from_user_flag(entry.user_origin),
         ..TurnOptions::default()
     }
+}
+
+fn legacy_prompt_groups(
+    content: &str,
+    options: &TurnOptions,
+) -> Vec<crate::agent_ops::QueuedDeliveryGroup> {
+    use crate::agent_ops::QueuedDeliveryGroup;
+    let mut groups = options.prepend_delivery_groups.clone().unwrap_or_else(|| {
+        if options.prepend_content.is_some()
+            || options.prepend_image_blocks.is_some()
+            || options.prepend_file_blocks.is_some()
+        {
+            vec![QueuedDeliveryGroup {
+                is_prepend: true,
+                content: options.prepend_content.clone().unwrap_or_default(),
+                image_blocks: options.prepend_image_blocks.clone(),
+                file_blocks: options.prepend_file_blocks.clone(),
+            }]
+        } else {
+            Vec::new()
+        }
+    });
+    if let Some(current) = &options.delivery_groups {
+        groups.extend(current.clone());
+    } else {
+        groups.push(QueuedDeliveryGroup {
+            is_prepend: false,
+            content: content.to_string(),
+            image_blocks: options.image_blocks.clone(),
+            file_blocks: options.file_blocks.clone(),
+        });
+    }
+    groups
+}
+
+/// Flatten durable retry groups once; their legacy wrapper is never a group.
+fn ordered_prompt_groups(
+    content: &str,
+    options: &TurnOptions,
+) -> Option<Vec<crate::agent_ops::QueuedDeliveryGroup>> {
+    if let Some(entries) = options.flushed_entries.as_ref().filter(|entries| {
+        entries.iter().any(|entry| {
+            entry.has_attachments()
+                || entry.delivery_groups.is_some()
+                || entry.prepend_delivery_groups.is_some()
+        })
+    }) {
+        // Batch prepends preceded the whole flush in the legacy prompt.
+        // Keep that order while preserving each prepend's own attachments.
+        let (mut prepends, current): (Vec<_>, Vec<_>) = entries
+            .iter()
+            .flat_map(QueuedMessage::ordered_delivery_groups)
+            .partition(|group| group.is_prepend);
+        prepends.extend(current);
+        return Some(prepends);
+    }
+    if options.delivery_groups.is_some() {
+        return Some(legacy_prompt_groups(content, options));
+    }
+    let groups = legacy_prompt_groups(content, options);
+    (options.prepend_delivery_groups.is_some()
+        || groups.iter().any(|g| g.is_prepend && g.has_attachments()))
+    .then_some(groups)
 }
 
 /// Conservative cap used when total system memory cannot be determined.
@@ -2709,6 +2790,8 @@ pub struct AgentManager {
     /// interrupt path and the spawn-window fallback-to-kill path; cleared by
     /// [`AgentManager::edit_and_regenerate`] (the truncation may remove the
     /// captured message, and the recreate's history replay covers survivors).
+    active_delivery_groups:
+        Arc<Mutex<HashMap<AgentId, Vec<crate::agent_ops::QueuedDeliveryGroup>>>>,
     stop_redelivery: Arc<Mutex<HashMap<AgentId, crate::agent_ops::QueuedPrepend>>>,
     /// Agents whose NEXT session establishment must SKIP the `session/load`
     /// resume and open a fresh `session/new` instead — armed by
@@ -2892,6 +2975,7 @@ impl AgentManager {
             setup_failure_notified: Arc::new(Mutex::new(HashSet::new())),
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
+            active_delivery_groups: Arc::new(Mutex::new(HashMap::new())),
             stop_redelivery: Arc::new(Mutex::new(HashMap::new())),
             force_recreate: Arc::new(Mutex::new(HashSet::new())),
             spawn_attempt_provider: Arc::new(Mutex::new(HashMap::new())),
@@ -5213,11 +5297,40 @@ impl AgentManager {
         // prepend ATTACHMENTS are unaffected: the history XML is text-only,
         // so `append_attachment_blocks` must still emit them.
         let history_covers_prepend = self.recreated.lock().unwrap().contains(agent_id);
-        let combined = match options.prepend_content.as_deref() {
-            Some(orig) if !orig.is_empty() && !history_covers_prepend => {
-                format!("{orig}\n\n{content}")
+        let groups = ordered_prompt_groups(content, options);
+        // Remember the payload actually submitted to this live turn. A
+        // zero-output interrupt/stop must carry every group, including a
+        // previous interrupt's carry-over, rather than just the last row.
+        if let Some(groups) = &groups {
+            self.active_delivery_groups
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone(), groups.clone());
+        } else {
+            self.active_delivery_groups.lock().unwrap().remove(agent_id);
+        }
+        let batch = options.flushed_entries.is_some() || options.delivery_groups.is_some();
+        let combined = if let Some(groups) = &groups {
+            if batch {
+                format!(
+                    "{} queued messages while you were working",
+                    groups.iter().filter(|g| !g.is_prepend).count()
+                )
+            } else if !history_covers_prepend {
+                groups
+                    .first()
+                    .map(|g| g.content.clone())
+                    .unwrap_or_default()
+            } else {
+                String::new()
             }
-            _ => content.to_string(),
+        } else {
+            match options.prepend_content.as_deref() {
+                Some(orig) if !orig.is_empty() && !history_covers_prepend => {
+                    format!("{orig}\n\n{content}")
+                }
+                _ => content.to_string(),
+            }
         };
         // Resolve each envelope layer's data (gating stays here); the
         // harness owns the wording and the layering order.
@@ -5227,7 +5340,32 @@ impl AgentManager {
         // agents; absent for non-specialist agents. Because it fires every turn
         // it also covers the session-recreated case handled by `build_turn_body`.
         let reminder = self.services.agent_role_reminder(agent_id).await;
-        let body = self.build_turn_body(agent_id, &combined).await;
+        let replay_ids: Vec<String> = options
+            .flushed_entries
+            .iter()
+            .flatten()
+            .flat_map(|entry| {
+                std::iter::once(entry.id.clone()).chain(
+                    entry
+                        .recovery_sources
+                        .iter()
+                        .map(|source| source.message_id.clone()),
+                )
+            })
+            .chain(
+                options
+                    .recovery_sources
+                    .iter()
+                    .map(|source| source.message_id.clone()),
+            )
+            .collect();
+        let body = self
+            .build_turn_body(
+                agent_id,
+                &combined,
+                (!replay_ids.is_empty()).then_some(replay_ids.as_slice()),
+            )
+            .await;
         // Fire-once agent/workspace naming instruction (port of
         // `agent-backend-handler.service.ts` `namingInstructions`): on the
         // first turn, a `<system>` block asks agents with generated names to name
@@ -5288,29 +5426,40 @@ impl AgentManager {
                 body: &body,
             });
         let mut blocks = text_prompt(&prompt_text);
-        // Image-reference resolution (monorepo#3338): attachment-registry
-        // references in this turn's (and any preempted prepend's) image
-        // blocks are resolved to inline bytes HERE — the single prompt
-        // assembly choke point — so the ACP receives them exactly as inline
-        // blocks, whatever ingress path carried the reference. No-op when no
-        // references are present.
-        let has_image_refs = !crate::agent_ops::image_block_ref_ids(options.image_blocks.as_ref())
-            .is_empty()
-            || !crate::agent_ops::image_block_ref_ids(options.prepend_image_blocks.as_ref())
-                .is_empty();
-        if has_image_refs {
-            let mut resolved = options.clone();
-            resolved.image_blocks = self
-                .services
-                .resolve_image_block_refs(resolved.image_blocks.take())
+        if let Some(groups) = &groups {
+            let mut message_number = 0;
+            for (i, group) in groups.iter().enumerate() {
+                let covered = group.is_prepend && history_covers_prepend;
+                let in_envelope = !batch && !history_covers_prepend && i == 0;
+                if !covered && !in_envelope {
+                    let text = if batch && !group.is_prepend {
+                        message_number += 1;
+                        format!("\n\nMessage #{}:\n{}", message_number, group.content)
+                    } else {
+                        group.content.clone()
+                    };
+                    blocks.extend(text_prompt(&text));
+                }
+                self.append_resolved_attachments(
+                    &mut blocks,
+                    group.image_blocks.as_ref(),
+                    group.file_blocks.as_ref(),
+                )
                 .await;
-            resolved.prepend_image_blocks = self
-                .services
-                .resolve_image_block_refs(resolved.prepend_image_blocks.take())
-                .await;
-            append_attachment_blocks(&mut blocks, &resolved);
+            }
         } else {
-            append_attachment_blocks(&mut blocks, options);
+            self.append_resolved_attachments(
+                &mut blocks,
+                options.prepend_image_blocks.as_ref(),
+                options.prepend_file_blocks.as_ref(),
+            )
+            .await;
+            self.append_resolved_attachments(
+                &mut blocks,
+                options.image_blocks.as_ref(),
+                options.file_blocks.as_ref(),
+            )
+            .await;
         }
         // Resolve `noteIds` to `workspace-asset://` image content blocks
         // (Fidelity B, PROTOCOL §5.5): each note is scanned for markdown
@@ -5361,13 +5510,39 @@ impl AgentManager {
         blocks
     }
 
+    /// Resolve references within their message group, before emitting the next text.
+    async fn append_resolved_attachments(
+        &self,
+        blocks: &mut Vec<ContentBlock>,
+        images: Option<&Value>,
+        files: Option<&Value>,
+    ) {
+        let resolved = self
+            .services
+            .resolve_image_block_refs(images.cloned())
+            .await;
+        append_attachment_blocks(
+            blocks,
+            &TurnOptions {
+                image_blocks: resolved,
+                file_blocks: files.cloned(),
+                ..TurnOptions::default()
+            },
+        );
+    }
+
     /// Build the user-turn body: normally just `content`, but when the ACP
     /// session was recreated (the resume-impossible fallback), prepend the prior
     /// conversation history as `<supervisor>` XML so the fresh session has
     /// context, then clear the flag (parity: TS `sessionWasRecreated` →
     /// `formatHistoryAsXml`). The just-persisted current user message is excluded
     /// from the rendered history.
-    async fn build_turn_body(&self, agent_id: &AgentId, content: &str) -> String {
+    async fn build_turn_body(
+        &self,
+        agent_id: &AgentId,
+        content: &str,
+        flushed_ids: Option<&[String]>,
+    ) -> String {
         if !self.take_recreated(agent_id) {
             return content.to_string();
         }
@@ -5391,10 +5566,24 @@ impl AgentManager {
         // appends trail it (the `model_changed` system notice lands after the
         // user row and before this render); with no user row fall back to
         // dropping the last message.
-        let prior: &[_] = match messages.iter().rposition(|m| m.role == "user") {
-            Some(idx) => &messages[..idx],
-            None => messages.split_last().map_or(&[], |(_, rest)| rest),
-        };
+        // A flush persisted all its rows before prompt assembly. Exclude the
+        // entire live batch, not just its final user row, from history replay.
+        let first_flushed = flushed_ids.and_then(|ids| {
+            messages.iter().position(|m| {
+                let id = m
+                    .metadata
+                    .as_ref()
+                    .and_then(|md| md.get("queueInfo"))
+                    .and_then(|info| info.get("queuedMessageId"))
+                    .and_then(Value::as_str);
+                id.is_some_and(|id| ids.iter().any(|source| source == id))
+            })
+        });
+        let prior: &[_] =
+            match first_flushed.or_else(|| messages.iter().rposition(|m| m.role == "user")) {
+                Some(idx) => &messages[..idx],
+                None => messages.split_last().map_or(&[], |(_, rest)| rest),
+            };
         if prior.is_empty() {
             return content.to_string();
         }
@@ -5496,6 +5685,7 @@ impl AgentManager {
                     }),
             )
             .await;
+        self.active_delivery_groups.lock().unwrap().remove(agent_id);
         self.registry.mark_idle_slot_held(agent_id);
         result
     }
@@ -5655,6 +5845,7 @@ impl AgentManager {
         // (the spawn-window user stop), which is installed here so it is
         // visible before `end_turn` frees the busy slot.
         self.recreated.lock().unwrap().remove(agent_id);
+        self.active_delivery_groups.lock().unwrap().remove(agent_id);
         self.prepend_pending.lock().unwrap().remove(agent_id);
         // A spawn attempt cancelled by this teardown never reaches the
         // spawn-failure publisher that would consume its provider record.
@@ -5894,6 +6085,7 @@ impl AgentManager {
             self.arm_stop_redelivery(agent_id, interrupted_message_id.as_ref())
                 .await;
         }
+        self.active_delivery_groups.lock().unwrap().remove(agent_id);
         // Cancel the current turn over the wire (keep-alive interrupt). The agent
         // resolves its in-flight `session/prompt` with `StopReason::Cancelled`;
         // best-effort — a wire error never blocks the stop. Time-bounded
@@ -6192,7 +6384,14 @@ impl AgentManager {
         if turn_progressed_after(&messages, last_user_idx, marker_row_id) {
             return None;
         }
-        let payload = extract_user_prepend(&messages[last_user_idx].content);
+        let payload = self
+            .active_delivery_groups
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .cloned()
+            .map(prepend_from_groups)
+            .unwrap_or_else(|| extract_user_prepend(&messages[last_user_idx].content));
         if payload.content.is_none()
             && payload.image_blocks.is_none()
             && payload.file_blocks.is_none()
@@ -8081,6 +8280,8 @@ impl AgentManager {
         // The `prepend_*` fields restore a failed zero-output interrupt's
         // combined delivery on retry (monorepo#1014).
         let options = TurnOptions {
+            delivery_groups: next.delivery_groups.clone(),
+            prepend_delivery_groups: next.prepend_delivery_groups.clone(),
             image_blocks: next.image_blocks.clone(),
             file_blocks: next.file_blocks.clone(),
             message_metadata: next.message_metadata.clone(),
@@ -8249,6 +8450,8 @@ impl AgentManager {
         // `try_drain_queue`.
         let mut options = TurnOptions {
             turn_id: Some(entry.turn_id.clone()),
+            delivery_groups: entry.delivery_groups.clone(),
+            prepend_delivery_groups: entry.prepend_delivery_groups.clone(),
             image_blocks: entry.image_blocks.clone(),
             file_blocks: entry.file_blocks.clone(),
             message_metadata: entry.message_metadata.clone(),
@@ -8452,7 +8655,9 @@ impl AgentManager {
             &mut last.prepend_content,
             &mut last.prepend_image_blocks,
             &mut last.prepend_file_blocks,
+            &mut last.prepend_delivery_groups,
             crate::agent_ops::QueuedPrepend {
+                delivery_groups: interrupt.prepend_delivery_groups,
                 content: interrupt.prepend_content,
                 image_blocks: interrupt.prepend_image_blocks,
                 file_blocks: interrupt.prepend_file_blocks,
@@ -8755,6 +8960,13 @@ impl AgentManager {
             return;
         }
 
+        // Snapshot before cancellation/cleanup removes the live payload.
+        let active_groups = self
+            .active_delivery_groups
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .cloned();
         // Sender attribution for the interrupted row / `stream:end` payload:
         // a user-origin delivery is `{ kind: "user" }`; an agent-to-agent
         // send carries the `messageMetadata` `fromAgentId`/`fromAgentName`
@@ -8842,7 +9054,10 @@ impl AgentManager {
                         // Extract the preempted message's text + attachments
                         // (shared with the zero-output user-stop redelivery
                         // arm, intent-hq/monorepo#1757).
-                        let payload = extract_user_prepend(&last_user_msg.content);
+                        let payload = active_groups
+                            .clone()
+                            .map(prepend_from_groups)
+                            .unwrap_or_else(|| extract_user_prepend(&last_user_msg.content));
 
                         // Prompt-only prepend: both user rows are
                         // already persisted, so nothing is appended to
@@ -8853,21 +9068,12 @@ impl AgentManager {
                         // own `prepend_*`): the entry's older prepend
                         // stays first, the just-preempted message follows
                         // — transcript order, nothing clobbered.
-                        if let Some(text) = payload.content.filter(|t| !t.is_empty()) {
-                            options.prepend_content = Some(match options.prepend_content.take() {
-                                Some(existing) if !existing.is_empty() => {
-                                    format!("{existing}\n\n{text}")
-                                }
-                                _ => text,
-                            });
-                        }
-                        options.prepend_image_blocks = merge_block_arrays(
-                            options.prepend_image_blocks.take(),
-                            payload.image_blocks,
-                        );
-                        options.prepend_file_blocks = merge_block_arrays(
-                            options.prepend_file_blocks.take(),
-                            payload.file_blocks,
+                        merge_prepend_payload(
+                            &mut options.prepend_content,
+                            &mut options.prepend_image_blocks,
+                            &mut options.prepend_file_blocks,
+                            &mut options.prepend_delivery_groups,
+                            payload,
                         );
                     }
                 }
@@ -8938,6 +9144,7 @@ impl AgentManager {
                     &mut last.prepend_content,
                     &mut last.prepend_image_blocks,
                     &mut last.prepend_file_blocks,
+                    &mut last.prepend_delivery_groups,
                     armed.clone(),
                 );
             }
@@ -8945,6 +9152,7 @@ impl AgentManager {
                 &mut options.prepend_content,
                 &mut options.prepend_image_blocks,
                 &mut options.prepend_file_blocks,
+                &mut options.prepend_delivery_groups,
                 armed,
             );
         }
@@ -11526,9 +11734,34 @@ fn extract_user_prepend(content: &Value) -> crate::agent_ops::QueuedPrepend {
         }
     };
     crate::agent_ops::QueuedPrepend {
+        delivery_groups: None,
         content: (!text.is_empty()).then_some(text),
         image_blocks: pick("image"),
         file_blocks: pick("file"),
+    }
+}
+
+fn prepend_from_groups(
+    mut groups: Vec<crate::agent_ops::QueuedDeliveryGroup>,
+) -> crate::agent_ops::QueuedPrepend {
+    let mut images = None;
+    let mut files = None;
+    for group in &mut groups {
+        group.is_prepend = true;
+        images = merge_block_arrays(images, group.image_blocks.clone());
+        files = merge_block_arrays(files, group.file_blocks.clone());
+    }
+    crate::agent_ops::QueuedPrepend {
+        content: Some(
+            groups
+                .iter()
+                .map(|group| group.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        ),
+        image_blocks: images,
+        file_blocks: files,
+        delivery_groups: Some(groups),
     }
 }
 
@@ -11556,8 +11789,35 @@ fn merge_prepend_payload(
     prepend_content: &mut Option<String>,
     prepend_image_blocks: &mut Option<Value>,
     prepend_file_blocks: &mut Option<Value>,
+    prepend_groups: &mut Option<Vec<crate::agent_ops::QueuedDeliveryGroup>>,
     armed: crate::agent_ops::QueuedPrepend,
 ) {
+    if prepend_groups.is_some() || armed.delivery_groups.is_some() {
+        let mut groups = prepend_groups.take().unwrap_or_else(|| {
+            if prepend_content.is_some()
+                || prepend_image_blocks.is_some()
+                || prepend_file_blocks.is_some()
+            {
+                vec![crate::agent_ops::QueuedDeliveryGroup {
+                    is_prepend: true,
+                    content: prepend_content.clone().unwrap_or_default(),
+                    image_blocks: prepend_image_blocks.clone(),
+                    file_blocks: prepend_file_blocks.clone(),
+                }]
+            } else {
+                Vec::new()
+            }
+        });
+        groups.extend(armed.delivery_groups.clone().unwrap_or_else(|| {
+            vec![crate::agent_ops::QueuedDeliveryGroup {
+                is_prepend: true,
+                content: armed.content.clone().unwrap_or_default(),
+                image_blocks: armed.image_blocks.clone(),
+                file_blocks: armed.file_blocks.clone(),
+            }]
+        }));
+        *prepend_groups = Some(groups);
+    }
     if let Some(text) = armed.content.filter(|t| !t.is_empty()) {
         *prepend_content = Some(match prepend_content.take() {
             Some(existing) if !existing.is_empty() => format!("{existing}\n\n{text}"),
@@ -13017,6 +13277,8 @@ async fn run_message_worker(
             let queued_submission_ids = next.submission_ids();
             content = next.content;
             options = TurnOptions {
+                delivery_groups: next.delivery_groups.clone(),
+                prepend_delivery_groups: next.prepend_delivery_groups.clone(),
                 image_blocks: next_image_blocks,
                 file_blocks: next_file_blocks,
                 message_metadata: next.message_metadata.clone(),
@@ -13221,6 +13483,8 @@ async fn run_message_worker(
             let queued_submission_ids = next.submission_ids();
             content = next.content;
             options = TurnOptions {
+                delivery_groups: next.delivery_groups.clone(),
+                prepend_delivery_groups: next.prepend_delivery_groups.clone(),
                 image_blocks: next_image_blocks,
                 file_blocks: next_file_blocks,
                 message_metadata: next.message_metadata.clone(),
@@ -14552,6 +14816,16 @@ async fn publish_error_status_and_requeue(
                     entry.prepend_content.as_deref(),
                 );
                 crate::agent_ops::QueuedMessage {
+                    delivery_groups: if content == entry.content {
+                        entry.delivery_groups.clone()
+                    } else {
+                        None
+                    },
+                    prepend_delivery_groups: if prepend_content == entry.prepend_content {
+                        entry.prepend_delivery_groups.clone()
+                    } else {
+                        None
+                    },
                     content,
                     persisted,
                     prepend_content,
@@ -14578,7 +14852,14 @@ async fn publish_error_status_and_requeue(
             )
         };
         let id = new_message_id();
+        let delivery_groups = ordered_prompt_groups(content, options);
+        // Some(empty) records that the legacy aggregate prepend is already
+        // represented in delivery_groups. A future new carry-over can still
+        // add earlier groups without duplicating that aggregate on retry.
+        let prepend_delivery_groups = delivery_groups.as_ref().map(|_| Vec::new());
         let mut queued = crate::agent_ops::QueuedMessage {
+            delivery_groups,
+            prepend_delivery_groups,
             turn_id: options.turn_id.clone().unwrap_or_else(|| id.clone()),
             id,
             content,

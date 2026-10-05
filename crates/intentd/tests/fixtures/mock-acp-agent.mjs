@@ -398,7 +398,7 @@ function modelDefaultEffort(behavior) {
 async function handlePrompt(id, params) {
   promptCount += 1;
   // Record every prompt this child receives when MOCK_AGENT_PROMPT_LOG points
-  // at a file — one JSON line per prompt ({ turn, text, blockTypes }) — so
+  // at a file — one JSON line per prompt ({ turn, text, blockTypes, blocks }) — so
   // e2e tests can assert exact outbound prompt assembly (e.g. the
   // FirstTurnPrepend `<system>` block fires on the first turn of a fresh
   // session and never repeats). `blockTypes` lists each prompt content
@@ -417,6 +417,7 @@ async function handlePrompt(id, params) {
           ...(effectiveModel !== null ? { effectiveModel, effectiveEffort } : {}),
           text: extractPromptText(params),
           blockTypes: blocks.map((b) => (b && typeof b.type === 'string' ? b.type : '')),
+          blocks,
         }) + '\n',
       );
     } catch (err) {
@@ -696,6 +697,11 @@ async function handlePrompt(id, params) {
     while (!fs.existsSync(active.releaseFile)) {
       await new Promise((r) => setTimeout(r, 10));
     }
+  }
+  // A queue-flush rule can fail only the selected batch, after its barrier.
+  // Restart tests boot the same durable queue with the rule removed.
+  if (active !== behavior && active.promptRpcError) {
+    return send({ jsonrpc: '2.0', id, error: active.promptRpcError });
   }
   const toolCalls = Array.isArray(active.toolCalls)
     ? active.toolCalls

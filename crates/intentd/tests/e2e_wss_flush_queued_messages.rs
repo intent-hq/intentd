@@ -2596,3 +2596,509 @@ async fn self_queue_reads_do_not_reveal_or_consume_pending_messages_over_wss() {
     let queue = wss_rpc(&mut rpc, 7, "agent.getQueue", json!({"agentId":agent})).await;
     assert_eq!(queue["queue"], json!([]));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attachment_groups_survive_natural_flush_over_wss() {
+    attachment_groups_over_wss(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attachment_groups_survive_explicit_flush_over_wss() {
+    attachment_groups_over_wss(true).await;
+}
+
+/// Failure cases: either side of a merge has attachments, image-only input,
+/// multiple images, file references, mixed authors, empty attachment arrays,
+/// editing/removing a sibling, and a flush pooling attachments after all text.
+/// The provider's complete blocks plus queue/transcript are the replay artifact.
+async fn attachment_groups_over_wss(explicit: bool) {
+    let Some(script) = gate("WSS queued attachment groups") else {
+        return;
+    };
+    let tmp = temp_data_dir();
+    let data_dir = tmp.path();
+    let (workspace_id, guest) = seed_workspace_with_guest(data_dir).await;
+    let release = data_dir.join("release-group-kickoff");
+    let Booted {
+        daemon: _daemon,
+        port,
+        cfg,
+        prompt_log,
+    } = boot_daemon(data_dir, &script, 0, Some(&release), &[]).await;
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({"workspaceId":workspace_id,"eventTypes":["agent:*"]}),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut guest_rpc = connect_ws_as(port, cfg, GUEST_TOKEN).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({"workspaceId":workspace_id,"name":"Attachment groups","provider":"mock","model":"default"}),
+    )
+    .await;
+    let agent = created["agent"]["id"].as_str().unwrap();
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let placed = wss_rpc(
+        &mut rpc,
+        3,
+        "file.placeAttachment",
+        json!({"workspaceId":workspace_id,"fileName":"group.png","data":png,"mimeType":"image/png"}),
+    )
+    .await;
+    let image_id = placed["attachmentId"].as_str().unwrap();
+    wss_rpc(
+        &mut rpc,
+        4,
+        "agent.sendMessage",
+        json!({"workspaceId":workspace_id,"agentId":agent,"content":KICKOFF_MSG}),
+    )
+    .await;
+    await_prompts(&prompt_log, 1).await;
+    let submissions = [
+        json!({"content":"group plain before","imageBlocks":[],"fileBlocks":[]}),
+        json!({"content":"group plain append"}),
+        json!({"content":"group two images","imageBlocks":[
+            {"type":"image","data":png,"mimeType":"image/png"},
+            {"type":"image","attachmentId":image_id}
+        ]}),
+        json!({"content":"","imageBlocks":[{"type":"image","data":png,"mimeType":"image/png"}]}),
+        json!({"content":"group file","fileBlocks":[{"type":"file","attachmentId":"att-group-file","fileName":"group.txt","mimeType":"text/plain"}]}),
+        json!({"content":"group plain after"}),
+        json!({"content":"group plain tail"}),
+    ];
+    let mut acknowledgements = Vec::new();
+    for (i, mut params) in submissions.into_iter().enumerate() {
+        params["workspaceId"] = json!(workspace_id);
+        params["agentId"] = json!(agent);
+        let envelope =
+            wss_rpc_envelope(&mut rpc, 10 + i as i64, "agent.queueMessage", params).await;
+        assert_eq!(envelope["jsonrpc"], "2.0");
+        assert_eq!(envelope["id"], 10 + i as i64);
+        assert!(envelope.get("error").is_none(), "{envelope}");
+        acknowledgements.push(envelope["result"]["queuedMessage"].clone());
+    }
+    assert_eq!(acknowledgements[0]["id"], acknowledgements[1]["id"]);
+    assert_eq!(acknowledgements[5]["id"], acknowledgements[6]["id"]);
+    for i in 2..6 {
+        assert_ne!(acknowledgements[i - 1]["id"], acknowledgements[i]["id"]);
+    }
+    let guest_ack = wss_rpc(
+        &mut guest_rpc,
+        20,
+        "agent.queueMessage",
+        json!({"workspaceId":workspace_id,"agentId":agent,"content":"group guest image",
+            "imageBlocks":[{"type":"image","data":png,"mimeType":"image/png"}]}),
+    )
+    .await;
+    let removed = wss_rpc(
+        &mut rpc,
+        21,
+        "agent.queueMessage",
+        json!({"workspaceId":workspace_id,"agentId":agent,"content":"group removed",
+            "imageBlocks":[{"type":"image","data":png,"mimeType":"image/png"}]}),
+    )
+    .await;
+    wss_rpc(
+        &mut rpc,
+        22,
+        "agent.removeQueuedMessage",
+        json!({"agentId":agent,"messageId":removed["queuedMessage"]["id"]}),
+    )
+    .await;
+    wss_rpc(
+        &mut rpc,
+        23,
+        "agent.editQueuedMessage",
+        json!({"agentId":agent,"messageId":acknowledgements[2]["id"],"content":"group edited two images","editing":false}),
+    )
+    .await;
+    let queue = wss_rpc(&mut rpc, 24, "agent.getQueue", json!({"agentId":agent})).await;
+    let rows = queue["queue"].as_array().unwrap();
+    assert_eq!(rows.len(), 6, "{queue}");
+    for row in rows {
+        assert_eq!(
+            row["mergeEligible"], false,
+            "last author has attachments: {row}"
+        );
+    }
+    assert_eq!(rows[1]["imageBlocks"].as_array().unwrap().len(), 2);
+    assert_eq!(rows[2]["imageBlocks"].as_array().unwrap().len(), 1);
+    assert_eq!(rows[3]["fileBlocks"].as_array().unwrap().len(), 1);
+    assert_eq!(rows[5]["id"], guest_ack["queuedMessage"]["id"]);
+    assert_eq!(rows[5]["author"]["principalId"], guest.id.0);
+    if explicit {
+        let ids: Vec<_> = rows.iter().map(|row| row["id"].clone()).collect();
+        wss_rpc(
+            &mut rpc,
+            25,
+            "agent.sendQueuedMessagesNow",
+            json!({"workspaceId":workspace_id,"agentId":agent,"messageIds":ids}),
+        )
+        .await;
+    } else {
+        std::fs::write(&release, "go").unwrap();
+    }
+    let observed = observe_drain(&mut sub, agent, 2).await;
+    assert_eq!(observed.processing_frames.len(), 1, "one ACP turn");
+    assert_eq!(
+        observed.processing_frames[0]["queuedMessages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    let prompts = await_prompts(&prompt_log, 2).await;
+    assert_eq!(prompts.len(), 2, "initial turn plus a single batch");
+    let log = std::fs::read_to_string(&prompt_log).unwrap();
+    let records: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let blocks = records[1]["blocks"].as_array().unwrap();
+    let position = |needle: &str| {
+        blocks
+            .iter()
+            .position(|b| b["text"].as_str().is_some_and(|t| t.contains(needle)))
+            .unwrap()
+    };
+    if explicit {
+        assert!(
+            position(KICKOFF_MSG) < position("Message #1:"),
+            "preempted turn stays ahead of the batch"
+        );
+    }
+    let first = position("Message #1:");
+    let second = position("Message #2:");
+    let third = position("Message #3:");
+    let fourth = position("Message #4:");
+    let fifth = position("Message #5:");
+    let sixth = position("Message #6:");
+    assert!(first < second && second < third && third < fourth && fourth < fifth && fifth < sixth);
+    assert!(blocks[second]["text"]
+        .as_str()
+        .unwrap()
+        .contains("group edited two images"));
+    assert_eq!(blocks[second + 1]["type"], "image");
+    assert_eq!(blocks[second + 2]["type"], "image");
+    assert_eq!(
+        blocks[second + 2]["data"],
+        png,
+        "reference resolved within its group"
+    );
+    assert_eq!(third, second + 3);
+    assert_eq!(blocks[third + 1]["type"], "image");
+    assert_eq!(fourth, third + 2);
+    assert!(blocks[fourth + 1]["text"]
+        .as_str()
+        .unwrap()
+        .contains("group.txt"));
+    assert_eq!(fifth, fourth + 2);
+    assert_eq!(blocks[sixth + 1]["type"], "image");
+    assert_eq!(blocks.iter().filter(|b| b["type"] == "image").count(), 4);
+    for needle in [
+        "group plain before",
+        "group plain append",
+        "group edited two images",
+        "group file",
+        "group plain after",
+        "group plain tail",
+        "group guest image",
+    ] {
+        assert_eq!(
+            prompts[1].matches(needle).count(),
+            1,
+            "no duplicated text: {needle}"
+        );
+    }
+    assert!(!prompts[1].contains("group removed"));
+    let conversation = wss_rpc(
+        &mut rpc,
+        26,
+        "agent.getConversation",
+        json!({"agentId":agent}),
+    )
+    .await;
+    assert_eq!(
+        user_row(&conversation, "group edited two images")["contentBlocks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        user_row(&conversation, "group file")["contentBlocks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let evidence = json!({"explicit":explicit,"queue":queue,"providerPrompts":records,"conversation":conversation});
+    let artifact = data_dir.join("attachment-groups.json");
+    std::fs::write(&artifact, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+    eprintln!(
+        "ATTACHMENT_GROUPS_ARTIFACT {}\n{}",
+        artifact.display(),
+        evidence
+    );
+    std::fs::write(&release, "go").unwrap();
+}
+
+/// Failure cases: flattened failed flush, lost durable groups after restart,
+/// retry nesting wrapper groups, changed combined-row permissions, and stale
+/// grouped text after a real edit. This drives failure/restart/retry over WSS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_attachment_batch_keeps_groups_through_restart_and_retry_over_wss() {
+    let Some(script) = gate("WSS attachment group restart") else {
+        return;
+    };
+    let tmp = temp_data_dir();
+    let data_dir = tmp.path();
+    let (workspace_id, _) = seed_workspace_with_guest(data_dir).await;
+    let release = data_dir.join("release-group-failure");
+    let failure = json!({"ifPromptContains":"durable first group","promptRpcError":{"code":-32603,"message":"group fixture failure"}});
+    let Booted {
+        daemon,
+        port,
+        cfg,
+        prompt_log,
+    } = boot_daemon(data_dir, &script, 0, Some(&release), &[failure]).await;
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({"workspaceId":workspace_id,"eventTypes":["agent:*"]}),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut guest_rpc = connect_ws_as(port, cfg, GUEST_TOKEN).await;
+    let created = wss_rpc(&mut rpc, 2, "agent.create", json!({"workspaceId":workspace_id,"name":"Durable groups","provider":"mock","model":"default"})).await;
+    let agent = created["agent"]["id"].as_str().unwrap();
+    wss_rpc(
+        &mut rpc,
+        3,
+        "agent.sendMessage",
+        json!({"workspaceId":workspace_id,"agentId":agent,"content":KICKOFF_MSG}),
+    )
+    .await;
+    await_prompts(&prompt_log, 1).await;
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    wss_rpc(&mut rpc, 4, "agent.queueMessage", json!({"workspaceId":workspace_id,"agentId":agent,"content":"durable first group","imageBlocks":[{"type":"image","data":png,"mimeType":"image/png"}]})).await;
+    wss_rpc(&mut guest_rpc, 5, "agent.queueMessage", json!({"workspaceId":workspace_id,"agentId":agent,"content":"durable second group","fileBlocks":[{"type":"file","attachmentId":"durable-file","fileName":"durable.txt"}]})).await;
+    std::fs::write(&release, "go").unwrap();
+    observe_drain(&mut sub, agent, 2).await;
+    // Queue publication follows stream:end, so wait for its observable state.
+    let before = timeout(common::test_timeout(Duration::from_secs(30)), async {
+        loop {
+            let queue = wss_rpc(&mut rpc, 6, "agent.getQueue", json!({"agentId":agent})).await;
+            if queue["queue"][0]["requeuedAfterFailure"] == true {
+                break queue;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        before["queue"].as_array().unwrap().len(),
+        1,
+        "one combined retry"
+    );
+    let groups = before["queue"][0]["deliveryGroups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert!(groups[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("durable first group"));
+    assert!(groups[1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("durable second group"));
+    assert_eq!(groups[0]["imageBlocks"].as_array().unwrap().len(), 1);
+    assert_eq!(groups[1]["fileBlocks"].as_array().unwrap().len(), 1);
+    let retry_id = before["queue"][0]["id"].clone();
+    let refused = wss_rpc_envelope(
+        &mut guest_rpc,
+        7,
+        "agent.editQueuedMessage",
+        json!({"agentId":agent,"messageId":retry_id,"content":"foreign edit"}),
+    )
+    .await;
+    assert!(
+        refused.get("error").is_some(),
+        "combined retry keeps head ACL: {refused}"
+    );
+    drop(sub);
+    drop(rpc);
+    drop(guest_rpc);
+    drop(daemon);
+    let Booted {
+        daemon: _daemon,
+        port,
+        cfg,
+        prompt_log,
+    } = boot_daemon(data_dir, &script, 0, None, &[]).await;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let after = wss_rpc(&mut rpc, 10, "agent.getQueue", json!({"agentId":agent})).await;
+    assert_eq!(
+        after["queue"][0]["deliveryGroups"],
+        before["queue"][0]["deliveryGroups"]
+    );
+    assert_eq!(after["queue"][0]["turnId"], before["queue"][0]["turnId"]);
+    let mut sub = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut sub,
+        11,
+        "events.subscribe",
+        json!({"workspaceId":workspace_id,"eventTypes":["agent:*"]}),
+    )
+    .await;
+    wss_rpc(
+        &mut rpc,
+        12,
+        "agent.retry",
+        json!({"workspaceId":workspace_id,"agentId":agent}),
+    )
+    .await;
+    observe_drain(&mut sub, agent, 1).await;
+    let prompts = await_prompts(&prompt_log, 3).await;
+    assert_eq!(prompts[2].matches("durable first group").count(), 1);
+    assert_eq!(prompts[2].matches("durable second group").count(), 1);
+    let log = std::fs::read_to_string(&prompt_log).unwrap();
+    let records: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let blocks = records[2]["blocks"].as_array().unwrap();
+    let first = blocks
+        .iter()
+        .position(|b| {
+            b["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("durable first group"))
+        })
+        .unwrap();
+    let second = blocks
+        .iter()
+        .position(|b| {
+            b["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("durable second group"))
+        })
+        .unwrap();
+    assert_eq!(blocks[first + 1]["type"], "image");
+    assert_eq!(second, first + 2);
+    assert!(blocks[second + 1]["text"]
+        .as_str()
+        .unwrap()
+        .contains("durable.txt"));
+    let conversation = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({"agentId":agent}),
+    )
+    .await;
+    for needle in ["durable first group", GUEST_PREAMBLE] {
+        assert_eq!(
+            user_row_texts(&conversation)
+                .iter()
+                .filter(|t| t.starts_with(needle))
+                .count(),
+            1,
+            "retry does not append duplicate rows"
+        );
+    }
+    let evidence = json!({"beforeRestart":before,"afterRestart":after,"prompts":records,"conversation":conversation});
+    let artifact = data_dir.join("attachment-groups-restart.json");
+    std::fs::write(&artifact, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+    eprintln!(
+        "ATTACHMENT_GROUPS_RESTART_ARTIFACT {}\n{}",
+        artifact.display(),
+        evidence
+    );
+}
+
+/// A zero-output interrupt must carry the whole flushed batch, not only the
+/// transcript's last user row, ahead of the interrupt's own attachment group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interrupt_keeps_all_flushed_attachment_groups_over_wss() {
+    let Some(script) = gate("WSS grouped batch interrupt") else {
+        return;
+    };
+    let tmp = temp_data_dir();
+    let data_dir = tmp.path();
+    let (workspace_id, _) = seed_workspace_with_guest(data_dir).await;
+    let release = data_dir.join("release-group-start");
+    let batch_release = data_dir.join("release-group-batch");
+    let rule = json!({"ifPromptContains":"interrupt group first","releaseFile":batch_release});
+    let Booted {
+        daemon: _daemon,
+        port,
+        cfg,
+        prompt_log,
+    } = boot_daemon(data_dir, &script, 0, Some(&release), &[rule]).await;
+    let mut rpc = connect_ws(port, cfg).await;
+    let created = wss_rpc(&mut rpc, 1, "agent.create", json!({"workspaceId":workspace_id,"name":"Interrupted groups","provider":"mock","model":"default"})).await;
+    let agent = created["agent"]["id"].as_str().unwrap();
+    wss_rpc(
+        &mut rpc,
+        2,
+        "agent.sendMessage",
+        json!({"workspaceId":workspace_id,"agentId":agent,"content":KICKOFF_MSG}),
+    )
+    .await;
+    await_prompts(&prompt_log, 1).await;
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    for (i, text) in ["interrupt group first", "interrupt group second"]
+        .into_iter()
+        .enumerate()
+    {
+        wss_rpc(&mut rpc, 3 + i as i64, "agent.queueMessage", json!({"workspaceId":workspace_id,"agentId":agent,"content":text,"imageBlocks":[{"type":"image","data":png,"mimeType":"image/png"}]})).await;
+    }
+    std::fs::write(&release, "go").unwrap();
+    await_prompts(&prompt_log, 2).await;
+    wss_rpc(&mut rpc, 5, "agent.sendMessage", json!({"workspaceId":workspace_id,"agentId":agent,"content":"interrupt group urgent","priority":"interrupt","imageBlocks":[{"type":"image","data":png,"mimeType":"image/png"}]})).await;
+    await_prompts(&prompt_log, 3).await;
+    let log = std::fs::read_to_string(&prompt_log).unwrap();
+    let records: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let blocks = records[2]["blocks"].as_array().unwrap();
+    let mut previous = None;
+    for text in [
+        "interrupt group first",
+        "interrupt group second",
+        "interrupt group urgent",
+    ] {
+        let positions: Vec<_> = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b["text"].as_str().is_some_and(|t| t.contains(text)))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(positions.len(), 1, "each message exactly once: {records:?}");
+        let index = positions[0];
+        assert_eq!(blocks[index + 1]["type"], "image");
+        if let Some(prev) = previous {
+            assert!(prev < index);
+        }
+        previous = Some(index);
+    }
+    assert_eq!(blocks.iter().filter(|b| b["type"] == "image").count(), 3);
+    let artifact = data_dir.join("attachment-groups-interrupt.json");
+    std::fs::write(&artifact, serde_json::to_vec_pretty(&records).unwrap()).unwrap();
+    eprintln!(
+        "ATTACHMENT_GROUPS_INTERRUPT_ARTIFACT {}\n{}",
+        artifact.display(),
+        log
+    );
+    std::fs::write(&batch_release, "go").unwrap();
+}
