@@ -146,10 +146,12 @@ async fn discovery_context_catalog_cache_visibility_and_readiness() {
         &bin,
         format!(
             r#"#!/bin/sh
-if [ "$*" = "model list --json" ]; then
+if [ "$#" = 5 ] && [ "$1 $2 $3 $4" = "model list --json --mcp-config" ]; then
+  [ -f "$5" ] && [ "$(cat "$5")" = '{{"mcpServers":{{}}}}' ] || exit 1
   printf 'probe\n' >> '{}'
   printf '%s\n' '{{"models":[{{"shortName":"routing-model","displayName":"Routing model"}}]}}'
-elif [ "$*" = "model list" ]; then
+elif [ "$#" = 4 ] && [ "$1 $2 $3" = "model list --mcp-config" ]; then
+  [ -f "$4" ] && [ "$(cat "$4")" = '{{"mcpServers":{{}}}}' ] || exit 1
   printf '%s\n' 'Available models:' '  - Routing model [routing-model]'
 fi
 exit 0

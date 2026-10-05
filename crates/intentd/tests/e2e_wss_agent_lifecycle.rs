@@ -16,6 +16,12 @@ mod common;
 #[path = "e2e_wss_agent_lifecycle/creation_preferences.rs"]
 mod creation_preferences;
 
+#[path = "e2e_wss_agent_lifecycle/provider_policy.rs"]
+mod provider_policy;
+
+#[path = "e2e_wss_agent_lifecycle/skill_catalog.rs"]
+mod skill_catalog;
+
 #[path = "e2e_wss_agent_lifecycle/structured_notices.rs"]
 mod structured_notices;
 
@@ -17074,15 +17080,29 @@ async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
             1,
             "each launch must use the selected adapter exactly once: {argv:?}"
         );
+        let policy = &session["codexPolicy"];
+        assert_eq!(policy["pathPresent"], true);
+        assert_eq!(policy["codexPath"], json!(selected_cli));
+        assert_eq!(policy["config"]["agents"]["enabled"], false);
+        assert_eq!(policy["config"]["features"]["multi_agent_v2"], false);
+        assert!(policy["config"]["mcp_servers"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|s| s["enabled"] == true));
         assert_eq!(
-            session["codexPolicy"],
-            json!({
-                "config": {"agents": {"enabled": false}, "features": {"multi_agent_v2": false}},
-                "pathPresent": true,
-                "codexPath": selected_cli,
-            }),
-            "each launch must replace hostile runtime overrides with the selected installed CLI and enforce daemon policy: {session}"
+            session["mcpNames"],
+            json!([]),
+            "Codex receives MCP only via owned CODEX_CONFIG"
         );
+        assert_eq!(
+            policy["home"], entries[0]["codexPolicy"]["home"],
+            "restart keeps stable owned home"
+        );
+        assert!(policy["home"]
+            .as_str()
+            .unwrap()
+            .contains("provider-profiles-v1/session-"));
         let pid = session["pid"].as_u64().expect("mock child pid");
         if turn == 0 {
             first_pid = Some(pid);

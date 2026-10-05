@@ -6231,6 +6231,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_policy_hook_uses_owner_identity_and_reloads_live_policy() {
+        let (_tmp, root, base, ws, owner) = setup().await;
+        let store = base.store().clone();
+        let svc = Services::new_with_file_secrets(
+            store.clone(),
+            intent_core::FileSecretStore::with_path(root.path().join("secrets.json")),
+        )
+        .with_event_bus(EventBus::new(store))
+        .with_workspaces_root(root.path().to_owned());
+        let mut session = svc.store().get_agent_session(&owner).await.unwrap();
+        session.provider = Some("claude-code".into());
+        svc.store()
+            .update_agent_session(&ws, &session)
+            .await
+            .unwrap();
+        let file = root.path().join("policy.json");
+        std::fs::write(&file, "{}").unwrap();
+        svc.set_provider_policy_sources(
+            "claude-code",
+            vec![crate::provider_profiles::PolicySource::ClaudeSettings(file)],
+        );
+        let code = "await ws.mcp.listServers(); return {dispatch:true,message:'policy checked'};";
+        let input = json!({"name":"policy hook", "code":code,"delayMs":10000});
+        let first = svc.hook_schedule_op(&ws, &owner, &input).await.unwrap();
+        assert_eq!(first["dispatched"], true);
+        svc.set_provider_policy_sources(
+            "claude-code",
+            vec![crate::provider_profiles::PolicySource::Unavailable],
+        );
+        let error = svc.hook_schedule_op(&ws, &owner, &input).await.unwrap_err();
+        assert!(error.to_string().contains("policy"), "{error}");
+    }
+
+    #[tokio::test]
     async fn hook_scripts_reach_ws_bindings() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
         // The script calls a real `ws.*` binding (workspace details) during
