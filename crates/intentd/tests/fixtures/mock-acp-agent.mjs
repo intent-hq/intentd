@@ -1119,6 +1119,19 @@ async function dispatch(msg) {
       });
     }
     case 'session/prompt':
+      // Test-owned receipt barrier: turnInFlight can be true before this child
+      // records the prompt. Hold only the selected current prompt, so replayed
+      // history in a fresh child's follow-up cannot accidentally re-enter it.
+      if (behavior.promptReceiptGate &&
+          extractPromptText(msg.params).trimEnd().endsWith(behavior.promptReceiptGate.suffix)) {
+        const gate = behavior.promptReceiptGate;
+        fs.writeFileSync(gate.enteredFile, String(process.pid));
+        const deadline = Date.now() + 5000;
+        while (!fs.existsSync(gate.releaseFile)) {
+          if (Date.now() >= deadline) throw new Error('prompt receipt gate was not released');
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
       return handlePrompt(msg.id, msg.params);
     case 'session/cancel':
       // STAB-124: echo the abort for any tool call parked by `parkMidToolCall`
