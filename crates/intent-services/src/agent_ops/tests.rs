@@ -5852,6 +5852,119 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
     assert!(v["lastActivity"].is_string());
 }
 
+/// The seq-0 chat snapshot needs activity metadata, never persisted history.
+#[tokio::test]
+async fn snapshot_activity_flags_do_not_read_transcript() {
+    use crate::test_tracing::{capture_sqlx_queries, warm_sqlx_pool};
+
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Snapshot").await;
+    svc.set_test_busy(&id, true);
+    warm_sqlx_pool(svc.store().read_pool()).await;
+
+    for history_size in [0, 32] {
+        for _ in 0..history_size {
+            svc.store()
+                .append_agent_message(
+                    &id,
+                    "assistant",
+                    &json!([{"type": "text", "text": "persisted history"}]),
+                    &now_iso(),
+                )
+                .await
+                .unwrap();
+        }
+        let (flags, queries) = capture_sqlx_queries(svc.agent_activity_flags(id.clone())).await;
+        assert_eq!(
+            flags,
+            json!({
+                "isResponding": true,
+                "isWaitingOnTool": false,
+                "isWaitingForOtherAgents": false,
+                "waitingForAgentIds": [],
+                "turnInFlight": false,
+                "lastStreamActivityAt": null,
+            })
+        );
+        assert_eq!(
+            queries.len(),
+            1,
+            "metadata-only read with {history_size} messages: {queries:?}"
+        );
+        assert!(
+            queries[0].sql.contains("FROM agent_session WHERE"),
+            "{queries:?}"
+        );
+        assert_eq!(queries[0].rows_returned, 1, "{queries:?}");
+    }
+}
+
+#[tokio::test]
+async fn snapshot_activity_flags_preserve_activity_and_liveness() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let idle = json!({
+        "isResponding": false,
+        "isWaitingOnTool": false,
+        "isWaitingForOtherAgents": false,
+        "waitingForAgentIds": [],
+        "turnInFlight": false,
+        "lastStreamActivityAt": null,
+    });
+    assert_eq!(svc.agent_activity_flags(id.clone()).await, idle);
+    assert_eq!(svc.agent_activity_flags(AgentId::new()).await, idle);
+
+    // Duplicate child watches retain one id, and tool waits require a worker.
+    for _ in 0..2 {
+        svc.register_completion_watch(&ws, &ws, id.clone(), "Parent".into(), child.clone(), None)
+            .unwrap();
+    }
+    let tool = json!({"type": "tool_use", "id": "msg:0", "name": "read_file",
+        "input": {}, "toolCallId": "call-1"});
+    svc.set_live_turn(&id, "msg", vec![tool.clone()]);
+    let mut expected = idle.clone();
+    expected["isWaitingForOtherAgents"] = json!(true);
+    expected["waitingForAgentIds"] = json!([child]);
+    assert_eq!(svc.agent_activity_flags(id.clone()).await, expected);
+
+    svc.set_test_busy(&id, true);
+    expected["isResponding"] = json!(true);
+    expected["isWaitingOnTool"] = json!(true);
+    expected["turnInFlight"] = json!(true);
+    expected["lastStreamActivityAt"] = json!(svc.live_turn_activity_at(&id).unwrap());
+    assert_eq!(svc.agent_activity_flags(id.clone()).await, expected);
+
+    svc.set_live_turn(
+        &id,
+        "msg",
+        vec![
+            tool,
+            json!({"type": "tool_result",
+        "id": "msg:1", "tool_use_id": "call-1", "output": "ok", "is_error": false}),
+        ],
+    );
+    expected["isWaitingOnTool"] = json!(false);
+    expected["lastStreamActivityAt"] = json!(svc.live_turn_activity_at(&id).unwrap());
+    assert_eq!(svc.agent_activity_flags(id.clone()).await, expected);
+
+    // Terminal status suppresses even a busy worker, live slot, and child wait.
+    for status in [
+        AgentStatus::Completed,
+        AgentStatus::Error,
+        AgentStatus::Deleted,
+    ] {
+        svc.store()
+            .set_agent_session_status(&ws, &id, status, false, &now_iso(), None)
+            .await
+            .unwrap();
+        assert_eq!(svc.agent_activity_flags(id.clone()).await, idle);
+    }
+    // A failed metadata read keeps the subscription's all-false fallback.
+    svc.store().read_pool().close().await;
+    assert_eq!(svc.agent_activity_flags(id).await, idle);
+}
+
 #[tokio::test]
 async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
     let (_t, svc, ws) = setup().await;
@@ -20501,6 +20614,38 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
     );
     let text = result["text"].as_str().expect("text");
     assert!(text.contains("stale-queue-entry"), "text: {text}");
+
+    // Recipient reads retain content-free warnings in both representations.
+    let before = svc.queue_snapshot(&target);
+    for filter in [None, Some(target.clone())] {
+        let own = intent_core::with_caller(
+            intent_core::Caller::Agent {
+                agent_id: target.clone(),
+            },
+            svc.agent_diagnostics_op(ws.clone(), filter, None, None),
+        )
+        .await
+        .expect("recipient diagnostics");
+        let queue = &own["diagnostics"]["queues"][0];
+        assert_eq!(queue["queueLength"], 2);
+        assert_eq!(queue["entries"], json!([]));
+        let own_risk = own["diagnostics"]["stuckRisks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["type"] == "stale-queue-entry")
+            .expect("recipient retains stale-queue-entry warning");
+        assert_eq!(own_risk["entryId"], entry_id);
+        assert_eq!(own_risk["count"], 1);
+        assert!(own["text"].as_str().unwrap().contains("stale-queue-entry"));
+        assert!(own["text"].as_str().unwrap().contains("contents hidden"));
+        assert!(!own.to_string().contains("\"content\""));
+    }
+    assert_eq!(
+        svc.queue_snapshot(&target),
+        before,
+        "diagnostics does not consume"
+    );
 
     // An actively-responding (non-stale) agent legitimately holds its queue
     // until the turn ends: no risk even with the old entry.

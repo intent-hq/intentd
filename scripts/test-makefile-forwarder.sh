@@ -39,10 +39,12 @@ done
 # "<target> RESUME=<v> BASE=<v> GATE_FORCE=<v>" to ROOT_LOG and exits with
 # ROOT_EXIT (both read from the environment; default success).
 root_log="$temp_dir/root.log"
-export ROOT_LOG="$root_log"
+root_goals_log="$temp_dir/root-goals.log"
+export ROOT_LOG="$root_log" ROOT_GOALS_LOG="$root_goals_log"
 write_stub_root() {
   cat >"$1/Makefile" <<MK
 ROOT_EXIT ?= 0
+\$(shell printf '%s\\n' '\$(MAKECMDGOALS)' >>"\$(ROOT_GOALS_LOG)")
 .PHONY: $targets
 $targets:
 	@printf '%s\\n' '\$@ RESUME=\$(RESUME) BASE=\$(BASE) GATE_FORCE=\$(GATE_FORCE)' >>"\$(ROOT_LOG)"
@@ -76,6 +78,7 @@ run_make() {
   local dir=$1
   shift
   : >"$root_log"
+  : >"$root_goals_log"
   set +e
   (cd "$dir" && "$make_bin" "$@") >"$temp_dir/stdout" 2>"$temp_dir/stderr"
   status=$?
@@ -83,6 +86,7 @@ run_make() {
   stdout=$(<"$temp_dir/stdout")
   stderr=$(<"$temp_dir/stderr")
   log=$(<"$root_log")
+  goals_log=$(<"$root_goals_log")
 }
 
 expect_status() {
@@ -148,6 +152,25 @@ run_make "$monorepo/packages/intentd"
 expect_status 0
 expect_log ""
 [[ "$stdout" == *"Targets:"* ]] || fail "$case_name: help text missing from stdout: $stdout"
+
+# (7) Mixed goals share one root invocation, in caller order, even under -j.
+# Root prerequisites can then order all goals before any compilation starts.
+for goals in 'gate check' 'check gate'; do
+  for parallel in '' '-j4'; do
+    case_name="combined $goals $parallel"
+    # Intentional splitting of this fixed list into make goals and flags.
+    # shellcheck disable=SC2086
+    run_make "$monorepo/packages/intentd" $goals $parallel RESUME=1 BASE=abc GATE_FORCE=1
+    expect_status 0
+    [[ "$goals_log" == "$goals" ]] || fail "$case_name: root invocations: $goals_log"
+    [[ $(printf '%s\n' "$log" | sort) == $'check RESUME=1 BASE=abc GATE_FORCE=1\ngate RESUME=1 BASE=abc GATE_FORCE=1' ]] || fail "$case_name: duplicate or missing goals: $log"
+  done
+done
+
+case_name="combined failure propagates without retrying"
+ROOT_EXIT=3 run_make "$monorepo/packages/intentd" -k -j4 gate check
+expect_status 2
+[[ "$goals_log" == 'gate check' ]] || fail "$case_name: root invocations: $goals_log"
 
 bash -n "${BASH_SOURCE[0]}" || fail "test-makefile-forwarder.sh does not parse"
 echo "makefile-forwarder tests passed"

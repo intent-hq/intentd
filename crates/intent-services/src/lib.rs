@@ -30131,12 +30131,13 @@ impl WorkspaceApi for Services {
 
     fn agent_activity_flags(&self, agent_id: AgentId) -> BoxFuture<'_, serde_json::Value> {
         Box::pin(async move {
-            // Load the session so the flags honor the same terminal-status
+            // Load only session metadata: activity and liveness do not need
+            // the transcript or its externalized payloads. Honor the same terminal-status
             // short-circuit and parent-watch lookup as the `AgentLite`
             // projection (see [`agent_activity_flags_for`]). On a read error the
             // snapshot degrades to all-`false` rather than failing the
             // subscription (matching `chat_snapshot`'s degrade-to-empty pattern).
-            match self.store.get_agent_session(&agent_id).await {
+            match self.store.get_agent_session_summary(&agent_id).await {
                 Ok(session) => {
                     let (
                         is_responding,

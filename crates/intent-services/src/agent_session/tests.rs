@@ -1403,6 +1403,78 @@ fn replay_tool() -> IncomingNotification {
     }
 }
 
+#[tokio::test]
+async fn structured_notices_survive_resume_replay_drain() {
+    use std::future::{poll_fn, Future};
+    use std::io::{Read, Seek};
+    use std::task::Poll;
+
+    let (_tmp, _services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut log = tempfile::tempfile().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(log.try_clone().unwrap())
+        .finish();
+    let _capture = crate::test_tracing::set_capture_default(subscriber);
+    let notice = |title: &str| {
+        tool_call_notification(&json!({
+            "sessionUpdate": "notice", "severity": "warning", "title": title,
+            "description": "Live diagnostic during replay"
+        }))
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tx.send(notice("Buffered notice")).unwrap();
+    tx.send(replay_chunk("Old assistant reply")).unwrap();
+    let mut drain = Box::pin(Services::drain_replay_notifications(
+        &mut rx,
+        &agent_id,
+        Some(&workspace_id),
+    ));
+    // Poll through the already-buffered burst and into the settle-window recv,
+    // then send a straggler without a timing-based sleep.
+    poll_fn(|cx| {
+        assert!(drain.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tx.send(notice("Settle-window notice")).unwrap();
+    tx.send(replay_tool()).unwrap();
+    drop(tx);
+    drain.await;
+    assert!(rx.try_recv().is_err());
+    assert!(timeout(Duration::from_millis(50), sub.recv())
+        .await
+        .is_err());
+    assert!(bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap()
+        .is_empty());
+    log.rewind().unwrap();
+    let mut diagnostics = String::new();
+    log.read_to_string(&mut diagnostics).unwrap();
+    for title in ["Buffered notice", "Settle-window notice"] {
+        let line = diagnostics
+            .lines()
+            .find(|line| line.contains(title))
+            .expect("notice logged");
+        for expected in [
+            "WARN",
+            "warning",
+            "Live diagnostic during replay",
+            ACP_SID,
+            agent_id.as_str(),
+            workspace_id.as_str(),
+        ] {
+            assert!(line.contains(expected), "missing {expected}: {line}");
+        }
+    }
+    assert!(!diagnostics.contains("Old assistant reply"));
+}
+
 /// The `session/load` replay burst buffered in the handle's channel is discarded
 /// (no events published, transcript untouched), while a subsequent real turn
 /// still streams its updates and accumulates the assistant message.
@@ -1425,7 +1497,7 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
     // The bounded drain empties the burst and cannot hang.
     timeout(
         Duration::from_secs(2),
-        Services::drain_replay_notifications(&mut replay_rx),
+        Services::drain_replay_notifications(&mut replay_rx, &agent_id, Some(&workspace_id)),
     )
     .await
     .expect("drain settles within the cap");
@@ -2431,6 +2503,32 @@ fn tool_call_notification(update: &Value) -> IncomingNotification {
         method: "session/update".to_string(),
         params: json!({ "sessionId": ACP_SID, "update": update }),
     }
+}
+
+#[tokio::test]
+async fn structured_notices_do_not_count_as_output_or_block_silent_redrive() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("notice-turn".into());
+    for severity in ["info", "warning", "error", "_future"] {
+        let update = tool_call_notification(&json!({
+            "sessionUpdate": "notice", "severity": severity,
+            "title": "Runtime diagnostic", "description": "Provider detail"
+        }));
+        assert!(
+            !services
+                .route_notification(&update, &agent_id, &workspace_id, &mut transcript)
+                .await
+        );
+    }
+    assert!(transcript.blocks.is_empty());
+    assert!(transcript.text_block_strings().is_empty());
+    assert!(
+        timeout(Duration::from_millis(50), sub.recv())
+            .await
+            .is_err(),
+        "no chat or activity events"
+    );
 }
 
 /// A binding can successfully create a proposal before its enclosing JS
