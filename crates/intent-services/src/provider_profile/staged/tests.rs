@@ -397,3 +397,66 @@ fn unsupported_policy_and_auth_are_explicit_preselection_deferrals() {
     r.policy.additional = &sources;
     assert_eq!(deferred(r), DeferredReason::PolicyAcquisition);
 }
+
+#[test]
+fn native_origin_url_denials_never_admit_descendant_paths() {
+    let root = scratch();
+    std::fs::create_dir(root.path().join("claude-code")).unwrap();
+    std::fs::write(
+        root.path().join("claude-code/managed-settings.json"),
+        r#"{"deniedMcpServers":[{"serverUrl":"http://fixture.invalid"}]}"#,
+    )
+    .unwrap();
+    let auth = AuthModelContext::default();
+    for transport in ["http", "sse"] {
+        let servers = intent_acp::normalize_mcp_servers(
+            &json!({"approved":{"type":transport,"url":"http://fixture.invalid/good"}}),
+        );
+        if let ProfileSelection::Managed(plan) =
+            select(request("claude-code", root.path(), &auth, &servers))
+        {
+            assert!(
+                plan.build(ProfileDirectory::ephemeral(root.path()).unwrap())
+                    .is_err(),
+                "native origin denial admitted {transport}"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_auth_helpers_and_cloud_routes_defer_without_execution() {
+    let root = scratch();
+    let servers = BTreeMap::new();
+    for helper in [
+        "apiKeyHelper",
+        "awsAuthRefresh",
+        "awsCredentialExport",
+        "gcpAuthRefresh",
+    ] {
+        let mut settings = json!({});
+        settings[helper] = json!("fixture-do-not-execute");
+        let auth = AuthModelContext {
+            claude_settings: Some(settings),
+            ..Default::default()
+        };
+        assert_eq!(
+            deferred(request("claude-code", root.path(), &auth, &servers)),
+            DeferredReason::AuthProjection
+        );
+    }
+    for flag in [
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+    ] {
+        let auth = AuthModelContext {
+            credential_environment: BTreeMap::from([(flag.into(), "1".into())]),
+            ..Default::default()
+        };
+        assert_eq!(
+            deferred(request("claude-code", root.path(), &auth, &servers)),
+            DeferredReason::AuthProjection
+        );
+    }
+}
