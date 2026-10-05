@@ -43,6 +43,7 @@ pub mod note_receipt_detail;
 pub mod note_source_session;
 pub mod note_stage;
 pub mod note_stage_read;
+pub mod note_stage_rendered;
 pub mod note_stage_search;
 pub mod note_stage_selection_markdown;
 pub mod path_utils;

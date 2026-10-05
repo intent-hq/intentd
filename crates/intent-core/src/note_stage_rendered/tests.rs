@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+use std::fmt::Write as _;
 
 struct Fixture {
     header: NoteStageHeader,
@@ -16,8 +17,10 @@ struct Fixture {
 fn hash(text: &str) -> String {
     Sha256::digest(text.as_bytes())
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to a String");
+            output
+        })
 }
 fn range(start: u64, end: u64) -> NoteStageRecord {
     serde_json::from_value(json!({"kind":"range","ordinal":0,"start":start,"end":end,"anchorAffinity":"after","headAffinity":"before","direction":"forward"})).unwrap()
