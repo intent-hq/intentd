@@ -879,6 +879,16 @@ impl SettingsRegistry {
                 "prepared config snapshot changed before publication".into(),
             ));
         }
+        // The watcher's startup catch-up can reread the exact current file.
+        // Keep its snapshot identity: publishing a replacement would retire
+        // admitted repository replies even though nothing changed. Validate
+        // the original snapshot first so stale reloads cannot bypass pins/ABA.
+        if prepared.candidate.source_text == inner.source_text {
+            return Ok(SettingsChanged {
+                generation: inner.generation,
+                changed: BTreeSet::new(),
+            });
+        }
         self.before_repository_publication(&prepared.snapshot, write, None)?;
         *inner = prepared.candidate;
         self.repository_published(&prepared.snapshot);
@@ -2210,6 +2220,71 @@ mod tests {
         );
         assert!(rx.has_changed().expect("sender alive"));
         assert_eq!(*rx.borrow_and_update(), notice);
+    }
+
+    #[test]
+    fn unchanged_reload_preserves_original_snapshot_and_self_write_history() {
+        let seed = "[git]\nautoCommit = true\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        for self_written in [false, true] {
+            if self_written {
+                reg.apply(&set("git.autoCommit", json!(false))).unwrap();
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let original = reg.snapshot();
+            let generation = reg.generation();
+            let stamp = reg.write_stamp();
+            let notices = reg.subscribe();
+            let notice = reg.reload(&text).unwrap();
+            assert!(notice.changed.is_empty());
+            assert_eq!(notice.generation, generation);
+            assert!(reg.with_original_snapshot(&original, |current| current));
+            assert_eq!(reg.write_stamp(), stamp);
+            assert!(!notices.has_changed().unwrap());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn unchanged_reload_still_rejects_superseded_preparation() {
+        let seed = "[server.wsApi]\nport = 6000\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let original = reg.snapshot();
+        let prepared = reg.prepare_repository_reload(seed).unwrap();
+        // Pins leave source_text unchanged but must invalidate the old candidate.
+        reg.pin("server.wsApi.port", json!(7000), "INTENTD_TCP_PORT")
+            .unwrap();
+        let current = reg.snapshot();
+        assert!(reg.publish_repository_reload(prepared, None).is_err());
+        assert!(reg.prepare_repository_reload_at(seed, original).is_err());
+        assert!(reg.with_original_snapshot(&current, |valid| valid));
+        assert_eq!(reg.get("server.wsApi.port"), Some(json!(7000)));
+        assert!(reg.reload(seed).unwrap().changed.is_empty());
+        assert!(reg.with_original_snapshot(&current, |valid| valid));
+        assert_eq!(reg.get("server.wsApi.port"), Some(json!(7000)));
+    }
+
+    #[test]
+    fn changed_reload_and_restoration_never_revive_original_snapshot() {
+        let seed = "[git]\nautoCommit = true\n";
+        for edited in [
+            "[git]\nautoCommit = false\n",
+            "# edited\n[git]\nautoCommit = true\n",
+        ] {
+            let (_dir, path) = temp_config(Some(seed));
+            let reg = SettingsRegistry::load(&path).unwrap();
+            let original = reg.snapshot();
+            let prepared = reg.prepare_repository_reload(seed).unwrap();
+            reg.reload(edited).unwrap();
+            assert!(!reg.with_original_snapshot(&original, |current| current));
+            reg.reload(seed).unwrap();
+            assert!(!reg.with_original_snapshot(&original, |current| current));
+            // Restoring the exact bytes cannot authorize a pre-edit candidate.
+            assert!(reg.publish_repository_reload(prepared, None).is_err());
+            assert_eq!(reg.get("git.autoCommit"), Some(json!(true)));
+        }
     }
 
     #[test]
