@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct CheckoutCaptureQuery {
     pub provider: String,
     pub instance_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_owner_avatar: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +106,8 @@ pub struct CheckoutProject {
     pub clone_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_avatar_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -17,6 +17,10 @@ pub use intent_core::RepoRef;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Repo {
+    /// Validated owning-namespace image for explicitly negotiated checkout output.
+    /// This metadata must not extend the unrelated legacy repository browse wire.
+    #[serde(skip)]
+    pub owner_avatar_url: Option<String>,
     pub owner: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]

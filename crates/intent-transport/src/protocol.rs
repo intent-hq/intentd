@@ -734,7 +734,9 @@ use std::time::{Duration, Instant};
 // private checkout. Clients require gitlabCheckout: 1 before using it.
 // Version 13.6 adds best-effort host.prepareProviderAdapters. Acknowledgement
 // promises admission only; clients tolerate -32601 on older daemons.
-pub const PROTOCOL_VERSION: &str = "13.6";
+// Version 13.7 adds capability-gated checkout owner-avatar opt-in.
+// Numeric versions do not replace the original connection capability.
+pub const PROTOCOL_VERSION: &str = "13.7";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
