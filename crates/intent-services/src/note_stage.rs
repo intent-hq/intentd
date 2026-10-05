@@ -418,3 +418,6 @@ mod boundary_tests;
 
 #[cfg(test)]
 mod commit_tests;
+
+#[cfg(test)]
+mod phantom_commit_tests;
