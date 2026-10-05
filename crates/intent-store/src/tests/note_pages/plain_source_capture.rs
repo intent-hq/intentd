@@ -99,3 +99,92 @@ async fn indexed_plain_paragraph_capture_preserves_actual_lexical_resources() {
         }
     }
 }
+
+#[tokio::test]
+async fn indexed_plain_ab_capture_retains_original_source_context_closure() {
+    use std::collections::BTreeSet;
+    use std::io::Write as _;
+
+    let (store, _temporary, note) = setup("ab").await;
+    let captured_at_ms = intent_core::now_epoch_ms();
+    let mut calls = Vec::new();
+    let first = super::record_page(
+        &store,
+        json!({"kind":"source","at":0,"maxSourceBytes":4096,"maxWireBytes":8192,"maxItems":64}),
+        &mut calls,
+    )
+    .await;
+    assert_eq!(first["text"], "ab");
+    assert_eq!(first["sourceLength"], 2);
+    assert_eq!(first["range"], json!({"start":0,"end":2}));
+    assert_eq!(first.get("nextCursor"), Some(&serde_json::Value::Null));
+    let mut pending = vec![(
+        "context".to_owned(),
+        first["contextRef"].as_str().unwrap().to_owned(),
+    )];
+    let mut seen = BTreeSet::new();
+    while let Some((kind, reference)) = pending.pop() {
+        if !seen.insert(reference.clone()) {
+            continue;
+        }
+        assert!(seen.len() <= 16, "small lexical fixture closure");
+        let mut request =
+            json!({"kind":kind,"maxSourceBytes":4096,"maxWireBytes":8192,"maxItems":64});
+        request[if kind == "metadata" {
+            "ref"
+        } else {
+            "contextRef"
+        }] = json!(reference);
+        // This two-character source has no paginated resource directory.
+        let response = super::record_page(&store, request, &mut calls).await;
+        assert_eq!(response.get("nextCursor"), Some(&serde_json::Value::Null));
+        super::resource_refs(&response["items"], &mut pending);
+    }
+    assert!(calls.len() > 2);
+    let mut paragraphs = BTreeSet::new();
+    for call in &calls {
+        let response = &call["response"];
+        for field in ["scope", "sourceRevision", "snapshotId", "expiresAt"] {
+            assert_eq!(response[field], first[field]);
+        }
+        assert_eq!(call["request"]["maxSourceBytes"], 4096);
+        assert_eq!(call["request"]["maxWireBytes"], 8192);
+        assert_eq!(call["request"]["maxItems"], 64);
+        for item in response["items"].as_array().into_iter().flatten() {
+            if item["kind"] == "boundary" && item["construct"] == "paragraph" {
+                assert_eq!(item["sourceRange"], json!({"start":0,"end":2}));
+                assert_eq!(item["entryPath"], "markdown");
+                assert!(seen.contains(item["detailRef"].as_str().unwrap()));
+                paragraphs.insert(item["id"].as_str().unwrap());
+            }
+        }
+    }
+    assert_eq!(paragraphs.len(), 1);
+    assert_eq!(
+        store
+            .get_note(&note.workspace_id, &note.id)
+            .await
+            .unwrap()
+            .content,
+        "ab"
+    );
+    let expiry = intent_core::parse_iso(first["expiresAt"].as_str().unwrap()).unwrap();
+    assert!(expiry.unix_timestamp_nanos() / 1_000_000 > i128::from(captured_at_ms));
+    if let Ok(directory) = std::env::var("NOTE_PAGE_TRANSCRIPT_DIR") {
+        let output = std::path::Path::new(&directory).join("plain-paragraph-ab.json");
+        let artifact = json!({
+            "backendHead":std::env::var("NOTE_PAGE_CAPTURE_HEAD").unwrap(),
+            "capturedAtMs":captured_at_ms,"source":"ab","at":0,
+            "workspaceId":"pages","noteId":"spec","principal":"alice","rpcId":1,
+            "calls":calls,
+            "claim":"original Store lexical source/context/detail closure for local recorded-clock replay; not native capture or staged mutation authority"
+        });
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output)
+            .unwrap()
+            .write_all(&serde_json::to_vec_pretty(&artifact).unwrap())
+            .unwrap();
+    }
+}
