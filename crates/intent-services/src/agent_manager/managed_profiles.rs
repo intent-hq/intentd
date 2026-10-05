@@ -9,6 +9,7 @@ use crate::provider_profile::{
     acquisition::LaunchInputs,
     ManagedProviderProfile, ProfileDirectory, ProfileIdentity, ProfilePurpose,
 };
+use crate::rules::managed_claude::WorkspaceInstructions;
 use crate::spawned_provider_catalog::{
     resolve_project_catalog, CatalogInputs, CatalogPurpose, CatalogSnapshot, ExecutionOptions,
     ExplicitServer,
@@ -21,11 +22,13 @@ pub(super) struct SessionProfile {
     pub profile: ManagedProviderProfile,
     acquired: Box<AcquiredAcpProfile>,
     catalog_fingerprint: String,
+    instructions: WorkspaceInstructions,
 }
 
 pub(super) struct Plan {
     acquired: Box<AcquiredAcpProfile>,
     catalog: CatalogSnapshot,
+    instructions: WorkspaceInstructions,
     parent: PathBuf,
     workspace: String,
     agent: String,
@@ -49,12 +52,17 @@ fn deferred(provider: &str, reason: &'static str, was_managed: bool) -> Result<O
 }
 
 impl Plan {
+    pub fn instructions(&self) -> &WorkspaceInstructions {
+        &self.instructions
+    }
+
     pub fn skill_catalog(&self) -> String {
         crate::skills::build_skills_catalog(&self.catalog.skills.skills)
     }
 
     pub fn matches(&self, previous: &SessionProfile) -> bool {
-        self.catalog.fingerprint == previous.catalog_fingerprint
+        self.instructions == previous.instructions
+            && self.catalog.fingerprint == previous.catalog_fingerprint
             && self.acquired.same_configuration(&previous.acquired)
     }
 
@@ -64,6 +72,14 @@ impl Plan {
         instructions: &str,
         servers: &NormalizedMcpServers,
     ) -> Result<(intent_acp::spawn::PreparedProvider, Arc<SessionProfile>)> {
+        let cwd = self.acquired.workspace().to_owned();
+        let current = tokio::task::spawn_blocking(move || WorkspaceInstructions::capture(&cwd))
+            .await
+            .map_err(|_| failure())?
+            .map_err(|()| failure())?;
+        if current != self.instructions {
+            return Err(failure());
+        }
         let parent = self.parent.clone();
         let workspace = self.workspace.clone();
         let agent = self.agent.clone();
@@ -108,6 +124,7 @@ impl Plan {
                 profile,
                 acquired: self.acquired,
                 catalog_fingerprint: self.catalog.fingerprint,
+                instructions: self.instructions,
             }),
         ))
     }
@@ -202,13 +219,26 @@ impl AgentManager {
             AcpAcquisition::Deferred(reason) => {
                 deferred(provider, reason.explanation(), was_managed)
             }
-            AcpAcquisition::Ready(acquired) => Ok(Some(Plan {
-                acquired,
-                catalog,
-                parent,
-                workspace: session.workspace_id.0.clone(),
-                agent: session.id.0.clone(),
-            })),
+            AcpAcquisition::Ready(acquired) => {
+                let cwd = acquired.workspace().to_owned();
+                let Ok(Ok(instructions)) =
+                    tokio::task::spawn_blocking(move || WorkspaceInstructions::capture(&cwd)).await
+                else {
+                    return deferred(
+                        provider,
+                        "workspace instruction scope or imports require native loading",
+                        was_managed,
+                    );
+                };
+                Ok(Some(Plan {
+                    acquired,
+                    catalog,
+                    instructions,
+                    parent,
+                    workspace: session.workspace_id.0.clone(),
+                    agent: session.id.0.clone(),
+                }))
+            }
         }
     }
 

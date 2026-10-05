@@ -3444,6 +3444,7 @@ impl AgentManager {
                 Some(&session),
                 workspace_api_docs.as_deref(),
                 owned_skills.as_deref(),
+                managed_plan.as_ref().map(managed_profiles::Plan::instructions),
             )
             .await
             {
@@ -11098,44 +11099,8 @@ async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) -> bool {
     confirm_tree_exit(&mut child, pgid, &descendants, KILL_SWEEP_REAP_GRACE).await
 }
 
-/// Observe the existing sweep's completion under one fixed deadline. These
-/// probes never signal: a recycled pid/group can only cause conservative
-/// retention of the launch directory, never kill an unrelated process.
 #[cfg(unix)]
-async fn confirm_tree_exit(
-    child: &mut Child,
-    pgid: nix::unistd::Pid,
-    descendants: &[i32],
-    grace: Duration,
-) -> bool {
-    use nix::errno::Errno;
-    use nix::sys::signal::{kill, killpg};
-    use nix::unistd::Pid;
-
-    let deadline = tokio::time::Instant::now() + grace;
-    if !matches!(
-        tokio::time::timeout_at(deadline, child.wait()).await,
-        Ok(Ok(_))
-    ) {
-        return false;
-    }
-    loop {
-        if killpg(pgid, None) == Err(Errno::ESRCH)
-            && descendants
-                .iter()
-                .all(|&pid| pid > 1 && kill(Pid::from_raw(pid), None) == Err(Errno::ESRCH))
-        {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep_until(
-            deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
-        )
-        .await;
-    }
-}
+use intent_acp::descendant_sweep::confirm_tree_exit;
 
 /// Non-unix fallback: no process groups, so fall back to killing the direct
 /// child (`kill_on_drop` remains the safety net on drop).

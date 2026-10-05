@@ -49,6 +49,15 @@ await write(path.join(home, '.claude.json'), JSON.stringify({ mcpServers: { host
 await write(path.join(cwd, '.mcp.json'), JSON.stringify({ mcpServers: { ambient: mcp('ambient') } }));
 await write(path.join(cwd, '.claude/skills/ambient/SKILL.md'), '---\nname: ambient\ndescription: AMBIENT-SKILL-MARKER\n---\nNever load.');
 await write(path.join(home, '.claude/skills/host/SKILL.md'), '---\nname: host\ndescription: HOST-SKILL-MARKER\n---\nNever load.');
+await write(path.join(root, 'CLAUDE.md'), 'ANCESTOR-INSTRUCTIONS-SENTINEL');
+await write(path.join(cwd, 'CLAUDE.md'), 'ROOT-INSTRUCTIONS-SENTINEL\n@docs/instructions.md');
+await write(path.join(cwd, '.claude/CLAUDE.md'), 'PROJECT-CLAUDE-INSTRUCTIONS-SENTINEL\n@../docs/instructions.md\n`@../docs/ignored.md`');
+await write(path.join(cwd, 'CLAUDE.local.md'), 'LOCAL-INSTRUCTIONS-SENTINEL');
+await write(path.join(cwd, 'docs/instructions.md'), 'IMPORTED-INSTRUCTIONS-SENTINEL\n@nested.md');
+await write(path.join(cwd, 'docs/nested.md'), 'NESTED-INSTRUCTIONS-SENTINEL\n@instructions.md');
+await write(path.join(cwd, 'docs/ignored.md'), 'CODE-IMPORT-MUST-NOT-LOAD');
+await write(path.join(cwd, '.claude/rules/tests.md'), 'RULES-INSTRUCTIONS-SENTINEL');
+const instructionMarkers = ['ANCESTOR','ROOT','PROJECT-CLAUDE','LOCAL','IMPORTED','NESTED','RULES'].map(s=>s+'-INSTRUCTIONS-SENTINEL');
 await write(path.join(cwd, 'approved.json'), JSON.stringify({ approved: mcp('approved'), 'workspace-mcp': mcp('bridge') }));
 const seen = [];
 let shouldCallTool = false;
@@ -167,6 +176,8 @@ async function managerFixture() {
       turns.push(body);
       assert(tools.some(t=>t.startsWith('mcp__workspace-mcp__')));
       assert(JSON.stringify(body.system).includes('AMBIENT-SKILL-MARKER'));
+      for (const marker of instructionMarkers) assert.equal(JSON.stringify(body.system).split(marker).length-1, 1, `managed new/load must preserve ${marker} once`);
+      assert(!JSON.stringify(body.system).includes('CODE-IMPORT-MUST-NOT-LOAD'));
     }
   }
   assert.equal(turns.length,2,'both actual conversation turns must reach the model');
@@ -216,6 +227,23 @@ try {
   await held.release(); held = null;
   console.log('PASS acquired executable cannot fall back to SDK bundled runtime');
   await managerFixture();
+  // Control arm: prove these ordinary sources reach the same pinned native
+  // runtime with its original source discovery, using synthetic auth only.
+  held = await acquired(true);
+  active = await adapter(held.launch);
+  await active.call('initialize', {protocolVersion:1,clientInfo:{name:'instructions-control',version:'1'},clientCapabilities:{}});
+  const nativeMeta = structuredClone(held.launch.meta);
+  nativeMeta.systemPrompt = 'EXISTING-INTERACTIVE-SYSTEM-PROMPT';
+  nativeMeta.claudeCode.options.settingSources = ['user','project','local'];
+  const nativeSession = (await active.call('session/new', {cwd,mcpServers:[],_meta:nativeMeta})).sessionId;
+  const beforeNative = seen.length;
+  await active.call('session/prompt', {sessionId:nativeSession,prompt:[{type:'text',text:'INSTRUCTION-CONTROL-TURN'}]});
+  const nativeInput = JSON.stringify(seen.slice(beforeNative));
+  for (const marker of instructionMarkers) assert(nativeInput.includes(marker), `native baseline must load ${marker}`);
+  assert(!nativeInput.includes('CODE-IMPORT-MUST-NOT-LOAD'));
+  await active.stop(); active = null;
+  await held.release(); held = null;
+  console.log('PASS managed new/load instruction sources match pinned native baseline');
   console.log('PASS acquired ACP new/load/respawn and ephemeral inventory');
 } finally {
   if (active) await active.stop();

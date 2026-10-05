@@ -8,6 +8,8 @@
 //! start (§6.8) — there is no wire method for it. File-sourced entries are
 //! read-only over the wire (edit the files directly).
 
+pub(crate) mod managed_claude;
+
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -477,6 +479,7 @@ pub(crate) async fn assemble_system_prompt(
         agent_session,
         workspace_api_docs,
         None,
+        None,
     )
     .await
 }
@@ -496,6 +499,7 @@ pub(crate) async fn assemble_system_prompt_with_skills(
     agent_session: Option<&intent_core::AgentSession>,
     workspace_api_docs: Option<&str>,
     owned_skill_catalog: Option<&str>,
+    owned_workspace_rules: Option<&managed_claude::WorkspaceInstructions>,
 ) -> Option<String> {
     // The session's pinned harness + doctrine (H2): a stamped session keeps
     // assembling the exact version it was created with; session-less calls
@@ -521,7 +525,13 @@ pub(crate) async fn assemble_system_prompt_with_skills(
     if let Some(c) = enabled_override(&overrides, "workspace") {
         parts.push(c);
     }
-    if let Some(path) = workspace_path {
+    if let Some(instructions) = owned_workspace_rules {
+        for (content, source) in &instructions.files {
+            if !content.trim().is_empty() {
+                parts.push(harness.user_rules_wrapper(content, source));
+            }
+        }
+    } else if let Some(path) = workspace_path {
         if let Some((content, source)) = load_workspace_rules(path, None) {
             if !content.trim().is_empty() {
                 parts.push(harness.user_rules_wrapper(&content, &source));
@@ -869,6 +879,7 @@ mod tests {
                 None,
                 None,
                 Some(selected),
+                None,
             )
             .await
             .unwrap();
