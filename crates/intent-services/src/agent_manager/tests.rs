@@ -27114,3 +27114,83 @@ async fn grouped_retry_keeps_legacy_prepend_and_cleans_up_on_stop() {
     mgr.stop(&id).await;
     assert!(!mgr.active_delivery_groups.lock().unwrap().contains_key(&id));
 }
+
+/// Failure cases: a retry replays its compatibility prepend mirror; a new
+/// legacy carry-over disappears; a subsequent stop/interrupt repeats originals.
+#[tokio::test]
+async fn grouped_retry_normalizes_mirrors_and_successive_carry_over() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-successive"),
+        AgentId::from("a-successive"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let group = |text: &str, data: &str, is_prepend| crate::agent_ops::QueuedDeliveryGroup {
+        is_prepend,
+        content: text.into(),
+        image_blocks: Some(json!([{"data":data,"mimeType":"image/png"}])),
+        file_blocks: None,
+    };
+    let older = group("older carry-over", "OLDER", true);
+    let current = group("retry current", "CURRENT", false);
+    let mut retry = flush_entry("successive", "compatibility wrapper".into());
+    retry.delivery_groups = Some(vec![older.clone(), current]);
+    retry.prepend_content = Some(older.content.clone());
+    retry.prepend_image_blocks = older.image_blocks.clone();
+    assert_eq!(retry.ordered_delivery_groups().len(), 2);
+    let mut options = super::turn_options_for_entry(&retry, false);
+    assert_eq!(
+        super::legacy_prompt_groups(&retry.content, &options).len(),
+        2
+    );
+    // A genuinely new legacy payload follows the old compatibility mirror.
+    retry.prepend_content = Some("older carry-over\n\nnew carry-over".into());
+    retry.prepend_image_blocks = Some(
+        json!([{"data":"OLDER","mimeType":"image/png"}, {"data":"NEW","mimeType":"image/png"}]),
+    );
+    let normalized = retry.ordered_delivery_groups();
+    assert_eq!(normalized.len(), 3);
+    assert_eq!(normalized[0].content, "new carry-over");
+    assert_eq!(
+        normalized[0].image_blocks.as_ref().unwrap()[0]["data"],
+        "NEW"
+    );
+    // Carry a grouped turn through a second interrupt/stop without pooling.
+    let mut payload = super::prepend_from_groups(normalized);
+    super::merge_prepend_payload(
+        &mut options.prepend_content,
+        &mut options.prepend_image_blocks,
+        &mut options.prepend_file_blocks,
+        &mut options.prepend_delivery_groups,
+        payload.clone(),
+    );
+    let once = super::legacy_prompt_groups(&retry.content, &options);
+    assert_eq!(once.len(), 3);
+    payload = super::prepend_from_groups(once);
+    super::merge_prepend_payload(
+        &mut options.prepend_content,
+        &mut options.prepend_image_blocks,
+        &mut options.prepend_file_blocks,
+        &mut options.prepend_delivery_groups,
+        payload,
+    );
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, &retry.content, &options)
+        .await;
+    let wire = serde_json::to_value(prompt).unwrap();
+    let blocks = wire.as_array().unwrap();
+    for (text, data) in [
+        ("new carry-over", "NEW"),
+        ("older carry-over", "OLDER"),
+        ("retry current", "CURRENT"),
+    ] {
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|b| b["text"].as_str().is_some_and(|t| t.contains(text)))
+                .count(),
+            1
+        );
+        assert_eq!(blocks.iter().filter(|b| b["data"] == data).count(), 1);
+    }
+}

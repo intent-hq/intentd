@@ -1637,23 +1637,15 @@ impl QueuedMessage {
     }
 
     pub(crate) fn ordered_delivery_groups(&self) -> Vec<QueuedDeliveryGroup> {
-        let mut groups = self.prepend_delivery_groups.clone().unwrap_or_else(|| {
-            if self.prepend_content.is_some()
-                || self.prepend_image_blocks.is_some()
-                || self.prepend_file_blocks.is_some()
-            {
-                vec![QueuedDeliveryGroup {
-                    is_prepend: true,
-                    content: self.prepend_content.clone().unwrap_or_default(),
-                    image_blocks: self.prepend_image_blocks.clone(),
-                    file_blocks: self.prepend_file_blocks.clone(),
-                }]
-            } else {
-                Vec::new()
-            }
-        });
+        let mut groups = delivery_prepend_groups(
+            self.prepend_delivery_groups.as_ref(),
+            self.prepend_content.as_ref(),
+            self.prepend_image_blocks.as_ref(),
+            self.prepend_file_blocks.as_ref(),
+            self.delivery_groups.as_deref().unwrap_or_default(),
+        );
         if let Some(current) = &self.delivery_groups {
-            groups.extend(current.clone());
+            extend_carry_over_groups(&mut groups, current.clone());
             return groups;
         }
         groups.push(QueuedDeliveryGroup {
@@ -1900,6 +1892,117 @@ pub(crate) struct QueuedDeliveryGroup {
     pub image_blocks: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_blocks: Option<Value>,
+}
+
+/// Normalize compatibility prepends against authoritative durable groups.
+/// Only complete text-and-attachment mirrors are removed; new legacy content
+/// remains a separate earlier group, including attachment-only content.
+pub(crate) fn delivery_prepend_groups(
+    explicit: Option<&Vec<QueuedDeliveryGroup>>,
+    content: Option<&String>,
+    images: Option<&Value>,
+    files: Option<&Value>,
+    durable: &[QueuedDeliveryGroup],
+) -> Vec<QueuedDeliveryGroup> {
+    if let Some(groups) = explicit {
+        return groups.clone();
+    }
+    if content.is_none() && images.is_none() && files.is_none() {
+        return Vec::new();
+    }
+    let mut legacy = QueuedDeliveryGroup {
+        is_prepend: true,
+        content: content.cloned().unwrap_or_default(),
+        image_blocks: images.cloned(),
+        file_blocks: files.cloned(),
+    };
+    let prepends: Vec<_> = durable.iter().filter(|g| g.is_prepend).collect();
+    // A compatibility triple can mirror several original groups. Strip its
+    // longest complete mirrored prefix, retaining any newly appended payload.
+    for start in 0..prepends.len() {
+        for end in (start + 1..=prepends.len()).rev() {
+            let slice = &prepends[start..end];
+            let text = slice
+                .iter()
+                .map(|g| g.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let strip_blocks = |legacy: &Option<Value>, image: bool| -> Option<Option<Value>> {
+                let expected: Vec<Value> = slice
+                    .iter()
+                    .flat_map(|g| {
+                        let blocks = if image {
+                            &g.image_blocks
+                        } else {
+                            &g.file_blocks
+                        };
+                        blocks
+                            .as_ref()
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .cloned()
+                    })
+                    .collect();
+                let actual = legacy.as_ref().and_then(Value::as_array);
+                if expected.is_empty() {
+                    return Some(legacy.clone());
+                }
+                let actual = actual?;
+                if !actual.starts_with(&expected) {
+                    return None;
+                }
+                let remaining = actual[expected.len()..].to_vec();
+                Some((!remaining.is_empty()).then_some(Value::Array(remaining)))
+            };
+            let remaining_text = if legacy.content == text {
+                Some(String::new())
+            } else {
+                legacy
+                    .content
+                    .strip_prefix(&format!("{text}\n\n"))
+                    .map(str::to_owned)
+            };
+            if let (Some(text), Some(images), Some(files)) = (
+                remaining_text,
+                strip_blocks(&legacy.image_blocks, true),
+                strip_blocks(&legacy.file_blocks, false),
+            ) {
+                legacy.content = text;
+                legacy.image_blocks = images;
+                legacy.file_blocks = files;
+                return if legacy.content.is_empty() && !legacy.has_attachments() {
+                    Vec::new()
+                } else {
+                    vec![legacy]
+                };
+            }
+        }
+    }
+    vec![legacy]
+}
+
+/// A captured zero-output turn can include the same original prefix already
+/// stored in a retry. Join that shared boundary once, without deduplicating
+/// independent queue entries or repeated messages elsewhere in the turn.
+pub(crate) fn extend_carry_over_groups(
+    older: &mut Vec<QueuedDeliveryGroup>,
+    newer: Vec<QueuedDeliveryGroup>,
+) {
+    let overlap = (1..=older.len().min(newer.len()))
+        .rev()
+        .find(|&n| {
+            older[older.len() - n..]
+                .iter()
+                .zip(&newer[..n])
+                .all(|(a, b)| {
+                    a.content == b.content
+                        && a.image_blocks == b.image_blocks
+                        && a.file_blocks == b.file_blocks
+                })
+        })
+        .unwrap_or(0);
+    older.extend(newer.into_iter().skip(overlap));
 }
 
 impl QueuedDeliveryGroup {

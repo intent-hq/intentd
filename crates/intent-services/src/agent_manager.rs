@@ -696,23 +696,15 @@ fn legacy_prompt_groups(
     options: &TurnOptions,
 ) -> Vec<crate::agent_ops::QueuedDeliveryGroup> {
     use crate::agent_ops::QueuedDeliveryGroup;
-    let mut groups = options.prepend_delivery_groups.clone().unwrap_or_else(|| {
-        if options.prepend_content.is_some()
-            || options.prepend_image_blocks.is_some()
-            || options.prepend_file_blocks.is_some()
-        {
-            vec![QueuedDeliveryGroup {
-                is_prepend: true,
-                content: options.prepend_content.clone().unwrap_or_default(),
-                image_blocks: options.prepend_image_blocks.clone(),
-                file_blocks: options.prepend_file_blocks.clone(),
-            }]
-        } else {
-            Vec::new()
-        }
-    });
+    let mut groups = crate::agent_ops::delivery_prepend_groups(
+        options.prepend_delivery_groups.as_ref(),
+        options.prepend_content.as_ref(),
+        options.prepend_image_blocks.as_ref(),
+        options.prepend_file_blocks.as_ref(),
+        options.delivery_groups.as_deref().unwrap_or_default(),
+    );
     if let Some(current) = &options.delivery_groups {
-        groups.extend(current.clone());
+        crate::agent_ops::extend_carry_over_groups(&mut groups, current.clone());
     } else {
         groups.push(QueuedDeliveryGroup {
             is_prepend: false,
@@ -11793,29 +11785,24 @@ fn merge_prepend_payload(
     armed: crate::agent_ops::QueuedPrepend,
 ) {
     if prepend_groups.is_some() || armed.delivery_groups.is_some() {
-        let mut groups = prepend_groups.take().unwrap_or_else(|| {
-            if prepend_content.is_some()
-                || prepend_image_blocks.is_some()
-                || prepend_file_blocks.is_some()
-            {
+        let mut groups = crate::agent_ops::delivery_prepend_groups(
+            prepend_groups.as_ref(),
+            prepend_content.as_ref(),
+            prepend_image_blocks.as_ref(),
+            prepend_file_blocks.as_ref(),
+            armed.delivery_groups.as_deref().unwrap_or_default(),
+        );
+        crate::agent_ops::extend_carry_over_groups(
+            &mut groups,
+            armed.delivery_groups.clone().unwrap_or_else(|| {
                 vec![crate::agent_ops::QueuedDeliveryGroup {
                     is_prepend: true,
-                    content: prepend_content.clone().unwrap_or_default(),
-                    image_blocks: prepend_image_blocks.clone(),
-                    file_blocks: prepend_file_blocks.clone(),
+                    content: armed.content.clone().unwrap_or_default(),
+                    image_blocks: armed.image_blocks.clone(),
+                    file_blocks: armed.file_blocks.clone(),
                 }]
-            } else {
-                Vec::new()
-            }
-        });
-        groups.extend(armed.delivery_groups.clone().unwrap_or_else(|| {
-            vec![crate::agent_ops::QueuedDeliveryGroup {
-                is_prepend: true,
-                content: armed.content.clone().unwrap_or_default(),
-                image_blocks: armed.image_blocks.clone(),
-                file_blocks: armed.file_blocks.clone(),
-            }]
-        }));
+            }),
+        );
         *prepend_groups = Some(groups);
     }
     if let Some(text) = armed.content.filter(|t| !t.is_empty()) {

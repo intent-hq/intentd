@@ -2839,8 +2839,15 @@ async fn attachment_groups_over_wss(explicit: bool) {
         2
     );
     let evidence = json!({"explicit":explicit,"queue":queue,"providerPrompts":records,"conversation":conversation});
-    let artifact = data_dir.join("attachment-groups.json");
-    std::fs::write(&artifact, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+    let artifact = save_group_artifact(
+        &data_dir,
+        if explicit {
+            "explicit.json"
+        } else {
+            "natural.json"
+        },
+        &evidence,
+    );
     eprintln!(
         "ATTACHMENT_GROUPS_ARTIFACT {}\n{}",
         artifact.display(),
@@ -3016,8 +3023,7 @@ async fn failed_attachment_batch_keeps_groups_through_restart_and_retry_over_wss
         );
     }
     let evidence = json!({"beforeRestart":before,"afterRestart":after,"prompts":records,"conversation":conversation});
-    let artifact = data_dir.join("attachment-groups-restart.json");
-    std::fs::write(&artifact, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+    let artifact = save_group_artifact(&data_dir, "restart.json", &evidence);
     eprintln!(
         "ATTACHMENT_GROUPS_RESTART_ARTIFACT {}\n{}",
         artifact.display(),
@@ -3093,12 +3099,22 @@ async fn interrupt_keeps_all_flushed_attachment_groups_over_wss() {
         previous = Some(index);
     }
     assert_eq!(blocks.iter().filter(|b| b["type"] == "image").count(), 3);
-    let artifact = data_dir.join("attachment-groups-interrupt.json");
-    std::fs::write(&artifact, serde_json::to_vec_pretty(&records).unwrap()).unwrap();
+    let artifact = save_group_artifact(&data_dir, "interrupt.json", &json!({"prompts":records}));
     eprintln!(
         "ATTACHMENT_GROUPS_INTERRUPT_ARTIFACT {}\n{}",
         artifact.display(),
         log
     );
     std::fs::write(&batch_release, "go").unwrap();
+}
+
+/// Keep repeatable evidence outside temporary daemon data when requested.
+fn save_group_artifact(data_dir: &Path, name: &str, evidence: &serde_json::Value) -> PathBuf {
+    let directory = std::env::var_os("INTENT_QUEUED_GROUP_ARTIFACT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.to_path_buf());
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join(name);
+    std::fs::write(&artifact, serde_json::to_vec_pretty(evidence).unwrap()).unwrap();
+    artifact
 }
