@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+use pulldown_cmark::{Event, Parser, Tag};
 use regex::Regex;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,13 +163,24 @@ impl Loader {
 /// whitespace; escaped spaces work, fragments are not filenames, and quoted
 /// paths stay text.
 fn imports(content: &str) -> Vec<String> {
-    static CODE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r"(?ms)^\s*```.*?^\s*```[^\n]*|^\s*~~~.*?^\s*~~~[^\n]*|`+[^`]*`+|<!--.*?-->|^(?: {4}| {0,3}\t)[^\n]*")
-            .unwrap()
-    });
     static IMPORT: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"(?:^|\s)@((?:\\ |[^\s\x22'`])+)").unwrap());
-    let text = CODE.replace_all(content, " ");
+    // Preserve original spelling for escaped spaces/fragments, but exclude
+    // complete Markdown code/HTML ranges. Block context distinguishes indented
+    // code from lazy paragraph continuations and nested list paragraphs.
+    let mut text = content.as_bytes().to_vec();
+    for (event, range) in Parser::new(content).into_offset_iter() {
+        if matches!(
+            event,
+            Event::Start(Tag::CodeBlock(_))
+                | Event::Code(_)
+                | Event::Html(_)
+                | Event::InlineHtml(_)
+        ) {
+            text[range].fill(b' ');
+        }
+    }
+    let text = String::from_utf8(text).expect("Markdown ranges preserve UTF-8 boundaries");
     IMPORT
         .captures_iter(&text)
         .map(|c| {
@@ -242,6 +254,11 @@ mod tests {
             imports("@docs/policy.md#section\n\n    @indented.md\n\t@tabbed.md\n\n@other.md"),
             vec!["docs/policy.md", "other.md"]
         );
+    }
+
+    #[test]
+    fn paragraph_and_list_continuations_are_not_indented_code() {
+        assert_eq!(imports("Paragraph\n    @paragraph.md\n\n- List item\n\n    @list.md\n\n        @list-code.md\n\nOutside paragraph\n\n    @code.md"), vec!["paragraph.md", "list.md"]);
     }
 
     #[test]

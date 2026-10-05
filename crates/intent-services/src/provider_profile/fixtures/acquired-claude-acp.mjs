@@ -61,7 +61,10 @@ await fs.appendFile(path.join(cwd, '.claude/CLAUDE.md'), '\n@../docs/anchored.md
 await write(path.join(cwd, 'docs/anchored.md'), 'FRAGMENT-IMPORT-SENTINEL');
 await write(path.join(cwd, 'docs/indented.md'), 'INDENTED-CODE-IMPORT-SENTINEL');
 for (let depth=1; depth<=5; depth++) await write(path.join(cwd, `docs/depth-${depth}.md`), `DEPTH-${depth}-IMPORT-SENTINEL`+(depth<5?`\n@depth-${depth+1}.md`:''));
-const importExpectations = [['FRAGMENT',true], ['INDENTED-CODE',false], ['DEPTH-4',true], ['DEPTH-5',false]];
+await fs.appendFile(path.join(cwd, '.claude/CLAUDE.md'), '\n\nParagraph continuation\n    @../docs/paragraph.md\n\n- List item\n\n    @../docs/list.md\n');
+await write(path.join(cwd, 'docs/paragraph.md'), 'PARAGRAPH-CONTINUATION-IMPORT-SENTINEL');
+await write(path.join(cwd, 'docs/list.md'), 'LIST-CONTINUATION-IMPORT-SENTINEL');
+const importExpectations = [['FRAGMENT',true], ['INDENTED-CODE',false], ['DEPTH-4',true], ['DEPTH-5',false], ['PARAGRAPH-CONTINUATION',true], ['LIST-CONTINUATION',true]];
 const instructionMarkers = ['ANCESTOR','ROOT','PROJECT-CLAUDE','LOCAL','IMPORTED','NESTED','RULES'].map(s=>s+'-INSTRUCTIONS-SENTINEL');
 await write(path.join(cwd, 'approved.json'), JSON.stringify({ approved: mcp('approved'), 'workspace-mcp': mcp('bridge') }));
 const seen = [];
