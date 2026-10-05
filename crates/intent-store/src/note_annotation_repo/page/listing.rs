@@ -57,6 +57,38 @@ fn summary_frame_len(empty_frame_bytes: usize, item_bytes: usize, cursor: &Value
     empty_frame_bytes - 4 + item_bytes + cursor.to_string().len()
 }
 
+fn admit_summary_rows(
+    mut out: Value,
+    rows: &[(Value, u64, u64)],
+    wire: usize,
+    rpc_id: &Value,
+    cursor: impl Fn(usize, u64, u64) -> Result<Value>,
+) -> Result<Value> {
+    // The empty envelope already accounts for brackets and separators.
+    // Serialize each item once, then check the complete frame before return.
+    let empty_frame_bytes = wire_len(&out, rpc_id);
+    let mut item_bytes = 0;
+    let mut admitted = Vec::new();
+    for (index, (item, owner, position)) in rows.iter().enumerate() {
+        let next_cursor = cursor(index, *owner, *position)?;
+        let candidate_bytes = item_bytes + item.to_string().len() + usize::from(index > 0);
+        if summary_frame_len(empty_frame_bytes, candidate_bytes, &next_cursor) > wire {
+            if admitted.is_empty() {
+                return Err(budget());
+            }
+            break;
+        }
+        item_bytes = candidate_bytes;
+        admitted.push(item.clone());
+        out["nextCursor"] = next_cursor;
+    }
+    out["items"] = json!(admitted);
+    if wire_len(&out, rpc_id) > wire {
+        return Err(budget());
+    }
+    Ok(out)
+}
+
 impl Store {
     /// Read an authenticated, bounded annotation page after service authorization.
     /// The service supplies the actual JSON-RPC ID for complete-frame budgeting.
@@ -141,48 +173,32 @@ impl Store {
         let epochs = self
             .validate_annotation_lease(id, &lease, scope, principal)
             .await?;
-        let (mut out, rows, more) = self
+        let (out, rows, more) = self
             .annotation_summary_rows(&lease, id, &epochs, cursor.as_ref(), &key)
             .await?;
-        // The empty envelope already accounts for brackets and separators.
-        // Serialize each item once, instead of cloning and serializing every
-        // growing prefix. Keep the final complete-frame check below.
-        let empty_frame_bytes = wire_len(&out, rpc_id);
-        let mut item_bytes = 0;
-        let mut admitted = Vec::new();
-        for (index, (item, owner, position)) in rows.iter().enumerate() {
-            let next_cursor = if index + 1 < rows.len() || more {
-                json!(Token {
-                    snapshot: id,
-                    kind: lease.query.kind_tag(),
-                    owner: *owner,
-                    position: *position,
-                    utf16: 0,
-                    items: u16::try_from(lease.query.items).map_err(|_| invalid())?,
-                    wire: u32::try_from(lease.query.wire).map_err(|_| invalid())?,
-                    binding: [0; 16]
-                }
-                .encode(&key)?)
-            } else {
-                Value::Null
-            };
-            let candidate_bytes = item_bytes + item.to_string().len() + usize::from(index > 0);
-            if summary_frame_len(empty_frame_bytes, candidate_bytes, &next_cursor)
-                > lease.query.wire
-            {
-                if admitted.is_empty() {
-                    return Err(budget());
-                }
-                break;
-            }
-            item_bytes = candidate_bytes;
-            admitted.push(item.clone());
-            out["nextCursor"] = next_cursor;
-        }
-        out["items"] = json!(admitted);
-        if wire_len(&out, rpc_id) > lease.query.wire {
-            return Err(budget());
-        }
+        let out = admit_summary_rows(
+            out,
+            &rows,
+            lease.query.wire,
+            rpc_id,
+            |index, owner, position| {
+                Ok(if index + 1 < rows.len() || more {
+                    json!(Token {
+                        snapshot: id,
+                        kind: lease.query.kind_tag(),
+                        owner,
+                        position,
+                        utf16: 0,
+                        items: u16::try_from(lease.query.items).map_err(|_| invalid())?,
+                        wire: u32::try_from(lease.query.wire).map_err(|_| invalid())?,
+                        binding: [0; 16]
+                    }
+                    .encode(&key)?)
+                } else {
+                    Value::Null
+                })
+            },
+        )?;
         self.validate_annotation_lease(id, &lease, scope, principal)
             .await?;
         Ok(out)
@@ -370,6 +386,63 @@ mod tests {
                     complete["nextCursor"] = cursor.clone();
                     let measured = summary_frame_len(empty_bytes, item_bytes, &cursor);
                     assert_eq!(measured, wire_len(&complete, &rpc_id));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn annotation_incremental_frame_admission_matches_greedy_complete_frames() {
+        let rpc_id = json!("\"\\\n😀");
+        let empty = json!({"items":[],"nextCursor":null,"scope":"é\n"});
+        for count in [0, 1, 3, 64] {
+            let rows = (0..count)
+                .map(|n| {
+                    (
+                        json!({"preview":"\"\\\u{0000}😀".repeat(n + 1)}),
+                        u64::try_from(n).unwrap(),
+                        0,
+                    )
+                })
+                .collect::<Vec<_>>();
+            for more in [false, true] {
+                let cursor = |index, owner, _| {
+                    Ok(if index + 1 < rows.len() || more {
+                        json!(format!("na1.{owner}\"\\\n"))
+                    } else {
+                        Value::Null
+                    })
+                };
+                // Independent oracle: serialize every complete candidate frame.
+                let mut frames = vec![empty.clone()];
+                for (index, (item, owner, position)) in rows.iter().enumerate() {
+                    let mut frame = frames.last().unwrap().clone();
+                    frame["items"].as_array_mut().unwrap().push(item.clone());
+                    frame["nextCursor"] = cursor(index, *owner, *position).unwrap();
+                    frames.push(frame);
+                }
+                for boundary in frames.iter().map(|frame| wire_len(frame, &rpc_id)) {
+                    for wire in [boundary - 1, boundary] {
+                        let mut expected = &frames[0];
+                        let mut failed_first = false;
+                        for (index, frame) in frames.iter().enumerate().skip(1) {
+                            if wire_len(frame, &rpc_id) > wire {
+                                failed_first = index == 1;
+                                break;
+                            }
+                            expected = frame;
+                        }
+                        let result =
+                            admit_summary_rows(empty.clone(), &rows, wire, &rpc_id, cursor);
+                        if failed_first || wire_len(expected, &rpc_id) > wire {
+                            assert!(matches!(
+                                result,
+                                Err(intent_core::Error::NotePage(NotePageError::Budget))
+                            ));
+                        } else {
+                            assert_eq!(result.unwrap(), *expected);
+                        }
+                    }
                 }
             }
         }
