@@ -130,7 +130,7 @@ impl NoteStageHeader {
                 !q.case_sensitive
                     && q.text.len() <= 1024
                     && !q.text.contains('\0')
-                    && (q.mode != NoteStageSearchMode::Source || !q.text.is_empty()),
+                    && !q.text.is_empty(),
             )?;
         }
         Ok(())

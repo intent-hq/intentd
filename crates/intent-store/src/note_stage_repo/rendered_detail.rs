@@ -185,7 +185,7 @@ impl Resources<'_> {
         entry["type"] = json!(kind);
         match node.value {
             Value::Object(_) | Value::Array(_) => {
-                entry["childrenRef"] = json!(self.reference(id, 1, 0)?)
+                entry["childrenRef"] = json!(self.reference(id, 1, 0)?);
             }
             Value::String(_) if scalar_resource(nodes, id) => {
                 entry["valueRef"] = json!(self.reference(id, 2, 0)?);

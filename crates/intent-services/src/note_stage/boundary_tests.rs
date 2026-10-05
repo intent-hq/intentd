@@ -552,4 +552,5 @@ async fn staged_search_service_rechecks_results_and_detail_original_expiry() {
     }
 }
 
+mod rendered;
 mod selection;

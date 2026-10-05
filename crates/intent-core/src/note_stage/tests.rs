@@ -17,7 +17,7 @@ fn selection_range(ordinal: u64, start: u64, end: u64) -> Value {
 }
 
 #[test]
-fn source_search_header_rejects_empty_but_preserves_literal_whitespace() {
+fn search_headers_reject_empty_but_preserve_literal_whitespace() {
     let mut header = source_search_header();
     header.query.as_mut().unwrap().text.clear();
     assert_eq!(header.validate(), Err(NoteMutationError::Invalid));
@@ -31,7 +31,15 @@ fn source_search_header_rejects_empty_but_preserves_literal_whitespace() {
     }
     header.query.as_mut().unwrap().text.clear();
     header.query.as_mut().unwrap().mode = NoteStageSearchMode::RenderedText;
-    assert!(header.validate().is_ok()); // Existing rendered policy is unchanged.
+    assert_eq!(header.validate(), Err(NoteMutationError::Invalid));
+    assert!(NoteStageTail::default()
+        .advance_for_header(NoteStageStream::Selection, &[], &header)
+        .is_err());
+    for text in [" ", "\t\n", "\u{feff}", "Straße😀"] {
+        header.query.as_mut().unwrap().text = text.into();
+        assert!(header.validate().is_ok());
+        assert_eq!(header.query.as_ref().unwrap().text, text);
+    }
 }
 
 #[test]

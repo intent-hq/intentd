@@ -2121,3 +2121,6 @@ async fn bounded_staged_source_search_and_raw_hit_details_over_wss() {
 
 #[path = "wss_integration/staged_selection.rs"]
 mod staged_selection;
+
+#[path = "wss_integration/staged_rendered.rs"]
+mod staged_rendered;

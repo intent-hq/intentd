@@ -267,15 +267,23 @@ pub(super) fn projection_descriptor(
     value: &Value,
     ordinal: u64,
 ) -> Result<ProjectionDescriptor<'_>> {
+    projection_descriptor_version(value, ordinal, 1)
+}
+
+fn projection_descriptor_version(
+    value: &Value,
+    ordinal: u64,
+    version: u64,
+) -> Result<ProjectionDescriptor<'_>> {
     const SAFE: u64 = 9_007_199_254_740_991;
     let object = value.as_object().ok_or_else(invalid)?;
     if object.keys().any(|key| {
-        !matches!(
+        !(matches!(
             key.as_str(),
             "version" | "nodeType" | "parentOrdinal" | "nativeRange" | "attributesRef"
-        )
+        ) || (version == 2 && key == "renderedText"))
     }) || ordinal > SAFE
-        || object.get("version").and_then(Value::as_u64) != Some(1)
+        || object.get("version").and_then(Value::as_u64) != Some(version)
     {
         return Err(invalid());
     }
@@ -1321,7 +1329,49 @@ pub(super) async fn validate_live_descriptors(
         next_ordinal = sum(ordinal, 1)?;
         verify_reference(conn, operation, &detail).await?;
         let value = metadata_resource(conn, operation, &detail.text_id).await?;
-        let descriptor = projection_descriptor(&value, ordinal)?;
+        let rendered: Option<NoteStageTextReference> = if value["version"] == 2 {
+            // Version two is an explicit captured rendered-search resource, not
+            // an extension accepted by existing version-one selection adapters.
+            let raw: Option<String> =
+                sqlx::query_scalar("SELECT header FROM note_stage WHERE operation_key=?")
+                    .bind(operation)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(db)?;
+            let header: NoteStageHeader =
+                serde_json::from_str(&raw.ok_or_else(invalid)?).map_err(db)?;
+            header.validate().map_err(Error::NoteMutation)?;
+            if header.action != intent_core::note_stage::NoteStageAction::Read
+                || header.output != intent_core::note_stage::NoteStageOutput::Search
+                || header.selection != intent_core::note_stage::NoteStageSelection::Ranges
+                || !header.query.as_ref().is_some_and(|q| {
+                    q.mode == intent_core::note_stage::NoteStageSearchMode::RenderedText
+                })
+                || ordinal != 1
+                || role != intent_core::note_stage::NoteStageRole::InlineSpan
+                || canonical_id.is_some()
+                || value.as_object().is_none_or(|object| object.len() != 6)
+                || value["nodeType"] != "text"
+                || value["parentOrdinal"] != 0
+                || !value["attributesRef"].is_string()
+            {
+                return Err(invalid());
+            }
+            let reference: NoteStageTextReference =
+                serde_json::from_value(value["renderedText"].clone()).map_err(|_| invalid())?;
+            if reference.length == 0 || reference.length > SAFE_LENGTH {
+                return Err(invalid());
+            }
+            verify_reference(conn, operation, &reference).await?;
+            Some(reference)
+        } else {
+            None
+        };
+        let descriptor = if rendered.is_some() {
+            projection_descriptor_version(&value, ordinal, 2)?
+        } else {
+            projection_descriptor(&value, ordinal)?
+        };
         if let Some(parent) = descriptor.parent_ordinal {
             let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM note_stage_validation WHERE operation_key=? AND kind='live' AND id=? AND state='done')")
                 .bind(operation).bind(parent.to_string()).fetch_one(&mut *conn).await.map_err(db)?;
@@ -1360,6 +1410,9 @@ pub(super) async fn validate_live_descriptors(
         }
         if let Some(reference) = descriptor.attributes_ref {
             metadata["attributesRef"] = Value::String(reference.to_owned());
+        }
+        if let Some(reference) = rendered {
+            metadata["renderedText"] = serde_json::to_value(reference).map_err(db)?;
         }
         claim_metadata(
             conn,

@@ -36,7 +36,7 @@ impl Services {
         rpc_id: Value,
     ) -> Result<Value> {
         query.validate().map_err(Error::NoteMutation)?;
-        if query.reference.starts_with("nsh1.") {
+        if query.reference.starts_with("nsh1.") || query.reference.starts_with("nrd1.") {
             return self.read_stage_search_detail(query, rpc_id).await;
         }
         let workspace = WorkspaceId(query.scope.workspace_id.clone());

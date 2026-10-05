@@ -12,6 +12,10 @@ mod freeze;
 mod output;
 mod read;
 mod reclaim;
+mod rendered_capture;
+#[cfg(test)]
+mod rendered_capture_tests;
+mod rendered_detail;
 pub use reclaim::NoteOperationReclaimStats;
 mod seal;
 mod search_detail;

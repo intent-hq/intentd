@@ -90,6 +90,7 @@ pub(super) struct Context {
     pub(super) binding: [u8; 32],
     pub(super) key: Vec<u8>,
     pub(super) query: String,
+    pub(super) rendered: Option<super::rendered_capture::Capture>,
 }
 impl Context {
     pub(super) async fn load(
@@ -111,9 +112,6 @@ impl Context {
             return Err(invalid());
         }
         let query = header.query.as_ref().ok_or_else(invalid)?;
-        if query.mode != NoteStageSearchMode::Source {
-            return Err(Error::Unsupported("rendered search output".into()));
-        }
         header.validate().map_err(fail)?;
         let expires = expiry(&serde_json::from_str(row.get("outcome")).map_err(db)?)?;
         let operation: String = row.get("operation_key");
@@ -122,6 +120,16 @@ impl Context {
         let length = u64::try_from(row.get::<i64, _>("view_length")).map_err(db)?;
         let generation:i64=sqlx::query_scalar("SELECT generation FROM note_stage_view WHERE operation_key=? ORDER BY generation DESC LIMIT 1").bind(&operation).fetch_one(&mut *conn).await.map_err(db)?;
         let generation = u64::try_from(generation).map_err(db)?;
+        let rendered = if query.mode == NoteStageSearchMode::RenderedText {
+            Some(
+                super::rendered_capture::prepare(
+                    conn, &operation, &header, generation, length, false,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let backend =
             sqlx::query("SELECT backend_id,token_key FROM note_page_backend WHERE singleton=1")
                 .fetch_one(&mut *conn)
@@ -159,7 +167,29 @@ impl Context {
             binding,
             key,
             query: query.text.clone(),
+            rendered,
         })
+    }
+    async fn piece(
+        &self,
+        conn: &mut SqliteConnection,
+        offset: u64,
+        budget: usize,
+    ) -> Result<String> {
+        if let Some(capture) = &self.rendered {
+            capture.piece(offset, budget)
+        } else {
+            Ok(view_read::read_piece(
+                conn,
+                &self.operation,
+                self.generation,
+                self.length,
+                offset,
+                budget,
+            )
+            .await?
+            .1)
+        }
     }
     pub(super) fn envelope(&self, request: &NoteStageRead, kind: &str) -> Value {
         json!({"kind":"noteOperationPage","scope":request.scope(),"operationId":request.operation_id,"headerDigest":request.header_digest,"payloadDigest":self.payload,"viewId":self.view,"outputKind":kind,"sourceLength":self.length,"items":[],"nextCursor":null,"expiresAt":self.expires})
@@ -220,15 +250,7 @@ async fn restore(
     // backing-piece SQL hydration is separately bounded by view_read's pieces.
     let units = usize::try_from(position.frontier - position.replay).map_err(db)?;
     let budget = (units * 3).clamp(4, MAX_CARRY_BYTES);
-    let (_, text) = view_read::read_piece(
-        conn,
-        &context.operation,
-        context.generation,
-        context.length,
-        position.replay,
-        budget,
-    )
-    .await?;
+    let text = context.piece(conn, position.replay, budget).await?;
     if text.len() > budget {
         return Err(invalid());
     }
@@ -339,15 +361,7 @@ pub(super) async fn read(
         if remaining < 4 {
             break;
         }
-        let (_, text) = view_read::read_piece(
-            &mut tx,
-            &context.operation,
-            context.generation,
-            context.length,
-            position.frontier,
-            remaining,
-        )
-        .await?;
+        let text = context.piece(&mut tx, position.frontier, remaining).await?;
         bytes += text.len();
         if text.is_empty() {
             return Err(invalid());
@@ -368,7 +382,17 @@ pub(super) async fn read(
             position.replay = matcher.replay_range().ok_or_else(invalid)?.start;
             if let Some(hit) = hit {
                 position.count += 1;
-                let item = json!({"hitId":hit_id(&context.binding,hit.start,hit.end),"sourceRange":{"start":hit.start,"end":hit.end},"detailRef":sign("nsh1.",&context.key,&context.binding,&[hit.start,hit.end,0])?});
+                let reference = if context.rendered.is_some() {
+                    super::rendered_detail::hit_ref(&context, hit.start, hit.end)?
+                } else {
+                    sign(
+                        "nsh1.",
+                        &context.key,
+                        &context.binding,
+                        &[hit.start, hit.end, 0],
+                    )?
+                };
+                let item = json!({"hitId":hit_id(&context.binding,hit.start,hit.end),"sourceRange":{"start":hit.start,"end":hit.end},"detailRef":reference});
                 items.push(item);
                 result["items"] = json!(items);
                 // Reserve the largest possible frontier and a full cursor. EOF
@@ -417,7 +441,7 @@ pub(super) async fn read(
 }
 
 impl Store {
-    /// Resolve a signed raw source-hit field from its original sealed view.
+    /// Resolve a signed source fragment or rendered metadata tree from its original sealed view.
     /// Current visibility is owned by Services at both request boundaries.
     /// # Errors
     /// Rejects receipt or cursor fallback, altered offsets/identity, expired views,
@@ -436,7 +460,6 @@ impl Store {
             || query.context_envelope
             || query.kind != ReceiptDetailKind::Detail
             || query.payload_digest.is_some()
-            || query.cursor.is_some()
             || query.text_id.is_some()
             || principal.is_empty()
             || principal.len() > 256
@@ -464,6 +487,15 @@ impl Store {
         request.validate().map_err(fail)?;
         let mut tx = self.read_pool().begin().await.map_err(db)?;
         let context = Context::load(&mut tx, principal, &request).await?;
+        if context.rendered.is_some() {
+            let page = super::rendered_detail::read(&context, query, rpc_id)?;
+            tx.commit().await.map_err(db)?;
+            context.recheck(self, &request).await?;
+            return Ok(page);
+        }
+        if query.cursor.is_some() {
+            return Err(invalid());
+        }
         let mut page = context.envelope(&request, "detail");
         let item = super::search_detail::read_fragment(
             &mut tx,

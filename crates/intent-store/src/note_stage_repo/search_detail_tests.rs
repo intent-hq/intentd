@@ -6,6 +6,7 @@ const KEY: &[u8] = &[42; 32];
 
 fn binding(length: u64) -> Context {
     Context {
+        rendered: None,
         operation: "op".into(),
         view: "view".into(),
         payload: "payload".into(),

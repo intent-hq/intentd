@@ -108,6 +108,28 @@ impl Store {
         {
             super::search_ranges::normalize(&mut tx, &key, &header, &view).await?;
         }
+        if header.output == intent_core::note_stage::NoteStageOutput::Search
+            && header.query.as_ref().is_some_and(|query| {
+                query.mode == intent_core::note_stage::NoteStageSearchMode::RenderedText
+            })
+        {
+            let capture = super::rendered_capture::prepare(
+                &mut tx,
+                &key,
+                &header,
+                view.generation,
+                view.length,
+                true,
+            )
+            .await?;
+            if capture.selected_range.start < capture.selected_range.end {
+                let start = capture.source_range.start + capture.selected_range.start;
+                let end = capture.source_range.start + capture.selected_range.end;
+                sqlx::query("INSERT INTO note_stage_search_range(operation_key,generation,start,end) VALUES(?,?,?,?)")
+                    .bind(&key).bind(i64::try_from(view.generation).map_err(db)?).bind(i64::try_from(start).map_err(db)?).bind(i64::try_from(end).map_err(db)?)
+                    .execute(&mut *tx).await.map_err(db)?;
+            }
+        }
         state["phase"] = json!("sealed");
         state["payloadDigest"] = json!(request.payload_digest);
         state["viewLength"] = json!(view.length);

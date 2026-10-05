@@ -34,7 +34,7 @@ enum Defect {
     Unknown,
     SourceMode,
 }
-fn canonical(v: Value) -> String {
+fn canonical(v: &Value) -> String {
     intent_core::note_artifact::canonical::canonical_json(&v.to_string()).unwrap()
 }
 fn reference(id: &str, text: &str) -> Value {
@@ -164,7 +164,7 @@ async fn fixture(
     }
     let length = u64::try_from(source.encode_utf16().count()).unwrap();
     let parent = canonical(
-        json!({"version":1,"nodeType":"paragraph","parentOrdinal":null,"nativeRange":{"from":100,"to":102+length},"attributesRef":"attrs"}),
+        &json!({"version":1,"nodeType":"paragraph","parentOrdinal":null,"nativeRange":{"from":100,"to":102+length},"attributesRef":"attrs"}),
     );
     let mut text_ref = reference("captured-text", rendered);
     if matches!(defect, Defect::Length) {
@@ -177,11 +177,11 @@ async fn fixture(
     if matches!(defect, Defect::Unknown) {
         leaf["unknown"] = json!(true);
     }
-    let leaf = canonical(leaf);
+    let leaf = canonical(&leaf);
     let attrs = canonical(
-        json!({"id":"attrs-entry","parentId":null,"type":"object","childrenRef":"empty"}),
+        &json!({"id":"attrs-entry","parentId":null,"type":"object","childrenRef":"empty"}),
     );
-    let empty = canonical(json!({"kind":"metadataChildren","items":[],"nextRef":null}));
+    let empty = canonical(&json!({"kind":"metadataChildren","items":[],"nextRef":null}));
     let mut texts = vec![
         json!({"kind":"text","id":"parent","offset":0,"text":parent}),
         json!({"kind":"text","id":"leaf","offset":0,"text":leaf}),

@@ -27,7 +27,7 @@ fn integer(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| invalid())
 }
 
-async fn records(
+pub(super) async fn records(
     conn: &mut SqliteConnection,
     operation: &str,
     stream: &str,
@@ -89,7 +89,7 @@ async fn empty_attributes(conn: &mut SqliteConnection, operation: &str, id: &str
     Ok(json!({}))
 }
 
-async fn descriptor(
+pub(super) async fn descriptor(
     conn: &mut SqliteConnection,
     operation: &str,
     generation: u64,
@@ -127,6 +127,9 @@ async fn descriptor(
     let mut expected = json!({"generation":generation,"sourceRange":{"start":source_range.start,"end":source_range.end},"nativeRange":value["nativeRange"],"parentOrdinal":value["parentOrdinal"],"nodeType":value["nodeType"],"role":role,"attributesRef":attrs});
     if let Some(id) = canonical_id {
         expected["canonicalId"] = json!(id);
+    }
+    if value["version"] == 2 {
+        expected["renderedText"] = value["renderedText"].clone();
     }
     if ledger != expected {
         return Err(invalid());
