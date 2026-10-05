@@ -199,7 +199,7 @@ async function managerFixture() {
     assert(!tools.some(t=>t.startsWith('mcp__ambient__')||t.startsWith('mcp__host__')));
     assert(!JSON.stringify(body.system).includes('HOST-SKILL-MARKER'));
     if(wss && !tools.length) continue;
-    if(Array.isArray(content) && content.some(b=>['MANAGED-FIRST-TURN','MANAGED-RESUMED-TURN'].some(marker=>b.text?.includes(marker)))) {
+    if(Array.isArray(content) && content.some(b=>['MANAGED-FIRST-TURN','MANAGED-RESUMED-TURN'].some(marker=>wss ? b.text?.includes(marker) : b.text===marker))) {
       turns.push(body);
       assert.equal(body.model,'claude-sonnet-4-6');
       assert(tools.some(t=>t.startsWith('mcp__workspace-mcp__')), JSON.stringify({tools, content}));
