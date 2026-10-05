@@ -348,9 +348,65 @@ async fn script_event_frame(watching: &mut Ws, sid: &str, event_type: &str) -> V
 }
 
 #[intent_test_macros::daemon_test]
+async fn script_create_rejects_invalid_cwd_without_replacement_over_wss() {
+    let worktree = common::test_tempdir("script-cwd-wss");
+    let srv = start(WsOptions::default()).await;
+    let mut client = connect_ws(srv.port, srv.cfg.clone()).await;
+    let created = rpc(
+        &mut client,
+        1,
+        "workspace.create",
+        json!({"title":"Script cwd","path":worktree.path(),"worktreePath":worktree.path()}),
+    )
+    .await;
+    let ws = created["result"]["workspace"]["id"].as_str().unwrap();
+    let original = rpc(&mut client, 2, "script.create", json!({"workspaceId":ws,"scriptId":"original","name":"original","command":"true","mode":"command","purpose":"saved","cwd":"."})).await;
+    assert!(original.get("error").is_none(), "{original}");
+    let before = rpc(&mut client, 3, "script.list", json!({"workspaceId":ws})).await;
+    for sid in ["new-invalid", "original"] {
+        for cwd in [
+            worktree.path().to_str().unwrap(),
+            "/outside-workspace",
+            "..",
+            "child/../sibling",
+        ] {
+            let rejected = rpc(&mut client, 4, "script.create", json!({"workspaceId":ws,"scriptId":sid,"name":"invalid","command":"echo replaced","mode":"command","cwd":cwd})).await;
+            assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+            assert!(
+                rejected["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("omit cwd"),
+                "{rejected}"
+            );
+            let after = rpc(&mut client, 5, "script.list", json!({"workspaceId":ws})).await;
+            assert_eq!(after["result"], before["result"]);
+            assert!(srv
+                .store
+                .get_script_in_workspace(&WorkspaceId::from_string(ws), "new-invalid")
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                serde_json::to_value(
+                    srv.store
+                        .get_script_in_workspace(&WorkspaceId::from_string(ws), "original")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                original["result"]
+            );
+        }
+    }
+    srv.ws.stop().await;
+}
+
+#[intent_test_macros::daemon_test]
 async fn script_changed_full_rows_and_terminal_order_over_wss() {
     let worktree = common::test_tempdir("script-snapshot-wss");
-    let srv = start(WsOptions::default()).await;
+    let mut srv = start(WsOptions::default()).await;
     let mut client = connect_ws(srv.port, srv.cfg.clone()).await;
     let created = rpc(
         &mut client,
@@ -424,10 +480,7 @@ async fn script_changed_full_rows_and_terminal_order_over_wss() {
             true,
         ),
     ] {
-        let mut params = json!({"workspaceId":ws,"scriptId":sid,"name":sid,"command":command,"mode":"command","purpose":purpose});
-        if bad_cwd {
-            params["cwd"] = json!("/outside-workspace");
-        }
+        let params = json!({"workspaceId":ws,"scriptId":sid,"name":sid,"command":command,"mode":"command","purpose":purpose});
         let created = rpc(&mut client, 3, "script.create", params).await;
         assert!(created.get("error").is_none(), "{created}");
         let event = script_event_frame(&mut watching, sid, "script:changed").await;
@@ -435,6 +488,53 @@ async fn script_changed_full_rows_and_terminal_order_over_wss() {
         expected["runtime"] = json!({"status":"idle","restartCount":0});
         assert_eq!(event["data"]["script"], expected);
         assert_eq!(event["data"]["action"], "created");
+        if bad_cwd {
+            // Simulate a definition saved before creation validated cwd. Keep
+            // the real creation snapshot assertion above, then restart with
+            // the invalid durable row to exercise launch failure over WSS.
+            srv.ws.stop().await;
+            let mut legacy = srv
+                .store
+                .get_script_in_workspace(&WorkspaceId::from_string(ws), sid)
+                .await
+                .unwrap()
+                .unwrap();
+            legacy.cwd = Some("/outside-workspace".into());
+            srv.store.upsert_script(&legacy).await.unwrap();
+            let services = Services::new(srv.store.clone())
+                .with_event_bus(srv.bus.clone())
+                .with_settings_registry(srv.registry.clone());
+            assert_eq!(services.hydrate_scripts().await.unwrap(), 1);
+            let tls = ensure_tls_certificate(srv.dir.path()).unwrap();
+            let tokens = Arc::new(MemTokenStore::default());
+            tokens.store_token(TOKEN).unwrap();
+            let tokens = Arc::new(AsyncTokenStore::new(tokens));
+            srv.api = Arc::new(services);
+            srv.ws = WsApiServer::new_with_reverse(
+                srv.api.clone(),
+                srv.bus.clone(),
+                &tls,
+                &tokens,
+                WsOptions {
+                    base_port: 0,
+                    bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
+                    ..Default::default()
+                },
+                srv.reverse_registry.clone(),
+                None,
+            )
+            .unwrap();
+            srv.port = srv.ws.start().await.unwrap();
+            client = connect_ws(srv.port, srv.cfg.clone()).await;
+            watching = connect_ws(srv.port, srv.cfg.clone()).await;
+            rpc(
+                &mut watching,
+                2,
+                "events.subscribe",
+                json!({"workspaceId":ws,"eventTypes":["script:changed","script:state"]}),
+            )
+            .await;
+        }
         if timeout {
             let run = rpc(
                 &mut client,
