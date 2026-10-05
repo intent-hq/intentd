@@ -33,7 +33,7 @@ static COORDINATION: LazyLock<HashMap<&'static str, Arc<Coordination>>> = LazyLo
         .collect()
 });
 
-/// Held through launch initialization (or the ephemeral adapter's lifetime).
+/// Held for the foreground provider process lifetime, including owned cleanup.
 /// Increment before waiting so queued preparation cannot overtake a real launch.
 pub(crate) struct LaunchGuard {
     coordination: Arc<Coordination>,
@@ -101,6 +101,11 @@ impl Drop for Pending {
 
 impl Preparation {
     pub(crate) fn enqueue(&self, ids: Vec<String>, settings: SettingsFile) {
+        // Non-Unix cleanup cannot yet own the npx.cmd -> node.exe tree.
+        // A best-effort no-op preserves ordinary on-demand launch safety.
+        if !cfg!(unix) {
+            return;
+        }
         let selector: Arc<Selector> = Arc::new(select);
         self.enqueue_with(ids, settings, &selector);
     }

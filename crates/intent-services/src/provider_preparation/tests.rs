@@ -479,3 +479,144 @@ fn pi_requires_detected_cli_and_rejects_known_old_versions_but_not_unknown() {
         assert_eq!(pi_eligible(&status), expected, "{version}/{resolved}");
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn foreground_npm_remains_exclusive_after_create_agent_returns() {
+    for delayed in [false, true] {
+        let dir = crate::test_support::test_tempdir("preparation-foreground-startup");
+        let root = dir.path().to_owned();
+        let (release, held) = std::sync::mpsc::sync_channel(1);
+        let held = Mutex::new(held);
+        let selector: Arc<Selector> = Arc::new(move |id, _| {
+            if delayed {
+                held.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            }
+            Some(fake_job(&root, id, None, false))
+        });
+        let queue = Preparation::default();
+        if delayed {
+            queue.enqueue_with(vec!["pi".into()], SettingsFile::default(), &selector);
+        }
+        let (manager, id, services) =
+            crate::agent_manager::tests::held_preparation_foreground(dir.path()).await;
+        wait_for(|| dir.path().join("foreground-started").exists()).await;
+        if delayed {
+            release.send(()).unwrap();
+        } else {
+            queue.enqueue_with(vec!["pi".into()], SettingsFile::default(), &selector);
+        }
+        wait_for(|| queue.state.lock().unwrap().pending.is_empty()).await;
+        let overlapped = dir.path().join("pi/started").exists();
+        if !delayed {
+            manager.stop(&id).await;
+        }
+        queue.shutdown().await;
+        // The delayed case exercises shutdown's batch teardown with a live guard.
+        manager.shutdown().await;
+        assert_eq!(
+            COORDINATION["pi"]
+                .launches
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        services.shutdown_store_writers().await;
+        assert!(
+            !overlapped,
+            "background npm started before foreground initialize (delayed selector: {delayed})"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn foreground_cleanup_cancellation_keeps_preparation_fenced_until_reaped() {
+    let dir = crate::test_support::test_tempdir("preparation-foreground-cleanup");
+    let (manager, id, services) =
+        crate::agent_manager::tests::held_preparation_foreground(dir.path()).await;
+    wait_for(|| dir.path().join("foreground-started").exists()).await;
+    let manager = Arc::new(manager);
+    let (entered, release) = crate::periodic_shutdown_tests::hold(&services, "physical-cleanup");
+    let owner = manager.clone();
+    let stop = tokio::spawn(async move { owner.stop(&id).await });
+    crate::periodic_shutdown_tests::entered(entered).await;
+    stop.abort();
+    let _ = stop.await;
+    let root = dir.path().to_owned();
+    let selector: Arc<Selector> = Arc::new(move |id, _| Some(fake_job(&root, id, None, false)));
+    let queue = Preparation::default();
+    queue.enqueue_with(vec!["pi".into()], SettingsFile::default(), &selector);
+    wait_for(|| queue.state.lock().unwrap().pending.is_empty()).await;
+    let overlapped = dir.path().join("pi/started").exists();
+    release.send(()).unwrap();
+    manager.shutdown().await;
+    assert_eq!(
+        COORDINATION["pi"]
+            .launches
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(
+        !overlapped,
+        "cancelled stop released protection before tree cleanup"
+    );
+    queue.enqueue_with(vec!["pi".into()], SettingsFile::default(), &selector);
+    wait_for(|| queue.state.lock().unwrap().outcomes.contains_key("pi")).await;
+    assert!(queue.state.lock().unwrap().outcomes["pi"].receipt.is_some());
+    queue.shutdown().await;
+    services.shutdown_store_writers().await;
+}
+
+#[cfg(not(unix))]
+#[test]
+fn unsupported_platform_preparation_is_noop_without_runtime_or_processes() {
+    let queue = Preparation::default();
+    queue.enqueue(
+        PROVIDERS.map(str::to_owned).to_vec(),
+        SettingsFile::default(),
+    );
+    assert!(queue.state.lock().unwrap().pending.is_empty());
+    assert!(queue.state.lock().unwrap().outcomes.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_foreground_initialize_retains_guard_until_cleanup_finishes() {
+    let dir = crate::test_support::test_tempdir("preparation-failed-initialize");
+    let (manager, id, services) =
+        crate::agent_manager::tests::held_preparation_foreground(dir.path()).await;
+    wait_for(|| dir.path().join("foreground-started").exists()).await;
+    let (entered, release) = crate::periodic_shutdown_tests::hold(&services, "physical-cleanup");
+    // The foreground fixture exits unsuccessfully as soon as it reads initialize.
+    assert!(manager
+        .start_session(&id, dir.path().to_owned(), find_provider("pi").unwrap())
+        .await
+        .is_err());
+    crate::periodic_shutdown_tests::entered(entered).await;
+    let root = dir.path().to_owned();
+    let selector: Arc<Selector> = Arc::new(move |id, _| Some(fake_job(&root, id, None, false)));
+    let queue = Preparation::default();
+    queue.enqueue_with(vec!["pi".into()], SettingsFile::default(), &selector);
+    wait_for(|| queue.state.lock().unwrap().pending.is_empty()).await;
+    let overlapped = dir.path().join("pi/started").exists();
+    release.send(()).unwrap();
+    manager.shutdown().await;
+    assert_eq!(
+        COORDINATION["pi"]
+            .launches
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(
+        !overlapped,
+        "failed initialize released protection before cleanup"
+    );
+    queue.enqueue_with(vec!["pi".into()], SettingsFile::default(), &selector);
+    wait_for(|| queue.state.lock().unwrap().outcomes.contains_key("pi")).await;
+    assert!(queue.state.lock().unwrap().outcomes["pi"].receipt.is_some());
+    queue.shutdown().await;
+    services.shutdown_store_writers().await;
+}

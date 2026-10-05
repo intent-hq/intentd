@@ -2705,6 +2705,7 @@ fn mock_handle() -> AgentHandle {
             _rules_config: None,
             _pi_extension: None,
             npx_launch_dir: None,
+            preparation_guard: None,
             cleanup_lease: None,
             cleanup_services: None,
         }),
@@ -5022,6 +5023,7 @@ fn track_mock_agent_inner(
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
@@ -5179,6 +5181,7 @@ fn track_mock_agent_prompt_rpc_error_inner(
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
@@ -9003,6 +9006,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
@@ -20955,6 +20959,7 @@ mod harness_wake_tests {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
@@ -26445,4 +26450,53 @@ async fn submission_correlation_partial_flush_retains_persisted_head_and_tail() 
             1
         );
     }
+}
+
+/// A foreground npm process held before ACP initialize, using the real manager
+/// spawn and resource ownership paths. Pi's extension is irrelevant to this race.
+#[cfg(unix)]
+pub(crate) async fn held_preparation_foreground(
+    root: &std::path::Path,
+) -> (AgentManager, AgentId, Services) {
+    use std::os::unix::fs::PermissionsExt;
+    let store = Store::open(&root.join("foreground.db")).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let services = Services::new_with_file_secrets(
+        store,
+        intent_core::FileSecretStore::with_path(root.join("secrets.json")),
+    )
+    .with_event_bus(bus.clone());
+    let mgr = AgentManager::new(services.clone(), Arc::new(BusEventSink::new(bus)), 4);
+    let ws = WorkspaceId::from("held-npm-workspace");
+    let id = AgentId::from("held-npm-agent");
+    seed_agent(&mgr, &ws, &id).await;
+    let npx = root.join("foreground-npx");
+    std::fs::write(
+        &npx,
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$FOREGROUND_STARTED\"\nread -r request\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut provider = *intent_providers::find_provider("pi").unwrap();
+    provider.mcp_via_pi_extension = false;
+    let mut opts = intent_acp::spawn::SpawnOptions::new(&provider);
+    opts.npx_fallback_binary = Some(&npx);
+    opts.npx_fallback_package = provider.npx_only_package;
+    opts.extra_env.insert(
+        "FOREGROUND_STARTED".into(),
+        root.join("foreground-started")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    mgr.create_agent(
+        id.clone(),
+        ws,
+        "Held npm",
+        "implementor",
+        root.to_owned(),
+        &opts,
+    )
+    .await
+    .unwrap();
+    (mgr, id, services)
 }

@@ -102,6 +102,7 @@ pub(super) fn handle(
                     _rules_config: None,
                     _pi_extension: None,
                     npx_launch_dir: None,
+                    preparation_guard: None,
                     cleanup_lease: None,
                     cleanup_services: None,
                 },
