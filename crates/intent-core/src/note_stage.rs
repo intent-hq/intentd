@@ -480,6 +480,40 @@ impl NoteStageTail {
     /// # Errors
     /// Rejects reopened groups, gaps, overlaps and equal-start splices/selections.
     pub fn advance(&self, stream: NoteStageStream, records: &[NoteStageRecord]) -> Result<Self> {
+        self.advance_with_selection_union(stream, records, false)
+    }
+
+    /// Advance using the operation's immutable, admitted header. Only source
+    /// search permits unordered, overlapping or duplicate selection ranges.
+    /// Records must first pass `NoteStageAppend::validate` with this same header;
+    /// the caller must bind the header and tail to the same persisted operation.
+    /// No uploaded record or digest is changed here. The Store computes the
+    /// selection union separately at seal; ordinals still describe upload order.
+    /// # Errors
+    /// Rejects invalid headers and all ordinary tail errors except selection
+    /// ordering when output is search and query mode is source.
+    pub fn advance_for_header(
+        &self,
+        stream: NoteStageStream,
+        records: &[NoteStageRecord],
+        header: &NoteStageHeader,
+    ) -> Result<Self> {
+        header.validate()?;
+        let selection_union = stream == NoteStageStream::Selection
+            && header.output == NoteStageOutput::Search
+            && header
+                .query
+                .as_ref()
+                .is_some_and(|query| query.mode == NoteStageSearchMode::Source);
+        self.advance_with_selection_union(stream, records, selection_union)
+    }
+
+    fn advance_with_selection_union(
+        &self,
+        stream: NoteStageStream,
+        records: &[NoteStageRecord],
+        selection_union: bool,
+    ) -> Result<Self> {
         require(stream != NoteStageStream::Text)?;
         let mut next = self.clone();
         for record in records {
@@ -515,7 +549,7 @@ impl NoteStageTail {
             }
             require(ordinal == next.next_ordinal && ordinal < SAFE)?;
             if let (Some((start, _)), Some((old_start, old_end))) = (range, next.previous_range) {
-                require(start > old_start && start >= old_end)?;
+                require(selection_union || (start > old_start && start >= old_end))?;
             }
             next.next_ordinal = ordinal + 1;
             next.previous_range = range;

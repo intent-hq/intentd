@@ -1,5 +1,211 @@
 use super::*;
 
+fn source_search_header() -> NoteStageHeader {
+    let mut header = begin().header;
+    header.output = NoteStageOutput::Search;
+    header.query = Some(NoteStageSearch {
+        text: "literal".into(),
+        case_sensitive: false,
+        mode: NoteStageSearchMode::Source,
+    });
+    header
+}
+
+fn selection_range(ordinal: u64, start: u64, end: u64) -> Value {
+    json!({"kind":"range","ordinal":ordinal,"start":start,"end":end,
+        "anchorAffinity":"after","headAffinity":"before","direction":"backward"})
+}
+
+#[test]
+fn source_search_tail_preserves_unordered_selection_records_across_pages() {
+    let header = source_search_header();
+    let header_before = serde_json::to_value(&header).unwrap();
+    let mut tail = NoteStageTail::default();
+    for (ordinal, (start, end)) in [(8, 12), (2, 9), (2, 9), (9, 14), (0, 0)]
+        .into_iter()
+        .enumerate()
+    {
+        let request = append(
+            NoteStageStream::Selection,
+            vec![selection_range(ordinal as u64, start, end)],
+        );
+        let original = serde_json::to_value(&request).unwrap();
+        let records = request.validate(&header).unwrap();
+        tail = tail
+            .advance_for_header(NoteStageStream::Selection, &records, &header)
+            .unwrap();
+        assert_eq!(tail.next_ordinal, ordinal as u64 + 1);
+        assert_eq!(tail.previous_range, Some((start, end)));
+        assert_eq!(serde_json::to_value(&request).unwrap(), original);
+        assert_eq!(request.computed_digest().unwrap(), request.chunk_digest);
+        // Persisted tails contain no union, sorted records or policy flag.
+        tail = serde_json::from_value(serde_json::to_value(&tail).unwrap()).unwrap();
+    }
+    assert_eq!(serde_json::to_value(&header).unwrap(), header_before);
+}
+
+#[test]
+fn source_search_selection_exception_is_header_specific_and_default_is_strict() {
+    for (start, end) in [(1, 3), (4, 10), (8, 12), (8, 13)] {
+        let request = append(
+            NoteStageStream::Selection,
+            vec![selection_range(0, 8, 12), selection_range(1, start, end)],
+        );
+        let header = source_search_header();
+        let records = request.validate(&header).unwrap();
+        let tail = NoteStageTail::default();
+        assert!(tail.advance(NoteStageStream::Selection, &records).is_err());
+        assert!(tail
+            .advance_for_header(NoteStageStream::Selection, &records, &header)
+            .is_ok());
+        let mut rendered = header.clone();
+        rendered.query.as_mut().unwrap().mode = NoteStageSearchMode::RenderedText;
+        for strict in [rendered, begin().header, {
+            let mut h = begin().header;
+            h.output = NoteStageOutput::SelectionMarkdown;
+            h
+        }] {
+            assert!(tail
+                .advance_for_header(NoteStageStream::Selection, &records, &strict)
+                .is_err());
+        }
+    }
+    let header = begin().header;
+    let request = append(
+        NoteStageStream::Selection,
+        vec![selection_range(0, 1, 3), selection_range(1, 3, 5)],
+    );
+    let records = request.validate(&header).unwrap();
+    assert!(NoteStageTail::default()
+        .advance_for_header(NoteStageStream::Selection, &records, &header)
+        .is_ok()); // Touching nonempty ranges were already legal in strict mode.
+}
+
+#[test]
+fn source_search_tail_keeps_ordinal_errors_atomic_and_rejects_invalid_headers() {
+    let header = source_search_header();
+    let request = append(NoteStageStream::Selection, vec![selection_range(0, 8, 12)]);
+    let tail = NoteStageTail::default()
+        .advance_for_header(
+            NoteStageStream::Selection,
+            &request.validate(&header).unwrap(),
+            &header,
+        )
+        .unwrap();
+    let original = tail.clone();
+    for ordinal in [0, 2, SAFE] {
+        let records = [NoteStageRecord::Range {
+            ordinal,
+            start: 0,
+            end: 1,
+            anchor_affinity: NoteStageAffinity::After,
+            head_affinity: NoteStageAffinity::Before,
+            direction: NoteStageDirection::Backward,
+        }];
+        assert!(tail
+            .advance_for_header(NoteStageStream::Selection, &records, &header)
+            .is_err());
+        assert_eq!(tail, original);
+    }
+    let request = append(
+        NoteStageStream::Selection,
+        vec![selection_range(1, 0, 1), selection_range(3, 1, 2)],
+    );
+    assert!(tail
+        .advance_for_header(
+            NoteStageStream::Selection,
+            &request.validate(&header).unwrap(),
+            &header,
+        )
+        .is_err());
+    assert_eq!(tail, original);
+    for invalid in [
+        {
+            let mut h = header.clone();
+            h.query = None;
+            h
+        },
+        {
+            let mut h = header.clone();
+            h.query.as_mut().unwrap().case_sensitive = true;
+            h
+        },
+    ] {
+        assert!(tail
+            .advance_for_header(NoteStageStream::Selection, &[], &invalid)
+            .is_err());
+    }
+}
+
+#[test]
+fn source_search_tail_does_not_relax_dirty_or_mutation_ordering() {
+    let header = source_search_header();
+    for stream in [NoteStageStream::Dirty, NoteStageStream::Mutation] {
+        for (start, end) in [(1, 3), (4, 10), (8, 12)] {
+            let mut records = vec![splice(9, 0, 8, 12), splice(9, 1, start, end)];
+            if stream == NoteStageStream::Mutation {
+                for record in &mut records {
+                    record.as_object_mut().unwrap().remove("localSequence");
+                }
+            }
+            let request = append(stream, records);
+            assert!(NoteStageTail::default()
+                .advance_for_header(stream, &request.validate(&header).unwrap(), &header)
+                .is_err());
+        }
+    }
+    let request = append(
+        NoteStageStream::Dirty,
+        vec![splice(8, 0, 8, 12), splice(9, 0, 0, 1)],
+    );
+    let tail = NoteStageTail::default()
+        .advance_for_header(
+            NoteStageStream::Dirty,
+            &request.validate(&header).unwrap(),
+            &header,
+        )
+        .unwrap();
+    let reopen = append(NoteStageStream::Dirty, vec![splice(8, 0, 20, 21)]);
+    assert!(tail
+        .advance_for_header(
+            NoteStageStream::Dirty,
+            &reopen.validate(&header).unwrap(),
+            &header,
+        )
+        .is_err());
+}
+
+#[test]
+fn source_search_selection_still_requires_valid_record_shapes_and_bounds() {
+    let header = source_search_header();
+    for value in [
+        selection_range(0, 4, 3),
+        selection_range(0, 0, SAFE + 1),
+        selection_range(SAFE, 0, 1),
+        json!({"kind":"range","ordinal":0,"start":0,"end":1,
+            "anchorAffinity":"sideways","headAffinity":"before","direction":"forward"}),
+    ] {
+        assert!(append(NoteStageStream::Selection, vec![value])
+            .validate(&header)
+            .is_err());
+    }
+    let request = append(NoteStageStream::Selection, vec![selection_range(0, 1, 2)]);
+    let records = request.validate(&header).unwrap();
+    for stream in [
+        NoteStageStream::Dirty,
+        NoteStageStream::Mutation,
+        NoteStageStream::Live,
+        NoteStageStream::Text,
+    ] {
+        assert!(NoteStageTail::default()
+            .advance_for_header(stream, &records, &header)
+            .is_err());
+    }
+    let mut all = header;
+    all.selection = NoteStageSelection::All;
+    assert!(request.validate(&all).is_err());
+}
+
 const OP: &str = "11111111-1111-4111-8111-111111111111";
 fn begin() -> NoteStageBegin {
     let mut request:NoteStageBegin=serde_json::from_value(json!({"backendId":"b","workspaceId":"w","noteId":"n","noteInstanceId":"i","operationId":OP,"headerDigest":"0".repeat(64),"expiresAt":"2026-10-05T12:00:00.000Z",
