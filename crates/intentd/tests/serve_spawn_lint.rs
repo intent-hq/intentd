@@ -12,7 +12,8 @@
 //! command needs the port marker; each daemon command independently needs complete
 //! identity. Identity env writes/removals, `env_clear` and dynamic env/envs invalidate
 //! identity until an explicit reset on that same variable, before spawn or return.
-//! Removing either token is harmless. Named mock helpers require a local reason.
+//! Removing standard/enterprise tokens or `GH_HOST` is harmless. Named mock
+//! helpers require a local reason.
 //!
 //! `// serve-spawn: allow — reason` permits only raw/wrapper launch mechanics,
 //! never identity inheritance. `// fixture-identity: allow — reason` authorizes
@@ -50,6 +51,9 @@ const RESET_HELPERS: &[&str] = &["hermetic_fixture_identity", "hermetic_pty_fixt
 const IDENTITY_KEYS: &[&str] = &[
     "GITHUB_TOKEN",
     "GH_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GH_HOST",
     "GH_CONFIG_DIR",
     "INTENTD_SECRETS_FILE",
 ];
@@ -373,8 +377,15 @@ fn classify(src: &str) -> Vec<Offense> {
                 .strip_prefix('"')
                 .is_some_and(|k| IDENTITY_KEYS.contains(&k));
             let dynamic_key = !key.starts_with('"');
-            let harmless_removal =
-                token.text == "env_remove" && ["\"GITHUB_TOKEN", "\"GH_TOKEN"].contains(&key);
+            let harmless_removal = token.text == "env_remove"
+                && [
+                    "\"GITHUB_TOKEN",
+                    "\"GH_TOKEN",
+                    "\"GH_ENTERPRISE_TOKEN",
+                    "\"GITHUB_ENTERPRISE_TOKEN",
+                    "\"GH_HOST",
+                ]
+                .contains(&key);
             if ["env_clear", "envs"].contains(&token.text.as_str())
                 || (["env", "env_remove"].contains(&token.text.as_str())
                     && (identity_key || dynamic_key)
@@ -711,6 +722,9 @@ mod identity_regressions {
         for mutation in [
             "env(\"GITHUB_TOKEN\", \"mock\")",
             "env(\"GH_TOKEN\", \"mock\")",
+            "env(\"GH_ENTERPRISE_TOKEN\", \"mock\")",
+            "env(\"GITHUB_ENTERPRISE_TOKEN\", \"mock\")",
+            "env(\"GH_HOST\", \"github.example.invalid\")",
             "env(\"GH_CONFIG_DIR\", outside)",
             "env(\"INTENTD_SECRETS_FILE\", outside)",
             "env_remove(\"GH_CONFIG_DIR\")",
@@ -875,6 +889,16 @@ cmd.env("GH_TOKEN", "synthetic").env_clear();"##;
     fn token_removal_and_unrelated_environment_are_allowed() {
         let src = "common::hermetic_serve_command(&d).env_remove(\"GITHUB_TOKEN\").env_remove(\"GH_TOKEN\").env(\"INTENTD_AUTH_TOKEN\", mock).env(\"URL\", \"https://mock.invalid\").spawn();";
         assert!(classify(src).is_empty());
+        for key in [
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+            "GH_HOST",
+        ] {
+            let src = format!("let mut cmd = common::hermetic_serve_command(&d); cmd.env_remove({key:?}); cmd.spawn();");
+            assert!(classify(&src).is_empty(), "{src}");
+        }
     }
     #[test]
     fn serve_in_unrelated_argument_does_not_make_a_doctor_command_a_daemon() {

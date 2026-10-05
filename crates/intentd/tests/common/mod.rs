@@ -600,7 +600,7 @@ async fn await_wss_stopped_impl(socket: &Path, log_path: Option<&Path>) {
     }
 }
 
-/// Build a daemon fixture with all four GitHub identity settings and an
+/// Build a daemon fixture with complete GitHub identity isolation and an
 /// OS-assigned WSS port. The caller owns `data_dir` through child shutdown.
 /// Workspaces, stdio, authentication, and mock-provider settings remain caller-owned.
 /// Later explicit TCP port overrides retain their usual meaning.
@@ -619,7 +619,8 @@ pub fn hermetic_serve_command_fixed_port(data_dir: &Path) -> std::process::Comma
     cmd
 }
 
-/// Apply all four identity settings, including after caller env overrides.
+/// Remove standard/enterprise GitHub tokens and `GH_HOST`, and select private
+/// config/secrets paths, including after caller env overrides.
 /// Reuse an existing `gh-config` only when it is a real, empty directory;
 /// reject populated directories and symlinks without deleting fixture state.
 /// The private secrets file may contain deliberately seeded state and is never
@@ -663,6 +664,9 @@ pub fn hermetic_fixture_identity(cmd: &mut std::process::Command, data_dir: &Pat
     }
     cmd.env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
+        .env_remove("GH_HOST")
         .env("GH_CONFIG_DIR", gh_config_dir)
         .env("INTENTD_SECRETS_FILE", secrets);
 }

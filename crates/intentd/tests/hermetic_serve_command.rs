@@ -29,7 +29,13 @@ fn fixture_command(data_dir: &Path, fixed: bool) -> Command {
 }
 
 fn identity_contract(cmd: &Command, data_dir: &Path) -> Result<(), &'static str> {
-    for name in ["GITHUB_TOKEN", "GH_TOKEN"] {
+    for name in [
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GH_HOST",
+    ] {
         if explicit_env(cmd, name) != EnvSetting::Removed {
             return Err(name);
         }
@@ -101,6 +107,9 @@ fn every_missing_identity_setting_is_detected_before_spawn() {
         for missing in [
             "GITHUB_TOKEN",
             "GH_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+            "GH_HOST",
             "GH_CONFIG_DIR",
             "INTENTD_SECRETS_FILE",
         ] {
@@ -206,12 +215,15 @@ fn secrets_symlink_is_rejected_without_reading_its_target() {
 }
 
 #[test]
-fn reapplying_identity_after_overrides_restores_all_four_settings() {
+fn reapplying_identity_after_overrides_restores_all_identity_settings() {
     let dir = common::test_tempdir("serve-contract-reapply-");
     let mut cmd = fixture_command(dir.path(), false);
     for key in [
         "GITHUB_TOKEN",
         "GH_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GH_HOST",
         "GH_CONFIG_DIR",
         "INTENTD_SECRETS_FILE",
     ] {
@@ -233,6 +245,9 @@ fn mock_token_exception_restores_private_paths_and_confines_endpoints() {
     for key in [
         "GITHUB_TOKEN",
         "GH_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GH_HOST",
         "GH_CONFIG_DIR",
         "INTENTD_SECRETS_FILE",
     ] {
@@ -292,6 +307,9 @@ fn pty_wrapper_copies_complete_constructor_after_synthetic_overrides() {
     for key in [
         "GITHUB_TOKEN",
         "GH_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GH_HOST",
         "GH_CONFIG_DIR",
         "INTENTD_SECRETS_FILE",
     ] {
@@ -299,7 +317,13 @@ fn pty_wrapper_copies_complete_constructor_after_synthetic_overrides() {
     }
     cmd.env("FIXTURE", "keep-me");
     common::hermetic_pty_fixture_identity(&mut cmd, dir.path());
-    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+    for key in [
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GH_HOST",
+    ] {
         assert_eq!(cmd.get_env(key), None);
     }
     for (key, path) in [

@@ -152,10 +152,16 @@ mod fixture_command_tests {
             &[
                 ("GH_TOKEN", "synthetic-gh-token"),
                 ("GITHUB_TOKEN", "synthetic-github-token"),
+                ("GH_ENTERPRISE_TOKEN", "synthetic-enterprise-token"),
+                ("GITHUB_ENTERPRISE_TOKEN", "synthetic-enterprise-token"),
+                ("GH_HOST", "enterprise.example.invalid"),
             ],
         );
         assert_eq!(explicit_env(&cmd, "GH_TOKEN"), EnvSetting::Removed);
         assert_eq!(explicit_env(&cmd, "GITHUB_TOKEN"), EnvSetting::Removed);
+        for key in ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST"] {
+            assert_eq!(explicit_env(&cmd, key), EnvSetting::Removed, "{key}");
+        }
     }
 
     #[test]

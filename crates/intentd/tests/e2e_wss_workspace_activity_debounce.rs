@@ -434,13 +434,22 @@ fn activity_command_preserves_identity_after_synthetic_overrides() {
         &[
             ("GITHUB_TOKEN", "synthetic-token"),
             ("GH_TOKEN", "synthetic-token"),
+            ("GH_ENTERPRISE_TOKEN", "synthetic-enterprise-token"),
+            ("GITHUB_ENTERPRISE_TOKEN", "synthetic-enterprise-token"),
+            ("GH_HOST", "enterprise.example.invalid"),
             ("GH_CONFIG_DIR", "synthetic-host-config"),
             ("INTENTD_SECRETS_FILE", "synthetic-host-secrets"),
             ("MOCK_AGENT_BEHAVIOR", "keep-me"),
         ],
     );
     let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
-    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+    for key in [
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GH_HOST",
+    ] {
         assert_eq!(env.get(OsStr::new(key)), Some(&None), "{key}");
     }
     for (key, path) in [
