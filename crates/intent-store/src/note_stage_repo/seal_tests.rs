@@ -1181,3 +1181,157 @@ async fn stage_seal_metadata_late_sql_failure_rolls_back_and_retries() {
     .unwrap();
     assert_eq!(count, 2);
 }
+
+// Exact docs fixture: intent-hq/intent@3cb338711caff0f4b44c863dca9b566da64b09ca
+// docs/protocol/fixtures/notes/staged-metadata.json
+// SHA256 4a32caebcc82cd57dfd7f05e1c0b7a2a1a74b007252503ea045cb89ebb1d04d6
+const PUBLISHED_STAGED_METADATA: &str = r#"{
+  "status": "controlled-upload-graph-not-runtime-proof",
+  "operationId": "staged-operation-a",
+  "roots": [
+    "text-root",
+    "text-root",
+    "text-empty-standalone"
+  ],
+  "texts": [
+    {
+      "id": "text-root",
+      "operationId": "staged-operation-a",
+      "text": "{\"childrenRef\":\"dir-root-a\",\"id\":\"entry-root\",\"parentId\":null,\"type\":\"object\"}"
+    },
+    {
+      "id": "dir-root-a",
+      "operationId": "staged-operation-a",
+      "text": "{\"items\":[\"text-array\",\"text-empty-array\"],\"kind\":\"metadataChildren\",\"nextRef\":\"dir-root-b\"}"
+    },
+    {
+      "id": "dir-root-b",
+      "operationId": "staged-operation-a",
+      "text": "{\"items\":[\"text-empty-object\",\"text-title\",\"text-long-key\"],\"kind\":\"metadataChildren\",\"nextRef\":null}"
+    },
+    {
+      "id": "text-array",
+      "operationId": "staged-operation-a",
+      "text": "{\"childrenRef\":\"dir-array\",\"id\":\"entry-array\",\"key\":\"array\",\"parentId\":\"entry-root\",\"type\":\"array\"}"
+    },
+    {
+      "id": "dir-array",
+      "operationId": "staged-operation-a",
+      "text": "{\"items\":[\"text-value\",\"text-null\"],\"kind\":\"metadataChildren\",\"nextRef\":null}"
+    },
+    {
+      "id": "text-value",
+      "operationId": "staged-operation-a",
+      "text": "{\"id\":\"entry-value\",\"index\":0,\"parentId\":\"entry-array\",\"type\":\"string\",\"valueRef\":\"scalar-shared\"}"
+    },
+    {
+      "id": "text-null",
+      "operationId": "staged-operation-a",
+      "text": "{\"id\":\"entry-null\",\"index\":1,\"parentId\":\"entry-array\",\"type\":\"null\",\"value\":null}"
+    },
+    {
+      "id": "text-empty-array",
+      "operationId": "staged-operation-a",
+      "text": "{\"childrenRef\":\"dir-empty-array\",\"id\":\"entry-empty-array\",\"key\":\"emptyArray\",\"parentId\":\"entry-root\",\"type\":\"array\"}"
+    },
+    {
+      "id": "dir-empty-array",
+      "operationId": "staged-operation-a",
+      "text": "{\"items\":[],\"kind\":\"metadataChildren\",\"nextRef\":null}"
+    },
+    {
+      "id": "text-empty-object",
+      "operationId": "staged-operation-a",
+      "text": "{\"childrenRef\":\"dir-empty-object\",\"id\":\"entry-empty-object\",\"key\":\"emptyObject\",\"parentId\":\"entry-root\",\"type\":\"object\"}"
+    },
+    {
+      "id": "dir-empty-object",
+      "operationId": "staged-operation-a",
+      "text": "{\"items\":[],\"kind\":\"metadataChildren\",\"nextRef\":null}"
+    },
+    {
+      "id": "text-title",
+      "operationId": "staged-operation-a",
+      "text": "{\"id\":\"entry-title\",\"key\":\"title\",\"parentId\":\"entry-root\",\"type\":\"string\",\"valueRef\":\"scalar-shared\"}"
+    },
+    {
+      "id": "text-long-key",
+      "operationId": "staged-operation-a",
+      "text": "{\"id\":\"entry-long-key\",\"keyRef\":\"scalar-long-key\",\"parentId\":\"entry-root\",\"type\":\"boolean\",\"value\":false}"
+    },
+    {
+      "id": "scalar-shared",
+      "operationId": "staged-operation-a",
+      "text": ""
+    },
+    {
+      "id": "scalar-long-key",
+      "operationId": "staged-operation-a",
+      "text": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+    },
+    {
+      "id": "unreachable-upload",
+      "operationId": "staged-operation-a",
+      "text": "not JSON, not a metadata entry"
+    },
+    {
+      "id": "text-empty-standalone",
+      "operationId": "staged-operation-a",
+      "text": "{\"childrenRef\":\"dir-empty-standalone\",\"id\":\"entry-empty-standalone\",\"parentId\":null,\"type\":\"object\"}"
+    },
+    {
+      "id": "dir-empty-standalone",
+      "operationId": "staged-operation-a",
+      "text": "{\"items\":[],\"kind\":\"metadataChildren\",\"nextRef\":null}"
+    }
+  ],
+  "expectedEntryIds": [
+    "entry-root",
+    "entry-array",
+    "entry-empty-array",
+    "entry-empty-object",
+    "entry-title",
+    "entry-long-key",
+    "entry-value",
+    "entry-null",
+    "entry-empty-standalone"
+  ]
+}
+"#;
+
+#[tokio::test]
+async fn stage_seal_metadata_published_canonical_byte_fixture() {
+    let fixture: Value = serde_json::from_str(PUBLISHED_STAGED_METADATA).unwrap();
+    let resources = fixture["texts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            assert_eq!(entry["operationId"], fixture["operationId"]);
+            (
+                entry["id"].as_str().unwrap().to_owned(),
+                entry["text"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let mut conn = graph_fixture(resources).await;
+    for root in fixture["roots"].as_array().unwrap() {
+        validate_attribute_graph(&mut conn, "op", root.as_str().unwrap())
+            .await
+            .unwrap();
+    }
+    let actual:Vec<String>=sqlx::query_scalar("SELECT id FROM note_stage_validation WHERE operation_key='op' AND kind='entryId' ORDER BY id").fetch_all(&mut conn).await.unwrap();
+    let mut expected: Vec<_> = fixture["expectedEntryIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap())
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    let unrelated:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM note_stage_validation WHERE operation_key='op' AND id='unreachable-upload')").fetch_one(&mut conn).await.unwrap();
+    assert!(
+        !unrelated,
+        "unrelated uploaded raw text is not a metadata graph edge"
+    );
+}
