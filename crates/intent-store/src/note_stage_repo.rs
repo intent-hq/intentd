@@ -17,6 +17,7 @@ mod seal;
 mod search_detail;
 mod search_output;
 mod search_ranges;
+mod selection_output;
 mod source;
 mod status;
 pub(crate) mod view_read;

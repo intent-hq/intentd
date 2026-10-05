@@ -392,7 +392,7 @@ async fn cache_text_digests(conn: &mut SqliteConnection, operation: &str) -> Res
     Ok(())
 }
 
-async fn verify_reference(
+pub(super) async fn verify_reference(
     conn: &mut SqliteConnection,
     operation: &str,
     reference: &NoteStageTextReference,
@@ -417,7 +417,7 @@ async fn verify_reference(
 
 // Primary-key keyset continuation, one <=64KiB encoded record at a time. Semantic
 // ordinals may reset per history group; chunk-local ordinals never do.
-async fn next_record(
+pub(super) async fn next_record(
     conn: &mut SqliteConnection,
     operation: &str,
     stream: &str,
@@ -786,7 +786,7 @@ async fn cached_text(
 // Only a specifically referenced entry/directory is reconstructed, and only
 // after its verified byte count passes the logical resource budget. Raw scalar
 // resources are never parsed as JSON or loaded wholesale by this function.
-async fn metadata_resource(
+pub(super) async fn metadata_resource(
     conn: &mut SqliteConnection,
     operation: &str,
     id: &str,

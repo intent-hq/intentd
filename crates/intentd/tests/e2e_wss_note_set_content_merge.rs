@@ -2118,3 +2118,6 @@ async fn bounded_staged_source_search_and_raw_hit_details_over_wss() {
     rpc.close(None).await.unwrap();
     fx.ws.stop().await;
 }
+
+#[path = "wss_integration/staged_selection.rs"]
+mod staged_selection;

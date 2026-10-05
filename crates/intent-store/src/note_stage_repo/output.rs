@@ -1,5 +1,5 @@
-//! Bounded immutable staged source output. Selection/rendered adapters are
-//! separate: no live descriptor is interpreted as source serialization authority.
+//! Bounded immutable staged source and supported native selection output.
+//! Selection resources must pass the independent frozen-view adapter.
 use super::{db, fail, require_workspace, view_read};
 use crate::Store;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -7,6 +7,7 @@ use hmac::{Hmac, Mac};
 use intent_core::{
     note_mutation::NoteMutationError,
     note_page::NotePageError,
+    note_stage::NoteStageOutput,
     note_stage_read::{NoteStageRead, NoteStageReadKind},
     Error, Result,
 };
@@ -61,8 +62,42 @@ fn smaller_prefix(text: &str, bytes: usize) -> usize {
     next
 }
 
+// Output positions are independent of the complete frozen source extent.
+// This scan is confined to the adapter's bounded selection result.
+fn selection_piece(text: &str, at: u64, max_bytes: usize) -> Result<(u64, String, u64)> {
+    let length = u64::try_from(text.encode_utf16().count()).map_err(db)?;
+    if text.is_empty() || at > length {
+        return Err(invalid());
+    }
+    let mut units = 0_u64;
+    let mut start = None;
+    for (byte, scalar) in text.char_indices() {
+        if units == at {
+            start = Some(byte);
+            break;
+        }
+        units += u64::try_from(scalar.len_utf16()).expect("scalar width fits");
+    }
+    let start = start
+        .or_else(|| (at == length).then_some(text.len()))
+        .ok_or_else(invalid)?;
+    let mut end = text.len().min(start.saturating_add(max_bytes));
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == start && at < length {
+        return Err(fail(NoteMutationError::Budget));
+    }
+    let part = &text[start..end];
+    Ok((
+        at + u64::try_from(part.encode_utf16().count()).map_err(db)?,
+        part.to_owned(),
+        length,
+    ))
+}
+
 impl Store {
-    /// Read one bounded source page from the original sealed view.
+    /// Read one bounded source or supported selection page from the sealed view.
     /// Current membership is checked by Services before and after this method.
     /// # Errors
     /// Rejects unknown/foreign operation, cancellation/expiry, cursor rebinding,
@@ -87,9 +122,13 @@ impl Store {
         if request.kind == NoteStageReadKind::Search {
             return super::search_output::read(self, principal, request, rpc_id).await;
         }
-        if request.kind != NoteStageReadKind::Source {
-            return Err(Error::Unsupported("staged output adapter".into()));
-        }
+        let (expected_output, output_kind) = match request.kind {
+            NoteStageReadKind::Source => (NoteStageOutput::Source, "source"),
+            NoteStageReadKind::SelectionMarkdown => {
+                (NoteStageOutput::SelectionMarkdown, "selectionMarkdown")
+            }
+            NoteStageReadKind::Search => unreachable!("search dispatched above"),
+        };
         let mut tx = self.read_pool().begin().await.map_err(db)?;
         require_workspace(&mut tx, &request.workspace_id).await?;
         let row=sqlx::query("SELECT o.operation_key,o.outcome,s.header_digest,s.payload_digest,s.view_id,s.view_length,s.phase,s.header FROM note_operation o JOIN note_stage s USING(operation_key) WHERE o.principal=? AND o.backend_id=? AND o.workspace_id=? AND o.note_id=? AND o.instance_id=? AND o.operation_id=? AND o.method_kind='staged'")
@@ -102,7 +141,7 @@ impl Store {
         }
         let header: intent_core::note_stage::NoteStageHeader =
             serde_json::from_str(row.get("header")).map_err(db)?;
-        if header.output != intent_core::note_stage::NoteStageOutput::Source {
+        if header.output != expected_output {
             return Err(invalid());
         }
         let state: Value = serde_json::from_str(row.get("outcome")).map_err(db)?;
@@ -134,16 +173,25 @@ impl Store {
             .map(|s| position(s, &key, &binding))
             .transpose()?
             .unwrap_or(0);
-        let (end, text) = view_read::read_piece(
-            &mut tx,
-            &operation,
-            u64::try_from(generation).map_err(db)?,
-            length,
-            at,
-            request.max_source_bytes.unwrap_or(8192),
-        )
-        .await?;
-        let mut out = json!({"kind":"noteOperationPage","scope":request.scope(),"operationId":request.operation_id,"headerDigest":request.header_digest,"payloadDigest":payload,"viewId":view,"outputKind":"source","sourceLength":length,"items":[],"nextCursor":null,"expiresAt":expires});
+        let generation = u64::try_from(generation).map_err(db)?;
+        let (end, text, output_length) = if request.kind == NoteStageReadKind::Source {
+            let (end, text) = view_read::read_piece(
+                &mut tx,
+                &operation,
+                generation,
+                length,
+                at,
+                request.max_source_bytes.unwrap_or(8192),
+            )
+            .await?;
+            (end, text, length)
+        } else {
+            let output =
+                super::selection_output::prepare(&mut tx, &operation, &header, generation, length)
+                    .await?;
+            selection_piece(&output, at, request.max_source_bytes.unwrap_or(8192))?
+        };
+        let mut out = json!({"kind":"noteOperationPage","scope":request.scope(),"operationId":request.operation_id,"headerDigest":request.header_digest,"payloadDigest":payload,"viewId":view,"outputKind":output_kind,"sourceLength":length,"items":[],"nextCursor":null,"expiresAt":expires});
         let mut bytes = text.len();
         loop {
             let part = &text[..bytes];
@@ -156,7 +204,7 @@ impl Store {
             } else {
                 json!([{"offset":at,"text":part}])
             };
-            out["nextCursor"] = if next == length {
+            out["nextCursor"] = if next == output_length {
                 Value::Null
             } else {
                 json!(cursor(&key, &binding, next)?)
@@ -165,7 +213,7 @@ impl Store {
                 .to_string()
                 .len()
                 <= request.max_wire_bytes.unwrap_or(4096)
-                && (next > at || at == length)
+                && (next > at || at == output_length)
             {
                 break;
             }
