@@ -14,6 +14,7 @@ mod read;
 mod reclaim;
 pub use reclaim::NoteOperationReclaimStats;
 mod seal;
+mod search_ranges;
 mod source;
 mod status;
 pub(crate) mod view_read;

@@ -22,28 +22,7 @@ INSERT INTO note_stage_view VALUES('op',0,8);
 INSERT INTO note_page_piece VALUES('w','n','old',0,3,'A😀'),('w','n','old',3,8,'BCDEF');
 INSERT INTO note_stage_view_piece VALUES('op',0,0,8,'root','root',0);
 ";
-// Owner registers these proposed tables with cleanup compatibility in0154.
-const TABLES: &str = r#"-- Proposed tables only; owner also widens/rebuilds the 0153 queue step check
--- preserving existing (due_ms,mode,step). Append cleanup phases15/16, terminal17.
--- mode0 skips receipt phases8..14 to15; mode1 visits all phases. No renumbering.
--- Both tables must be excluded from transfer and independently drained in64-row
--- batches before note_stage deletion. No view FK: view cleanup precedes these.
-CREATE TABLE note_stage_search_input (
- operation_key TEXT NOT NULL REFERENCES note_stage(operation_key) ON DELETE CASCADE,
- generation INTEGER NOT NULL CHECK(generation BETWEEN 0 AND 9007199254740991),
- start INTEGER NOT NULL CHECK(start BETWEEN 0 AND 9007199254740991),
- end INTEGER NOT NULL CHECK(end>start AND end<=9007199254740991),
- ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 9007199254740991),
- PRIMARY KEY(operation_key,generation,start,end,ordinal)
-);
-CREATE TABLE note_stage_search_range (
- operation_key TEXT NOT NULL REFERENCES note_stage(operation_key) ON DELETE CASCADE,
- generation INTEGER NOT NULL CHECK(generation BETWEEN 0 AND 9007199254740991),
- start INTEGER NOT NULL CHECK(start BETWEEN 0 AND 9007199254740991),
- end INTEGER NOT NULL CHECK(end>start AND end<=9007199254740991),
- PRIMARY KEY(operation_key,generation,start)
-);
-"#;
+const TABLES: &str = include_str!("../../migrations/0155_note_stage_search_ranges.sql");
 
 fn header(selection: &str) -> NoteStageHeader {
     serde_json::from_value(json!({"baseRevision":"base","editorSessionId":"editor","localEditSequence":0,"liveGeneration":0,"selectionGeneration":0,"action":"read","output":"search","selection":selection,"query":{"text":"B","caseSensitive":false,"mode":"source"}})).unwrap()

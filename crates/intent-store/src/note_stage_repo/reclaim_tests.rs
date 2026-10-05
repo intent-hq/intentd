@@ -5,12 +5,12 @@ use std::sync::{
     Arc,
 };
 
-// The final include is the proposed migration supplied separately for the
-// integration owner. No test-local replacement for reclamation schema/triggers.
-const MIGRATIONS: [&str; 3] = [
+// Use the actual migrations, not test-local replacement cleanup triggers.
+const MIGRATIONS: [&str; 4] = [
     include_str!("../../migrations/0151_note_operations.sql"),
     include_str!("../../migrations/0153_note_stages.sql"),
     include_str!("../../migrations/0154_note_operation_reclaim.sql"),
+    include_str!("../../migrations/0155_note_stage_search_ranges.sql"),
 ];
 async fn connection(url: &str) -> SqliteConnection {
     let mut conn = SqliteConnection::connect(url).await.unwrap();
@@ -561,4 +561,77 @@ async fn actual_store_wrapper_cancellation_rolls_back_fence_progress_and_reopens
         Err(Error::NoteMutation(NoteMutationError::Expired))
     ));
     store.close().await;
+}
+
+#[tokio::test]
+async fn search_metadata_shares_existing_phase_quota_and_rolls_back() {
+    let mut conn = fixture().await;
+    stage(&mut conn, "op", "root", "cancelled", 200).await;
+    stage(&mut conn, "keeper", "other", "sealed", 200).await;
+    for key in ["op", "keeper"] {
+        for i in 0..30_i64 {
+            sqlx::query("INSERT INTO note_stage_search_input VALUES(?,0,?,?,?)")
+                .bind(key)
+                .bind(i)
+                .bind(i + 1)
+                .bind(i)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        for i in 0..45_i64 {
+            sqlx::query("INSERT INTO note_stage_search_range VALUES(?,0,?,?)")
+                .bind(key)
+                .bind(i)
+                .bind(i + 1)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        for i in 0..60 {
+            sqlx::query(
+                "INSERT INTO note_stage_validation VALUES(?,'entry',?,NULL,NULL,'done','{}')",
+            )
+            .bind(key)
+            .bind(i.to_string())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+    }
+    sqlx::query("UPDATE note_operation_reclaim SET step=6 WHERE operation_key='op'")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    {
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(reclaim_batch(&mut tx, 1000).await.unwrap().child_rows, 64);
+        tx.rollback().await.unwrap();
+    }
+    assert_eq!(count(&mut conn, "note_stage_search_input").await, 60);
+    assert_eq!(count(&mut conn, "note_stage_search_range").await, 90);
+    assert_eq!(count(&mut conn, "note_stage_validation").await, 120);
+    for expected in [64, 64, 7, 0] {
+        assert_eq!(tick(&mut conn, 1000).await.child_rows, expected);
+    }
+    let step: i64 =
+        sqlx::query_scalar("SELECT step FROM note_operation_reclaim WHERE operation_key='op'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(step, 7);
+    for (table, expected) in [
+        ("note_stage_search_input", 30),
+        ("note_stage_search_range", 45),
+        ("note_stage_validation", 60),
+    ] {
+        assert_eq!(count(&mut conn, table).await, expected);
+        let own: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {table} WHERE operation_key='op'"
+        ))
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(own, 0);
+    }
 }

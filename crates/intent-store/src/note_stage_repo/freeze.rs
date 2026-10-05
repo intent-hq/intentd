@@ -101,6 +101,13 @@ impl Store {
         if marker {
             return Err(Error::Unsupported("staged canonical marker adapter".into()));
         }
+        if header.output == intent_core::note_stage::NoteStageOutput::Search
+            && header.query.as_ref().is_some_and(|query| {
+                query.mode == intent_core::note_stage::NoteStageSearchMode::Source
+            })
+        {
+            super::search_ranges::normalize(&mut tx, &key, &header, &view).await?;
+        }
         state["phase"] = json!("sealed");
         state["payloadDigest"] = json!(request.payload_digest);
         state["viewLength"] = json!(view.length);

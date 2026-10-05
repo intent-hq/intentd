@@ -120,6 +120,8 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
     ("note_stage_view", "backend-local immutable staged view and validation ownership never transfer"),
     ("note_stage_view_piece", "backend-local immutable staged view and validation ownership never transfer"),
     ("note_stage_validation", "backend-local immutable staged view and validation ownership never transfer"),
+    ("note_stage_search_input", "backend-local frozen search selection ordering never transfers"),
+    ("note_stage_search_range", "backend-local frozen search selection union never transfers"),
     ("note_operation", "durable retry identities belong to the original backend namespace, principal and note incarnation; never execute or replay them on an imported incarnation"),
     ("note_operation_item", "receipt-owned mappings, effects and inverse references are local to excluded note_operation identities"),
     ("note_operation_text", "receipt-owned inverse text views belong to excluded backend-local operations"),

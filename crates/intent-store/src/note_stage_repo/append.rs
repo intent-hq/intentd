@@ -98,7 +98,7 @@ pub(super) async fn append(
     let tail = if request.stream == NoteStageStream::Text {
         tail
     } else {
-        tail.advance(request.stream, &parsed)
+        tail.advance_for_header(request.stream, &parsed, header)
             .map_err(Error::NoteMutation)?
     };
     sqlx::query("INSERT INTO note_stage_chunk(operation_key,stream,sequence,previous_digest,chunk_digest,record_count) VALUES(?,?,?,?,?,?)")

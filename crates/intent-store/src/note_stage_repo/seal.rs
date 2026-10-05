@@ -118,7 +118,7 @@ pub(super) async fn verify_manifest(
                 .map_err(Error::NoteMutation)?;
             if entry.stream != NoteStageStream::Text {
                 computed_tail = computed_tail
-                    .advance(entry.stream, &parsed)
+                    .advance_for_header(entry.stream, &parsed, header)
                     .map_err(Error::NoteMutation)?;
             }
             previous = Some(chunk_hash);

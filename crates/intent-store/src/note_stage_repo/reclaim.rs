@@ -179,7 +179,30 @@ async fn reclaim_operation(
         }
     }
     if let Some((table, order)) = CHILDREN.get(step) {
-        let removed = drain(conn, table, "operation_key", order, &key).await?;
+        let removed = if step == 6 {
+            // Keep durable step numbers unchanged. Search indexes are derived
+            // metadata owned by stages created/sealed after migration 0155;
+            // both are drained before the stage parent, with one shared quota.
+            let mut removed = 0;
+            for (derived, key_order) in [
+                (
+                    "note_stage_search_input",
+                    "operation_key,generation,start,end,ordinal",
+                ),
+                ("note_stage_search_range", "operation_key,generation,start"),
+                (*table, *order),
+            ] {
+                let remaining = CHILD_BATCH - i64::try_from(removed).map_err(db)?;
+                if remaining == 0 {
+                    break;
+                }
+                removed +=
+                    drain(conn, derived, "operation_key", key_order, &key, remaining).await?;
+            }
+            removed
+        } else {
+            drain(conn, table, "operation_key", order, &key, CHILD_BATCH).await?
+        };
         stats.child_rows += removed;
         if removed == 0 {
             sqlx::query("UPDATE note_operation_reclaim SET step=step+1 WHERE operation_key=?")
@@ -217,12 +240,13 @@ async fn drain(
     scope: &str,
     order: &str,
     key: &str,
+    limit: i64,
 ) -> Result<u64> {
     // Identifiers come exclusively from constants above, never from requests.
     let sql = format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE {scope}=? ORDER BY {order} LIMIT ?)");
     Ok(sqlx::query(&sql)
         .bind(key)
-        .bind(CHILD_BATCH)
+        .bind(limit)
         .execute(conn)
         .await
         .map_err(db)?
@@ -256,6 +280,7 @@ async fn reclaim_root(
         "root_key",
         "root_key,start",
         &key,
+        CHILD_BATCH,
     )
     .await?;
     if stats.root_pieces != 0 {
