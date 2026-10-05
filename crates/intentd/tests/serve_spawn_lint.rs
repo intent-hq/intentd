@@ -185,7 +185,9 @@ fn classify(src: &str) -> Vec<Offense> {
     let mut chars: Vec<_> = parsed.blanked.chars().collect();
     let literals: Vec<_> = parsed.literals.iter().map(Literal::cooked).collect();
     for (i, literal) in parsed.literals.iter().enumerate() {
-        chars[literal.offset] = char::from_u32(0xf0000 + i as u32).expect("literal sentinel");
+        chars[literal.offset] =
+            char::from_u32(0xf0000 + u32::try_from(i).expect("literal count fits u32"))
+                .expect("literal sentinel");
     }
     let mut port_markers = BTreeMap::new();
     let mut identity_markers = BTreeMap::new();
@@ -354,7 +356,7 @@ fn classify(src: &str) -> Vec<Offense> {
             }
             if i == 0
                 || tokens[i - 1].text != "."
-                || !tokens.get(i + 1).is_some_and(|t| t.text == "(")
+                || tokens.get(i + 1).is_none_or(|t| t.text != "(")
             {
                 continue;
             }
@@ -366,7 +368,7 @@ fn classify(src: &str) -> Vec<Offense> {
             {
                 command.serve = true;
             }
-            let key = tokens.get(i + 2).map(|t| t.text.as_str()).unwrap_or("");
+            let key = tokens.get(i + 2).map_or("", |t| t.text.as_str());
             let identity_key = key
                 .strip_prefix('"')
                 .is_some_and(|k| IDENTITY_KEYS.contains(&k));
@@ -890,10 +892,10 @@ common::hermetic_pty_fixture_identity(&mut cmd, &d);"#;
     }
     #[test]
     fn guarded_spawn_must_observe_identity_before_a_later_reset() {
-        let src = r#"let mut cmd = common::hermetic_serve_command(&d);
+        let src = r"let mut cmd = common::hermetic_serve_command(&d);
 cmd.env_clear();
 let child = GuardedChild::spawn(&mut cmd);
-common::hermetic_fixture_identity(&mut cmd, &d);"#;
+common::hermetic_fixture_identity(&mut cmd, &d);";
         assert_eq!(classify(src), vec![Offense::IncompleteIdentity { line: 2 }]);
     }
 }
