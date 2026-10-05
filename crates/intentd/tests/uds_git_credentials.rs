@@ -283,6 +283,7 @@ async fn revoke_applies_to_next_helper_get() {
 
 #[test]
 fn credential_forwarding_commands_keep_mock_identity_private() {
+    use std::ffi::OsStr;
     for stored in [false, true] {
         let dir = temp_data_dir();
         let cmd = if stored {
@@ -291,7 +292,6 @@ fn credential_forwarding_commands_keep_mock_identity_private() {
             mock_env_token_command(dir.path())
         };
 
-        use std::ffi::OsStr;
         let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert_eq!(environment.get(OsStr::new("GH_TOKEN")), Some(&None));
         for (key, path) in [

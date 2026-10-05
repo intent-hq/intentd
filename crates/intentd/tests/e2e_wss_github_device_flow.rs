@@ -1130,6 +1130,7 @@ async fn github_rate_limited_surfaces_data_code_over_wss() {
 
 #[test]
 fn device_flow_command_restores_private_identity_and_preserves_restart_secrets() {
+    use std::ffi::OsStr;
     let dir = temp_data_dir();
     let secrets = dir.path().join("secrets.json");
     std::fs::write(
@@ -1151,7 +1152,6 @@ fn device_flow_command_restores_private_identity_and_preserves_restart_secrets()
             ],
         );
 
-        use std::ffi::OsStr;
         let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert_eq!(environment.get(OsStr::new("GH_TOKEN")), Some(&None));
         for (key, path) in [

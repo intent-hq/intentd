@@ -1977,6 +1977,7 @@ async fn members_list_attaches_the_owner_identity_over_wss() {
 
 #[test]
 fn mock_identity_command_contract_uses_only_owned_credentials() {
+    use std::ffi::OsStr;
     let dir = temp_data_dir();
     let cmd = mock_identity_command(
         dir.path(),
@@ -1990,7 +1991,6 @@ fn mock_identity_command_contract_uses_only_owned_credentials() {
         ],
     );
 
-    use std::ffi::OsStr;
     let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
     assert_eq!(environment.get(OsStr::new("GH_TOKEN")), Some(&None));
     for (key, path) in [
