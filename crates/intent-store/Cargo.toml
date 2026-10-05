@@ -7,6 +7,10 @@ repository.workspace = true
 license.workspace = true
 description = "SQLite + file-tree persistence (repositories, migrations, locking)"
 
+[package.metadata.cargo-shear]
+# Compiled separately by tests/store_pool_api.rs to assert rejected pool APIs.
+ignored-paths = ["tests/ui/store_pool_*.rs"]
+
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.10.19" }
 sqlx = { workspace = true }
