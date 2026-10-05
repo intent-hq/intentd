@@ -71,22 +71,18 @@ impl tracing::Subscriber for LifecycleCapture {
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
+/// `SQLite` db inside an RAII temp dir; the dir sweep on drop also covers the
+/// `-wal`/`-shm` sidecars.
 struct TempDb {
     path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("intentd-agent-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = crate::test_support::test_tempdir("intentd-agent-");
+        let path = dir.path().join("agent.db");
+        Self { path, _dir: dir }
     }
 }
 
@@ -700,7 +696,7 @@ where
 }
 
 /// [`connect`] against the recording mock; also returns the recorded frames.
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 fn connect_recording() -> (
     Connection,
     mpsc::UnboundedReceiver<IncomingNotification>,
@@ -754,6 +750,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -779,11 +776,13 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -836,6 +835,7 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     }
 }
 
@@ -857,7 +857,7 @@ async fn prompt_turn_streams_events_and_accumulates() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let stop = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1095,7 +1095,7 @@ async fn abnormal_stop_reason_persists_finish_reason_on_row_and_stream_end() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let stop = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1165,7 +1165,7 @@ async fn zero_output_abnormal_stop_reason_persists_empty_marker_row() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let stop = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1244,7 +1244,7 @@ async fn prompt_turn_activity_preview_clips_partial_line_and_digest() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let stop = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1349,7 +1349,7 @@ async fn agent_idle_payload_carries_agent_name_and_completion_report() {
     });
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1403,6 +1403,78 @@ fn replay_tool() -> IncomingNotification {
     }
 }
 
+#[tokio::test]
+async fn structured_notices_survive_resume_replay_drain() {
+    use std::future::{poll_fn, Future};
+    use std::io::{Read, Seek};
+    use std::task::Poll;
+
+    let (_tmp, _services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut log = tempfile::tempfile().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(log.try_clone().unwrap())
+        .finish();
+    let _capture = crate::test_tracing::set_capture_default(subscriber);
+    let notice = |title: &str| {
+        tool_call_notification(&json!({
+            "sessionUpdate": "notice", "severity": "warning", "title": title,
+            "description": "Live diagnostic during replay"
+        }))
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tx.send(notice("Buffered notice")).unwrap();
+    tx.send(replay_chunk("Old assistant reply")).unwrap();
+    let mut drain = Box::pin(Services::drain_replay_notifications(
+        &mut rx,
+        &agent_id,
+        Some(&workspace_id),
+    ));
+    // Poll through the already-buffered burst and into the settle-window recv,
+    // then send a straggler without a timing-based sleep.
+    poll_fn(|cx| {
+        assert!(drain.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tx.send(notice("Settle-window notice")).unwrap();
+    tx.send(replay_tool()).unwrap();
+    drop(tx);
+    drain.await;
+    assert!(rx.try_recv().is_err());
+    assert!(timeout(Duration::from_millis(50), sub.recv())
+        .await
+        .is_err());
+    assert!(bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap()
+        .is_empty());
+    log.rewind().unwrap();
+    let mut diagnostics = String::new();
+    log.read_to_string(&mut diagnostics).unwrap();
+    for title in ["Buffered notice", "Settle-window notice"] {
+        let line = diagnostics
+            .lines()
+            .find(|line| line.contains(title))
+            .expect("notice logged");
+        for expected in [
+            "WARN",
+            "warning",
+            "Live diagnostic during replay",
+            ACP_SID,
+            agent_id.as_str(),
+            workspace_id.as_str(),
+        ] {
+            assert!(line.contains(expected), "missing {expected}: {line}");
+        }
+    }
+    assert!(!diagnostics.contains("Old assistant reply"));
+}
+
 /// The `session/load` replay burst buffered in the handle's channel is discarded
 /// (no events published, transcript untouched), while a subsequent real turn
 /// still streams its updates and accumulates the assistant message.
@@ -1425,7 +1497,7 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
     // The bounded drain empties the burst and cannot hang.
     timeout(
         Duration::from_secs(2),
-        Services::drain_replay_notifications(&mut replay_rx),
+        Services::drain_replay_notifications(&mut replay_rx, &agent_id, Some(&workspace_id)),
     )
     .await
     .expect("drain settles within the cap");
@@ -1450,7 +1522,7 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
     // A subsequent real turn still streams + accumulates normally.
     let (conn, mut note_rx, _agent) = connect();
     let stop = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1518,7 +1590,7 @@ async fn tool_call_then_update_persists_use_and_result_blocks() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1623,7 +1695,7 @@ async fn heavy_tool_output_prestages_mid_turn_and_final_append_adopts() {
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -1791,7 +1863,7 @@ async fn repatched_tool_output_invalidates_prestaged_placeholder() {
     let (conn, mut note_rx, _agent) = connect_with(updates);
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -1879,7 +1951,7 @@ async fn title_only_update_leaves_prestaged_placeholder_untouched() {
     let (conn, mut note_rx, _agent) = connect_with(vec![tool_call, completed, title_only]);
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2000,7 +2072,7 @@ async fn status_only_update_keeps_title_name_and_input_on_event() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2062,7 +2134,7 @@ async fn richer_title_update_is_merged_into_block_and_event() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2138,7 +2210,7 @@ async fn tool_output_with_proposal_resource_appends_standalone_block() {
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates_with_proposal_resource());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2194,7 +2266,7 @@ async fn tool_output_with_collapsed_proposal_appends_standalone_block() {
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates_with_collapsed_proposal());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2297,7 +2369,7 @@ async fn registered_attachment_survives_garbled_tool_echo() {
     );
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2381,7 +2453,7 @@ async fn auggie_shaped_workspace_api_call_claims_registered_attachment() {
     );
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2430,6 +2502,158 @@ fn tool_call_notification(update: &Value) -> IncomingNotification {
     IncomingNotification {
         method: "session/update".to_string(),
         params: json!({ "sessionId": ACP_SID, "update": update }),
+    }
+}
+
+#[tokio::test]
+async fn structured_notices_do_not_count_as_output_or_block_silent_redrive() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("notice-turn".into());
+    for severity in ["info", "warning", "error", "_future"] {
+        let update = tool_call_notification(&json!({
+            "sessionUpdate": "notice", "severity": severity,
+            "title": "Runtime diagnostic", "description": "Provider detail"
+        }));
+        assert!(
+            !services
+                .route_notification(&update, &agent_id, &workspace_id, &mut transcript)
+                .await
+        );
+    }
+    assert!(transcript.blocks.is_empty());
+    assert!(transcript.text_block_strings().is_empty());
+    assert!(
+        timeout(Duration::from_millis(50), sub.recv())
+            .await
+            .is_err(),
+        "no chat or activity events"
+    );
+}
+
+/// A binding can successfully create a proposal before its enclosing JS
+/// fails. Preserve registered cards on failure, but never trust an error's
+/// echoed proposal payload to create a new actionable card.
+#[tokio::test]
+async fn failed_workspace_api_attaches_only_registered_proposals() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    for registered in [false, true] {
+        let mut transcript = super::Transcript::new("m1".to_string());
+        if registered {
+            services.turn_attachments().register(
+                &agent_id,
+                test_attachment("tar-created", intent_core::AttachmentPolicy::AtToolResult),
+            );
+        }
+        services.route_notification(
+            &tool_call_notification(&json!({
+                "sessionUpdate": "tool_call", "toolCallId": "transfer", "title": "workspace_api",
+                "kind": "other", "status": "in_progress",
+                "rawInput": { "code": "await ws.app.workspaces.transfer(id); throw Error('later');", "summary": "Transfer project" }
+            })), &agent_id, &workspace_id, &mut transcript,
+        ).await;
+        services.route_notification(
+            &tool_call_notification(&json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "transfer", "status": "failed",
+                "rawOutput": [{ "type": "resource", "resource": {
+                    "uri": "intent-proposal://workspace-transfer/untrusted",
+                    "mimeType": "application/vnd.intent.proposal+json",
+                    "text": "{\"kind\":\"workspace-transfer\",\"preview\":{\"title\":\"Untrusted echo\"},\"payload\":{}}"
+                }}]
+            })), &agent_id, &workspace_id, &mut transcript,
+        ).await;
+        let blocks = transcript.into_blocks();
+        assert_eq!(blocks[1]["is_error"], true);
+        assert_eq!(blocks.len(), if registered { 3 } else { 2 });
+        if registered {
+            assert!(blocks[2]["resource"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("tar-created"));
+        }
+        assert!(services
+            .turn_attachments()
+            .claim_at_tool_result(&agent_id, None, "workspace_api", None)
+            .is_empty());
+    }
+}
+
+/// Status-only completions claim and materialize the entire trusted batch,
+/// without inventing tool output, and publish the real resource block IDs.
+#[tokio::test]
+async fn status_only_workspace_api_attaches_registered_batch() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    for status in ["failed", "completed"] {
+        for registered in [false, true] {
+            let mut transcript = super::Transcript::new("m1".to_string());
+            let mut sub = bus.subscribe(SubscriptionFilter::default());
+            if registered {
+                services.turn_attachments().register_all(
+                    &agent_id,
+                    ["tar-first", "tar-second"]
+                        .into_iter()
+                        .map(|id| test_attachment(id, intent_core::AttachmentPolicy::AtToolResult))
+                        .collect(),
+                );
+            }
+            services.route_notification(
+                &tool_call_notification(&json!({
+                    "sessionUpdate": "tool_call", "toolCallId": "proposal", "title": "workspace_api",
+                    "kind": "other", "status": "in_progress",
+                    "rawInput": { "code": "await ws.app.proposal.show(p);" }
+                })), &agent_id, &workspace_id, &mut transcript,
+            ).await;
+            let terminal = tool_call_notification(&json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "proposal", "status": status
+            }));
+            services
+                .route_notification(&terminal, &agent_id, &workspace_id, &mut transcript)
+                .await;
+            let event = timeout(Duration::from_secs(2), async {
+                loop {
+                    for event in sub.recv().await.expect("subscription open") {
+                        if event.event_type == "agent:tool:call"
+                            && event.data["status"] != "started"
+                        {
+                            return event;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("terminal tool event");
+            assert!(event.data.get("output").is_none());
+            assert!(event.data.get("resultBlockId").is_none());
+            assert!(event.data.get("resultBlockIndex").is_none());
+            if registered {
+                assert_eq!(event.data["proposalBlockIds"], json!(["m1:1", "m1:2"]));
+                let items = event.data["registeredAttachments"].as_array().unwrap();
+                assert_eq!(items.len(), 2);
+                for (i, item) in items.iter().enumerate() {
+                    assert_eq!(
+                        transcript.blocks[i + 1],
+                        crate::tool_block::build_proposal_resource_block(
+                            &format!("m1:{}", i + 1),
+                            item
+                        )
+                    );
+                }
+            } else {
+                assert!(event.data.get("proposalBlockIds").is_none());
+                assert!(event.data.get("registeredAttachments").is_none());
+            }
+            // A repeated status-only update cannot attach the consumed batch again.
+            services
+                .route_notification(&terminal, &agent_id, &workspace_id, &mut transcript)
+                .await;
+            let blocks = transcript.into_blocks();
+            assert_eq!(blocks.len(), if registered { 3 } else { 1 });
+            assert!(!blocks.iter().any(|b| b["type"] == "tool_result"));
+            assert!(services
+                .turn_attachments()
+                .finish_turn(&agent_id)
+                .is_empty());
+        }
     }
 }
 
@@ -2587,7 +2811,7 @@ async fn turn_end_attachments_append_trailing_blocks_and_leftovers_drop() {
     );
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2681,7 +2905,7 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
     );
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2729,7 +2953,7 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
         .expect("append answer");
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2771,7 +2995,7 @@ async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
     );
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2807,7 +3031,7 @@ async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
     // A question-free turn must NOT clear the marker.
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2861,7 +3085,7 @@ async fn turn_end_records_pending_proposals_and_proposal_free_turn_keeps_them() 
     );
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -2895,7 +3119,7 @@ async fn turn_end_records_pending_proposals_and_proposal_free_turn_keeps_them() 
     // A proposal-free turn must NOT touch the list.
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -3372,7 +3596,7 @@ async fn stale_anonymous_tool_update_is_dropped_not_persisted() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -3906,7 +4130,7 @@ async fn pre_output_transport_death_marks_error_and_suppresses_terminal_events()
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -3972,7 +4196,7 @@ async fn post_output_transport_death_keeps_terminal_events() {
     let _capture_guard = capture.set_as_default();
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4052,7 +4276,7 @@ async fn post_output_transport_death_keeps_terminal_events() {
 /// A real clean `end_turn` at the truncation-redrive cap must fall through to
 /// terminal stream:end + idle, with the bounded diagnostic naming cap
 /// exhaustion rather than another redrive.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn truncation_cap_exhaustion_logs_terminal_outcome_and_idles() {
     let _env = EnvGuard::set_all(&[("INTENTD_SILENT_TAIL_SUSPECT_MS", "0")]);
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
@@ -4102,7 +4326,7 @@ async fn truncation_cap_exhaustion_logs_terminal_outcome_and_idles() {
     let capture = LifecycleCapture::default();
     let _capture_guard = capture.set_as_default();
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4316,8 +4540,9 @@ fn connect_with_prompt_rpc_error(
 fn spawn_mock_agent_with_prompt_rpc_error_code<R, W>(
     read: R,
     write: W,
-    code: i64,
-    error_message: String,
+    error: Value,
+    updates: Vec<String>,
+    prompt_calls: Arc<AtomicUsize>,
 ) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -4337,10 +4562,17 @@ where
                 continue;
             };
             if method == "session/prompt" {
+                prompt_calls.fetch_add(1, Ordering::SeqCst);
+                for note in &updates {
+                    write
+                        .write_all(format!("{note}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
                 let resp = json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "error": { "code": code, "message": error_message },
+                    "error": error,
                 });
                 write
                     .write_all(format!("{resp}\n").as_bytes())
@@ -4369,20 +4601,23 @@ where
 /// [`connect`] against a mock whose `session/prompt` fails with a JSON-RPC
 /// error carrying an explicit `code` + `message`.
 fn connect_with_prompt_rpc_error_code(
-    code: i64,
-    error_message: &str,
+    error: Value,
+    updates: Vec<String>,
 ) -> (
     Connection,
     mpsc::UnboundedReceiver<IncomingNotification>,
     JoinHandle<()>,
+    Arc<AtomicUsize>,
 ) {
     let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
     let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let prompt_calls = Arc::new(AtomicUsize::new(0));
     let agent = spawn_mock_agent_with_prompt_rpc_error_code(
         c2a_agent,
         a2c_agent,
-        code,
-        error_message.to_string(),
+        error,
+        updates,
+        prompt_calls.clone(),
     );
     let (note_tx, note_rx) = mpsc::unbounded_channel();
     let hooks = ConnectionHooks {
@@ -4390,7 +4625,7 @@ fn connect_with_prompt_rpc_error_code(
         ..ConnectionHooks::default()
     };
     let conn = Connection::new(c2a_client, a2c_client, None, hooks);
-    (conn, note_rx, agent)
+    (conn, note_rx, agent, prompt_calls)
 }
 
 /// Durable-before-observable on the STREAMING terminal-failure path
@@ -4415,7 +4650,7 @@ async fn streaming_terminal_failure_persists_error_before_publishing_events() {
         tokio::spawn(async move {
             let mut note_rx = note_rx;
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -4479,11 +4714,13 @@ async fn streaming_terminal_failure_persists_error_before_publishing_events() {
 #[tokio::test]
 async fn streaming_benign_cancel_does_not_persist_error() {
     let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
-    let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error_code(-32800, "request cancelled");
+    let (conn, mut note_rx, _agent, _prompt_calls) = connect_with_prompt_rpc_error_code(
+        json!({ "code": -32800, "message": "request cancelled" }),
+        Vec::new(),
+    );
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4514,6 +4751,125 @@ async fn streaming_benign_cancel_does_not_persist_error() {
         services.take_pending_terminal_error(&agent_id).is_none(),
         "nothing stashed for a benign cancel"
     );
+}
+
+/// Explicit cancellation wins over incidental network details, even after
+/// partial output or a host suspend: never retry or enroll cancelled work.
+#[tokio::test]
+async fn explicit_cancellation_with_transient_details_never_retries_or_suspends() {
+    let _env = EnvGuard::set_all(&[("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "1")]);
+    for error in [
+        json!({ "code": -32800, "message": "request cancelled",
+            "data": { "details": "terminated" } }),
+        json!({ "code": -32800, "message": "The operation was aborted due to timeout" }),
+        json!({ "code": -32800, "message": "request cancelled",
+            "data": { "details": "TimeoutError: request timed out" } }),
+        json!({ "code": -32800, "message": "TypeError: terminated" }),
+        json!({ "code": -32800, "message": "request cancelled",
+            "data": { "details": "Connection reset by peer" } }),
+    ] {
+        for overlap in [None, Some(Duration::from_secs(120))] {
+            for partial in [false, true] {
+                assert_explicit_cancellation_is_not_recovered(error.clone(), overlap, partial)
+                    .await;
+            }
+        }
+    }
+}
+
+async fn assert_explicit_cancellation_is_not_recovered(
+    error: Value,
+    overlap: Option<Duration>,
+    partial: bool,
+) {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(Arc::new(FakeSuspend(overlap)));
+    let updates = if partial {
+        vec![suspend_chunk("partial ")]
+    } else {
+        Vec::new()
+    };
+    let (conn, mut note_rx, _agent, prompt_calls) =
+        connect_with_prompt_rpc_error_code(error.clone(), updates);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_connection_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("cancelled turn settles")
+    .expect_err("cancellation returns Err");
+    assert_eq!(
+        prompt_calls.load(Ordering::SeqCst),
+        1,
+        "cancelled prompt must not retry: {error}, overlap={overlap:?}, partial={partial}"
+    );
+    assert!(
+        crate::agent_manager::prompt_cancellation_error(&err),
+        "cancellation must reach the worker, not the suspend marker: {err}"
+    );
+    assert!(
+        bus.store()
+            .list_interrupted_agents()
+            .await
+            .unwrap()
+            .is_empty(),
+        "cancelled work must not enroll for wake recovery"
+    );
+    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_ne!(stored.status, AgentStatus::Error);
+    assert!(stored.stop_reason.is_none());
+    assert!(
+        stored.attention_request_kind.is_none(),
+        "no recovery blocker for cancellation"
+    );
+    assert!(services.take_pending_terminal_error(&agent_id).is_none());
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.len(),
+        usize::from(partial),
+        "preserve only existing partial output"
+    );
+    for message in &messages {
+        assert_eq!(message.role, "assistant");
+        assert!(message
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("interruptReason"))
+            .is_none());
+    }
+    let mut events = Vec::new();
+    while !events
+        .iter()
+        .any(|e: &Event| e.event_type == "agent:stream:end")
+    {
+        events.extend(
+            timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .expect("terminal stream event arrives")
+                .expect("subscription open"),
+        );
+    }
+    assert!(!events
+        .iter()
+        .any(|e| e.event_type == "agent:attention-requested"));
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .unwrap();
+    assert_ne!(end.data["interruptReason"], json!("system_suspend"));
 }
 
 /// Mock agent whose `session/prompt` fails the first `failures` calls with a
@@ -4622,20 +4978,29 @@ fn connect_with_failing_prompts_then_success(
 const FETCH_EPIPE_UNAVAILABLE: &str = "fetch failed (EPIPE: connect EPIPE 34.36.229.120:443): \
     {\"apiStatus\":\"unavailable\",\"message\":\"fetch failed (EPIPE: connect EPIPE 34.36.229.120:443)\"}";
 
-/// Regression for monorepo#3007: a transient provider-fetch failure (`-32603`
-/// wrapping an EPIPE connect + `apiStatus: unavailable`) on an output-free
+/// Regression for monorepo#3007 / intent#6750: a transient provider-fetch failure
+/// (including timeout and undici body-stream termination) on an output-free
 /// attempt is retried in place — the turn completes normally instead of
 /// failing terminally, and no Error status is persisted.
 #[tokio::test]
 async fn transient_provider_fetch_failure_retries_and_turn_completes() {
-    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let _env = EnvGuard::set_all(&[("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10")]);
+    for error_message in
+        std::iter::once(FETCH_EPIPE_UNAVAILABLE).chain(SUSPEND_TRANSIENT_ERRORS.iter().copied())
+    {
+        assert_output_free_fetch_failure_retries(error_message).await;
+    }
+}
+
+async fn assert_output_free_fetch_failure_retries(error_message: &str) {
     let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(None)));
     let (conn, mut note_rx, _agent, prompt_calls) =
-        connect_with_failing_prompts_then_success(2, FETCH_EPIPE_UNAVAILABLE, prompt_updates());
+        connect_with_failing_prompts_then_success(2, error_message, prompt_updates());
 
     let stop = timeout(
         Duration::from_secs(10),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4691,7 +5056,7 @@ async fn transient_provider_fetch_failure_exhausts_bounded_retries() {
 
     let err = timeout(
         Duration::from_secs(10),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4740,7 +5105,7 @@ async fn terminal_provider_error_fails_fast_without_retry() {
 
     let err = timeout(
         Duration::from_secs(10),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4781,7 +5146,7 @@ async fn transient_fetch_failure_after_streamed_output_is_not_retried() {
 
     let err = timeout(
         Duration::from_secs(10),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4798,8 +5163,114 @@ async fn transient_fetch_failure_after_streamed_output_is_not_retried() {
         matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
         "post-output failure keeps the terminal wrapper: {err}"
     );
-    // The streamed partial persisted as the turn's assistant row (unchanged
-    // from today's post-output failure handling).
+    // The streamed partial persisted as the turn's ONE assistant row
+    // (unchanged from today's post-output failure handling). The additional
+    // system-role blocker notice this path now appends (intent-hq/intent#5419)
+    // is asserted by `post_output_transient_fetch_failure_raises_blocker_attention`.
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.iter().filter(|m| m.role == "assistant").count(),
+        1,
+        "streamed partial persisted, not duplicated: {messages:?}"
+    );
+}
+
+/// Regression for intent-hq/intent#5419: a transient provider-fetch failure
+/// AFTER streamed output is not retried in place (the #3007 idempotency
+/// guard) and stays terminal (`status = error`), but the dying agent now
+/// raises a blocker-style attention request naming the cause — so the
+/// parent's watch/attention surface, the delegation group, and the user
+/// learn about the death immediately instead of discovering it later. The
+/// mid-turn raise is parked (the agent is busy) and flushed by the terminal
+/// choke point, so the transcript notice lands AFTER the persisted partial
+/// assistant row and `agent:attention-requested` precedes `agent:failed`.
+#[tokio::test]
+async fn post_output_transient_fetch_failure_raises_blocker_attention() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Delegated shape: a parent session whose child is the dying agent, so
+    // the blocker path's direct parent wake has a target.
+    let parent_id = AgentId::from("parent-1");
+    services
+        .store
+        .insert_agent_session(&new_session(&parent_id, &workspace_id))
+        .await
+        .expect("insert parent session");
+    let mut child = new_session(&agent_id, &workspace_id);
+    child.parent_agent_id = Some(parent_id.clone());
+    services
+        .store
+        .update_agent_session(&workspace_id, &child)
+        .await
+        .expect("link child to parent");
+    // Production shape: the raise happens INSIDE the live turn, where the
+    // manager's busy set defers the surfacing to the turn-end flush.
+    services.set_test_busy(&agent_id, true);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(prompt_updates(), FETCH_EPIPE_UNAVAILABLE);
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_connection_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("a post-output transient failure stays terminal (no redrive)");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "post-output failure keeps the terminal wrapper: {err}"
+    );
+
+    // Terminal classification is unchanged: Error persisted, context stashed.
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::Error,
+        "the post-output transient failure still parks the session in Error"
+    );
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_some(),
+        "terminal context stashed for the worker as before"
+    );
+    // The blocker-style attention request is recorded on the dying agent
+    // and names the cause.
+    assert_eq!(
+        stored.attention_request_kind.as_deref(),
+        Some("blocker"),
+        "a post-output transient fetch failure raises a blocker attention request (intent#5419)"
+    );
+    let reason = stored
+        .attention_request_reason
+        .as_deref()
+        .expect("attention reason recorded");
+    assert!(
+        reason.contains("transient provider fetch failure after streamed output"),
+        "reason names the cause: {reason}"
+    );
+    assert!(
+        reason.contains("attempt 1"),
+        "reason carries the attempt count: {reason}"
+    );
+    assert!(
+        reason.contains("EPIPE"),
+        "reason carries the error class/text: {reason}"
+    );
+    // Transcript: the streamed partial persisted as the assistant row, and
+    // the blocker notice landed AFTER it (flushed at the terminal choke
+    // point, not interleaved with the turn's own output).
     let messages = services
         .store
         .get_agent_messages(&agent_id, None)
@@ -4807,8 +5278,205 @@ async fn transient_fetch_failure_after_streamed_output_is_not_retried() {
         .unwrap();
     assert_eq!(
         messages.len(),
+        2,
+        "assistant partial + blocker notice: {messages:?}"
+    );
+    assert_eq!(messages[0].role, "assistant");
+    assert_eq!(messages[1].role, "system");
+    assert_eq!(
+        messages[1].content[0]["meta"]["kind"],
+        json!("blocker-report")
+    );
+    // The parent received the DIRECT blocker wake immediately. Scope: this
+    // parent holds no completion watch and only `run_prompt_turn` runs here,
+    // so the assertion proves exactly one attention wake from the raise
+    // itself. In production an armed parent watch stays armed across the
+    // raise and `agent:failed` then delivers the ordinary completion wake
+    // (a grouped parent later gets the aggregate) — that is the existing
+    // attention contract, not exercised by this test.
+    let parent = services.store.get_agent_session(&parent_id).await.unwrap();
+    assert_eq!(
+        parent.messages.len(),
         1,
-        "streamed partial persisted, not duplicated"
+        "the raise itself delivers exactly one direct attention wake to the parent"
+    );
+    let wake_text = serde_json::to_string(&parent.messages[0].content).unwrap();
+    assert!(
+        wake_text.contains("transient provider fetch failure after streamed output"),
+        "parent wake names the cause: {wake_text}"
+    );
+    // Event order: `agent:attention-requested` (kind blocker) precedes
+    // `agent:failed` — never a bare failure that later grows an attention
+    // card.
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:failed") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+    let attention_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:attention-requested")
+        .expect("agent:attention-requested emitted for the dying agent");
+    let failed_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:failed")
+        .expect("agent:failed emitted");
+    assert!(
+        attention_idx < failed_idx,
+        "attention surfaces before the terminal failure: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+    assert_eq!(events[attention_idx].data["kind"], json!("blocker"));
+    assert_eq!(
+        events[attention_idx].data["parentAgentId"],
+        json!(parent_id.0)
+    );
+}
+
+/// Unchanged behaviour guard for intent-hq/intent#5419: a NON-transient
+/// post-output error is terminal exactly as today — no attention request is
+/// recorded, no notice appended, no `agent:attention-requested` emitted.
+#[tokio::test]
+async fn post_output_non_transient_error_raises_no_attention() {
+    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    services.set_test_busy(&agent_id, true);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(prompt_updates(), "provider rejected the request: boom");
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_connection_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("a post-output terminal error still fails the turn");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "terminal error keeps the wrapper: {err}"
+    );
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::Error, "terminal as today");
+    assert!(
+        stored.attention_request_kind.is_none(),
+        "no attention request for a non-transient failure: {:?}",
+        stored.attention_request_kind
+    );
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1, "assistant partial only, no notice");
+    assert_eq!(messages[0].role, "assistant");
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:failed") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.event_type == "agent:attention-requested"),
+        "no attention event for a non-transient failure: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+}
+
+/// Attempt-count regression for intent-hq/intent#5419 (PR #2004 review): on
+/// the abandon-during-backoff fall-through, `fetch_retry_attempt` has already
+/// been bumped for the retry that never dispatches. The blocker reason must
+/// still report the attempt that actually ran — ONE `session/prompt`, so
+/// `attempt 1 of 3` — not the abandoned retry's ordinal. Deterministic shape:
+/// the attempt fails transient with nothing buffered (arming the backoff), and
+/// the update lands 100ms into a 1s backoff, so the post-backoff drain flips
+/// `any_update_received` and abandons the retry.
+#[tokio::test]
+async fn backoff_late_output_blocker_reason_reports_dispatched_attempt() {
+    let _env = EnvGuard::set_all(&[("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "1000")]);
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let chunk = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "late during backoff" } }
+        }
+    })
+    .to_string();
+    let (release_error_tx, release_error_rx) = tokio::sync::oneshot::channel();
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let (_agent, prompt_calls) = spawn_stall_then_error_then_update_mock_agent(
+        c2a_agent,
+        a2c_agent,
+        chunk,
+        release_error_rx,
+    );
+    let (note_tx, mut note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    // Fail the first (and only) attempt immediately.
+    release_error_tx.send(()).expect("mock alive");
+
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_connection_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("turn settles within 10s")
+    .expect_err("abandoned retry surfaces the attempt's error");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "abandoned retry keeps the terminal wrapper: {err}"
+    );
+    assert_eq!(
+        prompt_calls.load(Ordering::SeqCst),
+        1,
+        "exactly one session/prompt dispatched — the retry was abandoned"
+    );
+
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::Error);
+    assert_eq!(
+        stored.attention_request_kind.as_deref(),
+        Some("blocker"),
+        "abandon-during-backoff fall-through raises the blocker too"
+    );
+    let reason = stored
+        .attention_request_reason
+        .as_deref()
+        .expect("attention reason recorded");
+    assert!(
+        reason.contains("attempt 1 of 3"),
+        "reason counts the attempt that actually dispatched, not the abandoned retry: {reason}"
     );
 }
 
@@ -4884,10 +5552,17 @@ where
 /// is NOT retried — the handler may have side-effected (file written,
 /// terminal command run), so re-dispatching is no longer provably idempotent
 /// even though no `session/update` streamed.
+///
+/// intent-hq/intent#5419 (PR #2004 review): this side-effect-only fall-through
+/// raises the same blocker-style attention request as the streamed-output
+/// path, and its reason names the guard that actually tripped — "after a
+/// side-effecting client request", never "after streamed output" — with
+/// `agent:attention-requested` ahead of `agent:failed`.
 #[tokio::test]
 async fn transient_fetch_failure_after_client_request_is_not_retried() {
     std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
-    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
     let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
     let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
     let (_agent, prompt_calls) = spawn_mock_agent_with_client_request_then_transient_failure(
@@ -4904,7 +5579,7 @@ async fn transient_fetch_failure_after_client_request_is_not_retried() {
 
     let err = timeout(
         Duration::from_secs(10),
-        services.run_prompt_turn(
+        services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -4926,6 +5601,64 @@ async fn transient_fetch_failure_after_client_request_is_not_retried() {
         1,
         "no retry after a side-effecting client request"
     );
+
+    // The side-effect-only path raises the blocker too, naming ITS cause.
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::Error);
+    assert_eq!(
+        stored.attention_request_kind.as_deref(),
+        Some("blocker"),
+        "client-request fall-through raises a blocker attention request (intent#5419)"
+    );
+    let reason = stored
+        .attention_request_reason
+        .as_deref()
+        .expect("attention reason recorded");
+    assert!(
+        reason.contains("transient provider fetch failure after a side-effecting client request"),
+        "reason names the client-request guard: {reason}"
+    );
+    assert!(
+        !reason.contains("after streamed output"),
+        "no output streamed, so the reason must not claim it did: {reason}"
+    );
+    assert!(
+        reason.contains("attempt 1 of 3"),
+        "reason carries the dispatched attempt count: {reason}"
+    );
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == "system" && m.content[0]["meta"]["kind"] == json!("blocker-report")),
+        "blocker notice appended to the transcript: {messages:?}"
+    );
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:failed") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+    let attention_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:attention-requested")
+        .expect("agent:attention-requested emitted for the client-request fall-through");
+    let failed_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:failed")
+        .expect("agent:failed emitted");
+    assert!(
+        attention_idx < failed_idx,
+        "attention surfaces before the terminal failure: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+    assert_eq!(events[attention_idx].data["kind"], json!("blocker"));
 }
 
 /// Injectable [`SuspendOverlapQuery`](crate::SuspendOverlapQuery) for the
@@ -4957,7 +5690,16 @@ fn suspend_chunk(text: &str) -> String {
     .to_string()
 }
 
-/// Task C happy path: a transient upstream disconnect whose active window
+// Include fetch-only shapes: disconnect classification alone must not gate
+// suspend enrollment (intent-hq/intent#6750).
+const SUSPEND_TRANSIENT_ERRORS: &[&str] = &[
+    "Connection reset by peer",
+    "Internal error: The operation was aborted due to timeout: {\"apiStatus\":\"unavailable\"}",
+    "Internal error: The operation was aborted due to timeout",
+    "Internal error: {\"details\":\"terminated\"}",
+];
+
+/// A transient upstream disconnect or provider-fetch failure whose active window
 /// overlapped a detected host suspend is ENROLLED as interrupted, not surfaced
 /// terminally. `run_prompt_turn` returns the suspend-interrupt marker error,
 /// emits the interrupted terminal `agent:stream:end` (`stopReason:
@@ -4966,19 +5708,26 @@ fn suspend_chunk(text: &str) -> String {
 /// `interrupted_agent` row for the wake orchestrator (Task D).
 #[tokio::test]
 async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_failure() {
+    for error_message in SUSPEND_TRANSIENT_ERRORS {
+        assert_suspend_interrupt_enrolled(error_message).await;
+    }
+}
+
+async fn assert_suspend_interrupt_enrolled(error_message: &str) {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
         Duration::from_secs(120),
     ))));
-    // Stream a partial chunk, then fail with a connection-reset RPC error.
+    // Partial output rules out in-place retry; suspend enrollment must also
+    // take precedence over the post-output blocker path.
     let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], error_message);
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let capture = LifecycleCapture::default();
     let _capture_guard = capture.set_as_default();
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5005,6 +5754,12 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
     assert!(
         !events.iter().any(|e| e.event_type == "agent:failed"),
         "no agent:failed for a sleep-induced interruption"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.event_type == "agent:attention-requested"),
+        "no terminal blocker for a sleep-induced interruption: {error_message}"
     );
     let end = events
         .iter()
@@ -5061,7 +5816,9 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
     // The interrupted_agent row is written for the wake orchestrator (Task D).
     let interrupted = bus.store().list_interrupted_agents().await.unwrap();
     assert!(
-        interrupted.iter().any(|ia| ia.agent_id == agent_id),
+        interrupted
+            .iter()
+            .any(|ia| ia.agent_id == agent_id && ia.reason.as_deref() == Some("system_suspend")),
         "interrupted_agent row enrolled for wake-resume"
     );
 }
@@ -5072,14 +5829,20 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
 /// no `interrupted_agent` row).
 #[tokio::test]
 async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
+    for error_message in SUSPEND_TRANSIENT_ERRORS {
+        assert_awake_transient_failure(error_message).await;
+    }
+}
+
+async fn assert_awake_transient_failure(error_message: &str) {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(None)));
     let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], error_message);
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5106,6 +5869,12 @@ async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
         events.iter().any(|e| e.event_type == "agent:failed"),
         "awake-time failure surfaces agent:failed"
     );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_type == "agent:attention-requested"),
+        "awake-time post-output failure still raises blocker attention: {error_message}"
+    );
     let interrupted = bus.store().list_interrupted_agents().await.unwrap();
     assert!(
         interrupted.is_empty(),
@@ -5113,7 +5882,7 @@ async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
     );
 }
 
-/// Task C boundary: a NON-transient error (a terminal 4xx) is NOT enrolled even
+/// A NON-transient error (4xx, quota, or unrelated termination) is NOT enrolled even
 /// when a suspend overlapped — the classifier rejects it, so the turn surfaces
 /// terminally with `agent:failed` and no `interrupted_agent` row. (A 404, not
 /// a 401: an auth-flavored 4xx now takes the auth-required mapping instead of
@@ -5121,16 +5890,28 @@ async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
 /// `map_acp_session_error_maps_auth_and_demotes_verdict`.)
 #[tokio::test]
 async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
+    for error_message in [
+        "HTTP 404 Not Found",
+        "Internal error: process: terminated by signal",
+        "Internal error: rate_limit_error: {\"details\":\"terminated\"}",
+        "Internal error: insufficient_quota: fetch failed",
+        "Internal error: monthly quota exhausted: ECONNRESET",
+    ] {
+        assert_suspend_rejects_terminal_failure(error_message).await;
+    }
+}
+
+async fn assert_suspend_rejects_terminal_failure(error_message: &str) {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
         Duration::from_secs(120),
     ))));
     let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error(Vec::new(), "HTTP 404 Not Found");
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], error_message);
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5140,7 +5921,7 @@ async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
             None,
         )
         .await
-        .expect_err("a terminal 4xx fails the turn");
+        .expect_err("a terminal rejection fails the turn");
     assert!(
         matches!(
             &err,
@@ -5164,23 +5945,95 @@ async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
     );
 }
 
+#[intent_test_macros::daemon_test]
+async fn suspend_late_enrollment_persists_after_early_close() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let bus = EventBus::new(store.clone());
+    let services = Services::new_with_file_secrets(
+        store.clone(),
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets")),
+    )
+    .with_event_bus(bus.clone());
+    let workspace_id = WorkspaceId::from("late-suspend-workspace");
+    let agent_id = AgentId::from("late-suspend-agent");
+    store
+        .insert_workspace(&workspace(&workspace_id))
+        .await
+        .unwrap();
+    store
+        .insert_agent_session(&new_session(&agent_id, &workspace_id))
+        .await
+        .unwrap();
+    store
+        .set_acp_session_id(&workspace_id, &agent_id, ACP_SID)
+        .await
+        .unwrap();
+    services.begin_settings_shutdown();
+    let _ = services
+        .enroll_suspend_interrupted_turn(
+            &agent_id,
+            &workspace_id,
+            uuid::Uuid::new_v4().to_string(),
+            vec![json!({"type":"text","text":"retained partial"})],
+            None,
+            intent_acp::AcpError::Transport("Connection reset by peer".into()),
+        )
+        .await;
+    timeout(Duration::from_secs(5), services.shutdown_store_writers())
+        .await
+        .unwrap();
+    bus.shutdown().await.unwrap();
+    store.close().await;
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    let row = reopened
+        .get_interrupted_agent(&agent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.reason.as_deref(), Some("system_suspend"));
+    let messages = reopened.get_agent_messages(&agent_id, None).await.unwrap();
+    assert!(messages
+        .iter()
+        .any(|message| message.content.to_string().contains("retained partial")));
+    assert!(!messages.iter().any(|message| message.role == "user"));
+    let events = reopened
+        .query_events(&intent_store::EventQuery::default())
+        .await
+        .unwrap();
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "agent:failed"));
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "agent:stream:end"
+            && event.data["stopReason"] == "interrupted"));
+    reopened.close().await;
+}
+
 /// Task D end-to-end: a turn ENROLLED by Task C's classifier (a suspend-
 /// overlapping transient disconnect via the real `run_prompt_turn` path) is
 /// resumed by the wake-triggered sweep. The enrolled row is tagged
 /// `system_suspend`, the sweep resumes exactly it, and its atomic claim leaves
 /// the row resolved (no longer pending).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_resume_resumes_turn_enrolled_by_suspend_classifier() {
+    for error_message in SUSPEND_TRANSIENT_ERRORS {
+        assert_wake_resumes_enrolled_turn(error_message).await;
+    }
+}
+
+async fn assert_wake_resumes_enrolled_turn(error_message: &str) {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
         Duration::from_secs(120),
     ))));
 
-    // Task C: a transient disconnect overlapping a suspend enrolls the turn.
+    // A transient failure overlapping a suspend enrolls the turn.
     let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], error_message);
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5249,7 +6102,7 @@ async fn suspend_enrollment_self_heals_resume_without_wake_broadcast() {
     let (conn, mut note_rx, _agent) =
         connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5306,7 +6159,7 @@ async fn idle_timeout_silent_turn_suppresses_agent_failed() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5381,7 +6234,7 @@ async fn idle_timeout_after_output_flushes_partial_and_marks_streamed() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5460,7 +6313,7 @@ async fn idle_timeout_after_unmapped_update_marks_streamed() {
     let _sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -5667,7 +6520,7 @@ async fn mid_turn_stall_emits_stalled_then_resumed_and_rearms() {
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -5745,18 +6598,21 @@ async fn mid_turn_stall_emits_stalled_then_resumed_and_rearms() {
 /// enough for the daemon to settle into its retry backoff, far shorter than
 /// the 1s backoff), and only THEN streams `update` — so the note is
 /// guaranteed to be picked up by a buffered `try_recv` drain, never by the
-/// select-loop arm.
+/// select-loop arm. Returns the `session/prompt` dispatch counter alongside
+/// the task handle (a second prompt is counted but never answered).
 fn spawn_stall_then_error_then_update_mock_agent<R, W>(
     read: R,
     write: W,
     update: String,
     release_error: tokio::sync::oneshot::Receiver<()>,
-) -> JoinHandle<()>
+) -> (JoinHandle<()>, Arc<AtomicUsize>)
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    let prompt_calls = Arc::new(AtomicUsize::new(0));
+    let counter = prompt_calls.clone();
+    let handle = tokio::spawn(async move {
         let mut lines = BufReader::new(read).lines();
         let mut write = write;
         let mut release = Some(release_error);
@@ -5771,6 +6627,7 @@ where
                 continue;
             };
             if method == "session/prompt" {
+                counter.fetch_add(1, Ordering::SeqCst);
                 if let Some(release_error) = release.take() {
                     let _ = release_error.await;
                     let resp = json!({
@@ -5806,7 +6663,8 @@ where
                 .unwrap();
             write.flush().await.unwrap();
         }
-    })
+    });
+    (handle, prompt_calls)
 }
 
 /// Regression (PR #1462 review): `resumed` must be emitted even when the
@@ -5837,7 +6695,7 @@ async fn buffered_update_drained_after_stall_still_emits_resumed() {
     let (release_error_tx, release_error_rx) = tokio::sync::oneshot::channel();
     let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
     let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
-    let _agent = spawn_stall_then_error_then_update_mock_agent(
+    let (_agent, _prompt_calls) = spawn_stall_then_error_then_update_mock_agent(
         c2a_agent,
         a2c_agent,
         chunk,
@@ -5857,7 +6715,7 @@ async fn buffered_update_drained_after_stall_still_emits_resumed() {
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -5910,7 +6768,7 @@ async fn sub_threshold_turn_emits_no_stall_status() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -6080,7 +6938,7 @@ async fn tool_call_in_flight_suppresses_stall_until_closed() {
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -6126,13 +6984,17 @@ async fn tool_call_in_flight_suppresses_stall_until_closed() {
     );
 }
 
-/// Full suppression (intent-hq/monorepo#3466): a tool call that NEVER closes
-/// keeps the stall advisory suppressed for the entire silence — the 30-minute
-/// prompt idle timeout is the backstop for a genuinely hung tool — and the
-/// turn still resolves normally.
+/// Suppression below the ceiling (intent-hq/monorepo#3466): a tool call that
+/// never closes keeps the stall advisory suppressed while the silence stays
+/// below the open-tool ceiling ([`open_tool_call_stall_ms`], pinned far above
+/// this test's silence) — a long tool run is expected silence — and the turn
+/// still resolves normally.
 #[tokio::test]
-async fn unclosed_tool_call_never_emits_stalled() {
-    let _env = EnvGuard::set_all(&[("INTENTD_STREAM_STALL_MS", "50")]);
+async fn unclosed_tool_call_below_ceiling_emits_no_stalled() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "60000"),
+    ]);
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let (conn, mut note_rx, _agent, release_close, release_end) =
         connect_tool_silence(vec![tool_stall_tool_call()], Vec::new());
@@ -6144,7 +7006,7 @@ async fn unclosed_tool_call_never_emits_stalled() {
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -6184,13 +7046,693 @@ async fn unclosed_tool_call_never_emits_stalled() {
     assert_eq!(
         phases,
         vec!["prompt"],
-        "an open tool call suppresses the stall advisory entirely"
+        "an open tool call suppresses the stall advisory below the ceiling"
+    );
+}
+
+/// Regression for intent-hq/intent#5395 (the opencode/grok "stalls while
+/// Thinking after the first tool calls" signature): a `tool_call` whose
+/// terminal `tool_call_update` never arrives must NOT suppress the stall
+/// advisory indefinitely. Once the silence crosses the open-tool ceiling
+/// (`INTENTD_OPEN_TOOL_CALL_STALL_MS`, lowered here) the `stalled` advisory
+/// fires with the tool still open, carrying the real `silentMs`; the ceiling
+/// is advisory only, so the turn still resolves normally when released.
+#[tokio::test]
+async fn unclosed_tool_call_past_ceiling_emits_stalled() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "150"),
+    ]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent, release_close, release_end) =
+        connect_tool_silence(vec![tool_stall_tool_call()], Vec::new());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let turn = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            services
+                .run_connection_prompt_turn(
+                    &conn,
+                    &mut note_rx,
+                    &agent_id,
+                    &workspace_id,
+                    ACP_SID,
+                    vec![text_block("hi")],
+                    Some("turn-tool-hung-ceiling"),
+                )
+                .await
+        })
+    };
+
+    let mut events = Vec::new();
+    let mut cursor = 0;
+    wait_for_event_type(&mut sub, &mut events, &mut cursor, "agent:tool:call").await;
+    // The tool call is never closed: the advisory must still fire once the
+    // silence crosses the 150ms ceiling (RED at the parent SHA: the open call
+    // suppressed it for the entire silence and this wait timed out).
+    wait_for_status_phase(&mut sub, &mut events, &mut cursor, "stalled").await;
+    let stalled = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:status" && e.data["phase"] == json!("stalled"))
+        .expect("stalled status captured");
+    assert!(
+        stalled.data["silentMs"].as_u64().unwrap() >= 150,
+        "silentMs reflects the ceiling, not the tool-free threshold: {:?}",
+        stalled.data
+    );
+    // Advisory only: releasing the held response resolves the turn normally.
+    release_close.send(()).expect("mock alive");
+    release_end.send(()).expect("mock alive");
+    let stop = timeout(Duration::from_secs(2), turn)
+        .await
+        .expect("turn completes")
+        .expect("worker task")
+        .expect("the ceiling advisory never fails the turn");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let phases: Vec<&str> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:status")
+        .map(|e| e.data["phase"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        phases,
+        vec!["prompt", "stalled"],
+        "exactly one stalled advisory past the open-tool ceiling"
+    );
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:failed"),
+        "the open-tool ceiling is advisory: no terminal failure"
+    );
+}
+
+/// Regression for intent-hq/intent#5395 (open-tool terminal half — the exact
+/// reported signature): a `tool_call` whose completion the adapter lost stays
+/// open with NO `session/update` of any kind. Past the open-tool advisory the
+/// `stalled` advisory fires; past `INTENTD_OPEN_TOOL_CALL_TERMINAL_MS` the
+/// turn ENDS with the distinct provider-stall error naming the hung tool call
+/// (id + title), takes the ordinary terminal path (`status = error`, context
+/// stashed, `agent:failed`) and raises the blocker attention request —
+/// `stalled` → `agent:attention-requested` → `agent:failed` — instead of
+/// sitting on the ~2 h idle-timeout redrive path. The tool-free terminal
+/// threshold is pinned BELOW the open-tool one and does not fire early: the
+/// turn survives past it while the tool is open. RED at the parent SHA: the
+/// turn never settled (idle timeout left at its 30-minute default).
+#[tokio::test]
+async fn open_tool_call_silence_past_terminal_threshold_fails_turn_and_raises_attention() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "100"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "150"),
+        ("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS", "600"),
+    ]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let parent_id = AgentId::from("parent-tool-stall");
+    services
+        .store
+        .insert_agent_session(&new_session(&parent_id, &workspace_id))
+        .await
+        .expect("insert parent session");
+    let mut child = new_session(&agent_id, &workspace_id);
+    child.parent_agent_id = Some(parent_id.clone());
+    services
+        .store
+        .update_agent_session(&workspace_id, &child)
+        .await
+        .expect("link child to parent");
+    services.set_test_busy(&agent_id, true);
+    // The tool_call opens and nothing ever closes it (both releases held for
+    // the whole test; the mock keeps its pipes open).
+    let (conn, mut note_rx, _agent, _release_close, _release_end) =
+        connect_tool_silence(vec![tool_stall_tool_call()], Vec::new());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let started = std::time::Instant::now();
+    let err = timeout(
+        Duration::from_secs(5),
+        services.run_connection_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            Some("turn-tool-hung-terminal"),
+        ),
+    )
+    .await
+    .expect("an open-tool provider stall ends the turn well before the idle timeout")
+    .expect_err("the open-tool provider stall fails the turn");
+    assert!(
+        started.elapsed() >= Duration::from_millis(600),
+        "the tool-free terminal threshold (150ms) must not fire while a tool call is open: \
+         settled after {:?}",
+        started.elapsed()
+    );
+    let intent_core::Error::Internal(msg) = &err else {
+        panic!("Internal error expected: {err}");
+    };
+    assert!(
+        msg.starts_with(&format!(
+            "session/prompt failed: {}",
+            intent_acp::PROVIDER_STALL_PREFIX
+        )),
+        "distinct provider-stall error under the ordinary terminal wrapper: {msg}"
+    );
+    assert!(
+        msg.contains("tool call t1 (") && msg.contains("Run tests") && msg.contains("still open"),
+        "error names the hung tool call id and title: {msg}"
+    );
+    assert!(
+        !msg.contains(intent_acp::PROMPT_IDLE_TIMEOUT_PREFIX),
+        "{msg}"
+    );
+
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::Error);
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_some(),
+        "terminal context stashed for the worker"
+    );
+    assert_eq!(stored.attention_request_kind.as_deref(), Some("blocker"));
+    let reason = stored
+        .attention_request_reason
+        .as_deref()
+        .expect("attention reason recorded");
+    assert!(
+        reason.contains("provider stall")
+            && reason.contains("t1 (")
+            && reason.contains("still open"),
+        "reason names the stall and the hung tool call: {reason}"
+    );
+    let parent = services.store.get_agent_session(&parent_id).await.unwrap();
+    assert_eq!(
+        parent.messages.len(),
+        1,
+        "one direct attention wake to the parent"
+    );
+
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:failed") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    let tool_call_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:tool:call")
+        .unwrap_or_else(|| panic!("tool call routed: {types:?}"));
+    let stalled_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:stream:status" && e.data["phase"] == json!("stalled"))
+        .unwrap_or_else(|| panic!("stalled advisory precedes the terminal stall: {types:?}"));
+    let attention_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:attention-requested")
+        .unwrap_or_else(|| panic!("agent:attention-requested emitted: {types:?}"));
+    let failed_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:failed")
+        .expect("agent:failed emitted");
+    assert!(
+        tool_call_idx < stalled_idx && stalled_idx < attention_idx && attention_idx < failed_idx,
+        "tool call → stalled → attention → failed: {types:?}"
+    );
+    assert_eq!(events[attention_idx].data["kind"], json!("blocker"));
+    assert!(
+        events[failed_idx].data["error"]
+            .as_str()
+            .unwrap()
+            .contains(intent_acp::PROVIDER_STALL_PREFIX),
+        "agent:failed names the provider stall: {:?}",
+        events[failed_idx].data
+    );
+    assert_eq!(
+        events[failed_idx].data["turnId"],
+        json!("turn-tool-hung-terminal")
+    );
+}
+
+/// The open-tool provider stall embeds the provider-controlled tool id and
+/// title in the flattened `session/prompt failed:` wrapper. A hung call whose
+/// label mentions "cancelled" must NOT be reclassified as a benign cancel by
+/// `agent_manager::prompt_cancellation_error`'s substring heuristic — it
+/// would skip Error persistence here and the worker's teardown/requeue. The
+/// stall prefix is rejected first, so the terminal semantics hold regardless
+/// of the diagnostic label (intent-hq/intent#5395 review).
+#[tokio::test]
+async fn open_tool_call_stall_with_cancelled_in_label_stays_terminal() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "100"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "150"),
+        ("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS", "300"),
+    ]);
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    services.set_test_busy(&agent_id, true);
+    let tool_call = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "cancelled-sweep",
+                "title": "Inspect cancelled jobs", "kind": "execute", "status": "in_progress",
+                "rawInput": { "command": "jobs" } }
+        }
+    })
+    .to_string();
+    let (conn, mut note_rx, _agent, _release_close, _release_end) =
+        connect_tool_silence(vec![tool_call], Vec::new());
+
+    let err = timeout(
+        Duration::from_secs(5),
+        services.run_connection_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            Some("turn-tool-hung-cancelled-label"),
+        ),
+    )
+    .await
+    .expect("the open-tool provider stall ends the turn")
+    .expect_err("the open-tool provider stall fails the turn");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cancelled-sweep") && msg.contains("Inspect cancelled jobs"),
+        "precondition: the label reaches the flattened wrapper: {msg}"
+    );
+    assert!(
+        !crate::agent_manager::prompt_cancellation_error(&err),
+        "a provider stall is never a benign cancel, whatever the tool label: {msg}"
+    );
+
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::Error,
+        "Error status persisted despite \"cancelled\" in the tool label"
+    );
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_some(),
+        "terminal context stashed for the worker"
+    );
+    assert_eq!(stored.attention_request_kind.as_deref(), Some("blocker"));
+    assert!(
+        stored
+            .attention_request_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("provider stall") && r.contains("cancelled-sweep")),
+        "attention reason names the stall and the hung tool call: {:?}",
+        stored.attention_request_reason
+    );
+}
+
+/// Mock agent for the streaming-tool guard: `session/prompt` streams
+/// `open_update` (a `tool_call` start), then emits `heartbeat_update` every
+/// `every` until `release_end` fires, then streams `close_update` and
+/// resolves `end_turn`. Models a legitimately long tool run that keeps
+/// reporting progress.
+fn spawn_heartbeat_tool_mock_agent<R, W>(
+    read: R,
+    write: W,
+    open_update: String,
+    heartbeat_update: String,
+    every: Duration,
+    close_update: String,
+    release_end: tokio::sync::oneshot::Receiver<()>,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        let mut release_end = Some(release_end);
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                if let Some(mut release_end) = release_end.take() {
+                    write
+                        .write_all(format!("{open_update}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    write.flush().await.unwrap();
+                    loop {
+                        tokio::select! {
+                            _ = &mut release_end => break,
+                            () = tokio::time::sleep(every) => {
+                                write
+                                    .write_all(format!("{heartbeat_update}\n").as_bytes())
+                                    .await
+                                    .unwrap();
+                                write.flush().await.unwrap();
+                            }
+                        }
+                    }
+                    write
+                        .write_all(format!("{close_update}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    write.flush().await.unwrap();
+                }
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/prompt" => json!({ "stopReason": "end_turn" }),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// Guard for the open-tool terminal threshold (intent-hq/intent#5395): a tool
+/// call that keeps STREAMING non-terminal `tool_call_update` chunks is not a
+/// stall — every update resets the silence clock — so a run lasting far past
+/// `INTENTD_OPEN_TOOL_CALL_TERMINAL_MS` (and past every other threshold) is
+/// never terminated, emits no `stalled` advisory, raises no attention, and
+/// resolves normally once the tool completes.
+#[tokio::test]
+async fn streaming_tool_call_past_open_tool_terminal_threshold_is_not_terminated() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "300"),
+        ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "400"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "500"),
+        ("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS", "600"),
+    ]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let heartbeat = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "in_progress" }
+        }
+    })
+    .to_string();
+    let tool_done = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed", "rawOutput": { "summary": "12 passed" } }
+        }
+    })
+    .to_string();
+    let (release_end_tx, release_end_rx) = tokio::sync::oneshot::channel();
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let _agent = spawn_heartbeat_tool_mock_agent(
+        c2a_agent,
+        a2c_agent,
+        tool_stall_tool_call(),
+        heartbeat,
+        Duration::from_millis(30),
+        tool_done,
+        release_end_rx,
+    );
+    let (note_tx, mut note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let turn = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            services
+                .run_connection_prompt_turn(
+                    &conn,
+                    &mut note_rx,
+                    &agent_id,
+                    &workspace_id,
+                    ACP_SID,
+                    vec![text_block("hi")],
+                    Some("turn-tool-streaming"),
+                )
+                .await
+        })
+    };
+
+    let mut events = Vec::new();
+    let mut cursor = 0;
+    wait_for_event_type(&mut sub, &mut events, &mut cursor, "agent:tool:call").await;
+    // The tool runs 2.5× past the 600ms open-tool terminal threshold while
+    // heart-beating every 30ms.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    release_end_tx.send(()).expect("mock alive");
+    let stop = timeout(Duration::from_secs(2), turn)
+        .await
+        .expect("turn completes")
+        .expect("worker task")
+        .expect("a streaming tool call is never failed as a provider stall");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let phases: Vec<&str> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:status")
+        .map(|e| e.data["phase"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        phases,
+        vec!["prompt"],
+        "a streaming tool call is neither stalled nor terminated"
+    );
+    assert!(!events.iter().any(|e| e.event_type == "agent:failed"));
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert!(
+        stored.attention_request_kind.is_none(),
+        "no attention raise for a streaming tool call: {:?}",
+        stored.attention_request_kind
+    );
+}
+
+/// Regression for intent-hq/intent#5395 (terminal half): tool-free silence
+/// past `INTENTD_PROVIDER_STALL_TERMINAL_MS` ENDS the turn with the distinct
+/// provider-stall error instead of waiting for the 30-minute idle timeout's
+/// warn-and-continue redrive. The turn takes the ordinary terminal path
+/// (`status = error`, terminal context stashed for the worker, `agent:failed`
+/// emitted) and raises the intent-hq/intent#5419-style blocker attention
+/// request naming the stall — `agent:attention-requested` precedes
+/// `agent:failed`, the parent gets the direct wake, and the `stalled`
+/// advisory fired first. RED at the parent SHA: the turn never settled
+/// (the idle timeout is left at its 30-minute default here).
+#[tokio::test]
+async fn tool_free_provider_stall_past_terminal_threshold_fails_turn_and_raises_attention() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "200"),
+    ]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Delegated shape: a parent session whose child is the stalling agent, so
+    // the blocker path's direct parent wake has a target.
+    let parent_id = AgentId::from("parent-stall");
+    services
+        .store
+        .insert_agent_session(&new_session(&parent_id, &workspace_id))
+        .await
+        .expect("insert parent session");
+    let mut child = new_session(&agent_id, &workspace_id);
+    child.parent_agent_id = Some(parent_id.clone());
+    services
+        .store
+        .update_agent_session(&workspace_id, &child)
+        .await
+        .expect("link child to parent");
+    // Production shape: the raise happens INSIDE the live turn, where the
+    // manager's busy set defers the surfacing to the turn-end flush.
+    services.set_test_busy(&agent_id, true);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    // The provider streams a little text, then hangs with NO tool call open
+    // (the silent mock never resolves the prompt and keeps its pipes open).
+    let chunk = |text: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": ACP_SID,
+                "update": { "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": text } }
+            }
+        })
+        .to_string()
+    };
+    let (conn, mut note_rx, _agent) = connect_silent(vec![chunk("Thinking "), chunk("hard")]);
+
+    let err = timeout(
+        Duration::from_secs(5),
+        services.run_connection_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            Some("turn-provider-stall"),
+        ),
+    )
+    .await
+    .expect("a tool-free provider stall ends the turn well before the idle timeout")
+    .expect_err("the provider stall fails the turn");
+    let intent_core::Error::Internal(msg) = &err else {
+        panic!("Internal error expected: {err}");
+    };
+    assert!(
+        msg.starts_with(&format!(
+            "session/prompt failed: {}",
+            intent_acp::PROVIDER_STALL_PREFIX
+        )),
+        "distinct provider-stall error under the ordinary terminal wrapper: {msg}"
+    );
+    assert!(
+        !msg.contains(intent_acp::PROMPT_IDLE_TIMEOUT_PREFIX),
+        "a provider stall is not an idle timeout (no warn-and-continue): {msg}"
+    );
+
+    // Ordinary terminal classification: Error persisted, context stashed.
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::Error);
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_some(),
+        "terminal context stashed for the worker"
+    );
+    // Blocker-style attention request naming the stall.
+    assert_eq!(
+        stored.attention_request_kind.as_deref(),
+        Some("blocker"),
+        "a terminal provider stall raises a blocker attention request (intent#5395)"
+    );
+    let reason = stored
+        .attention_request_reason
+        .as_deref()
+        .expect("attention reason recorded");
+    assert!(
+        reason.contains("provider stall"),
+        "reason names the stall: {reason}"
+    );
+    assert!(
+        reason.contains("no tool call in flight"),
+        "reason states the tool-free condition: {reason}"
+    );
+    // Transcript: streamed partial persisted, blocker notice after it.
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.len(),
+        2,
+        "assistant partial + blocker notice: {messages:?}"
+    );
+    assert_eq!(messages[0].role, "assistant");
+    assert_eq!(messages[1].role, "system");
+    assert_eq!(
+        messages[1].content[0]["meta"]["kind"],
+        json!("blocker-report")
+    );
+    // The parent received the direct blocker wake.
+    let parent = services.store.get_agent_session(&parent_id).await.unwrap();
+    assert_eq!(
+        parent.messages.len(),
+        1,
+        "one direct attention wake to the parent"
+    );
+    let wake_text = serde_json::to_string(&parent.messages[0].content).unwrap();
+    assert!(
+        wake_text.contains("provider stall"),
+        "parent wake names the stall: {wake_text}"
+    );
+    // Event order: stalled advisory → agent:attention-requested → agent:failed.
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:failed") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    let stalled_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:stream:status" && e.data["phase"] == json!("stalled"))
+        .unwrap_or_else(|| panic!("stalled advisory precedes the terminal stall: {types:?}"));
+    let attention_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:attention-requested")
+        .unwrap_or_else(|| panic!("agent:attention-requested emitted: {types:?}"));
+    let failed_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:failed")
+        .expect("agent:failed emitted");
+    assert!(
+        stalled_idx < attention_idx && attention_idx < failed_idx,
+        "stalled → attention → failed: {types:?}"
+    );
+    assert_eq!(events[attention_idx].data["kind"], json!("blocker"));
+    assert!(
+        events[failed_idx].data["error"]
+            .as_str()
+            .unwrap()
+            .contains(intent_acp::PROVIDER_STALL_PREFIX),
+        "agent:failed names the provider stall: {:?}",
+        events[failed_idx].data
+    );
+    assert_eq!(
+        events[failed_idx].data["turnId"],
+        json!("turn-provider-stall")
+    );
+    assert!(
+        events.iter().any(|e| e.event_type == "agent:stream:end"),
+        "terminal stream:end emitted: {types:?}"
     );
 }
 
 /// `INTENTD_STREAM_STALL_MS` overrides the stall threshold; absent (or
 /// unparseable) it falls back to the 5-minute default, which stays below the
-/// silent-tail-suspect default (stall < silent-tail-suspect < 30-min idle).
+/// silent-tail-suspect default. The intent-hq/intent#5395 thresholds
+/// (`INTENTD_OPEN_TOOL_CALL_STALL_MS`, `INTENTD_PROVIDER_STALL_TERMINAL_MS`,
+/// `INTENTD_OPEN_TOOL_CALL_TERMINAL_MS`) override the same way, and the
+/// defaults keep the ordering stall (5) < silent-tail-suspect (8) < open-tool
+/// ceiling (15) < terminal stall (20) < open-tool terminal (25) < 30-min idle
+/// timeout (both terminal stalls must sit below the idle timeout to be
+/// reachable at all).
 #[test]
 fn stream_stall_ms_env_override_and_default() {
     {
@@ -6201,14 +7743,69 @@ fn stream_stall_ms_env_override_and_default() {
         let _env = EnvGuard::set_all(&[("INTENTD_STREAM_STALL_MS", "not-a-number")]);
         assert_eq!(crate::agent_session::stream_stall_ms(), 300_000);
     }
+    {
+        let _env = EnvGuard::set_all(&[
+            ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "4321"),
+            ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "5432"),
+            ("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS", "6543"),
+        ]);
+        assert_eq!(crate::agent_session::open_tool_call_stall_ms(), 4321);
+        assert_eq!(crate::agent_session::provider_stall_terminal_ms(), 5432);
+        assert_eq!(crate::agent_session::open_tool_call_terminal_ms(), 6543);
+    }
+    {
+        let _env = EnvGuard::set_all(&[
+            ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "nope"),
+            ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "nope"),
+            ("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS", "nope"),
+        ]);
+        assert_eq!(crate::agent_session::open_tool_call_stall_ms(), 900_000);
+        assert_eq!(
+            crate::agent_session::provider_stall_terminal_ms(),
+            1_200_000
+        );
+        assert_eq!(
+            crate::agent_session::open_tool_call_terminal_ms(),
+            1_500_000
+        );
+    }
     let _env = EnvGuard::apply(&[
         ("INTENTD_STREAM_STALL_MS", None),
         ("INTENTD_SILENT_TAIL_SUSPECT_MS", None),
+        ("INTENTD_OPEN_TOOL_CALL_STALL_MS", None),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", None),
+        ("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS", None),
+        ("INTENTD_PROMPT_IDLE_TIMEOUT_MS", None),
     ]);
     assert_eq!(crate::agent_session::stream_stall_ms(), 300_000);
     assert_eq!(crate::agent_session::silent_tail_suspect_ms(), 480_000);
+    assert_eq!(crate::agent_session::open_tool_call_stall_ms(), 900_000);
+    assert_eq!(
+        crate::agent_session::provider_stall_terminal_ms(),
+        1_200_000
+    );
+    assert_eq!(
+        crate::agent_session::open_tool_call_terminal_ms(),
+        1_500_000
+    );
     assert!(
         crate::agent_session::stream_stall_ms() < crate::agent_session::silent_tail_suspect_ms()
+    );
+    assert!(
+        crate::agent_session::silent_tail_suspect_ms()
+            < crate::agent_session::open_tool_call_stall_ms()
+    );
+    assert!(
+        crate::agent_session::open_tool_call_stall_ms()
+            < crate::agent_session::provider_stall_terminal_ms()
+    );
+    assert!(
+        crate::agent_session::provider_stall_terminal_ms()
+            < crate::agent_session::open_tool_call_terminal_ms()
+    );
+    assert!(
+        crate::agent_session::open_tool_call_terminal_ms()
+            < u64::try_from(intent_acp::session::prompt_idle_timeout().as_millis()).unwrap()
     );
 }
 
@@ -6240,7 +7837,7 @@ async fn dropped_anonymous_tool_update_does_not_suppress_stall() {
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -6287,7 +7884,7 @@ async fn prompt_turn_failure_stamps_turn_id_on_agent_failed() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -6334,7 +7931,7 @@ async fn prompt_turn_failure_omits_turn_id_when_absent() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -6390,7 +7987,7 @@ async fn detached_turn_end_usage_bookkeeping_still_lands() {
     });
 
     let stop = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -6442,6 +8039,74 @@ async fn detached_turn_end_usage_bookkeeping_still_lands() {
     assert_eq!(usage.by_agent_id[&agent_id.0].input_tokens, 70);
 }
 
+#[tokio::test]
+async fn shutdown_retains_turn_bookkeeping_after_handle_leaves_chain() {
+    let (tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with_prompt_result(
+        prompt_updates(),
+        json!({"stopReason":"end_turn", "usage": {
+            "totalTokens":100, "inputTokens":100, "outputTokens":0,
+            "cachedReadTokens":0, "cachedWriteTokens":0
+        }}),
+    );
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let prev = tokio::spawn(async move {
+        let _ = wait.await;
+    });
+    services
+        .turn_bookkeeping
+        .lock()
+        .unwrap()
+        .insert(agent_id.clone(), prev);
+    services
+        .run_connection_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .unwrap();
+    // The cost-only path can take this handle out of the map. Losing that
+    // caller must not detach the underlying bookkeeping from shutdown.
+    let handle = services
+        .turn_bookkeeping
+        .lock()
+        .unwrap()
+        .remove(&agent_id)
+        .unwrap();
+    drop(handle);
+    let drain = services.shutdown_store_writers();
+    tokio::pin!(drain);
+    let returned_early = tokio::select! {
+        biased;
+        () = &mut drain => true,
+        () = std::future::ready(()) => false,
+    };
+    release.send(()).unwrap();
+    if !returned_early {
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .unwrap();
+    }
+    assert!(
+        !returned_early,
+        "shutdown abandoned turn bookkeeping behind its predecessor"
+    );
+    bus.shutdown().await.unwrap();
+    bus.store().close().await;
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    let (_, _, _, snapshot) = reopened
+        .get_agent_session_token_usage(&workspace_id, &agent_id)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.unwrap().input_tokens, 100);
+    reopened.close().await;
+}
+
 /// Cross-turn bookkeeping ordering (monorepo#738): detached turn-end
 /// bookkeeping tasks for one agent are CHAINED — each awaits its predecessor
 /// — so a delayed task from turn N can neither skew turn N+1's usage-stats
@@ -6490,7 +8155,7 @@ async fn detached_bookkeeping_chains_per_agent_across_turns() {
         .insert(agent_id.clone(), prev);
 
     services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -7530,7 +9195,7 @@ async fn normal_zero_output_turn_end_leaves_the_pinned_slot_to_the_teardown_flus
         let workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             services
-                .run_prompt_turn(
+                .run_connection_prompt_turn(
                     &conn,
                     &mut note_rx,
                     &agent_id,
@@ -7827,7 +9492,7 @@ async fn tool_only_turn_emits_throttled_activity_with_last_tool_use() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let stop = services
-        .run_prompt_turn(
+        .run_connection_prompt_turn(
             &conn,
             &mut note_rx,
             &agent_id,
@@ -8858,13 +10523,34 @@ fn prompt_auth_required_turn_error_matches_mapped_shape() {
             "{id}: {msg}"
         );
         assert!(
+            msg.contains(super::PROMPT_AUTH_REQUIRED_MARKER),
+            "{id}: {msg}"
+        );
+        assert!(
             super::prompt_auth_required_turn_error(&Error::InvalidParams(msg)),
             "{id}"
         );
     }
     // Other InvalidParams shapes, mid-string mentions, and Internal errors
-    // never classify — they still need the worker-emitted event pair.
+    // never classify — they still need the worker-emitted event pair. In
+    // particular the turn-start disabled-provider rejection
+    // (intent-hq/intent#5737) shares the `session/prompt: provider "` prefix
+    // but is raised BEFORE any spawn, with no pair emitted.
+    let disabled = crate::agent_ops::ensure_provider_enabled(
+        "session/prompt",
+        "codex",
+        Some(&std::collections::BTreeMap::from([(
+            "codex".to_string(),
+            false,
+        )])),
+    )
+    .expect_err("codex disabled");
+    assert!(
+        matches!(&disabled, Error::InvalidParams(m) if m.starts_with(super::PROMPT_AUTH_REQUIRED_PREFIX)),
+        "the disabled rejection shares the prefix, which is why the marker exists: {disabled:?}"
+    );
     for err in [
+        disabled,
         Error::InvalidParams("agent.create: provider \"pi\" is not authenticated".into()),
         Error::InvalidParams(format!(
             "bad params: {}session/prompt: provider \"pi\"",
@@ -8913,4 +10599,219 @@ fn load_auth_required_error_matches_mapped_shape() {
     ] {
         assert!(!super::load_auth_required_error(&err), "{err:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Text-block `media` sidecar (§7.1): header-only Markdown image dimension
+// probe on the streaming write path.
+// ---------------------------------------------------------------------------
+
+/// A probe context rooted in a scratch dir: `<dir>/root` is the workspace
+/// root, `<dir>/assets` the assets root, workspace `ws-1`.
+fn probe_context(dir: &std::path::Path) -> super::ProbeContext {
+    std::fs::create_dir_all(dir.join("root")).unwrap();
+    super::ProbeContext {
+        workspace_id: "ws-1".to_string(),
+        workspace_root: dir.join("root").to_string_lossy().into_owned(),
+        assets_root: Some(dir.join("assets")),
+    }
+}
+
+fn write_png(path: &std::path::Path, w: u32, h: u32) {
+    crate::image_dimensions::tests::write_image(path, w, h, image::ImageFormat::Png);
+}
+
+/// A reference split across chunks resolves exactly once — on the chunk that
+/// completes it — and the flushed block carries the union of every entry the
+/// chunks resolved; a block that resolved nothing carries no `media` key.
+#[test]
+fn media_sidecar_resolves_split_reference_once_and_persists_union() {
+    let dir = crate::test_support::test_tempdir("media-split-");
+    write_png(&dir.path().join("assets/ws-1/a.png"), 640, 480);
+    write_png(&dir.path().join("root/docs/b.png"), 8, 9);
+    let mut t =
+        super::Transcript::new("m1".to_string()).with_probe_context(probe_context(dir.path()));
+
+    t.push_chunk("See ![shot](workspace-asset://ws-1/a.p", false);
+    assert_eq!(
+        t.probe_new_images(),
+        None,
+        "incomplete reference resolves nothing"
+    );
+    t.push_chunk("ng) and ![b](docs/b.png).", false);
+    assert_eq!(
+        t.probe_new_images().map(Value::Object),
+        Some(json!({
+            "workspace-asset://ws-1/a.png": { "width": 640, "height": 480 },
+            "docs/b.png": { "width": 8, "height": 9 },
+        })),
+        "the completing chunk carries both entries"
+    );
+    t.push_chunk(
+        " Again ![shot](workspace-asset://ws-1/a.png) and ![x](https://e.com/x.png).",
+        false,
+    );
+    assert_eq!(
+        t.probe_new_images(),
+        None,
+        "a repeated src and an https source add no NEW entry"
+    );
+    assert_eq!(
+        t.snapshot_blocks()[0]["media"],
+        json!({
+            "workspace-asset://ws-1/a.png": { "width": 640, "height": 480 },
+            "docs/b.png": { "width": 8, "height": 9 },
+        }),
+        "the mid-turn snapshot carries the union so far"
+    );
+
+    // A tool block closes the text block; the next text block starts clean.
+    t.push_block(json!({ "type": "tool_use", "name": "t", "input": {} }));
+    t.push_chunk("no images here", false);
+    assert_eq!(t.probe_new_images(), None);
+
+    let blocks = t.into_blocks();
+    assert_eq!(
+        blocks[0]["media"],
+        json!({
+            "workspace-asset://ws-1/a.png": { "width": 640, "height": 480 },
+            "docs/b.png": { "width": 8, "height": 9 },
+        }),
+        "persisted media = union of what was sent live"
+    );
+    assert_eq!(blocks[0]["text"].as_str().unwrap().matches("![").count(), 4);
+    assert!(
+        blocks[2].get("media").is_none(),
+        "no media key when nothing resolved"
+    );
+}
+
+/// The per-turn probe cache serves a repeated `src` without touching the
+/// filesystem again: the file is deleted after its first probe and a later
+/// block still resolves it.
+#[test]
+fn media_sidecar_probe_cache_serves_repeats_across_blocks() {
+    let dir = crate::test_support::test_tempdir("media-cache-");
+    let png = dir.path().join("root/shot.png");
+    write_png(&png, 31, 17);
+    let mut t =
+        super::Transcript::new("m1".to_string()).with_probe_context(probe_context(dir.path()));
+
+    t.push_chunk("![a](shot.png)", false);
+    assert!(t.probe_new_images().is_some());
+    std::fs::remove_file(&png).unwrap();
+    t.push_block(json!({ "type": "tool_use", "name": "t", "input": {} }));
+    t.push_chunk("![again](shot.png)", false);
+    assert_eq!(
+        t.probe_new_images().map(Value::Object),
+        Some(json!({ "shot.png": { "width": 31, "height": 17 } })),
+        "cache hit — the file is gone"
+    );
+    assert_eq!(
+        t.into_blocks()[2]["media"],
+        json!({ "shot.png": { "width": 31, "height": 17 } })
+    );
+}
+
+/// At most [`super::MAX_IMAGE_REFS_PER_BLOCK`] references are examined per
+/// text block; the cap resets on the next block.
+#[test]
+fn media_sidecar_caps_references_per_block() {
+    let dir = crate::test_support::test_tempdir("media-cap-");
+    let cap = super::MAX_IMAGE_REFS_PER_BLOCK;
+    for i in 0..=cap {
+        write_png(&dir.path().join(format!("root/i{i}.png")), 4, 4);
+    }
+    let mut t =
+        super::Transcript::new("m1".to_string()).with_probe_context(probe_context(dir.path()));
+    let refs = (0..=cap).fold(String::new(), |mut acc, i| {
+        acc.push_str("![i](i");
+        acc.push_str(&i.to_string());
+        acc.push_str(".png) ");
+        acc
+    });
+    t.push_chunk(&refs, false);
+    let media = t.probe_new_images().expect("entries resolved");
+    assert_eq!(
+        media.len(),
+        cap,
+        "the {}th reference is not examined",
+        cap + 1
+    );
+    assert!(!media.contains_key(&format!("i{cap}.png")));
+    t.push_chunk(&format!("![late](i{cap}.png)"), false);
+    assert_eq!(
+        t.probe_new_images(),
+        None,
+        "past the cap nothing more is examined"
+    );
+
+    t.push_block(json!({ "type": "tool_use", "name": "t", "input": {} }));
+    t.push_chunk(&format!("![late](i{cap}.png)"), false);
+    assert!(t.probe_new_images().is_some(), "the cap is per block");
+}
+
+/// Reasoning never resolves entries, and a probe-less transcript (no
+/// context) leaves every block untouched.
+#[test]
+fn media_sidecar_skips_thinking_and_probeless_transcripts() {
+    let dir = crate::test_support::test_tempdir("media-skip-");
+    write_png(&dir.path().join("root/shot.png"), 3, 3);
+    let mut t =
+        super::Transcript::new("m1".to_string()).with_probe_context(probe_context(dir.path()));
+    t.push_chunk("![a](shot.png)", true);
+    assert_eq!(t.probe_new_images(), None);
+    let blocks = t.into_blocks();
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert!(blocks[0].get("media").is_none());
+
+    let mut t = super::Transcript::new("m1".to_string());
+    t.push_chunk("![a](shot.png)", false);
+    assert_eq!(t.probe_new_images(), None);
+    assert!(t.into_blocks()[0].get("media").is_none());
+}
+
+/// End to end through `route_notification`: the `chat:stream:delta` event of
+/// the chunk that completes a reference carries `media`; earlier chunks do
+/// not.
+#[tokio::test]
+async fn chunk_delta_event_carries_media_for_the_completing_chunk() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let dir = crate::test_support::test_tempdir("media-event-");
+    write_png(&dir.path().join("assets/ws-1/a.png"), 20, 10);
+    let mut transcript =
+        super::Transcript::new("m1".to_string()).with_probe_context(probe_context(dir.path()));
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    for note in [
+        message_note("Here: ![a](workspace-asset://ws-1/"),
+        message_note("a.png) done"),
+    ] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+    let mut deltas: Vec<Event> = Vec::new();
+    while deltas.len() < 2 {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        deltas.extend(
+            batch
+                .into_iter()
+                .filter(|e| e.event_type == "chat:stream:delta"),
+        );
+    }
+    assert!(deltas[0].data.get("media").is_none());
+    assert_eq!(
+        deltas[1].data["media"],
+        json!({ "workspace-asset://ws-1/a.png": { "width": 20, "height": 10 } })
+    );
+    assert_eq!(deltas[1].data["blockType"], "text");
+    assert_eq!(
+        transcript.into_blocks()[0]["media"],
+        json!({ "workspace-asset://ws-1/a.png": { "width": 20, "height": 10 } })
+    );
 }

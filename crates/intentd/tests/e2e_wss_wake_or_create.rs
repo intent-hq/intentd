@@ -27,8 +27,12 @@
 #![cfg(unix)]
 
 mod common;
+#[path = "e2e_wss_wake_or_create/daemon_exit.rs"]
+mod daemon_exit;
+#[path = "e2e_wss_wake_or_create/fixture_identity.rs"]
+mod fixture_identity;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,46 +47,188 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    /// Kept alive for the daemon's lifetime; the store lives under it.
+    data_dir: daemon_exit::FixtureDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let was_panicking = std::thread::panicking();
+        let started = std::time::Instant::now();
+        let deadline = started + daemon_exit::BOUND;
+        let pid = self.child.id();
+        let mut events = vec![json!({"event": "TeardownEntered", "pid": pid})];
+        let mut wait_attempted = false;
+        let attempt = catch_unwind(AssertUnwindSafe(|| -> std::io::Result<()> {
+            let mut wait = daemon_exit::ExitWait::new(&mut self.child)?;
+            daemon_exit::shutdown(
+                &self.data_dir.path().join("intentd.sock"),
+                pid,
+                deadline,
+                &mut events,
+            )?;
+            wait.until_exit(deadline, || {
+                events.push(json!({"event": "DaemonExitWaitPending", "pid": pid,
+                    "scope": "fixture direct-child exit readiness; not production admission"}));
+
+                Ok(())
+            })?;
+            events.push(json!({"event": "DaemonExitReadyUnreaped", "pid": pid}));
+
+            daemon_exit::remaining(deadline)?;
+            wait_attempted = true;
+            let waited = wait.reap();
+            events.push(daemon_exit::wait_record(&waited));
+
+            let status = waited?;
+            if !daemon_exit::normal(status) {
+                return Err(daemon_exit::invalid("unexpected daemon termination status"));
+            }
+
+            daemon_exit::remaining(deadline)?;
+            Ok(())
+        }));
+        let mut failure = match &attempt {
+            _ if was_panicking => Some("test was already panicking before teardown".to_owned()),
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some("panic during fixture teardown".to_owned()),
+        };
+        if let Some(error) = &failure {
+            // Latch before cleanup. The original error/panic remains primary;
+            // cleanup cannot turn a forced termination or unknown owner into success.
+            events.push(json!({"event": "TeardownFailed", "error": error}));
+
+            if !wait_attempted {
+                let cleanup = catch_unwind(AssertUnwindSafe(|| -> std::io::Result<()> {
+                    events.push(json!({"event": "FailureCleanupKillAttempt", "pid": pid}));
+
+                    let killed = self.child.kill();
+
+                    events.push(
+                        json!({"event": "FailureCleanupKillResult", "ok": killed.is_ok(),
+                        "error": killed.as_ref().err().map(ToString::to_string)}),
+                    );
+                    killed?;
+                    let mut wait = daemon_exit::ExitWait::new(&mut self.child)?;
+                    wait.until_exit(deadline, || Ok(()))?;
+                    let waited = wait.reap();
+                    events.push(daemon_exit::wait_record(&waited));
+
+                    waited.map(|_| ())
+                }));
+                events.push(json!({"event": "FailureCleanupResult", "result": match cleanup {
+                    Ok(Ok(())) => "direct daemon reaped after failure".to_owned(),
+                    Ok(Err(error)) => error.to_string(), Err(_) => "cleanup panicked".to_owned(),
+                }}));
+            }
+        }
+        let finalizing = catch_unwind(AssertUnwindSafe(|| {
+            daemon_exit::finalize_and_measure(
+                started,
+                deadline,
+                || {
+                    let failed = failure.is_some() || daemon_exit::remaining(deadline).is_err();
+                    let directory = self.data_dir.finalize(failed);
+                    json!({"complete": !failed && daemon_exit::directory_complete(&directory),
+                    "daemonDirectory": directory})
+                },
+                std::time::Instant::now,
+            )
+        }));
+        let (resources, completion) = match &finalizing {
+            Ok((resources, completion)) => (resources.clone(), completion.clone()),
+            Err(_) => (
+                json!({"complete":false,"error":"resource finalization panicked"}),
+                daemon_exit::completion(started, deadline, std::time::Instant::now(), false),
+            ),
+        };
+        if completion["normalCompletion"] != true {
+            failure
+                .get_or_insert_with(|| "incomplete, failed or late semantic finalization".into());
+        }
+        let receipt = json!({"pid":pid,"events":events,"failure":failure,"completion":completion,
+            "resources":resources,
+            "platform":std::env::consts::OS,"normalCompletion":failure.is_none() && completion["normalCompletion"] == true,
+            "timingScope":"semantic finalization before serialization; synchronous syscalls are not hard-preemptible"});
+        if failure.is_some() {
+            if let Some(path) = receipt["resources"]["daemonDirectory"]["retained"].as_str() {
+                // Already failed; retain the write result without hiding the
+                // original panic/error. No additional success grace is granted.
+                let retained = serde_json::to_vec_pretty(&receipt)
+                    .map_err(std::io::Error::other)
+                    .and_then(|bytes| {
+                        std::fs::write(Path::new(path).join("teardown-failure.json"), bytes)
+                    });
+                events.push(json!({"event":"FailureEvidenceWrite","ok":retained.is_ok(),
+                    "error":retained.err().map(|e|e.to_string())}));
+            }
+        }
+        let mut receipt = receipt;
+        receipt["events"] = json!(events);
+        let reporting = catch_unwind(AssertUnwindSafe(|| {
+            daemon_exit::report("fixture-graceful-teardown", &receipt)
+        }));
+        daemon_exit::propagate_teardown_outcome(
+            was_panicking,
+            attempt,
+            finalizing,
+            failure,
+            reporting,
+            |outcomes| {
+                std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!("fixture-teardown-outcomes {outcomes}\n"),
+                )
+            },
+        );
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-woc-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-woc-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+    serve_command(data_dir, listen, env)
+        .spawn()
+        .expect("spawn intentd serve")
+}
+
+fn serve_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
     common::seed_default_provider(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.spawn().expect("spawn intentd serve")
+    // This suite expects an anonymous primary author. Apply isolation last so
+    // caller-provided fixture inputs cannot restore a host credential or root.
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    common::hermetic_github_identity(&mut cmd, data_dir);
+    cmd.env_remove("GH_HOST")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_CONFIG", data_dir.join("config.toml"))
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1");
+    cmd
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -244,6 +390,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -269,11 +416,13 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -334,14 +483,15 @@ async fn boot_daemon_with_task_env(
     title: &str,
     extra_env: &[(&str, &str)],
 ) -> (Daemon, String, String, u16, String) {
-    let data_dir = temp_data_dir();
+    let data_dir_guard: daemon_exit::FixtureDir = temp_data_dir().into();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_task(&data_dir, title).await;
-    let mut env: Vec<(&str, &str)> = vec![("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let mut env: Vec<(&str, &str)> = vec![("INTENTD_AUTH_TOKEN", TOKEN)];
     env.extend_from_slice(extra_env);
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -403,7 +553,7 @@ fn gate(test: &str) -> Option<String> {
 /// C1d-10a: exercise the four wire-contract slices of the widened
 /// `agent.wakeOrCreate` over one pinned WSS connection, all on a single
 /// daemon boot. Bundled to keep the (expensive) daemon spawn under one test.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_widened_wire_contract_over_wss() {
     let (_daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task("WOC Task").await;
     let cfg = client_config(&fp);
@@ -557,14 +707,24 @@ async fn wake_or_create_widened_wire_contract_over_wss() {
                     .is_some_and(|t| t.contains("reboot"))
         })
         .unwrap_or_else(|| panic!("wake user row persisted: {convo}"));
+    // The row-level copy also carries the daemon's `fromPrincipalId` stamp
+    // for the wire caller; the in-block fold does not (row-level only).
+    let me = wss_rpc(&mut rpc, 8, "principal.me", json!({})).await;
+    let principal_id = me["id"].as_str().expect("caller principal id");
     assert_eq!(
         wake_row["metadata"],
-        json!({ "type": "task_wake", "source": "wake" }),
+        json!({ "type": "task_wake", "source": "wake", "fromPrincipalId": principal_id }),
         "wake row carries row-level messageMetadata (monorepo#1217): {wake_row}"
     );
     assert_eq!(
-        wake_row["contentBlocks"][0]["messageMetadata"]["type"], "task_wake",
+        wake_row["contentBlocks"][0]["messageMetadata"],
+        json!({ "type": "task_wake", "source": "wake" }),
         "in-block fold preserved alongside the row-level copy: {wake_row}"
+    );
+    assert_eq!(
+        wake_row["author"]["principalId"],
+        json!(principal_id),
+        "wake row resolves its author from the stamp: {wake_row}"
     );
 }
 
@@ -574,7 +734,7 @@ async fn wake_or_create_widened_wire_contract_over_wss() {
 /// message line, and `agent.getSubscriptions` for the caller must list the
 /// completion watch on the created agent immediately — SUB-1 parity with the
 /// wake/queued branches. Hermetic (no ACP provider needed).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn wake_or_create_created_new_subscribes_caller_over_wss() {
     let (_daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task("WOC 926 Task").await;
     let cfg = client_config(&fp);
@@ -665,7 +825,7 @@ async fn wake_or_create_created_new_subscribes_caller_over_wss() {
 /// preamble bytes at delegate time — but the daemon needs the mock env gate
 /// satisfied so `agent.delegate`'s availability gate accepts the mock
 /// provider's `default` model.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_with_task_note_id_appends_preamble_over_wss() {
     const TITLE: &str = "TASK-C preamble task";
     let Some(script) = gate("WSS delegate preamble E2E") else {
@@ -731,7 +891,7 @@ This note is your workspace for this task. Update it with your progress, finding
 /// unrelated agent stays out of scope, and a nonexistent note id yields an
 /// empty (not erroring) snapshot. No ACP turn is driven, but the mock env
 /// gate must be satisfied for `agent.delegate`'s availability gate.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn diagnostics_task_note_filter_matches_delegated_agent_over_wss() {
     let Some(script) = gate("WSS diagnostics task filter E2E") else {
         return;
@@ -819,7 +979,7 @@ async fn diagnostics_task_note_filter_matches_delegated_agent_over_wss() {
 /// over the real WSS wire — the opt-out only gates the idle subscriber.
 /// No ACP turn is driven, but the mock env gate must be satisfied for
 /// `agent.delegate`'s availability gate.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_with_skip_auto_commit_stays_status_neutral_over_wss() {
     const TITLE: &str = "TASK-C skipAutoCommit task";
     let Some(script) = gate("WSS delegate skipAutoCommit E2E") else {
@@ -885,7 +1045,7 @@ This note is your workspace for this task. Update it with your progress, finding
 /// stays idempotent-ok. No ACP turn is driven — the guard fires before any
 /// turn starts — but the mock env gate must be satisfied for
 /// `agent.delegate`'s availability gate.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn occupancy_guard_delegate_and_assign_agent_over_wss() {
     let Some(script) = gate("WSS occupancy guard E2E") else {
         return;
@@ -1023,7 +1183,7 @@ async fn occupancy_guard_delegate_and_assign_agent_over_wss() {
 /// the replacement agent ALSO parks in Error after migration — its queue is
 /// deterministically un-drained when we read it back (a session-fatal turn
 /// never drains the queue).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn parked_messages_survive_wake_or_create_replacement() {
     let Some(script) = gate("WSS wakeOrCreate queue-migration E2E") else {
         return;
@@ -1250,4 +1410,371 @@ async fn parked_messages_survive_wake_or_create_replacement() {
         "agent:queue:updated for B carries the migrated follow-up"
     );
     assert!(saw_deleted, "agent:deleted observed for the poisoned agent");
+}
+
+/// Multiplayer w2 + agent-creation decision (2026-09-19: guests steer
+/// existing agents only): a collaborator's `agent.wakeOrCreate` is refused
+/// at the transport gate with `-32003 Forbidden` before any side effect —
+/// no agent exists afterwards. The owner's wake then keeps its principal
+/// through the runtime wake path's terminal-failure requeue. The wake row is
+/// persisted with the owner's `fromPrincipalId`; when the turn fails
+/// session-fatally (mock provider safety block) the requeued kickoff on
+/// `agent.getQueue` / `agent:queue:updated` still carries the owner's stamp
+/// (not the retrying guest's, not none) plus the resolved `author`
+/// projection, and `agent.getSession` serves the same `author` on the
+/// persisted row as `agent.getConversation`.
+#[intent_test_macros::daemon_test]
+async fn wake_stamp_survives_terminal_failure_requeue_over_wss() {
+    use intent_core::{now_iso, Principal, PrincipalId};
+    use intent_store::Store;
+    use sha2::Digest as _;
+
+    let Some(script) = gate("WSS guest wake attribution E2E") else {
+        return;
+    };
+    let behavior = json!({
+        "promptRpcError": {
+            "code": -32603,
+            "message": "The model provider blocked this response for safety reasons. \
+                        Please start a new session",
+        },
+    })
+    .to_string();
+    let (daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task_env(
+        "Guest Wake Task",
+        &[
+            ("MOCK_AGENT_SCRIPT_PATH", &script),
+            ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ],
+    )
+    .await;
+    let cfg = client_config(&fp);
+
+    // A collaborator with its own credential, seeded into the daemon's store.
+    let guest_token = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+    let guest = Principal {
+        id: PrincipalId::new(),
+        identity: None,
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: Some("Guest User".to_string()),
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    let primary = {
+        let store = Store::open(&daemon.data_dir.path().join("intentd.db"))
+            .await
+            .expect("open daemon store");
+        store
+            .upsert_principal(&guest)
+            .await
+            .expect("guest principal");
+        let token_hash =
+            sha2::Sha256::digest(guest_token.as_bytes())
+                .iter()
+                .fold(String::new(), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                });
+        store
+            .insert_principal_credential(&guest.id, &token_hash)
+            .await
+            .expect("guest credential");
+        store
+            .add_workspace_member(
+                &intent_core::WorkspaceId::from(ws_id.as_str()),
+                &guest.id,
+                intent_core::WorkspaceRole::Collaborator,
+            )
+            .await
+            .expect("guest membership");
+        store.get_primary_principal().await.expect("primary")
+    };
+
+    // SUBSCRIBER conn (owner) — subscribe BEFORE any turn.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let wake_params = json!({
+        "workspaceId": ws_id,
+        "taskNoteId": task_note_id,
+        "contextMessage": "guest kickoff",
+        "model": "default",
+        "messageMetadata": { "fromPrincipalId": "spoof" },
+        "create": { "provider": "mock" },
+    });
+
+    // The GUEST may not create agents: refused at the transport gate, and
+    // no agent exists in the workspace afterwards.
+    let guest_url = format!("wss://localhost:{port}/ws?token={guest_token}");
+    let mut guest_rpc = common::wss_connect_with_retry(port, cfg.clone(), &guest_url).await;
+    let refused =
+        wss_rpc_envelope(&mut guest_rpc, 9, "agent.wakeOrCreate", wake_params.clone()).await;
+    assert_eq!(
+        refused["error"]["code"], -32003,
+        "guest agent.wakeOrCreate is Forbidden: {refused}"
+    );
+    assert_eq!(refused["error"]["message"], "Forbidden", "{refused}");
+    assert!(refused.get("result").is_none(), "{refused}");
+    let agents = wss_rpc(
+        &mut guest_rpc,
+        10,
+        "agent.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        agents["agents"].as_array().map(Vec::len),
+        Some(0),
+        "the refused wake created nothing: {agents}"
+    );
+
+    // The OWNER wakes (creates) the task agent with a spoofed stamp.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let woke = wss_rpc(&mut rpc, 10, "agent.wakeOrCreate", wake_params).await;
+    assert_eq!(woke["ok"], true, "owner wakeOrCreate: {woke}");
+    let agent_id = woke["agentId"].as_str().expect("agentId").to_string();
+    // The OWNER enqueued the kickoff, so no collaborator sender preamble is
+    // prepended: the requeue keeps the enqueue-time content verbatim.
+    let kickoff_content = json!("guest kickoff");
+
+    // Wait for the terminal failure and for the `agent:queue:updated` that
+    // announces the requeued kickoff.
+    let mut saw_status_error = false;
+    let mut requeue_event: Option<Value> = None;
+    for _ in 0..200 {
+        if saw_status_error && requeue_event.is_some() {
+            break;
+        }
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        if event["type"] == "agent:queue:updated"
+            && event["data"]["queue"]
+                .as_array()
+                .is_some_and(|q| q.iter().any(|m| m["content"] == kickoff_content))
+        {
+            requeue_event = Some(event["data"].clone());
+        }
+        if event["type"] == "agent:status-changed" && event["data"]["status"] == "error" {
+            saw_status_error = true;
+        }
+    }
+    assert!(saw_status_error, "agent parked in error after the block");
+
+    // The requeued kickoff keeps the owner's stamp — on the queue read …
+    let queue = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.getQueue",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let parked = queue["queue"].as_array().expect("queue array");
+    let kickoff = parked
+        .iter()
+        .find(|m| m["content"] == kickoff_content)
+        .unwrap_or_else(|| panic!("requeued kickoff on the queue: {queue}"));
+    assert_eq!(
+        kickoff["messageMetadata"]["fromPrincipalId"],
+        json!(primary.id.0),
+        "the requeued wake carries the owner's principal (never the spoof, never none): {kickoff}"
+    );
+    let expected_author = json!({
+        "principalId": primary.id.0,
+        "login": primary.login,
+        "displayName": primary.display_name,
+        "avatarUrl": primary.avatar_url,
+    });
+    assert_eq!(
+        kickoff["author"], expected_author,
+        "agent.getQueue entries carry the resolved author: {kickoff}"
+    );
+    // … and on the `agent:queue:updated` payload that announced the requeue.
+    let queue_event = requeue_event.expect("agent:queue:updated announcing the requeue");
+    let announced = queue_event["queue"]
+        .as_array()
+        .expect("queue array")
+        .iter()
+        .find(|m| m["content"] == kickoff_content)
+        .unwrap_or_else(|| panic!("requeued kickoff in agent:queue:updated: {queue_event}"));
+    assert_eq!(
+        announced["messageMetadata"]["fromPrincipalId"],
+        json!(primary.id.0),
+        "agent:queue:updated carries the owner's stamp: {announced}"
+    );
+    assert_eq!(
+        announced["author"], expected_author,
+        "agent:queue:updated entries carry the resolved author: {announced}"
+    );
+
+    // The persisted wake row: stamped, and served with the same `author` by
+    // both hydration routes.
+    let session = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let session_row = session["session"]["messages"]
+        .as_array()
+        .expect("session messages")
+        .iter()
+        .find(|m| m["role"] == "user" && m["metadata"]["fromPrincipalId"] == json!(primary.id.0))
+        .unwrap_or_else(|| panic!("stamped wake row in agent.getSession: {session}"));
+    assert_eq!(
+        session_row["author"], expected_author,
+        "agent.getSession serves the resolved author: {session_row}"
+    );
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let conv_row = conv["messages"]
+        .as_array()
+        .expect("conversation messages")
+        .iter()
+        .find(|m| m["id"] == session_row["id"])
+        .unwrap_or_else(|| panic!("the same row in agent.getConversation: {conv}"));
+    assert_eq!(
+        conv_row["author"], expected_author,
+        "agent.getConversation and agent.getSession agree on the author"
+    );
+    assert!(
+        session["session"]["messages"]
+            .as_array()
+            .expect("session messages")
+            .iter()
+            .filter(|m| m["role"] != "user")
+            .all(|m| m.get("author").is_none()),
+        "non-user rows carry no author on agent.getSession: {session}"
+    );
+
+    // agent.retry by a DIFFERENT caller (the guest — a steer it keeps)
+    // redrives the owner's requeued kickoff. Rule: the retrier is not the
+    // author — the redriven entry keeps the owner's stamp, and when the
+    // redrive fails the same way the second requeue still carries it (never
+    // re-stamped to the guest).
+    let retried = wss_rpc(
+        &mut guest_rpc,
+        14,
+        "agent.retry",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(retried["ok"], true, "guest agent.retry: {retried}");
+    assert_eq!(
+        retried["redriven"], true,
+        "retry redrove the requeued kickoff: {retried}"
+    );
+
+    let mut saw_pending = false;
+    let mut saw_second_error = false;
+    let mut second_requeue: Option<Value> = None;
+    for _ in 0..200 {
+        if saw_second_error && second_requeue.is_some() {
+            break;
+        }
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        // The retry's own `pending` flip fences the first cycle's events off.
+        if event["type"] == "agent:status-changed" && event["data"]["status"] == "pending" {
+            saw_pending = true;
+            continue;
+        }
+        if !saw_pending {
+            continue;
+        }
+        if event["type"] == "agent:status-changed" && event["data"]["status"] == "error" {
+            saw_second_error = true;
+        }
+        if event["type"] == "agent:queue:updated"
+            && event["data"]["queue"]
+                .as_array()
+                .is_some_and(|q| q.iter().any(|m| m["content"] == kickoff_content))
+        {
+            second_requeue = Some(event["data"].clone());
+        }
+    }
+    assert!(
+        saw_second_error,
+        "the redriven turn failed again after retry"
+    );
+    let second_requeue = second_requeue.expect("agent:queue:updated announcing the second requeue");
+    let redriven = second_requeue["queue"]
+        .as_array()
+        .expect("queue array")
+        .iter()
+        .find(|m| m["content"] == kickoff_content)
+        .expect("kickoff in the second requeue");
+    assert_eq!(
+        redriven["messageMetadata"]["fromPrincipalId"],
+        json!(primary.id.0),
+        "the entry redriven by the guest's retry keeps the owner's stamp: {redriven}"
+    );
+    assert_eq!(redriven["author"], expected_author, "{redriven}");
+    assert_eq!(redriven["requeuedAfterFailure"], true, "{redriven}");
+
+    let queue_after_retry = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getQueue",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let kickoff_after_retry = queue_after_retry["queue"]
+        .as_array()
+        .expect("queue array")
+        .iter()
+        .find(|m| m["content"] == kickoff_content)
+        .unwrap_or_else(|| panic!("kickoff requeued after the retry: {queue_after_retry}"));
+    assert_eq!(
+        kickoff_after_retry["messageMetadata"]["fromPrincipalId"],
+        json!(primary.id.0),
+        "agent.getQueue after retry: {kickoff_after_retry}"
+    );
+    assert_eq!(kickoff_after_retry["author"], expected_author);
+
+    // The transcript never gains a row attributed to the retrier: every
+    // user row still carries the owner's principal.
+    let session_after_retry = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let user_rows: Vec<&Value> = session_after_retry["session"]["messages"]
+        .as_array()
+        .expect("session messages")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .collect();
+    assert!(!user_rows.is_empty(), "{session_after_retry}");
+    for row in user_rows {
+        assert_eq!(
+            row["metadata"]["fromPrincipalId"],
+            json!(primary.id.0),
+            "a user row was re-attributed by the retry: {row}"
+        );
+        assert_eq!(row["author"], expected_author, "{row}");
+    }
 }

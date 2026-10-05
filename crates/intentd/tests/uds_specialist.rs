@@ -5,6 +5,8 @@
 //! malformed/unknown ids map to `-32602`. Directory roots are injected via
 //! `Services::with_specialist_dirs` so the test is hermetic.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::{Path, PathBuf};
@@ -21,23 +23,16 @@ use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+impl TempDb {
+    fn new() -> Self {
+        let dir = common::test_tempdir("intentd-spec-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -105,18 +100,18 @@ fn write_specialist(dir: &Path, id: &str, name: &str, desc: &str, prompt: &str) 
 }
 
 struct Harness {
-    _user: TempDir,
-    _bundled: TempDir,
-    _work: TempDir,
-    _tmp: TempDb,
-    _ws_root: tempfile::TempDir,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    server: Option<tokio::task::JoinHandle<()>>,
     user_dir: PathBuf,
     bundled_dir: PathBuf,
     work_dir: PathBuf,
     socket: PathBuf,
+    _user: tempfile::TempDir,
+    _bundled: tempfile::TempDir,
+    _work: tempfile::TempDir,
+    _tmp: TempDb,
+    _ws_root: tempfile::TempDir,
     _sock_dir: tempfile::TempDir,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-    server: Option<tokio::task::JoinHandle<()>>,
 }
 
 async fn start() -> Harness {
@@ -131,26 +126,23 @@ async fn start_with_settings(config_toml: &str) -> Harness {
 }
 
 async fn start_with_config(config_toml: Option<&str>) -> Harness {
-    let tag = Uuid::new_v4();
-    let user = TempDir(std::env::temp_dir().join(format!("intentd-spec-user-{tag}")));
-    let bundled = TempDir(std::env::temp_dir().join(format!("intentd-spec-bundled-{tag}")));
-    let work = TempDir(std::env::temp_dir().join(format!("intentd-spec-work-{tag}")));
-    std::fs::create_dir_all(&user.0).unwrap();
-    std::fs::create_dir_all(&bundled.0).unwrap();
-    std::fs::create_dir_all(&work.0).unwrap();
-    let tmp = TempDb {
-        path: std::env::temp_dir().join(format!("intentd-spec-{tag}.db")),
-    };
+    let user = common::test_tempdir("intentd-spec-user-");
+    let bundled = common::test_tempdir("intentd-spec-bundled-");
+    let work = common::test_tempdir("intentd-spec-work-");
+    let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let mut services = Services::new(store)
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone())
-        .with_specialist_dirs(Some(user.0.clone()), Some(bundled.0.clone()));
+        .with_specialist_dirs(
+            Some(user.path().to_path_buf()),
+            Some(bundled.path().to_path_buf()),
+        );
     if let Some(toml) = config_toml {
         // The config file lives inside the work temp dir so it is swept with it.
-        let config_path = work.0.join("config.toml");
+        let config_path = work.path().join("config.toml");
         std::fs::write(&config_path, toml).unwrap();
         let registry = intent_services::SettingsRegistry::load(&config_path).expect("load config");
         services = services.with_settings_registry(Arc::new(registry));
@@ -161,7 +153,7 @@ async fn start_with_config(config_toml: Option<&str>) -> Harness {
     let sock_dir = common::test_tempdir_in("/tmp", "is-");
     let socket = sock_dir.path().join("uds.sock");
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let socket = socket.clone();
         async move {
             let _ = serve_uds(services, bus, &socket, None, async {
@@ -171,9 +163,9 @@ async fn start_with_config(config_toml: Option<&str>) -> Harness {
         }
     });
     Harness {
-        user_dir: user.0.clone(),
-        bundled_dir: bundled.0.clone(),
-        work_dir: work.0.clone(),
+        user_dir: user.path().to_path_buf(),
+        bundled_dir: bundled.path().to_path_buf(),
+        work_dir: work.path().to_path_buf(),
         _user: user,
         _bundled: bundled,
         _work: work,
@@ -197,7 +189,7 @@ impl Harness {
     }
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_full_crud_and_three_tier_resolution() {
     let h = start().await;
     // Seed a bundled (read-only) specialist + a bundled-only one.
@@ -383,7 +375,7 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     h.shutdown().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_full_frontmatter_wire_parity() {
     let h = start().await;
     // Seed a bundled specialist whose frontmatter carries every optional scalar
@@ -526,7 +518,7 @@ async fn specialist_full_frontmatter_wire_parity() {
     h.shutdown().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_hidden_inherits_across_tiers_on_the_wire() {
     let h = start().await;
     // Regression: a user-tier chief-of-staff.md materialized before the hidden
@@ -595,7 +587,7 @@ async fn specialist_hidden_inherits_across_tiers_on_the_wire() {
     h.shutdown().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_bundled_read_only_and_invalid_params() {
     let h = start().await;
     write_specialist(
@@ -668,7 +660,7 @@ fn find_spec<'a>(list: &'a Value, id: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("specialist {id} missing from list"))
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_resolution_preview() {
     // monorepo#3044: the preview's "default provider" context derives from
     // settings only (no positional fallback), so pin auggie explicitly.
@@ -789,7 +781,7 @@ async fn specialist_resolution_preview() {
 /// concrete provider/model `agent.delegate` would pin — not
 /// "Provider default". A specialist with no pin of its own stays
 /// undecorated.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_preview_uses_own_pin_without_global_default() {
     let h = start().await;
     write_specialist_frontmatter(
@@ -839,7 +831,7 @@ async fn specialist_preview_uses_own_pin_without_global_default() {
     h.shutdown().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_resolution_preview_inherits_settings() {
     let h = start_with_settings(
         "[model]\ndefaultProvider = \"auggie\"\ndefault = \"sonnet4.5\"\n\n[model.providerDefaults]\ncodex = \"gpt-5.3-codex/high\"\n",

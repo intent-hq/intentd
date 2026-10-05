@@ -21,7 +21,7 @@ mod common;
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,28 +31,28 @@ use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
+const GUEST_TOKEN: &str = "beefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef";
+
 const START_MSG: &str = "Start the long-running task";
 const QUEUED_ONE: &str = "preserved queue message one";
-const QUEUED_TWO: &str = "preserved queue message two";
+const QUEUED_TWO_INPUT: &str = "preserved queue message two";
+const QUEUED_TWO: &str = "Message from @guest (Guest User), a collaborator (guest) of this workspace — not the workspace owner.\n\npreserved queue message two";
 /// Stable prefix of the continuation wording in
 /// `Services::resume_interrupted_agent` — the delivered message embeds a
 /// per-resume humanized outage duration, so asserts match on this prefix.
 const CONTINUATION_PREFIX: &str = "You were interrupted for about ";
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-queue-order-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-queue-order-")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -216,9 +216,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: 
     // inert until the explicit resume path (`--resume-all` still forces the
     // sweep over the pin), but the `auto` default resumes on headless hosts.
     common::disable_resume_on_start(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -235,6 +234,51 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: 
     #[cfg(unix)]
     cmd.process_group(0);
     cmd.spawn().expect("spawn intentd serve")
+}
+
+async fn seed_workspace_with_guest(data_dir: &Path) -> (String, intent_core::Principal) {
+    use intent_core::{now_iso, Principal, PrincipalId, WorkspaceId, WorkspaceRole};
+    use intent_store::Store;
+    let store = Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace_seed(&ws))
+        .await
+        .expect("insert ws");
+    let guest = Principal {
+        id: PrincipalId::new(),
+        identity: None,
+        github_user_id: None,
+        login: Some("guest".to_string()),
+        display_name: Some("Guest User".to_string()),
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store
+        .upsert_principal(&guest)
+        .await
+        .expect("guest principal");
+    let token_hash =
+        Sha256::digest(GUEST_TOKEN.as_bytes())
+            .iter()
+            .fold(String::new(), |mut s, b| {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+                s
+            });
+    store
+        .insert_principal_credential(&guest.id, &token_hash)
+        .await
+        .expect("guest credential");
+    store
+        .add_workspace_member(&ws, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("guest membership");
+    (ws.0, guest)
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
@@ -254,6 +298,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -279,11 +324,13 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -350,9 +397,8 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
         "firstTurnDelayMs": 600_000
     })
     .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -366,19 +412,7 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon1 did not start");
 
-    let ws_id = {
-        use intent_core::WorkspaceId;
-        use intent_store::Store;
-        let store = Store::open(&data_dir.join("intentd.db"))
-            .await
-            .expect("open store");
-        let ws = WorkspaceId::new();
-        store
-            .insert_workspace(&workspace_seed(&ws))
-            .await
-            .expect("insert ws");
-        ws.0
-    };
+    let (ws_id, _guest) = seed_workspace_with_guest(data_dir).await;
 
     let create_result = uds_rpc(
         &socket,
@@ -432,7 +466,7 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
     }
     assert!(active, "agent never reached active mid-turn state");
 
-    // Queue two messages behind the parked turn.
+    // Distinct human authors retain two rows for FIFO recovery assertions.
     let q1 = uds_rpc(
         &socket,
         4,
@@ -441,14 +475,20 @@ async fn interrupt_midturn_with_queued_messages(data_dir: &Path, script: &str) -
     )
     .await;
     assert_eq!(q1["result"]["success"], json!(true), "queue one: {q1}");
-    let q2 = uds_rpc(
-        &socket,
+    let status = common::await_wss_status(&socket).await;
+    let fp = status["result"]["fingerprint"].as_str().unwrap();
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let url = format!("wss://localhost:{port}/ws?token={GUEST_TOKEN}");
+    let mut guest_rpc =
+        common::wss_connect_with_retry(port, Arc::new(client_config(fp)), &url).await;
+    let q2 = wss_rpc(
+        &mut guest_rpc,
         5,
         "agent.queueMessage",
-        json!({ "agentId": agent_id, "content": QUEUED_TWO }),
+        json!({"agentId":agent_id,"content":QUEUED_TWO_INPUT}),
     )
     .await;
-    assert_eq!(q2["result"]["success"], json!(true), "queue two: {q2}");
+    assert_eq!(q2["success"], json!(true), "queue two: {q2}");
 
     let queue = uds_rpc(&socket, 6, "agent.getQueue", json!({ "agentId": agent_id })).await;
     let entries = queue["result"]["queue"].as_array().expect("queue array");
@@ -609,9 +649,8 @@ async fn boot_restart_daemon(
     WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
 ) {
     let behavior = json!({ "response": "resumed turn done" }).to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -643,7 +682,8 @@ async fn resume_rpc_continuation_first_then_queue_fifo() {
     let Some(script) = gate("resume_rpc_continuation_first_then_queue_fifo") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, agent_id) = interrupt_midturn_with_queued_messages(&data_dir, &script).await;
 
     eprintln!("Phase 2: restart daemon, verify rehydrated pending state over WSS");
@@ -676,8 +716,6 @@ async fn resume_rpc_continuation_first_then_queue_fifo() {
     eprintln!("Phase 4: assert transcript ordering");
     let users = user_message_texts(&data_dir, &agent_id).await;
     assert_continuation_first_then_fifo(&users);
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// Abandon path: the preserved queue stays intact and inert (no auto-send),
@@ -688,7 +726,8 @@ async fn abandon_keeps_preserved_queue_inert() {
     let Some(script) = gate("abandon_keeps_preserved_queue_inert") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, agent_id) = interrupt_midturn_with_queued_messages(&data_dir, &script).await;
 
     eprintln!("Phase 2: restart daemon, verify rehydrated pending state over WSS");
@@ -796,8 +835,6 @@ async fn abandon_keeps_preserved_queue_inert() {
         let blocks = last.content.as_array().expect("content blocks");
         assert_eq!(blocks[0]["meta"]["kind"], json!("interruption"));
     }
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// Headless `serve --resume-all`: the startup sweep resumes the agent with
@@ -808,7 +845,8 @@ async fn resume_all_continuation_first_then_queue_fifo() {
     let Some(script) = gate("resume_all_continuation_first_then_queue_fifo") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, agent_id) = interrupt_midturn_with_queued_messages(&data_dir, &script).await;
 
     eprintln!("Phase 2: restart daemon with --resume-all, await headless drain");
@@ -833,6 +871,4 @@ async fn resume_all_continuation_first_then_queue_fifo() {
     eprintln!("Phase 3: assert transcript ordering");
     let users = user_message_texts(&data_dir, &agent_id).await;
     assert_continuation_first_then_fifo(&users);
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }

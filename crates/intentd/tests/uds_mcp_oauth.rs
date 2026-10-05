@@ -5,6 +5,8 @@
 //! presence-only. Uses a dummy bag literal so tests can assert its absence
 //! from every response frame.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;
@@ -21,26 +23,19 @@ use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 /// Dummy bag literal: any response that leaks it fails the test.
 const DUMMY: &str = "dummy-oauth-bag-marker-DO-NOT-ECHO";
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 impl TempDb {
     fn new() -> Self {
-        Self {
-            path: std::env::temp_dir().join(format!("intentd-oauth-{}.db", Uuid::new_v4())),
-        }
-    }
-}
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = common::test_tempdir("intentd-oauth-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -103,7 +98,7 @@ fn assert_no_dummy(v: &Value, ctx: &str) {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn mcp_oauth_round_trip_never_echoes_bag_and_validates_params() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -120,7 +115,7 @@ async fn mcp_oauth_round_trip_never_echoes_bag_and_validates_params() {
     let socket = sock_dir.path().join("uds.sock");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {

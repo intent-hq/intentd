@@ -9,7 +9,7 @@
 //! secrets, `known_repo`, usage stats, idempotency keys, clients).
 
 use intent_core::transfer::TransferTableStat;
-use intent_core::{Error, Result, WorkspaceId};
+use intent_core::{Error, Result, TokenUsageTotals, WorkspaceId};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 
 use crate::Store;
@@ -48,12 +48,19 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ("comment", "workspace_id = ?1"),
     ("draft", "workspace_id = ?1"),
     ("agent_session", "workspace_id = ?1"),
+    // Ownership must precede queue restoration; history is imported separately
+    // from live delivery so already-delivered wakes never fire again.
+    ("script_monitor", "workspace_id = ?1"),
     (
         "agent_message",
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
     ),
     (
         "agent_message_payload",
+        "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
+    ),
+    (
+        "agent_usage_cell",
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
     ),
     (
@@ -94,6 +101,16 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("note_search_ctx", "derived note search identities/context; note import triggers rebuild them"),
+    ("note_fts", "derived note full-text index; note import triggers rebuild it"),
+    ("note_fts_config", "FTS5 shadow table of the derived note index"),
+    ("note_fts_data", "FTS5 shadow table of the derived note index"),
+    ("note_fts_docsize", "FTS5 shadow table of the derived note index"),
+    ("note_fts_idx", "FTS5 shadow table of the derived note index"),
+    (
+        "repository_selection_state",
+        "daemon-local root/selection continuity and tombstones; imported intent is unverified",
+    ),
     (
         "_sqlx_migrations",
         "sqlx's own migration bookkeeping; every database maintains its own",
@@ -116,6 +133,27 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
         "daemon-global repository registry; the target daemon discovers repos itself",
     ),
     (
+        "execution_node",
+        "node registrations and pinned identities belong to the source head installation; \
+         workspace transfer cannot enroll hosts or claim their ownership on the target",
+    ),
+    (
+        "node_lease",
+        "source-head lease/incarnation bindings, link generations, acknowledgement watermarks \
+         and release fences are not portable execution authority; the target needs its own enrollment",
+    ),
+    (
+        "node_assignment",
+        "run ownership, capture counters, opaque node paths, merge targets and tombstones bind \
+         agents to source-head leases; imported agent sessions do not inherit those assignments",
+    ),
+    (
+        "node_checkpoint",
+        "checkpoint metadata and replay receipts bind source-head assignments to immutable \
+         hub refs, manifests and blobs not carried by the workspace archive; importing these \
+         rows alone would create dangling recovery pointers and cannot transfer ownership",
+    ),
+    (
         "client",
         "connected FE clients are per-daemon; imported draft rows referencing them \
          are dropped by the import transform layer",
@@ -123,6 +161,13 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
     (
         "idempotency_key",
         "per-daemon RPC replay-protection bookkeeping, not workspace state",
+    ),
+    (
+        "attachment_idempotency_keys",
+        "7-day lost-reply recovery bookkeeping for keyed attachment placements against \
+         THIS daemon (intent-hq/intent#4691); a client retrying against the target is \
+         talking to a different daemon, and the bound `attachments` rows transfer on \
+         their own",
     ),
     (
         "deleted_workspace_id",
@@ -164,6 +209,57 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          workspace-scoped export could violate the agent_session FKs on import, \
          and losing a marker fails open — at worst one already-delivered \
          advisory wake repeats once on the target",
+    ),
+    (
+        "principal",
+        "daemon-global people registry (the primary principal is minted per daemon \
+         by migration 0125); principal ids are daemon-local, so the import \
+         transform nulls the workspace's `owner_principal_id` / \
+         `legacy_author_principal_id` and the workspace insert trigger re-derives \
+         the owner from the target's primary principal",
+    ),
+    (
+        "workspace_sharing_summary",
+        "derived sharing counters; the target's grant/invitation triggers rebuild them",
+    ),
+    (
+        "workspace_invite_seat",
+        "derived daemon-local invitation reservations; no invitations transfer",
+    ),
+    (
+        "workspace_member",
+        "rows FK onto daemon-local `principal` ids; the target's workspace insert \
+         trigger recreates the owner membership for its own primary principal",
+    ),
+    (
+        "principal_credential",
+        "per-daemon bearer credentials; credentials never leave the source machine",
+    ),
+    (
+        "workspace_invite",
+        "invite links FK onto daemon-local `principal` ids and hash secrets minted \
+         against THIS daemon; an open invite is meaningless on the target",
+    ),
+    (
+        "host_member",
+        "host authority never transfers with a workspace",
+    ),
+    (
+        "host_membership_state",
+        "host-local authority counters and revocation clock",
+    ),
+    (
+        "principal_revocation",
+        "host-local principal revocation generations",
+    ),
+    (
+        "repository_authority_revision",
+        "daemon-local authority continuity and tombstones; target mutations retain \
+         their own revisions, and source counters cannot authorize target operations",
+    ),
+    (
+        "host_invite",
+        "host-local invitations and secrets, unrelated to workspace transfer",
     ),
     (
         "agent_message_fts",
@@ -323,6 +419,16 @@ impl Store {
     /// payload the export archive writes to `rows/<table>.jsonl` and
     /// [`Store::transfer_import_rows`] round-trips on the target.
     ///
+    /// Every table is read inside ONE deferred read transaction on a single
+    /// read-pool connection, so the whole export observes a single WAL
+    /// snapshot: a write committing mid-export can no longer land a `note`
+    /// row and a `note_version` snapshot from different revisions in the
+    /// same archive (intent-hq/intent#4876). Readers never block the writer
+    /// in WAL mode, so concurrent writes still proceed; the cost is that a
+    /// checkpoint cannot advance past this snapshot while it is held, so the
+    /// WAL can grow for the duration of a large export under sustained
+    /// writes (one-shot RPC, reclaimed at the next checkpoint after commit).
+    ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
@@ -330,12 +436,17 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
+        let mut tx = self
+            .read_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(format!("transfer export begin failed: {e}")))?;
         let mut out = Vec::with_capacity(TRANSFER_TABLES.len());
         for (table, predicate) in TRANSFER_TABLES {
             let sql = format!("SELECT * FROM \"{table}\" WHERE {predicate}");
             let rows = sqlx::query(&sql)
                 .bind(&workspace_id.0)
-                .fetch_all(self.read_pool())
+                .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("transfer export {table} failed: {e}")))?;
             let mut objects = Vec::with_capacity(rows.len());
@@ -344,6 +455,22 @@ impl Store {
             }
             out.push(((*table).to_string(), objects));
         }
+        #[cfg(test)]
+        {
+            let barrier = self
+                .export_author_barrier
+                .lock()
+                .map_err(|_| Error::Internal("export test barrier poisoned".into()))?
+                .take();
+            if let Some(barrier) = barrier {
+                barrier.entered.notify_one();
+                barrier.release.notified().await;
+            }
+        }
+        crate::transfer_authorship::capture(&mut tx, &mut out).await?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("transfer export commit failed: {e}")))?;
         Ok(out)
     }
 
@@ -372,6 +499,7 @@ impl Store {
         &self,
         rows: &[(String, Vec<serde_json::Value>)],
     ) -> Result<usize> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         for (table, _) in rows {
             if !TRANSFER_TABLES.iter().any(|(t, _)| t == table) {
                 return Err(Error::InvalidParams(format!(
@@ -384,12 +512,22 @@ impl Store {
         for (table, _) in TRANSFER_TABLES {
             schemas.insert(*table, self.table_columns(table).await?);
         }
+        let imported_agent_ids: Vec<&str> = rows
+            .iter()
+            .find(|(table, _)| table == "agent_session")
+            .into_iter()
+            .flat_map(|(_, objects)| objects)
+            .filter_map(|object| object.get("id").and_then(serde_json::Value::as_str))
+            .collect();
+        let imported_agent_ids_json = serde_json::to_string(&imported_agent_ids)
+            .map_err(|e| Error::Internal(format!("transfer import agent ids: {e}")))?;
 
         let mut tx = self
             .write_pool()
             .begin()
             .await
             .map_err(|e| Error::Internal(format!("transfer import begin failed: {e}")))?;
+        reclaim_imported_metadata(&mut tx, rows).await?;
         let mut inserted = 0usize;
         for (table, _) in TRANSFER_TABLES {
             let Some((_, objects)) = rows.iter().find(|(t, _)| t == table) else {
@@ -397,11 +535,79 @@ impl Store {
             };
             let schema = &schemas[table];
             for object in objects {
+                // Deleting a workspace suppresses its retained monitor ledger.
+                // Reimport must preserve that terminal fence, never re-arm it.
+                if *table == "script_monitor" {
+                    let existing: Option<(String, String)> =
+                        sqlx::query_as("SELECT workspace_id,state FROM script_monitor WHERE id=?")
+                            .bind(object["id"].as_str())
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(|e| {
+                                Error::Internal(format!("read imported monitor fence: {e}"))
+                            })?;
+                    if existing.is_some_and(|(ws, state)| {
+                        object["workspace_id"].as_str() == Some(ws.as_str()) && state != "active"
+                    }) {
+                        continue;
+                    }
+                }
+                // Imported conversation rows are history, not fresh wakes.
+                // Stage their metadata as NULL inside this transaction, then
+                // restore it by UPDATE; keep normal INSERT delivery fences on.
+                let history_metadata = (*table == "agent_message")
+                    .then(|| object.get("metadata").and_then(serde_json::Value::as_str))
+                    .flatten()
+                    .filter(|raw| {
+                        serde_json::from_str::<serde_json::Value>(raw)
+                            .is_ok_and(|md| md["type"] == "script_monitor_wake")
+                    });
                 let map = object.as_object().ok_or_else(|| {
                     Error::InvalidParams(format!(
                         "transfer import: {table} row is not a JSON object"
                     ))
                 })?;
+                // An archive's target/provenance labels are claims, not proof.
+                // Keep the captured target fields and every old monitor field
+                // for inspection, but require explicit destination validation
+                // through qualify_legacy_pr_monitor_target before using them.
+                // No current remote, authority counter or default forge is used.
+                let monitor_map = if *table == "pr_monitor" {
+                    let mut claim = map.clone();
+                    // The generic importer also supports REAL values. Monitor
+                    // numbers do not: never round a u64 through f64/SQLite or
+                    // coerce text/bools. Signed old values stay inspectable but
+                    // cannot become a resolved target until positive/checked.
+                    if claim
+                        .get("pr_number")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_none()
+                    {
+                        return Err(Error::InvalidParams(
+                            "transfer import: pr_monitor.pr_number must be an exact signed integer"
+                                .into(),
+                        ));
+                    }
+                    let has_target = [
+                        "target_provider",
+                        "target_instance_base_url",
+                        "target_project_path",
+                        "target_kind",
+                    ]
+                    .iter()
+                    .any(|key| claim.get(*key).is_some_and(|v| !v.is_null()));
+                    claim.insert("target_provenance".into(), "unresolved".into());
+                    let reason = if has_target {
+                        "unverified-import"
+                    } else {
+                        "missing-provenance"
+                    };
+                    claim.insert("target_unresolved_reason".into(), reason.into());
+                    Some(claim)
+                } else {
+                    None
+                };
+                let map = monitor_map.as_ref().unwrap_or(map);
                 let mut columns = Vec::with_capacity(map.len());
                 for key in map.keys() {
                     if !schema.contains(key) {
@@ -421,19 +627,256 @@ impl Store {
                 );
                 let mut query = sqlx::query(&sql);
                 for (key, value) in map {
-                    query = bind_json_value(query, table, key, value)?;
+                    query = bind_json_value(
+                        query,
+                        table,
+                        key,
+                        if history_metadata.is_some() && key == "metadata" {
+                            &serde_json::Value::Null
+                        } else {
+                            value
+                        },
+                    )?;
                 }
+                if inserted == 0 {
+                    // The one original batch may create grants through workspace
+                    // triggers. Do not nest per-row or membership tickets here.
+                    lifecycle.begin(&[crate::RepositoryLifecycleKey::Database])?;
+                }
+                // Observe the destination before the original INSERT. A source
+                // archive cannot replace its local choice or import continuity.
+                let selection_before = if *table == "workspace" {
+                    let id = map
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            Error::InvalidParams("transfer workspace id must be text".into())
+                        })?;
+                    let id = WorkspaceId::from(id);
+                    let before =
+                        crate::repository_selection_repo::imported_primary_before(&mut tx, &id)
+                            .await?;
+                    Some((id, before))
+                } else {
+                    None
+                };
                 query.execute(&mut *tx).await.map_err(|e| {
                     Error::Internal(format!("transfer import insert into {table} failed: {e}"))
                 })?;
+                if let Some(metadata) = history_metadata {
+                    sqlx::query("UPDATE agent_message SET metadata=? WHERE id=? AND agent_id=?")
+                        .bind(metadata)
+                        .bind(object["id"].as_str())
+                        .bind(object["agent_id"].as_str())
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!("restore imported monitor history: {e}"))
+                        })?;
+                }
+                if let Some((id, before)) = selection_before {
+                    crate::repository_selection_repo::classify_imported_primary(
+                        &mut tx, &id, before,
+                    )
+                    .await?;
+                }
                 inserted += 1;
             }
+        }
+        if !imported_agent_ids.is_empty() {
+            sqlx::query(
+                "UPDATE agent_message SET \
+                 usage_model=COALESCE(NULLIF(usage_model,''), \
+                   COALESCE(NULLIF((SELECT resolved_model FROM agent_session \
+                                    WHERE id=agent_message.agent_id),''), \
+                            NULLIF((SELECT model FROM agent_session \
+                                    WHERE id=agent_message.agent_id),''), 'unknown')), \
+                 usage_origin=COALESCE(usage_origin, CASE \
+                   WHEN role='assistant' THEN 'agent' \
+                   WHEN role='user' AND CASE WHEN json_valid(metadata) \
+                     THEN COALESCE(NULLIF(json_extract(metadata,'$.fromAgentId'),''),'') \
+                     ELSE '' END <> '' THEN 'agent' \
+                   WHEN role='user' THEN 'human' ELSE 'excluded' END) \
+                 WHERE agent_id IN (SELECT value FROM json_each(?)) \
+                 AND (NULLIF(usage_model,'') IS NULL OR usage_origin IS NULL)",
+            )
+            .bind(&imported_agent_ids_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("materialize imported provenance failed: {e}")))?;
+
+            let session_rows = sqlx::query(
+                "SELECT s.id, COALESCE(NULLIF(s.resolved_model,''), NULLIF(s.model,''), 'unknown') AS model, \
+                 s.token_usage, s.token_usage_baseline FROM agent_session s \
+                 WHERE s.id IN (SELECT value FROM json_each(?)) \
+                 AND NOT EXISTS (SELECT 1 FROM agent_usage_cell c WHERE c.agent_id=s.id)",
+            )
+            .bind(&imported_agent_ids_json)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("read imported usage snapshots failed: {e}")))?;
+            for row in session_rows {
+                let snapshot = row
+                    .get::<Option<String>, _>("token_usage")
+                    .and_then(|raw| serde_json::from_str::<TokenUsageTotals>(&raw).ok());
+                let baseline = row
+                    .get::<Option<String>, _>("token_usage_baseline")
+                    .and_then(|raw| serde_json::from_str::<TokenUsageTotals>(&raw).ok());
+                if snapshot.is_none() && baseline.is_none() {
+                    continue;
+                }
+                let snapshot = snapshot.unwrap_or_default();
+                let baseline = baseline.unwrap_or_default();
+                let mut costs = std::collections::BTreeMap::<String, f64>::new();
+                for cost in [baseline.cost.as_ref(), snapshot.cost.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    *costs.entry(cost.currency.clone()).or_default() += cost.amount;
+                }
+                let costs_json = serde_json::to_string(&costs).map_err(|e| {
+                    Error::Internal(format!("encode imported usage costs failed: {e}"))
+                })?;
+                let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+                sqlx::query(
+                    "INSERT INTO agent_usage_cell (agent_id, model, input_tokens, output_tokens, \
+                     cache_read_tokens, cache_creation_tokens, thought_tokens, costs_json) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(agent_id, model) DO NOTHING",
+                )
+                .bind(row.get::<String, _>("id"))
+                .bind(row.get::<String, _>("model"))
+                .bind(to_i64(
+                    baseline.input_tokens.saturating_add(snapshot.input_tokens),
+                ))
+                .bind(to_i64(
+                    baseline
+                        .output_tokens
+                        .saturating_add(snapshot.output_tokens),
+                ))
+                .bind(to_i64(
+                    baseline
+                        .cache_read_tokens
+                        .saturating_add(snapshot.cache_read_tokens),
+                ))
+                .bind(to_i64(
+                    baseline
+                        .cache_creation_tokens
+                        .saturating_add(snapshot.cache_creation_tokens),
+                ))
+                .bind(to_i64(
+                    baseline
+                        .thought_tokens
+                        .saturating_add(snapshot.thought_tokens),
+                ))
+                .bind(costs_json)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("materialize imported usage failed: {e}")))?;
+            }
+            sqlx::query(
+                "INSERT INTO agent_usage_cell \
+                 (agent_id, model, human_messages, agent_messages) \
+                 SELECT agent_id, COALESCE(NULLIF(usage_model,''),'unknown'), \
+                   SUM(CASE WHEN usage_origin='human' THEN 1 ELSE 0 END), \
+                   SUM(CASE WHEN role='assistant' OR usage_origin='agent' THEN 1 ELSE 0 END) \
+                 FROM agent_message WHERE agent_id IN (SELECT value FROM json_each(?)) \
+                 AND role IN ('user','assistant') \
+                 GROUP BY agent_id, COALESCE(NULLIF(usage_model,''),'unknown') \
+                 ON CONFLICT(agent_id, model) DO UPDATE SET \
+                   human_messages=excluded.human_messages, \
+                   agent_messages=excluded.agent_messages",
+            )
+            .bind(&imported_agent_ids_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("materialize imported counts failed: {e}")))?;
         }
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("transfer import commit failed: {e}")))?;
+        lifecycle.settle();
         Ok(inserted)
     }
+}
+
+/// Older workspace deletes left these no-workspace-FK registries behind.
+/// Reclaim only IDs present in this archive, owned by an absent workspace
+/// that the same transaction is about to insert. No workspace-wide orphan
+/// sweep, upsert, or provisioning-ownership change is implied by an import.
+/// Cleanup rolls back with every later insert/validation failure.
+async fn reclaim_imported_metadata(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    rows: &[(String, Vec<serde_json::Value>)],
+) -> Result<()> {
+    let workspaces: std::collections::HashSet<&str> = rows
+        .iter()
+        .find(|(table, _)| table == "workspace")
+        .into_iter()
+        .flat_map(|(_, objects)| objects)
+        .filter_map(|row| row.get("id")?.as_str())
+        .collect();
+    for (table, key) in [
+        ("interrupted_agent", "agent_id"),
+        ("script", "id"),
+        ("attachments", "id"),
+    ] {
+        let Some((_, objects)) = rows.iter().find(|(t, _)| t == table) else {
+            continue;
+        };
+        for row in objects {
+            let (Some(id), Some(workspace)) = (
+                row.get(key).and_then(serde_json::Value::as_str),
+                row.get("workspace_id").and_then(serde_json::Value::as_str),
+            ) else {
+                continue; // Ordinary insert validation still rejects bad rows.
+            };
+            if !workspaces.contains(workspace) {
+                continue;
+            }
+            if table == "attachments" {
+                // An attachment can have several retry keys. Bound each
+                // statement while retaining the import's single transaction.
+                loop {
+                    let removed = sqlx::query(
+                        "DELETE FROM attachment_idempotency_keys WHERE rowid IN \
+                         (SELECT k.rowid FROM attachment_idempotency_keys k \
+                          JOIN attachments a ON a.id = k.attachment_id \
+                          WHERE a.id = ?1 AND a.workspace_id = ?2 AND k.workspace_id = ?2 \
+                            AND NOT EXISTS (SELECT 1 FROM workspace WHERE id = ?2) LIMIT ?3)",
+                    )
+                    .bind(id)
+                    .bind(workspace)
+                    .bind(crate::agent_repo::DELETE_CASCADE_BATCH)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("reclaim attachment retry keys failed: {e}"))
+                    })?
+                    .rows_affected();
+                    if removed < crate::agent_repo::DELETE_CASCADE_BATCH.unsigned_abs() {
+                        break;
+                    }
+                }
+            }
+            let agent_guard = if table == "interrupted_agent" {
+                " AND NOT EXISTS (SELECT 1 FROM agent_session WHERE id = ?1)"
+            } else {
+                ""
+            };
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE {key} = ?1 AND workspace_id = ?2 \
+                 AND NOT EXISTS (SELECT 1 FROM workspace WHERE id = ?2){agent_guard}"
+            ))
+            .bind(id)
+            .bind(workspace)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("reclaim imported {table} metadata failed: {e}"))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Serialize one `SQLite` row to a JSON object keyed by column name (see
@@ -544,7 +987,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 /// Inverse of [`base64_encode`]; `None` on any malformed input.
 // Byte extraction from a 24-bit accumulator: truncation is the point.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         match c {
@@ -578,12 +1021,305 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[path = "transfer_reimport_tests.rs"]
+mod reimport_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{TRANSFER_EXCLUDED_TABLES, TRANSFER_TABLES};
     use crate::Store;
-    use intent_core::WorkspaceId;
+    use intent_core::{AgentId, TokenUsageTotals, WorkspaceId};
     use std::fmt::Write as _;
     use uuid::Uuid;
+
+    fn monitor_import_rows(
+        provider: &str,
+        kind: &str,
+        provenance: &str,
+    ) -> Vec<(String, Vec<serde_json::Value>)> {
+        use serde_json::json;
+        vec![
+            (
+                "workspace".into(),
+                vec![
+                    json!({"id":"monitor-import", "title":"Transferred watch", "branch":"main", "created_at":"created", "updated_at":"updated"}),
+                ],
+            ),
+            (
+                "agent_session".into(),
+                vec![
+                    json!({"id":"monitor-owner", "workspace_id":"monitor-import", "name":"Original owner", "status":"idle", "created_at":"created", "updated_at":"updated"}),
+                ],
+            ),
+            (
+                "pr_monitor".into(),
+                vec![json!({
+                    "monitor_id":"transferred", "workspace_id":"monitor-import", "agent_id":"monitor-owner",
+                    "repo_owner":"o", "repo_name":"r", "pr_number":42, "state":"active",
+                    "last_snapshot":" {\"state\":\"after\"} ", "baseline_snapshot":"{\"state\":\"before\"}",
+                    "pending_changes":"  [ \"Unsent original change\" ] ", "pending_since":"pending", "last_change_at":"changed",
+                    "last_polled_at":"polled", "last_error":"Original error", "created_at":"created", "updated_at":"updated",
+                    "target_provider":provider, "target_instance_base_url":format!("https://{provider}.com"),
+                    "target_project_path":"o/r", "target_kind":kind,
+                    "target_provenance":provenance, "target_unresolved_reason":null
+                })],
+            ),
+        ]
+    }
+
+    fn old_monitor_fields(value: &serde_json::Value) -> serde_json::Value {
+        let mut old = value.as_object().unwrap().clone();
+        old.retain(|key, _| !key.starts_with("target_"));
+        serde_json::Value::Object(old)
+    }
+
+    async fn exported_monitor(store: &Store, id: &str) -> serde_json::Value {
+        store
+            .transfer_export_rows(&WorkspaceId("monitor-import".into()))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(name, _)| name == "pr_monitor")
+            .unwrap()
+            .1
+            .into_iter()
+            .find(|row| row["monitor_id"] == id)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn monitor_import_claims_need_explicit_destination_target_validation() {
+        use crate::{
+            MonitorQualificationOutcome, MonitorTargetProvenance, MonitorTargetUnresolvedReason,
+            PersistedMonitorTarget,
+        };
+        for label in [
+            "captured-request",
+            "legacy-github-writer",
+            "validated-transfer",
+        ] {
+            let db = TempDb::new();
+            let store = Store::open(&db.path).await.unwrap();
+            let rows = monitor_import_rows("github", "pull-request", label);
+            let original = old_monitor_fields(&rows[2].1[0]);
+            store.transfer_import_rows(&rows).await.unwrap();
+            let id = intent_core::PrMonitorId("transferred".into());
+            let imported = store.get_qualified_pr_monitor(&id).await.unwrap();
+            assert_eq!(
+                imported.target(),
+                &PersistedMonitorTarget::Unresolved {
+                    reason: MonitorTargetUnresolvedReason::UnverifiedImport
+                }
+            );
+            assert_eq!(imported.target_evidence()["projectPath"], "o/r");
+            assert_eq!(
+                original,
+                old_monitor_fields(&exported_monitor(&store, "transferred").await)
+            );
+            assert!(
+                store
+                    .find_active_pr_monitor(
+                        &intent_core::AgentId("monitor-owner".into()),
+                        "o",
+                        "r",
+                        42
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "unverified claims must not select the legacy provider path"
+            );
+            // This is explicit fixture-supplied validation, not acceptance of
+            // the archive label. The production provider resolver stays external.
+            let target = intent_core::ReviewTarget {
+                repository: intent_core::RepositoryTarget {
+                    provider: intent_core::RepositoryProvider::Github,
+                    instance_base_url: "https://github.com".into(),
+                    project_path: "o/r".into(),
+                },
+                kind: intent_core::RepositoryResourceKind::PullRequest,
+                number: 42,
+            };
+            assert_eq!(
+                store
+                    .qualify_legacy_pr_monitor_target(
+                        &imported,
+                        &target,
+                        MonitorTargetProvenance::ValidatedTransfer
+                    )
+                    .await
+                    .unwrap(),
+                MonitorQualificationOutcome::Applied
+            );
+            assert_eq!(
+                original,
+                old_monitor_fields(&exported_monitor(&store, "transferred").await)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_import_preserves_same_named_different_provider_claims_without_resolving_them()
+    {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        let mut rows = monitor_import_rows("github", "pull-request", "captured-request");
+        let mut gl = monitor_import_rows("gitlab", "merge-request", "captured-request")[2]
+            .1
+            .remove(0);
+        gl["monitor_id"] = "transferred-gl".into();
+        gl["pending_changes"] = "[\"GitLab original pending change\"]".into();
+        rows[2].1.push(gl);
+        assert_eq!(store.transfer_import_rows(&rows).await.unwrap(), 4);
+        for source in &rows[2].1 {
+            let id = source["monitor_id"].as_str().unwrap();
+            let saved = exported_monitor(&store, id).await;
+            assert_eq!(old_monitor_fields(&saved), old_monitor_fields(source));
+            assert_eq!(saved["target_provider"], source["target_provider"]);
+            assert_eq!(saved["target_provenance"], "unresolved");
+        }
+        let mut duplicate = rows[2].1[0].clone();
+        duplicate["monitor_id"] = "same-unresolved-target-duplicate".into();
+        assert!(store
+            .transfer_import_rows(&[("pr_monitor".into(), vec![duplicate])])
+            .await
+            .is_err());
+        assert_eq!(
+            store
+                .load_active_qualified_pr_monitors()
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_monitor_import_stays_inspectable_and_cancellable() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        let mut rows = monitor_import_rows("unrecognized", "unknown-kind", "pretend-proof");
+        rows[2].1[0]["pr_number"] = (-4).into();
+        rows[2].1[0]["repo_owner"] = "".into();
+        rows[2].1[0]["target_project_path"] = serde_json::Value::Null;
+        store.transfer_import_rows(&rows).await.unwrap();
+        let id = intent_core::PrMonitorId("transferred".into());
+        let claim = store.get_qualified_pr_monitor(&id).await.unwrap();
+        assert!(matches!(
+            claim.target(),
+            crate::PersistedMonitorTarget::Unresolved { .. }
+        ));
+        assert_eq!(claim.target_evidence()["provider"], "unrecognized");
+        assert_eq!(claim.monitor().pending_changes, ["Unsent original change"]);
+        assert!(store
+            .update_pr_monitor_state(&id, intent_core::PrMonitorState::Cancelled, "cancelled")
+            .await
+            .unwrap());
+        let cancelled = store.get_qualified_pr_monitor(&id).await.unwrap();
+        assert_eq!(cancelled.monitor().agent_id, claim.monitor().agent_id);
+        assert_eq!(
+            cancelled.monitor().pending_changes,
+            claim.monitor().pending_changes
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_import_rejects_lossy_or_non_integer_numbers() {
+        for number in [
+            serde_json::json!(u64::MAX),
+            serde_json::json!(i64::MAX as u64 + 1),
+            serde_json::json!(42.5),
+            serde_json::json!("42"),
+            serde_json::json!(true),
+        ] {
+            let db = TempDb::new();
+            let store = Store::open(&db.path).await.unwrap();
+            let mut rows = monitor_import_rows("gitlab", "merge-request", "captured-request");
+            rows[2].1[0]["pr_number"] = number.clone();
+            assert!(
+                store.transfer_import_rows(&rows).await.is_err(),
+                "lossy monitor number {number} was accepted"
+            );
+            assert!(store
+                .get_workspace(&WorkspaceId("monitor-import".into()))
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_import_rejects_runtime_authority_and_credentials_atomically() {
+        for field in [
+            "connection_id",
+            "authority_generation",
+            "credential",
+            "daemon_epoch",
+        ] {
+            let db = TempDb::new();
+            let store = Store::open(&db.path).await.unwrap();
+            let mut rows = monitor_import_rows("gitlab", "merge-request", "validated-transfer");
+            rows[2].1[0][field] = "untrusted runtime data".into();
+            assert!(store.transfer_import_rows(&rows).await.is_err());
+            assert!(store
+                .get_workspace(&WorkspaceId("monitor-import".into()))
+                .await
+                .is_err());
+        }
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        let mut rows = monitor_import_rows("gitlab", "merge-request", "validated-transfer");
+        rows.push(("repository_authority_revision".into(), vec![]));
+        assert!(store.transfer_import_rows(&rows).await.is_err());
+        assert!(store
+            .get_workspace(&WorkspaceId("monitor-import".into()))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn monitor_transfer_retains_pending_but_uses_only_destination_continuity() {
+        let source_db = TempDb::new();
+        let destination_db = TempDb::new();
+        let source = Store::open(&source_db.path).await.unwrap();
+        let destination = Store::open(&destination_db.path).await.unwrap();
+        let input = monitor_import_rows("gitlab", "merge-request", "captured-request");
+        source.transfer_import_rows(&input).await.unwrap();
+        sqlx::query("UPDATE repository_authority_revision SET revision=100 WHERE kind='workspace' AND subject_id='monitor-import'")
+            .execute(source.write_pool()).await.unwrap();
+        let ws = WorkspaceId("monitor-import".into());
+        let exported = source.transfer_export_rows(&ws).await.unwrap();
+        assert!(!exported
+            .iter()
+            .any(|(name, _)| name == "repository_authority_revision"));
+        destination.transfer_import_rows(&exported).await.unwrap();
+        let local = destination
+            .repository_workspace_authority_snapshot(&ws)
+            .await
+            .unwrap();
+        assert_eq!(local.workspace.revision.unwrap().get(), 1);
+        assert_eq!(
+            source
+                .repository_workspace_authority_snapshot(&ws)
+                .await
+                .unwrap()
+                .workspace
+                .revision
+                .unwrap()
+                .get(),
+            100
+        );
+        let id = intent_core::PrMonitorId("transferred".into());
+        let saved = destination.get_qualified_pr_monitor(&id).await.unwrap();
+        assert!(matches!(
+            saved.target(),
+            crate::PersistedMonitorTarget::Unresolved { .. }
+        ));
+        assert_eq!(
+            old_monitor_fields(&exported_monitor(&destination, "transferred").await),
+            old_monitor_fields(&input[2].1[0])
+        );
+        assert_eq!(saved.monitor().agent_id.0, "monitor-owner");
+    }
 
     /// A unique temp DB path cleaned up on drop (mirrors `crate::tests::TempDb`,
     /// which is private to that module).
@@ -636,9 +1372,10 @@ mod tests {
             format!("INSERT INTO note_line_attribution (note_id, workspace_id, computed_at, attributions_json) VALUES ('n1', '{ws}', '{t}', '[]')"),
             format!("INSERT INTO comment (id, thread_id, note_id, workspace_id, kind, content, author, author_type, anchor_json, created_at, updated_at) VALUES ('c-{ws}', 'th', 'n1', '{ws}', 'comment', 'hi', 'u', 'user', '{{}}', '{t}', '{t}')"),
             format!("INSERT INTO draft (workspace_id, agent_id, client_id, text, updated_at) VALUES ('{ws}', '{agent}', '{client}', 'd', '{t}')"),
-            format!("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('m-{ws}', '{agent}', 1, 'user', '[]', '{t}')"),
+            format!("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at, usage_model, usage_origin) VALUES ('m-{ws}', '{agent}', 1, 'user', '[]', '{t}', 'test-model', 'human')"),
             format!("INSERT INTO agent_message_payload (message_id, agent_id, block_ordinal, kind, encoding, body) VALUES ('m-{ws}', '{agent}', 0, 'tool_result_output', 'none', X'227822')"),
             format!("INSERT INTO agent_message_payload (message_id, agent_id, block_ordinal, kind, encoding, body) VALUES ('m-{ws}', '{agent}', 1, 'tool_use_input_replay', 'none', X'7b2274657874223a2278222c226f726967696e616c4368617273223a317d')"),
+            format!("INSERT INTO agent_usage_cell (agent_id, model, human_messages) VALUES ('{agent}', 'test-model', 1)"),
             format!("INSERT INTO agent_queue (id, agent_id, position, payload, created_at) VALUES ('q-{ws}', '{agent}', 0, '{{}}', '{t}')"),
             format!("INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at) VALUES ('{agent}', '{ws}', 'working', '{t}')"),
             format!("INSERT INTO agent_flipped_completion (agent_id, workspace_id, task_note_id, recorded_at) VALUES ('{agent}', '{ws}', 'n1', '{t}')"),
@@ -649,6 +1386,7 @@ mod tests {
             format!("INSERT INTO hook (hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at) VALUES ('h-{ws}', '{ws}', '{agent}', 'H', 'return', 10000, 'scheduled', '{t}')"),
             format!("INSERT INTO pr_monitor (monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, created_at, updated_at) VALUES ('pm-{ws}', '{ws}', '{agent}', 'o', 'r', 1, 'active', '{t}', '{t}')"),
             format!("INSERT INTO script (id, workspace_id, name, command, mode, source, created_at) VALUES ('s-{ws}', '{ws}', 'S', 'true', 'command', 'user', '{t}')"),
+            format!("INSERT INTO script_monitor (id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at) VALUES ('sm-{ws}', '{ws}', '{agent}', 's-{ws}', 'run-{ws}', 'active', '{{}}', '{t}')"),
             format!("INSERT INTO task_agent_link (workspace_id, note_id, task_key, task_text, agent_id, created_at) VALUES ('{ws}', 'n1', 'k', 'do', '{agent}', 1)"),
             format!("INSERT INTO sandbox (id, workspace_id, agent_id, path, branch, base_commit_sha, created_at, updated_at) VALUES ('sb-{ws}', '{ws}', '{agent}', '/tmp/sb', 'sb/a', 'abc', '{t}', '{t}')"),
             format!("INSERT INTO tracked_changes (id, workspace_id, path, stage, status, created_at, updated_at) VALUES ('tc-{ws}', '{ws}', 'a.txt', 'unstaged', 'modified', '{t}', '{t}')"),
@@ -724,6 +1462,16 @@ mod tests {
         let src = Store::open(&src_db.path).await.expect("open source");
         seed(&src, "ws-rt").await;
         let ws = WorkspaceId("ws-rt".to_string());
+        let agent_id = intent_core::AgentId::from("agent-ws-rt");
+        let effort = crate::AgentTurnEffort {
+            effort: None,
+            default_value: "medium".into(),
+            provider: "mock".into(),
+            model: None,
+        };
+        src.set_agent_session_last_turn_effort(&ws, &agent_id, &effort)
+            .await
+            .unwrap();
 
         let mut exported = src.transfer_export_rows(&ws).await.expect("export");
         assert_eq!(exported.len(), TRANSFER_TABLES.len());
@@ -746,6 +1494,12 @@ mod tests {
         let dst_db = TempDb::new();
         let dst = Store::open(&dst_db.path).await.expect("open target");
         let inserted = dst.transfer_import_rows(&exported).await.expect("import");
+        assert_eq!(
+            dst.get_agent_session_last_turn_effort(&ws, &agent_id)
+                .await
+                .unwrap(),
+            Some(effort)
+        );
         assert_eq!(inserted, total);
 
         let mut re_exported = dst.transfer_export_rows(&ws).await.expect("re-export");
@@ -767,6 +1521,281 @@ mod tests {
             }
         }
         assert_eq!(exported, re_exported, "round-trip must be lossless");
+        // Archives made before the effort baseline column remain importable;
+        // desired reasoning_effort is not evidence of a previously used level.
+        for (table, rows) in &mut exported {
+            if table == "agent_session" {
+                for row in rows {
+                    row.as_object_mut().unwrap().remove("last_turn_effort");
+                }
+            }
+        }
+        let legacy_db = TempDb::new();
+        let legacy = Store::open(&legacy_db.path).await.unwrap();
+        legacy.transfer_import_rows(&exported).await.unwrap();
+        assert!(legacy
+            .get_agent_session_last_turn_effort(&ws, &agent_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Regression for intent-hq/intent#4876: the export reads every table
+    /// from ONE snapshot. A writer commits versioned note updates (`note.rev`
+    /// bump + matching `note_version` row, one write transaction each) in a
+    /// tight loop while the export runs repeatedly; every export must pair
+    /// the `note` row with a newest `note_version` of the SAME revision and
+    /// content. Before the fix each table was read with its own statement on
+    /// its own pooled connection, so a write landing between the `note` and
+    /// `note_version` reads exported a row at rev N next to a snapshot at
+    /// rev N+1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transfer_export_pairs_note_row_with_same_rev_snapshot_under_concurrent_writes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const FILLER_NOTES: usize = 64;
+        const EXPORTS: usize = 200;
+
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.expect("open");
+        let ws = "ws-snap";
+        let t = "2026-01-01T00:00:00Z";
+        run(&store, format!("INSERT INTO workspace (id, title, branch, created_at, updated_at) VALUES ('{ws}', 'T', 'main', '{t}', '{t}')")).await;
+        // Filler notes widen the gap between the `note` and `note_version`
+        // reads (each exported row is serialized before the next table).
+        for i in 0..FILLER_NOTES {
+            run(&store, format!("INSERT INTO note (id, workspace_id, title, content, created_at, updated_at, rev) VALUES ('f{i}', '{ws}', 'F', 'body', '{t}', '{t}', 1)")).await;
+            run(&store, format!("INSERT INTO note_version (note_id, workspace_id, v, date, author_id, author_name, author_type, title, content) VALUES ('f{i}', '{ws}', 1, '{t}', 'u', 'U', 'user', 'F', 'body')")).await;
+        }
+        run(&store, format!("INSERT INTO note (id, workspace_id, title, content, created_at, updated_at, rev) VALUES ('hot', '{ws}', 'H', 'c1', '{t}', '{t}', 1)")).await;
+        run(&store, format!("INSERT INTO note_version (note_id, workspace_id, v, date, author_id, author_name, author_type, title, content) VALUES ('hot', '{ws}', 1, '{t}', 'u', 'U', 'user', 'H', 'c1')")).await;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let store = store.clone();
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let mut k: i64 = 1;
+                while !stop.load(Ordering::Relaxed) {
+                    k += 1;
+                    let mut conn = store.write_pool().acquire().await.expect("acquire");
+                    for sql in [
+                        "BEGIN IMMEDIATE".to_string(),
+                        format!("UPDATE note SET content = 'c{k}', rev = {k} WHERE id = 'hot' AND workspace_id = '{ws}'"),
+                        format!("INSERT INTO note_version (note_id, workspace_id, v, date, author_id, author_name, author_type, title, content) VALUES ('hot', '{ws}', {k}, '{t}', 'u', 'U', 'user', 'H', 'c{k}')"),
+                        format!("DELETE FROM note_version WHERE note_id = 'hot' AND workspace_id = '{ws}' AND v < {k} - 20"),
+                        "COMMIT".to_string(),
+                    ] {
+                        sqlx::query(&sql)
+                            .execute(&mut *conn)
+                            .await
+                            .unwrap_or_else(|e| panic!("writer failed: {sql}: {e}"));
+                    }
+                }
+                k
+            })
+        };
+
+        let ws_id = WorkspaceId(ws.to_string());
+        for i in 0..EXPORTS {
+            let exported = store.transfer_export_rows(&ws_id).await.expect("export");
+            let table = |name: &str| {
+                &exported
+                    .iter()
+                    .find(|(t, _)| t == name)
+                    .unwrap_or_else(|| panic!("{name} exported"))
+                    .1
+            };
+            let note = table("note")
+                .iter()
+                .find(|r| r["id"] == "hot")
+                .expect("hot note exported");
+            let rev = note["rev"].as_i64().expect("rev");
+            let newest = table("note_version")
+                .iter()
+                .filter(|r| r["note_id"] == "hot")
+                .max_by_key(|r| r["v"].as_i64().expect("v"))
+                .expect("hot note_version exported");
+            assert_eq!(
+                newest["v"], rev,
+                "export {i}: note row rev {rev} must match newest exported \
+                 note_version — the export captured note/history at different times"
+            );
+            assert_eq!(
+                newest["content"], note["content"],
+                "export {i}: newest note_version content must match the note row"
+            );
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let last = writer.await.expect("writer task");
+        assert!(last > 1, "writer must have committed at least one update");
+    }
+
+    #[tokio::test]
+    async fn transfer_import_materializes_legacy_usage_and_message_counts() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.expect("open target");
+        let t = "2026-01-01T00:00:00Z";
+        let ws_id = WorkspaceId("ws-legacy-transfer".to_string());
+        let agent_id = AgentId("agent-legacy-transfer".to_string());
+        let snapshot = TokenUsageTotals {
+            input_tokens: 70,
+            ..Default::default()
+        };
+        let rows = vec![
+            (
+                "workspace".to_string(),
+                vec![serde_json::json!({
+                    "id": &ws_id.0, "title": "Legacy", "branch": "main",
+                    "created_at": t, "updated_at": t
+                })],
+            ),
+            (
+                "agent_session".to_string(),
+                vec![serde_json::json!({
+                    "id": &agent_id.0, "workspace_id": &ws_id.0, "name": "Legacy",
+                    "status": "idle", "model": "legacy-model",
+                    "token_usage": serde_json::to_string(&snapshot).unwrap(),
+                    "created_at": t, "updated_at": t
+                })],
+            ),
+            (
+                "agent_message".to_string(),
+                vec![
+                    serde_json::json!({
+                        "id": "m-human", "agent_id": &agent_id.0, "seq": 0,
+                        "role": "user", "content": "[]", "created_at": t
+                    }),
+                    serde_json::json!({
+                        "id": "m-assistant", "agent_id": &agent_id.0, "seq": 1,
+                        "role": "assistant", "content": "[]", "created_at": t
+                    }),
+                    serde_json::json!({
+                        "id": "m-automatic", "agent_id": &agent_id.0, "seq": 2,
+                        "role": "user", "content": "[]",
+                        "metadata": "{\"fromAgentId\":\"agent-source\"}", "created_at": t
+                    }),
+                    serde_json::json!({
+                        "id": "m-system", "agent_id": &agent_id.0, "seq": 3,
+                        "role": "system", "content": "[]", "created_at": t
+                    }),
+                ],
+            ),
+        ];
+        assert!(
+            rows.iter().all(|(table, _)| table != "agent_usage_cell"),
+            "pre-0115 archive has no materialized usage cells"
+        );
+        store
+            .transfer_import_rows(&rows)
+            .await
+            .expect("import archive");
+
+        let imported_usage = store
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("read imported legacy usage");
+        assert_eq!(imported_usage[0].5.len(), 1);
+        assert_eq!(imported_usage[0].5[0].model, "legacy-model");
+        assert_eq!(
+            imported_usage[0].5[0].reported_totals.input_tokens, 70,
+            "legacy session snapshot seeds its missing usage cell"
+        );
+
+        store
+            .set_agent_session_token_usage(
+                &ws_id,
+                &agent_id,
+                &TokenUsageTotals {
+                    input_tokens: 100,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("continue imported session");
+        store
+            .append_agent_message(&agent_id, "user", &serde_json::json!([]), t)
+            .await
+            .expect("append after import");
+
+        for _ in 0..2 {
+            let usage = store
+                .get_workspace_agent_usage_data(&ws_id)
+                .await
+                .expect("reconcile imported usage");
+            assert_eq!(usage[0].5.len(), 1);
+            assert_eq!(usage[0].5[0].model, "legacy-model");
+            assert_eq!(usage[0].5[0].reported_totals.input_tokens, 100);
+            assert_eq!(
+                (usage[0].5[0].human_messages, usage[0].5[0].agent_messages),
+                (2, 2),
+                "legacy and appended rows count exactly once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_round_trip_does_not_seed_current_model_when_modern_cells_exist() {
+        let src_db = TempDb::new();
+        let src = Store::open(&src_db.path).await.expect("open source");
+        let t = "2026-01-01T00:00:00Z";
+        let ws_id = WorkspaceId("ws-modern-model-switch".to_string());
+        let agent_id = AgentId("agent-modern-model-switch".to_string());
+        run(
+            &src,
+            format!(
+                "INSERT INTO workspace (id, title, branch, created_at, updated_at) \
+                 VALUES ('{}', 'Modern', 'main', '{t}', '{t}')",
+                ws_id.0
+            ),
+        )
+        .await;
+        run(
+            &src,
+            format!(
+                "INSERT INTO agent_session \
+                 (id, workspace_id, name, status, model, created_at, updated_at) \
+                 VALUES ('{}', '{}', 'Modern', 'idle', 'model-a', '{t}', '{t}')",
+                agent_id.0, ws_id.0
+            ),
+        )
+        .await;
+        src.set_agent_session_token_usage(
+            &ws_id,
+            &agent_id,
+            &TokenUsageTotals {
+                input_tokens: 70,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("persist model-a usage");
+        src.set_agent_session_model(&ws_id, &agent_id, "model-b", None, t)
+            .await
+            .expect("switch model without a new turn");
+
+        let exported = src.transfer_export_rows(&ws_id).await.expect("export");
+        let exported_cells = exported
+            .iter()
+            .find(|(table, _)| table == "agent_usage_cell")
+            .expect("usage-cell table");
+        assert_eq!(exported_cells.1.len(), 1, "modern archive carries one cell");
+
+        let dst_db = TempDb::new();
+        let dst = Store::open(&dst_db.path).await.expect("open target");
+        dst.transfer_import_rows(&exported).await.expect("import");
+        let usage = dst
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("read imported usage");
+        let cells: Vec<_> = usage[0]
+            .5
+            .iter()
+            .map(|cell| (cell.model.as_str(), cell.reported_totals.input_tokens))
+            .collect();
+        assert_eq!(cells, [("model-a", 70)]);
     }
 
     /// The import transaction is atomic: a batch whose LAST table row
@@ -890,15 +1919,17 @@ mod tests {
     /// `transferred_table_columns_match_snapshot` after deciding what the
     /// column change means for transfer (see that test's message).
     const TRANSFERRED_COLUMNS: &str = "\
-workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, browser_client_id
+workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, browser_client_id, legacy_author_principal_id, owner_principal_id, last_content_activity
 note: id, workspace_id, title, content, content_type, tags, is_pinned, is_archived, is_default, parent_id, visibility, task_json, created_at, updated_at, rev
-note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content
+note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content, rev
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
-agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes
-agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails
+agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort
+script_monitor: id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at, settled_at, cancel_intent, wake_state
+agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails, usage_model, usage_origin
 agent_message_payload: message_id, agent_id, block_ordinal, kind, encoding, body
+agent_usage_cell: agent_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, thought_tokens, costs_json, human_messages, agent_messages
 agent_queue: id, agent_id, position, payload, created_at, turn_id
 interrupted_agent: agent_id, workspace_id, prev_status, interrupted_at, resolution, resolved_at, reason
 agent_flipped_completion: agent_id, workspace_id, task_note_id, recorded_at
@@ -906,8 +1937,8 @@ delegation_group: group_id, workspace_id, parent_agent_id, await_mode, expected_
 completion_watch: id, parent_workspace_id, child_workspace_id, parent_agent_id, parent_agent_name, child_agent_id, group_id, report_delivered, wake_on_attention, created_at, completion_only
 event_subscription: id, workspace_id, subscriber_agent_id, event_types, exclude_self, batch_window_ms, created_at
 hook: hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at, last_run_at, next_run_at, run_count, last_error, last_logs, last_state, expires_at, perpetual, dispatch_count, cron, run_at
-pr_monitor: monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, last_snapshot, pending_changes, pending_since, last_change_at, last_polled_at, last_error, created_at, updated_at, baseline_snapshot
-script: id, workspace_id, name, command, cwd, env, mode, category, source, auto_start, created_at, updated_at, was_running
+pr_monitor: monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, last_snapshot, pending_changes, pending_since, last_change_at, last_polled_at, last_error, created_at, updated_at, baseline_snapshot, target_provider, target_instance_base_url, target_project_path, target_kind, target_provenance, target_unresolved_reason
+script: id, workspace_id, name, command, cwd, env, mode, category, source, auto_start, created_at, updated_at, was_running, purpose, archived_at, last_run, pending_run_id, pending_started_at, latest_run_id, latest_run_result
 task_agent_link: workspace_id, note_id, task_key, task_text, agent_id, created_at
 sandbox: id, workspace_id, agent_id, path, branch, base_commit_sha, snapshot_commit_sha, status, created_at, updated_at, retry_count
 tracked_changes: id, workspace_id, path, stage, status, agent_id, session_id, turn, commit_hash, old_blob_sha, new_blob_sha, additions, deletions, created_at, updated_at
@@ -952,6 +1983,149 @@ attachments: id, workspace_id, file_name, mime_type, size, uploaded_at, stored_p
              make sure the import path tolerates its absence (or defaults it);\n\
              then replace TRANSFERRED_COLUMNS with the actual snapshot \
              below:\n\n{actual}\n"
+        );
+    }
+
+    fn selection_import_rows(path: &str) -> Vec<(String, Vec<serde_json::Value>)> {
+        vec![(
+            "workspace".into(),
+            vec![
+                serde_json::json!({"id":"selection-import","title":"Imported","branch":"main","repository_path":path,"created_at":"same","updated_at":"same"}),
+            ],
+        )]
+    }
+    fn selection_import_root() -> intent_core::RepositoryRootId {
+        intent_core::RepositoryRootId {
+            workspace_id: WorkspaceId::from("selection-import"),
+            kind: intent_core::RepositoryRootKind::Primary,
+        }
+    }
+    #[tokio::test]
+    async fn selection_new_import_is_unresolved_without_invented_provenance() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .transfer_import_rows(&selection_import_rows("/imported"))
+            .await
+            .unwrap();
+        let snapshot = store
+            .repository_selection_snapshot(&selection_import_root())
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.selection(),
+            Some(&crate::RepositoryStoredSelection::Saved(
+                intent_core::SavedReviewSelection::UnresolvedHistorical {
+                    source: None,
+                    record_id: None
+                }
+            ))
+        );
+        let export = store
+            .transfer_export_rows(&WorkspaceId::from("selection-import"))
+            .await
+            .unwrap();
+        assert!(!export
+            .iter()
+            .any(|(table, _)| table == "repository_selection_state"));
+    }
+    #[tokio::test]
+    async fn selection_source_counter_table_is_rejected_without_any_import_effect() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        let mut input = selection_import_rows("/imported");
+        input.push((
+            "repository_selection_state".into(),
+            vec![serde_json::json!({"root_incarnation":99,"selection_revision":99})],
+        ));
+        assert!(store.transfer_import_rows(&input).await.is_err());
+        assert!(store
+            .get_workspace(&WorkspaceId::from("selection-import"))
+            .await
+            .is_err());
+    }
+    #[tokio::test]
+    async fn selection_duplicate_import_retains_original_constraint_and_local_choice() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .transfer_import_rows(&selection_import_rows("/local"))
+            .await
+            .unwrap();
+        let root = selection_import_root();
+        let before = store.repository_selection_snapshot(&root).await.unwrap();
+        store
+            .write_repository_selection(
+                &before,
+                crate::RepositorySelectionChange::ExplicitRemote {
+                    remote_name: "local".into(),
+                },
+            )
+            .await
+            .result
+            .unwrap();
+        let local = store.repository_selection_snapshot(&root).await.unwrap();
+        assert!(store
+            .transfer_import_rows(&selection_import_rows("/other"))
+            .await
+            .is_err());
+        let after = store.repository_selection_snapshot(&root).await.unwrap();
+        assert_eq!(after.binding(), local.binding());
+        assert_eq!(after.selection(), local.selection());
+        assert_eq!(after.root_incarnation(), local.root_incarnation());
+        assert_eq!(after.selection_revision(), local.selection_revision());
+    }
+    #[tokio::test]
+    async fn selection_original_import_transaction_preserves_equal_binding_and_marks_rebind() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        store
+            .transfer_import_rows(&selection_import_rows("/local"))
+            .await
+            .unwrap();
+        // Fixture BEFORE INSERT supplies acknowledged same-row/no-effect and
+        // rebound outcomes to the unchanged generic INSERT algorithm. Production
+        // still uses plain INSERT and retains duplicate-ID constraint errors.
+        sqlx::query("CREATE TRIGGER fixture_import_existing BEFORE INSERT ON workspace WHEN EXISTS(SELECT 1 FROM workspace WHERE id=NEW.id) BEGIN UPDATE workspace SET repository_path=NEW.repository_path WHERE id=NEW.id; SELECT RAISE(IGNORE); END")
+            .execute(store.write_pool()).await.unwrap();
+        let root = selection_import_root();
+        for change in [
+            crate::RepositorySelectionChange::ExplicitRemote {
+                remote_name: "local".into(),
+            },
+            crate::RepositorySelectionChange::Reset,
+        ] {
+            let before = store.repository_selection_snapshot(&root).await.unwrap();
+            store
+                .write_repository_selection(&before, change)
+                .await
+                .result
+                .unwrap();
+            let local = store.repository_selection_snapshot(&root).await.unwrap();
+            for _ in 0..2 {
+                store
+                    .transfer_import_rows(&selection_import_rows("/local"))
+                    .await
+                    .unwrap();
+                let after = store.repository_selection_snapshot(&root).await.unwrap();
+                assert_eq!(after.selection(), local.selection());
+                assert_eq!(after.root_incarnation(), local.root_incarnation());
+                assert_eq!(after.selection_revision(), local.selection_revision());
+            }
+        }
+        store
+            .transfer_import_rows(&selection_import_rows("/rebound"))
+            .await
+            .unwrap();
+        let after = store.repository_selection_snapshot(&root).await.unwrap();
+        assert_eq!(
+            after.selection(),
+            Some(&crate::RepositoryStoredSelection::Saved(
+                intent_core::SavedReviewSelection::UnresolvedHistorical {
+                    source: None,
+                    record_id: None
+                }
+            ))
         );
     }
 }

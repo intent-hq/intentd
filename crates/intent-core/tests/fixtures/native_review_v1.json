@@ -1,0 +1,179 @@
+{
+  "prepare": {
+    "valid": true,
+    "warnings": [],
+    "errors": [],
+    "filesCount": 0,
+    "additions": 0,
+    "deletions": 0,
+    "files": [],
+    "suggestedPRTitle": "Submitted suggestion",
+    "suggestedPRBody": "Submitted body",
+    "reviewPreparation": {
+      "operationId": "operation-create",
+      "scope": {
+        "daemonId": "daemon-A",
+        "authorityScopeId": "caller-workspace-1",
+        "authorityGeneration": "9007199254740995"
+      },
+      "contextRevision": {
+        "epoch": "daemon-boot-1",
+        "sequence": "9007199254740993"
+      },
+      "root": {
+        "workspaceId": "workspace-1",
+        "kind": "primary"
+      },
+      "worktreeId": "worktree-1",
+      "source": {
+        "repository": {
+          "provider": "gitlab",
+          "instanceBaseUrl": "https://git.example:8443/gitlab",
+          "projectPath": "team/sub/app"
+        },
+        "providerProjectId": "18446744073709551615",
+        "connection": {
+          "connectionId": "gitlab-connection",
+          "accountId": "account-A",
+          "connectionGeneration": "18446744073709551615"
+        },
+        "branch": "feature"
+      },
+      "target": {
+        "repository": {
+          "provider": "gitlab",
+          "instanceBaseUrl": "https://git.example:8443/gitlab",
+          "projectPath": "team/sub/app"
+        },
+        "providerProjectId": "18446744073709551615",
+        "connection": {
+          "connectionId": "gitlab-connection",
+          "accountId": "account-A",
+          "connectionGeneration": "18446744073709551615"
+        },
+        "branch": "main"
+      },
+      "localHeadSha": "local-B",
+      "transport": {
+        "remoteName": "origin",
+        "fetchUrls": ["https://git.example:8443/gitlab/team/sub/app.git"],
+        "pushUrls": ["ssh://git@git.example/team/sub/app.git"]
+      }
+    }
+  },
+  "execute": {
+    "success": true,
+    "steps": [
+      {
+        "id": "create-pr",
+        "name": "Create pull request",
+        "status": "completed"
+      }
+    ],
+    "result": {
+      "prNumber": 7,
+      "prUrl": "https://git.example:8443/gitlab/team/sub/app/-/merge_requests/7"
+    },
+    "reviewExecution": {
+      "requestId": "request-create",
+      "preparation": {
+        "operationId": "operation-create",
+        "scope": {
+          "daemonId": "daemon-A",
+          "authorityScopeId": "caller-workspace-1",
+          "authorityGeneration": "9007199254740995"
+        },
+        "contextRevision": {
+          "epoch": "daemon-boot-1",
+          "sequence": "9007199254740993"
+        },
+        "root": {
+          "workspaceId": "workspace-1",
+          "kind": "primary"
+        },
+        "worktreeId": "worktree-1",
+        "source": {
+          "repository": {
+            "provider": "gitlab",
+            "instanceBaseUrl": "https://git.example:8443/gitlab",
+            "projectPath": "team/sub/app"
+          },
+          "providerProjectId": "18446744073709551615",
+          "connection": {
+            "connectionId": "gitlab-connection",
+            "accountId": "account-A",
+            "connectionGeneration": "18446744073709551615"
+          },
+          "branch": "feature"
+        },
+        "target": {
+          "repository": {
+            "provider": "gitlab",
+            "instanceBaseUrl": "https://git.example:8443/gitlab",
+            "projectPath": "team/sub/app"
+          },
+          "providerProjectId": "18446744073709551615",
+          "connection": {
+            "connectionId": "gitlab-connection",
+            "accountId": "account-A",
+            "connectionGeneration": "18446744073709551615"
+          },
+          "branch": "main"
+        },
+        "localHeadSha": "local-B",
+        "transport": {
+          "remoteName": "origin",
+          "fetchUrls": ["https://git.example:8443/gitlab/team/sub/app.git"],
+          "pushUrls": ["ssh://git@git.example/team/sub/app.git"]
+        }
+      },
+      "gitReceipts": [],
+      "outcome": {
+        "status": "reused",
+        "review": {
+          "resource": {
+            "repository": {
+              "provider": "gitlab",
+              "instanceBaseUrl": "https://git.example:8443/gitlab",
+              "projectPath": "team/sub/app"
+            },
+            "kind": "merge-request",
+            "number": 7
+          },
+          "url": "https://git.example:8443/gitlab/team/sub/app/-/merge_requests/7",
+          "title": "Existing provider title",
+          "body": "Existing provider body",
+          "state": "open",
+          "draft": true,
+          "sourceBranch": "feature",
+          "targetBranch": "main",
+          "source": {
+            "provider": "gitlab",
+            "instanceBaseUrl": "https://git.example:8443/gitlab",
+            "projectId": "18446744073709551615",
+            "projectPath": null,
+            "branch": "feature"
+          },
+          "target": {
+            "provider": "gitlab",
+            "instanceBaseUrl": "https://git.example:8443/gitlab",
+            "projectId": "18446744073709551615",
+            "projectPath": null,
+            "branch": "main"
+          },
+          "author": "existing-author",
+          "mergeable": null,
+          "mergeableState": null,
+          "headSha": "remote-A",
+          "createdAt": "2026-09-26T10:00:00Z",
+          "updatedAt": "2026-09-27T10:00:00Z"
+        }
+      },
+      "publication": {
+        "state": "local-ahead",
+        "localHeadSha": "local-B",
+        "remoteSourceSha": "remote-A"
+      }
+    }
+  }
+}

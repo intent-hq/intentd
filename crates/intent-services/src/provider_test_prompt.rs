@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::one_shot_acp::{run_one_shot_acp, OneShotError};
+use crate::one_shot_acp::{run_one_shot_acp, OneShotEffort, OneShotError};
 
 /// The literal prompt the probe sends. The answer is never surfaced — any
 /// successfully completed turn is a pass.
@@ -69,7 +69,9 @@ fn failure_reason(err: &OneShotError) -> &'static str {
         OneShotError::Rpc(_)
         | OneShotError::Transport(_)
         | OneShotError::Exited(_)
-        | OneShotError::Empty => "error",
+        | OneShotError::Empty
+        | OneShotError::InvalidEffort(_)
+        | OneShotError::ApplyEffort(_) => "error",
     }
 }
 
@@ -93,6 +95,7 @@ fn failure(reason: &str, message: impl Into<String>) -> Value {
 /// (the caller maps it to `-32602`). Every runtime failure is a structured
 /// `{ ok: false, reason, message }` result, not a wire error.
 pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
+    api: Option<&dyn intent_core::WorkspaceApi>,
     provider_id: &str,
     model: Option<&str>,
     provider_paths: &HashMap<String, String, S>,
@@ -144,19 +147,23 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
     // An npx launch runs a Node child whatever the provider's declared
     // runtime — thread the signal into the env builder (STAB-50 heap cap).
     let via_npx = resolved_bin.is_none();
-    let npx = intent_providers::find_npx();
+    let npx = if provider_id == "codex" {
+        intent_providers::find_codex_npx()
+    } else {
+        intent_providers::find_npx()
+    };
     let Some(mut cmd) = crate::complete_ops::one_shot_launch(provider, resolved_bin, npx, model)
     else {
         return Ok(failure(
             "not-installed",
-            format!(
-                "{provider_id}: no adapter could be resolved \
-                 (binary not found and npx unavailable)"
-            ),
+            crate::complete_ops::missing_one_shot_adapter_message(provider_id),
         ));
     };
-    // Provider env parity with real ACP spawns: `one_shot_launch` only builds
-    // argv, but some providers need their spawn env to launch at all —
+    if let Err(err) = cmd.check_npx_version().await {
+        return Ok(failure("not-installed", err.to_string()));
+    }
+    // Provider env parity with real ACP spawns: `one_shot_launch` builds
+    // argv and the Codex mode, but some providers need more spawn env —
     // cortex's `ELECTRON_RUN_AS_NODE`, opencode's `OPENCODE_CONFIG_CONTENT`,
     // the Node heap cap. No rules file, MCP block, or unsloth endpoint: the
     // probe wants the barest viable session.
@@ -171,28 +178,36 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
     ) {
         cmd = cmd.env(key, value);
     }
-    // codex loads MCP servers from its inherited CODEX_HOME regardless of the
-    // empty ACP `mcpServers` list; the probe child gets the same isolated
-    // throwaway home the one-shot completion path uses — a test prompt must
-    // never start user-configured MCP servers.
-    let (cmd, _codex_home) = if provider_id == "codex" {
-        match crate::provider_models::with_isolated_codex_home(cmd) {
-            Ok((cmd, home)) => (cmd, Some(home)),
-            Err(e) => {
-                return Ok(failure(
-                    "spawn-failed",
-                    format!("codex: failed to create isolated CODEX_HOME: {e}"),
-                ))
-            }
-        }
-    } else {
-        (cmd, None)
+    let cmd = crate::complete_ops::apply_one_shot_launch_policy(provider, cmd);
+    let cmd = match cmd.prepare_installed().await {
+        Ok(cmd) => cmd,
+        Err(reason) => return Ok(failure("not-installed", reason)),
     };
     let outcome = run_one_shot_acp(
+        Some((
+            provider_id,
+            Box::pin(async {
+                match api {
+                    Some(api) => api
+                        .settings_get("providers.fastMode".into())
+                        .await
+                        .ok()
+                        .and_then(|v| {
+                            v.get("value")
+                                .and_then(|m| m.get(provider_id))
+                                .and_then(Value::as_bool)
+                        })
+                        .unwrap_or(false),
+                    None => false,
+                }
+            }),
+        )),
         cmd,
         TEST_PROMPT,
         crate::complete_ops::config_option_model(provider, model),
+        None,
         TEST_PROMPT_TIMEOUT,
+        &OneShotEffort::default(),
     )
     .await;
     Ok(match outcome {
@@ -272,7 +287,7 @@ mod tests {
     async fn unsupported_provider_returns_structured_unsupported() {
         let paths: HashMap<String, String> = HashMap::new();
         for provider in ["unsloth", "antigravity"] {
-            let v = provider_test_prompt(provider, None, &paths, None)
+            let v = provider_test_prompt(None, provider, None, &paths, None)
                 .await
                 .unwrap();
             assert_eq!(v["ok"], false);
@@ -286,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_provider_is_an_error() {
         let paths: HashMap<String, String> = HashMap::new();
-        let err = provider_test_prompt("not-a-provider", None, &paths, None)
+        let err = provider_test_prompt(None, "not-a-provider", None, &paths, None)
             .await
             .unwrap_err();
         assert!(err.contains("Unknown providerId"), "{err}");

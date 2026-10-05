@@ -3,6 +3,8 @@
 //! FE-parity payload and publishes a `line-attribution:updated` event whose
 //! `data.attributions` matches what `line-attribution.load` then returns.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;
@@ -18,23 +20,16 @@ use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 impl TempDb {
     fn new() -> Self {
-        Self {
-            path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
-        }
-    }
-}
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = common::test_tempdir("intentd-uds-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -124,7 +119,7 @@ fn boot(
             .with_event_bus(bus.clone()),
     );
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -137,7 +132,7 @@ fn boot(
     (socket, server, shutdown_tx, ws_root, sock_dir)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn line_attribution_compute_now_persists_and_emits_event() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");

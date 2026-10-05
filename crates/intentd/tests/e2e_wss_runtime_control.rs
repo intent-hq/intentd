@@ -7,9 +7,16 @@
 
 mod common;
 
+#[path = "e2e_wss_runtime_control/independent_installations.rs"]
+mod independent_installations;
+
+#[path = "e2e_wss_runtime_control/port_lease.rs"]
+mod port_lease;
+
+use intentd_test_support::GuardedChild;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +32,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -39,7 +45,7 @@ fn free_port() -> u16 {
 }
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
     /// If false, skip `data_dir` cleanup in Drop (for tests that reuse the same `data_dir`)
     cleanup_data_dir: bool,
@@ -47,23 +53,17 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
         if self.cleanup_data_dir {
             let log_path = self.data_dir.join("daemon.log");
             if let Ok(log) = std::fs::read_to_string(&log_path) {
                 eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
-            let _ = std::fs::remove_dir_all(&self.data_dir);
         }
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-runtime-ctrl-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-runtime-ctrl-")
 }
 
 /// Shared `serve` setup: hermetic dirs, log redirection, env. Used by the
@@ -92,11 +92,20 @@ fn configure_serve(cmd: &mut Command, data_dir: &Path, listen: &str, env: &[(&st
     }
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve");
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
+    let mut cmd = common::serve_command();
     configure_serve(&mut cmd, data_dir, listen, env);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
+}
+
+/// [`spawn_serve`] without the `INTENTD_TCP_PORT=0` seam: the listener binds
+/// the seeded/settings `server.wsApi.port`, for tests whose assertion IS that
+/// port (a same-port listener restart, a batch's explicit port).
+fn spawn_serve_fixed_port(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
+    let mut cmd = common::serve_command_fixed_port();
+    cmd.env_remove("INTENTD_TCP_PORT");
+    configure_serve(&mut cmd, data_dir, listen, env);
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 /// Spawn `intentd serve` as the CHILD of a stand-in sitter: `sitter_bin` (a
@@ -113,7 +122,7 @@ fn spawn_serve_under_stand_in_sitter(
     env: &[(&str, &str)],
     sitter_bin: &Path,
     daemon_pid_path: &Path,
-) -> Child {
+) -> GuardedChild {
     let mut cmd = Command::new(sitter_bin);
     cmd.arg("-c")
         .arg(r#""$1" serve & echo "$!" > "$2"; wait"#)
@@ -124,14 +133,65 @@ fn spawn_serve_under_stand_in_sitter(
     spawn_retrying_etxtbsy(&mut cmd, "stand-in sitter wrapper")
 }
 
+/// Builder contract: `common::serve_command` spawns the `intentd` bin's
+/// `serve` subcommand with the `INTENTD_TCP_PORT=0` ephemeral-port seam
+/// baked in; `serve_command_fixed_port` omits the seam; a later `.env` on
+/// the same `Command` overrides the seam, so deliberate pins keep working.
+#[test]
+fn serve_command_builders_own_the_tcp_port_seam() {
+    use std::ffi::OsStr;
+
+    fn tcp_port_env(cmd: &Command) -> Option<String> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == OsStr::new("INTENTD_TCP_PORT"))
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    let cmd = common::serve_command();
+    assert_eq!(cmd.get_program(), OsStr::new(env!("CARGO_BIN_EXE_intentd")));
+    assert_eq!(
+        cmd.get_args().collect::<Vec<_>>(),
+        vec![OsStr::new("serve")],
+        "serve_command adds exactly the `serve` subcommand"
+    );
+    assert_eq!(
+        tcp_port_env(&cmd),
+        Some("0".to_string()),
+        "serve_command carries the INTENTD_TCP_PORT=0 seam"
+    );
+
+    let fixed = common::serve_command_fixed_port();
+    assert_eq!(
+        fixed.get_program(),
+        OsStr::new(env!("CARGO_BIN_EXE_intentd"))
+    );
+    assert_eq!(
+        fixed.get_args().collect::<Vec<_>>(),
+        vec![OsStr::new("serve")]
+    );
+    assert_eq!(
+        tcp_port_env(&fixed),
+        None,
+        "serve_command_fixed_port sets no INTENTD_TCP_PORT"
+    );
+
+    let mut pinned = common::serve_command();
+    pinned.env("INTENTD_TCP_PORT", "7000");
+    assert_eq!(
+        tcp_port_env(&pinned),
+        Some("7000".to_string()),
+        "a later .env overrides the builder's seam"
+    );
+}
+
 /// `spawn` with a bounded retry on ETXTBSY: a concurrently forked test
 /// child can transiently inherit a just-written copy's write fd (it is
 /// closed only at that child's own exec), making exec of the fresh copy
 /// fail with "Text file busy". Only needed for the COPIED sitter/decoy
 /// binaries (intent-hq/monorepo#4220).
-fn spawn_retrying_etxtbsy(cmd: &mut Command, what: &str) -> Child {
+fn spawn_retrying_etxtbsy(cmd: &mut Command, what: &str) -> GuardedChild {
     for _ in 0..400 {
-        match cmd.spawn() {
+        match GuardedChild::spawn(cmd) {
             Ok(child) => return child,
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
                 std::thread::sleep(Duration::from_millis(5));
@@ -178,15 +238,29 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     write_half.write_all(line.as_bytes()).await.unwrap();
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(
-        common::test_timeout(Duration::from_secs(30)),
-        reader.read_line(&mut buf),
-    )
+    timeout(common::test_timeout(Duration::from_secs(30)), async {
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            assert!(
+                reader.read_line(&mut buf).await.expect("read uds frame") > 0,
+                "UDS closed before the original RPC response"
+            );
+            let frame: Value = serde_json::from_str(buf.trim_end()).expect("invalid JSON frame");
+            if frame["id"] == json!(id) {
+                return frame;
+            }
+            // Retirement notifications may precede a shutdown reply on this
+            // same connection; a notification is not the request's result.
+            assert!(
+                common::is_repository_retirement_notification(&frame),
+                "unexpected UDS response: {frame}"
+            );
+            eprintln!("UDS RPC {id}: original notification {}", frame["method"]);
+        }
+    })
     .await
     .expect("uds rpc timed out")
-    .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
 /// Poll until new TCP connections to `port` are refused — the listener socket
@@ -328,8 +402,9 @@ where
 /// → verify RPCs work → disable over UDS → verify listener stops and new connections fail.
 #[tokio::test]
 async fn runtime_ws_listener_toggle_over_wss() {
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     // Start daemon with both UDS and TCP (server.wsApi.enabled seeded in config.toml)
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -444,9 +519,10 @@ async fn runtime_ws_listener_toggle_over_wss() {
 /// setting was ignored at boot and the listener stayed down until manual toggle.
 #[tokio::test]
 // Port numbers are far below 2^53: loss-free in f64.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let port_s = free_port().to_string();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
 
@@ -643,12 +719,13 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
 /// listener starts on the NEW port.
 #[tokio::test]
 async fn batch_hook_ordering_port_before_enable() {
-    let data_dir = temp_data_dir();
-    // No INTENTD_TCP_PORT: the env-0 ephemeral seam would override the batch's
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    // Fixed port: the env-0 ephemeral seam would override the batch's
     // explicit port and the bound port is exactly what proves hook ordering.
     // Boot UDS-only (no wsApi seed) so the batch below exercises a cold start.
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
-    let child = spawn_serve(&data_dir, "uds", &env);
+    let child = spawn_serve_fixed_port(&data_dir, "uds", &env);
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -715,8 +792,9 @@ async fn batch_hook_ordering_port_before_enable() {
 async fn wss_system_status_includes_capacity_version_uptime() {
     // system.status over WSS reports maxAgents, version, uptimeSeconds alongside
     // existing fields (additive change for FE health menu).
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let _daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
         data_dir: data_dir.clone(),
@@ -758,6 +836,16 @@ async fn wss_system_status_includes_capacity_version_uptime() {
     // Supervision probe (intent-hq/intent#3875): always present, and false
     // here — the daemon was spawned by the test harness, not a sitter.
     assert_eq!(r["updateSupported"], false, "updateSupported: {r}");
+    // Idle-update handshake visibility over the real WSS wire: no turn in
+    // flight, no sitter advertised the handshake — the object is present
+    // with `supported` false and the timestamps explicitly null.
+    assert_eq!(r["busyAgents"], 0, "busyAgents: {r}");
+    let idle = &r["idleUpdateCheck"];
+    assert!(idle["enabled"].is_boolean(), "idleUpdateCheck.enabled: {r}");
+    assert_eq!(idle["supported"], false, "idleUpdateCheck.supported: {r}");
+    assert_eq!(idle["restartPending"], false, "restartPending: {r}");
+    assert!(idle["lastRequestedAt"].is_null(), "lastRequestedAt: {r}");
+    assert!(idle["nextEligibleAt"].is_null(), "nextEligibleAt: {r}");
     // Descriptor gauge (intent-hq/intent#4390) over the real WSS wire: the
     // startup sample lands before the listeners bind, so both fields are live
     // on Linux/macOS, and a running daemon can never hold zero descriptors or
@@ -871,7 +959,8 @@ async fn wss_system_status_includes_capacity_version_uptime() {
 async fn wss_system_request_update_signals_the_sitter() {
     use std::os::unix::process::ExitStatusExt;
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let sitter_dir = data_dir.join("sitter");
     std::fs::create_dir_all(&sitter_dir).expect("mkdir sitter dir");
     let sitter_bin = sitter_dir.join("intentd-sitter");
@@ -884,6 +973,8 @@ async fn wss_system_request_update_signals_the_sitter() {
     std::fs::copy("/bin/sh", &sitter_bin).expect("copy stand-in sitter shell");
     let daemon_pid_path = sitter_dir.join("daemon.pid");
 
+    // The wrapper shell, not the `intentd` bin, is the spawned program, so
+    // `common::serve_command` cannot build it: carry its seam explicitly.
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let mut daemon = Daemon {
         child: spawn_serve_under_stand_in_sitter(
@@ -995,13 +1086,14 @@ async fn wss_system_status_reports_budget_fields_when_installed() {
     // agentMemoryChargedBytes once the descendant-tree sampler has landed a
     // sample (absent before — the budget is inert until then), and
     // queuedSpawns (0 with nothing queued).
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     std::fs::write(
         data_dir.join("config.toml"),
         "[agents]\nmemoryBudgetMb = 20480\n",
     )
     .expect("seed config.toml with agents.memoryBudgetMb");
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let _daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
         data_dir: data_dir.clone(),
@@ -1056,11 +1148,13 @@ async fn runtime_toggled_wss_serves_system_status() {
     // Daemon starts UDS-only, then toggles WSS on at runtime via
     // settings.update. Verify system.status works over the runtime-started
     // WSS listener (tests OnceLock control population, §5.7).
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
-    // Start daemon with ONLY UDS (no wsApi config seed)
+    // Start daemon with ONLY UDS (no wsApi config seed); fixed port so the
+    // runtime toggle binds exactly the port the settings.update names.
     let _daemon = Daemon {
-        child: spawn_serve(&data_dir, "uds", &env),
+        child: spawn_serve_fixed_port(&data_dir, "uds", &env),
         data_dir: data_dir.clone(),
         cleanup_data_dir: true,
     };
@@ -1136,7 +1230,16 @@ async fn runtime_toggled_wss_serves_system_status() {
     // which would let a bundle read a count without a byte total. Asserting
     // the pair rather than a concrete value keeps this deterministic: the
     // first tick fires at startup but a fast test can still beat it.
-    for field in ["childProcesses", "childMemoryBytes", "childMemoryPeakBytes"] {
+    // The agent-attributed share (§5.5 `agentMemoryBytes` /
+    // `agentProcessCount`) rides the same sample and follows the same
+    // all-null-or-all-present contract.
+    for field in [
+        "childProcesses",
+        "childMemoryBytes",
+        "childMemoryPeakBytes",
+        "agentMemoryBytes",
+        "agentProcessCount",
+    ] {
         assert!(
             r.get(field).is_some(),
             "{field} must ride the WSS status result: {r}"
@@ -1146,10 +1249,12 @@ async fn runtime_toggled_wss_serves_system_status() {
         &r["childProcesses"],
         &r["childMemoryBytes"],
         &r["childMemoryPeakBytes"],
+        &r["agentMemoryBytes"],
+        &r["agentProcessCount"],
     ];
     let nulls = sampled.iter().filter(|v| v.is_null()).count();
     assert!(
-        nulls == 0 || nulls == 3,
+        nulls == 0 || nulls == 5,
         "descendant-tree fields must be all-null or all-present, got {nulls} nulls: {r}"
     );
     if nulls == 0 {
@@ -1165,6 +1270,48 @@ async fn runtime_toggled_wss_serves_system_status() {
             peak >= bytes,
             "peak {peak} must be >= instantaneous {bytes}"
         );
+        // No agent was spawned: the attributed share is zero, and it can
+        // never exceed the aggregate it is carved out of.
+        let agent_bytes = r["agentMemoryBytes"]
+            .as_u64()
+            .expect("agentMemoryBytes when sampled");
+        assert!(
+            agent_bytes <= bytes,
+            "agentMemoryBytes {agent_bytes} must be <= childMemoryBytes {bytes}"
+        );
+        assert_eq!(r["agentProcessCount"], 0, "no spawned agents: {r}");
+        assert_eq!(agent_bytes, 0, "no spawned agents: {r}");
+    }
+
+    // `agent.memoryUsage` (§5.5) over the same connection: daemon-wide, no
+    // `workspaceId`. The result envelope always carries the three keys;
+    // before the sampler's first tick `sampledAt` / `totalBytes` are null,
+    // afterwards `sampledAt` is an RFC-3339 stamp and `totalBytes` a u64 —
+    // and with no spawned agent the list is empty either way.
+    let resp = wss_rpc(&mut ws, 5, "agent.memoryUsage", json!({})).await;
+    assert_eq!(resp["id"], 5);
+    assert_eq!(resp["jsonrpc"], "2.0");
+    let r = &resp["result"];
+    assert!(
+        resp.get("error").is_none(),
+        "agent.memoryUsage must succeed: {resp}"
+    );
+    let obj = r.as_object().expect("agent.memoryUsage result object");
+    for key in ["sampledAt", "totalBytes", "agents"] {
+        assert!(obj.contains_key(key), "{key} must be present: {r}");
+    }
+    assert_eq!(r["agents"], json!([]), "no spawned agents: {r}");
+    if r["sampledAt"].is_null() {
+        assert!(
+            r["totalBytes"].is_null(),
+            "unsampled ⇒ totalBytes null: {r}"
+        );
+    } else {
+        assert!(
+            r["sampledAt"].as_str().is_some_and(|s| s.contains('T')),
+            "sampledAt is an RFC-3339 stamp: {r}"
+        );
+        assert_eq!(r["totalBytes"], 0, "no spawned agents: {r}");
     }
 }
 
@@ -1178,11 +1325,12 @@ async fn runtime_toggled_wss_serves_system_status() {
 /// without a tunnel) while serving loopback-free hosts for 0.0.0.0.
 #[tokio::test]
 async fn runtime_bind_address_change_restarts_listener() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Fixed seeded port (no INTENTD_TCP_PORT=0 seam) so the restarted
     // listener rebinds the same port and only the address changes.
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
-    let child = spawn_serve(&data_dir, "both", &env);
+    let child = spawn_serve_fixed_port(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -1351,9 +1499,11 @@ async fn runtime_bind_address_list_applies_and_validates() {
         eprintln!("skipping: IPv6 loopback unavailable");
         return;
     }
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    // Fixed seeded port: the list-form restart must rebind the same port.
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
-    let child = spawn_serve(&data_dir, "both", &env);
+    let child = spawn_serve_fixed_port(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -1478,7 +1628,8 @@ async fn runtime_bind_address_list_applies_and_validates() {
 /// makes pairing succeed here).
 #[tokio::test]
 async fn tunnel_only_advertises_loopback_only() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Seed a wide bindAddress alongside tunnel-only BEFORE boot, so the test
     // proves the loopback override wins on the advertised surfaces.
     // configure_serve appends [server.wsApi] after these tables.
@@ -1552,7 +1703,7 @@ case "$1" in
     ;;
   serve)
     printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
-    sleep 600
+    exec sleep 600
     ;;
 esac
 "#;
@@ -1570,12 +1721,12 @@ esac
 /// fires for a WSS caller and rolls the setting back.
 #[tokio::test]
 async fn tunnel_settings_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let tailcat = write_fake_tailcat(&data_dir);
     let tailcat_s = tailcat.to_string_lossy().to_string();
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_TAILCAT_BIN", &tailcat_s),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -1690,4 +1841,335 @@ async fn tunnel_settings_over_wss() {
         disable.get("error").is_none(),
         "settings.update server.tunnel.enabled=false over WSS should succeed: {disable}"
     );
+}
+
+/// Exact update control over authenticated, fingerprint-pinned WSS. A staged
+/// release fixture avoids any public network access; updater HTTP tests exercise
+/// archive download and verification separately.
+#[tokio::test]
+async fn wss_exact_update_validates_reports_failure_and_restarts_without_channel_check() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
+    let dir = temp_data_dir();
+    let data_dir = dir.path().to_path_buf();
+    let sitter_dir = data_dir.join("sitter");
+    std::fs::create_dir_all(&sitter_dir).unwrap();
+    let sitter_bin = sitter_dir.join("intentd-sitter");
+    std::fs::copy("/bin/sh", &sitter_bin).unwrap();
+    let daemon_pid_path = sitter_dir.join("daemon.pid");
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("INTENTD_SITTER_EXACT_UPDATE", "1"),
+    ];
+    let mut daemon = Daemon {
+        child: spawn_serve_under_stand_in_sitter(
+            &data_dir,
+            "both",
+            &env,
+            &sitter_bin,
+            &daemon_pid_path,
+        ),
+        data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let daemon_pid = std::fs::read_to_string(&daemon_pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _kill_daemon = KillPidOnDrop(daemon_pid);
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut ws = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let unsupported = wss_rpc(&mut ws, 80, "system.status", json!({})).await;
+    assert_eq!(unsupported["result"]["exactUpdateSupported"], false);
+    let unsupported = wss_rpc(
+        &mut ws,
+        81,
+        "system.requestUpdate",
+        json!({"targetVersion":"99.0.0"}),
+    )
+    .await;
+    assert_eq!(unsupported["error"]["code"], -32603);
+    std::fs::write(
+        sitter_dir.join("sitter.pid"),
+        format!("{}\n", daemon.child.id()),
+    )
+    .unwrap();
+    let supported = wss_rpc(&mut ws, 82, "system.status", json!({})).await;
+    assert_eq!(supported["result"]["exactUpdateSupported"], true);
+    let child_env = wss_rpc(&mut ws, 88, "host.exec", json!({
+        "command":"/bin/sh", "args":["-c", "printf '%s' \"${INTENTD_SITTER_EXACT_UPDATE-unset}\""], "timeoutMs":5000
+    })).await;
+    assert_eq!(
+        child_env["result"]["stdout"], "unset",
+        "handshake must not leak to children: {child_env}"
+    );
+
+    for params in [
+        json!({"targetVersion":"../escape"}),
+        json!({"targetVersion":null}),
+        json!({"targetVersion":"99.0.0+build"}),
+        json!({"targetVersion":"99.0.0", "url":"https://attacker/asset"}),
+    ] {
+        let r = wss_rpc(&mut ws, 83, "system.requestUpdate", params).await;
+        assert_eq!(r["jsonrpc"], "2.0");
+        assert_eq!(r["id"], 83);
+        assert_eq!(r["error"]["code"], -32602, "{r}");
+    }
+    for target in ["0.0.1", env!("CARGO_PKG_VERSION")] {
+        let r = wss_rpc(
+            &mut ws,
+            84,
+            "system.requestUpdate",
+            json!({"targetVersion":target}),
+        )
+        .await;
+        assert_eq!(r["error"]["code"], -32603, "{r}");
+    }
+    let paths = intentd_sitter::paths::SitterPaths::from_data_dir(&data_dir);
+    let mut installed = intentd_sitter::state::SitterState {
+        current_version: Some("99.0.0".into()),
+        ..Default::default()
+    };
+    intentd_sitter::state::save(&paths.state_path, &installed).unwrap();
+    let r = wss_rpc(
+        &mut ws,
+        85,
+        "system.requestUpdate",
+        json!({"targetVersion":"98.0.0"}),
+    )
+    .await;
+    assert_eq!(
+        r,
+        json!({"jsonrpc":"2.0", "id":85, "result":{"ok":true,"targetVersion":"98.0.0"}})
+    );
+    let failed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let r = wss_rpc(&mut ws, 86, "system.status", json!({})).await;
+            if r["result"]["targetUpdate"]["state"] == "failed" {
+                break r;
+            }
+            // timing-guard: bounded polling of observable update state / sitter exit.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(failed["result"]["targetUpdate"]["targetVersion"], "98.0.0");
+    assert!(failed["result"]["targetUpdate"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("newer version"));
+    assert!(
+        daemon.child.try_wait().unwrap().is_none(),
+        "failed update must not signal sitter"
+    );
+    installed.current_version = Some("100.0.0".into());
+    intentd_sitter::state::save(&paths.state_path, &installed).unwrap();
+    let binary = paths.daemon_binary("100.0.0");
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    // An already-staged modern release includes its required sidecar payload.
+    // Otherwise an exact update correctly attempts to repair the installation.
+    let libexec = binary.parent().unwrap().join("libexec");
+    std::fs::create_dir_all(&libexec).unwrap();
+    std::fs::write(libexec.join("tailcat"), b"sidecar fixture").unwrap();
+    std::fs::set_permissions(
+        libexec.join("tailcat"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(libexec.join("tailcat.LICENSE"), b"license fixture").unwrap();
+    std::fs::write(binary, b"already verified/staged release fixture").unwrap();
+    let r = wss_rpc(
+        &mut ws,
+        87,
+        "system.requestUpdate",
+        json!({"targetVersion":"100.0.0"}),
+    )
+    .await;
+    assert_eq!(
+        r,
+        json!({"jsonrpc":"2.0", "id":87, "result":{"ok":true,"targetVersion":"100.0.0"}})
+    );
+    let exit = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(exit) = daemon.child.try_wait().unwrap() {
+                break exit;
+            }
+            // timing-guard: bounded polling of observable update state / sitter exit.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        exit.signal(),
+        Some(libc::SIGHUP),
+        "exact install must only restart, never SIGUSR1 channel check"
+    );
+}
+
+/// Enabled secure WSS is a startup requirement, including an explicit first-boot port.
+#[test]
+fn occupied_fixed_wss_port_fails_daemon_boot() {
+    let dir = temp_data_dir();
+    let hog = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = hog.local_addr().unwrap().port();
+    let config = format!("[server.wsApi]\nenabled = true\nport = {port}\n");
+    std::fs::write(dir.path().join("config.toml"), &config).unwrap();
+    let mut child = spawn_serve_fixed_port(dir.path(), "uds", &[("INTENTD_AUTH_TOKEN", TOKEN)]);
+    let exit = child.wait_with_timeout(Duration::from_secs(30)).unwrap();
+    let log = std::fs::read_to_string(dir.path().join("daemon.log")).unwrap();
+    assert!(
+        exit.is_some(),
+        "occupied fixed WSS must exit, not serve UDS: {log}"
+    );
+    assert!(
+        !exit.unwrap().success(),
+        "secure bind failure must exit nonzero: {log}"
+    );
+    assert!(
+        log.contains("Address already in use"),
+        "actionable bind error: {log}"
+    );
+    assert!(
+        log.contains("phase=\"store_close\" state=\"completed\""),
+        "store cleanup completes: {log}"
+    );
+    assert!(
+        !dir.path().join("intentd.pid").exists(),
+        "failed boot removes pidfile"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+        config
+    );
+    assert!(
+        !dir.path().join("intentd.sock").exists(),
+        "no local readiness after failed boot"
+    );
+}
+
+#[tokio::test]
+async fn first_enable_publishes_assignment_and_fixed_failure_keeps_daemon_alive() {
+    first_enable_scenario(false).await;
+}
+
+#[tokio::test]
+async fn first_enable_port_lease_blocks_competing_fixture_until_recovery() {
+    first_enable_scenario(true).await;
+}
+
+async fn first_enable_scenario(with_contender: bool) {
+    let lease = port_lease::acquire();
+    let dir = temp_data_dir();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "[server.wsApi]\nenabled = false\n",
+    )
+    .unwrap();
+    let mut daemon = spawn_serve_fixed_port(dir.path(), "uds", &[("INTENTD_AUTH_TOKEN", TOKEN)]);
+    let socket = dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let before = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(
+        !before.contains("port ="),
+        "disabled boot must not allocate"
+    );
+    let enabled = uds_rpc(
+        &socket,
+        1,
+        "settings.update",
+        json!({"changes":[{"path":"server.wsApi.enabled","value":true}]}),
+    )
+    .await;
+    assert!(enabled.get("error").is_none(), "{enabled}");
+    let status = uds_rpc(&socket, 2, "system.status", json!({})).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    assert!(port >= 5181);
+    let assigned = enabled["result"]["applied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["path"] == "server.wsApi.port")
+        .expect("enable publishes implicit assignment");
+    assert_eq!(assigned["value"].as_f64(), Some(f64::from(port)));
+    assert_eq!(assigned["origin"], "file");
+    let mut client = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let setting = wss_rpc(
+        &mut client,
+        3,
+        "settings.get",
+        json!({"path":"server.wsApi.port"}),
+    )
+    .await;
+    assert_eq!(setting["result"]["value"].as_f64(), Some(f64::from(port)));
+    assert_eq!(setting["result"]["revision"], enabled["result"]["revision"]);
+    drop(client);
+    let disabled = uds_rpc(
+        &socket,
+        4,
+        "settings.update",
+        json!({"changes":[{"path":"server.wsApi.enabled","value":false}]}),
+    )
+    .await;
+    assert!(disabled.get("error").is_none(), "{disabled}");
+    await_tcp_refused(port).await;
+    let saved = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    let hog = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let failed = uds_rpc(
+        &socket,
+        5,
+        "settings.update",
+        json!({"changes":[{"path":"server.wsApi.enabled","value":true}]}),
+    )
+    .await;
+    assert!(
+        failed["error"]["data"]
+            .as_str()
+            .unwrap()
+            .contains("Address already in use"),
+        "{failed}"
+    );
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "runtime failure must not exit daemon"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+        saved
+    );
+    drop(hog);
+    let contender = if with_contender {
+        Some(port_lease::Contender::start(port).await)
+    } else {
+        None
+    };
+    let retried = uds_rpc(
+        &socket,
+        6,
+        "settings.update",
+        json!({"changes":[{"path":"server.wsApi.enabled","value":true}]}),
+    )
+    .await;
+    assert!(retried.get("error").is_none(), "{retried}");
+    let status = uds_rpc(&socket, 7, "system.status", json!({})).await;
+    assert_eq!(status["result"]["port"], port);
+    if let Some(contender) = contender {
+        drop(daemon);
+        drop(lease);
+        contender.finish(port).await;
+    }
 }

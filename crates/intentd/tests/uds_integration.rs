@@ -1,6 +1,8 @@
 //! End-to-end UDS slice test: seed via the store, then drive the daemon as a
 //! JSON-RPC client over a temp Unix-domain socket (§5.7 `DoD`).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::Path;
@@ -34,6 +36,7 @@ fn seed_workspace(id: &WorkspaceId) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts.clone(),
         last_activity: None,
+        last_content_activity: None,
         tags: vec!["seed".to_string()],
         path: None,
         repository_path: None,
@@ -59,11 +62,13 @@ fn seed_workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -119,13 +124,12 @@ async fn send_session(socket: &Path, frames: &[&str]) -> Vec<Value> {
     out
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_slice_end_to_end() {
     // Use a short base path: macOS caps UDS paths at ~104 bytes (SUN_LEN) and
     // `temp_dir()` resolves to a long `/var/folders/...` path.
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = Path::new("/tmp").join(format!("intentd-it-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir_in("/tmp", "intentd-it-");
+    let dir = dir_guard.path().to_path_buf();
     std::env::set_var("INTENTD_DATA_DIR", &dir);
     let config = Config::resolve().expect("resolve config");
 
@@ -151,11 +155,18 @@ async fn uds_slice_end_to_end() {
             // Keep the (y) github.* section hermetic: `github.connect` must
             // deterministically fail fast (port 0 is never a valid
             // destination), never touch the real github.com.
-            .with_github_login_base_uri("http://127.0.0.1:0"),
+            .with_github_login_base_uri("http://127.0.0.1:0")
+            // Same for the boot-time primary-identity refresh: the in-process
+            // daemon still resolves the HOST's `gh auth token`, and a live
+            // `GET /user` would hydrate the developer's login onto the primary
+            // principal — racing the (j) `authorType == "agent"` assertion on a
+            // gh-authenticated machine (intent-hq/intent#5650). An unroutable
+            // API base fails the read fast and keeps the identity anonymous.
+            .with_github_api_base_uri("http://127.0.0.1:0"),
     );
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
-    let server = tokio::spawn(async move {
+    let server = intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &socket, None, async move {
             let _ = rx.await;
         })
@@ -181,7 +192,26 @@ async fn uds_slice_end_to_end() {
     let wss = resp["result"]["workspaces"]
         .as_array()
         .expect("workspaces array");
-    assert!(wss.iter().any(|w| w["id"] == json!("ws-seed")));
+    let seeded = wss
+        .iter()
+        .find(|w| w["id"] == json!("ws-seed"))
+        .expect("seeded workspace listed");
+    // Multiplayer w1: a UDS connection IS the primary user, so the row's
+    // membership summary is relative to the owner.
+    assert_eq!(seeded["myRole"], json!("owner"));
+    assert_eq!(seeded["memberCount"], json!(1));
+    assert_eq!(seeded["openInviteCount"], json!(0));
+    assert!(seeded["ownerPrincipalId"].is_string());
+
+    // (a') principal.me over UDS: the primary principal, administrator.
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":1,"method":"principal.me"}"#,
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "principal.me: {resp}");
+    assert_eq!(resp["result"]["id"], seeded["ownerPrincipalId"]);
+    assert_eq!(resp["result"]["isAdministrator"], json!(true));
 
     // (b) note.list with the seeded workspaceId
     let resp = send(
@@ -1012,5 +1042,4 @@ async fn uds_slice_end_to_end() {
 
     let _ = tx.send(());
     let _ = server.await;
-    let _ = std::fs::remove_dir_all(&dir);
 }

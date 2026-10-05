@@ -12,7 +12,10 @@
 //! 4. the one-time boot migration of the deprecated `providers.active`
 //!    rewrites config.toml (key removed, value carried into
 //!    `model.defaultProvider`, comments preserved) and a restart from the
-//!    migrated file never rewrites it again.
+//!    migrated file never rewrites it again;
+//! 5. unsupported newer-client batches and failed file writes preserve
+//!    values, revision, bytes and events; subsequent update/reset writes
+//!    survive a real daemon restart without leaking rejected changes.
 //!
 //! Adjacent coverage lives elsewhere and is intentionally not duplicated:
 //! startup refusal on malformed config + flag-pin precedence in
@@ -25,7 +28,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,7 +43,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -65,15 +67,11 @@ impl Drop for Daemon {
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-livereload-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-livereload-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -83,7 +81,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    let mut cmd = common::serve_command();
     // Guarantee the config-watcher readiness marker (INFO, target `intentd`)
     // reaches daemon.log even when the caller's RUST_LOG is stricter (e.g.
     // `warn`): append a crate-scoped directive, which EnvFilter resolves in
@@ -93,8 +91,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         Ok(v) if !v.is_empty() => format!("{v},intentd=info"),
         _ => "info".to_string(),
     };
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("RUST_LOG", rust_log)
@@ -315,11 +312,55 @@ async fn await_config_watcher_ready(data_dir: &Path) {
     }
 }
 
+/// The readiness marker `await_config_watcher_ready` gates on must mean the
+/// directory watch is actually live, not merely requested: the registration
+/// runs on the hub's registrar thread after `ConfigWatcher::start` returns
+/// (intent-hq/intent#4953), so a marker logged straight after `start` would
+/// let a test hand-edit config.toml before the watch exists. Under the
+/// watcher-creation-failure seam every registration settles as failed, so
+/// the daemon must report `failed to start` and never `ready`.
+#[tokio::test]
+async fn config_watcher_readiness_marker_waits_for_a_live_watch() {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
+        child: spawn_serve(
+            &data_dir,
+            "uds",
+            &[("INTENTD_TEST_FAIL_WATCHER_CREATION", "1")],
+        ),
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let log_path = data_dir.join("daemon.log");
+    let deadline = tokio::time::Instant::now() + LIVENESS;
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            !log.contains("config.toml live-reload watcher ready"),
+            "readiness must not be reported while the config directory watch is not live\n\
+             --- daemon log ---\n{log}"
+        );
+        if log.contains("config.toml live-reload watcher failed to start") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the daemon never reported the config watcher failing to start within {LIVENESS:?}\n\
+             --- daemon log ---\n{log}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    drop(daemon);
+}
+
 /// Boot with the WSS listener enabled, discover the WSS port + fingerprint via
 /// `system.status` over UDS, and return (daemon, rpc conn, subscriber conn)
 /// with the subscriber already subscribed to `settings:changed`.
 async fn boot_with_wss(data_dir: &Path) -> (Daemon, Wss, Wss) {
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(data_dir, "both", &env);
     let daemon = Daemon {
         child,
@@ -363,13 +404,297 @@ async fn boot_with_wss(data_dir: &Path) -> (Daemon, Wss, Wss) {
     (daemon, rpc, sub)
 }
 
+/// Capture complete read results, including origins and revisions, so a
+/// rejected request cannot silently change anything clients observe.
+async fn settings_snapshot(rpc: &mut Wss, paths: &[&str]) -> Vec<Value> {
+    let mut settings = Vec::new();
+    for path in paths {
+        let get = wss_rpc(rpc, 100, "settings.get", json!({ "path": path })).await;
+        assert_eq!(get["jsonrpc"], json!("2.0"), "{get}");
+        assert_eq!(get["id"], json!(100), "{get}");
+        assert!(get.get("error").is_none(), "{get}");
+        assert_eq!(get["result"]["path"], json!(path), "{get}");
+        settings.push(get["result"].clone());
+    }
+    settings
+}
+
+async fn assert_settings_change(sub: &mut Wss, changes: &Value, revision: u64) {
+    let event = next_settings_event(sub).await;
+    assert_eq!(event["jsonrpc"], json!("2.0"), "{event}");
+    assert_eq!(event["params"]["event"]["data"]["changes"], *changes);
+    assert_eq!(
+        event["params"]["event"]["data"]["revision"],
+        json!(revision)
+    );
+}
+
+/// A newer client may send a path or enum this daemon does not know. The
+/// whole batch must reject before writes/events, then supported update/reset
+/// requests must still persist a startup-compatible file (intent#5909).
+#[tokio::test]
+async fn newer_client_settings_batches_reject_atomically_and_restart() {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path();
+    let config_path = data_dir.join("config.toml");
+    let comment = "# Operator comment survives validation and reset.";
+    std::fs::write(
+        &config_path,
+        format!("{comment}\n[git]\nautoCommit = true\n[workspace]\nbranchPrefix = \"seed/\"\n"),
+    )
+    .expect("seed config.toml");
+
+    let (daemon, mut rpc, mut sub) = boot_with_wss(data_dir).await;
+    await_config_watcher_ready(data_dir).await;
+    let paths = [
+        "git.autoCommit",
+        "workspace.branchPrefix",
+        "agents.resumeInterruptedOnStart",
+        "quickActions.providerSettings",
+    ];
+    let before = settings_snapshot(&mut rpc, &paths).await;
+    let revision = before[0]["revision"].as_u64().expect("initial revision");
+    let original = std::fs::read(&config_path).expect("read seeded config");
+
+    for (path, value) in [
+        ("future.setting", json!(true)),
+        ("agents.resumeInterruptedOnStart", json!("future-policy")),
+        // Object-shaped at the wire catalog, but invalid for the daemon's
+        // typed config: provider option values must be strings.
+        (
+            "quickActions.providerSettings",
+            json!({ "future-provider": { "option": null } }),
+        ),
+    ] {
+        let rejected = wss_rpc(
+            &mut rpc,
+            10,
+            "settings.update",
+            json!({ "changes": [
+                { "path": "git.autoCommit", "value": false },
+                { "path": "workspace.branchPrefix", "value": "rejected/" },
+                { "path": path, "value": value }
+            ] }),
+        )
+        .await;
+        assert_eq!(rejected["jsonrpc"], json!("2.0"), "{rejected}");
+        assert_eq!(rejected["id"], json!(10), "{rejected}");
+        assert!(rejected.get("result").is_none(), "{rejected}");
+        assert_eq!(rejected["error"]["code"], json!(-32602), "{rejected}");
+        assert!(
+            rejected["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(path),
+            "error must identify {path}: {rejected}"
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), original);
+        assert_eq!(settings_snapshot(&mut rpc, &paths).await, before);
+        assert_no_settings_event(&mut sub, 3).await;
+    }
+
+    let update = wss_rpc(
+        &mut rpc,
+        11,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "git.autoCommit", "value": false },
+            { "path": "workspace.branchPrefix", "value": "accepted/" }
+        ] }),
+    )
+    .await;
+    let applied = json!([
+        { "path": "git.autoCommit", "value": false, "origin": "file" },
+        { "path": "workspace.branchPrefix", "value": "accepted/", "origin": "file" }
+    ]);
+    assert_eq!(
+        update,
+        json!({ "jsonrpc": "2.0", "id": 11, "result": {
+            "applied": applied, "revision": revision + 1
+        }})
+    );
+    assert_settings_change(&mut sub, &applied, revision + 1).await;
+    let accepted = settings_snapshot(&mut rpc, &paths).await;
+    assert_eq!(accepted[0]["value"], json!(false));
+    assert_eq!(accepted[1]["value"], json!("accepted/"));
+
+    let reset = wss_rpc(
+        &mut rpc,
+        12,
+        "settings.reset",
+        json!({ "path": "git.autoCommit" }),
+    )
+    .await;
+    assert_eq!(
+        reset,
+        json!({ "jsonrpc": "2.0", "id": 12, "result": {
+            "path": "git.autoCommit", "value": true, "origin": "default", "revision": revision + 2
+        }})
+    );
+    assert_settings_change(
+        &mut sub,
+        &json!([{ "path": "git.autoCommit", "value": true, "origin": "default" }]),
+        revision + 2,
+    )
+    .await;
+    let after_reset = settings_snapshot(&mut rpc, &paths).await;
+    assert_eq!(after_reset[0]["value"], json!(true));
+    assert_eq!(after_reset[0]["origin"], json!("default"));
+    assert_eq!(after_reset[1]["value"], json!("accepted/"));
+    assert_eq!(after_reset[1]["origin"], json!("file"));
+    for (after, prior) in after_reset.iter().zip(&before).skip(2) {
+        assert_eq!(after["value"], prior["value"]);
+        assert_eq!(after["origin"], prior["origin"]);
+    }
+    assert!(after_reset
+        .iter()
+        .all(|s| s["revision"] == json!(revision + 2)));
+    let committed = std::fs::read_to_string(&config_path).unwrap();
+    intent_core::settings_file::SettingsFile::parse_str(&committed)
+        .expect("successful writes must pass the startup parser");
+    assert!(committed.contains(comment), "{committed}");
+    assert!(
+        !committed.contains("autoCommit"),
+        "reset must remove the key"
+    );
+    assert!(!committed.contains("rejected/"), "{committed}");
+    assert_no_settings_event(&mut sub, 3).await;
+
+    drop(sub);
+    drop(rpc);
+    drop(daemon);
+    // Keep the exact file and data directory: only the daemon is replaced.
+    let (_restarted, mut rpc, mut sub) = boot_with_wss(data_dir).await;
+    await_config_watcher_ready(data_dir).await;
+    let restarted = settings_snapshot(&mut rpc, &paths).await;
+    for (after, prior) in restarted.iter().zip(&after_reset) {
+        assert_eq!(after["value"], prior["value"]);
+        assert_eq!(after["origin"], prior["origin"]);
+        assert_eq!(after["revision"], json!(0), "revision is process-local");
+    }
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), committed);
+    assert_no_settings_event(&mut sub, 3).await;
+}
+
+/// A failed atomic replacement must not leave a candidate document behind
+/// for a later unrelated write to persist. Exercise both update and reset
+/// failures through the real transport, then restart on the recovered file.
+#[tokio::test]
+async fn failed_settings_writes_do_not_leak_into_later_wss_writes_or_restart() {
+    for reset in [false, true] {
+        let data_dir_guard = temp_data_dir();
+        let data_dir = data_dir_guard.path();
+        let config_path = data_dir.join("config.toml");
+        let saved_path = data_dir.join("saved-config.toml");
+        let comment = "# Preserve the last committed settings after an I/O failure.";
+        std::fs::write(
+            &config_path,
+            format!(
+                "{comment}\n[git]\nautoCommit = false\n[workspace]\nbranchPrefix = \"seed/\"\n"
+            ),
+        )
+        .unwrap();
+        let (daemon, mut rpc, mut sub) = boot_with_wss(data_dir).await;
+        await_config_watcher_ready(data_dir).await;
+        let paths = ["git.autoCommit", "model.default", "workspace.branchPrefix"];
+        let before = settings_snapshot(&mut rpc, &paths).await;
+        let revision = before[0]["revision"].as_u64().unwrap();
+        let original = std::fs::read(&config_path).unwrap();
+
+        // A directory at the target makes rename fail even as root. Keep
+        // the original bytes aside until the successful write: restoring
+        // them earlier could let the watcher repair leaked candidate state
+        // and mask this regression. Missing/unreadable files keep last-good.
+        std::fs::rename(&config_path, &saved_path).unwrap();
+        std::fs::create_dir(&config_path).unwrap();
+        let (method, params) = if reset {
+            ("settings.reset", json!({ "path": "git.autoCommit" }))
+        } else {
+            (
+                "settings.update",
+                json!({ "changes": [
+                { "path": "git.autoCommit", "value": true },
+                { "path": "model.default", "value": "rejected-model" }
+            ] }),
+            )
+        };
+        let failed = wss_rpc(&mut rpc, 10, method, params).await;
+        assert_eq!(failed["jsonrpc"], json!("2.0"), "{failed}");
+        assert_eq!(failed["id"], json!(10), "{failed}");
+        assert!(failed.get("result").is_none(), "{failed}");
+        assert_eq!(failed["error"]["code"], json!(-32603), "{failed}");
+        assert_eq!(failed["error"]["message"], json!("Internal error"));
+        assert!(
+            failed["error"]["data"]
+                .as_str()
+                .unwrap()
+                .contains("could not write config"),
+            "must reach persistence, not fail input validation: {failed}"
+        );
+        assert!(
+            config_path.is_dir(),
+            "failed write must not replace the target"
+        );
+        assert_eq!(std::fs::read_dir(&config_path).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&saved_path).unwrap(), original);
+        assert_eq!(settings_snapshot(&mut rpc, &paths).await, before);
+        assert_no_settings_event(&mut sub, 3).await;
+
+        std::fs::remove_dir(&config_path).unwrap();
+        let recovered = wss_rpc(
+            &mut rpc,
+            11,
+            "settings.update",
+            json!({ "changes": [{ "path": "workspace.branchPrefix", "value": "recovered/" }] }),
+        )
+        .await;
+        let applied =
+            json!([{ "path": "workspace.branchPrefix", "value": "recovered/", "origin": "file" }]);
+        assert_eq!(
+            recovered,
+            json!({ "jsonrpc": "2.0", "id": 11, "result": {
+                "applied": applied, "revision": revision + 1
+            }})
+        );
+        // This positive event is also a barrier for the earlier no-event assertion.
+        assert_settings_change(&mut sub, &applied, revision + 1).await;
+        let after = settings_snapshot(&mut rpc, &paths).await;
+        for (value, prior) in after.iter().zip(&before).take(2) {
+            assert_eq!(value["value"], prior["value"], "failed {method} leaked");
+            assert_eq!(value["origin"], prior["origin"], "failed {method} leaked");
+        }
+        assert_eq!(after[2]["value"], json!("recovered/"));
+        assert!(after.iter().all(|s| s["revision"] == json!(revision + 1)));
+        let committed = std::fs::read_to_string(&config_path).unwrap();
+        intent_core::settings_file::SettingsFile::parse_str(&committed)
+            .expect("recovered file must pass the startup parser");
+        assert!(committed.contains(comment), "{committed}");
+        assert!(committed.contains("autoCommit = false"), "{committed}");
+        assert!(!committed.contains("rejected-model"), "{committed}");
+        assert_eq!(std::fs::read(&saved_path).unwrap(), original);
+        assert_no_settings_event(&mut sub, 3).await;
+
+        drop(sub);
+        drop(rpc);
+        drop(daemon);
+        let (_restarted, mut rpc, _sub) = boot_with_wss(data_dir).await;
+        let restarted = settings_snapshot(&mut rpc, &paths).await;
+        for (value, prior) in restarted.iter().zip(&after) {
+            assert_eq!(value["value"], prior["value"]);
+            assert_eq!(value["origin"], prior["origin"]);
+        }
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), committed);
+    }
+}
+
 /// §5.12 scenario 1: `settings.update` over WSS rewrites config.toml on disk
 /// (atomic, comment-preserving) and emits `settings:changed` to WSS
 /// subscribers; envelope shapes match PROTOCOL §5.12 (plus the additive
 /// `origin` field on reads).
 #[tokio::test]
 async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_path = data_dir.join("config.toml");
     std::fs::write(
         &config_path,
@@ -465,7 +790,8 @@ async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
 /// absent defaults, string-only updates, persistence, clearing and reset.
 #[tokio::test]
 async fn notification_sound_path_round_trips_and_resets_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_path = data_dir.join("config.toml");
     std::fs::write(&config_path, "[notifications]\nsoundEnabled = false\n")
         .expect("seed legacy notification config");
@@ -561,7 +887,8 @@ async fn notification_sound_path_round_trips_and_resets_over_wss() {
 /// the daemon up, and a subsequent valid edit recovers.
 #[tokio::test]
 async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_path = data_dir.join("config.toml");
     std::fs::write(&config_path, "[workspace]\nbranchPrefix = \"before/\"\n")
         .expect("seed config.toml");
@@ -679,7 +1006,8 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
 /// still tolerates-and-ignores them for pre-rename clients.
 #[tokio::test]
 async fn background_agents_table_migrates_to_quick_actions_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_path = data_dir.join("config.toml");
     std::fs::write(
         &config_path,
@@ -773,7 +1101,8 @@ async fn background_agents_table_migrates_to_quick_actions_over_wss() {
 /// normalization is strictly read-side.
 #[tokio::test]
 async fn legacy_compound_model_default_reads_back_as_the_split_triple_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_path = data_dir.join("config.toml");
     let seed =
         "[model]\ndefault = \"codex:gpt-5\"\nproviderDefaults = { codex = \"codex:gpt-5-mini\" }\n";
@@ -846,7 +1175,8 @@ async fn legacy_compound_model_default_reads_back_as_the_split_triple_over_wss()
 /// genuinely one-time.
 #[tokio::test]
 async fn active_provider_boot_migration_rewrites_config_once_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_path = data_dir.join("config.toml");
     std::fs::write(
         &config_path,
@@ -931,4 +1261,101 @@ async fn active_provider_boot_migration_rewrites_config_once_over_wss() {
         after, migrated,
         "a file without the legacy key is never rewritten at boot"
     );
+}
+
+#[tokio::test]
+async fn quick_action_effort_persists_emits_changes_and_resets_over_wss() {
+    let dir = temp_data_dir();
+    let (daemon, mut rpc, mut sub) = boot_with_wss(dir.path()).await;
+    await_config_watcher_ready(dir.path()).await;
+    let paths = [
+        "quickActions.defaultReasoningEffort",
+        "quickActions.typeReasoningEffortOverrides",
+        "quickActions.providerSettings",
+    ];
+    let initial = settings_snapshot(&mut rpc, &paths).await;
+    assert_eq!(initial[0]["value"], Value::Null);
+    assert_eq!(initial[1]["value"], json!({}));
+    let revision = initial[0]["revision"].as_u64().unwrap();
+    let values = [
+        json!(" High "),
+        json!({"commit":"low"}),
+        json!({
+            "codex":{"defaultReasoningEffort":"high","typeReasoningEffortOverrides":{"commit":"low"}},
+            "claude-code":{"defaultModel":"old-snapshot"}
+        }),
+    ];
+    let changes: Vec<Value> = paths
+        .iter()
+        .zip(&values)
+        .map(|(path, value)| json!({"path":path,"value":value}))
+        .collect();
+    let update = wss_rpc(&mut rpc, 20, "settings.update", json!({"changes":changes})).await;
+    let applied: Vec<Value> = paths
+        .iter()
+        .zip(&values)
+        .map(|(path, value)| json!({"path":path,"value":value,"origin":"file"}))
+        .collect();
+    assert_eq!(
+        update,
+        json!({"jsonrpc":"2.0","id":20,"result":{"applied":applied,"revision":revision+1}})
+    );
+    assert_settings_change(&mut sub, &json!(applied), revision + 1).await;
+    drop(sub);
+    drop(rpc);
+    drop(daemon);
+    let (restarted_daemon, mut rpc, mut sub) = boot_with_wss(dir.path()).await;
+    await_config_watcher_ready(dir.path()).await;
+    let reloaded = settings_snapshot(&mut rpc, &paths).await;
+    for (got, value) in reloaded.iter().zip(&values) {
+        assert_eq!(got["value"], *value);
+    }
+    let revision = reloaded[0]["revision"].as_u64().unwrap();
+    let reset = wss_rpc(&mut rpc, 21, "settings.reset", json!({"path":paths[0]})).await;
+    assert_eq!(
+        reset,
+        json!({"jsonrpc":"2.0","id":21,"result":{"path":paths[0],"value":null,"origin":"default","revision":revision+1}})
+    );
+    assert_settings_change(
+        &mut sub,
+        &json!([{"path":paths[0],"value":null,"origin":"default"}]),
+        revision + 1,
+    )
+    .await;
+    let after = settings_snapshot(&mut rpc, &paths).await;
+    assert_eq!(after[0]["value"], Value::Null);
+    assert_eq!(after[1]["value"], values[1]);
+    assert_eq!(after[2]["value"], values[2]);
+    for invalid in [json!({"commit":false}), json!({"commit":null})] {
+        let rejected = wss_rpc(
+            &mut rpc,
+            22,
+            "settings.update",
+            json!({"changes":[{"path":paths[1],"value":invalid}]}),
+        )
+        .await;
+        assert_eq!(rejected["error"]["code"], -32602);
+    }
+    // Blank writes read as unset immediately and after a daemon restart.
+    for blank in ["", "   "] {
+        let updated = wss_rpc(
+            &mut rpc,
+            23,
+            "settings.update",
+            json!({"changes":[{"path":paths[0],"value":blank}]}),
+        )
+        .await;
+        assert!(updated.get("error").is_none(), "{updated}");
+        assert_eq!(
+            settings_snapshot(&mut rpc, &paths).await[0]["value"],
+            Value::Null
+        );
+    }
+    drop(sub);
+    drop(rpc);
+    drop(restarted_daemon);
+    let (_blank_restart, mut rpc, _sub) = boot_with_wss(dir.path()).await;
+    let blank_reloaded = settings_snapshot(&mut rpc, &paths).await;
+    assert_eq!(blank_reloaded[0]["value"], Value::Null);
+    assert_eq!(blank_reloaded[1]["value"], values[1]);
 }

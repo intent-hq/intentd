@@ -2,7 +2,7 @@
 //! owner of every system-generated string that shapes an agent's system
 //! prompt or per-turn prompt envelope.
 //!
-//! One trait, one module per version. [`Harness`] exposes a method per text
+//! One trait, versioned registry entries. [`Harness`] exposes a method per text
 //! surface; each version implements it ([`v1`] = the post-#2457 set,
 //! byte-pinned by `crate::v1_goldens` and
 //! `agent_manager::v1_turn_envelope_goldens`; [`v1_1`] reuses v1's text
@@ -12,14 +12,17 @@
 //! [`v2_2`] rewrites the workspace status-message guidance to one short
 //! plain sentence; [`v2_3`] rewords the `## Suggested Next Steps` prompt
 //! hint so suggestions are levers on the plan, not a restatement of it,
-//! byte-pinned by `crate::v2_3_goldens`). Call sites carry typed data
-//! into the harness and never format doctrine/envelope text themselves, so a
+//! byte-pinned by `crate::v2_3_goldens`; [`v2_4`] extends that hint so
+//! prompts may carry markdown inline links for clickable PR/issue
+//! references, byte-pinned by `crate::v2_4_goldens`; [`v2_5`] keeps those
+//! text surfaces while versioning three PR-context specialists). Call sites carry
+//! typed data into the harness and never format doctrine/envelope text themselves, so a
 //! future version can reword or reorder surfaces without touching managers.
 //! A new version that changes no text surface reuses the prior version's
 //! harness singleton and swaps only its doctrine (as [`v1_1`]–[`v2_2`] do);
 //! one that rewords a surface adds a unit struct whose [`Harness`] impl
 //! forwards every method to the prior implementation and overrides only
-//! what changed (as [`v2_3`] does) — the v(N)→v(N+1) diff is exactly the
+//! what changed (as [`v2_3`] and [`v2_4`] do) — the v(N)→v(N+1) diff is exactly the
 //! changed surfaces, and the compiler enforces the forwarding set.
 //!
 //! Wake/queue system messages (hook/PR-monitor/watch wakes, dequeue notes,
@@ -31,8 +34,8 @@
 //! Each version also owns a [`Doctrine`] — its bundled instruction/specialist
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
-//! session `harnessVersion` (`"1.0"`, `"1.1"`, `"2.0"`, `"2.1"`, `"2.2"`,
-//! or `"2.3"`) to the pair, so a session keeps assembling the exact doctrine
+//! session `harnessVersion` (`"1.0"` through `"3.0"`) to the pair, so a session
+//! keeps assembling the exact doctrine
 //! it was created with even after the binary ships a newer set. All past
 //! versions stay bundled.
 
@@ -40,26 +43,51 @@ pub(crate) mod v1;
 pub(crate) mod v1_1;
 pub(crate) mod v2;
 pub(crate) mod v2_1;
+pub(crate) mod v2_10;
 pub(crate) mod v2_2;
 pub(crate) mod v2_3;
+pub(crate) mod v2_4;
+pub(crate) mod v2_5;
+pub(crate) mod v2_6;
+pub(crate) mod v2_7;
+pub(crate) mod v2_8;
+pub(crate) mod v2_9;
+
+// Context rendering is admitted separately from the versioned text bundle.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) mod repository_guidance_v3;
 
 use crate::agent_ops::ready_delta::UnblockedTask;
 use crate::pr_monitor::PrMonitorSnapshot;
 use intent_core::settings_file::AgentFeaturesSettings;
+
+/// Authenticated host-member data for the versioned human sender preamble.
+/// Service callers resolve role and identity from durable principal state.
+pub(crate) struct HostMemberSender<'a> {
+    pub login: Option<&'a str>,
+    pub display_name: Option<&'a str>,
+    pub principal_id: &'a str,
+    pub identity: Option<&'a intent_core::PrincipalIdentity>,
+}
 
 /// Typed inputs for [`Harness::compose_turn_prompt`]: the per-turn envelope
 /// layers, outermost-first. Each optional layer is either raw data the
 /// harness wraps itself (`stdin_context`) or a surface string already
 /// rendered by this same harness (`first_turn_prepend` via
 /// [`Harness::first_turn_prepend_block`], `snapshot_line` via
-/// [`Harness::snapshot_line`], `naming_nudge` via [`Harness::naming_nudge`],
-/// `role_reminder` via [`Harness::role_reminder_prefix`]) — the caller only
-/// decides presence, never wording.
+/// [`Harness::snapshot_line`], `setup_notice` via
+/// [`Harness::setup_in_progress_notice`] / [`Harness::setup_failed_notice`],
+/// `naming_nudge` via [`Harness::naming_nudge`], `role_reminder` via
+/// [`Harness::role_reminder_prefix`]) — the caller only decides presence,
+/// never wording.
 pub(crate) struct TurnEnvelopeParams<'a> {
     /// Fire-once `<system>`-wrapped assembled system prompt (§18.1 fallback).
     pub first_turn_prepend: Option<&'a str>,
     /// Recurring `current ws.agent.snapshot() => {json}` line.
     pub snapshot_line: Option<&'a str>,
+    /// Workspace setup-stage notice (§6.5): present while the setup script is
+    /// still `pending` / `running`, and once after it `failed`.
+    pub setup_notice: Option<&'a str>,
     /// Raw stdin/context-reference text; the harness owns the `Context:`
     /// block shape around it.
     pub stdin_context: Option<&'a str>,
@@ -167,9 +195,21 @@ pub(crate) trait Harness: Send + Sync {
     ) -> String;
     /// Per-turn `[Role Reminder: You are a {name}. {reminder}]` prefix.
     fn role_reminder_prefix(&self, name: &str, reminder: &str) -> String;
+    /// `[System: workspace setup is still running …]` notice for a turn that
+    /// starts while the workspace's setup script is `pending` / `running`:
+    /// names the terminal, marks the worktree provisional, and tells the
+    /// agent to wait with a self-checking hook on
+    /// `ws.workspace.details().setupStatus` that dispatches once `state` is
+    /// anything other than `pending` / `running` (safe under any ordering,
+    /// including a stage that settles `skipped`).
+    fn setup_in_progress_notice(&self, terminal_name: &str) -> String;
+    /// `[System: workspace setup failed …]` notice for the first turn after
+    /// the setup script `failed`; `exit_code` is `None` when the script died
+    /// before an exit code was observed.
+    fn setup_failed_notice(&self, exit_code: Option<u32>, terminal_name: &str) -> String;
     /// Compose the full outbound turn prompt: the layering order
-    /// (`FirstTurnPrepend` → snapshot → Context → naming nudge → role reminder
-    /// → body) is itself versioned.
+    /// (`FirstTurnPrepend` → snapshot → setup notice → Context → naming nudge
+    /// → role reminder → body) is itself versioned.
     fn compose_turn_prompt(&self, params: &TurnEnvelopeParams<'_>) -> String;
 
     // --- Queue notes and warnings (`agent_manager.rs`) ---
@@ -182,6 +222,23 @@ pub(crate) trait Harness: Send + Sync {
     /// prepended to agent-origin (A2A) sends; an absent `name` renders
     /// `[MESSAGE FROM AGENT ({agent_id})]`.
     fn a2a_sender_note(&self, name: Option<&str>, agent_id: &str) -> String;
+    /// `Message from @{login} ({display_name}), a collaborator (guest) of
+    /// this workspace — not the workspace owner.` sender preamble prepended
+    /// to a human message sent by a collaborator principal (multiplayer).
+    /// Falls back to the login alone, then the display name alone, then
+    /// `principal {principal_id}`.
+    fn collaborator_sender_preamble(
+        &self,
+        login: Option<&str>,
+        display_name: Option<&str>,
+        principal_id: &str,
+    ) -> String;
+    /// Qualified member sender attribution introduced in v2.9. Historical
+    /// harnesses retain their original collaborator surface; new inputs use
+    /// the latest harness, so stored historical messages are never rewritten.
+    fn host_member_sender_preamble(&self, sender: HostMemberSender<'_>) -> String {
+        self.collaborator_sender_preamble(sender.login, sender.display_name, sender.principal_id)
+    }
     /// Human-readable wait for [`Harness::dequeue_wait_note`]: `Ns` under a
     /// minute, then `Nm Ss`, then `Nh Mm`; negative waits clamp to `0s`.
     fn wait_duration(&self, secs: i64) -> String;
@@ -214,6 +271,10 @@ pub(crate) trait Harness: Send + Sync {
         size: Option<u64>,
         id: &str,
     ) -> String;
+    /// `[Queued message of N chars was dropped: …]` recovery marker that
+    /// replaces an oversized queue entry whose turn failed with a
+    /// context-size error (HTTP 413), so the retry can succeed.
+    fn context_size_requeue_marker(&self, original_chars: usize) -> String;
 
     // --- Completion / group / watch wakes (`lib.rs`, `agent_ops.rs`) ---
 
@@ -271,6 +332,14 @@ pub(crate) trait Harness: Send + Sync {
     fn hook_wake_logs_section(&self, message: &str, logs: Option<&str>) -> String;
     /// Log-line warning for a returned hook `state` exceeding the byte cap.
     fn hook_state_dropped_warning(&self, state_bytes: usize, cap_bytes: usize) -> String;
+    /// Trailing marker appended to a dispatch message (or eviction error
+    /// text) that was head-truncated to the wake-message char cap.
+    fn hook_wake_message_truncated_marker(
+        &self,
+        omitted_chars: usize,
+        total_chars: usize,
+        cap_chars: usize,
+    ) -> String;
     /// Diagnostic summary for a run whose `ws.host.exec` calls failed
     /// (nonzero exit / timeout) without the script throwing — persisted to
     /// `lastError` so silent check failures stay observable (monorepo#3231).
@@ -313,7 +382,13 @@ pub(crate) trait Harness: Send + Sync {
     fn hook_run_at_fired_notice(&self, hook_name: &str, hook_id: &str, run_at: &str) -> String;
     /// FE-cancel notice body (`hook.cancel` with no agent caller).
     fn hook_cancelled_from_app_notice(&self) -> String;
-    /// Archive-sweep cancel notice body.
+    /// Pre-v2.7 per-hook archive-sweep cancel notice body. Retired as a
+    /// runtime surface by the consolidated
+    /// [`Harness::workspace_archived_watches_cancelled_notice`]; kept on the
+    /// trait so the per-version goldens keep pinning its bytes.
+    // `expect(dead_code)` cannot pin an unused trait method (rustc treats it as a
+    // liveness root and reports the expectation unfulfilled), hence the allow.
+    #[cfg_attr(not(test), expect(clippy::allow_attributes), allow(dead_code))]
     fn hook_cancelled_workspace_archived_notice(&self) -> String;
 
     // --- PR monitor wakes and notices (`pr_monitor.rs`) ---
@@ -343,8 +418,27 @@ pub(crate) trait Harness: Send + Sync {
     ) -> String;
     /// FE-cancel notice (`pr.unmonitor` with no agent caller).
     fn pr_monitor_cancelled_from_app_notice(&self, label: &str) -> String;
-    /// Archive-sweep cancel notice.
+    /// Pre-v2.7 per-monitor archive-sweep cancel notice. Retired as a
+    /// runtime surface by the consolidated
+    /// [`Harness::workspace_archived_watches_cancelled_notice`]; kept on the
+    /// trait so the per-version goldens keep pinning its bytes.
+    #[cfg_attr(not(test), expect(clippy::allow_attributes), allow(dead_code))]
     fn pr_monitor_cancelled_workspace_archived_notice(&self, label: &str) -> String;
+    /// Former-owner notice when the monitor was taken over by the owner's
+    /// parent (`reason: "transferred"`).
+    fn pr_monitor_transferred_to_parent_notice(&self, label: &str, parent_id: &str) -> String;
+
+    // --- Workspace archive notices (`lib.rs`) ---
+
+    /// The one consolidated notice an agent reads after its workspace was
+    /// unarchived, naming every background hook (`(name, hook_id)`) and PR
+    /// monitor (label) the archive sweep cancelled and how to re-arm each
+    /// kind. Callers pass at least one item; empty kinds are omitted.
+    fn workspace_archived_watches_cancelled_notice(
+        &self,
+        hooks: &[(&str, &str)],
+        monitors: &[&str],
+    ) -> String;
 
     // --- Other conversation-reaching strings (`agent_ops.rs`) ---
 
@@ -380,13 +474,13 @@ pub(crate) struct HarnessEntry {
     /// the read-live behavior (`session_agent_features`); exercised by
     /// registry tests meanwhile (hence the allow — the lib build has no
     /// reader).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub default_features: fn() -> AgentFeaturesSettings,
     /// `(camelCase key, human-readable label)` for every `agentFeatures`
     /// toggle this version knows about. For diagnostics/UI surfaces;
     /// exercised by registry tests meanwhile (hence the allow — the lib
     /// build has no reader).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub feature_labels: &'static [(&'static str, &'static str)],
 }
 
@@ -408,10 +502,20 @@ pub(crate) struct Doctrine {
 /// drift.
 pub(crate) const LATEST_VERSION: &str = intent_core::CURRENT_HARNESS_VERSION;
 
+/// Version 3.0 identifies optional repository-context guidance at consuming
+/// boundaries. Its ordinary text, doctrine and feature defaults remain 2.10's;
+/// this entry does not enable the callback selector.
+static V3_ENTRY: HarnessEntry = HarnessEntry {
+    version: "3.0",
+    harness: v2_10::ENTRY.harness,
+    doctrine: v2_10::ENTRY.doctrine,
+    default_features: AgentFeaturesSettings::default,
+    feature_labels: v1::FEATURE_LABELS,
+};
+
 /// Every bundled harness version, oldest first. All past versions stay
 /// bundled so an old session keeps resolving the doctrine it was created
-/// with. Adding a version = a `resources/**/<ver>/` directory + a module +
-/// one row here.
+/// with. A version with unchanged text and doctrine may reuse their references.
 static REGISTRY: &[&HarnessEntry] = &[
     &v1::ENTRY,
     &v1_1::ENTRY,
@@ -419,6 +523,14 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v2_1::ENTRY,
     &v2_2::ENTRY,
     &v2_3::ENTRY,
+    &v2_4::ENTRY,
+    &v2_5::ENTRY,
+    &v2_6::ENTRY,
+    &v2_7::ENTRY,
+    &v2_8::ENTRY,
+    &v2_9::ENTRY,
+    &v2_10::ENTRY,
+    &V3_ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
@@ -475,8 +587,24 @@ mod tests {
     fn registry_resolves_stamped_current_version() {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(entry.version, "2.3");
-        assert_eq!(next_steps(entry.harness), next_steps(&v2_3::V2_3));
+        assert_eq!(entry.version, "3.0");
+        let previous = resolve_entry("2.10");
+        assert_eq!(previous.version, "2.10");
+        let member = |h: &dyn Harness| {
+            h.host_member_sender_preamble(HostMemberSender {
+                login: Some("same"),
+                display_name: Some("Same Person"),
+                principal_id: "person-1",
+                identity: None,
+            })
+        };
+        assert_eq!(member(entry.harness), member(previous.harness));
+        assert_ne!(member(entry.harness), member(resolve_entry("2.8").harness));
+        assert!(std::ptr::eq(entry.doctrine, previous.doctrine));
+        assert_eq!((entry.default_features)(), (previous.default_features)());
+        assert_eq!(entry.feature_labels, previous.feature_labels);
+        assert_eq!(next_steps(entry.harness), next_steps(&v2_4::V2_4));
+        assert_ne!(next_steps(entry.harness), next_steps(&v2_3::V2_3));
         assert_ne!(next_steps(entry.harness), next_steps(&v1::V1));
     }
 
@@ -550,7 +678,7 @@ mod tests {
     fn latest_is_current_harness_version() {
         assert_eq!(LATEST_VERSION, intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(latest_entry().version, LATEST_VERSION);
-        assert_eq!(next_steps(latest()), next_steps(&v2_3::V2_3));
+        assert_eq!(next_steps(latest()), next_steps(&v2_4::V2_4));
         assert_ne!(next_steps(latest()), next_steps(&v1::V1));
     }
 
@@ -662,5 +790,70 @@ mod tests {
             v2_2.harness.commit_policy_clause(),
             v2_3.harness.commit_policy_clause()
         );
+    }
+
+    /// v2.4 keeps v2.3's doctrine byte-for-byte and swaps only the
+    /// text-surface implementation, so the diff is exactly the extended
+    /// suggested-next-steps block (markdown-link guidance).
+    #[test]
+    fn v2_4_extends_only_suggested_next_steps() {
+        let v2_3 = resolve_entry("2.3");
+        let v2_4 = resolve_entry("2.4");
+        assert_eq!(v2_3.doctrine.specialists, v2_4.doctrine.specialists);
+        assert!(std::ptr::eq(
+            v2_3.doctrine.instructions,
+            v2_4.doctrine.instructions
+        ));
+        assert_eq!(next_steps(v2_4.harness), next_steps(&v2_4::V2_4));
+        for auto_commit in [false, true] {
+            assert_ne!(
+                v2_3.harness.suggested_next_steps_block(auto_commit),
+                v2_4.harness.suggested_next_steps_block(auto_commit)
+            );
+        }
+        assert!(next_steps(v2_4.harness).contains("[label](url)"));
+        assert!(!next_steps(v2_3.harness).contains("[label](url)"));
+        assert_eq!(
+            v2_3.harness.ask_questions_block(),
+            v2_4.harness.ask_questions_block()
+        );
+        assert_eq!(
+            v2_3.harness.commit_policy_clause(),
+            v2_4.harness.commit_policy_clause()
+        );
+    }
+
+    #[test]
+    fn v2_5_versions_only_pr_context_specialists() {
+        let v2_4 = resolve_entry("2.4");
+        let v2_5 = resolve_entry("2.5");
+        assert!(std::ptr::eq(
+            v2_4.doctrine.instructions,
+            v2_5.doctrine.instructions
+        ));
+        assert_eq!(next_steps(v2_4.harness), next_steps(v2_5.harness));
+        assert_eq!((v2_4.default_features)(), (v2_5.default_features)());
+        assert_eq!(v2_4.feature_labels, v2_5.feature_labels);
+        assert_eq!(
+            v2_5.doctrine.specialists,
+            crate::specialists::EMBEDDED_BUNDLED_V2_5
+        );
+        assert_eq!(
+            v2_4.doctrine.specialists.len(),
+            v2_5.doctrine.specialists.len()
+        );
+        for ((old_id, old_content), (new_id, new_content)) in v2_4
+            .doctrine
+            .specialists
+            .iter()
+            .zip(v2_5.doctrine.specialists.iter())
+        {
+            assert_eq!(old_id, new_id);
+            if matches!(*old_id, "implementor" | "spec-writer" | "verifier") {
+                assert_ne!(old_content, new_content, "{old_id} must be versioned");
+            } else {
+                assert_eq!(old_content, new_content, "{old_id} must not change");
+            }
+        }
     }
 }

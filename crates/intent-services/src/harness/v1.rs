@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
 use intent_core::TaskStatus;
+use intent_sourcecontrol::PrAncestry;
 
 use super::{ChildSettlementParams, Doctrine, Harness, HarnessEntry, TurnEnvelopeParams};
 use crate::agent_ops::ready_delta::{UnblockedReason, UnblockedTask};
@@ -88,6 +89,28 @@ pub(crate) const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message wa
 #[cfg(test)]
 pub(crate) const A2A_SENDER_NOTE_PREFIX: &str = "[MESSAGE FROM AGENT";
 
+/// Stable prefix of [`Harness::collaborator_sender_preamble`], asserted by
+/// the goldens. Like [`A2A_SENDER_NOTE_PREFIX`] it is NOT the annotation
+/// skip condition: the guard rebuilds the exact preamble from the bound
+/// caller's principal row and compares byte-for-byte.
+#[cfg(test)]
+pub(crate) const COLLABORATOR_SENDER_PREAMBLE_PREFIX: &str = "Message from ";
+
+/// Collapse control characters in a caller-visible display string to single
+/// spaces and drop a string that sanitizes to empty, so a hostile name
+/// cannot inject header-like lines into a single-line note.
+pub(super) fn single_line_name(name: Option<&str>) -> Option<String> {
+    name.map(|n| {
+        n.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+    .filter(|n| !n.is_empty())
+}
+
 /// Cap (in chars) on the `[hook logs]` section appended to dispatch/evict
 /// wakes.
 pub(crate) const HOOK_WAKE_LOGS_CAP: usize = 2048;
@@ -165,8 +188,8 @@ fn plural(n: i64) -> &'static str {
 }
 
 /// Per-check state transitions between two snapshots: added, removed, and
-/// state-changed checks, plus a required-flag flip when both sides report
-/// trustworthy `requiredKnown` flags.
+/// state-changed checks, plus a required-flag flip when both sides know that
+/// name's required flag, independently of uncertainty for other check names.
 ///
 /// Normal success transitions are suppressed: a check going `pending` →
 /// `passed`, or appearing already green, is expected progress rather than a
@@ -175,8 +198,12 @@ fn plural(n: i64) -> &'static str {
 /// `failed` → `passed` recovery IS reported, since it resolves a previously
 /// reported failure.
 fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
+    if (old.checks_seed_pending && old.head_sha == new.head_sha) || new.checks_unobserved {
+        return Vec::new();
+    }
     let (o, n) = (&old.requirements.checks, &new.requirements.checks);
-    let required_known = o.required_known && n.required_known;
+    let old_required = old.known_required_checks();
+    let new_required = new.known_required_checks();
     let by_name = |items: &[crate::pr_ops::MergeRequirementCheck]| {
         items
             .iter()
@@ -201,7 +228,10 @@ fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> 
                         check.name, prev.status, check.status
                     ));
                 }
-                if required_known && prev.required != check.required {
+                if old_required.contains(&check.name)
+                    && new_required.contains(&check.name)
+                    && prev.required != check.required
+                {
                     changes.push(format!(
                         "check {} is {} required to merge",
                         check.name,
@@ -402,9 +432,36 @@ impl Harness for V1 {
         format!("[Role Reminder: You are a {name}. {reminder}]")
     }
 
+    fn setup_in_progress_notice(&self, terminal_name: &str) -> String {
+        format!(
+            "[System: workspace setup is still running — the setup script is executing in the \
+             \"{terminal_name}\" terminal. Worktree contents (submodules, tooling, generated \
+             files) are provisional while ws.workspace.details().setupStatus.state is \
+             \"pending\" or \"running\". Do not diagnose missing files or tools as bugs yet: \
+             wait with a self-checking background hook (ws.hook.schedule) that reads \
+             ws.workspace.details().setupStatus and dispatches as soon as state is anything \
+             other than \"pending\" or \"running\" (\"completed\", \"failed\", \"skipped\", or \
+             \"unknown\"), then re-check the worktree.]"
+        )
+    }
+
+    fn setup_failed_notice(&self, exit_code: Option<u32>, terminal_name: &str) -> String {
+        let outcome = match exit_code {
+            Some(code) => format!("the setup script exited with code {code}"),
+            None => "the setup script failed before it exited (no exit code)".to_string(),
+        };
+        format!(
+            "[System: workspace setup failed — {outcome}. Its output is in the \
+             \"{terminal_name}\" terminal (ws.terminal.list / ws.terminal.readOutput). The \
+             worktree may be missing submodules or tooling: read that output before \
+             diagnosing missing files, and tell the user setup needs attention.]"
+        )
+    }
+
     fn compose_turn_prompt(&self, params: &TurnEnvelopeParams<'_>) -> String {
         // Inside-out layering, `\n\n` joins: body ← role reminder ← naming
-        // nudge ← Context block ← snapshot line ← FirstTurnPrepend.
+        // nudge ← Context block ← setup notice ← snapshot line ←
+        // FirstTurnPrepend.
         let prompt_text = match params.role_reminder {
             Some(r) => format!("{r}\n\n{}", params.body),
             None => params.body.to_string(),
@@ -415,6 +472,10 @@ impl Harness for V1 {
         };
         let prompt_text = match params.stdin_context {
             Some(ctx) => format!("Context:\n{ctx}\n\n---\n\n{prompt_text}"),
+            None => prompt_text,
+        };
+        let prompt_text = match params.setup_notice {
+            Some(notice) => format!("{notice}\n\n{prompt_text}"),
             None => prompt_text,
         };
         let prompt_text = match params.snapshot_line {
@@ -447,20 +508,30 @@ impl Harness for V1 {
         // it): collapse newlines/control chars in the display name to
         // single spaces so a hostile agent name cannot inject header-like
         // lines, and drop a name that sanitizes to empty.
-        let name = name
-            .map(|n| {
-                n.chars()
-                    .map(|c| if c.is_control() { ' ' } else { c })
-                    .collect::<String>()
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .filter(|n| !n.is_empty());
-        match name {
+        match single_line_name(name) {
             Some(name) => format!("[MESSAGE FROM AGENT {name} ({agent_id})]"),
             None => format!("[MESSAGE FROM AGENT ({agent_id})]"),
         }
+    }
+
+    fn collaborator_sender_preamble(
+        &self,
+        login: Option<&str>,
+        display_name: Option<&str>,
+        principal_id: &str,
+    ) -> String {
+        // Single-line for the same reasons as `a2a_sender_note`: the
+        // exact-match idempotency guard keys on it and a client may strip
+        // it with a single-line pattern.
+        let who = match (single_line_name(login), single_line_name(display_name)) {
+            (Some(login), Some(name)) => format!("@{login} ({name})"),
+            (Some(login), None) => format!("@{login}"),
+            (None, Some(name)) => name,
+            (None, None) => format!("principal {principal_id}"),
+        };
+        format!(
+            "Message from {who}, a collaborator (guest) of this workspace — not the workspace owner."
+        )
     }
 
     fn wait_duration(&self, secs: i64) -> String {
@@ -525,6 +596,15 @@ impl Harness for V1 {
              file is NOT inlined in this message. Call \
              ws.file.getAttachment(\"{id}\") to copy it into your working directory, \
              then read it from the returned path.]"
+        )
+    }
+
+    fn context_size_requeue_marker(&self, original_chars: usize) -> String {
+        format!(
+            "[Queued message of {original_chars} chars was dropped: the turn failed because \
+             the message was too large for the model (HTTP 413). The original content is not \
+             retained in the queue; re-obtain it from its source (e.g. ws.script.output / \
+             ws.host.exec) in bounded form.]"
         )
     }
 
@@ -760,6 +840,19 @@ impl Harness for V1 {
         )
     }
 
+    fn hook_wake_message_truncated_marker(
+        &self,
+        omitted_chars: usize,
+        total_chars: usize,
+        cap_chars: usize,
+    ) -> String {
+        format!(
+            "\n[hook message truncated: {omitted_chars} of {total_chars} chars omitted past the \
+             {cap_chars}-char cap — have the hook dispatch a summary and read the full data \
+             directly]"
+        )
+    }
+
     fn hook_exec_failures_warning(&self, lines: &[&str], total: usize) -> String {
         let omitted = total.saturating_sub(lines.len());
         let more = if omitted > 0 {
@@ -915,20 +1008,37 @@ impl Harness for V1 {
             checks.push_str(" (required-check flags unavailable)");
         }
         lines.push(checks);
+        let count = match r.threads.unresolved {
+            Some(n) => n.to_string(),
+            None => "unknown (thread resolution state unreadable)".to_string(),
+        };
         let threads = match r.threads.resolution_required {
-            Some(true) => format!(
-                "unresolved threads: {} (resolution required to merge)",
-                r.threads.unresolved
-            ),
-            _ => format!("unresolved threads: {}", r.threads.unresolved),
+            Some(true) => format!("unresolved threads: {count} (resolution required to merge)"),
+            _ => format!("unresolved threads: {count}"),
         };
         lines.push(threads);
         if r.has_conflicts {
             lines.push("merge conflicts present".to_string());
         }
-        if r.is_behind {
-            lines.push("branch is behind its base".to_string());
-        }
+        lines.push(match &r.ancestry {
+            PrAncestry::Unknown => "branch ancestry: unknown".to_string(),
+            PrAncestry::Known { behind_by, .. } => {
+                let suffix = if *behind_by == 1 { "" } else { "s" };
+                let mut line = format!("branch ancestry: {behind_by} commit{suffix} behind base");
+                if *behind_by > 0 && crate::pr_monitor::requirements_ready(r) {
+                    line.push_str(" (behind but mergeable)");
+                }
+                line
+            }
+        });
+        lines.push(
+            match r.branch_update_required {
+                Some(true) => "forge requires a branch update before merging",
+                Some(false) => "forge branch-update requirement: not required",
+                None => "forge branch-update requirement: unknown",
+            }
+            .to_string(),
+        );
         if r.is_in_merge_queue == Some(true) {
             lines.push("in merge queue".to_string());
         }
@@ -1018,23 +1128,38 @@ impl Harness for V1 {
                 new.review_comment_count
             ));
         }
-        if o.threads.unresolved != n.threads.unresolved {
-            let verb = if n.threads.unresolved < o.threads.unresolved {
-                "thread(s) resolved"
-            } else {
-                "thread(s) unresolved/opened"
-            };
-            changes.push(format!(
-                "{verb}: {} → {} unresolved",
-                o.threads.unresolved, n.threads.unresolved
-            ));
+        // A count delta is only meaningful when both sides are known; a
+        // readability transition is reported as such, never as a `n → 0` /
+        // `0 → n` delta.
+        match (o.threads.unresolved, n.threads.unresolved) {
+            (Some(before), Some(after)) if before != after => {
+                let verb = if after < before {
+                    "thread(s) resolved"
+                } else {
+                    "thread(s) unresolved/opened"
+                };
+                changes.push(format!("{verb}: {before} → {after} unresolved"));
+            }
+            (Some(_), None) => {
+                changes
+                    .push("review threads unreadable (resolution state unavailable)".to_string());
+            }
+            (None, Some(after)) => {
+                changes.push(format!("review threads readable again: {after} unresolved"));
+            }
+            _ => {}
         }
 
         changes.extend(diff_checks(old, new));
 
         // Suite completion: the last pending check finishing is reported as
         // ONE aggregate line (individual success lines are suppressed above).
-        if o.checks.pending > 0 && n.checks.pending == 0 && n.checks.total > 0 {
+        if (!old.checks_seed_pending || old.head_sha != new.head_sha)
+            && !new.checks_unobserved
+            && (o.checks.pending > 0 || old.checks_unobserved)
+            && n.checks.pending == 0
+            && n.checks.total > 0
+        {
             changes.push(if n.checks.failed == 0 {
                 format!("all checks passed ({})", n.checks.total)
             } else {
@@ -1048,7 +1173,7 @@ impl Harness for V1 {
         // Mergeability + residual signals. `unknown` is a transient GitHub
         // state ("still recomputing", e.g. while a merge-queue group is
         // processed), never an actionable signal — and the recomputation
-        // also resets the derived conflict/behind/blocked signals, so while
+        // also resets the derived conflict/blocked signals, so while
         // the NEW snapshot's mergeability is unknown their clearing
         // direction is suppressed alongside the raw `mergeable`/`merge
         // state` transitions (the appearing direction always reports). A
@@ -1067,12 +1192,24 @@ impl Harness for V1 {
                 "merge conflicts resolved".to_string()
             });
         }
-        if o.is_behind != n.is_behind && (n.is_behind || !recomputing) {
-            changes.push(if n.is_behind {
-                "branch is now behind its base".to_string()
-            } else {
-                "branch is no longer behind its base".to_string()
-            });
+        // Ancestry is visible in the checklist, but neither distance nor
+        // availability changes warrant a wake or reset the debounce window.
+        // Only a known true→false forge verdict clears this requirement.
+        // In particular, an old persisted baseline has None, not false.
+        let update_change = match (o.branch_update_required, n.branch_update_required) {
+            (Some(false), Some(true)) => Some("forge now requires a branch update before merging"),
+            (Some(true), Some(false)) => {
+                Some("forge no longer requires a branch update before merging")
+            }
+            (None, Some(true)) => {
+                Some("forge branch-update requirement available: required before merging")
+            }
+            (None, Some(false)) => Some("forge branch-update requirement available: not required"),
+            (Some(_), None) => Some("forge branch-update requirement unknown"),
+            _ => None,
+        };
+        if let Some(line) = update_change {
+            changes.push(line.to_string());
         }
         if o.is_in_merge_queue != n.is_in_merge_queue {
             changes.push(if n.is_in_merge_queue == Some(true) {
@@ -1183,6 +1320,47 @@ impl Harness for V1 {
         format!(
             "[PR monitor {label}] This monitor was cancelled because its workspace was \
              archived — it will not report again."
+        )
+    }
+
+    fn pr_monitor_transferred_to_parent_notice(&self, label: &str, parent_id: &str) -> String {
+        format!(
+            "[PR monitor {label}] Your parent agent ({parent_id}) took over this monitor \
+             because your work had settled — it now receives the PR's wakes and this \
+             monitor will not report to you again. Do not re-register a monitor on this \
+             PR (ws.pr.monitor would be refused while your parent holds it); no other \
+             action is needed."
+        )
+    }
+
+    fn workspace_archived_watches_cancelled_notice(
+        &self,
+        hooks: &[(&str, &str)],
+        monitors: &[&str],
+    ) -> String {
+        let items: Vec<String> = hooks
+            .iter()
+            .map(|(name, id)| format!("hook \"{name}\" ({id})"))
+            .chain(monitors.iter().map(|label| format!("PR monitor {label}")))
+            .collect();
+        let cancelled = if items.len() == 1 {
+            "this background watch was cancelled and was NOT resumed"
+        } else {
+            "these background watches were cancelled and were NOT resumed"
+        };
+        let mut re_arm = Vec::new();
+        if !hooks.is_empty() {
+            re_arm.push("ws.hook.get(hookId) recovers a hook's script for ws.hook.schedule");
+        }
+        if !monitors.is_empty() {
+            re_arm.push("ws.pr.monitor re-registers a PR");
+        }
+        format!(
+            "[SYSTEM NOTICE] This workspace was archived and has since been unarchived. \
+             While it was archived, {cancelled}: {}. If a condition still matters, \
+             re-arm it: {}.",
+            items.join(", "),
+            re_arm.join("; ")
         )
     }
 

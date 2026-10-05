@@ -21,21 +21,27 @@ impl Store {
                 "encode note_line_attribution attributions failed: {e}"
             ))
         })?;
-        sqlx::query(
-            "INSERT INTO note_line_attribution (note_id, workspace_id, computed_at, attributions_json) \
-             VALUES (?, ?, ?, ?) \
-             ON CONFLICT(workspace_id, note_id) DO UPDATE SET \
-               computed_at = excluded.computed_at, \
-               attributions_json = excluded.attributions_json",
-        )
-        .bind(data.note_id.as_str())
-        .bind(data.workspace_id.as_str())
-        .bind(&data.computed_at)
-        .bind(&attributions_json)
-        .execute(self.write_pool())
+        // Keep retries inside the caller's future so a newer note edit can
+        // cancel an older scheduled refresh, including its acquire/backoff.
+        // This scoped upsert is idempotent; only transient contention is retried.
+        crate::with_write_txn_retry(|| async {
+            sqlx::query(
+                "INSERT INTO note_line_attribution (note_id, workspace_id, computed_at, attributions_json) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(workspace_id, note_id) DO UPDATE SET \
+                   computed_at = excluded.computed_at, \
+                   attributions_json = excluded.attributions_json",
+            )
+            .bind(data.note_id.as_str())
+            .bind(data.workspace_id.as_str())
+            .bind(&data.computed_at)
+            .bind(&attributions_json)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("upsert note_line_attribution failed: {e}")))?;
+            Ok(())
+        })
         .await
-        .map_err(|e| Error::Internal(format!("upsert note_line_attribution failed: {e}")))?;
-        Ok(())
     }
 
     /// Load the persisted attribution snapshot for a note, or `None` if never

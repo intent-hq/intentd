@@ -135,7 +135,7 @@ impl TermStats {
 /// most frequent spelling wins).
 #[must_use]
 // Term/source counts are far below 2^53: loss-free in f64.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 pub fn extract_vocabulary(sources: &[(SourceKind, &str)], max_terms: usize) -> Vec<String> {
     if max_terms == 0 {
         return Vec::new();
@@ -406,7 +406,7 @@ fn flush_segment(cur: &mut String, segs: &mut Vec<String>) {
 /// Dictation-usefulness factor: penalizes overlong tokens, separator-heavy
 /// path-like tokens, and vowel-less (unpronounceable) strings.
 // Token lengths are far below 2^53: loss-free in f64.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn usefulness(spelling: &str) -> f64 {
     let n = spelling.chars().count();
     let mut factor = 1.0;

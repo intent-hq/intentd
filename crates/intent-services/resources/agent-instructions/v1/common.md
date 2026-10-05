@@ -62,7 +62,7 @@ If you cannot proceed with your assignment, raise attention explicitly instead o
 
 `reason` is required. Both work for every agent (delegated or not, with or without a linked task). After the call, end your turn normally — do not keep retrying a path you have identified as blocked.
 
-Do **NOT** use `ws.agent.reportToParent` to report a blocker or ask for a discussion — it marks your task `review_required` (success-flavored, no attention surfaces). Reserve it for completed or progressing work.
+Do **NOT** use `ws.agent.reportToParent` to report a blocker or ask for a discussion — it marks your task `review_required` (success-flavored, no attention surfaces). Reserve it for completed or progressing work. Neither `ws.agent.reportToParent` nor `ws.task.updateNoteStatus` ever moves your own task out of `complete`/`cancelled`: `reportToParent` returns its ordinary report result, and a `ws.task.updateNoteStatus` call asking for a different status is refused as a no-op whose result carries an `advisory` (a same-status write is the ordinary no-op with no `advisory`).
 
 ## Waiting on External Conditions
 
@@ -74,7 +74,7 @@ Never block or sleep inside your turn waiting for something external (CI, anothe
 - **Prefer existing primitives** for in-workspace waits: `ws.event.subscribe` for file/task/git events, `ws.agent.watch` for sibling agents. Reserve hooks for conditions those cannot see — hook code runs with the full `ws.*` API, so make the hook self-checking: for PR watching it calls `ws.pr.snapshot(prNumber)` itself, diffs against `hookState`, and dispatches only on meaningful change.
 - **Cross-repo PRs**: `ws.pr.snapshot(prNumber, { repo: "owner/name" })` takes an explicit repo, so a hook can watch a PR in a different repo (e.g. a submodule PR) the same way — diff that snapshot against `hookState`. For fields the snapshot does not carry, run `gh api repos/{owner}/{repo}/pulls/{n}` via `ws.host.exec` instead.
 - **Hygiene**: max 5 hooks, cadence ≥10s — pick the slowest cadence that serves the goal, and cancel hooks that are no longer relevant.
-- **Report before waiting** (delegated agents): before ending your turn to wait on a hook, call `ws.agent.reportToParent` describing what you're watching and the expected wake condition, and set your task note status to `waiting` (`ws.task.updateNoteStatus`) so you don't look stalled.
+- **Report before waiting** (delegated agents): before ending your turn to wait on a hook, call `ws.agent.reportToParent` describing what you're watching and the expected wake condition, and set your task note status to `waiting` (`ws.task.updateNoteStatus`) so you don't look stalled — unless it is already `complete`/`cancelled`: the daemon ignores a linked agent's status writes from a terminal status and returns an `advisory`. Never try to reopen your own task; ask the coordinator/user instead.
 - **TTL**: every hook expires at most 24 hours after creation. On expiry you're woken with an expiry message and must decide whether to reschedule. Set `ttlMs` to your estimated time-to-fire plus reasonable margin — don't default to the 24-hour cap — so expiry doubles as an "overdue — reassess" wake.
 
 ## Response Organization

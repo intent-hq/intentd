@@ -35,7 +35,23 @@ target_args=()
 if [[ -n "${GITHUB_SHA:-}" && "$REPO" == "${GITHUB_REPOSITORY:-}" ]]; then
   target_args=(--target "$GITHUB_SHA")
 fi
-if ! gh release view "$channel_tag" --repo "$REPO" >/dev/null 2>&1; then
+# A failed tag lookup (even HTTP 404) can mean missing repository access, not
+# a missing release. Only a successful, complete listing establishes absence.
+# --paginate also finds old channel releases and drafts visible to this token.
+lookup_release() {
+  local release_tags
+  if ! release_tags=$(gh api --paginate "repos/$REPO/releases?per_page=100" --jq '.[].tag_name'); then
+    echo "error: could not list releases on $REPO; cannot determine whether $channel_tag exists" >&2
+    return 1
+  fi
+  release_found=false
+  if grep -Fxq -- "$channel_tag" <<<"$release_tags"; then
+    release_found=true
+  fi
+}
+
+lookup_release
+if [[ "$release_found" != true ]]; then
   if ! gh release create "$channel_tag" \
     --repo "$REPO" \
     --latest=false \
@@ -45,7 +61,11 @@ if ! gh release view "$channel_tag" --repo "$REPO" >/dev/null 2>&1; then
   then
     # Tolerate only a lost create race (two publishes close together): the
     # release must exist now; otherwise fail loudly.
-    if ! gh release view "$channel_tag" --repo "$REPO" >/dev/null 2>&1; then
+    if ! lookup_release; then
+      echo "error: failed to create release $channel_tag and could not verify its existence" >&2
+      exit 1
+    fi
+    if [[ "$release_found" != true ]]; then
       echo "error: failed to create release $channel_tag and it does not exist" >&2
       exit 1
     fi

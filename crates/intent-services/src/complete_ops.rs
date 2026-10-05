@@ -35,17 +35,120 @@ use crate::enhance_ops::{
     clean_agent_message, run_auggie_print, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS,
 };
 use crate::file_ops;
-use crate::one_shot_acp::{run_one_shot_acp, OneShotCommand, OneShotError};
+use crate::one_shot_acp::{run_one_shot_acp, OneShotCommand, OneShotEffort, OneShotError};
 use crate::Services;
 
 /// Providers served by the ephemeral ACP one-shot runner. Every other
 /// provider (and unset/undecidable settings) resolves the gate closed.
 const ACP_ONE_SHOT_PROVIDERS: &[&str] = &["claude-code", "codex", "pi"];
 
+/// System prompt for a claude-code one-shot whose caller supplied none. The
+/// adapter treats an absent (or empty) `_meta.systemPrompt` as "use the
+/// `claude_code` preset", which is exactly the agentic context a utility
+/// completion must not load, so the slot is always filled.
+const CLAUDE_CODE_UTILITY_SYSTEM_PROMPT: &str =
+    "You are a text-only utility answering a single request. Reply with the requested output and nothing else.";
+
 /// The typed `{ available: false, reason }` result for a provider that cannot
 /// serve a one-shot completion.
 fn unavailable(reason: impl std::fmt::Display) -> Value {
     json!({ "available": false, "reason": reason.to_string() })
+}
+
+/// `System: <system>\n\n<prompt>` — the FE streamChat composition used when a
+/// system prompt is supplied and the provider has no dedicated system-prompt
+/// channel; otherwise the raw prompt verbatim.
+fn compose_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
+    match system_prompt {
+        Some(s) => format!("System: {s}\n\n{prompt}"),
+        None => prompt.to_string(),
+    }
+}
+
+/// The turn text and `session/new` `_meta` for a one-shot on `provider_id`.
+///
+/// claude-code gets the slimmed utility session (intent-hq/intent#4587): the
+/// caller's system prompt (or [`CLAUDE_CODE_UTILITY_SYSTEM_PROMPT`]) goes out
+/// as a string `_meta.systemPrompt`, and `_meta.claudeCode.options` disables
+/// the built-in tools and drops the project/local setting tiers. The prompt
+/// then rides the turn alone — composing `System:` into the user text as
+/// well would say it twice. Every other provider keeps the composed prompt
+/// and no `_meta`, exactly as before.
+///
+/// Verified against the pinned `@agentclientprotocol/claude-agent-acp` 0.81.1
+/// (`dist/acp-agent.js`, `session/new`) and its `@anthropic-ai/claude-agent-sdk`
+/// 0.3.280:
+/// - a string `_meta.systemPrompt` is passed to the SDK as `systemPrompt`
+///   verbatim and REPLACES the `claude_code` preset (an object form would only
+///   append to it);
+/// - `_meta.claudeCode.options` is spread over the adapter's SDK options, so
+///   `tools: []` wins over the adapter's `{ preset: "claude_code" }` tools
+///   default and the SDK spawns the CLI with `--tools ""` (no built-in tools;
+///   the adapter documents `tools` as the preferred spelling of the legacy
+///   `disableBuiltInTools`) — no tool schemas in context and no tool calls
+///   possible, mechanically;
+/// - the same spread lets `settingSources` override the adapter's
+///   `["user", "project", "local"]` default (`--setting-sources=user`), so the
+///   repo's `.claude/settings*.json` and `CLAUDE.md` no longer load. The
+///   `user` tier is deliberately kept: `~/.claude/settings.json` carries
+///   `apiKeyHelper` / `env` auth routing, and dropping it would break
+///   completions for anyone authenticating that way;
+/// - `strictMcpConfig: true` reaches the SDK through the same spread and
+///   spawns the CLI with `--strict-mcp-config`. `--tools ""` only removes the
+///   built-in tools and `--setting-sources` only governs `settings*.json`;
+///   user-scope MCP servers live in `~/.claude.json`, which neither flag
+///   touches, so without this the CLI would still connect them and attach
+///   their tool schemas. The adapter never sets it on its own, and it only
+///   passes `--mcp-config` for a non-empty `mcpServers` map (the one-shot
+///   sends none), so strict mode means zero MCP servers.
+pub(crate) fn one_shot_session_shape(
+    provider_id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+) -> (String, Option<Value>) {
+    if provider_id != "claude-code" {
+        return (compose_prompt(prompt, system_prompt), None);
+    }
+    let meta = json!({
+        "systemPrompt": system_prompt.unwrap_or(CLAUDE_CODE_UTILITY_SYSTEM_PROMPT),
+        "claudeCode": {
+            "options": {
+                "tools": [],
+                "settingSources": ["user"],
+                "strictMcpConfig": true,
+            }
+        }
+    });
+    (prompt.to_string(), Some(meta))
+}
+
+/// Effort is independent of model selection, and saved choices belong only
+/// to the active provider. Never filter these against cached capabilities.
+fn resolve_quick_action_effort(
+    settings: &intent_core::settings_file::SettingsFile,
+    quick_action_type: Option<&str>,
+    effective_provider: Option<&str>,
+    run_provider: &str,
+    explicit: Option<&str>,
+) -> OneShotEffort {
+    let nonblank = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_owned());
+    let explicit = explicit.and_then(nonblank);
+    let mut saved = Vec::new();
+    if effective_provider == Some(run_provider) {
+        let quick = &settings.quick_actions;
+        if let Some(value) = quick_action_type
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .and_then(|t| quick.type_reasoning_effort_overrides.get(t))
+            .and_then(|v| nonblank(v))
+        {
+            saved.push(value);
+        }
+        if let Some(value) = quick.default_reasoning_effort.as_deref().and_then(nonblank) {
+            saved.push(value);
+        }
+    }
+    OneShotEffort { explicit, saved }
 }
 
 /// Resolve the quick-action model for a one-shot completion the caller sent no
@@ -158,8 +261,9 @@ fn resolve_quick_action_model(
 }
 
 /// Pick the one-shot launch for `provider`, mirroring `resolve_spawn`: a
-/// `resolved_bin` wins — for an `npx_only_package` provider that is ONLY the
-/// validated `providers.paths` adapter override
+/// `resolved_bin` wins unless the provider forbids overrides — for an
+/// `npx_only_package` provider that is ONLY an opted-in, validated
+/// `providers.paths` adapter override
 /// ([`intent_providers::resolve_npx_only_override`], monorepo#4352), with the
 /// pinned package via `npx -y` otherwise; for other providers it is the
 /// discovered binary, with the pinned `fallback_npx_package` as the fallback.
@@ -184,28 +288,64 @@ pub(crate) fn one_shot_launch(
         ..Default::default()
     };
     let args = intent_providers::build_provider_args(provider, &inputs);
-    if let Some(bin) = resolved_bin {
-        return Some(OneShotCommand::binary(bin, args));
-    }
-    if let Some(pkg) = provider.npx_only_package {
-        return npx.map(|npx| OneShotCommand::npx(npx, pkg).args(args));
-    }
-    let pkg = provider.fallback_npx_package?;
-    // The daemon-managed npx fallback: keep a stray env override from
-    // redirecting the adapter (mirrors the codex probe launch, #555).
-    npx.map(|npx| {
-        OneShotCommand::npx(npx, pkg)
+    let resolved_bin = resolved_bin
+        .filter(|_| provider.npx_only_package.is_none() || provider.npx_only_honors_path_override);
+    let via_npx = resolved_bin.is_none();
+    let mut cmd = if let Some(bin) = resolved_bin {
+        OneShotCommand::binary(bin, args)
+    } else if let Some(pkg) = provider.npx_only_package {
+        OneShotCommand::npx(npx?, pkg).args(args)
+    } else {
+        let pkg = provider.fallback_npx_package?;
+        // The daemon-managed npx fallback: keep a stray env override from
+        // redirecting the adapter (mirrors the codex probe launch, #555).
+        OneShotCommand::npx(npx?, pkg)
             .args(args)
             .env_remove("CODEX_PATH")
             .env_remove("CODEX_CONFIG")
-    })
+    };
+    if intent_providers::installed_cli::InstalledCli::for_provider(provider.id).is_some() {
+        for (key, value) in intent_providers::build_provider_env_for_spawn(
+            provider, model, None, None, None, via_npx, None,
+        ) {
+            cmd = cmd.env(key, value);
+        }
+    }
+    Some(apply_one_shot_launch_policy(provider, cmd))
+}
+
+/// Apply daemon-owned launch policy after caller-specific environment merges.
+/// The adapter command applies removals after sets, so `CODEX_CONFIG` is replaced
+/// without adding it to the removal list.
+pub(crate) fn apply_one_shot_launch_policy(
+    provider: &intent_providers::ProviderConfig,
+    cmd: OneShotCommand,
+) -> OneShotCommand {
+    if provider.id == "codex" {
+        cmd.env(
+            "CODEX_CONFIG",
+            intent_providers::CODEX_SUBAGENT_POLICY_CONFIG,
+        )
+    } else {
+        cmd
+    }
+}
+
+pub(crate) fn missing_one_shot_adapter_message(provider_id: &str) -> String {
+    if provider_id == "codex" {
+        intent_providers::CODEX_ACP_PREREQUISITE_ERROR.to_string()
+    } else {
+        format!(
+            "{provider_id}: no adapter could be resolved (binary not found and npx unavailable)"
+        )
+    }
 }
 
 /// Resolve the adapter binary a one-shot launch (`agent.completeOnce`, the
 /// live test prompt) runs for `provider`, matching `resolve_spawn`'s
 /// precedence: an npx-only provider honors ONLY a valid `providers.paths`
 /// adapter override, and only when it opts in (never auto-discovery —
-/// monorepo#4352; pi resolves nothing), any other provider walks
+/// monorepo#4352; codex and pi resolve nothing), any other provider walks
 /// `find_provider_binary`'s tiers. `explicit_path` is the raw
 /// `providers.paths[primary_binary_provider_id]` value (blank = unset).
 pub(crate) fn resolve_one_shot_binary(
@@ -273,6 +413,7 @@ impl Services {
     /// caller's optional `type` hint keying the override map. The chain
     /// resolves to a `(provider, model)` pair, so a legacy compound value
     /// naming another registered provider routes the one-shot there.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn agent_complete_once_op(
         &self,
         prompt: String,
@@ -281,6 +422,7 @@ impl Services {
         quick_action_type: Option<String>,
         workspace_id: Option<WorkspaceId>,
         timeout_ms: Option<u64>,
+        reasoning_effort: Option<String>,
     ) -> Result<Value> {
         let settings = self.effective_settings();
         let effective_provider = crate::agent_session::derived_default_provider(&settings);
@@ -292,7 +434,7 @@ impl Services {
         // the chain can still resolve when the default provider is unset;
         // the gate closes only when neither yields a provider.
         let (run_provider, model) = match model.filter(|m| !m.trim().is_empty()) {
-            Some(m) => match effective_provider {
+            Some(m) => match effective_provider.clone() {
                 Some(p) => (p, Some(m)),
                 None => {
                     return Ok(unavailable(
@@ -315,6 +457,14 @@ impl Services {
             },
         };
 
+        let effort = resolve_quick_action_effort(
+            &settings,
+            quick_action_type.as_deref(),
+            effective_provider.as_deref(),
+            &run_provider,
+            reasoning_effort.as_deref(),
+        );
+
         // Optional cwd pin: unknown workspace surfaces as -32602 (NotFound);
         // a workspace without a filesystem root just runs without a cwd
         // (mirrors §5.31).
@@ -326,20 +476,37 @@ impl Services {
             }
             None => None,
         };
-        // `System: <system>\n\n<prompt>` mirrors the FE streamChat composition
-        // when a system prompt is supplied; otherwise the raw prompt is used
-        // verbatim. Shared by both routes.
-        let full_prompt = match system_prompt.as_deref().map(str::trim) {
-            Some(s) if !s.is_empty() => format!("System: {s}\n\n{prompt}"),
-            _ => prompt.clone(),
-        };
+        // A blank system prompt counts as none. The auggie CLI route composes
+        // it into the prompt text; the ACP route decides per provider
+        // (`one_shot_session_shape`).
+        let system_prompt = system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
         if run_provider != "auggie" {
             return self
-                .complete_once_via_acp(&run_provider, &full_prompt, model.as_deref(), cwd, timeout)
+                .complete_once_via_acp(
+                    &run_provider,
+                    &prompt,
+                    system_prompt,
+                    model.as_deref(),
+                    cwd,
+                    timeout,
+                    &effort,
+                )
                 .await;
         }
+        if let Some(requested) = effort.explicit.as_deref() {
+            return Err(Error::InvalidParams(format!(
+                "reasoningEffort {requested:?} is not supported by the auggie print path"
+            )));
+        }
+        if !effort.saved.is_empty() {
+            tracing::warn!("saved quick-action effort is unsupported by the auggie print path; using provider default");
+        }
+        let full_prompt = compose_prompt(&prompt, system_prompt);
 
         // Binary resolution order (per spec Design): self.auggie_bin (test seam) →
         // context.auggiePath (user setting, EXCLUSIVE when set) → find_auggie().
@@ -386,19 +553,23 @@ impl Services {
         Ok(json!({ "text": text }))
     }
 
-    /// The non-auggie route: run `full_prompt` through an ephemeral ACP
+    /// The non-auggie route: run `prompt` (+ `system_prompt`, shaped per
+    /// provider by [`one_shot_session_shape`]) through an ephemeral ACP
     /// session on the provider's adapter. A provider with no one-shot support
     /// and one whose adapter cannot be resolved (no binary, no npx) both
     /// return `{ available: false, reason }`; a resolved adapter that then
     /// fails the turn surfaces as an error, matching the auggie route's
     /// spawn/exit failures.
+    #[expect(clippy::too_many_arguments)]
     async fn complete_once_via_acp(
         &self,
         provider_id: &str,
-        full_prompt: &str,
+        prompt: &str,
+        system_prompt: Option<&str>,
         model: Option<&str>,
         cwd: Option<PathBuf>,
         timeout_ms: u64,
+        effort: &OneShotEffort,
     ) -> Result<Value> {
         if !ACP_ONE_SHOT_PROVIDERS.contains(&provider_id) {
             return Ok(unavailable(format!(
@@ -424,39 +595,66 @@ impl Services {
         // hermetically on hosts where npx is installed.
         let npx = match &self.one_shot_npx {
             Some(pinned) => pinned.clone(),
+            None if provider_id == "codex" => intent_providers::find_codex_npx(),
             None => intent_providers::find_npx(),
         };
         let Some(cmd) = one_shot_launch(provider, resolved_bin, npx, model) else {
-            return Ok(unavailable(format!(
-                "{provider_id}: no adapter could be resolved (binary not found and npx unavailable)"
-            )));
+            return Ok(unavailable(missing_one_shot_adapter_message(provider_id)));
         };
+        if let Err(err) = cmd.check_npx_version().await {
+            return Ok(unavailable(err.to_string()));
+        }
         let cmd = match cwd {
             Some(dir) => cmd.cwd(dir),
             None => cmd,
         };
-        // codex loads MCP servers from its inherited CODEX_HOME regardless of
-        // the empty ACP `mcpServers` list, so the one-shot child gets the same
-        // isolated throwaway home the model probe uses — a one-shot must never
-        // start user-configured MCP servers. The TempDir binding keeps the
-        // isolated home alive for the duration of the run.
-        let (cmd, _codex_home) = if provider_id == "codex" {
-            match crate::provider_models::with_isolated_codex_home(cmd) {
-                Ok((cmd, home)) => (cmd, Some(home)),
-                Err(e) => {
-                    return Ok(unavailable(format!(
-                        "codex: failed to create isolated CODEX_HOME: {e}"
-                    )))
-                }
+        // Unit tests that pin a fake npx also use an isolated installed CLI.
+        // Production and WSS tests always use canonical host discovery.
+        #[cfg(all(test, unix))]
+        let fixture_home = tempfile::tempdir().expect("fixture installed home");
+        #[cfg(all(test, unix))]
+        let cmd = if self.one_shot_npx.is_some() {
+            if let Some(cli) =
+                intent_providers::installed_cli::InstalledCli::for_provider(provider_id)
+            {
+                cmd.prepare_with_context(crate::installed_cli::test_context_in(
+                    cli,
+                    fixture_home.path(),
+                ))
+                .await
+                .map_err(intent_core::Error::Internal)?
+            } else {
+                cmd
             }
         } else {
-            (cmd, None)
+            cmd
         };
+        // Missing installed runtimes are an actionable unavailable result,
+        // rather than an internal wire error whose details would be hidden.
+        let cmd = match cmd.prepare_installed().await {
+            Ok(cmd) => cmd,
+            Err(reason) => return Ok(unavailable(reason)),
+        };
+        let (turn_prompt, session_meta) =
+            one_shot_session_shape(provider_id, prompt, system_prompt);
         match run_one_shot_acp(
+            Some((
+                provider_id,
+                Box::pin(async {
+                    self.effective_settings()
+                        .providers
+                        .fast_mode
+                        .get(provider_id)
+                        .copied()
+                        .unwrap_or(false)
+                }),
+            )),
             cmd,
-            full_prompt,
+            &turn_prompt,
             config_option_model(provider, model),
+            session_meta,
             Duration::from_millis(timeout_ms),
+            effort,
         )
         .await
         {
@@ -470,6 +668,7 @@ impl Services {
                 waited_ms,
                 limit,
             }),
+            Err(OneShotError::InvalidEffort(message)) => Err(Error::InvalidParams(message)),
             Err(err) => Err(Error::Internal(format!("{provider_id}: {err}"))),
         }
     }
@@ -479,6 +678,48 @@ impl Services {
 mod tests {
     use super::*;
     use intent_store::Store;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fast_mode_complete_once_reads_live_daemon_preferences() {
+        use std::os::unix::fs::PermissionsExt;
+        for provider in ["claude-code", "codex"] {
+            let dir = crate::test_support::test_tempdir("fast-mode-complete-");
+            let bin = dir.path().join("adapter.mjs");
+            std::fs::write(&bin, format!("#!/usr/bin/env node\nif(process.argv.includes('--version')){{console.log('11.0.0');process.exit(0);}}\nconst provider = {provider:?}; const failOff = false; const logPath = {};\n{}", json!(dir.path().join("calls.jsonl")), include_str!("../tests/fixtures/fast-mode.mjs"))).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let (_tmp, services) = services_with_settings(&[
+                ("model.defaultProvider", json!(provider)),
+                ("quickActions.defaultReasoningEffort", json!("high")),
+                ("providers.paths", json!({provider:bin})),
+            ])
+            .await;
+            let services = services.with_one_shot_npx(Some(bin));
+            for enabled in [false, true, false] {
+                services
+                    .settings_registry()
+                    .unwrap()
+                    .apply(&[("providers.fastMode".into(), json!({provider:enabled}))])
+                    .unwrap();
+                let result = services
+                    .agent_complete_once_op(
+                        "inspect".into(),
+                        None,
+                        Some("supported".into()),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let state: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
+                assert_eq!(state["fastMode"], enabled);
+                assert_eq!(state["model"], "supported");
+                assert_eq!(state["effort"], "high");
+            }
+        }
+    }
 
     /// RAII temp `SQLite` store: the db (and its `-wal`/`-shm` sidecars) live in
     /// a guarded temp dir removed on drop — including on panic — unless
@@ -536,7 +777,7 @@ mod tests {
         let (_tmp, services) =
             services_with_bin(PathBuf::from("/nonexistent/intentd-test/auggie")).await;
         let err = services
-            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Internal(_)), "got {err:?}");
@@ -555,7 +796,7 @@ mod tests {
         let services =
             Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -584,6 +825,19 @@ mod tests {
             .collect();
         registry.apply(&applied).expect("apply settings");
         let services = Services::new(store).with_settings_registry(registry);
+        // Installed providers use a pinned adapter through npx. Route their
+        // fixture executables through the explicit npx test seam as well.
+        let fixture_npx = keys
+            .iter()
+            .find(|(key, _)| *key == "providers.paths")
+            .and_then(|(_, paths)| paths.get("claude-code").or_else(|| paths.get("codex")))
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        let services = if let Some(npx) = fixture_npx {
+            services.with_one_shot_npx(Some(npx))
+        } else {
+            services
+        };
         (tmp, services)
     }
 
@@ -636,9 +890,7 @@ rl.on('line', (line) => {{
     #[cfg(unix)]
     #[tokio::test]
     async fn complete_once_routes_acp_provider_to_one_shot_runner() {
-        // codex resolves its adapter through `providers.paths["codex"]`
-        // (`find_provider_binary`'s explicit tier), so the whole route runs
-        // against the mock adapter with no provider install.
+        // The npx seam runs the mock adapter without npm or model access.
         let (_dir, bin) = fake_acp_adapter("ok", "🤖\nslug-from-acp");
         let (_tmp, services) = services_with_settings(&[
             ("model.defaultProvider", serde_json::json!("codex")),
@@ -649,13 +901,184 @@ rl.on('line', (line) => {{
         ])
         .await;
         let v = services
-            .agent_complete_once_op("make a slug".into(), None, None, None, None, None)
+            .with_one_shot_npx(Some(bin))
+            .agent_complete_once_op("make a slug".into(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(
             v["text"], "slug-from-acp",
             "the ACP reply must come back cleaned, like the auggie route"
         );
+    }
+
+    /// Like [`fake_acp_adapter`], but the reply is a JSON object echoing the
+    /// `session/new` params and the `session/prompt` text the adapter saw, so
+    /// a test can assert the exact setup shape a provider route puts on the
+    /// wire.
+    #[cfg(unix)]
+    fn fake_acp_adapter_echoing_session(tag: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::tests::test_tempdir(&format!("intentd-complete-acp-echo-{tag}-"));
+        let script = dir.path().join("adapter.mjs");
+        std::fs::write(
+            &script,
+            r"import readline from 'node:readline';
+const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+const rl = readline.createInterface({ input: process.stdin, terminal: false });
+let sessionNew = null;
+let selectedModel = null;
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') return send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+  if (msg.method === 'session/new') { sessionNew = msg.params; return send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1' } }); }
+  if (msg.method === 'session/set_config_option') { selectedModel = msg.params.value; return send({ jsonrpc: '2.0', id: msg.id, result: {} }); }
+  if (msg.method === 'session/prompt') {
+    const text = JSON.stringify({ sessionNew, prompt: msg.params.prompt[0].text, selectedModel, argv: process.argv.slice(2), config: process.argv.includes('--workspaces=false') ? process.env.CODEX_CONFIG : null, hasCodexPath: 'CODEX_PATH' in process.env, codexPath: process.env.CODEX_PATH });
+    send({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: { sessionId: 's1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } },
+    });
+    send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+  }
+});
+",
+        )
+        .expect("write mock adapter");
+        let bin = dir.path().join("acp-adapter");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nexec node {:?} \"$@\"\n",
+                script.to_string_lossy()
+            ),
+        )
+        .expect("write adapter wrapper");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, bin)
+    }
+
+    /// Run `agent.completeOnce` on `provider` against the echoing adapter and
+    /// return the parsed `{ sessionNew, prompt }` the adapter observed.
+    #[cfg(unix)]
+    async fn observed_session(
+        provider: &str,
+        bin: &std::path::Path,
+        system_prompt: Option<&str>,
+    ) -> serde_json::Value {
+        let (_tmp, services) = services_with_settings(&[
+            ("model.defaultProvider", serde_json::json!(provider)),
+            (
+                "providers.paths",
+                serde_json::json!({ provider: bin.to_string_lossy() }),
+            ),
+        ])
+        .await;
+        let services =
+            if intent_providers::installed_cli::InstalledCli::for_provider(provider).is_some() {
+                services.with_one_shot_npx(Some(bin.to_path_buf()))
+            } else {
+                services
+            };
+        let v = services
+            .agent_complete_once_op(
+                "summarize".into(),
+                system_prompt.map(str::to_string),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        serde_json::from_str(v["text"].as_str().expect("text reply")).expect("echo parses")
+    }
+
+    /// intent-hq/intent#4587: the claude-code one-shot is a slimmed utility
+    /// session — the caller's system prompt replaces the `claude_code` preset
+    /// via a string `_meta.systemPrompt`, the built-in tools are disabled
+    /// mechanically, the project/local setting tiers are dropped, ambient
+    /// MCP servers are excluded, and the turn carries the bare prompt (no
+    /// duplicated `System:` composition).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_claude_code_sends_slimmed_session_meta() {
+        let (_dir, bin) = fake_acp_adapter_echoing_session("claude");
+        let seen = observed_session("claude-code", &bin, Some("be terse")).await;
+        assert_eq!(
+            seen["sessionNew"]["_meta"],
+            serde_json::json!({
+                "systemPrompt": "be terse",
+                "claudeCode": {
+                    "options": {
+                        "tools": [],
+                        "settingSources": ["user"],
+                        "strictMcpConfig": true,
+                    }
+                },
+            })
+        );
+        assert_eq!(seen["sessionNew"]["mcpServers"], serde_json::json!([]));
+        assert_eq!(seen["prompt"], "summarize");
+    }
+
+    /// Without a caller system prompt the slot is still filled: an absent
+    /// `_meta.systemPrompt` would reinstate the preset.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_claude_code_fills_system_prompt_when_caller_sent_none() {
+        let (_dir, bin) = fake_acp_adapter_echoing_session("claude-default");
+        let seen = observed_session("claude-code", &bin, None).await;
+        assert_eq!(
+            seen["sessionNew"]["_meta"]["systemPrompt"],
+            CLAUDE_CODE_UTILITY_SYSTEM_PROMPT
+        );
+        assert_eq!(
+            seen["sessionNew"]["_meta"]["claudeCode"]["options"]["tools"],
+            serde_json::json!([])
+        );
+        assert_eq!(seen["prompt"], "summarize");
+    }
+
+    /// Other ACP providers are untouched: no `_meta` on `session/new`, and the
+    /// system prompt still rides the turn as the `System:` composition.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_non_claude_provider_keeps_plain_session_new() {
+        let (_dir, bin) = fake_acp_adapter_echoing_session("codex");
+        let seen = observed_session("codex", &bin, Some("be terse")).await;
+        assert!(
+            seen["sessionNew"].get("_meta").is_none(),
+            "codex must see no `_meta`, got: {}",
+            seen["sessionNew"]
+        );
+        assert_eq!(seen["sessionNew"]["mcpServers"], serde_json::json!([]));
+        assert_eq!(seen["prompt"], "System: be terse\n\nsummarize");
+    }
+
+    #[test]
+    fn one_shot_session_shape_per_provider() {
+        let (prompt, meta) = one_shot_session_shape("claude-code", "p", Some("s"));
+        assert_eq!(prompt, "p");
+        assert_eq!(meta.as_ref().unwrap()["systemPrompt"], "s");
+        let (prompt, meta) = one_shot_session_shape("claude-code", "p", None);
+        assert_eq!(prompt, "p");
+        assert_eq!(
+            meta.as_ref().unwrap()["systemPrompt"],
+            CLAUDE_CODE_UTILITY_SYSTEM_PROMPT
+        );
+        for provider in ["codex", "pi"] {
+            assert_eq!(
+                one_shot_session_shape(provider, "p", Some("s")),
+                ("System: s\n\np".to_string(), None)
+            );
+            assert_eq!(
+                one_shot_session_shape(provider, "p", None),
+                ("p".to_string(), None)
+            );
+        }
     }
 
     #[tokio::test]
@@ -666,7 +1089,7 @@ rl.on('line', (line) => {{
             services_with_settings(&[("model.defaultProvider", serde_json::json!("opencode"))])
                 .await;
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -692,7 +1115,7 @@ rl.on('line', (line) => {{
                 .await;
         let services = services.with_one_shot_npx(None);
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -729,7 +1152,7 @@ rl.on('line', (line) => {
     send({
       jsonrpc: '2.0',
       method: 'session/update',
-      params: { sessionId: 's1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: process.env.CODEX_HOME ?? 'unset' } } },
+      params: { sessionId: 's1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: JSON.stringify({ home: process.env.CODEX_HOME, mode: process.env.INITIAL_AGENT_MODE }) } } },
     });
     send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
   }
@@ -757,10 +1180,19 @@ rl.on('line', (line) => {
         ])
         .await;
         let v = services
-            .agent_complete_once_op("echo home".into(), None, None, None, None, None)
+            .with_one_shot_npx(Some(bin))
+            .agent_complete_once_op("echo home".into(), None, None, None, None, None, None)
             .await
             .unwrap();
-        let child_home = v["text"].as_str().expect("adapter echoed CODEX_HOME");
+        let child_env: serde_json::Value =
+            serde_json::from_str(v["text"].as_str().expect("adapter echoed environment")).unwrap();
+        assert_eq!(
+            child_env["mode"],
+            std::env::var("INITIAL_AGENT_MODE").unwrap_or_else(|_| "agent-full-access".into())
+        );
+        let child_home = child_env["home"]
+            .as_str()
+            .expect("adapter echoed CODEX_HOME");
         assert!(
             child_home.contains("intentd-codex-home-"),
             "the one-shot child must see the isolated throwaway CODEX_HOME, got: {child_home}"
@@ -804,37 +1236,223 @@ rl.on('line', (line) => {
     }
 
     #[test]
+    fn one_shot_codex_uses_pinned_runtime_even_with_resolved_adapter() {
+        let codex = intent_providers::find_provider("codex").unwrap();
+        let npx = PathBuf::from("/test/node/bin/npx");
+        for model in [None, Some("gpt-5.5"), Some("gpt-5.5/high")] {
+            let cmd = one_shot_launch(
+                codex,
+                Some(PathBuf::from("/custom/codex-acp")),
+                Some(npx.clone()),
+                model,
+            )
+            .unwrap();
+            assert_eq!(cmd.program(), npx.as_path());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_shot_codex_policy_replaces_enabling_env_in_child() {
+        let (dir, npx) = fake_acp_adapter_echoing_session("codex-policy");
+        let codex = intent_providers::find_provider("codex").unwrap();
+        for model in [None, Some("gpt-5.5"), Some("gpt-5.5/high")] {
+            for enabled in [json!(true), json!({"enabled": true})] {
+                let cmd = one_shot_launch(
+                    codex,
+                    Some(PathBuf::from("/custom/forbidden-codex-acp")),
+                    Some(npx.clone()),
+                    model,
+                )
+                .unwrap()
+                .env("CODEX_PATH", "/custom/forbidden-codex")
+                .env(
+                    "CODEX_CONFIG",
+                    json!({"agents": {"enabled": true}, "features": {"multi_agent_v2": enabled}})
+                        .to_string(),
+                );
+                // Test prompts finalize policy after their provider env merge.
+                let cmd = apply_one_shot_launch_policy(codex, cmd)
+                    .prepare_with_context(crate::installed_cli::test_context_in(
+                        intent_providers::installed_cli::InstalledCli::Codex,
+                        &dir.path().join("runtime"),
+                    ))
+                    .await
+                    .unwrap();
+                let reply = run_one_shot_acp(
+                    None,
+                    cmd,
+                    "hello",
+                    config_option_model(codex, model),
+                    None,
+                    Duration::from_secs(5),
+                    &OneShotEffort::default(),
+                )
+                .await
+                .unwrap();
+                let observed: Value = serde_json::from_str(&reply).unwrap();
+                assert_eq!(
+                    observed["argv"],
+                    json!([
+                        "--workspaces=false",
+                        "-y",
+                        intent_providers::config::CODEX_ACP_NPX_PACKAGE
+                    ])
+                );
+                assert_eq!(observed["hasCodexPath"], true);
+                assert_eq!(
+                    observed["codexPath"],
+                    json!(dir.path().join("runtime/codex"))
+                );
+                let config: Value =
+                    serde_json::from_str(observed["config"].as_str().unwrap()).unwrap();
+                assert_eq!(
+                    config,
+                    json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}})
+                );
+                assert_eq!(
+                    observed["selectedModel"],
+                    json!(config_option_model(codex, model))
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_codex_reports_missing_npx_despite_custom_adapter() {
+        let (_dir, adapter) = fake_acp_adapter("native-only", "must not run");
+        let (_tmp, services) = services_with_settings(&[
+            ("model.defaultProvider", json!("codex")),
+            ("providers.paths", json!({"codex": adapter})),
+        ])
+        .await;
+        let result = services
+            .with_one_shot_npx(None)
+            .agent_complete_once_op("hello".into(), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result["available"], false);
+        let reason = result["reason"].as_str().unwrap();
+        for expected in ["Node.js", "npx", "Install"] {
+            assert!(reason.contains(expected), "{reason}");
+        }
+    }
+
+    #[test]
+    fn one_shot_codex_requires_npx_even_with_resolved_adapter() {
+        let codex = intent_providers::find_provider("codex").unwrap();
+        assert!(
+            one_shot_launch(codex, Some(PathBuf::from("/custom/codex-acp")), None, None,).is_none()
+        );
+    }
+
+    #[test]
+    fn one_shot_codex_enforces_both_subagent_settings() {
+        let codex = intent_providers::find_provider("codex").unwrap();
+        let cmd = one_shot_launch(codex, None, Some(PathBuf::from("/test/npx")), None).unwrap();
+        let config = cmd
+            .env_vars()
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "CODEX_CONFIG")
+            .map(|(_, value)| value.to_str().unwrap());
+        assert_eq!(
+            config.map(|value| serde_json::from_str::<Value>(value).unwrap()),
+            Some(json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}))
+        );
+        assert!(!cmd.removed_env_vars().iter().any(|key| key == "CODEX_PATH"));
+        assert!(!cmd
+            .removed_env_vars()
+            .iter()
+            .any(|key| key == "CODEX_CONFIG"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_one_shot_codex_ignores_explicit_adapter() {
+        let (_dir, adapter) = fake_acp_adapter("codex-ignored", "must not run");
+        let codex = intent_providers::find_provider("codex").unwrap();
+        assert_eq!(resolve_one_shot_binary(codex, adapter.to_str()), None);
+    }
+
+    #[test]
     fn one_shot_launch_resolution_precedence() {
         let npx = PathBuf::from("/usr/bin/npx");
         let bin = PathBuf::from("/opt/bin/codex-acp");
 
-        // npx-only (claude-code, pi): a resolved binary (the validated
-        // adapter override — monorepo#4352) wins even without npx; otherwise
-        // the pinned package runs via npx, and no npx means no launch at all.
+        // Both installed providers use their reviewed package, even when a
+        // legacy adapter path is present.
         let claude = intent_providers::find_provider("claude-code").unwrap();
         let adapter = PathBuf::from("/opt/lib/claude-agent-acp/dist/index.js");
         let launch = one_shot_launch(claude, Some(adapter.clone()), Some(npx.clone()), None)
             .expect("override launches");
-        assert_eq!(launch.program(), adapter.as_path());
-        assert!(one_shot_launch(claude, Some(adapter), None, None).is_some());
+        assert_eq!(launch.program(), npx.as_path());
+        assert!(one_shot_launch(claude, Some(adapter), None, None).is_none());
         let launch = one_shot_launch(claude, None, Some(npx.clone()), None).expect("npx launches");
         assert_eq!(launch.program(), npx.as_path());
         assert!(one_shot_launch(claude, None, None, None).is_none());
 
-        // codex: resolved binary first, pinned npx fallback second, nothing
-        // when neither resolves (the `{ available: false }` path).
+        // Codex ignores resolved adapters and always requires npx.
         let codex = intent_providers::find_provider("codex").unwrap();
-        assert!(one_shot_launch(codex, Some(bin), None, None).is_some());
+        assert!(one_shot_launch(codex, Some(bin), None, None).is_none());
         assert!(one_shot_launch(codex, None, Some(npx), None).is_some());
         assert!(one_shot_launch(codex, None, None, None).is_none());
     }
 
-    /// monorepo#4352: an npx-only provider resolves ONLY a valid adapter
-    /// override — never a PATH/managed-bin hit — so one-shots and the live
-    /// test prompt run the same adapter `resolve_spawn` would.
+    #[test]
+    fn one_shot_codex_mode_and_policy_preserve_other_providers() {
+        let codex = intent_providers::find_provider("codex").unwrap();
+        for via_npx in [false, true] {
+            let cmd = one_shot_launch(
+                codex,
+                (!via_npx).then(|| PathBuf::from("/opt/bin/codex-acp")),
+                Some(PathBuf::from("/usr/bin/npx")),
+                None,
+            )
+            .unwrap();
+            // The provider suite covers the explicit-value matrix under its
+            // env lock; do not mutate process-global env in service tests.
+            let mut expected: Vec<_> = intent_providers::build_provider_env_for_spawn(
+                codex, None, None, None, None, true, None,
+            )
+            .into_iter()
+            .map(|(k, v)| (k, std::ffi::OsString::from(v)))
+            .collect();
+            expected.push((
+                "CODEX_CONFIG".to_string(),
+                intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into(),
+            ));
+            assert_eq!(cmd.env_vars(), expected.as_slice());
+            let removed: Vec<_> = cmd.removed_env_vars().iter().map(String::as_str).collect();
+            assert!(removed.is_empty());
+        }
+        for id in intent_providers::all_provider_ids()
+            .into_iter()
+            .filter(|id| *id != "codex")
+        {
+            let provider = intent_providers::find_provider(id).unwrap();
+            let cmd = one_shot_launch(
+                provider,
+                Some(PathBuf::from("/mock/adapter")),
+                Some(PathBuf::from("/mock/npx")),
+                None,
+            )
+            .unwrap();
+            assert!(
+                !cmd.env_vars()
+                    .iter()
+                    .any(|(key, _)| key == "INITIAL_AGENT_MODE" || key == "CODEX_CONFIG"),
+                "{id} must not acquire Codex policy"
+            );
+        }
+    }
+
+    /// Installed providers ignore legacy adapter paths consistently for
+    /// one-shots, test prompts, model probes and persistent sessions.
     #[cfg(unix)]
     #[test]
-    fn resolve_one_shot_binary_npx_only_honors_only_valid_override() {
+    fn resolve_one_shot_binary_ignores_legacy_installed_adapter_override() {
         use std::os::unix::fs::PermissionsExt;
         let claude = intent_providers::find_provider("claude-code").unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -843,7 +1461,7 @@ rl.on('line', (line) => {
         std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             resolve_one_shot_binary(claude, Some(adapter.to_str().unwrap())),
-            Some(adapter.clone())
+            None
         );
         assert_eq!(resolve_one_shot_binary(claude, None), None);
         let missing = dir.path().join("missing");
@@ -865,7 +1483,7 @@ rl.on('line', (line) => {
         let (_bin_dir, bin) = fake_auggie("ok", "printf '🤖\\nslug-goes-here\\n'");
         let (_tmp, services) = services_with_bin(bin).await;
         let v = services
-            .agent_complete_once_op("make a slug".into(), None, None, None, None, None)
+            .agent_complete_once_op("make a slug".into(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(v["text"], "slug-goes-here");
@@ -877,7 +1495,7 @@ rl.on('line', (line) => {
         let (_bin_dir, bin) = fake_auggie("slow", "sleep 30");
         let (_tmp, services) = services_with_bin(bin).await;
         let err = services
-            .agent_complete_once_op("hi".into(), None, None, None, None, Some(200))
+            .agent_complete_once_op("hi".into(), None, None, None, None, Some(200), None)
             .await
             .unwrap_err();
         assert!(
@@ -899,7 +1517,7 @@ rl.on('line', (line) => {
         let (_bin_dir, bin) = fake_auggie("fail", "exit 3");
         let (_tmp, services) = services_with_bin(bin).await;
         let err = services
-            .agent_complete_once_op("hi".into(), None, None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
             .await
             .unwrap_err();
         assert!(
@@ -936,7 +1554,7 @@ rl.on('line', (line) => {
             .expect("set setting");
         let services = Services::new(store.clone()).with_settings_registry(registry.clone());
         let result = services
-            .agent_complete_once_op("test".into(), None, None, None, None, None)
+            .agent_complete_once_op("test".into(), None, None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(result["text"], "from-setting");
@@ -950,7 +1568,7 @@ rl.on('line', (line) => {
             .expect("set setting");
         let services = Services::new(store.clone()).with_settings_registry(registry.clone());
         let err = services
-            .agent_complete_once_op("test".into(), None, None, None, None, None)
+            .agent_complete_once_op("test".into(), None, None, None, None, None, None)
             .await
             .unwrap_err();
         assert!(
@@ -975,6 +1593,7 @@ rl.on('line', (line) => {
                 None,
                 Some(WorkspaceId::from("ws-missing")),
                 None,
+                None,
             )
             .await
             .unwrap_err();
@@ -996,6 +1615,7 @@ rl.on('line', (line) => {
             .agent_complete_once_op(
                 "why?".into(),
                 Some("be terse".into()),
+                None,
                 None,
                 None,
                 None,
@@ -1029,14 +1649,14 @@ rl.on('line', (line) => {
     /// The expected pair for a rung that resolved on the effective provider.
     /// (Wrapped in `Some` to mirror the resolver's return type — `None` is
     /// the closed gate.)
-    #[allow(clippy::unnecessary_wraps)]
+    #[expect(clippy::unnecessary_wraps)]
     fn on(provider: &str, model: &str) -> Option<(String, Option<String>)> {
         Some((provider.to_string(), Some(model.to_string())))
     }
 
     /// The expected pair for a chain that fell through entirely: the
     /// effective provider with its CLI default.
-    #[allow(clippy::unnecessary_wraps)]
+    #[expect(clippy::unnecessary_wraps)]
     fn cli_default(provider: &str) -> Option<(String, Option<String>)> {
         Some((provider.to_string(), None))
     }
@@ -1332,7 +1952,15 @@ rl.on('line', (line) => {
         let services = services.with_settings_registry(std::sync::Arc::new(registry));
 
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, Some("commit".into()), None, None)
+            .agent_complete_once_op(
+                "hi".into(),
+                None,
+                None,
+                Some("commit".into()),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert!(
@@ -1341,7 +1969,7 @@ rl.on('line', (line) => {
         );
 
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, Some("pr".into()), None, None)
+            .agent_complete_once_op("hi".into(), None, None, Some("pr".into()), None, None, None)
             .await
             .unwrap();
         assert!(
@@ -1356,6 +1984,7 @@ rl.on('line', (line) => {
                 None,
                 Some("opus4.7".into()),
                 Some("commit".into()),
+                None,
                 None,
                 None,
             )
@@ -1392,12 +2021,228 @@ rl.on('line', (line) => {
         let services = services.with_settings_registry(std::sync::Arc::new(registry));
 
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, Some("commit".into()), None, None)
+            .agent_complete_once_op(
+                "hi".into(),
+                None,
+                None,
+                Some("commit".into()),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert!(
             !v["text"].as_str().unwrap().contains("--model"),
             "providerSettings must not resolve a model, got {v:?}"
         );
+    }
+    #[test]
+    fn quick_action_effort_resolution_preserves_candidates_and_provider_isolation() {
+        let mut settings = intent_core::settings_file::SettingsFile::default();
+        settings.model.default_reasoning_effort = Some("ordinary-agent-only".into());
+        assert!(
+            resolve_quick_action_effort(&settings, None, Some("codex"), "codex", None)
+                .saved
+                .is_empty()
+        );
+        settings.quick_actions.default_reasoning_effort = Some(" low ".into());
+        settings
+            .quick_actions
+            .type_reasoning_effort_overrides
+            .insert("commit".into(), " high ".into());
+        for explicit in [None, Some(""), Some(" "), Some("max")] {
+            let resolved = resolve_quick_action_effort(
+                &settings,
+                Some("commit"),
+                Some("codex"),
+                "codex",
+                explicit,
+            );
+            assert_eq!(resolved.saved, ["high", "low"]);
+            assert_eq!(
+                resolved.explicit.as_deref(),
+                explicit.filter(|s| !s.trim().is_empty())
+            );
+        }
+        assert_eq!(
+            resolve_quick_action_effort(&settings, Some(" commit "), Some("codex"), "codex", None)
+                .saved,
+            ["high", "low"],
+            "action type normalization must match model resolution"
+        );
+        let other = resolve_quick_action_effort(
+            &settings,
+            Some("commit"),
+            Some("codex"),
+            "claude-code",
+            Some("high"),
+        );
+        assert!(other.saved.is_empty());
+        assert_eq!(other.explicit.as_deref(), Some("high"));
+        assert_eq!(
+            resolve_quick_action_effort(&settings, None, Some("codex"), "codex", None).saved,
+            ["low"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quick_action_effort_reaches_provider_with_explicit_model_and_cold_catalog() {
+        let (_dir, bin, _, _cli_env) = crate::test_support::quick_action_effort_adapter(&json!({}));
+        let (_tmp, svc) = services_with_settings(&[
+            ("model.defaultProvider", json!("claude-code")),
+            ("providers.paths", json!({"claude-code":bin})),
+            ("quickActions.defaultReasoningEffort", json!("low")),
+            (
+                "quickActions.typeReasoningEffortOverrides",
+                json!({"commit":"high", "pr":"stale", "fast":""}),
+            ),
+            ("model.defaultReasoningEffort", json!("ordinary-agent-only")),
+        ])
+        .await;
+        for (kind, explicit, expected) in [
+            (Some("commit"), None, "high"),
+            (Some("pr"), None, "low"),
+            (Some("fast"), None, "low"),
+            (None, None, "low"),
+            (Some("commit"), Some("low"), "low"),
+            (Some("commit"), Some("  "), "high"),
+        ] {
+            let result = svc
+                .agent_complete_once_op(
+                    "hello".into(),
+                    None,
+                    Some("chosen".into()),
+                    kind.map(str::to_owned),
+                    None,
+                    None,
+                    explicit.map(str::to_owned),
+                )
+                .await
+                .unwrap();
+            let reply: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
+            assert_eq!(reply, json!({"model":"chosen", "effort":expected}));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quick_action_effort_auggie_explicit_rejects_and_saved_does_not_add_flags() {
+        let (_dir, bin) = fake_auggie_echoing_args("effort");
+        let (_tmp, svc) = services_with_bin(bin).await;
+        let error = svc
+            .agent_complete_once_op(
+                "hi".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("high".into()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), -32602);
+        svc.settings_registry
+            .as_ref()
+            .unwrap()
+            .apply(&[("quickActions.defaultReasoningEffort".into(), json!("high"))])
+            .unwrap();
+        let reply = svc
+            .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(!reply["text"].as_str().unwrap().contains("effort"));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quick_action_effort_live_selector_overrules_nonempty_cached_levels() {
+        for (cached, live, expected) in [("low", "high", "high"), ("high", "low", "low")] {
+            let (_dir, bin, _, _cli_env) =
+                crate::test_support::quick_action_effort_adapter(&json!({"modelValues":[live]}));
+            let (_tmp, svc) = services_with_settings(&[
+                ("model.defaultProvider", json!("claude-code")),
+                ("providers.paths", json!({"claude-code":bin})),
+                ("quickActions.defaultModel", json!("chosen")),
+                ("quickActions.defaultReasoningEffort", json!("low")),
+                (
+                    "quickActions.typeReasoningEffortOverrides",
+                    json!({"commit":"high"}),
+                ),
+            ])
+            .await;
+            let version = (crate::model_catalog::source_for("claude-code")
+                .unwrap()
+                .version_key)();
+            svc.models_catalog.store_for_test(
+                "claude-code",
+                &version,
+                vec![json!({
+                    "id":"chosen", "provider":"claude-code", "effortLevels":[cached]
+                })],
+            );
+            assert_eq!(
+                svc.cached_models().cached_effort_levels("chosen"),
+                Some(vec![cached.to_owned()])
+            );
+            let reply = svc
+                .agent_complete_once_op(
+                    "hi".into(),
+                    None,
+                    None,
+                    Some("commit".into()),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let text: Value = serde_json::from_str(reply["text"].as_str().unwrap()).unwrap();
+            assert_eq!(text["effort"], expected);
+            let explicit = svc
+                .agent_complete_once_op(
+                    "hi".into(),
+                    None,
+                    None,
+                    Some("commit".into()),
+                    None,
+                    None,
+                    Some("high".into()),
+                )
+                .await;
+            if live == "high" {
+                assert!(explicit.is_ok());
+            } else {
+                assert_eq!(explicit.unwrap_err().code(), -32602);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quick_action_effort_legacy_compound_model_does_not_leak_provider_defaults() {
+        let (_dir, bin, _, _cli_env) = crate::test_support::quick_action_effort_adapter(&json!({}));
+        let (tmp, svc) =
+            services_with_settings(&[("providers.paths", json!({"claude-code":bin}))]).await;
+        let config = tmp.dir.path().join("legacy.toml");
+        std::fs::write(&config, format!("[model]\ndefaultProvider = \"codex\"\n[quickActions]\ndefaultModel = \"claude-code:chosen\"\ndefaultReasoningEffort = \"low\"\n[quickActions.typeReasoningEffortOverrides]\ncommit = \"high\"\n[providers.paths]\nclaude-code = {bin:?}\n")).unwrap();
+        let svc = svc.with_settings_registry(std::sync::Arc::new(
+            crate::SettingsRegistry::load(config).unwrap(),
+        ));
+        let reply = svc
+            .agent_complete_once_op(
+                "hi".into(),
+                None,
+                None,
+                Some("commit".into()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let text: Value = serde_json::from_str(reply["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text, json!({"model":"chosen", "effort":"medium"}));
     }
 }

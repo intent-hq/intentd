@@ -63,7 +63,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,7 +78,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd";
@@ -99,15 +98,11 @@ impl Drop for Daemon {
                 eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-hook-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-hook-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -115,9 +110,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -387,6 +381,7 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -412,11 +407,13 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.expect("insert ws");
     let note = services
@@ -471,15 +468,15 @@ async fn await_conversation_contains<S>(
     }
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Full background-hook lifecycle over the real WSS wire (see module docs).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn hook_lifecycle_over_wss() {
     let Some(script) = gate("WSS hook lifecycle E2E") else {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
 
     // Agent-JS payloads, one per prompt marker. The inner hook scripts are
@@ -491,12 +488,16 @@ async fn hook_lifecycle_over_wss() {
     );
     // Retired-hook recovery: `ws.hook.get` on the dispatcher AFTER it retired
     // must return the full row — original `code` included — through the real
-    // prelude → ACP callback → service → store route.
+    // prelude → ACP callback → service → store route. The retired row is only
+    // listed with `includeRetired: true`, and then WITHOUT `code` (the light
+    // projection) — `ws.hook.get` is the recovery path.
     let get_retired_js = format!(
-        "const hooks = await ws.hook.list(); \
+        "const hooks = await ws.hook.list({{ includeRetired: true }}); \
          const retired = hooks.find(h => h.name === 'dispatcher'); \
          const row = await ws.hook.get(retired.hookId); \
          const out = ['getState=' + row.state]; \
+         out.push('listCodeOmitted=' + (retired.code === undefined)); \
+         out.push('listedByDefault=' + (await ws.hook.list()).some(h => h.name === 'dispatcher')); \
          out.push('codeMatch=' + (row.code === {code})); \
          out.push('idMatch=' + (row.hookId === retired.hookId)); \
          return out.join(' ');",
@@ -677,9 +678,8 @@ async fn hook_lifecycle_over_wss() {
     })
     .to_string();
 
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -868,24 +868,47 @@ async fn hook_lifecycle_over_wss() {
         "agent.get serves waitingOnHooks for the hook-owning agent: {got}"
     );
 
-    // FE read: hook.list reports both hooks with the wire `{ hooks }` shape.
+    // FE read: a bare hook.list is ACTIVE-only (intent-hq/intent#5307) — the
+    // retired dispatcher is absent and the watcher row is the full shape,
+    // `code` included.
     let listed = wss_rpc(&mut rpc, 201, "hook.list", json!({ "workspaceId": ws_id })).await;
     let hooks = listed["hooks"].as_array().expect("hooks array");
-    assert_eq!(hooks.len(), 2, "dispatcher + watcher listed: {listed}");
-    let watcher = hooks
-        .iter()
-        .find(|h| h["hookId"] == json!(watcher_id))
-        .unwrap_or_else(|| panic!("watcher in hook.list: {listed}"));
+    assert_eq!(hooks.len(), 1, "active watcher only by default: {listed}");
+    let watcher = &hooks[0];
+    assert_eq!(watcher["hookId"], json!(watcher_id));
     assert_eq!(watcher["name"], "watcher");
     assert_eq!(watcher["state"], "scheduled");
     assert_eq!(watcher["delayMs"], 60_000);
     assert_eq!(watcher["agentId"], json!(agent_id));
     assert_eq!(watcher["runCount"], 1, "validation run counted: {watcher}");
+    assert!(
+        watcher["code"].is_string(),
+        "active rows keep `code`: {watcher}"
+    );
+    // `includeRetired: true` reports both hooks; the retired dispatcher is
+    // the light projection (no code / lastState / lastLogs).
+    let listed = wss_rpc(
+        &mut rpc,
+        209,
+        "hook.list",
+        json!({ "workspaceId": ws_id, "includeRetired": true }),
+    )
+    .await;
+    let hooks = listed["hooks"].as_array().expect("hooks array");
+    assert_eq!(hooks.len(), 2, "dispatcher + watcher listed: {listed}");
     let dispatcher = hooks
         .iter()
         .find(|h| h["name"] == json!("dispatcher"))
         .unwrap_or_else(|| panic!("dispatcher in hook.list: {listed}"));
     assert_eq!(dispatcher["state"], "dispatched");
+    assert_eq!(dispatcher["agentId"], json!(agent_id));
+    for heavy in ["code", "lastState", "lastLogs"] {
+        assert_eq!(
+            dispatcher.get(heavy),
+            None,
+            "retired row omits `{heavy}`: {dispatcher}"
+        );
+    }
     // A one-shot hook's sole fire is still counted: `dispatchCount` means
     // "fires so far" for every hook, not just perpetual ones.
     assert_eq!(dispatcher["dispatchCount"], 1, "{dispatcher}");
@@ -902,9 +925,15 @@ async fn hook_lifecycle_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-    for (i, needle) in ["getState=dispatched", "codeMatch=true", "idMatch=true"]
-        .into_iter()
-        .enumerate()
+    for (i, needle) in [
+        "getState=dispatched",
+        "listCodeOmitted=true",
+        "listedByDefault=false",
+        "codeMatch=true",
+        "idMatch=true",
+    ]
+    .into_iter()
+    .enumerate()
     {
         await_conversation_contains(
             &mut rpc,
@@ -1225,7 +1254,13 @@ async fn hook_lifecycle_over_wss() {
         "[Background hook \\\"counter\\\"] counted 2",
     )
     .await;
-    let listed = wss_rpc(&mut rpc, 630, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        630,
+        "hook.list",
+        json!({ "workspaceId": ws_id, "includeRetired": true }),
+    )
+    .await;
     let counter = listed["hooks"]
         .as_array()
         .expect("hooks array")
@@ -1299,8 +1334,15 @@ async fn hook_lifecycle_over_wss() {
     assert_eq!(expired["data"]["hookId"], json!(ttl_id));
     assert_eq!(expired["data"]["agentId"], json!(agent_id));
 
-    // Terminal in hook.list; runNow on an expired hook is -32602.
-    let listed = wss_rpc(&mut rpc, 702, "hook.list", json!({ "workspaceId": ws_id })).await;
+    // Terminal in hook.list (retired rows need `includeRetired`); runNow on
+    // an expired hook is -32602.
+    let listed = wss_rpc(
+        &mut rpc,
+        702,
+        "hook.list",
+        json!({ "workspaceId": ws_id, "includeRetired": true }),
+    )
+    .await;
     let ttl_hook = listed["hooks"]
         .as_array()
         .expect("hooks array")
@@ -1562,7 +1604,13 @@ async fn hook_lifecycle_over_wss() {
     assert_eq!(expired["data"]["hookId"], json!(timer_id));
     assert_eq!(expired["data"]["state"], "expired", "{expired}");
     let timer_row = find(
-        &wss_rpc(&mut rpc, 930, "hook.list", json!({ "workspaceId": ws_id })).await,
+        &wss_rpc(
+            &mut rpc,
+            930,
+            "hook.list",
+            json!({ "workspaceId": ws_id, "includeRetired": true }),
+        )
+        .await,
         &timer_id,
     );
     assert_eq!(timer_row["state"], "expired", "{timer_row}");
@@ -1583,4 +1631,116 @@ async fn hook_lifecycle_over_wss() {
         "retired timer ⇒ -32602: {err}"
     );
     await_conversation_contains(&mut rpc, 940, &ws_id, &agent_id, "fired and is now retired").await;
+}
+
+/// Recursive validation must fail only the offending MCP call, leaving the
+/// disposable daemon, another agent, and ordinary background hooks usable.
+#[intent_test_macros::daemon_test]
+async fn recursive_hook_validation_leaves_daemon_usable() {
+    let Some(script) = gate("recursive hook validation E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let (ws_id, _) = seed_workspace_and_note(&data_dir).await;
+    // Finite even without the guard: exceed the validation boundary without
+    // an unbounded reproduction in the daemon process.
+    let mut recursive_code = "return {dispatch: false};".to_string();
+    for _ in 0..3 {
+        recursive_code = format!(
+            "return await ws.hook.schedule({{name: 'nested', delayMs: 600000, code: {}}});",
+            json!(recursive_code)
+        );
+    }
+    let recursive_js = format!(
+        "try {{ await ws.hook.schedule({{name: 'recursive-root', delayMs: 600000, code: {}}}); \
+         throw new Error('unexpected acceptance'); }} catch (error) {{ return String(error); }}",
+        json!(recursive_code)
+    );
+    let behavior = json!({
+        "response": "ok",
+        "rules": [
+            {
+                "ifPromptContains": "RECURSIVE_HOOK",
+                "toolCall": {"name": "workspace_api", "arguments": {
+                    "code": recursive_js, "summary": "test bounded hook validation"
+                }},
+                "emitToolBlocks": true,
+                "response": "recursion checked"
+            },
+            {
+                "ifPromptContains": "ORDINARY_HOOK",
+                "toolCall": {"name": "workspace_api", "arguments": {
+                    "code": "await ws.hook.schedule({name: 'healthy', delayMs: 600000, code: 'return {dispatch: false};'}); return 'ordinary hook scheduled';",
+                    "summary": "schedule an ordinary hook"
+                }},
+                "emitToolBlocks": true,
+                "response": "ordinary work completed"
+            }
+        ]
+    }).to_string();
+    let child = spawn_serve(
+        &data_dir,
+        &[
+            ("INTENTD_AUTH_TOKEN", TOKEN),
+            ("MOCK_AGENT_SCRIPT_PATH", &script),
+            ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ],
+    );
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut rpc = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    for (index, (prompt, expected)) in [
+        ("RECURSIVE_HOOK", "nested hook validation limit"),
+        ("ORDINARY_HOOK", "ordinary hook scheduled"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let base = i64::try_from(index).unwrap() * 1000;
+        let created = wss_rpc(
+            &mut rpc,
+            base + 1,
+            "agent.create",
+            json!({
+                "workspaceId": ws_id, "name": prompt, "model": "default", "provider": "mock"
+            }),
+        )
+        .await;
+        let id = created["agent"]["id"].as_str().unwrap();
+        wss_rpc(
+            &mut rpc,
+            base + 2,
+            "agent.sendMessage",
+            json!({
+                "workspaceId": ws_id, "agentId": id, "content": prompt
+            }),
+        )
+        .await;
+        await_conversation_contains(&mut rpc, base + 10, &ws_id, id, expected).await;
+        let hooks = wss_rpc(
+            &mut rpc,
+            base + 900,
+            "hook.list",
+            json!({
+                "workspaceId": ws_id, "agentId": id, "includeRetired": true
+            }),
+        )
+        .await;
+        let hooks = hooks["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), index, "only the ordinary hook may persist");
+        if index == 1 {
+            assert_eq!(hooks[0]["name"], "healthy");
+        }
+    }
 }

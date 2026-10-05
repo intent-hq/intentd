@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
 use intent_core::{
-    now_iso, ActorType, AgentId, Event, EventActor, Workspace, WorkspaceActivity,
+    now_iso, ActorType, AgentId, Event, EventActor, MessageOrigin, Workspace, WorkspaceActivity,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
@@ -54,6 +54,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -79,35 +80,32 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
-struct TempDb {
+/// `SQLite` db (plus its `.config.toml` sibling) inside an RAII temp dir; the
+/// dir sweep on drop also covers the `-wal`/`-shm` sidecars.
+pub(crate) struct TempDb {
     path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("intentd-goldens-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
+        let dir = crate::test_support::test_tempdir("intentd-goldens-");
+        let path = dir.path().join("goldens.db");
+        Self { path, _dir: dir }
     }
 }
 
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm", ".config.toml"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
-    }
-}
-
-async fn setup() -> (TempDb, Services, WorkspaceId) {
+pub(crate) async fn setup() -> (TempDb, Services, WorkspaceId) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
@@ -202,6 +200,54 @@ fn golden_a2a_sender_note() {
             "header must start with the idempotency-guard prefix: {note}"
         );
         assert!(!note.contains('\n'), "header must be single-line: {note}");
+    }
+}
+
+/// The collaborator sender preamble (multiplayer) is a single plain-prose
+/// line naming the sender and their guest role: login + display name, then
+/// login alone, then display name alone, then the principal id. Control
+/// characters in either name collapse to spaces so a hostile profile
+/// cannot inject a second line.
+#[test]
+fn golden_collaborator_sender_preamble() {
+    let harness = crate::harness::latest();
+    assert_eq!(
+        harness.collaborator_sender_preamble(Some("octocat"), Some("The Octocat"), "p-1"),
+        "Message from @octocat (The Octocat), a collaborator (guest) of this workspace — not \
+         the workspace owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(Some("octocat"), None, "p-1"),
+        "Message from @octocat, a collaborator (guest) of this workspace — not the workspace \
+         owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(None, Some("The Octocat"), "p-1"),
+        "Message from The Octocat, a collaborator (guest) of this workspace — not the \
+         workspace owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(None, None, "p-1"),
+        "Message from principal p-1, a collaborator (guest) of this workspace — not the \
+         workspace owner."
+    );
+    assert_eq!(
+        harness.collaborator_sender_preamble(Some("evil\nlogin"), Some("  \n"), "p-1"),
+        "Message from @evil login, a collaborator (guest) of this workspace — not the \
+         workspace owner."
+    );
+    for preamble in [
+        harness.collaborator_sender_preamble(Some("octocat"), Some("The Octocat"), "p-1"),
+        harness.collaborator_sender_preamble(None, None, "p-1"),
+    ] {
+        assert!(
+            preamble.starts_with(crate::harness::v1::COLLABORATOR_SENDER_PREAMBLE_PREFIX),
+            "preamble must start with the stable prefix: {preamble}"
+        );
+        assert!(
+            !preamble.contains('\n'),
+            "preamble must be single-line: {preamble}"
+        );
     }
 }
 
@@ -334,6 +380,7 @@ fn golden_supervisor_history_wrapper() {
         content: json!([{ "type": "text", "text": text }]),
         metadata: None,
         app_message_id: None,
+        author: None,
         created_at: "2026-01-02T03:04:05Z".to_string(),
     };
     // The default per-block cap (4000) keeps the golden byte-identical.
@@ -710,6 +757,8 @@ fn merge_requirements(
     unresolved: i64,
 ) -> crate::pr_ops::MergeRequirements {
     crate::pr_ops::MergeRequirements {
+        ancestry: intent_sourcecontrol::PrAncestry::Unknown,
+        branch_update_required: None,
         state: state.to_string(),
         is_draft: false,
         has_conflicts: false,
@@ -732,7 +781,7 @@ fn merge_requirements(
             changes_requested: 0,
         },
         threads: crate::pr_ops::MergeRequirementsThreads {
-            unresolved,
+            unresolved: Some(unresolved),
             resolution_required: Some(true),
         },
         merge_state_status: None,
@@ -743,7 +792,7 @@ fn merge_requirements(
     }
 }
 
-fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
+pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
     crate::pr_monitor::PrMonitorSnapshot {
         title: "feat: add adapter".to_string(),
         url: "https://github.com/o/r/pull/42".to_string(),
@@ -752,10 +801,15 @@ fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
         review_comment_count: 1,
         requirements: merge_requirements(state, 0, 1),
         ejection_tracked: true,
+        checks_unobserved: false,
+        checks_seed_pending: false,
+        status_checks: Some(Vec::new()),
+        required_check_names: None,
+        observed_at: None,
     }
 }
 
-fn pr_monitor_row() -> intent_core::PrMonitor {
+pub(crate) fn pr_monitor_row() -> intent_core::PrMonitor {
     intent_core::PrMonitor {
         monitor_id: intent_core::PrMonitorId::from("prmon-1"),
         workspace_id: WorkspaceId::from("ws-1"),
@@ -795,7 +849,9 @@ fn golden_pr_monitor_checklist_and_change_wake() {
          - state: open\n\
          - approvals: review_required (0/1 required)\n\
          - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
-         - unresolved threads: 1 (resolution required to merge)"
+         - unresolved threads: 1 (resolution required to merge)\n\
+         - branch ancestry: unknown\n\
+         - forge branch-update requirement: unknown"
     );
 }
 
@@ -855,6 +911,7 @@ fn golden_pr_monitor_checklist_branch_lines() {
     r.is_draft = true;
     r.has_conflicts = true;
     r.is_behind = true;
+    r.branch_update_required = Some(true);
     r.mergeable = Some(false);
     r.checks.failed = 1;
     r.checks.passed = 1;
@@ -871,7 +928,8 @@ fn golden_pr_monitor_checklist_branch_lines() {
          - checks: 1 passed, 1 failed, 1 pending (of 3); failing required: build\n\
          - unresolved threads: 1 (resolution required to merge)\n\
          - merge conflicts present\n\
-         - branch is behind its base\n\
+         - branch ancestry: unknown\n\
+         - forge requires a branch update before merging\n\
          - in merge queue\n\
          - blocked: merge conflicts"
     );
@@ -891,12 +949,28 @@ fn golden_pr_monitor_checklist_branch_lines() {
          - approvals: review_required (0 approving)\n\
          - checks: 2 passed, 0 failed, 1 pending (of 3) (required-check flags unavailable)\n\
          - unresolved threads: 1\n\
+         - branch ancestry: unknown\n\
+         - forge branch-update requirement: unknown\n\
          - (branch rules unreadable — approval/thread requirements unknown)"
+    );
+    // Thread resolution state unreadable (`threads.unresolved` absent): the
+    // row says so instead of printing a fabricated 0.
+    let mut s = pr_snapshot("open");
+    s.requirements.threads.unresolved = None;
+    assert_eq!(
+        crate::pr_monitor::render_checklist(&s),
+        "- state: open\n\
+         - approvals: review_required (0/1 required)\n\
+         - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
+         - unresolved threads: unknown (thread resolution state unreadable) (resolution required to merge)\n\
+         - branch ancestry: unknown\n\
+         - forge branch-update requirement: unknown"
     );
 }
 
-/// FE-cancel and archive-sweep notices for hooks and PR monitors: exact
-/// wake bytes delivered to the owning agent.
+/// FE-cancel notices for hooks and PR monitors: exact wake bytes delivered
+/// to the owning agent. (The archive sweep's consolidated notice is a v2.7
+/// surface, pinned in `v2_7_goldens.rs`.)
 #[tokio::test]
 async fn golden_hook_and_pr_monitor_cancel_notice_bytes() {
     let (_t, svc, ws) = setup().await;
@@ -926,7 +1000,7 @@ async fn golden_hook_and_pr_monitor_cancel_notice_bytes() {
         texts,
         vec!["[Background hook \"watcher\"] This hook was cancelled from the app.".to_string()]
     );
-    // PR monitor FE-cancel + archive-sweep notices.
+    // PR monitor FE-cancel notice.
     let mut monitor = pr_monitor_row();
     monitor.workspace_id = ws.clone();
     monitor.agent_id = owner.clone();
@@ -943,54 +1017,6 @@ async fn golden_hook_and_pr_monitor_cancel_notice_bytes() {
         texts[1],
         "[PR monitor o/r#42] This monitor was cancelled from the app — it will not \
          report again."
-    );
-    let mut monitor2 = pr_monitor_row();
-    monitor2.monitor_id = intent_core::PrMonitorId::from("prmon-2");
-    monitor2.workspace_id = ws.clone();
-    monitor2.agent_id = owner.clone();
-    assert!(svc
-        .store()
-        .insert_pr_monitor(&monitor2)
-        .await
-        .expect("insert 2"));
-    svc.cancel_workspace_pr_monitors(&ws).await;
-    let texts = wake_texts_when(&svc, &owner, 3).await;
-    assert_eq!(
-        texts[2],
-        "[PR monitor o/r#42] This monitor was cancelled because its workspace was \
-         archived — it will not report again."
-    );
-}
-
-/// Archive-sweep hook cancel notice: exact wake bytes (framed like every
-/// hook wake).
-#[tokio::test]
-async fn golden_hook_archive_cancel_notice_bytes() {
-    let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
-    let svc = svc.with_event_bus(bus);
-    let owner = AgentId::from("agent-arch");
-    seed_agent(&svc, &ws, &owner).await;
-    svc.hook_schedule_op(
-        &ws,
-        &owner,
-        &json!({
-            "name": "sweeper",
-            "code": "return { dispatch: false };",
-            "delayMs": 10_000,
-        }),
-    )
-    .await
-    .expect("schedule");
-    svc.cancel_workspace_hooks(&ws).await;
-    let texts = wake_texts_when(&svc, &owner, 1).await;
-    assert_eq!(
-        texts,
-        vec![
-            "[Background hook \"sweeper\"] This hook was cancelled because its workspace \
-             was archived."
-                .to_string()
-        ]
     );
 }
 
@@ -1198,7 +1224,7 @@ fn golden_hook_state_notes_are_single_line_and_embed_hook_id() {
 // ---------------------------------------------------------------------------
 
 /// Seed a bare agent session row owned by `ws` (mirrors the hook tests).
-async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
+pub(crate) async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
     let ts = now_iso();
     let session = intent_core::AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
@@ -1244,6 +1270,7 @@ async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     svc.store()
         .insert_agent_session(&session)
@@ -1256,7 +1283,7 @@ async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
 /// Wake persistence can lag the op return, so poll until at least `expected`
 /// messages are present (generous deadline, monorepo#1358 precedent); on
 /// timeout return whatever was seen and let the caller's assert report it.
-async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usize) -> Vec<String> {
+pub(crate) async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usize) -> Vec<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let session = svc.store().get_agent_session(id).await.expect("session");
@@ -1306,7 +1333,7 @@ async fn golden_questions_dismissed_notice_bytes() {
 }
 
 /// Report-to-parent wake: exact bytes of the ungrouped immediate parent wake.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn golden_report_to_parent_wake_bytes() {
     let (_t, svc, ws) = setup().await;
     let parent = AgentId::from("agent-parent");
@@ -1343,7 +1370,7 @@ async fn golden_report_to_parent_wake_bytes() {
 }
 
 /// Attention-request wakes: exact bytes for the blocker and discussion verbs.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn golden_attention_request_wake_bytes() {
     let (_t, svc, ws) = setup().await;
     let parent = AgentId::from("agent-parent");
@@ -1401,7 +1428,7 @@ async fn golden_attention_request_wake_bytes() {
 /// Watcher fan-out attention wake (monorepo#1229/#2051): an explicit
 /// non-parent `ws.agent.watch` watcher gets the remains-armed variant, with
 /// the ungrouped completion promise.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn golden_watcher_attention_wake_bytes() {
     let (_t, svc, ws) = setup().await;
     let parent = AgentId::from("agent-parent");
@@ -1480,6 +1507,55 @@ fn golden_image_and_attachment_notice_bytes() {
     );
 }
 
+/// Workspace setup-stage notices (§6.5): exact bytes of the in-progress
+/// notice and of the failure notice with and without an exit code, plus the
+/// envelope slot — after the snapshot line, before the Context block.
+#[test]
+fn golden_setup_notice_bytes_and_envelope_slot() {
+    use crate::harness::TurnEnvelopeParams;
+    let h = crate::harness::resolve_entry("1.0").harness;
+    assert_eq!(
+        h.setup_in_progress_notice("Setup Script"),
+        "[System: workspace setup is still running — the setup script is executing in the \
+         \"Setup Script\" terminal. Worktree contents (submodules, tooling, generated files) \
+         are provisional while ws.workspace.details().setupStatus.state is \"pending\" or \
+         \"running\". Do not diagnose missing files or tools as bugs yet: wait with a \
+         self-checking background hook (ws.hook.schedule) that reads \
+         ws.workspace.details().setupStatus and dispatches as soon as state is anything \
+         other than \"pending\" or \"running\" (\"completed\", \"failed\", \"skipped\", or \
+         \"unknown\"), then re-check the worktree.]"
+    );
+    assert_eq!(
+        h.setup_failed_notice(Some(3), "Setup Script"),
+        "[System: workspace setup failed — the setup script exited with code 3. Its output is \
+         in the \"Setup Script\" terminal (ws.terminal.list / ws.terminal.readOutput). The \
+         worktree may be missing submodules or tooling: read that output before diagnosing \
+         missing files, and tell the user setup needs attention.]"
+    );
+    assert_eq!(
+        h.setup_failed_notice(None, "Setup Script"),
+        "[System: workspace setup failed — the setup script failed before it exited (no exit \
+         code). Its output is in the \"Setup Script\" terminal (ws.terminal.list / \
+         ws.terminal.readOutput). The worktree may be missing submodules or tooling: read \
+         that output before diagnosing missing files, and tell the user setup needs \
+         attention.]"
+    );
+    let composed = h.compose_turn_prompt(&TurnEnvelopeParams {
+        first_turn_prepend: Some("<system>sp</system>"),
+        snapshot_line: Some("current ws.agent.snapshot() => {}"),
+        setup_notice: Some("[System: setup]"),
+        stdin_context: Some("ctx"),
+        naming_nudge: None,
+        role_reminder: None,
+        body: "hello",
+    });
+    assert_eq!(
+        composed,
+        "<system>sp</system>\n\ncurrent ws.agent.snapshot() => {}\n\n[System: setup]\n\n\
+         Context:\nctx\n\n---\n\nhello"
+    );
+}
+
 /// Supervisor-history truncation markers: the omitted-exchanges comment
 /// (exact bytes inside the wrapper) and the middle-truncation marker line
 /// inside an oversized `tool_result`.
@@ -1494,6 +1570,7 @@ fn golden_supervisor_history_truncation_markers() {
         content: blocks,
         metadata: None,
         app_message_id: None,
+        author: None,
         created_at: "2026-01-02T03:04:05Z".to_string(),
     };
     // Two exchanges with a budget that only fits the newest: the omission
@@ -1619,7 +1696,8 @@ fn golden_supervisor_history_truncation_markers() {
 /// via a hermetic assembly with no workspace path (no rule files, no skills,
 /// no RTK — only the always-on layers). Assembled under a session pinned to
 /// `harnessVersion: "1.0"` so the bytes stay frozen as later versions reword
-/// surfaces (v2.3 rewords the next-steps layer; `v2_3_goldens` pins that).
+/// surfaces (v2.3/v2.4 reword the next-steps layer; `v2_3_goldens` /
+/// `v2_4_goldens` pin those).
 #[tokio::test]
 async fn golden_assembled_prompt_static_layers() {
     let (_t, svc, ws) = setup().await;
@@ -1857,8 +1935,8 @@ async fn golden_v1_session_assembles_v1_doctrine() {
     assert!(latest.contains("ws.workspace.proposeSibling"));
     // Only the doctrine layer differs between v1 and v2.2 (the last version
     // on v1 text surfaces): the static layers after the specialization
-    // rules are byte-identical. Latest (v2.3) additionally rewords the
-    // next-steps layer and nothing else.
+    // rules are byte-identical. Latest (v2.4, like v2.3) additionally
+    // rewords the next-steps layer and nothing else.
     session.harness_version = "2.2".to_string();
     let pinned_v2_2 = assemble(Some(session.clone())).await;
     let v2_2_rules = crate::instructions::get_instruction_with_common_for(
@@ -1933,14 +2011,14 @@ fn golden_bundled_doctrine_hashes() {
         })
         .collect();
     let expected = vec![
-        "task-loop: f18d40f5c74b12b45c9f656900665c82398fc5aaa716c5770e22068dd839a560".to_string(),
-        "interactive: 072a355b7c77a499b00701c9e175673a4ff4224c486f51677f7caa23986d5788".to_string(),
-        "workspace-agent: 202521ab3e7055486384e3093fc6d1f2b4f507c0248a9808597cae465a4cb268"
+        "task-loop: cc1f40de9643f88529dd5fa61d1f868ae269020aa3ef5d08986a721e19c64c44".to_string(),
+        "interactive: 013e064b03286569622d905efd0ee4c2a227fc18f0364d3277a95b548dd1f6c3".to_string(),
+        "workspace-agent: a4602194c382d803f1a1143159035a93e76d0793027d469485126efa475e0ac6"
             .to_string(),
-        "task-breakdown: 55aeb42266161ca997549cfe887bbc807c3511920d6304f5d4508c327fbad3be"
+        "task-breakdown: 1e9e1e2daf42a8adadd8c31d7697f0bac02bf5a7c818b00ae4e50074e40b9e66"
             .to_string(),
-        "common: e098afd3a53c2313c8e4207a8c07f011119a5f7767270328f4dfa541cf455185".to_string(),
-        "workspace: fe126c3dc9450fdef98bffc0cffdc170e488b26b926e1e2e137dd6f42702b308".to_string(),
+        "common: 45db6f16aec87f11050b5cc1979370c06f00f00149df20e245fce83acd73b2f0".to_string(),
+        "workspace: d0b0ecd88bed6224442633dc3dc026a1276d37536478730969703a35e6a91a90".to_string(),
     ];
     assert_eq!(actual, expected);
 }
@@ -1977,6 +2055,7 @@ fn golden_rtk_instruction_line() {
 #[test]
 fn golden_skills_catalog_wrapper() {
     let skill = |name: &str, description: &str, location: &str| crate::skills::SkillMetadata {
+        resource_directory: None,
         name: name.to_string(),
         description: description.to_string(),
         location: location.to_string(),
@@ -2058,6 +2137,7 @@ fn golden_isolation_hints() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     let specialist = crate::rules::SpecialistPromptInjection {
         behavior_prompt: None,
@@ -2112,7 +2192,16 @@ async fn golden_snapshot_line_shape() {
     let (_t, svc, ws) = setup().await;
     let owner = AgentId::from("agent-snap");
     seed_agent(&svc, &ws, &owner).await;
-    svc.enqueue_message(&owner, "pending".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &owner,
+        "pending".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     let line = svc
         .agent_state_snapshot_line(&owner)
         .await

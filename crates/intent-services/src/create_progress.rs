@@ -242,7 +242,7 @@ pub(crate) fn cache_ensure_reporter(
 ) {
     use intent_git::repo_cache::CacheEnsureEvent as Ev;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Ev>();
-    let handle = tokio::spawn(async move {
+    let handle = intent_core::spawn_daemon(async move {
         let mut pump = CacheEnsurePump::new();
         while let Some(ev) = rx.recv().await {
             for frame in pump.handle(ev) {
@@ -275,7 +275,7 @@ pub(crate) fn submodule_hydration_reporter(
     tokio::task::JoinHandle<()>,
 ) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let handle = tokio::spawn(async move {
+    let handle = intent_core::spawn_daemon(async move {
         let mut parser = crate::clone_ops::SubmoduleAwareParser::for_submodule_update();
         while let Some(text) = rx.recv().await {
             for (_phase, pct, msg) in parser.parse(&text) {

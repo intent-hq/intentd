@@ -7,22 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Identifies a repository on a forge (host-agnostic).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepoRef {
-    pub owner: String,
-    pub name: String,
-}
-
-impl RepoRef {
-    /// Convenience constructor.
-    pub fn new(owner: impl Into<String>, name: impl Into<String>) -> Self {
-        Self {
-            owner: owner.into(),
-            name: name.into(),
-        }
-    }
-}
+/// Case-insensitive repository identity; defined in `intent-core` so every
+/// slug-holding crate shares one type, re-exported here at its historical path.
+pub use intent_core::RepoRef;
 
 /// Repository metadata (parity with the FE `GithubRepo`). Backs the
 /// `github.repos.list/search/get` browse surface. `url` carries GitHub's
@@ -201,10 +188,11 @@ pub enum PrInvolvement {
 
 /// Filter for listing pull requests.
 ///
-/// When `involvement` or `search` is set, listing routes through
-/// `GET /search/issues` (`is:pr repo:o/r is:<state> [<filter>:@me] [<text>]`)
-/// so callers can express author/assignee/review-requested/involves @me and
-/// free text; otherwise the plain `GET /repos/{o}/{r}/pulls` path is used with
+/// When `involvement`, `search`, or `extra_repos` is set, listing routes
+/// through `GET /search/issues` (`is:pr repo:o/r [repo:o2/r2 …] is:<state>
+/// [<filter>:@me] [<text>]`) so callers can express
+/// author/assignee/review-requested/involves @me, free text, and a multi-repo
+/// scope; otherwise the plain `GET /repos/{o}/{r}/pulls` path is used with
 /// client-side `author` filtering.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -218,6 +206,12 @@ pub struct PrQuery {
     /// non-blank value routes the listing through `/search/issues` even
     /// without `involvement`. Blank/absent leaves listing behavior unchanged.
     pub search: Option<String>,
+    /// Additional repositories searched alongside the addressed repo in ONE
+    /// `/search/issues` request (a `repo:` qualifier each); GitHub blends and
+    /// orders the hits natively. Non-empty routes the listing through search
+    /// even with a blank `search`; empty leaves listing behavior unchanged.
+    #[serde(default)]
+    pub extra_repos: Vec<RepoRef>,
     pub limit: Option<u8>,
     /// Engine-native continuation cursor (a REST page number); `None` is the
     /// first page. The opaque wire `nextToken` is owned by the services layer.
@@ -258,6 +252,42 @@ pub struct Review {
     pub verdict: ReviewVerdict,
     pub body: Option<String>,
     pub submitted_at: String,
+}
+
+/// One changed PR file; absent patches include binary or forge-omitted diffs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestFile {
+    pub filename: String,
+    #[serde(alias = "previous_filename")]
+    pub previous_filename: Option<String>,
+    pub status: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changes: u64,
+    pub patch: Option<String>,
+    #[serde(alias = "blob_url")]
+    pub url: Option<String>,
+}
+
+/// A bounded changed-file page with an explicit forge-limit signal.
+#[derive(Debug, Clone)]
+pub struct PullRequestFilesPage {
+    pub items: Vec<PullRequestFile>,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+}
+
+/// A review detail row preserving dismissed/pending states and stable identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestReview {
+    pub id: u64,
+    pub author: String,
+    pub state: String,
+    pub body: Option<String>,
+    pub submitted_at: Option<String>,
+    pub url: Option<String>,
 }
 
 /// A conversation (issue/PR) comment, optionally line-anchored.
@@ -327,6 +357,12 @@ pub struct CheckRun {
     pub name: String,
     pub state: CheckState,
     pub url: Option<String>,
+    /// When the run started (REST `started_at`, RFC 3339), used only to pick
+    /// the live run among same-name twins on a head (see
+    /// [`RollupCheck::started_at`]). Daemon-internal: never serialized, so
+    /// the documented `CheckRun` wire shape is unchanged.
+    #[serde(skip)]
+    pub started_at: Option<String>,
 }
 
 /// An issue (PRs excluded; gated by capabilities).
@@ -345,9 +381,10 @@ pub struct Issue {
 
 /// Filter for listing issues.
 ///
-/// When `search` is set, listing routes through `GET /search/issues`
-/// (`is:issue repo:o/r [state:<state>] <text>`) so callers can express free
-/// text; otherwise the plain `GET /repos/{o}/{r}/issues` listing is used.
+/// When `search` or `extra_repos` is set, listing routes through
+/// `GET /search/issues` (`is:issue repo:o/r [repo:o2/r2 …] [state:<state>]
+/// <text>`) so callers can express free text and a multi-repo scope;
+/// otherwise the plain `GET /repos/{o}/{r}/issues` listing is used.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueQuery {
@@ -356,6 +393,12 @@ pub struct IssueQuery {
     /// Free-text search term; a non-blank value routes the listing through
     /// `/search/issues`. Blank/absent leaves listing behavior unchanged.
     pub search: Option<String>,
+    /// Additional repositories searched alongside the addressed repo in ONE
+    /// `/search/issues` request (a `repo:` qualifier each); GitHub blends and
+    /// orders the hits natively. Non-empty routes the listing through search
+    /// even with a blank `search`; empty leaves listing behavior unchanged.
+    #[serde(default)]
+    pub extra_repos: Vec<RepoRef>,
     pub limit: Option<u8>,
     /// Engine-native continuation cursor (a REST page number); `None` is the
     /// first page. The opaque wire `nextToken` is owned by the services layer.
@@ -388,9 +431,22 @@ pub struct AuthStatus {
     pub scopes: Vec<String>,
 }
 
+/// Conservative headroom for the resources used by PR reads, from the host's probe
+/// ([`crate::SourceControl::rate_limit_status`]); every field is `None`
+/// when the host lacks the signal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RateLimitStatus {
+    /// When the quota window resets, as a unix timestamp (seconds).
+    pub reset_at: Option<u64>,
+    /// Requests left in the current window.
+    pub remaining: Option<u64>,
+    /// The window's full request quota.
+    pub limit: Option<u64>,
+}
+
 /// Capabilities a concrete host may or may not support (FE gates UI on these).
 // One bool per independent capability; the flat shape IS the wire contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScCapabilities {
@@ -405,17 +461,43 @@ pub struct ScCapabilities {
 /// One entry of the forge's status-check rollup for a pull request, carrying
 /// the per-check "is this required to merge?" flag GitHub only exposes through
 /// GraphQL (`statusCheckRollup.contexts` → `isRequired(pullRequestNumber:)`).
-/// Both check-runs and legacy commit statuses collapse onto this shape.
+/// Both check-runs and legacy commit statuses collapse onto this shape;
+/// [`RollupCheck::kind`] tells them apart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RollupCheck {
     pub name: String,
+    /// Which kind of rollup node this is. A legacy commit status posted under
+    /// a check run's name is independent evidence, not another attempt of
+    /// that run: GitHub requires both to pass when their shared name is
+    /// required.
+    #[serde(default)]
+    pub kind: RollupCheckKind,
     pub state: CheckState,
     /// Whether the host reports this check as required for merging. `false`
     /// when the host says so *and* when the signal is unavailable — callers
     /// that need the distinction consult [`MergeRequirementSignals`].
     pub is_required: bool,
     pub url: Option<String>,
+    /// When the check-run started (GraphQL `CheckRun.startedAt`, RFC 3339).
+    /// `None` for legacy commit statuses and hosts that do not report it.
+    /// A head that carries several runs of the same check (a re-run, or a
+    /// `concurrency`-cancelled duplicate beside the live run) is resolved
+    /// onto the latest start, matching how the host reports the required
+    /// check's state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+}
+
+/// The kind of node a [`RollupCheck`] was mapped from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollupCheckKind {
+    /// A check run (GraphQL `CheckRun`, REST `/check-runs`).
+    #[default]
+    CheckRun,
+    /// A legacy commit status (GraphQL `StatusContext`, REST `/statuses`).
+    StatusContext,
 }
 
 /// Merge-relevant branch rules for a pull request's base branch (GitHub
@@ -466,8 +548,15 @@ pub struct MergeRequirementSignals {
     /// Whether the rollup's `isRequired` flags are trustworthy — `false` when
     /// the host did not report the rollup at all.
     pub checks_known: bool,
+    /// Internal observation identity, when the host supplies one. The service
+    /// must not combine these checks with a PR read for a different head.
+    /// This is adapter bookkeeping, not an addition to the public wire payload.
+    #[serde(skip)]
+    pub checks_head_sha: Option<String>,
     /// Base-branch rules, or `None` when they are unreadable (missing scope,
-    /// unsupported endpoint) — a degraded but non-fatal probe.
+    /// unsupported endpoint) — a degraded but non-fatal probe. Quota
+    /// exhaustion on that read is never folded into `None`; it fails the
+    /// probe with [`crate::Error::RateLimited`].
     pub branch_rules: Option<BranchRules>,
     /// Whether the PR is currently queued in the host's merge queue (GitHub
     /// GraphQL `isInMergeQueue`). `None` when the host does not report it.
@@ -477,4 +566,194 @@ pub struct MergeRequirementSignals {
     /// not report it (no merge-queue support) or the PR was never ejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_removal: Option<MergeQueueRemoval>,
+}
+
+/// Tallies of a pull request's inline review threads: the total number of
+/// review comments across every thread (replies included) and the number of
+/// unresolved threads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewThreadTally {
+    pub review_comment_count: i64,
+    pub unresolved: i64,
+}
+
+/// Everything the PR monitor's per-poll snapshot needs about one pull
+/// request, read by [`crate::SourceControl::pr_observation`] in ONE forge
+/// round trip where the host can fold it (GitHub GraphQL): the
+/// [`PullRequest`] itself, the merge-requirement signals, the submitted
+/// reviews, the review-thread tally, and the conversation-comment count.
+///
+/// The bounded windows degrade to `None` rather than truncating silently:
+/// `reviews` is `None` when the PR has more reviews than one window carries,
+/// `threads` when it has more review threads — callers then take the paged
+/// per-signal reads for that piece only. `signals.branch_rules` is `None`
+/// unless the host folded the base branch's rules in; callers read them via
+/// [`crate::SourceControl::branch_rules`] when they need them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrObservation {
+    pub pr: PullRequest,
+    /// Live revisions from the same observation, never the PR's stored base OID.
+    /// Internal cache/adapter identity; absent for REST-only observations.
+    #[serde(skip)]
+    pub ancestry_identity: Option<PrAncestryIdentity>,
+    pub signals: MergeRequirementSignals,
+    pub reviews: Option<Vec<Review>>,
+    pub threads: Option<ReviewThreadTally>,
+    pub conversation_count: i64,
+}
+
+/// A measured, revision-bound ancestry result. Missing old baseline fields
+/// decode to unknown; an unreadable comparison is never a zero count.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum PrAncestry {
+    #[default]
+    Unknown,
+    Known {
+        #[serde(rename = "baseSha")]
+        base_sha: String,
+        #[serde(rename = "headSha")]
+        head_sha: String,
+        #[serde(rename = "behindBy")]
+        behind_by: u64,
+    },
+}
+
+/// Immutable comparison inputs and the branch/fork identity that scopes reuse.
+/// Kept in the existing in-memory PR cache, not persisted or projected on PRs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrAncestryIdentity {
+    pub base_sha: String,
+    pub head_sha: String,
+    pub target_branch: String,
+    pub head_repository: Option<String>,
+}
+
+impl PrAncestryIdentity {
+    /// GitHub object IDs must be full commit hashes, never symbolic refs.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let sha = |s: &str| s.len() == 40 && s.bytes().all(|c| c.is_ascii_hexdigit());
+        sha(&self.base_sha) && sha(&self.head_sha) && !self.target_branch.is_empty()
+    }
+}
+/// Availability of one provider field; absent evidence is never a passing result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderAvailability {
+    Available,
+    Restricted,
+    Unavailable,
+    Transient,
+    RateLimited,
+    #[default]
+    Unknown,
+}
+
+/// Provider-confirmed project and branch, within one logical instance.
+/// Missing identities stay `None` in the containing detail envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewBranchIdentity {
+    pub instance_base_url: String,
+    pub project_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
+    pub branch: String,
+}
+
+/// Positively observed provider state, independent of the legacy PR projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfirmedReviewState {
+    Open,
+    Locked,
+    Closed,
+    Merged,
+}
+
+/// Additive detail projection; the legacy `PullRequest` and GitHub shapes stay unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewDetails {
+    pub review: PullRequest,
+    pub source: Option<ReviewBranchIdentity>,
+    pub target: Option<ReviewBranchIdentity>,
+    /// Actual provider boolean; absence or a malformed value cannot establish non-draft status.
+    #[serde(default)]
+    pub confirmed_draft: Option<bool>,
+    /// Actual provider state; consumers must not infer this from legacy `review.state`.
+    #[serde(default)]
+    pub confirmed_state: Option<ConfirmedReviewState>,
+}
+impl ReviewDetails {
+    /// Reuse requires positively open state, known draft status and exact project/branch identities.
+    #[must_use]
+    pub fn matches_open(
+        &self,
+        source: &ReviewBranchIdentity,
+        target: &ReviewBranchIdentity,
+    ) -> bool {
+        let equal = |actual: &ReviewBranchIdentity, expected: &ReviewBranchIdentity| {
+            actual.instance_base_url == expected.instance_base_url
+                && actual.project_id == expected.project_id
+                && actual.branch == expected.branch
+                && match (&actual.project_path, &expected.project_path) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                }
+        };
+        self.confirmed_state == Some(ConfirmedReviewState::Open)
+            && self.confirmed_draft.is_some()
+            && self.review.state == PrState::Open
+            && !source.instance_base_url.is_empty()
+            && source.instance_base_url == target.instance_base_url
+            && source.project_id > 0
+            && source.project_id == target.project_id
+            && !source.branch.is_empty()
+            && !target.branch.is_empty()
+            && source.branch != target.branch
+            && self.source.as_ref().is_some_and(|s| equal(s, source))
+            && self.target.as_ref().is_some_and(|t| equal(t, target))
+    }
+}
+
+/// Availability accompanying optional reads, separate from their legacy projections.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewAvailability {
+    pub policy: ProviderAvailability,
+    pub approvals: ProviderAvailability,
+    pub checks: ProviderAvailability,
+    pub discussions: ProviderAvailability,
+}
+
+/// Review observation with explicit unknown/restricted fields and confirmed identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewObservation {
+    pub details: ReviewDetails,
+    pub signals: MergeRequirementSignals,
+    pub reviews: Option<Vec<Review>>,
+    pub threads: Option<ReviewThreadTally>,
+    pub conversation_count: Option<i64>,
+    pub availability: ReviewAvailability,
+}
+
+/// Outcome of the API stage only; this says nothing about local commit publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewCreateOutcome {
+    Created,
+    Reused,
+}
+
+/// An actual API response or an existing open review, never synthesized request metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCreateResult {
+    pub outcome: ReviewCreateOutcome,
+    pub details: ReviewDetails,
 }

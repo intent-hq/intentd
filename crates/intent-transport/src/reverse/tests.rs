@@ -7,6 +7,26 @@ use tokio::sync::mpsc;
 
 use super::*;
 
+#[tokio::test]
+async fn shutdown_releases_reverse_request_blocked_on_full_outbound_lane() {
+    let (tx, _idle_peer) = mpsc::channel(1);
+    tx.send("occupied".to_string()).await.unwrap();
+    let reverse = ReverseChannel::new(tx);
+    let request = reverse.request("browser.exec", json!({}), Duration::from_secs(60));
+    tokio::pin!(request);
+    tokio::select! {
+        biased;
+        result = &mut request => panic!("request did not wait for outbound space: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    reverse.close();
+    let error = tokio::time::timeout(Duration::from_secs(1), request)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.message.contains("closed"));
+}
+
 #[test]
 fn screenshot_requests_use_a_shorter_inner_deadline() {
     let timeout = request_timeout(
@@ -109,6 +129,30 @@ async fn client_error_response_propagates() {
     let err = handle.await.unwrap().expect_err("client replied error");
     assert_eq!(err.code, -32603);
     assert_eq!(err.message, "no handler");
+}
+
+/// Multiplayer w3: a channel bound to a non-administrator principal refuses
+/// every reverse RPC up front (`-32003`) and puts nothing on the wire.
+#[tokio::test]
+async fn non_administrator_channel_refuses_reverse_requests_without_sending() {
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let reverse = ReverseChannel::new(out_tx).with_administrator(false);
+    assert!(!reverse.is_administrator());
+    assert!(ReverseChannel::new(mpsc::channel::<String>(1).0).is_administrator());
+
+    let err = reverse
+        .request(
+            "host.openExternal",
+            json!({ "url": "x" }),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("non-administrator channels never serve reverse RPCs");
+    assert_eq!(err.code, -32003);
+    assert!(
+        out_rx.try_recv().is_err(),
+        "nothing may be sent to a non-administrator connection"
+    );
 }
 
 #[test]

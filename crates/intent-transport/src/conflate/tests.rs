@@ -169,6 +169,115 @@ fn terminal_chunks_concatenate_in_arrival_order() {
     assert_eq!(BASE64.decode(merged).unwrap(), b"hello world");
 }
 
+fn positioned_terminal(start: u64, end: u64) -> Event {
+    event(
+        TERMINAL_DATA,
+        None,
+        json!({
+            "terminalId": "t-1", "chunk": chunk("same"), "daemonBootId": "boot-1",
+            "startOffset": start.to_string(), "endOffset": end.to_string(),
+        }),
+    )
+}
+
+#[test]
+fn terminal_cursor_conflation_preserves_the_full_adjacent_range() {
+    for start in [0, 9_007_199_254_740_993] {
+        let mut buf = ConflationBuffer::new();
+        for offset in [start, start + 4, start + 8] {
+            let ev = positioned_terminal(offset, offset + 4);
+            let key = event_key(&ev).unwrap();
+            assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
+        }
+        let merged = frame_data(&buf.pop().unwrap().into_frame("sub-1"));
+        assert!(buf.pop().is_none());
+        assert_eq!(merged["startOffset"], start.to_string());
+        assert_eq!(merged["endOffset"], (start + 12).to_string());
+        assert_eq!(merged["daemonBootId"], "boot-1");
+        assert_eq!(
+            BASE64.decode(merged["chunk"].as_str().unwrap()).unwrap(),
+            b"samesamesame"
+        );
+    }
+}
+
+#[test]
+fn terminal_cursor_conflation_refuses_discontinuity_or_invalid_metadata() {
+    let valid = positioned_terminal(0, 4);
+    let adjacent = positioned_terminal(4, 8);
+    let mut incompatible = vec![
+        positioned_terminal(5, 9),
+        positioned_terminal(2, 6),
+        valid.clone(),
+    ];
+    for (field, value) in [
+        ("daemonBootId", json!("boot-2")),
+        ("daemonBootId", json!("")),
+        ("startOffset", json!(4)),
+        ("startOffset", json!("+4")),
+        ("endOffset", json!("7")),
+        ("endOffset", json!("3")),
+        ("endOffset", json!("18446744073709551616")),
+        ("endOffset", Value::Null),
+    ] {
+        let mut ev = adjacent.clone();
+        ev.data[field] = value;
+        incompatible.push(ev);
+    }
+    for field in ["daemonBootId", "startOffset", "endOffset"] {
+        let mut ev = adjacent.clone();
+        ev.data.as_object_mut().unwrap().remove(field);
+        incompatible.push(ev);
+    }
+    incompatible.push(event(
+        TERMINAL_DATA,
+        None,
+        json!({"terminalId":"t-1","chunk":chunk("same")}),
+    ));
+    for bad in incompatible {
+        // Either arrival order must preserve both original payloads.
+        for pair in [[valid.clone(), bad.clone()], [bad.clone(), valid.clone()]] {
+            let mut buf = ConflationBuffer::new();
+            for ev in &pair {
+                let key = event_key(ev).unwrap();
+                assert!(buf
+                    .push(key.clone(), EventItem::new(&key, ev.clone()))
+                    .is_none());
+            }
+            for ev in pair {
+                assert_eq!(frame_data(&buf.pop().unwrap().into_frame("sub-1")), ev.data);
+            }
+            assert!(buf.pop().is_none());
+        }
+    }
+}
+
+#[test]
+fn terminal_cursor_conflation_seals_ranges_at_the_byte_cap() {
+    let mut first = positioned_terminal(0, u64::try_from(TERMINAL_CONCAT_CAP_BYTES).unwrap());
+    first.data["chunk"] = json!(BASE64.encode(vec![b'x'; TERMINAL_CONCAT_CAP_BYTES]));
+    let end = u64::try_from(TERMINAL_CONCAT_CAP_BYTES).unwrap();
+    let second = positioned_terminal(end, end + 4);
+    let third = positioned_terminal(end + 4, end + 8);
+    let mut buf = ConflationBuffer::new();
+    for ev in [first.clone(), second, third] {
+        let key = event_key(&ev).unwrap();
+        assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
+    }
+    assert_eq!(
+        frame_data(&buf.pop().unwrap().into_frame("sub-1")),
+        first.data
+    );
+    let tail = frame_data(&buf.pop().unwrap().into_frame("sub-1"));
+    assert_eq!(tail["startOffset"], end.to_string());
+    assert_eq!(tail["endOffset"], (end + 8).to_string());
+    assert_eq!(
+        BASE64.decode(tail["chunk"].as_str().unwrap()).unwrap(),
+        b"samesame"
+    );
+    assert!(buf.pop().is_none());
+}
+
 #[test]
 fn terminal_chunks_do_not_merge_across_terminals() {
     let mut buf: ConflationBuffer<EventItem> = ConflationBuffer::new();
@@ -379,6 +488,87 @@ fn incremental_chat_blocks_do_not_merge_across_blocks() {
     assert!(buf.pop().is_none());
     assert_eq!(first["added"][0]["block"]["textDelta"], json!("one more"));
     assert_eq!(second["added"][0]["block"]["textDelta"], json!("two"));
+}
+
+/// Incremental fragments carrying `media` (§7.1) union their entries into the
+/// pending block; a fragment without `media` leaves the pending map intact.
+#[test]
+fn incremental_chat_blocks_union_media_across_merged_fragments() {
+    let with_media = |added: bool, text: &str, media: Value| {
+        let mut d = incremental_chunk_delta(added, "m-1:0", text);
+        let bucket = if added { "added" } else { "updated" };
+        d[bucket][0]["block"]["media"] = media;
+        d
+    };
+    let mut buf: ConflationBuffer<ChatItem> = ConflationBuffer::new();
+    for delta in [
+        incremental_chunk_delta(true, "m-1:0", "See "),
+        with_media(
+            false,
+            "![a](a.png)",
+            json!({ "a.png": { "width": 1, "height": 2 } }),
+        ),
+        incremental_chunk_delta(false, "m-1:0", " and "),
+        with_media(
+            false,
+            "![b](b.png)",
+            json!({ "b.png": { "width": 3, "height": 4 } }),
+        ),
+    ] {
+        let (key, item) = ChatItem::from_delta(&delta).unwrap();
+        assert!(buf.push(key, item).is_none());
+    }
+    let only = buf.pop().unwrap().into_delta();
+    assert!(buf.pop().is_none());
+    let block = &only["added"][0]["block"];
+    assert_eq!(block["textDelta"], json!("See ![a](a.png) and ![b](b.png)"));
+    assert_eq!(
+        block["media"],
+        json!({
+            "a.png": { "width": 1, "height": 2 },
+            "b.png": { "width": 3, "height": 4 },
+        })
+    );
+}
+
+#[test]
+fn full_chat_blocks_union_media_across_replaced_entities() {
+    let with_media = |added: bool, text: &str, media: Value| {
+        let mut d = chunk_delta(added, "m-1:0", text);
+        let bucket = if added { "added" } else { "updated" };
+        d[bucket][0]["block"]["media"] = media;
+        d
+    };
+    let mut buf: ConflationBuffer<ChatItem> = ConflationBuffer::new();
+    for delta in [
+        chunk_delta(true, "m-1:0", "See "),
+        with_media(
+            false,
+            "See ![a](a.png)",
+            json!({ "a.png": { "width": 1, "height": 2 } }),
+        ),
+        chunk_delta(false, "m-1:0", "See ![a](a.png) and "),
+        with_media(
+            false,
+            "See ![a](a.png) and ![b](b.png)",
+            json!({ "b.png": { "width": 3, "height": 4 } }),
+        ),
+    ] {
+        let (key, item) = ChatItem::from_delta(&delta).unwrap();
+        assert!(buf.push(key, item).is_none());
+    }
+    let only = buf.pop().unwrap().into_delta();
+    assert!(buf.pop().is_none());
+    let block = &only["added"][0]["block"];
+    assert_eq!(block["text"], json!("See ![a](a.png) and ![b](b.png)"));
+    assert_eq!(
+        block["media"],
+        json!({
+            "a.png": { "width": 1, "height": 2 },
+            "b.png": { "width": 3, "height": 4 },
+        }),
+        "the latest full entity wins but the earlier chunks' media survives the replace"
+    );
 }
 
 #[test]

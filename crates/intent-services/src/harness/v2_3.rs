@@ -117,6 +117,14 @@ impl Harness for V2_3 {
         V1.role_reminder_prefix(name, reminder)
     }
 
+    fn setup_in_progress_notice(&self, terminal_name: &str) -> String {
+        V1.setup_in_progress_notice(terminal_name)
+    }
+
+    fn setup_failed_notice(&self, exit_code: Option<u32>, terminal_name: &str) -> String {
+        V1.setup_failed_notice(exit_code, terminal_name)
+    }
+
     fn compose_turn_prompt(&self, params: &TurnEnvelopeParams<'_>) -> String {
         V1.compose_turn_prompt(params)
     }
@@ -131,6 +139,15 @@ impl Harness for V2_3 {
 
     fn a2a_sender_note(&self, name: Option<&str>, agent_id: &str) -> String {
         V1.a2a_sender_note(name, agent_id)
+    }
+
+    fn collaborator_sender_preamble(
+        &self,
+        login: Option<&str>,
+        display_name: Option<&str>,
+        principal_id: &str,
+    ) -> String {
+        V1.collaborator_sender_preamble(login, display_name, principal_id)
     }
 
     fn wait_duration(&self, secs: i64) -> String {
@@ -165,6 +182,10 @@ impl Harness for V2_3 {
         id: &str,
     ) -> String {
         V1.attachment_reference_notice(name, mime, size, id)
+    }
+
+    fn context_size_requeue_marker(&self, original_chars: usize) -> String {
+        V1.context_size_requeue_marker(original_chars)
     }
 
     fn completion_wake(&self, params: &ChildSettlementParams<'_>, watch_retired: bool) -> String {
@@ -224,6 +245,15 @@ impl Harness for V2_3 {
 
     fn hook_state_dropped_warning(&self, state_bytes: usize, cap_bytes: usize) -> String {
         V1.hook_state_dropped_warning(state_bytes, cap_bytes)
+    }
+
+    fn hook_wake_message_truncated_marker(
+        &self,
+        omitted_chars: usize,
+        total_chars: usize,
+        cap_chars: usize,
+    ) -> String {
+        V1.hook_wake_message_truncated_marker(omitted_chars, total_chars, cap_chars)
     }
 
     fn hook_exec_failures_warning(&self, lines: &[&str], total: usize) -> String {
@@ -318,6 +348,18 @@ impl Harness for V2_3 {
 
     fn pr_monitor_cancelled_workspace_archived_notice(&self, label: &str) -> String {
         V1.pr_monitor_cancelled_workspace_archived_notice(label)
+    }
+
+    fn pr_monitor_transferred_to_parent_notice(&self, label: &str, parent_id: &str) -> String {
+        V1.pr_monitor_transferred_to_parent_notice(label, parent_id)
+    }
+
+    fn workspace_archived_watches_cancelled_notice(
+        &self,
+        hooks: &[(&str, &str)],
+        monitors: &[&str],
+    ) -> String {
+        V1.workspace_archived_watches_cancelled_notice(hooks, monitors)
     }
 
     fn delegation_first_message(&self, body: Option<&str>, title: &str, note_id: &str) -> String {

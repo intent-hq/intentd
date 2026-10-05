@@ -73,7 +73,7 @@ fn create_specialist_with_coding_agent(dir: &std::path::Path, id: &str, coding_a
 /// (`model.defaultProvider`) is resolved onto the created session's
 /// `provider` when it is available — never left to fall through to the
 /// hardcoded default provider (Auggie) at spawn time.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_with_no_explicit_model_resolves_configured_default_provider() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
     set(&svc, "model.defaultProvider", json!("mock"));
@@ -135,7 +135,7 @@ async fn delegate_unknown_default_provider_fails_loudly() {
 
 /// A specialist's frontmatter `codingAgent` takes precedence over the
 /// configured default (D2 step 1 beats step 2).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_specialist_explicit_coding_agent_beats_configured_default() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
     create_specialist_with_coding_agent(specialists_dir.path(), "mock-specialist", "mock");
@@ -258,7 +258,7 @@ async fn delegate_with_nothing_configured_fails_loudly() {
 /// made its own provider-adjacent choice by supplying a model — so the child
 /// runs on the settings-derived default provider with the caller's model,
 /// never on a specialist's `codingAgent` rung.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_with_explicit_model_skips_d2_resolution() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
     set(&svc, "model.defaultProvider", json!("mock"));
@@ -289,7 +289,7 @@ async fn delegate_with_explicit_model_skips_d2_resolution() {
 /// An explicit `provider` param pins the child's provider, outranking the
 /// settings-derived default (PROTOCOL §5.5: param > specialist frontmatter >
 /// settings default).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_explicit_provider_param_beats_configured_default() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
     // The configured default names a DIFFERENT provider — the explicit
@@ -326,7 +326,7 @@ async fn delegate_explicit_provider_param_beats_configured_default() {
 
 /// The explicit `provider` param also outranks the specialist's frontmatter
 /// `codingAgent` (D2 step 1) — the caller's word is final.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_explicit_provider_param_beats_specialist_coding_agent() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
     // The specialist pins a DIFFERENT (unavailable) provider — if the param
@@ -360,7 +360,7 @@ async fn delegate_explicit_provider_param_beats_specialist_coding_agent() {
 /// An explicit `provider` alongside a BARE `model` disambiguates which
 /// provider serves the model — the exact multi-provider-model use case the
 /// param exists for (monorepo#3044).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_explicit_provider_with_bare_model_pins_provider() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
     set(&svc, "model.defaultProvider", json!("codex"));
@@ -487,7 +487,7 @@ async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
 /// `-32602` before the classification loop can start ANY task — never a
 /// partial batch where earlier rows spawned before a later row surfaced the
 /// same shared failure.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_bad_top_level_provider_rejects_before_any_start() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
     let t1 = seed_task(&svc, &ws, "First").await;
@@ -529,7 +529,7 @@ async fn batch_delegate_bad_top_level_provider_rejects_before_any_start() {
 /// — and, being per-entry, a bad override surfaces as that row's `error`
 /// disposition without failing rows that already started (the documented
 /// non-transactional batch contract, same as `model`/`specialist`).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn batch_delegate_provider_top_level_inherited_and_per_entry_override_wins() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
     let t1 = seed_task(&svc, &ws, "Inherits").await;
@@ -705,6 +705,85 @@ fn enabled_gate_rejects_explicitly_disabled_providers() {
     .expect("absent entry means enabled");
     super::ensure_provider_enabled("agent.delegate", "codex", None)
         .expect("absent map means enabled");
+}
+
+#[test]
+fn enabled_gate_preserves_non_disableable_provider_policy() {
+    // Every current registry entry can be disabled. Exercise the same predicate
+    // with a non-disableable config without changing the production registry.
+    let mut provider = *intent_providers::find_provider("codex").unwrap();
+    let disabled = [(provider.id.to_owned(), false)].into();
+    assert!(super::provider_config_is_disabled(
+        &provider,
+        Some(&disabled)
+    ));
+    provider.can_be_disabled = false;
+    assert!(!super::provider_config_is_disabled(
+        &provider,
+        Some(&disabled)
+    ));
+    assert!(!super::provider_config_is_disabled(&provider, None));
+    assert!(!super::provider_is_disabled("unknown", Some(&disabled)));
+}
+
+/// The turn-start re-home resolver (intent-hq/intent#5737): the
+/// settings-derived default is the target only when it passes the same
+/// availability funnel as the create/delegate front doors; the model is what
+/// a fresh agent on that provider would get (`model.providerDefaults[id]` →
+/// `model.default` → `None` for the CLI default). No default configured, a
+/// disabled default, or an unrunnable one (env gate) all yield `None`.
+#[tokio::test]
+async fn disabled_provider_rehome_targets_only_a_usable_default() {
+    let (_t, svc, _ws, _specialists, _cfg) = setup().await;
+    let env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);
+    let resolve = |svc: &crate::Services| {
+        super::resolve_disabled_provider_rehome(svc, &svc.effective_settings(), "session/prompt")
+    };
+
+    assert_eq!(resolve(&svc), None, "no model.defaultProvider → no target");
+
+    set(&svc, "model.defaultProvider", json!("mock"));
+    assert_eq!(
+        resolve(&svc),
+        Some(super::DisabledProviderRehome {
+            provider: "mock".to_string(),
+            model: None,
+        }),
+        "available default with no settings model → CLI default"
+    );
+
+    set(&svc, "model.default", json!("global-default"));
+    assert_eq!(
+        resolve(&svc).and_then(|t| t.model).as_deref(),
+        Some("global-default"),
+        "model.default applies when nothing provider-specific is set"
+    );
+    set(
+        &svc,
+        "model.providerDefaults",
+        json!({ "mock": "mock-default" }),
+    );
+    assert_eq!(
+        resolve(&svc).and_then(|t| t.model).as_deref(),
+        Some("mock-default"),
+        "model.providerDefaults[mock] wins over model.default"
+    );
+
+    set(&svc, "providers.enabled", json!({ "mock": false }));
+    assert_eq!(resolve(&svc), None, "a disabled default is not a target");
+    set(&svc, "providers.enabled", json!({}));
+    assert!(
+        resolve(&svc).is_some(),
+        "re-enabled default is a target again"
+    );
+
+    drop(env);
+    let _unset = EnvGuard::apply(&[("MOCK_AGENT_SCRIPT_PATH", None)]);
+    assert_eq!(
+        resolve(&svc),
+        None,
+        "an unrunnable (env-gated) default is not a target"
+    );
 }
 
 /// End to end through `agent.delegate`: a provider that is installed and
@@ -910,7 +989,7 @@ fn auth_gate_names_each_providers_catalog_login_hint() {
 /// the resolved provider fails fast with the actionable `-32602` — before
 /// any session row is persisted — and flipping the cache back to unknown
 /// lets the same delegate proceed.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_hard_false_auth_verdict_rejected_before_session_row() {
     let (_t, svc, ws, _specialists, _cfg) = setup().await;
     let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", "/tmp/does-not-need-to-exist.js")]);

@@ -1,9 +1,13 @@
 //! Hidden, daemon-managed cache of read-only GitHub clones.
 //!
 //! Layout: `<cache_root>/<owner>/<repo>` — a normal clone with the remote's
-//! default branch checked out. The caller passes the cache root (e.g.
-//! `<workspaces_root>/.repo-cache`, dot-prefixed so it stays invisible to
-//! users and recent-repo derivation); this module never reads config.
+//! default branch checked out. The `<owner>/<repo>` key is the case-folded
+//! [`RepoRef`] identity (ASCII lowercase), so case-variant slugs of one
+//! repository (`Intent-HQ/IntentD`, `intent-hq/intentd`) share a single
+//! slot even on a case-sensitive filesystem. The caller passes the cache
+//! root (e.g. `<workspaces_root>/.repo-cache`, dot-prefixed so it stays
+//! invisible to users and recent-repo derivation); this module never reads
+//! config.
 //!
 //! [`ensure_cached_repo`] is the single entry point: it serializes callers on
 //! a per-repo async lock, then either clones fresh (cache miss) or refreshes
@@ -23,14 +27,16 @@
 //! offered via the env-backed github.com-scoped credential helper
 //! ([`crate::auth::token_helper_config`]) — never argv.
 
+pub mod qualified;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use git2::Repository;
-use intent_core::{Error, Result};
+use git2::{ConfigLevel, Direction, ErrorCode, Repository};
+use intent_core::{Error, GitRemoteUrl, RepoRef, Result};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::auth::{token_helper_config, TOKEN_ENV};
@@ -198,10 +204,129 @@ fn forget_fresh(cache_path: &Path) {
     map.remove(cache_path);
 }
 
-/// Ensure `<cache_root>/<owner>/<repo>` holds a fresh cached clone of
-/// `github_url` and return that path.
+/// Directory name of the repo cache under the workspaces root. Spell the
+/// cache root through [`cache_root_for`], never by joining this literal.
+pub const REPO_CACHE_DIR_NAME: &str = ".repo-cache";
+
+/// The canonical repo-cache root: `<workspaces_root>/.repo-cache`. Every
+/// production and test site that needs the cache root derives it here so
+/// a layout change lands in one place.
+#[must_use]
+pub fn cache_root_for(workspaces_root: &Path) -> PathBuf {
+    workspaces_root.join(REPO_CACHE_DIR_NAME)
+}
+
+/// THE cache slot derivation for `owner`/`repo`: `<cache_root>/<owner>/<repo>`
+/// with both segments case-folded per [`RepoRef::identity_parts`], so every
+/// casing of one slug resolves to (and locks on) the same path. Callers
+/// validate the raw segments first. Tests must call this rather than join
+/// segments themselves, so a slot-layout change cannot desynchronize their
+/// expectations.
+#[must_use]
+pub fn cache_path_for(cache_root: &Path, owner: &str, repo: &str) -> PathBuf {
+    let (owner, repo) = RepoRef::new(owner, repo).identity_parts();
+    cache_root.join(owner).join(repo)
+}
+
+/// Whether `entry` is a real directory — a symlink (to a directory or
+/// anywhere else) is not. `DirEntry::file_type` never follows symlinks.
+fn is_real_dir_entry(entry: &std::fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|t| t.is_dir())
+}
+
+/// Adopt a pre-existing case-variant slot into the folded `cache_path`
+/// (case-sensitive filesystems only see this: a cache populated before the
+/// key was folded may sit at `<Owner>/<Repo>`). Runs only on a miss at the
+/// folded path; scans `cache_root` for an `<o>/<r>` directory whose
+/// [`RepoRef`] identity matches and renames it into place, then prunes the
+/// old owner dir if it emptied. Best effort — any failure leaves the miss
+/// in place and the caller clones fresh.
 ///
-/// - Cache miss: full clone into the cache path.
+/// The scan is confined to real directories exactly two levels under
+/// `cache_root`: symlinked owner or repo entries are never followed (so
+/// nothing outside the cache can be moved into it), an owner entry is only
+/// descended when its name already matches `owner`, and a folded parent
+/// that resolves through a symlink is rejected (so the rename never writes
+/// outside the cache). The rename itself never clobbers content: the
+/// destination is re-checked right before, and `rename(2)` refuses to
+/// replace a non-empty directory or a non-directory, so at worst an empty
+/// directory that raced into place is replaced.
+fn adopt_case_variant_cache(cache_root: &Path, owner: &str, repo: &str, cache_path: &Path) {
+    if cache_path.exists() {
+        return;
+    }
+    let wanted = RepoRef::new(owner, repo);
+    let Some(parent) = cache_path.parent() else {
+        return;
+    };
+    let Ok(owners) = std::fs::read_dir(cache_root) else {
+        return;
+    };
+    for owner_entry in owners.flatten() {
+        let Ok(owner_name) = owner_entry.file_name().into_string() else {
+            continue;
+        };
+        if !is_real_dir_entry(&owner_entry) || RepoRef::new(owner_name.as_str(), repo) != wanted {
+            continue;
+        }
+        let Ok(repos) = std::fs::read_dir(owner_entry.path()) else {
+            continue;
+        };
+        for repo_entry in repos.flatten() {
+            let Ok(repo_name) = repo_entry.file_name().into_string() else {
+                continue;
+            };
+            let candidate = repo_entry.path();
+            if candidate == cache_path
+                || !is_real_dir_entry(&repo_entry)
+                || RepoRef::new(owner_name.as_str(), repo_name.as_str()) != wanted
+            {
+                continue;
+            }
+            let adopted = (|| {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if !std::fs::symlink_metadata(parent)?.is_dir() {
+                    return Err(std::io::Error::other(
+                        "folded owner path is not a real directory",
+                    ));
+                }
+                if std::fs::symlink_metadata(cache_path).is_ok() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "folded slot appeared during adoption",
+                    ));
+                }
+                std::fs::rename(&candidate, cache_path)
+            })();
+            if let Err(e) = adopted {
+                tracing::warn!(
+                    error = %e,
+                    from = %candidate.display(),
+                    to = %cache_path.display(),
+                    "repo cache case-variant slot could not be adopted; cloning fresh"
+                );
+                return;
+            }
+            tracing::info!(
+                from = %candidate.display(),
+                to = %cache_path.display(),
+                "adopted case-variant repo cache slot"
+            );
+            // Prune the vacated owner dir only when it is now empty.
+            let _ = std::fs::remove_dir(owner_entry.path());
+            return;
+        }
+    }
+}
+
+/// Ensure `<cache_root>/<owner>/<repo>` (case-folded, see
+/// [`cache_path_for`]) holds a fresh cached clone of `github_url` and return
+/// that path.
+///
+/// - Cache miss: full clone into the cache path. A pre-existing case-variant
+///   slot is adopted by rename first (see [`adopt_case_variant_cache`]).
 /// - Cache hit: `git fetch --prune origin` + hard reset of the remote default
 ///   branch. Any anomaly self-heals by deleting the cache dir and re-cloning —
 ///   refresh never fails the flow.
@@ -243,19 +368,19 @@ pub async fn ensure_cached_repo_with_progress(
 ) -> Result<PathBuf> {
     validate_segment("owner", owner)?;
     validate_segment("repo", repo)?;
-    let cache_path = cache_root.join(owner).join(repo);
-
-    let lock = lock_for(&cache_path);
-    let _guard = lock.lock().await;
+    let cache_path = cache_path_for(cache_root, owner, repo);
 
     let path = cache_path.clone();
+    let root = cache_root.to_path_buf();
+    let owner = owner.to_string();
+    let repo = repo.to_string();
     let url = github_url.to_string();
     let token = token.map(str::to_owned);
-    tokio::task::spawn_blocking(move || {
+    with_cache_lock_blocking(&cache_path, move || {
+        adopt_case_variant_cache(&root, &owner, &repo, &path);
         ensure_blocking(&path, &url, token.as_deref(), progress.as_ref())
     })
-    .await
-    .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))??;
+    .await?;
     Ok(cache_path)
 }
 
@@ -304,11 +429,12 @@ fn ensure_blocking_with_ttl(
                 }
             }
         } else {
-            // The cache is keyed by `<owner>/<repo>` segments only, so two
-            // different hosts (or two `file://` sources) carrying the same
-            // owner/repo pair must never serve each other's content. A cache
-            // whose `origin` differs from the requested URL is stale, not a
-            // hit — wipe and re-clone from the requested URL.
+            // The cache is keyed by the case-folded `<owner>/<repo>` segments
+            // only, so two different hosts (or two `file://` sources) carrying
+            // the same owner/repo pair must never serve each other's content. A cache
+            // whose `origin` names a different source than the requested URL
+            // (see [`origin_url_matches`]) is stale, not a hit — wipe and
+            // re-clone from the requested URL.
             tracing::warn!(
                 path = %cache_path.display(),
                 "repo cache origin does not match the requested URL; re-cloning"
@@ -326,9 +452,10 @@ fn ensure_blocking_with_ttl(
     Ok(())
 }
 
-/// Whether the cache's `origin` remote points at exactly `github_url`. Any
-/// failure to read it (unopenable repo, missing remote) counts as a mismatch
-/// — the caller self-heals by re-cloning.
+/// Whether the cache's `origin` remote names the same source as `github_url`
+/// (see [`origin_url_matches`]). Any failure to read it (unopenable repo,
+/// missing remote) counts as a mismatch — the caller self-heals by
+/// re-cloning.
 fn origin_matches(cache_path: &Path, github_url: &str) -> bool {
     let Ok(repo) = Repository::open(cache_path) else {
         return false;
@@ -336,55 +463,43 @@ fn origin_matches(cache_path: &Path, github_url: &str) -> bool {
     let Ok(remote) = repo.find_remote("origin") else {
         return false;
     };
-    remote.url().ok() == Some(github_url)
+    remote
+        .url()
+        .ok()
+        .is_some_and(|origin| origin_url_matches(origin, github_url))
+}
+
+/// Whether a cached slot's `origin` URL and a requested URL name the same
+/// source. Two GitHub URLs (per [`GitRemoteUrl::github_repo`]) compare by
+/// identity — host case-insensitive, owner/repo under [`RepoRef`] equality —
+/// because every casing of one slug shares a single folded slot, so a
+/// case-variant request must reuse it rather than wipe and re-clone. Anything
+/// else (another host, a `file://` or local-path source) compares
+/// byte-for-byte, so two sources that merely share an owner/repo pair never
+/// serve each other's content.
+fn origin_url_matches(origin: &str, requested: &str) -> bool {
+    if origin == requested {
+        return true;
+    }
+    matches!(
+        (github_repo(origin), github_repo(requested)),
+        (Some(cached), Some(wanted)) if cached == wanted
+    )
 }
 
 /// Whether `url` is a GitHub URL for exactly `owner`/`repo` — the check the
 /// GitHub-scoped [`list_cached_branches`] reader uses to confirm a cached
-/// slot's `origin`. Accepts the HTTPS/SSH URL and scp-like forms, an optional
-/// `.git` suffix, userinfo, and a port; host, owner, and repo compare
-/// case-insensitively (GitHub slugs are case-insensitive). Anything not on
-/// `github.com` — another host or a local path — is not a GitHub slot.
+/// slot's `origin`. Owner/repo compare under [`RepoRef`] equality (GitHub
+/// slugs are case-insensitive); the accepted URL forms are those of
+/// [`GitRemoteUrl::github_repo`].
 fn origin_is_github_slot(url: &str, owner: &str, repo: &str) -> bool {
-    let trimmed = url.trim().trim_end_matches('/');
-    let (rest, scp_like) = match trimmed.split_once("://") {
-        Some((scheme, rest)) => {
-            let known = ["https", "http", "ssh", "git"]
-                .iter()
-                .any(|s| scheme.eq_ignore_ascii_case(s));
-            if !known {
-                return false;
-            }
-            (rest, false)
-        }
-        // No scheme: only the scp-like `user@host:owner/repo` form qualifies.
-        None => (trimmed, true),
-    };
-    let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
-    let (authority, path) = if scp_like {
-        match rest.split_once(':') {
-            Some(pair) => pair,
-            None => return false,
-        }
-    } else {
-        match rest.split_once('/') {
-            Some(pair) => pair,
-            None => return false,
-        }
-    };
-    let host = authority.split(':').next().unwrap_or(authority);
-    if !host.eq_ignore_ascii_case("github.com") {
-        return false;
-    }
-    let mut segments = path.split('/').filter(|s| !s.is_empty());
-    let (Some(o), Some(r)) = (segments.next(), segments.next()) else {
-        return false;
-    };
-    if segments.next().is_some() {
-        return false;
-    }
-    let r = r.strip_suffix(".git").unwrap_or(r);
-    o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo)
+    github_repo(url).is_some_and(|slug| slug == RepoRef::new(owner, repo))
+}
+
+/// The GitHub `owner`/`repo` a remote URL names, via the one owned parser in
+/// intent-core; `None` for any non-GitHub host or local path.
+fn github_repo(url: &str) -> Option<RepoRef> {
+    GitRemoteUrl::parse(url).and_then(|u| u.github_repo())
 }
 
 /// Refresh an existing cache: fetch + prune, re-resolve the remote's default
@@ -599,7 +714,8 @@ fn chunk_fn(
 /// checkout provisioned FROM the cache never overlaps a concurrent
 /// [`ensure_cached_repo`] refresh/re-clone of the same cache (which
 /// hard-resets or deletes the directory mid-read). The closure runs on the
-/// blocking pool.
+/// blocking pool and owns the guard: cancelling the async caller must not let
+/// another operation touch the cache while its blocking work is still running.
 ///
 /// # Errors
 ///
@@ -610,10 +726,104 @@ where
     T: Send + 'static,
 {
     let lock = lock_for(cache_path);
-    let _guard = lock.lock().await;
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
+    let guard = lock.lock_owned().await;
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        f()
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
+}
+
+/// Seed a hub through temporary cache alternates, then dissociate before it is
+/// exposed. Caller MUST hold `with_cache_lock_blocking` through this operation
+/// and publication of the destination. Cache refresh, self-heal and eviction
+/// cannot run while the hub borrows objects; afterwards it has no dependency on
+/// the cache. A failed initialization remains unpublished and is rebuilt on retry.
+pub(crate) fn seed_detached_bare(cache: &Path, bare: &Path) -> Result<()> {
+    let source = Repository::open(cache).map_err(map_git_err)?;
+    let objects = source
+        .path()
+        .join("objects")
+        .canonicalize()
+        .map_err(|e| Error::Internal(format!("cache object directory: {e}")))?;
+    let objects = objects
+        .to_str()
+        .filter(|p| !p.contains(['\n', '\r']))
+        .ok_or_else(|| Error::InvalidParams("cache object path cannot be an alternate".into()))?;
+    let alternate = bare.join("objects/info/alternates");
+    std::fs::write(&alternate, format!("{objects}\n"))
+        .map_err(|e| Error::Internal(format!("write hub alternate: {e}")))?;
+    sync_bare_base(cache, bare)?;
+    // Unlike -l, -a copies the reachable objects borrowed from alternates.
+    run_git(bare, &["repack", "-a", "-d"], None, cache_clone_timeout())?;
+    std::fs::remove_file(alternate)
+        .map_err(|e| Error::Internal(format!("dissociate hub alternate: {e}")))?;
+    run_git(
+        bare,
+        &["fsck", "--connectivity-only", "--no-dangling"],
+        None,
+        cache_clone_timeout(),
+    )
+}
+
+/// Copy only the cache's forge-tracking branch refs into the head-owned base
+/// namespace. The caller holds the cache lock. No configured remote, network
+/// fetch, agent refs or checkpoint refs are involved. Fetch imports missing
+/// objects normally when refreshing an already-dissociated hub.
+pub(crate) fn sync_bare_base(cache: &Path, bare: &Path) -> Result<()> {
+    let source = Repository::open(cache).map_err(map_git_err)?;
+    let destination = Repository::open_bare(bare).map_err(map_git_err)?;
+    let mut wanted = BTreeMap::new();
+    for reference in source
+        .references_glob("refs/remotes/origin/*")
+        .map_err(map_git_err)?
+    {
+        let reference = reference.map_err(map_git_err)?;
+        // origin/HEAD is symbolic, not a forge branch.
+        if reference.symbolic_target_bytes().is_some() {
+            continue;
+        }
+        let name = reference
+            .name()
+            .map_err(|e| Error::InvalidParams(format!("non-UTF-8 cache branch: {e}")))?;
+        let branch = name
+            .strip_prefix("refs/remotes/origin/")
+            .expect("glob prefix");
+        wanted.insert(format!("refs/heads/{branch}"), name.to_string());
+    }
+    // Remove obsolete heads before fetching: topic and topic/subtopic cannot
+    // coexist as Git refs. Fetching first would fail before reaching the prune
+    // on every retry. This loop touches only the head-owned base namespace;
+    // checkpoint/agent/publication refs keep their objects pinned throughout.
+    for reference in destination
+        .references_glob("refs/heads/*")
+        .map_err(map_git_err)?
+    {
+        let mut reference = reference.map_err(map_git_err)?;
+        let name = reference
+            .name()
+            .map_err(|e| Error::InvalidParams(format!("non-UTF-8 hub base branch: {e}")))?;
+        if !wanted.contains_key(name) {
+            reference.delete().map_err(map_git_err)?;
+        }
+    }
+    if !wanted.is_empty() {
+        let specs: Vec<String> = wanted
+            .iter()
+            .map(|(dst, src)| format!("+{src}:{dst}"))
+            .collect();
+        let mut args = vec![
+            std::ffi::OsStr::new("fetch"),
+            std::ffi::OsStr::new("--no-tags"),
+            std::ffi::OsStr::new("--no-write-fetch-head"),
+            std::ffi::OsStr::new("--"),
+            cache.as_os_str(),
+        ];
+        args.extend(specs.iter().map(std::ffi::OsStr::new));
+        run_git_os(bare, &args, None, cache_clone_timeout())?;
+    }
+    Ok(())
 }
 
 /// Branches read from a cached clone by [`list_cached_branches`] — no
@@ -629,7 +839,8 @@ pub struct CachedBranches {
 }
 
 /// List branches from the cached clone at `<cache_root>/<owner>/<repo>`
-/// without touching the network. A cache miss (missing dir or an unopenable
+/// (case-folded, see [`cache_path_for`]) without touching the network. A
+/// cache miss (missing dir or an unopenable
 /// repo) is a graceful `Ok(None)`, never an error. Briefly holds the
 /// per-repo cache lock so a concurrent [`ensure_cached_repo`] refresh or
 /// re-clone is never observed mid-mutation — but only via `try_lock`: when
@@ -641,8 +852,8 @@ pub struct CachedBranches {
 /// trustworthy) folds to the same graceful miss — a deliberate trade-off
 /// favoring promptness over a hit during that briefer window.
 ///
-/// The cache is keyed by `<owner>/<repo>` segments only, while creation
-/// accepts GitHub-style URLs from any host and treats same-named origins as
+/// The cache is keyed by the case-folded `<owner>/<repo>` segments only, while
+/// creation accepts GitHub-style URLs from any host and treats same-named origins as
 /// distinct (see [`ensure_cached_repo`]'s origin check). This GitHub-scoped
 /// reader therefore verifies the slot's `origin` actually points at
 /// `github.com/<owner>/<repo>`; a slot occupied by another host's clone (or
@@ -658,18 +869,21 @@ pub async fn list_cached_branches(
 ) -> Result<Option<CachedBranches>> {
     validate_segment("owner", owner)?;
     validate_segment("repo", repo)?;
-    let cache_path = cache_root.join(owner).join(repo);
+    let cache_path = cache_path_for(cache_root, owner, repo);
 
     let lock = lock_for(&cache_path);
-    let Ok(_guard) = lock.try_lock() else {
+    let Ok(guard) = lock.try_lock_owned() else {
         return Ok(None);
     };
 
     let owner = owner.to_string();
     let repo = repo.to_string();
-    tokio::task::spawn_blocking(move || list_cached_branches_blocking(&cache_path, &owner, &repo))
-        .await
-        .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        list_cached_branches_blocking(&cache_path, &owner, &repo)
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
 }
 
 /// Blocking body of [`list_cached_branches`]: read-only ref enumeration of
@@ -1147,6 +1361,131 @@ pub(crate) enum OriginTarget<'a> {
     Remove,
 }
 
+/// Remove remote `name` from `repo`, editing only the repository's own
+/// (local) config. libgit2's `remote_delete` walks `remote.<name>.*` across
+/// every config level but deletes from the repository level, so an entry
+/// inherited from the global config — a developer's
+/// `remote.origin.prune = true` — fails the whole removal with "could not
+/// find key" (intent-hq/intent#5326). This mirrors its effect scoped to the
+/// local level, leaving inherited entries untouched: every ref matching the
+/// destination of one of the remote's configured fetch refspecs
+/// (`remote.<name>.fetch`, as `git_remote_delete` does — falling back to
+/// `refs/remotes/<name>/*` only when no fetch refspec is configured), the
+/// `branch.*.remote` / `branch.*.merge` pairs naming the remote, then every
+/// `remote.<name>.*` key.
+pub(crate) fn remove_remote_local_only(repo: &Repository, name: &str) -> Result<()> {
+    let remote = match repo.find_remote(name) {
+        Ok(remote) => Some(remote),
+        Err(e) if e.code() == ErrorCode::NotFound => None,
+        Err(e) => return Err(map_git_err(e)),
+    };
+    // A configured fetch refspec may have no destination (`refs/heads/main`,
+    // `refs/heads/main:`, or a negative `^refs/heads/x`): it stores nothing
+    // locally, so it matches no ref — and, being configured, it also rules
+    // out the `refs/remotes/<name>/*` fallback. `Refspec::dst_bytes` unwraps a
+    // NULL destination, so read the destination from the refspec text instead.
+    let mut has_fetch_refspec = false;
+    let mut dst_patterns: Vec<Vec<u8>> = Vec::new();
+    for spec in remote.iter().flat_map(git2::Remote::refspecs) {
+        if spec.direction() != Direction::Fetch {
+            continue;
+        }
+        has_fetch_refspec = true;
+        if let Some(dst) = fetch_refspec_dst(spec.bytes()) {
+            dst_patterns.push(dst.to_vec());
+        }
+    }
+    if !has_fetch_refspec {
+        dst_patterns.push(format!("refs/remotes/{name}/*").into_bytes());
+    }
+    // Match and delete on the raw name bytes: a ref name need not be UTF-8,
+    // and a `&str` round-trip would silently skip such a ref.
+    let mut doomed: Vec<git2::Reference<'_>> = Vec::new();
+    for reference in repo.references().map_err(map_git_err)? {
+        let reference = reference.map_err(map_git_err)?;
+        if dst_patterns
+            .iter()
+            .any(|pattern| refspec_pattern_matches(pattern, reference.name_bytes()))
+        {
+            doomed.push(reference);
+        }
+    }
+    for mut reference in doomed {
+        reference.delete().map_err(map_git_err)?;
+    }
+
+    let mut local = repo
+        .config()
+        .map_err(map_git_err)?
+        .open_level(ConfigLevel::Local)
+        .map_err(map_git_err)?;
+    let remote_prefix = format!("remote.{name}.");
+    let mut remote_keys: Vec<String> = Vec::new();
+    let mut branch_sections: Vec<String> = Vec::new();
+    {
+        let mut entries = local.entries(None).map_err(map_git_err)?;
+        while let Some(entry) = entries.next() {
+            let entry = entry.map_err(map_git_err)?;
+            let Ok(key) = entry.name() else {
+                continue;
+            };
+            if key.starts_with(&remote_prefix) {
+                if !remote_keys.iter().any(|k| k == key) {
+                    remote_keys.push(key.to_owned());
+                }
+            } else if let Some(section) = key
+                .strip_prefix("branch.")
+                .and_then(|k| k.strip_suffix(".remote"))
+            {
+                if entry.value().is_ok_and(|v| v == name) {
+                    branch_sections.push(section.to_owned());
+                }
+            }
+        }
+    }
+    for section in branch_sections {
+        for key in ["remote", "merge"] {
+            if let Err(e) = local.remove(&format!("branch.{section}.{key}")) {
+                if e.code() != ErrorCode::NotFound {
+                    return Err(map_git_err(e));
+                }
+            }
+        }
+    }
+    for key in remote_keys {
+        local.remove_multivar(&key, ".*").map_err(map_git_err)?;
+    }
+    Ok(())
+}
+
+/// The destination side of a fetch refspec `spec`, or `None` when it has no
+/// destination — mirroring `git_refspec__parse` for the fetch direction: an
+/// optional leading `+`, the right side is what follows the *last* `:`, and a
+/// missing or empty right side leaves the destination unset (a negative
+/// `^…` refspec has no right side at all).
+fn fetch_refspec_dst(spec: &[u8]) -> Option<&[u8]> {
+    let spec = spec.strip_prefix(b"+").unwrap_or(spec);
+    let colon = spec.iter().rposition(|&b| b == b':')?;
+    let dst = &spec[colon + 1..];
+    (!dst.is_empty()).then_some(dst)
+}
+
+/// Whether a refspec destination `pattern` matches the reference `name`, on
+/// raw bytes. libgit2 accepts a refspec side that is either a literal name or
+/// carries exactly one `*`, matched as an unanchored-in-the-middle prefix /
+/// suffix pair — the same shapes `git_refspec_dst_matches` answers.
+fn refspec_pattern_matches(pattern: &[u8], name: &[u8]) -> bool {
+    match pattern.iter().position(|&b| b == b'*') {
+        None => pattern == name,
+        Some(star) => {
+            let (prefix, suffix) = (&pattern[..star], &pattern[star + 1..]);
+            name.len() >= prefix.len() + suffix.len()
+                && name.starts_with(prefix)
+                && name.ends_with(suffix)
+        }
+    }
+}
+
 /// Shared body of the standalone plain-clone provisioners: local `git clone`
 /// of `source_path`, overlay of the source's remote-tracking refs, branch +
 /// checkout + hard reset, then `origin` retargeted per `origin`. The origin
@@ -1183,23 +1522,53 @@ pub(crate) fn provision_plain_clone_checkout(
     (|| {
         // The local clone only maps the source's refs/heads/* into
         // refs/remotes/origin/*; overlay the source's own remote-tracking refs
-        // so every upstream branch resolves as a base ref.
+        // so every upstream branch resolves as a base ref. `--no-prune`
+        // because an inherited `remote.origin.prune` / `fetch.prune` would
+        // otherwise delete every copied ref the source does not itself carry
+        // under refs/remotes/origin/* (intent-hq/intent#5326).
         run_git(
             checkout_path,
             &[
                 "fetch",
+                "--no-prune",
                 "origin",
                 "+refs/remotes/origin/*:refs/remotes/origin/*",
             ],
             None,
             cache_fetch_timeout(),
         )?;
+        // Match the CoW path's preference for an existing source-local branch.
+        // A local clone maps source heads to origin/*; the overlay above can
+        // replace that tip with a stale upstream ref (notably after a cached
+        // PR branch has advanced). Materialize the source-local branch in the
+        // new destination before checkout, without changing either source ref.
+        let source = Repository::open(source_path).map_err(map_git_err)?;
+        match source.find_branch(branch, git2::BranchType::Local) {
+            Ok(source_branch) => {
+                let destination = Repository::open(checkout_path).map_err(map_git_err)?;
+                match destination.find_branch(branch, git2::BranchType::Local) {
+                    Ok(_) => {}
+                    Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                        let tip = source_branch.get().peel_to_commit().map_err(map_git_err)?;
+                        let commit = destination.find_commit(tip.id()).map_err(map_git_err)?;
+                        let mut materialized = destination
+                            .branch(branch, &commit, false)
+                            .map_err(map_git_err)?;
+                        // Preserve Direct checkout's best-effort tracking setup.
+                        let _ = materialized.set_upstream(Some(&format!("origin/{branch}")));
+                    }
+                    Err(error) => return Err(map_git_err(error)),
+                };
+            }
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => return Err(map_git_err(error)),
+        }
         let sha =
             crate::cow_checkout::checkout_in_clone(checkout_path, branch, base_ref, "origin")?;
         let repo = Repository::open(checkout_path).map_err(map_git_err)?;
         match origin {
             OriginTarget::Url(url) => repo.remote_set_url("origin", url).map_err(map_git_err)?,
-            OriginTarget::Remove => repo.remote_delete("origin").map_err(map_git_err)?,
+            OriginTarget::Remove => remove_remote_local_only(&repo, "origin")?,
         }
         Ok(sha)
     })()
@@ -1290,7 +1659,12 @@ fn run_git_os_streamed(
         cmd.arg("-c").arg(token_helper_config());
         cmd.env(TOKEN_ENV, token);
     }
-    let mut child = cmd
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
@@ -1303,6 +1677,15 @@ fn run_git_os_streamed(
         .spawn()
         .map_err(|e| Error::Internal(format!("failed to spawn git: {e}")))?;
 
+    wait_for_cache_git(child, args, timeout, on_chunk)
+}
+
+fn wait_for_cache_git(
+    mut child: std::process::Child,
+    args: &[&std::ffi::OsStr],
+    timeout: Duration,
+    on_chunk: Option<ProgressChunkFn>,
+) -> Result<()> {
     // Drain stdout (piped only when streaming) on its own thread so the
     // child never blocks on a full pipe; its text feeds the callback only.
     let stdout_drain = child.stdout.take().map(|stdout| {
@@ -1344,9 +1727,9 @@ fn run_git_os_streamed(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // The child has exited, so both pipes are at EOF — the drain
-                // threads finish promptly; join them so every chunk reached
-                // the callback before we return.
+                // An owned helper can retain a pipe after the direct child
+                // exits. Reap the group before joining its output callbacks.
+                reap_cache_child_group(&mut child);
                 join_stdout(stdout_drain);
                 if status.success() {
                     let _ = read_stderr(drain);
@@ -1364,8 +1747,9 @@ fn run_git_os_streamed(
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    reap_cache_child_group(&mut child);
+                    join_stdout(stdout_drain);
+                    let _ = read_stderr(drain);
                     return Err(Error::Internal(format!(
                         "git {} timed out after {}s",
                         subcommand_name(args),
@@ -1375,12 +1759,28 @@ fn run_git_os_streamed(
                 std::thread::sleep(GIT_POLL);
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                reap_cache_child_group(&mut child);
+                join_stdout(stdout_drain);
+                let _ = read_stderr(drain);
                 return Err(Error::Internal(format!("git wait failed: {e}")));
             }
         }
     }
+}
+
+/// Every cache command starts in its own process group. Helpers must lose
+/// their inherited output pipes before the final progress callbacks are joined.
+fn reap_cache_child_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: this PID belongs to our child, started with process_group(0).
+        // A negative PID signals only that owned process group.
+        unsafe {
+            libc::kill(-child.id().cast_signed(), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Drain a child's stderr chunk-by-chunk: invoke `cb` once per
@@ -1584,6 +1984,21 @@ mod tests {
             .to_string()
     }
 
+    /// The pub path helpers are the one spelling of the cache layout:
+    /// `cache_root_for` nests `.repo-cache` under the workspaces root and
+    /// `cache_path_for` folds mixed-case owner/repo into a single slot.
+    #[test]
+    fn path_helpers_fold_slugs_under_cache_root() {
+        let workspaces_root = Path::new("/srv/workspaces");
+        let cache_root = cache_root_for(workspaces_root);
+        assert_eq!(cache_root, workspaces_root.join(REPO_CACHE_DIR_NAME));
+
+        let slot = cache_path_for(&cache_root, "Intent-HQ", "IntentD");
+        assert_eq!(slot, cache_root.join("intent-hq").join("intentd"));
+        assert_eq!(slot, cache_path_for(&cache_root, "intent-hq", "intentd"));
+        assert!(slot.starts_with(&cache_root));
+    }
+
     /// Cache miss → a fresh clone lands at `<root>/<owner>/<repo>` with the
     /// origin's default branch checked out and its content on disk.
     #[tokio::test]
@@ -1641,6 +2056,205 @@ mod tests {
             "two\n"
         );
         assert_eq!(head_sha(&path), head_sha(origin.path()));
+    }
+
+    /// Case-variant slugs of one repository resolve to ONE folded slot: the
+    /// second ensure lands on the same path and refreshes (marker survives)
+    /// instead of cloning a parallel `<Owner>/<Repo>` copy.
+    #[tokio::test]
+    async fn case_variant_slugs_share_one_cache_slot() {
+        let origin = init_repo("repocache-origin-casefold");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("casefold");
+        let url = file_url(origin.path());
+
+        let path = ensure_cached_repo(root.path(), &url, "Intent-HQ", "IntentD", None)
+            .await
+            .unwrap();
+        assert_eq!(path, root.path().join("intent-hq").join("intentd"));
+        let marker = path.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        forget_fresh(&path);
+        let path2 = ensure_cached_repo(root.path(), &url, "intent-hq", "intentd", None)
+            .await
+            .unwrap();
+
+        assert_eq!(path, path2);
+        assert!(marker.exists(), "case-variant slug must not clone twice");
+        // Assert the real entry names: on a case-insensitive filesystem a
+        // lookup of `Intent-HQ` would alias `intent-hq`, proving nothing.
+        assert_eq!(
+            dir_names(root.path()),
+            vec!["intent-hq".to_string()],
+            "only the folded owner dir may exist"
+        );
+        assert_eq!(
+            dir_names(&root.path().join("intent-hq")),
+            vec!["intentd".to_string()],
+            "only the folded repo dir may exist"
+        );
+    }
+
+    /// Sorted entry names directly under `dir`.
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A slot populated before the key was folded (`<Owner>/<Repo>` on a
+    /// case-sensitive filesystem) is adopted by rename on the next ensure —
+    /// the clone is reused (marker survives), not re-cloned, and the vacated
+    /// owner dir is pruned.
+    #[tokio::test]
+    async fn preexisting_case_variant_slot_is_adopted_by_rename() {
+        let origin = init_repo("repocache-origin-adopt");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("adopt");
+        let url = file_url(origin.path());
+
+        let folded = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let marker = folded.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        // Move the slot to a raw-cased location, as a pre-fold cache would sit.
+        let legacy_owner = root.path().join("Acme");
+        std::fs::rename(root.path().join("acme"), &legacy_owner).unwrap();
+        std::fs::rename(legacy_owner.join("widget"), legacy_owner.join("Widget")).unwrap();
+        let case_sensitive_fs = !folded.exists();
+
+        forget_fresh(&folded);
+        let path = ensure_cached_repo(root.path(), &url, "Acme", "Widget", None)
+            .await
+            .unwrap();
+
+        assert_eq!(path, folded);
+        assert!(
+            marker.exists(),
+            "adoption must reuse the clone, not re-clone"
+        );
+        assert_eq!(head_sha(&path), head_sha(origin.path()));
+        if case_sensitive_fs {
+            assert!(
+                !legacy_owner.exists(),
+                "vacated raw-cased owner dir must be pruned"
+            );
+        }
+    }
+
+    /// Plant a fake legacy slot `<root>/<owner>/<repo>` holding one file.
+    fn plant_slot(root: &Path, owner: &str, repo: &str) -> PathBuf {
+        let dir = root.join(owner).join(repo);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker"), "keep").unwrap();
+        dir
+    }
+
+    /// Adoption confines its scan to real `<owner>/<repo>` directories:
+    /// unrelated owners and repos are left alone, and an already-populated
+    /// folded slot is never clobbered by a case variant sitting next to it.
+    #[test]
+    fn adoption_ignores_nonmatching_dirs_and_never_clobbers_folded_slot() {
+        let root = CacheRoot::new("adopt-nonmatch");
+        let folded = root.path().join("acme").join("widget");
+        let other_repo = plant_slot(root.path(), "Acme", "other");
+        let other_owner = plant_slot(root.path(), "other", "Widget");
+
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+        assert!(!folded.exists(), "no matching variant: nothing to adopt");
+        assert!(other_repo.join("marker").exists());
+        assert!(other_owner.join("marker").exists());
+
+        // A populated folded slot plus a case variant: the variant must stay
+        // put and the folded content must survive untouched.
+        std::fs::create_dir_all(&folded).unwrap();
+        std::fs::write(folded.join("marker"), "folded").unwrap();
+        if root
+            .path()
+            .join("Acme")
+            .join("Widget")
+            .join("marker")
+            .exists()
+        {
+            return; // case-insensitive filesystem: the two spellings alias
+        }
+        let variant = plant_slot(root.path(), "Acme", "Widget");
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+        assert_eq!(
+            std::fs::read_to_string(folded.join("marker")).unwrap(),
+            "folded"
+        );
+        assert!(variant.join("marker").exists(), "variant must not move");
+    }
+
+    /// A symlinked owner entry is never descended: a directory outside the
+    /// cache must not be moved into the folded slot through it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adoption_does_not_follow_owner_symlink() {
+        let root = CacheRoot::new("adopt-owner-symlink");
+        let outside = CacheRoot::new("adopt-owner-symlink-outside");
+        let victim = plant_slot(outside.path(), "x", "Widget");
+        std::os::unix::fs::symlink(outside.path().join("x"), root.path().join("Acme")).unwrap();
+        let folded = root.path().join("acme").join("widget");
+
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+
+        assert!(!folded.exists(), "must not adopt through an owner symlink");
+        assert!(victim.join("marker").exists(), "outside dir must stay put");
+        assert!(root
+            .path()
+            .join("Acme")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink());
+    }
+
+    /// A symlinked repo entry is never adopted, even when its name matches.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adoption_does_not_follow_repo_symlink() {
+        let root = CacheRoot::new("adopt-repo-symlink");
+        let outside = CacheRoot::new("adopt-repo-symlink-outside");
+        let victim = plant_slot(outside.path(), "x", "y");
+        let legacy_owner = root.path().join("Acme");
+        std::fs::create_dir_all(&legacy_owner).unwrap();
+        let link = legacy_owner.join("Widget");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let folded = root.path().join("acme").join("widget");
+
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+
+        assert!(!folded.exists(), "must not adopt a repo symlink");
+        assert!(link.symlink_metadata().unwrap().is_symlink(), "link stays");
+        assert!(victim.join("marker").exists(), "outside dir must stay put");
+    }
+
+    /// A folded owner path that is itself a symlink is rejected: the rename
+    /// must never write outside the cache root. The legacy slot stays put.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adoption_rejects_symlinked_folded_owner() {
+        let root = CacheRoot::new("adopt-dest-symlink");
+        let outside = CacheRoot::new("adopt-dest-symlink-outside");
+        let legacy = plant_slot(root.path(), "Acme", "Widget");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("acme")).unwrap();
+        let folded = root.path().join("acme").join("widget");
+
+        adopt_case_variant_cache(root.path(), "Acme", "Widget", &folded);
+
+        assert!(legacy.join("marker").exists(), "legacy slot must stay put");
+        assert!(
+            !outside.path().join("widget").exists(),
+            "nothing may be written through the folded owner symlink"
+        );
+        assert!(!folded.exists());
     }
 
     /// A cache that diverged from origin (local commit) is clobbered back to
@@ -1819,6 +2433,152 @@ mod tests {
         assert_eq!(head_sha(&path), head_sha(origin_b.path()));
     }
 
+    /// Seed a cache slot from a local origin, then point its `origin` remote
+    /// at `origin_url` so the write-side origin check sees a URL it never
+    /// fetches from. Returns the slot path and a marker planted in `.git`
+    /// that only survives when the slot is reused.
+    async fn seeded_slot_with_origin(tag: &str, origin_url: &str) -> (CacheRoot, PathBuf, PathBuf) {
+        let origin = init_repo(&format!("repocache-origin-{tag}"));
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new(tag);
+        let path = ensure_cached_repo(
+            root.path(),
+            &file_url(origin.path()),
+            "acme",
+            "widget",
+            None,
+        )
+        .await
+        .unwrap();
+        Repository::open(&path)
+            .unwrap()
+            .remote_set_url("origin", origin_url)
+            .unwrap();
+        let marker = path.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+        (root, path, marker)
+    }
+
+    /// All casings of one GitHub slug share the folded slot, so a request
+    /// whose URL differs from the slot's `origin` only in case (host or
+    /// slug, `.git` optional) is a hit: within the freshness TTL the ensure
+    /// takes the `fresh` skip and never escalates to `Step("re-clone")`.
+    #[tokio::test]
+    async fn case_variant_github_url_reuses_slot_without_reclone() {
+        let (_root, path, marker) =
+            seeded_slot_with_origin("origincase", "https://github.com/Acme/Widget.git").await;
+
+        for requested in [
+            "https://github.com/acme/widget.git",
+            "https://GitHub.com/ACME/WIDGET",
+        ] {
+            let (cb, events) = event_collector();
+            ensure_blocking_with_ttl(&path, requested, None, Some(&cb), Duration::from_secs(600))
+                .unwrap();
+            let steps: Vec<&str> = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|ev| match ev {
+                    CacheEnsureEvent::Step(s) => Some(*s),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(steps, vec!["fresh"], "{requested}: {steps:?}");
+            assert!(
+                marker.exists(),
+                "{requested}: case-variant URL must not re-clone"
+            );
+        }
+    }
+
+    /// The write-side origin check folds only GitHub slug identity: a
+    /// foreign host or a different slug on github.com is still a mismatch,
+    /// and non-GitHub (`file://`, local path) origins compare byte-for-byte
+    /// so a case-variant local source stays isolated.
+    #[tokio::test]
+    async fn origin_matches_isolates_foreign_and_local_origins() {
+        let (_root, path, _marker) =
+            seeded_slot_with_origin("originforeign", "https://github.com/Acme/Widget.git").await;
+        assert!(origin_matches(&path, "https://github.com/acme/widget"));
+        assert!(origin_matches(&path, "git@github.com:acme/widget.git"));
+        for requested in [
+            "https://gitlab.com/acme/widget.git",
+            "https://ghe.example.com/Acme/Widget.git",
+            "https://github.com/other/widget.git",
+            "https://github.com/acme/other.git",
+            "https://github.com/acme/widget/extra",
+            "file:///tmp/acme/widget",
+            "https://example.invalid/a@github.com/acme/widget.git",
+            "/tmp/a@github.com:acme/widget.git",
+        ] {
+            assert!(!origin_matches(&path, requested), "{requested}");
+        }
+
+        let local = "file:///tmp/Acme/Widget";
+        Repository::open(&path)
+            .unwrap()
+            .remote_set_url("origin", local)
+            .unwrap();
+        assert!(origin_matches(&path, local));
+        assert!(
+            !origin_matches(&path, "file:///tmp/acme/widget"),
+            "local origins never fold case"
+        );
+        assert!(!origin_matches(&path, "https://github.com/Acme/Widget.git"));
+    }
+
+    /// [`origin_url_matches`] is pure: GitHub URLs match by folded slug
+    /// across URL forms; everything else requires byte equality.
+    #[test]
+    fn origin_url_matches_folds_github_slugs_only() {
+        assert!(origin_url_matches(
+            "https://github.com/Acme/Widget.git",
+            "https://github.com/acme/widget.git"
+        ));
+        assert!(origin_url_matches(
+            "https://github.com/acme/widget.git",
+            "https://GITHUB.COM/acme/widget"
+        ));
+        assert!(origin_url_matches(
+            "https://gitlab.com/acme/widget.git",
+            "https://gitlab.com/acme/widget.git"
+        ));
+        assert!(!origin_url_matches(
+            "https://gitlab.com/Acme/Widget.git",
+            "https://gitlab.com/acme/widget.git"
+        ));
+        assert!(!origin_url_matches(
+            "https://github.com/acme/widget.git",
+            "https://gitlab.com/acme/widget.git"
+        ));
+        assert!(!origin_url_matches(
+            "https://github.com/acme/widget.git",
+            "https://github.com/acme/other.git"
+        ));
+        assert!(!origin_url_matches("/tmp/Acme/Widget", "/tmp/acme/widget"));
+        // An `@` in a path or a local path never folds into the GitHub slot,
+        // on either side of the comparison (mirrors the reader-side set in
+        // `origin_is_github_slot_recognizes_github_urls`).
+        for foreign in [
+            "https://example.invalid/a@github.com/acme/widget.git",
+            "/tmp/a@github.com:acme/widget.git",
+            "https://github.com.evil.example/acme/widget",
+            "./a@github.com:acme/widget.git",
+            "file:///tmp/a@github.com:acme/widget.git",
+        ] {
+            assert!(
+                !origin_url_matches("https://github.com/acme/widget.git", foreign),
+                "{foreign}"
+            );
+            assert!(
+                !origin_url_matches(foreign, "https://github.com/acme/widget.git"),
+                "{foreign}"
+            );
+            assert!(origin_url_matches(foreign, foreign), "{foreign}");
+        }
+    }
+
     /// Untracked pollution in the cache work tree (e.g. leftovers from a
     /// process killed mid-checkout) is cleaned by the refresh, so it never
     /// copies into hydrated checkouts.
@@ -1936,6 +2696,115 @@ mod tests {
         assert!(path.join("a.txt").exists());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cache_timeout_joins_progress_callback_before_returning() {
+        use std::{io::BufRead, os::unix::process::CommandExt};
+
+        struct CleanupGroup(u32);
+        impl Drop for CleanupGroup {
+            fn drop(&mut self) {
+                // SAFETY: the PID came from our child spawned in a fresh
+                // process group; the negative PID selects only that group.
+                unsafe {
+                    libc::kill(-self.0.cast_signed(), libc::SIGKILL);
+                }
+            }
+        }
+        let mut child = Command::new("sh")
+            .args(["-c", "echo progress >&2; echo ready; read line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let _cleanup = CleanupGroup(child.id());
+        let _stdin = child.stdin.take().unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let finished_tx = std::sync::Mutex::new(Some(finished_tx));
+        let callback: ProgressChunkFn = Arc::new(move |_| {
+            if let Some(tx) = entered_tx.lock().unwrap().take() {
+                tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                finished_tx
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+            }
+        });
+        let mut job = tokio::task::spawn_blocking(move || {
+            wait_for_cache_git(
+                child,
+                &[std::ffi::OsStr::new("clone")],
+                Duration::ZERO,
+                Some(callback),
+            )
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let returned_while_callback_held = tokio::time::timeout(Duration::from_secs(10), &mut job)
+            .await
+            .is_ok();
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap();
+        if !returned_while_callback_held {
+            assert!(job.await.unwrap().is_err());
+        }
+        assert!(
+            !returned_while_callback_held,
+            "cache timeout returned while a progress callback still owned its persistence channel"
+        );
+    }
+
+    /// The blocking closure outlives a cancelled async caller. Its guard must
+    /// outlive that caller too, or cache cleanup/hub retry can enter mid-copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_cache_work_keeps_lock_until_blocking_closure_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = cache_path_for(&cache_root_for(root.path()), "acme", "widget");
+        let first_path = path.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(async move {
+            with_cache_lock_blocking(&first_path, move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                finished_tx.send(()).unwrap();
+                Ok(())
+            })
+            .await
+        });
+        entered_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        // The closure cannot finish before release_tx, and the cancelled task
+        // has definitely dropped its async locals. No scheduling delay needed.
+        let retained = lock_for(&path).try_lock_owned().is_err();
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap();
+        with_cache_lock_blocking(&path, || Ok(())).await.unwrap();
+        assert!(
+            retained,
+            "cancelled caller released the cache lock before its blocking work finished"
+        );
+    }
+
     /// `provision_direct_checkout` produces a standalone plain clone of the
     /// cache on the workspace branch, with `origin` retargeted at the real
     /// URL (never the cache path).
@@ -1967,6 +2836,76 @@ mod tests {
             std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
             "one\n"
         );
+    }
+
+    /// A refreshed daemon-owned PR branch must survive a stale cache
+    /// remote-tracking overlay in the Direct path, including force pushes.
+    #[tokio::test]
+    async fn direct_checkout_preserves_refreshed_pr_branch_over_stale_remote() {
+        let origin = init_repo("repocache-direct-pr");
+        commit_file(origin.path(), "a.txt", "base\n");
+        let base = head_sha(origin.path());
+        crate::testutil::create_branch(origin.path(), "topic");
+        let root = CacheRoot::new("direct-pr");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let cache_head = head_sha(&cache);
+        let checkout_root = CacheRoot::new("direct-pr-dst");
+        let mut prior_checkouts: Vec<(PathBuf, String)> = Vec::new();
+        for label in ["first", "forward", "force"] {
+            if label == "force" {
+                let repo = Repository::open(origin.path()).unwrap();
+                let base = repo.revparse_single(&base).unwrap();
+                repo.reset(&base, git2::ResetType::Hard, None).unwrap();
+            }
+            commit_file(origin.path(), "a.txt", label);
+            let expected = head_sha(origin.path());
+            let repo = Repository::open(origin.path()).unwrap();
+            repo.reference(
+                "refs/pull/42/head",
+                git2::Oid::from_str(&expected).unwrap(),
+                true,
+                "move canonical PR head",
+            )
+            .unwrap();
+            crate::fetch::prepare_cached_pr_branch(
+                &cache,
+                "origin",
+                42,
+                "topic",
+                Some(&expected),
+                None,
+            )
+            .unwrap();
+            let checkout = checkout_root.path().join(label);
+            let actual = provision_direct_checkout(&cache, &checkout, &url, "topic", None).unwrap();
+            assert_eq!(actual, expected);
+            let destination = Repository::open(&checkout).unwrap();
+            let branch = destination
+                .find_branch("topic", git2::BranchType::Local)
+                .unwrap();
+            assert_eq!(
+                branch.upstream().unwrap().get().name().unwrap(),
+                "refs/remotes/origin/topic",
+                "Direct checkout retains upstream tracking"
+            );
+            assert_eq!(
+                std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
+                label
+            );
+            assert_eq!(head_sha(&cache), cache_head, "cache HEAD stays unchanged");
+            assert_eq!(
+                crate::refs::rev_parse(&cache, "refs/remotes/origin/topic").unwrap(),
+                base,
+                "stale upstream ref is preserved, not rewritten"
+            );
+            for (path, sha) in &prior_checkouts {
+                assert_eq!(&head_sha(path), sha, "earlier destination is preserved");
+            }
+            prior_checkouts.push((checkout, expected));
+        }
     }
 
     /// A `base_ref` naming a non-default origin branch resolves through the
@@ -2109,8 +3048,9 @@ mod tests {
     }
 
     /// [`origin_is_github_slot`] URL-form coverage: HTTPS/SSH/scp-like
-    /// github.com origins for the slug match (case-insensitively, `.git`
-    /// optional); other hosts, schemes, slugs, and path shapes do not.
+    /// github.com origins for the slug match (case-insensitively on both the
+    /// URL and the requested owner/repo, `.git` optional); other hosts,
+    /// schemes, slugs, and path shapes do not.
     #[test]
     fn origin_is_github_slot_recognizes_github_urls() {
         for url in [
@@ -2124,6 +3064,7 @@ mod tests {
             "git@github.com:acme/widget.git",
         ] {
             assert!(origin_is_github_slot(url, "acme", "widget"), "{url}");
+            assert!(origin_is_github_slot(url, "ACME", "Widget"), "{url}");
         }
         for url in [
             "https://gitlab.com/acme/widget.git",
@@ -2136,6 +3077,8 @@ mod tests {
             "https://github.com/widget.git",
             "https://github.com.evil.com/acme/widget.git",
             "git@gitlab.com:acme/widget.git",
+            "https://example.invalid/a@github.com/acme/widget.git",
+            "/tmp/a@github.com:acme/widget.git",
         ] {
             assert!(!origin_is_github_slot(url, "acme", "widget"), "{url}");
         }
@@ -3210,6 +4153,301 @@ mod tests {
             !is_fresh(&cache_path, CACHE_FRESH_TTL_DEFAULT),
             "a failed ensure must not mark the slot fresh"
         );
+    }
+
+    /// [`remove_remote_local_only`] deletes the refs matching the remote's
+    /// configured fetch-refspec destinations, as `git_remote_delete` does —
+    /// not a fixed `refs/remotes/<name>/*` glob. With
+    /// `+refs/heads/*:refs/remotes/upstream/*`, the refs under `upstream/`
+    /// go, while a ref under another remote's namespace and a stale one under
+    /// `refs/remotes/origin/` (outside the configured destination) both stay.
+    #[test]
+    fn remove_remote_local_only_follows_fetch_refspec_destinations() {
+        let repo_dir = init_repo("rmremote-refspec");
+        commit_file(repo_dir.path(), "a.txt", "one\n");
+        let repo = Repository::open(repo_dir.path()).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.remote_with_fetch(
+            "origin",
+            "https://example.invalid/acme/widget.git",
+            "+refs/heads/*:refs/remotes/upstream/*",
+        )
+        .unwrap();
+        for name in [
+            "refs/remotes/upstream/main",
+            "refs/remotes/upstream/feature",
+            "refs/remotes/other/main",
+            "refs/remotes/origin/stale",
+        ] {
+            repo.reference(name, head, false, "test").unwrap();
+        }
+        {
+            let mut config = repo.config().unwrap();
+            config.set_str("branch.main.remote", "origin").unwrap();
+            config
+                .set_str("branch.main.merge", "refs/heads/main")
+                .unwrap();
+        }
+
+        remove_remote_local_only(&repo, "origin").unwrap();
+
+        assert!(repo.find_reference("refs/remotes/upstream/main").is_err());
+        assert!(repo
+            .find_reference("refs/remotes/upstream/feature")
+            .is_err());
+        assert!(
+            repo.find_reference("refs/remotes/other/main").is_ok(),
+            "a ref outside the remote's fetch destination must survive"
+        );
+        assert!(
+            repo.find_reference("refs/remotes/origin/stale").is_ok(),
+            "only refs matching a configured fetch destination are deleted"
+        );
+        assert!(repo.find_remote("origin").is_err());
+        let local = git2::Config::open(&repo_dir.path().join(".git").join("config")).unwrap();
+        for key in [
+            "remote.origin.url",
+            "remote.origin.fetch",
+            "branch.main.remote",
+            "branch.main.merge",
+        ] {
+            assert!(
+                local.get_string(key).is_err(),
+                "{key} must be removed from the local config"
+            );
+        }
+    }
+
+    /// [`remove_remote_local_only`] falls back to `refs/remotes/<name>/*` only
+    /// when the remote has no fetch refspec configured (a bare
+    /// `remote.<name>.url`), still leaving other remotes' refs intact.
+    #[test]
+    fn remove_remote_local_only_falls_back_to_remote_namespace_without_refspec() {
+        let repo_dir = init_repo("rmremote-norefspec");
+        commit_file(repo_dir.path(), "a.txt", "one\n");
+        let repo = Repository::open(repo_dir.path()).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.config()
+            .unwrap()
+            .set_str(
+                "remote.origin.url",
+                "https://example.invalid/acme/widget.git",
+            )
+            .unwrap();
+        assert_eq!(
+            repo.find_remote("origin").unwrap().refspecs().count(),
+            0,
+            "fixture must configure origin without a fetch refspec"
+        );
+        for name in [
+            "refs/remotes/origin/main",
+            "refs/remotes/origin/feature",
+            "refs/remotes/other/main",
+        ] {
+            repo.reference(name, head, false, "test").unwrap();
+        }
+
+        remove_remote_local_only(&repo, "origin").unwrap();
+
+        assert!(repo.find_reference("refs/remotes/origin/main").is_err());
+        assert!(repo.find_reference("refs/remotes/origin/feature").is_err());
+        assert!(
+            repo.find_reference("refs/remotes/other/main").is_ok(),
+            "another remote's ref must survive the fallback"
+        );
+        assert!(repo.find_remote("origin").is_err());
+        let local = git2::Config::open(&repo_dir.path().join(".git").join("config")).unwrap();
+        assert!(local.get_string("remote.origin.url").is_err());
+    }
+
+    /// [`refspec_pattern_matches`] answers the two refspec-side shapes on raw
+    /// bytes: a literal name matches only itself; a single `*` matches any
+    /// (possibly empty, possibly non-UTF-8, `/`-containing) middle.
+    #[test]
+    fn refspec_pattern_matches_literal_and_single_glob_on_bytes() {
+        assert!(refspec_pattern_matches(
+            b"refs/heads/main",
+            b"refs/heads/main"
+        ));
+        assert!(!refspec_pattern_matches(
+            b"refs/heads/main",
+            b"refs/heads/main2"
+        ));
+        assert!(!refspec_pattern_matches(
+            b"refs/heads/main",
+            b"refs/heads/mai"
+        ));
+
+        let glob = b"refs/remotes/upstream/*";
+        assert!(refspec_pattern_matches(glob, b"refs/remotes/upstream/main"));
+        assert!(refspec_pattern_matches(glob, b"refs/remotes/upstream/a/b"));
+        assert!(refspec_pattern_matches(glob, b"refs/remotes/upstream/"));
+        assert!(refspec_pattern_matches(
+            glob,
+            b"refs/remotes/upstream/latin-\xff"
+        ));
+        assert!(!refspec_pattern_matches(glob, b"refs/remotes/upstream"));
+        assert!(!refspec_pattern_matches(glob, b"refs/remotes/other/main"));
+
+        let infix = b"refs/remotes/up*-mirror";
+        assert!(refspec_pattern_matches(
+            infix,
+            b"refs/remotes/upstream-mirror"
+        ));
+        assert!(refspec_pattern_matches(infix, b"refs/remotes/up-mirror"));
+        assert!(!refspec_pattern_matches(infix, b"refs/remotes/upstream"));
+        assert!(!refspec_pattern_matches(infix, b"refs/remotes/u-mirror"));
+    }
+
+    /// [`fetch_refspec_dst`] follows libgit2's fetch-direction parse: the
+    /// destination is what follows the last `:` after an optional `+`, and a
+    /// missing or empty right side means no destination (as does a negative
+    /// `^…` refspec, which has no right side).
+    #[test]
+    fn fetch_refspec_dst_follows_libgit2_fetch_parse() {
+        assert_eq!(
+            fetch_refspec_dst(b"+refs/heads/*:refs/remotes/origin/*"),
+            Some(&b"refs/remotes/origin/*"[..])
+        );
+        assert_eq!(
+            fetch_refspec_dst(b"refs/heads/main:refs/remotes/origin/main"),
+            Some(&b"refs/remotes/origin/main"[..])
+        );
+        assert_eq!(
+            fetch_refspec_dst(b"refs/heads/a:b:refs/remotes/origin/c"),
+            Some(&b"refs/remotes/origin/c"[..])
+        );
+        assert_eq!(fetch_refspec_dst(b"refs/heads/main"), None);
+        assert_eq!(fetch_refspec_dst(b"+refs/heads/main"), None);
+        assert_eq!(fetch_refspec_dst(b"refs/heads/main:"), None);
+        assert_eq!(fetch_refspec_dst(b"^refs/heads/main"), None);
+        assert_eq!(fetch_refspec_dst(b"^refs/heads/*"), None);
+    }
+
+    /// A configured fetch refspec without a destination (source-only, empty
+    /// destination, or negative) stores nothing locally, so it must match no
+    /// ref — and, being configured, must not trigger the
+    /// `refs/remotes/<name>/*` fallback either. `Refspec::dst_bytes` panics on
+    /// such a refspec; [`remove_remote_local_only`] must still succeed, leave
+    /// every ref intact, and drop the local `remote.<name>.*` config.
+    #[test]
+    fn remove_remote_local_only_tolerates_fetch_refspecs_without_destination() {
+        for (label, fetch_specs) in [
+            ("source-only", &["refs/heads/main"][..]),
+            ("empty-destination", &["refs/heads/main:"][..]),
+            ("negative-only", &["^refs/heads/main"][..]),
+            (
+                "mixed-with-negative-glob",
+                &["refs/heads/main", "^refs/heads/*", "refs/heads/topic:"][..],
+            ),
+        ] {
+            let repo_dir = init_repo("rmremote-nodst");
+            commit_file(repo_dir.path(), "a.txt", "one\n");
+            let repo = Repository::open(repo_dir.path()).unwrap();
+            let head = repo.head().unwrap().target().unwrap();
+            let (first, rest) = fetch_specs.split_first().unwrap();
+            repo.remote_with_fetch("origin", "https://example.invalid/acme/widget.git", first)
+                .unwrap();
+            for spec in rest {
+                repo.remote_add_fetch("origin", spec).unwrap();
+            }
+            assert_eq!(
+                repo.find_remote("origin").unwrap().refspecs().count(),
+                fetch_specs.len(),
+                "{label}: fixture must configure every fetch refspec"
+            );
+            for name in ["refs/remotes/origin/main", "refs/remotes/other/main"] {
+                repo.reference(name, head, false, "test").unwrap();
+            }
+
+            remove_remote_local_only(&repo, "origin")
+                .unwrap_or_else(|e| panic!("{label}: removal must succeed: {e}"));
+
+            assert!(
+                repo.find_reference("refs/remotes/origin/main").is_ok(),
+                "{label}: a configured destination-less refspec must not trigger the namespace fallback"
+            );
+            assert!(
+                repo.find_reference("refs/remotes/other/main").is_ok(),
+                "{label}: an unrelated ref must survive"
+            );
+            assert!(
+                repo.find_remote("origin").is_err(),
+                "{label}: remote must be gone"
+            );
+            let local = git2::Config::open(&repo_dir.path().join(".git").join("config")).unwrap();
+            assert!(local.get_string("remote.origin.url").is_err(), "{label}");
+            assert!(local.get_string("remote.origin.fetch").is_err(), "{label}");
+        }
+    }
+
+    /// [`remove_remote_local_only`] must not skip a remote-tracking ref whose
+    /// name is not valid UTF-8 (`git check-ref-format` accepts such names, and
+    /// `git_remote_delete` removes them): it matches and deletes on the raw
+    /// name bytes, still leaving an unrelated ref intact.
+    ///
+    /// Linux-only (intent-hq/intent#5585): the fixture writes the ref as a
+    /// loose file whose name carries the raw `\xff` byte, and macOS's APFS
+    /// enforces UTF-8 file names, so `git update-ref` fails there with
+    /// `Illegal byte sequence` before any production code runs. The raw-name
+    /// behaviour under test is filesystem-independent; Linux keeps the
+    /// coverage.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remove_remote_local_only_deletes_non_utf8_ref_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let repo_dir = init_repo("rmremote-nonutf8");
+        commit_file(repo_dir.path(), "a.txt", "one\n");
+        let repo = Repository::open(repo_dir.path()).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.remote_with_fetch(
+            "origin",
+            "https://example.invalid/acme/widget.git",
+            "+refs/heads/*:refs/remotes/upstream/*",
+        )
+        .unwrap();
+        repo.reference("refs/remotes/other/main", head, false, "test")
+            .unwrap();
+        let raw_name: &[u8] = b"refs/remotes/upstream/latin-\xff";
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir.path())
+            .arg("update-ref")
+            .arg(OsStr::from_bytes(raw_name))
+            .arg(head.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "fixture: git update-ref must accept the raw name"
+        );
+        let has_ref = |repo: &Repository, name: &[u8]| {
+            repo.references()
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .any(|r| r.name_bytes() == name)
+        };
+        assert!(
+            has_ref(&repo, raw_name),
+            "fixture must create the non-UTF-8 ref"
+        );
+
+        remove_remote_local_only(&repo, "origin").unwrap();
+
+        assert!(
+            !has_ref(&repo, raw_name),
+            "the non-UTF-8 ref under the fetch destination must be deleted"
+        );
+        assert!(
+            has_ref(&repo, b"refs/remotes/other/main"),
+            "an unrelated ref must survive"
+        );
+        assert!(repo.find_remote("origin").is_err());
     }
 
     /// [`parse_fresh_ttl`] handles the env shapes: unset/garbage fall back to

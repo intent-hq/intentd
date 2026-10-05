@@ -66,6 +66,172 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
     (tmp, services, ws, specialists_dir, config_dir)
 }
 
+async fn create_versioned_chief(
+    svc: &Services,
+    ws: &WorkspaceId,
+    metadata: serde_json::Value,
+) -> intent_core::Result<serde_json::Value> {
+    svc.agent_create_op(
+        ws.clone(),
+        Some("Assistant".into()),
+        None,
+        Some("chief-of-staff".into()),
+        None,
+        None,
+        false,
+        intent_core::AgentCreateExtra {
+            metadata: Some(metadata),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn chief_prompt_version_validates_creation_without_inference() {
+    let (_tmp, svc, ws, _specialists, _config) = setup().await;
+    for version in [
+        json!(0),
+        json!(-1),
+        json!(3.0),
+        json!(1.5),
+        json!("3"),
+        json!(true),
+        json!({}),
+        json!([]),
+        json!(4_294_967_296_u64),
+    ] {
+        let result =
+            create_versioned_chief(&svc, &ws, json!({"chiefPromptVersion": version})).await;
+        assert!(
+            matches!(result, Err(intent_core::Error::InvalidParams(_))),
+            "{result:?}"
+        );
+    }
+    assert!(svc.agent_list_op(ws.clone()).await.unwrap().is_empty());
+
+    for metadata in [
+        json!({}),
+        json!({"chiefPromptVersion": null}),
+        json!({"chiefPromptVersion": 1}),
+        json!({"chiefPromptVersion": 3}),
+        json!({"chiefPromptVersion": u32::MAX}),
+    ] {
+        let expected = intent_core::chief_prompt_version(&metadata);
+        let created = create_versioned_chief(&svc, &ws, metadata).await.unwrap();
+        let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let get = svc.agent_get_op(id.clone(), None).await.unwrap();
+        assert_eq!(get.metadata.chief_prompt_version, expected);
+        assert_eq!(
+            created["agent"]["metadata"]
+                .get("chiefPromptVersion")
+                .cloned(),
+            expected.map(|v| json!(v))
+        );
+        let rows = svc.agent_list_op(ws.clone()).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .metadata
+                .chief_prompt_version,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn chief_prompt_version_invalidates_only_for_changed_prompt_identity() {
+    let (_tmp, svc, ws, _specialists, _config) = setup().await;
+    for mutation in [
+        json!({"systemPrompt": "new instructions"}),
+        json!({"specialist": null}),
+    ] {
+        let created = create_versioned_chief(
+            &svc,
+            &ws,
+            json!({
+                "chiefPromptVersion": 3, "behaviorPrompt": "You are Assistant."
+            }),
+        )
+        .await
+        .unwrap();
+        let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        svc.store()
+            .append_agent_message(
+                &id,
+                "user",
+                &json!([{"type": "text", "text": "Keep this history"}]),
+                &intent_core::now_iso(),
+            )
+            .await
+            .unwrap();
+        let before = svc.store().get_agent_session(&id).await.unwrap();
+        svc.agent_update_op(
+            id.clone(),
+            json!({
+                "name": "My custom thread", "model": "another-model",
+                "systemPrompt": null, "specialist": "chief-of-staff"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.agent_get_op(id.clone(), None)
+                .await
+                .unwrap()
+                .metadata
+                .chief_prompt_version,
+            Some(3)
+        );
+        for forbidden in [
+            json!({"metadata": {"chiefPromptVersion": 3}}),
+            json!({"chiefPromptVersion": 3}),
+        ] {
+            assert!(matches!(
+                svc.agent_update_op(id.clone(), forbidden).await,
+                Err(intent_core::Error::InvalidParams(_))
+            ));
+        }
+        svc.agent_update_op(id.clone(), mutation).await.unwrap();
+        let stored = svc.store().get_agent_session(&id).await.unwrap();
+        assert!(stored
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get("chiefPromptVersion")
+            .is_none());
+        assert_eq!(
+            stored.metadata.as_ref().unwrap()["behaviorPrompt"],
+            before.metadata.as_ref().unwrap()["behaviorPrompt"]
+        );
+        assert_eq!(stored.messages, before.messages);
+        assert_eq!(stored.name, "My custom thread");
+        assert_eq!(
+            svc.agent_get_op(id.clone(), None)
+                .await
+                .unwrap()
+                .metadata
+                .chief_prompt_version,
+            None
+        );
+        svc.agent_update_op(
+            id.clone(),
+            json!({"systemPrompt": null, "specialist": "chief-of-staff"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.agent_get_op(id, None)
+                .await
+                .unwrap()
+                .metadata
+                .chief_prompt_version,
+            None
+        );
+    }
+}
+
 async fn create_agent(
     svc: &Services,
     ws: &WorkspaceId,
@@ -241,7 +407,7 @@ async fn retired_model_tier_falls_through_to_settings() {
 
 /// The delegate path ignores the retired `modelTier` identically to direct
 /// create — it funnels through the same resolver in `agent_create_op`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn retired_model_tier_ignored_on_delegate_path() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
     create_specialist_with_retired_tier(specialists_dir.path(), "tiered", "smart");
@@ -267,7 +433,7 @@ async fn retired_model_tier_ignored_on_delegate_path() {
 /// the id, BEFORE provider/effort resolution — not a confusing downstream
 /// provider-resolution failure — and no child agent is created
 /// (monorepo#3497). An alias still delegates fine.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn unknown_specialist_rejects_delegate() {
     let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
 
@@ -322,7 +488,7 @@ async fn unknown_specialist_rejects_delegate() {
 /// monorepo#1729 (issue repro): a delegated specialist with no frontmatter
 /// model resolves `model.providerDefaults`, NOT the quick-action default —
 /// the quick-action model settings never apply to a delegated session.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_ignores_quick_action_default_model() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
     create_specialist_without_model(specialists_dir.path(), "implementor-test");
@@ -370,7 +536,7 @@ async fn delegate_ignores_quick_action_default_model() {
 /// Seeded through `model.providerDefaults` rather than `model.default`: a
 /// compound `model.default` makes `resolve_delegate_provider` derive that
 /// provider and assert it is installed, which no CI runner guarantees.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn delegate_ignores_quick_action_type_override() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
     create_specialist_without_model(specialists_dir.path(), "implementor-test");
@@ -631,9 +797,8 @@ async fn create_agent_with_optional_name(
 }
 
 /// A name-less create carrying a specialist derives the agent name from the
-/// specialist's frontmatter display name and counts it as explicitly set
-/// (matches the desktop FE, which resolves the display name client-side and
-/// sends it as an explicit `name`).
+/// specialist's frontmatter display name and keeps it eligible for a
+/// first-message task-specific rename.
 #[tokio::test]
 async fn omitted_name_derives_from_specialist_display_name() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
@@ -652,7 +817,7 @@ async fn omitted_name_derives_from_specialist_display_name() {
     )
     .await;
     assert_eq!(agent["name"], "Fancy Display Name");
-    assert_eq!(agent["nameExplicitlySet"], true);
+    assert_eq!(agent["nameExplicitlySet"], false);
 }
 
 /// The embedded bundled `spec-writer` resolves with zero local files: a
@@ -669,7 +834,7 @@ async fn omitted_name_derives_from_embedded_spec_writer() {
     )
     .await;
     assert_eq!(agent["name"], "Coordinator");
-    assert_eq!(agent["nameExplicitlySet"], true);
+    assert_eq!(agent["nameExplicitlySet"], false);
 }
 
 /// An explicit client-supplied name beats the specialist display name.

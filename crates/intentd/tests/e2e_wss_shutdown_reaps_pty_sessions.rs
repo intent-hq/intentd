@@ -11,7 +11,7 @@ mod common;
 
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,15 +28,11 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-ptyreap-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-ptyreap-")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -67,7 +63,7 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     let mut buf = String::new();
     timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
         .await
-        .expect("uds rpc timed out")
+        .unwrap_or_else(|_| panic!("UDS RPC {method} (id {id}) timed out waiting for response"))
         .expect("read uds response");
     serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
@@ -168,7 +164,9 @@ where
     loop {
         let next = timeout(Duration::from_secs(15), ws.next())
             .await
-            .expect("wss rpc timed out");
+            .unwrap_or_else(|_| {
+                panic!("WSS RPC {method} (id {id}) timed out waiting for response")
+            });
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -257,7 +255,8 @@ impl Drop for KillOnDrop {
 /// exits cleanly (monorepo#1526).
 #[tokio::test]
 async fn shutdown_reaps_terminal_and_script_pty_sessions() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let ws_id = "ws-pty-reap";
 
@@ -297,14 +296,19 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
     common::enable_ws_api(&data_dir);
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
+    let mut cmd = common::serve_command();
+    common::hermetic_github_identity(&mut cmd, &data_dir);
+    // gh auth token can otherwise select an inherited enterprise credential.
+    cmd.env_remove("GH_HOST")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
         .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
+        .env("RUST_LOG", "info")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -312,8 +316,29 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
     // Own process group so the DaemonGuard's SIGKILL cannot leak PTY children
     // if the test panics before the graceful path runs.
     cmd.process_group(0);
+    // Assert before boot so a missing override cannot fall back to shared state.
+    let explicit_env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+    let owned_workspaces = explicit_env.get(std::ffi::OsStr::new("INTENTD_WORKSPACES_DIR"))
+        == Some(&Some(data_dir.join("workspaces").as_os_str()));
+    let owned_secrets = explicit_env.get(std::ffi::OsStr::new("INTENTD_SECRETS_FILE"))
+        == Some(&Some(data_dir.join("secrets.json").as_os_str()));
+    let isolated_gh = explicit_env.get(std::ffi::OsStr::new("GH_CONFIG_DIR"))
+        == Some(&Some(data_dir.join("gh-config").as_os_str()));
+    let no_host_auth_env = [
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GH_HOST",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ]
+    .iter()
+    .all(|key| explicit_env.get(std::ffi::OsStr::new(key)) == Some(&None));
+    assert!(
+        owned_workspaces && owned_secrets && isolated_gh && no_host_auth_env,
+        "shutdown fixture isolation: owned workspaces={owned_workspaces}, owned secrets={owned_secrets}, disposable GH_CONFIG_DIR={isolated_gh}, removed credential env={no_host_auth_env}"
+    );
     let child = cmd.spawn().expect("spawn intentd serve");
-    let mut daemon = DaemonGuard::new(child, data_dir.clone(), true);
+    let mut daemon = DaemonGuard::process_only(child);
     if !await_uds(&socket).await {
         if let Ok(log) = std::fs::read_to_string(data_dir.join("daemon.log")) {
             eprintln!("Daemon log:\n{log}");
@@ -411,8 +436,33 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
         }
     })
     .await
-    .expect("daemon did not exit after system.shutdown");
-    assert!(exit_ok, "daemon exited non-zero");
+    .expect("daemon-exit phase timed out after system.shutdown acknowledgement and terminal and script PTYs reap");
+    assert!(exit_ok, "daemon-exit phase returned a non-zero status");
+    // Both stderr and the rotated file must contain the final record immediately
+    // after process exit, with no writer-drain sleep hiding lost final logs.
+    let stderr_log = std::fs::read_to_string(data_dir.join("daemon.log")).unwrap();
+    assert_shutdown_phase_order(&stderr_log);
+    let mut log_paths = Vec::new();
+    for entry in std::fs::read_dir(&data_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("intentd.")
+            && path.extension().is_some_and(|ext| ext == "log")
+        {
+            log_paths.push(path);
+        }
+    }
+    // The daemon can cross midnight; dated filenames preserve phase order.
+    log_paths.sort();
+    let file_log = log_paths
+        .into_iter()
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect::<String>();
+    assert_shutdown_phase_order(&file_log);
+    eprintln!("shutdown complete: terminal and script PTYs reaped; daemon exited successfully");
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
@@ -432,6 +482,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -457,10 +508,80 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
+}
+
+fn assert_shutdown_phase_order(log: &str) {
+    let phases = [
+        "cleanup",
+        "pty_shutdown",
+        "request_drain",
+        "agent_checkpoint",
+        "agent_deliveries",
+        "startup_recovery_join",
+        "tunnel_stop",
+        "wss_stop",
+        "mcp_start_join",
+        "mcp_shutdown",
+        "agent_shutdown",
+        "writer_drain",
+        "store_close",
+        "wal_checkpoint",
+        "write_pool_close",
+        "read_pool_close",
+        "runtime_drop",
+    ];
+    let mut previous_start = 0;
+    for phase in phases {
+        let start = format!("phase=\"{phase}\" state=\"started\"");
+        let end = format!("phase=\"{phase}\" state=\"completed\"");
+        let start_at = log
+            .find(&start)
+            .unwrap_or_else(|| panic!("missing {start}: {log}"));
+        let end_at = log
+            .find(&end)
+            .unwrap_or_else(|| panic!("missing {end}: {log}"));
+        assert!(
+            start_at >= previous_start && end_at > start_at,
+            "out of order {phase}: {log}"
+        );
+        assert_eq!(log.matches(&start).count(), 1, "duplicate {start}");
+        assert_eq!(log.matches(&end).count(), 1, "duplicate {end}");
+        assert!(log[end_at..]
+            .lines()
+            .next()
+            .unwrap()
+            .contains("elapsed_ms="));
+        previous_start = start_at;
+    }
+    let completions = [
+        "read_pool_close",
+        "store_close",
+        "cleanup",
+        "serve_lifetime",
+        "runtime_drop",
+    ];
+    let mut previous_end = 0;
+    for phase in completions {
+        let end = format!("phase=\"{phase}\" state=\"completed\"");
+        let at = log
+            .find(&end)
+            .unwrap_or_else(|| panic!("missing {end}: {log}"));
+        assert!(at > previous_end, "out of order {end}: {log}");
+        previous_end = at;
+    }
+    assert!(
+        log.find("phase=\"serve_lifetime\" state=\"completed\"")
+            .unwrap()
+            < log
+                .find("phase=\"runtime_drop\" state=\"started\"")
+                .unwrap()
+    );
 }

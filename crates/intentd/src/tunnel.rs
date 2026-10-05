@@ -87,7 +87,9 @@ fn tailcat_spawn_error_impl(
         return Error::Internal(format!(
             "cannot run tailcat {action}: the tailcat sidecar binary was not found \
              ({}; checked libexec/ and the directory next to the intentd binary, \
-             then PATH). Update intentd (`intentd update`) — releases before \
+             then PATH). The installation may be incomplete. Run `intentd update` \
+             to update or repair it. If it still reports already up to date, \
+             reinstall intentd to refresh the updater. Releases before \
              v0.9.10 did not bundle the tailcat sidecar \
              (https://github.com/tailscale/tailcat)",
             bin.display()
@@ -135,7 +137,7 @@ impl TunnelSupervisor {
     }
 
     /// Test seam: shorten the address wait so failure paths don't stall tests.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_address_timeout(mut self, timeout: Duration) -> Self {
         self.address_timeout = timeout;
         self
@@ -161,7 +163,7 @@ impl TunnelSupervisor {
         .await?;
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let task = tokio::spawn(supervise(
+        let task = intent_core::spawn_daemon(supervise(
             self.bin.clone(),
             self.key_path.clone(),
             ws_port,
@@ -305,7 +307,7 @@ async fn spawn_and_read_address(
     // key parse failure, network errors) are diagnosable, and the child never
     // blocks on a full pipe.
     if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let line = line.trim();
@@ -333,7 +335,9 @@ async fn spawn_and_read_address(
         Ok(Some(addr)) => {
             // Keep draining stdout in the background so the child never
             // blocks on a full pipe.
-            tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+            intent_core::spawn_daemon(
+                async move { while let Ok(Some(_)) = lines.next_line().await {} },
+            );
             Ok((child, addr))
         }
         Ok(None) => {
@@ -366,7 +370,7 @@ fn parse_listen_addr(line: &str) -> Option<String> {
 /// every restart report the same address; a restart that reports a different
 /// one (key file replaced underneath us) is logged loudly but kept — the
 /// supervisor's `address` still serves the original until stop/start.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn supervise(
     bin: PathBuf,
     key_path: PathBuf,
@@ -469,7 +473,7 @@ case "$1" in
     ;;
   serve)
     printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
-    sleep 600
+    exec sleep 600
     ;;
 esac
 "#;
@@ -528,7 +532,7 @@ case "$1" in
       while [ ! -f "$dir/exit-now" ]; do sleep 0.1; done
       exit 1
     fi
-    sleep 600
+    exec sleep 600
     ;;
 esac
 "#;
@@ -620,7 +624,13 @@ esac
         assert!(msg.contains("sidecar binary was not found"), "{msg}");
         assert!(msg.contains("/opt/intentd/libexec/tailcat"), "{msg}");
         assert!(msg.contains("intentd update"), "{msg}");
+        assert!(msg.contains("installation may be incomplete"), "{msg}");
+        assert!(msg.contains("update or repair"), "{msg}");
         assert!(msg.contains("before v0.9.10"), "{msg}");
+        assert!(
+            msg.contains("reinstall intentd to refresh the updater"),
+            "{msg}"
+        );
         assert!(
             msg.contains("https://github.com/tailscale/tailcat"),
             "{msg}"

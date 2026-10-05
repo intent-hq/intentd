@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,6 +23,7 @@ use tokio::io::AsyncRead;
 use tokio::process::{Child, Command};
 use uuid::Uuid;
 
+use crate::mcp_oauth::McpOauthService;
 use crate::settings::{AsyncSecretStore, REDACTED_PLACEHOLDER};
 use crate::settings_registry::SettingsRegistry;
 use crate::{system_actor, EventBus};
@@ -54,8 +56,10 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(30);
 /// Consecutive ping failures before the monitor restarts a server (parity: 3).
 const MAX_FAILURES: u32 = 3;
 /// Grace window between SIGTERM and SIGKILL when reaping (PTY-host parity).
+#[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_millis(500);
 /// Poll cadence while waiting for a reaped child to exit.
+#[cfg(unix)]
 const REAP_POLL: Duration = Duration::from_millis(25);
 
 /// Epoch milliseconds (the `startedAt` shape in PROTOCOL §5.22's example).
@@ -100,6 +104,19 @@ fn status_stopped(server_id: &str) -> Value {
 /// An `error` status snapshot carrying `last_error` for `server_id`.
 fn status_error(server_id: &str, last_error: &str) -> Value {
     status_value(server_id, "error", None, None, Some(last_error), None)
+}
+
+/// An `auth_required` status snapshot for a remote server whose endpoint
+/// rejected the daemon's configured or stored credentials.
+fn status_auth_required(server_id: &str, last_error: &str) -> Value {
+    status_value(
+        server_id,
+        "auth_required",
+        None,
+        None,
+        Some(last_error),
+        None,
+    )
 }
 
 /// The `id` of a config Value (empty when absent).
@@ -288,15 +305,18 @@ enum ToolTarget {
     /// Forward over a stateless streamable-HTTP session.
     Http {
         url: String,
-        headers: Vec<(String, String)>,
+        config: Value,
+        generation: u64,
     },
 }
 
 /// Transport-specific runtime half of a tracked server entry.
 enum ServerRuntime {
-    /// A spawned stdio child + its JSON-RPC stdio connection.
+    /// A spawned stdio child + its JSON-RPC stdio connection. The child is
+    /// boxed: `tokio::process::Child` is large on Windows, which would make
+    /// the data-less `Remote` variant pay for it (`clippy::large_enum_variant`).
     Stdio {
-        child: Child,
+        child: Box<Child>,
         pid: Option<u32>,
         conn: Arc<Connection>,
     },
@@ -311,12 +331,18 @@ struct RunningServer {
     runtime: ServerRuntime,
     status: Value,
     failures: u32,
+    generation: u64,
 }
 
 /// Shared runtime state for the [`McpHub`].
 struct HubInner {
     servers: Mutex<HashMap<String, RunningServer>>,
     bus: Mutex<Option<EventBus>>,
+    oauth_store: Option<Store>,
+    next_generation: AtomicU64,
+    background_stop: tokio::sync::watch::Sender<bool>,
+    #[cfg(test)]
+    before_reap: Mutex<Option<Arc<crate::CompletionClassifyPark>>>,
 }
 
 /// Runtime manager for external MCP servers (the `ServerManager` + `HealthMonitor`
@@ -336,12 +362,40 @@ impl Default for McpHub {
 impl McpHub {
     /// Build an empty hub with no event bus wired yet.
     pub fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// Build an empty hub backed by the daemon store for refresh-aware OAuth
+    /// header construction on remote probes and tool calls.
+    pub(crate) fn with_oauth_store(store: Store) -> Self {
+        Self::build(Some(store))
+    }
+
+    fn build(oauth_store: Option<Store>) -> Self {
         Self {
             inner: Arc::new(HubInner {
                 servers: Mutex::new(HashMap::new()),
                 bus: Mutex::new(None),
+                oauth_store,
+                next_generation: AtomicU64::new(1),
+                background_stop: tokio::sync::watch::channel(false).0,
+                #[cfg(test)]
+                before_reap: Mutex::new(None),
             }),
         }
+    }
+
+    /// Fence boot starts and health ticks while their current operation settles.
+    pub fn begin_background_shutdown(&self) {
+        self.inner.background_stop.send_replace(true);
+    }
+
+    fn background_stopping(&self) -> bool {
+        *self.inner.background_stop.borrow()
+    }
+
+    fn next_generation(&self) -> u64 {
+        self.inner.next_generation.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Wire the event bus the hub publishes `mcp.servers:status-changed` onto.
@@ -392,6 +446,14 @@ impl McpHub {
         let rs = self.inner.servers.lock().unwrap().remove(id);
         match rs {
             Some(mut rs) => {
+                #[cfg(test)]
+                {
+                    let park = self.inner.before_reap.lock().unwrap().take();
+                    if let Some(park) = park {
+                        park.entered.notify_one();
+                        park.release.notified().await;
+                    }
+                }
                 reap(&mut rs).await;
                 true
             }
@@ -435,14 +497,15 @@ impl McpHub {
                 let rs = RunningServer {
                     config,
                     runtime: ServerRuntime::Stdio {
-                        child,
+                        child: Box::new(child),
                         pid,
                         conn: Arc::new(conn),
                     },
                     status: status.clone(),
                     failures: 0,
+                    generation: self.next_generation(),
                 };
-                self.inner.servers.lock().unwrap().insert(id, rs);
+                self.register_runtime(id, rs).await;
                 self.publish_status(&status).await;
                 status
             }
@@ -459,16 +522,26 @@ impl McpHub {
     /// `error`) so the health sweep re-probes it — there is no process to
     /// restart, only status to flip.
     async fn start_remote(&self, id: String, config: Value) -> Value {
-        let status = remote_probe_status(&id, &config).await;
+        let status = self.remote_probe_status(&id, &config).await;
         let rs = RunningServer {
             config,
             runtime: ServerRuntime::Remote,
             status: status.clone(),
             failures: 0,
+            generation: self.next_generation(),
         };
-        self.inner.servers.lock().unwrap().insert(id, rs);
+        self.register_runtime(id, rs).await;
         self.publish_status(&status).await;
         status
+    }
+
+    /// A concurrent start can register during our handshake. Keep its displaced
+    /// runtime owned until cleanup finishes, without holding the map lock.
+    async fn register_runtime(&self, id: String, server: RunningServer) {
+        let displaced = self.inner.servers.lock().unwrap().insert(id, server);
+        if let Some(mut displaced) = displaced {
+            reap(&mut displaced).await;
+        }
     }
 
     /// Restart `config`: stop-then-start (emits `stopped` then `running`/`error`).
@@ -505,6 +578,9 @@ impl McpHub {
         // so slow endpoints cannot serialize the sweep and starve stdio pings.
         let mut remote_probes = tokio::task::JoinSet::new();
         for (id, probe) in targets {
+            if self.background_stopping() {
+                break;
+            }
             let conn = match probe {
                 Probe::Remote(config) => {
                     let hub = self.clone();
@@ -529,7 +605,7 @@ impl McpHub {
                     None => continue,
                 }
             };
-            if failures >= MAX_FAILURES {
+            if failures >= MAX_FAILURES && !self.background_stopping() {
                 tracing::warn!(server = %id, "mcp server unhealthy; restarting");
                 self.restart(config, true).await;
             }
@@ -541,7 +617,7 @@ impl McpHub {
     /// `mcp.servers:status-changed` on a state transition. `startedAt` is
     /// preserved across consecutive `running` probes.
     async fn reprobe_remote(&self, id: &str, config: &Value) {
-        let mut next = remote_probe_status(id, config).await;
+        let mut next = self.remote_probe_status(id, config).await;
         let changed = {
             let mut map = self.inner.servers.lock().unwrap();
             // The entry may have been stopped or replaced while the probe ran.
@@ -568,13 +644,25 @@ impl McpHub {
     /// Spawn the periodic health-monitor loop (ping + auto-restart). The first
     /// sweep runs after one interval; missed ticks are skipped.
     pub fn spawn_health_monitor(&self) -> tokio::task::JoinHandle<()> {
+        self.spawn_health_monitor_with_interval(HEALTH_INTERVAL)
+    }
+
+    fn spawn_health_monitor_with_interval(
+        &self,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
         let hub = self.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(HEALTH_INTERVAL);
+        let mut stopping = self.inner.background_stop.subscribe();
+        intent_core::spawn_daemon(async move {
+            let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    biased;
+                    _ = stopping.wait_for(|stop| *stop) => break,
+                    _ = ticker.tick() => {}
+                }
                 hub.health_tick().await;
             }
         })
@@ -641,7 +729,8 @@ impl McpHub {
                     .to_string();
                 Ok(ToolTarget::Http {
                     url,
-                    headers: config_headers(&rs.config),
+                    config: rs.config.clone(),
+                    generation: rs.generation,
                 })
             }
         }
@@ -669,9 +758,12 @@ impl McpHub {
     }
 
     /// Forward one tool request to the server's transport. stdio reuses the
-    /// live [`Connection`]; `http` runs a stateless streamable-HTTP session
-    /// per call (initialize → notifications/initialized → the request), the
-    /// whole session bounded by `timeout` on top of each request's own bound.
+    /// live [`Connection`], and a request abandoned on timeout is followed by
+    /// an MCP `notifications/cancelled` naming its id so the server can stop
+    /// the work (the HTTP session below drops its connection instead); `http`
+    /// runs a stateless streamable-HTTP session per call (initialize →
+    /// notifications/initialized → the request), the whole session bounded
+    /// by `timeout` on top of each request's own bound.
     async fn forward(
         &self,
         server_id: &str,
@@ -681,7 +773,16 @@ impl McpHub {
     ) -> Result<Value> {
         match self.tool_target(server_id)? {
             ToolTarget::Stdio(conn) => {
-                conn.request_timeout(method, params, timeout)
+                let cancel = |id: i64| {
+                    (
+                        "notifications/cancelled".to_string(),
+                        json!({
+                            "requestId": id,
+                            "reason": format!("{method} timed out after {}ms", timeout.as_millis()),
+                        }),
+                    )
+                };
+                conn.request_timeout_with_cancel(method, params, timeout, cancel)
                     .await
                     .map_err(|e| match e {
                         intent_acp::AcpError::Timeout(_) => {
@@ -690,12 +791,85 @@ impl McpHub {
                         other => Error::Internal(format!("mcp {method} failed: {other}")),
                     })
             }
-            ToolTarget::Http { url, headers } => {
+            ToolTarget::Http {
+                url,
+                config,
+                generation,
+            } => {
+                let headers = self.remote_headers(server_id, &config).await;
                 let session = http_tool_session(&url, &headers, method, params, timeout);
-                tokio::time::timeout(timeout, session)
+                let outcome = tokio::time::timeout(timeout, session)
                     .await
-                    .map_err(|_| Error::Internal(format!("mcp {method} timed out")))?
+                    .map_err(|_| Error::Internal(format!("mcp {method} timed out")))?;
+                if let Err(error) = &outcome {
+                    if is_auth_failure(error) {
+                        self.mark_auth_required(server_id, generation, error).await;
+                    }
+                }
+                outcome
             }
+        }
+    }
+
+    /// Build outbound headers for a saved remote config. An explicit
+    /// `Authorization` config header wins; otherwise the daemon reads the
+    /// server's stored OAuth bag and performs refresh when needed.
+    async fn remote_headers(&self, server_id: &str, config: &Value) -> Vec<(String, String)> {
+        let mut headers = config_headers(config);
+        if headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            return headers;
+        }
+        let Some(store) = self.inner.oauth_store.as_ref() else {
+            return headers;
+        };
+        match McpOauthService::new(store)
+            .authorization_header(server_id)
+            .await
+        {
+            Ok(Some(value)) => headers.push(("Authorization".to_string(), value)),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                server = %server_id,
+                error = %error,
+                "failed to read mcp oauth bag; continuing without stored authorization"
+            ),
+        }
+        headers
+    }
+
+    /// Probe a remote config and shape the result as its lifecycle status.
+    async fn remote_probe_status(&self, id: &str, config: &Value) -> Value {
+        let headers = self.remote_headers(id, config).await;
+        match probe_remote(config, &headers).await {
+            Ok(tool_count) => {
+                status_value(id, "running", None, tool_count, None, Some(now_millis()))
+            }
+            Err(error) if is_auth_failure(&error) => status_auth_required(id, &error.to_string()),
+            Err(error) => status_error(id, &error.to_string()),
+        }
+    }
+
+    /// Move a tracked remote server to `auth_required` after a forwarded HTTP
+    /// request receives 401/403. Publish only on a real state transition.
+    async fn mark_auth_required(&self, server_id: &str, generation: u64, error: &Error) {
+        let status = status_auth_required(server_id, &error.to_string());
+        let changed = {
+            let mut servers = self.inner.servers.lock().unwrap();
+            let Some(server) = servers.get_mut(server_id) else {
+                return;
+            };
+            if !matches!(server.runtime, ServerRuntime::Remote) || server.generation != generation {
+                return;
+            }
+            let changed = server.status.get("state") != status.get("state");
+            server.status = status.clone();
+            changed
+        };
+        if changed {
+            self.publish_status(&status).await;
         }
     }
 }
@@ -761,8 +935,13 @@ async fn spawn_stdio(config: &Value) -> Result<(Child, Option<u32>, Connection, 
         .take()
         .map(|s| Box::new(s) as Box<dyn AsyncRead + Unpin + Send>);
     let conn = Connection::new(stdin, stdout, stderr, ConnectionHooks::default());
-    let tool_count = mcp_handshake(&conn).await?;
-    Ok((child, pid, conn, tool_count))
+    match mcp_handshake(&conn).await {
+        Ok(tool_count) => Ok((child, pid, conn, tool_count)),
+        Err(error) => {
+            reap_child(&mut child, pid).await;
+            Err(error)
+        }
+    }
 }
 
 /// Run the MCP `initialize` → `notifications/initialized` → `tools/list`
@@ -797,14 +976,6 @@ async fn ping(conn: &Connection) -> bool {
         .is_ok()
 }
 
-/// Probe `config` and shape the outcome as a wire `McpServerStatus` (§5.22).
-async fn remote_probe_status(id: &str, config: &Value) -> Value {
-    match probe_remote(config).await {
-        Ok(tool_count) => status_value(id, "running", None, tool_count, None, Some(now_millis())),
-        Err(e) => status_error(id, &e.to_string()),
-    }
-}
-
 /// Probe a remote MCP endpoint from the daemon host. `http` runs the full MCP
 /// handshake (`initialize` → `notifications/initialized` → `tools/list`) over
 /// streamable HTTP POST; `sse` is a reachability probe only (full SSE sessions
@@ -812,7 +983,7 @@ async fn remote_probe_status(id: &str, config: &Value) -> Value {
 /// The whole probe is bounded by [`PROBE_TIMEOUT`] on top of the per-request
 /// [`HANDSHAKE_TIMEOUT`]. Redirects are never followed: configured headers may
 /// carry credentials that reqwest would forward to a cross-host redirect.
-async fn probe_remote(config: &Value) -> Result<Option<u64>> {
+async fn probe_remote(config: &Value, headers: &[(String, String)]) -> Result<Option<u64>> {
     let transport = config
         .get("transport")
         .and_then(Value::as_str)
@@ -828,11 +999,10 @@ async fn probe_remote(config: &Value) -> Result<Option<u64>> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| Error::Internal(format!("http client init failed: {e}")))?;
-    let headers = config_headers(config);
     let probe = async move {
         match transport {
-            "sse" => probe_sse(&client, &url, &headers).await.map(|()| None),
-            _ => probe_http_handshake(&client, &url, &headers).await,
+            "sse" => probe_sse(&client, &url, headers).await.map(|()| None),
+            _ => probe_http_handshake(&client, &url, headers).await,
         }
     };
     tokio::time::timeout(PROBE_TIMEOUT, probe)
@@ -1014,9 +1184,16 @@ async fn probe_http_handshake(
         .map(String::from);
     let sid = session.as_deref();
     let ver = proto.as_deref();
-    // Notification (servers typically answer 202); failures are non-fatal.
+    // Notification (servers typically answer 202); only authentication
+    // failures are fatal because later requests cannot use the session.
     let inited = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-    let _ = post_rpc(client, url, headers, sid, ver, &inited).await;
+    if let Ok(resp) = post_rpc(client, url, headers, sid, ver, &inited).await {
+        if matches!(resp.status().as_u16(), 401 | 403) {
+            let error = check_http_status(resp.status()).unwrap_err();
+            delete_session(client, url, headers, sid, ver).await;
+            return Err(error);
+        }
+    }
     let tools = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} });
     let tool_count = match post_rpc(client, url, headers, sid, ver, &tools).await {
         Ok(resp) if resp.status().is_success() => {
@@ -1026,6 +1203,11 @@ async fn probe_http_handshake(
                     .and_then(Value::as_array)
                     .map(|a| a.len() as u64)
             })
+        }
+        Ok(resp) if matches!(resp.status().as_u16(), 401 | 403) => {
+            let error = check_http_status(resp.status()).unwrap_err();
+            delete_session(client, url, headers, sid, ver).await;
+            return Err(error);
         }
         _ => None,
     };
@@ -1253,11 +1435,17 @@ fn check_http_status(status: reqwest::StatusCode) -> Result<()> {
     let code = status.as_u16();
     Err(match code {
         401 | 403 => Error::Internal(format!(
-            "authentication failed (HTTP {code}) — check configured headers"
+            "authentication failed (HTTP {code}) — authenticate or check configured credentials"
         )),
         500..=599 => Error::Internal(format!("server error (HTTP {code})")),
         _ => Error::Internal(format!("unexpected HTTP {code} from server")),
     })
+}
+
+/// Whether an internally-shaped remote HTTP failure represents a 401/403.
+/// Only messages emitted by [`check_http_status`] reach this helper.
+fn is_auth_failure(error: &Error) -> bool {
+    matches!(error, Error::Internal(message) if message.starts_with("authentication failed (HTTP 401)") || message.starts_with("authentication failed (HTTP 403)"))
 }
 
 /// Terminate a stdio server's whole process group (SIGTERM → grace → SIGKILL),
@@ -1269,9 +1457,13 @@ async fn reap(rs: &mut RunningServer) {
     let ServerRuntime::Stdio { child, pid, .. } = &mut rs.runtime else {
         return;
     };
+    reap_child(child, *pid).await;
+}
+
+async fn reap_child(child: &mut Child, pid: Option<u32>) {
     #[cfg(unix)]
     {
-        if let Some(pid) = *pid {
+        if let Some(pid) = pid {
             let descendants = intent_acp::descendant_pids(pid).await;
             let _ = kill_group(pid, nix::sys::signal::Signal::SIGTERM);
             let mut exited = false;
@@ -1296,6 +1488,8 @@ async fn reap(rs: &mut RunningServer) {
         let _ = pid;
         let _ = child.kill().await;
     }
+    // SIGKILL is a signal, not a join: retain ownership through actual exit.
+    let _ = child.wait().await;
 }
 
 /// Signal a whole process group by its leader pid (pgid == pid via `process_group`).
@@ -1440,9 +1634,9 @@ impl<'a> McpServersService<'a> {
         let normalized = merge_redacted_secrets(normalize_config(config, Some(server_id))?, stored);
         configs.insert(server_id.to_string(), normalized.clone());
         write_configs(self.secrets, &configs).await?;
-        // Apply live: any tracked server (running, or a remote in `error`)
-        // picks up the new definition on restart — an error-state remote must
-        // re-probe the updated URL/headers, not keep probing the old config.
+        // Apply live: any tracked server (running, or a remote in `error` or
+        // `auth_required`) picks up the new definition on restart. A failed
+        // remote must re-probe updated credentials, not keep the old config.
         let tracked = self.hub.status(server_id)["state"] != "stopped";
         if tracked {
             let enable = enable_user_servers(&self.effective());
@@ -1550,7 +1744,7 @@ impl<'a> McpServersService<'a> {
     /// user deleted/disabled/updated mid-sweep is never left running from this
     /// task's stale snapshot.
     pub(crate) async fn start_enabled(&self) {
-        if !enable_user_servers(&self.effective()) {
+        if self.hub.background_stopping() || !enable_user_servers(&self.effective()) {
             return;
         }
         let ids: Vec<String> = read_configs(self.secrets)
@@ -1559,10 +1753,19 @@ impl<'a> McpServersService<'a> {
             .map(String::from)
             .collect();
         for id in ids {
+            if self.hub.background_stopping() {
+                break;
+            }
             let Some(config) = self.eligible_config(&id).await else {
                 continue;
             };
+            if self.hub.background_stopping() {
+                break;
+            }
             self.hub.start(config.clone(), true).await;
+            if self.hub.background_stopping() {
+                break;
+            }
             // A mutation that landed during the handshake found no hub entry to
             // stop or restart, so reconcile it here.
             match self.eligible_config(&id).await {
@@ -2128,6 +2331,241 @@ mod tests {
         let h = McpHub::new();
         let status = h.restart(stdio_cfg("r1", BOGUS_CMD), false).await;
         assert_eq!(status, status_stopped("r1"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overlapping_starts_reap_displaced_child_and_descendant() {
+        use nix::sys::signal::{kill, killpg, Signal};
+        use nix::unistd::Pid;
+        use tokio::io::AsyncWriteExt;
+        struct Cleanup(Vec<i32>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for pid in &self.0 {
+                    let _ = killpg(Pid::from_raw(*pid), Signal::SIGKILL);
+                    let _ = kill(Pid::from_raw(*pid), Signal::SIGKILL);
+                }
+            }
+        }
+        let dir = crate::test_support::test_tempdir("mcp-overlapping-starts");
+        let path = dir.path().join("state.db");
+        let store = Store::open(&path).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let hub = McpHub::new();
+        hub.set_event_bus(bus.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let script = r"import json,os,signal,socket,subprocess,sys
+child=subprocess.Popen(['sleep','3600'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+def stop(signum, frame):
+    child.wait()
+    sys.exit(0)
+signal.signal(signal.SIGTERM,stop)
+for line in sys.stdin:
+    req=json.loads(line)
+    if req.get('method')=='initialize':
+        host,port=sys.argv[1].rsplit(':',1)
+        with socket.create_connection((host,int(port))) as control:
+            control.sendall((str(os.getpid())+' '+str(child.pid)+'\n').encode())
+            control.recv(1)
+    if 'id' in req:
+        result={'tools':[]} if req.get('method')=='tools/list' else {}
+        print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':result}),flush=True)
+";
+        let config = json!({"id":"overlap", "transport":"stdio", "command":"python3", "args":["-u","-c",script,address]});
+        let mut cleanup = Cleanup(Vec::new());
+        let mut starts = Vec::new();
+        let mut controls = Vec::new();
+        for _ in 0..2 {
+            let worker = hub.clone();
+            let config = config.clone();
+            starts.push(tokio::spawn(
+                async move { worker.start(config, true).await },
+            ));
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let (read, write) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let pids: Vec<i32> = line
+                .split_whitespace()
+                .map(|pid| pid.parse().unwrap())
+                .collect();
+            assert_eq!(pids.len(), 2);
+            cleanup.0.extend(pids);
+            controls.push(write);
+        }
+        for pid in &cleanup.0 {
+            assert!(kill(Pid::from_raw(*pid), None).is_ok());
+        }
+        // B registers while A is still positively held in initialize.
+        controls[1].write_all(b"x").await.unwrap();
+        let second = starts.pop().unwrap();
+        let second_status = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_status["state"], "running");
+        assert_eq!(hub.status("overlap")["pid"], cleanup.0[2]);
+        controls[0].write_all(b"x").await.unwrap();
+        let first_status = tokio::time::timeout(Duration::from_secs(5), starts.pop().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_status["state"], "running");
+        hub.begin_background_shutdown();
+        hub.shutdown().await;
+        let settled = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if cleanup
+                    .0
+                    .iter()
+                    .all(|pid| kill(Pid::from_raw(*pid), None) == Err(nix::errno::Errno::ESRCH))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            settled,
+            "overlapping MCP starts discarded a child or descendant before reap"
+        );
+        cleanup.0.clear();
+        bus.shutdown().await.unwrap();
+        store.close().await;
+        let reopened = Store::open(&path).await.unwrap();
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.data["serverId"] == "overlap"
+                    && event.data["status"]["state"] == "running")
+                .count(),
+            2
+        );
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn health_shutdown_joins_removed_child_reap_and_status() {
+        use tokio::io::AsyncWriteExt;
+        let dir = crate::test_support::test_tempdir("mcp-health-drain");
+        let path = dir.path().join("state.db");
+        let store = Store::open(&path).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let (hub, read, mut write) = stdio_hub_with_duplex("held-health");
+        hub.set_event_bus(bus.clone());
+        let pid = {
+            let mut map = hub.inner.servers.lock().unwrap();
+            let server = map.get_mut("held-health").unwrap();
+            server.failures = MAX_FAILURES - 1;
+            server.config = stdio_cfg("held-health", BOGUS_CMD);
+            let ServerRuntime::Stdio { child, .. } = &server.runtime else {
+                unreachable!()
+            };
+            child.id().unwrap()
+        };
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        *hub.inner.before_reap.lock().unwrap() = Some(park.clone());
+        let mut monitor = hub.spawn_health_monitor_with_interval(Duration::from_millis(1));
+        let mut reader = tokio::io::BufReader::new(read);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "ping");
+        let response = json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":-32603,"message":"controlled ping failure"}});
+        write
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), park.entered.notified())
+            .await
+            .unwrap();
+        assert!(!hub
+            .inner
+            .servers
+            .lock()
+            .unwrap()
+            .contains_key("held-health"));
+        hub.begin_background_shutdown();
+        let pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(
+                std::future::Future::poll(std::pin::Pin::new(&mut monitor), cx).is_pending(),
+            )
+        })
+        .await;
+        assert!(pending, "health monitor discarded a removed child");
+        park.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), monitor)
+            .await
+            .unwrap()
+            .unwrap();
+        hub.shutdown().await;
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        bus.shutdown().await.unwrap();
+        store.close().await;
+        let reopened = Store::open(&path).await.unwrap();
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.data["serverId"] == "held-health"
+                    && event.data["status"]["state"] == "error")
+                .count(),
+            1
+        );
+        reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn start_enabled_refuses_after_background_stop() {
+        let dir = crate::test_support::test_tempdir("mcp-boot-refusal");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let secrets = mem_async();
+        let hub = McpHub::new();
+        hub.set_event_bus(bus.clone());
+        let mut configs = Map::new();
+        configs.insert("refused".into(), stdio_cfg("refused", BOGUS_CMD));
+        write_configs(&secrets, &configs).await.unwrap();
+        hub.begin_background_shutdown();
+        svc(None, &secrets, &hub).start_enabled().await;
+        let monitor = hub.spawn_health_monitor();
+        tokio::time::timeout(Duration::from_secs(1), monitor)
+            .await
+            .unwrap()
+            .unwrap();
+        hub.shutdown().await;
+        bus.shutdown().await.unwrap();
+        assert!(store
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap()
+            .is_empty());
+        store.close().await;
     }
 
     #[tokio::test]
@@ -3115,15 +3553,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_probe_401_maps_to_auth_error() {
+    async fn http_probe_401_maps_to_auth_required() {
         let (url, _guard) =
             http_stub("HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n").await;
         let h = McpHub::new();
         let status = h.start(remote_cfg("r-auth", "http", &url), true).await;
-        assert_eq!(status["state"], json!("error"));
+        assert_eq!(status["state"], json!("auth_required"));
         let err = status["lastError"].as_str().unwrap();
         assert!(err.contains("authentication failed"), "got: {err}");
         assert!(err.contains("401"), "got: {err}");
+        assert!(err.contains("configured credentials"), "got: {err}");
     }
 
     #[tokio::test]
@@ -3256,7 +3695,7 @@ mod tests {
             http_stub("HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n").await;
         let h = McpHub::new();
         let _ = h.start(remote_cfg("r-stop", "http", &url), true).await;
-        assert_eq!(h.status("r-stop")["state"], json!("error"));
+        assert_eq!(h.status("r-stop")["state"], json!("auth_required"));
         assert!(h.stop("r-stop").await, "tracked entry is stopped");
         assert_eq!(h.status("r-stop"), status_stopped("r-stop"));
     }
@@ -3502,12 +3941,13 @@ mod tests {
         let rs = RunningServer {
             config: stdio_cfg(id, "sleep"),
             runtime: ServerRuntime::Stdio {
-                child,
+                child: Box::new(child),
                 pid: None,
                 conn: Arc::new(conn),
             },
             status: status_value(id, "running", None, None, None, None),
             failures: 0,
+            generation: h.next_generation(),
         };
         h.inner.servers.lock().unwrap().insert(id.to_string(), rs);
         (h, c2s_server, s2c_server)
@@ -3523,6 +3963,7 @@ mod tests {
             runtime: ServerRuntime::Remote,
             status: status_value(id, "running", None, None, None, None),
             failures: 0,
+            generation: h.next_generation(),
         };
         h.inner.servers.lock().unwrap().insert(id.to_string(), rs);
         h
@@ -3644,13 +4085,122 @@ mod tests {
                 "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}]}}}}\n"
             );
             s2c.write_all(resp.as_bytes()).await.unwrap();
+            reader
         });
         let result = h
             .call_tool("s1", "echo", json!({ "x": 1 }), None)
             .await
             .unwrap();
-        responder.await.unwrap();
+        let mut reader = responder.await.unwrap();
         assert_eq!(result["content"][0]["text"], json!("ok"));
+        // An answered call is followed by nothing — no stray cancel.
+        let mut extra = String::new();
+        let quiet = tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut extra))
+            .await
+            .is_err();
+        assert!(quiet, "unexpected line after the answered call: {extra}");
+    }
+
+    /// The live stdio [`Connection`] behind a hub entry.
+    fn stdio_conn(h: &McpHub, id: &str) -> Arc<Connection> {
+        match &h.inner.servers.lock().unwrap()[id].runtime {
+            ServerRuntime::Stdio { conn, .. } => Arc::clone(conn),
+            ServerRuntime::Remote => panic!("{id} is not a stdio server"),
+        }
+    }
+
+    /// Read one JSON-RPC line from the fake server's stdin.
+    async fn read_json(reader: &mut tokio::io::BufReader<tokio::io::DuplexStream>) -> Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stdio_call_tool_timeout_sends_one_cancelled_notification() {
+        // The server never answers the first call. Once the per-call timeout
+        // fires the client sends exactly one notifications/cancelled naming
+        // the abandoned id: the next line on the wire is the follow-up call,
+        // not a second cancel.
+        let (h, c2s, mut s2c) = stdio_hub_with_duplex("s1");
+        let server = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(c2s);
+            let req = read_json(&mut reader).await;
+            assert_eq!(req["method"], json!("tools/call"));
+            let abandoned = req["id"].as_i64().unwrap();
+
+            let cancel = read_json(&mut reader).await;
+            assert_eq!(cancel["method"], json!("notifications/cancelled"));
+            assert!(cancel.get("id").is_none(), "notification: {cancel}");
+            assert_eq!(cancel["params"]["requestId"], json!(abandoned));
+            let reason = cancel["params"]["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("tools/call timed out after 100ms"),
+                "got: {reason}"
+            );
+
+            let next = read_json(&mut reader).await;
+            assert_eq!(
+                next["method"],
+                json!("tools/call"),
+                "one cancel only: {next}"
+            );
+            assert_eq!(next["params"]["name"], json!("fast"));
+            let id = next["id"].as_i64().unwrap();
+            let resp =
+                format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[]}}}}\n");
+            s2c.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let err = h
+            .call_tool("s1", "slow", json!({}), Some(Duration::from_millis(100)))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("timed out"), "got: {err}");
+        h.call_tool("s1", "fast", json!({}), None).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stdio_late_reply_after_cancel_is_discarded() {
+        // A reply landing after the cancel is read and dropped — the
+        // connection stays usable and the next call gets its own answer.
+        let (h, c2s, mut s2c) = stdio_hub_with_duplex("s1");
+        let conn = stdio_conn(&h, "s1");
+        let server = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(c2s);
+            let abandoned = read_json(&mut reader).await["id"].as_i64().unwrap();
+            let cancel = read_json(&mut reader).await;
+            assert_eq!(cancel["params"]["requestId"], json!(abandoned));
+            let late = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{abandoned},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"late\"}}]}}}}\n"
+            );
+            s2c.write_all(late.as_bytes()).await.unwrap();
+
+            let next = read_json(&mut reader).await;
+            assert_eq!(next["params"]["name"], json!("fresh"));
+            let id = next["id"].as_i64().unwrap();
+            assert_ne!(id, abandoned);
+            let resp = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"fresh\"}}]}}}}\n"
+            );
+            s2c.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let before = conn.response_seq();
+        let err = h
+            .call_tool("s1", "slow", json!({}), Some(Duration::from_millis(100)))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("timed out"), "got: {err}");
+        // The late reply is consumed with no slot to land in: the response
+        // watermark advances while nothing is pending.
+        assert!(
+            conn.await_response_after(before, Duration::from_secs(2))
+                .await,
+            "late reply was read by the connection"
+        );
+        let result = h.call_tool("s1", "fresh", json!({}), None).await.unwrap();
+        assert_eq!(result["content"][0]["text"], json!("fresh"));
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -3691,16 +4241,48 @@ mod tests {
     /// `tools/call` based on the request body (a `tools/call` naming the tool
     /// `boom` gets a JSON-RPC error envelope).
     async fn http_tool_stub() -> (String, tokio::task::JoinHandle<()>) {
+        http_tool_stub_with_options(None, None).await
+    }
+
+    /// The body-aware tool stub with an optional exact bearer requirement.
+    async fn http_tool_stub_with_auth(
+        required_auth: Option<&str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        http_tool_stub_with_options(required_auth, None).await
+    }
+
+    /// The body-aware tool stub with optional auth and one denied request kind.
+    async fn http_tool_stub_with_options(
+        required_auth: Option<&str>,
+        denied_request: Option<&str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let required_auth = required_auth.map(String::from);
+        let denied_request = denied_request.map(String::from);
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
+                let required_auth = required_auth.clone();
+                let denied_request = denied_request.clone();
                 tokio::spawn(async move {
                     while let Some(req) = read_http_request(&mut sock).await {
-                        let resp = if req.contains("\"method\":\"initialize\"") {
+                        let authorized = required_auth.as_ref().is_none_or(|expected| {
+                            req.lines().any(|line| {
+                                line.split_once(':').is_some_and(|(name, value)| {
+                                    name.eq_ignore_ascii_case("authorization")
+                                        && value.trim() == expected
+                                })
+                            })
+                        });
+                        let denied = denied_request
+                            .as_ref()
+                            .is_some_and(|request_kind| req.contains(request_kind));
+                        let resp = if !authorized || denied {
+                            "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n".to_string()
+                        } else if req.contains("\"method\":\"initialize\"") {
                             ok_json_response(
                                 r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"stub","version":"0"}}}"#,
                             )
@@ -3790,6 +4372,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_probe_and_tool_call_use_stored_oauth_header() {
+        const TOKEN: &str = "unit-oauth-token";
+        let (url, _guard) = http_tool_stub_with_auth(Some(&format!("Bearer {TOKEN}"))).await;
+        let (_tmp, store) = open_store().await;
+        McpOauthService::new(&store)
+            .set(
+                "r-oauth",
+                json!({ "access_token": TOKEN, "token_type": "bearer" }),
+            )
+            .await
+            .unwrap();
+        let h = McpHub::with_oauth_store(store);
+
+        let status = h.start(remote_cfg("r-oauth", "http", &url), true).await;
+        assert_eq!(status["state"], json!("running"));
+        let result = h.call_tool("r-oauth", "t1", json!({}), None).await.unwrap();
+        assert_eq!(result["content"][0]["text"], json!("http-ok"));
+        assert!(!status.to_string().contains(TOKEN));
+        assert!(!result.to_string().contains(TOKEN));
+    }
+
+    #[tokio::test]
     async fn http_call_tool_surfaces_server_error_message() {
         let (url, _guard) = http_tool_stub().await;
         let h = remote_hub("r1", "http", &url, json!({}));
@@ -3822,7 +4426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_tool_error_never_echoes_configured_headers() {
+    async fn http_tool_auth_error_updates_status_without_echoing_headers() {
         let (url, _guard) =
             http_stub("HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n").await;
         let h = remote_hub(
@@ -3835,6 +4439,49 @@ mod tests {
         let msg = format!("{err}");
         assert!(!msg.contains("supersecret-token"), "leaked secret: {msg}");
         assert!(msg.contains("authentication failed"), "got: {msg}");
+        let status = h.status("r1");
+        assert_eq!(status["state"], json!("auth_required"));
+        assert!(!status.to_string().contains("supersecret-token"));
+    }
+
+    #[tokio::test]
+    async fn http_probe_follow_up_auth_errors_require_authentication() {
+        for denied_request in ["notifications/initialized", "\"method\":\"tools/list\""] {
+            let (url, guard) = http_tool_stub_with_options(None, Some(denied_request)).await;
+            let h = McpHub::new();
+            let status = h.start(remote_cfg("r-follow-up", "http", &url), true).await;
+            guard.abort();
+
+            assert_eq!(status["state"], json!("auth_required"), "{denied_request}");
+            assert!(
+                status["lastError"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("HTTP 401")),
+                "{denied_request}: {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_http_auth_error_does_not_replace_restarted_status() {
+        let (url, _guard) = http_tool_stub().await;
+        let h = remote_hub("r-stale", "http", &url, json!({}));
+        let old_generation = match h.tool_target("r-stale").unwrap() {
+            ToolTarget::Http { generation, .. } => generation,
+            ToolTarget::Stdio(_) => panic!("expected HTTP target"),
+        };
+
+        let restarted = h.restart(remote_cfg("r-stale", "http", &url), true).await;
+        assert_eq!(restarted["state"], json!("running"));
+
+        let stale_error = Error::Internal(
+            "authentication failed (HTTP 401) — authenticate or check configured credentials"
+                .to_string(),
+        );
+        h.mark_auth_required("r-stale", old_generation, &stale_error)
+            .await;
+
+        assert_eq!(h.status("r-stale")["state"], json!("running"));
     }
 
     #[test]

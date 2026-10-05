@@ -34,7 +34,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "cececececececececececececececececececececececececececececececece";
@@ -44,25 +43,21 @@ const STALE_TOKEN: &str = "stale-access-token-EXPIRED";
 /// The refresh token stored in the expired bag; must appear in the grant POST.
 const REFRESH_TOKEN: &str = "refresh-token-abc123";
 
-/// Live `intentd serve` process; killed and its data dir removed on drop.
+/// Live `intentd serve` process; killed on drop.
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    _data_dir_guard: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-oar-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-oar-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -71,9 +66,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -232,10 +226,13 @@ struct Fixture {
 }
 
 /// Spawn the mock fixture with `args` and read its `PORT=<n>` announcement.
-async fn spawn_fixture(script: &str, args: &[&str]) -> Fixture {
-    let mut child = tokio::process::Command::new("node")
-        .arg(script)
-        .args(args)
+async fn spawn_fixture(script: &str, args: &[&str], required_auth: Option<&str>) -> Fixture {
+    let mut command = tokio::process::Command::new("node");
+    command.arg(script).args(args);
+    if let Some(required_auth) = required_auth {
+        command.env("MOCK_MCP_REQUIRED_AUTH", required_auth);
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -285,12 +282,13 @@ async fn boot_daemon() -> (
     Daemon,
     WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
 ) {
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        _data_dir_guard: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -350,8 +348,8 @@ async fn test_connection_refreshes_expired_bag_and_persists_it() {
     let Some(script) = fixture_script() else {
         return;
     };
-    let mut mcp = spawn_fixture(script, &["--http", "--log-auth"]).await;
-    let mut token_ep = spawn_fixture(script, &["--token"]).await;
+    let mut mcp = spawn_fixture(script, &["--http", "--log-auth"], None).await;
+    let mut token_ep = spawn_fixture(script, &["--token"], None).await;
 
     let (_daemon, mut ws) = boot_daemon().await;
     let server_id = create_server(&mut ws, 1, &mcp.base_url).await;
@@ -425,6 +423,63 @@ async fn test_connection_refreshes_expired_bag_and_persists_it() {
     assert_eq!(auth, "AUTH=Bearer refreshed-token-1", "probe #2 header");
 }
 
+/// The saved-server lifecycle path uses the same refresh-aware daemon token
+/// consumer as `mcp.testConnection`: an expired bag is refreshed before the
+/// initial remote probe, and restart performs another authenticated re-probe.
+#[tokio::test]
+async fn lifecycle_probe_refreshes_expired_bag_before_restart() {
+    let Some(script) = fixture_script() else {
+        return;
+    };
+    let mut mcp = spawn_fixture(
+        script,
+        &["--http", "--log-auth"],
+        Some("Bearer refreshed-token-1"),
+    )
+    .await;
+    let mut token_ep = spawn_fixture(script, &["--token"], None).await;
+    let (_daemon, mut ws) = boot_daemon().await;
+    let server_id = create_server(&mut ws, 1, &mcp.base_url).await;
+
+    let set = wss_rpc(
+        &mut ws,
+        2,
+        "mcp.oauth.set",
+        json!({ "serverId": server_id, "tokenBag": {
+            "access_token": STALE_TOKEN,
+            "expires_at": epoch_secs_ago(600),
+            "refresh_token": REFRESH_TOKEN,
+            "token_endpoint": format!("{}/token", token_ep.base_url),
+            "client_id": "lifecycle-client",
+        } }),
+    )
+    .await;
+    assert!(!set.to_string().contains(STALE_TOKEN));
+
+    let enabled = wss_rpc(
+        &mut ws,
+        3,
+        "mcp.servers.toggle",
+        json!({ "serverId": server_id, "enabled": true }),
+    )
+    .await;
+    assert_eq!(enabled["status"]["state"], json!("running"));
+    assert_eq!(enabled["status"]["toolCount"], json!(2));
+    assert!(!enabled.to_string().contains("refreshed-token-1"));
+    assert!(token_ep.next_line().await.starts_with("HIT=1 BODY="));
+    assert_eq!(mcp.next_line().await, "AUTH=Bearer refreshed-token-1");
+
+    let restarted = wss_rpc(
+        &mut ws,
+        4,
+        "mcp.servers.restart",
+        json!({ "serverId": server_id }),
+    )
+    .await;
+    assert_eq!(restarted["status"]["state"], json!("running"));
+    assert!(!restarted.to_string().contains("refreshed-token-1"));
+}
+
 /// Expired bag WITHOUT refresh metadata: no refresh attempted, no error — the
 /// stale stored token is sent as-is (fail-soft §5.22.1 contract).
 #[tokio::test]
@@ -432,7 +487,7 @@ async fn test_connection_expired_bag_without_refresh_metadata_falls_back() {
     let Some(script) = fixture_script() else {
         return;
     };
-    let mut mcp = spawn_fixture(script, &["--http", "--log-auth"]).await;
+    let mut mcp = spawn_fixture(script, &["--http", "--log-auth"], None).await;
 
     let (_daemon, mut ws) = boot_daemon().await;
     let server_id = create_server(&mut ws, 1, &mcp.base_url).await;

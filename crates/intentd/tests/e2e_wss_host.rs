@@ -15,7 +15,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,7 +30,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
@@ -38,6 +37,7 @@ const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
     child: Child,
+    _data_dir_guard: tempfile::TempDir,
     data_dir: PathBuf,
 }
 
@@ -45,15 +45,11 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-host-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-host-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -63,9 +59,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -225,11 +220,13 @@ where
 /// Boot a daemon with the WSS listener enabled and return the live handle + a pinned WSS
 /// client config plus the bound TCP port (discovered via UDS `system.status`).
 async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
@@ -670,7 +667,8 @@ async fn host_provider_auth_status_over_wss() {
 #[tokio::test]
 async fn host_claude_auth_status_honors_cli_json_and_force_over_wss() {
     use std::os::unix::fs::PermissionsExt;
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let bin_dir = data_dir.join("bin");
     let home_dir = data_dir.join("home");
     std::fs::create_dir_all(&bin_dir).unwrap();
@@ -699,7 +697,6 @@ exit "$code"
     let path = format!("{}:/usr/bin:/bin", bin_dir.display());
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("PATH", path.as_str()),
         ("HOME", home_dir.to_str().unwrap()),
         ("SHELL", "/bin/sh"),
@@ -708,6 +705,7 @@ exit "$code"
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
@@ -840,6 +838,7 @@ async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: Some(root.to_string_lossy().into_owned()),
         repository_path: None,
@@ -865,11 +864,13 @@ async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.expect("insert ws");
     ws_id.0
@@ -908,11 +909,10 @@ where
 #[tokio::test]
 async fn host_exec_over_wss() {
     let (daemon, port, cfg) = boot().await;
-    // Real filesystem root the daemon can `cd` into; kept alive until the
-    // daemon drops (its `Drop` removes the whole data dir; the workspace root
-    // is a sibling temp dir, cleaned up here).
-    let root = std::env::temp_dir().join(format!("itd-wss-exec-root-{}", Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&root).expect("mkdir workspace root");
+    // Real filesystem root the daemon can `cd` into; a sibling temp dir the
+    // guard removes when the test ends.
+    let root_guard = common::test_tempdir("itd-wss-exec-root-");
+    let root = root_guard.path().to_path_buf();
     let ws_id = seed_workspace_with_path(&daemon.data_dir, &root).await;
     let mut ws = connect_ws(port, cfg).await;
 
@@ -1041,9 +1041,8 @@ async fn host_exec_over_wss() {
     // symlink cwd keeps working.
     #[cfg(unix)]
     {
-        let outside =
-            std::env::temp_dir().join(format!("itd-wss-exec-outside-{}", Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&outside).expect("mkdir outside dir");
+        let outside_guard = common::test_tempdir("itd-wss-exec-outside-");
+        let outside = outside_guard.path().to_path_buf();
         std::os::unix::fs::symlink(&outside, root.join("escape")).expect("plant escape symlink");
         let frame = json!({
             "jsonrpc": "2.0", "id": 206, "method": "host.exec",
@@ -1089,11 +1088,7 @@ async fn host_exec_over_wss() {
             inside_link["exitCode"], 0,
             "in-workspace symlink cwd ⇒ ok: {inside_link}"
         );
-
-        let _ = std::fs::remove_dir_all(&outside);
     }
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Read one `events.event` frame whose `event.type` matches `type_filter` AND
@@ -1541,7 +1536,8 @@ async fn host_exec_stream_acp_handshake_probe_over_wss() {
 /// holding a unique binary; asserts host.findBinary resolves that binary.
 #[tokio::test]
 async fn host_find_binary_uses_login_shell_path() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Create a unique temp dir with a fake binary
     let pid = std::process::id();
@@ -1575,15 +1571,15 @@ async fn host_find_binary_uses_login_shell_path() {
     }
 
     // Spawn daemon with minimal PATH and fake SHELL
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("PATH", "/usr/bin:/bin"), // Minimal PATH that won't find our binary
         ("SHELL", fake_shell_path.to_str().unwrap()),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 
@@ -1631,11 +1627,13 @@ async fn host_find_binary_uses_login_shell_path() {
 /// WSS e2e for host.providerDiscovery: proves the providers + npx wire envelope.
 #[tokio::test]
 async fn host_provider_discovery_over_wss() {
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 
@@ -1866,26 +1864,27 @@ async fn host_provider_discovery_over_wss() {
 #[cfg(unix)]
 #[tokio::test]
 async fn host_provider_discovery_gates_pi_on_old_cli_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
 
-    // Fake `pi` that reports a version older than PI_CLI_MIN_VERSION.
+    // The previously supported minimum lacks the 0.81.0 thinking-level RPC.
     let fake_pi = data_dir.join("fake-pi");
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&fake_pi, "#!/bin/sh\necho 0.79.0\n").expect("write fake pi");
+        std::fs::write(&fake_pi, "#!/bin/sh\necho 0.80.4\n").expect("write fake pi");
         std::fs::set_permissions(&fake_pi, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake pi");
     }
 
     let fake_pi_str = fake_pi.to_str().unwrap();
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("PI_ACP_PI_COMMAND", fake_pi_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 
@@ -1914,7 +1913,7 @@ async fn host_provider_discovery_gates_pi_on_old_cli_over_wss() {
     assert_eq!(pi["cliCommand"], fake_pi_str, "{pi}");
     assert_eq!(pi["cliResolved"], true, "{pi}");
     assert_eq!(pi["cliResolvedPath"], fake_pi_str, "{pi}");
-    assert_eq!(pi["cliVersion"], "0.79.0", "{pi}");
+    assert_eq!(pi["cliVersion"], "0.80.4", "{pi}");
     assert_eq!(pi["cliVersionOk"], false, "{pi}");
     assert_eq!(
         pi["cliRequirement"],
@@ -1924,7 +1923,7 @@ async fn host_provider_discovery_gates_pi_on_old_cli_over_wss() {
     let reason = pi["unavailableReason"]
         .as_str()
         .expect("gated pi must carry unavailableReason");
-    assert!(reason.contains("0.79.0"), "{pi}");
+    assert!(reason.contains("0.80.4"), "{pi}");
     assert!(
         reason.contains(intent_providers::PI_CLI_REQUIREMENT),
         "{pi}"
@@ -1939,7 +1938,8 @@ async fn host_provider_discovery_gates_pi_on_old_cli_over_wss() {
 /// `secondaryResolvedPath` stay auto-detected (never the override path).
 #[tokio::test]
 async fn host_provider_discovery_honors_path_overrides_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Fake executables the overrides point at — valid (absolute + executable)
     // regardless of what is really installed on the host.
@@ -1967,10 +1967,11 @@ async fn host_provider_discovery_honors_path_overrides_over_wss() {
     )
     .expect("seed config.toml with providers.paths");
 
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 
@@ -2032,7 +2033,8 @@ async fn host_provider_discovery_honors_path_overrides_over_wss() {
 /// repeat discovery call is idempotent.
 #[tokio::test]
 async fn host_provider_discovery_self_heals_default_provider_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Force one registered provider to report installed regardless of the
     // real host: point its providers.paths override(s) at fake executables.
@@ -2056,10 +2058,11 @@ async fn host_provider_discovery_self_heals_default_provider_over_wss() {
     )
     .expect("seed config.toml with providers.paths");
 
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 
@@ -2143,19 +2146,20 @@ async fn host_provider_discovery_self_heals_default_provider_over_wss() {
 /// `path`, and `-32603` when the path collides with an existing file.
 #[tokio::test]
 async fn host_create_directory_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Pin the daemon-host home so the tilde-expansion assertion is exact.
     let home = data_dir.join("home");
     std::fs::create_dir_all(&home).expect("mkdir fake home");
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", home.to_str().unwrap()),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 
@@ -2271,7 +2275,8 @@ async fn host_create_directory_over_wss() {
 /// honored for relocated folders.
 #[tokio::test]
 async fn host_list_directory_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Pin the daemon-host home so the favorites assertions are exact:
     // Desktop exists conventionally, Downloads is relocated via the XDG
@@ -2285,14 +2290,14 @@ async fn host_list_directory_over_wss() {
         "XDG_DOWNLOAD_DIR=\"$HOME/Fetched\"\n",
     )
     .expect("write user-dirs.dirs");
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", home.to_str().unwrap()),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 
@@ -2354,11 +2359,13 @@ async fn host_list_directory_over_wss() {
 async fn host_discovery_cache_positive_and_negative_over_wss() {
     use std::os::unix::fs::PermissionsExt;
 
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 

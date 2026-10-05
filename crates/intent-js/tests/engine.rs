@@ -285,3 +285,36 @@ async fn value_envelope_round_trips_and_undefined_maps_to_null() {
         .expect("value return must succeed");
     assert_eq!(some["a"], 1, "value envelope must round-trip");
 }
+
+#[tokio::test]
+async fn cancellation_interrupts_non_yielding_javascript() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal = cancelled.clone();
+    let cancel = std::thread::spawn(move || {
+        // timing-guard: cancel from outside the runtime while synchronous JS spins, before its 500ms deadline
+        std::thread::sleep(Duration::from_millis(50));
+        signal.store(true, Ordering::Relaxed);
+    });
+    let error = intent_js::eval_with_cancellation("for (;;) {}", &short_opts(500), None, cancelled)
+        .await
+        .unwrap_err();
+    cancel.join().unwrap();
+    assert!(
+        matches!(error, JsError::Runtime(ref text) if text.contains("cancelled")),
+        "expected cancellation, got {error}"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_flag_preserves_success_when_open() {
+    let result = intent_js::eval_with_cancellation(
+        "return 42",
+        &short_opts(500),
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, serde_json::json!(42));
+}

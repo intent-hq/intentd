@@ -5,15 +5,16 @@ use std::path::PathBuf;
 use git2::{Repository, Signature};
 use intent_core::events::AGENT_IDLE;
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, ContentType, Event, EventActor, Note, NoteId,
-    NoteMetadata, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, ContentType, Error, Event, EventActor, Note,
+    NoteId, NoteMetadata, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceAttention,
+    WorkspaceId, WorkspaceStatus,
 };
 use intent_store::{NewTrackedChange, Store};
 use serde_json::json;
 
 use crate::auto_commit::{
-    is_meaningful_agent_name, is_normal_finish_reason, normalize_subject, parse_commit_message_json,
+    is_generation_timeout, is_meaningful_agent_name, is_normal_finish_reason, normalize_subject,
+    parse_commit_message_json,
 };
 use crate::Services;
 
@@ -76,6 +77,7 @@ fn workspace_with_repo(id: &WorkspaceId, repo: &GitRepo) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -101,11 +103,13 @@ fn workspace_with_repo(id: &WorkspaceId, repo: &GitRepo) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -183,6 +187,7 @@ fn session(
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     }
 }
 
@@ -223,8 +228,11 @@ async fn setup_dirty_workspace(repo: &GitRepo) -> (TempDb, Services, WorkspaceId
     std::fs::write(repo.dir.join("change.txt"), "agent edit\n").unwrap();
     // Inject a missing auggie path so generation falls back to the deterministic
     // subject, preserving pre-LLM test semantics.
-    let services =
-        Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+    let services = Services::new_with_file_secrets(
+        store,
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
+    )
+    .with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
     (tmp, services, ws_id)
 }
 
@@ -316,7 +324,7 @@ fn fake_auggie(tag: &str, body: &str) -> (tempfile::TempDir, PathBuf) {
     (dir, bin)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn task_linked_idle_commits_with_both_trailers() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -342,7 +350,7 @@ async fn task_linked_idle_commits_with_both_trailers() {
 /// (monorepo#3778) must still auto-commit on idle: the path resolution falls
 /// back to `repositoryPath` instead of silently skipping on the missing
 /// `worktreePath`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn repository_only_workspace_auto_commits_via_repository_path() {
     let repo = init_git_repo();
     let tmp = TempDb::new();
@@ -370,7 +378,7 @@ async fn repository_only_workspace_auto_commits_via_repository_path() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn auto_commit_disabled_setting_is_silent_skip() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -392,7 +400,7 @@ async fn auto_commit_disabled_setting_is_silent_skip() {
     assert_eq!(commits.len(), 1, "no new commit when auto-commit disabled");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_override_disabled_is_silent_skip() {
     // Global git.autoCommit stays at its default (true); the persisted
     // per-workspace override (false) must win at the idle-commit gate.
@@ -415,7 +423,7 @@ async fn workspace_override_disabled_is_silent_skip() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_override_enabled_beats_global_disabled() {
     // Global git.autoCommit=false, workspace override=true → commit proceeds.
     let repo = init_git_repo();
@@ -458,7 +466,7 @@ async fn session_skip_auto_commit_is_silent_skip() {
     assert_eq!(commits.len(), 1);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn clean_tree_is_silent_skip() {
     let repo = init_git_repo();
     let tmp = TempDb::new();
@@ -475,7 +483,61 @@ async fn clean_tree_is_silent_skip() {
     assert_eq!(commits.len(), 1);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
+async fn index_refresh_failure_does_not_repeat_auto_commit() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws) = setup_dirty_workspace(&repo).await;
+    let agent = session("agent-refresh", &ws, None, false, "Builder", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws, "agent-refresh").await;
+    std::fs::write(repo.dir.join("unrelated.txt"), "other actor\n").unwrap();
+    intent_git::stage::stage(&repo.dir, &["unrelated.txt".to_string()]).unwrap();
+    let git = Repository::open(&repo.dir).unwrap();
+    let parent = git.head().unwrap().target().unwrap();
+    let index_before = std::fs::read(git.path().join("index")).unwrap();
+    let lock = git.path().join("index.lock");
+    std::fs::write(&lock, "held by test\n").unwrap();
+    let event = idle_event(&ws, "agent-refresh", "end_turn");
+
+    svc.handle_agent_idle_auto_commit(&event).await;
+    let committed = git.head().unwrap().peel_to_commit().unwrap();
+    assert_ne!(committed.id(), parent);
+    assert_eq!(committed.parent_id(0).unwrap(), parent);
+    assert!(committed
+        .tree()
+        .unwrap()
+        .get_name("unrelated.txt")
+        .is_none());
+    assert_eq!(
+        std::fs::read(git.path().join("index")).unwrap(),
+        index_before
+    );
+    assert_eq!(
+        svc.store()
+            .list_tracked_changes(&ws)
+            .await
+            .unwrap()
+            .iter()
+            .find(|r| r.path == "change.txt")
+            .unwrap()
+            .stage,
+        "committed"
+    );
+
+    // Both with the lock held and after it is released, a later idle event
+    // cannot recommit the stale index or sweep in another actor's staged work.
+    svc.handle_agent_idle_auto_commit(&event).await;
+    std::fs::remove_file(lock).unwrap();
+    svc.handle_agent_idle_auto_commit(&event).await;
+    assert_eq!(git.head().unwrap().target(), Some(committed.id()));
+    assert_eq!(
+        std::fs::read(git.path().join("index")).unwrap(),
+        index_before
+    );
+    assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 2);
+}
+
+#[intent_test_macros::daemon_test]
 async fn non_task_agent_commits_with_agent_id_only() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -516,7 +578,7 @@ async fn missing_agent_id_event_is_a_no_op() {
     assert_eq!(commits.len(), 1);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn fallback_subject_uses_default_for_auto_named_non_task_agent() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -530,7 +592,7 @@ async fn fallback_subject_uses_default_for_auto_named_non_task_agent() {
     assert!(message.starts_with("Agent changes"), "subject: {message}");
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn idle_auto_commit_does_not_sweep_unattributed_changes() {
     // monorepo#939 regression: the idle auto-commit path must only commit the
     // paths attributed to the idle agent — another actor's dirty file stays
@@ -565,7 +627,7 @@ async fn idle_auto_commit_does_not_sweep_unattributed_changes() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn idle_auto_commit_with_no_attributed_paths_is_silent_skip() {
     // Dirty worktree but zero tracked-change rows for the idle agent: the
     // attribution-filtered fallback yields an empty commit set, which the
@@ -588,7 +650,7 @@ async fn idle_auto_commit_with_no_attributed_paths_is_silent_skip() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn idle_auto_commit_ignores_other_agents_attribution() {
     // Attribution rows exist, but for a different agent: the idle agent's
     // attributed set is still empty, so nothing is committed.
@@ -700,7 +762,7 @@ fn parse_commit_message_rejects_empty_output() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn generated_message_replaces_fallback_subject() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -723,7 +785,7 @@ async fn generated_message_replaces_fallback_subject() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn generation_uses_commit_quick_action_override() {
     // monorepo#1734: the auto-commit path calls agent.completeOnce with
     // `type: "commit"`, so the user's commit quick-action override reaches
@@ -758,7 +820,7 @@ printf '{"subject": "feat: %s"}' "$args""#,
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn generation_timeout_falls_back_to_subject() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -789,8 +851,284 @@ async fn generation_timeout_falls_back_to_subject() {
     assert!(message.starts_with("Timeout Agent"), "got: {message}");
 }
 
+/// intent-hq/intent#5454: the generation budget is 60 s (up from 30 s) so a
+/// loaded host produces a real message instead of the fallback subject. The
+/// §5.32 120 s `timeoutMs` cap is a compile-time assertion next to the constant.
+#[test]
+fn generation_budget_is_sixty_seconds() {
+    assert_eq!(crate::auto_commit::GENERATION_TIMEOUT_MS, 60_000);
+}
+
+/// intent-hq/intent#5454: only budget exhaustion (auggie / ACP timeouts, or
+/// the whole budget spent queued for an adapter slot) starts the cool-down.
+/// The ACP route wraps transport / JSON-RPC failures as `Error::Internal`
+/// too, so a provider error that merely *mentions* a timeout must not count.
+#[test]
+fn is_generation_timeout_classifies_budget_exhaustion_only() {
+    assert!(is_generation_timeout(&Error::Internal(
+        "One-shot completion timed out after 60000ms".into()
+    )));
+    assert!(is_generation_timeout(&Error::Internal(
+        "claude: one-shot prompt timed out".into()
+    )));
+    assert!(is_generation_timeout(&Error::Internal(
+        "claude: one-shot session setup timed out".into()
+    )));
+    assert!(is_generation_timeout(&Error::AdapterBusy {
+        provider: "auggie".into(),
+        waited_ms: 60_000,
+        limit: 4,
+    }));
+    assert!(!is_generation_timeout(&Error::Internal(
+        "auggie exited with status 3".into()
+    )));
+    assert!(!is_generation_timeout(&Error::Internal(
+        "auggie binary not found".into()
+    )));
+    assert!(!is_generation_timeout(&Error::Internal(
+        "claude: one-shot transport failed: request timed out".into()
+    )));
+    assert!(!is_generation_timeout(&Error::Internal(
+        "claude: adapter returned an error: upstream request timed out (-32000)".into()
+    )));
+    assert!(!is_generation_timeout(&Error::Internal(
+        "claude: adapter exited before completing the turn: exit status: 1; stderr: timed out"
+            .into()
+    )));
+}
+
+/// Fake auggie that counts its invocations in a `calls` file beside the
+/// script, hangs on the FIRST call (so the compressed budget times it out) and
+/// answers a well-formed commit message on every later call. Lets the
+/// cool-down tests tell "skipped up front" (call count unchanged, fallback
+/// subject) from "generation ran again" (call count grew, generated subject).
 #[cfg(unix)]
-#[tokio::test]
+fn fake_auggie_hang_once(tag: &str) -> (tempfile::TempDir, PathBuf) {
+    fake_auggie(
+        tag,
+        r#"calls="$(dirname "$0")/calls"
+n=$(cat "$calls" 2>/dev/null || echo 0)
+echo $((n+1)) > "$calls"
+if [ "$n" -eq 0 ]; then sleep 60; fi
+printf '{"subject": "feat: generated after cool-down"}'"#,
+    )
+}
+
+#[cfg(unix)]
+fn fake_auggie_calls(bin_dir: &tempfile::TempDir) -> u32 {
+    std::fs::read_to_string(bin_dir.path().join("calls"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Re-dirty `change.txt` after an auto-commit landed it, and re-attribute it
+/// so the next idle has something to commit again.
+#[cfg(unix)]
+async fn redirty_change(repo: &GitRepo, svc: &Services, ws: &WorkspaceId, agent: &str) {
+    std::fs::write(repo.dir.join("change.txt"), "agent edit, again\n").unwrap();
+    attribute_dirty_change(svc, ws, agent).await;
+}
+
+/// intent-hq/intent#5454: after a generation timeout the workspace enters a
+/// cool-down — the next idle within the window skips generation up front (no
+/// CLI spawn, no second wait on the budget) and commits the fallback subject.
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn generation_timeout_starts_cooldown_that_skips_next_generation() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let (bin_dir, bin) = fake_auggie_hang_once("cooldown");
+    let (_config_dir, registry) = auggie_active_registry();
+    let svc = svc
+        .with_auggie_bin(bin)
+        .with_settings_registry(registry)
+        .with_auto_commit_timeout_ms(250)
+        .with_auto_commit_cooldown_ms(60_000);
+    let agent = session("agent-c1", &ws_id, None, false, "Cooldown Agent", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-c1").await;
+
+    // First idle: the CLI hangs, the budget elapses, fallback subject lands.
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c1", "end_turn"))
+        .await;
+    assert_eq!(fake_auggie_calls(&bin_dir), 1);
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
+    assert!(message.starts_with("Cooldown Agent"), "got: {message}");
+
+    // Second idle inside the window: generation is skipped up front — the CLI
+    // (which would now answer successfully) is never spawned.
+    redirty_change(&repo, &svc, &ws_id, "agent-c1").await;
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c1", "end_turn"))
+        .await;
+    assert_eq!(
+        fake_auggie_calls(&bin_dir),
+        1,
+        "generation ran again inside the cool-down window"
+    );
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
+    assert!(message.starts_with("Cooldown Agent"), "got: {message}");
+}
+
+/// intent-hq/intent#5454: the cool-down expires — once the window has passed
+/// the next idle attempts generation again (and, here, succeeds).
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn generation_cooldown_expires_and_generation_resumes() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let (bin_dir, bin) = fake_auggie_hang_once("cooldown-expiry");
+    let (_config_dir, registry) = auggie_active_registry();
+    let svc = svc
+        .with_auggie_bin(bin)
+        .with_settings_registry(registry)
+        .with_auto_commit_timeout_ms(250)
+        .with_auto_commit_cooldown_ms(300);
+    let agent = session("agent-c2", &ws_id, None, false, "Expiry Agent", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-c2").await;
+
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c2", "end_turn"))
+        .await;
+    assert_eq!(fake_auggie_calls(&bin_dir), 1);
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
+    assert!(message.starts_with("Expiry Agent"), "got: {message}");
+
+    // Outlive the compressed 300 ms window, then idle again: generation runs
+    // and this time the CLI answers.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    redirty_change(&repo, &svc, &ws_id, "agent-c2").await;
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c2", "end_turn"))
+        .await;
+    assert_eq!(
+        fake_auggie_calls(&bin_dir),
+        2,
+        "generation did not resume after the cool-down expired"
+    );
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
+    assert!(
+        message.starts_with("feat: generated after cool-down"),
+        "got: {message}"
+    );
+}
+
+/// intent-hq/intent#5454: a non-timeout generation failure (here: a
+/// non-zero exit) does NOT start the cool-down — only timeouts do.
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn non_timeout_generation_failure_does_not_start_cooldown() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let (bin_dir, bin) = fake_auggie(
+        "cooldown-exit",
+        r#"calls="$(dirname "$0")/calls"
+n=$(cat "$calls" 2>/dev/null || echo 0)
+echo $((n+1)) > "$calls"
+exit 3"#,
+    );
+    let (_config_dir, registry) = auggie_active_registry();
+    let svc = svc
+        .with_auggie_bin(bin)
+        .with_settings_registry(registry)
+        .with_auto_commit_cooldown_ms(60_000);
+    let agent = session("agent-c3", &ws_id, None, false, "Exit Agent", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-c3").await;
+
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c3", "end_turn"))
+        .await;
+    assert_eq!(fake_auggie_calls(&bin_dir), 1);
+    redirty_change(&repo, &svc, &ws_id, "agent-c3").await;
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c3", "end_turn"))
+        .await;
+    assert_eq!(
+        fake_auggie_calls(&bin_dir),
+        2,
+        "a non-timeout failure must not suppress the next generation"
+    );
+}
+
+/// Like [`fake_auggie_hang_once`] but the script never reads stdin, so a
+/// prompt larger than the pipe capacity (64 KiB on Linux) blocks the daemon's
+/// stdin write until the child exits.
+#[cfg(unix)]
+fn fake_auggie_hang_once_no_stdin_read(tag: &str) -> (tempfile::TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::tests::test_tempdir(&format!("intentd-acommit-{tag}-"));
+    let bin = dir.path().join("auggie");
+    std::fs::write(
+        &bin,
+        r#"#!/bin/sh
+calls="$(dirname "$0")/calls"
+n=$(cat "$calls" 2>/dev/null || echo 0)
+echo $((n+1)) > "$calls"
+if [ "$n" -eq 0 ]; then sleep 60; fi
+printf '{"subject": "feat: generated after cool-down"}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (dir, bin)
+}
+
+/// intent-hq/intent#5454: the generation prompt can exceed the pipe capacity
+/// (the diff section alone is capped at 64 KiB, plus AGENTS.md and the system
+/// prompt). With a hung CLI that never drains stdin, the write itself blocks —
+/// it must sit inside the budgeted region so the timeout still fires, the
+/// fallback subject lands and the cool-down engages.
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn large_prompt_to_non_reading_cli_still_times_out_and_cools_down() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    // Enough untracked files with long paths to hit DIFF_CAP_BYTES, plus a
+    // full-cap AGENTS.md: the composed prompt is well past 64 KiB.
+    let bulk = repo.dir.join(format!("bulk-{}", "p".repeat(48)));
+    std::fs::create_dir_all(&bulk).unwrap();
+    for i in 0..1200 {
+        std::fs::write(bulk.join(format!("f{i:04}.txt")), "x\n").unwrap();
+    }
+    std::fs::write(repo.dir.join("AGENTS.md"), "a".repeat(9 * 1024)).unwrap();
+
+    let (bin_dir, bin) = fake_auggie_hang_once_no_stdin_read("cooldown-noread");
+    let (_config_dir, registry) = auggie_active_registry();
+    let svc = svc
+        .with_auggie_bin(bin)
+        .with_settings_registry(registry)
+        .with_auto_commit_timeout_ms(250)
+        .with_auto_commit_cooldown_ms(60_000);
+    let agent = session("agent-c4", &ws_id, None, false, "NoRead Agent", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-c4").await;
+
+    // First idle: the write blocks on the full pipe, the budget elapses
+    // anyway, the fallback subject lands. The outer deadline is what fails
+    // when the write happens before the timed region.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c4", "end_turn")),
+    )
+    .await
+    .expect("stdin write blocked past the outer deadline: budget never started");
+    assert_eq!(fake_auggie_calls(&bin_dir), 1);
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
+    assert!(message.starts_with("NoRead Agent"), "got: {message}");
+
+    // Second idle inside the window: cool-down skips generation up front.
+    redirty_change(&repo, &svc, &ws_id, "agent-c4").await;
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c4", "end_turn"))
+        .await;
+    assert_eq!(
+        fake_auggie_calls(&bin_dir),
+        1,
+        "generation ran again inside the cool-down window"
+    );
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
+    assert!(message.starts_with("NoRead Agent"), "got: {message}");
+}
+
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
 async fn malformed_output_falls_back_to_subject() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -807,7 +1145,7 @@ async fn malformed_output_falls_back_to_subject() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn no_changes_skips_generation_and_commit() {
     let repo = init_git_repo();
     let tmp = TempDb::new();
@@ -828,7 +1166,7 @@ async fn no_changes_skips_generation_and_commit() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn generated_message_preserves_trailers() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
@@ -852,4 +1190,188 @@ async fn generated_message_preserves_trailers() {
         message.starts_with("chore: generated commit"),
         "got: {message}"
     );
+}
+
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn generation_applies_commit_quick_action_effort_before_prompt() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let (_dir, bin, log, _cli_env) = crate::test_support::quick_action_effort_adapter(&json!({
+        "response": "{\"subject\":\"feat: configured effort\"}"
+    }));
+    let (_config_dir, registry) = auggie_active_registry();
+    registry
+        .apply(&[
+            ("model.defaultProvider".into(), json!("claude-code")),
+            ("providers.paths".into(), json!({"claude-code":bin})),
+            ("quickActions.defaultReasoningEffort".into(), json!("low")),
+            (
+                "quickActions.typeReasoningEffortOverrides".into(),
+                json!({"commit":"high"}),
+            ),
+        ])
+        .unwrap();
+    // Installed CLI providers ignore adapter path overrides. Route the pinned
+    // npm launch through the same isolated seam as the complete-once fixtures.
+    let svc = svc
+        .with_settings_registry(registry)
+        .with_one_shot_npx(Some(bin));
+    let agent = session("effort-agent", &ws_id, None, false, "Builder", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "effort-agent").await;
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "effort-agent", "end_turn"))
+        .await;
+    assert!(last_commit_trailers(&repo.dir)
+        .2
+        .starts_with("feat: configured effort"));
+    let calls: Vec<serde_json::Value> = std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|c| c["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "initialize",
+            "session/new",
+            "session/set_config_option",
+            "session/prompt"
+        ]
+    );
+    assert_eq!(calls[2]["params"]["configId"], "adapter-thinking");
+    assert_eq!(calls[2]["params"]["value"], "high");
+}
+
+#[intent_test_macros::daemon_test]
+async fn auto_commit_attribution_survives_receiver_abort() {
+    use crate::periodic_shutdown_tests::{drain_held, entered, hold};
+    let repo = init_git_repo();
+    let (db, svc, ws) = setup_dirty_workspace(&repo).await;
+    let bus = crate::events::EventBus::new(svc.store().clone());
+    let svc = svc
+        .with_event_bus(bus.clone())
+        .with_auto_commit_cooldown_ms(60_000);
+    svc.store()
+        .set_workspace_auto_commit(&ws, true)
+        .await
+        .unwrap();
+    assert!(svc.arm_auto_commit_cooldown(&ws));
+    assert!(svc.effective_auto_commit(&ws).await);
+    svc.store()
+        .insert_agent_session(&session("agent-tail", &ws, None, false, "Tail", true))
+        .await
+        .unwrap();
+    attribute_dirty_change(&svc, &ws, "agent-tail").await;
+    let (rx, release) = hold(&svc, "git");
+    let task = svc.spawn_auto_commit_loop();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while bus.subscriber_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let e = idle_event(&ws, "agent-tail", "end_turn");
+    bus.publish(&intent_store::NewEvent {
+        workspace_id: e.workspace_id,
+        timestamp: e.timestamp,
+        event_type: e.event_type,
+        actor: e.actor,
+        session_id: e.session_id,
+        correlation_id: e.correlation_id,
+        parent_event_id: e.parent_event_id,
+        metadata: e.metadata,
+        data: e.data,
+    })
+    .await
+    .unwrap();
+    entered(rx).await;
+    assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 2);
+    assert_eq!(
+        svc.store().list_tracked_changes(&ws).await.unwrap()[0].stage,
+        "unstaged"
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    drain_held(&svc, release).await;
+    bus.shutdown().await.unwrap();
+    svc.store().close().await;
+    let reopened = Store::open(&db.path).await.unwrap();
+    let rows = reopened.list_tracked_changes(&ws).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].stage, "committed");
+    assert_eq!(rows[0].agent_id.as_deref(), Some("agent-tail"));
+    for kind in ["git:commit", "changes:git-status"] {
+        let events = reopened
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![kind.into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "{kind}");
+    }
+    reopened.close().await;
+}
+
+#[tokio::test]
+#[expect(clippy::async_yields_async)] // Deliberately construct under one caller and poll under another.
+async fn agent_commit_captures_polling_caller_before_owned_handoff() {
+    use intent_core::{with_caller, Caller, HostRole, PrincipalId, WorkspaceApi};
+    let repo = init_git_repo();
+    let (_db, svc, ws) = setup_dirty_workspace(&repo).await;
+    svc.store()
+        .insert_agent_session(&session("context-agent", &ws, None, false, "Context", true))
+        .await
+        .unwrap();
+    attribute_dirty_change(&svc, &ws, "context-agent").await;
+    svc.store()
+        .set_workspace_auto_commit(&ws, true)
+        .await
+        .unwrap();
+    let future = svc.git_agent_commit(
+        ws.clone(),
+        "Scoped commit".into(),
+        Some(AgentId::from("context-agent")),
+        None,
+        None,
+        false,
+        None,
+    );
+    assert!(intent_core::current_caller().is_none());
+    with_caller(Caller::Daemon, future).await.unwrap();
+    assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 2);
+    assert_eq!(
+        svc.store().list_tracked_changes(&ws).await.unwrap()[0].stage,
+        "committed"
+    );
+    std::fs::write(repo.dir.join("change.txt"), "forbidden later edit").unwrap();
+    let future = with_caller(Caller::Daemon, async {
+        svc.git_agent_commit(
+            ws.clone(),
+            "Forbidden commit".into(),
+            Some(AgentId::from("context-agent")),
+            None,
+            Some(vec!["change.txt".into()]),
+            true,
+            None,
+        )
+    })
+    .await;
+    let result = with_caller(
+        Caller::Wire {
+            principal_id: PrincipalId::from("nonmember"),
+            host_role: HostRole::Guest,
+        },
+        future,
+    )
+    .await;
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+    assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 2);
+    svc.shutdown_store_writers().await;
 }

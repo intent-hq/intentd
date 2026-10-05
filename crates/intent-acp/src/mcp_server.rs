@@ -16,9 +16,16 @@ use serde_json::{json, Value};
 
 use crate::tool_restrictions::get_tool_denylist_for_agent_type;
 
-mod bindings;
+pub(crate) mod bindings;
 mod dispatch;
+pub mod private_results;
+pub mod repository_guidance;
+pub mod request_context;
 mod tools;
+
+use private_results::DeliveryResponse;
+use repository_guidance::{BridgeResponse, GuidanceBinding, RepositoryGuidanceSource};
+use request_context::{CapturedRequestContext, McpRequestContext};
 
 pub(crate) use tools::ToolDef;
 pub use tools::{
@@ -105,6 +112,10 @@ pub struct WorkspaceMcpServer {
     /// every non-flagged provider keeps today's full description
     /// byte-identical.
     compact_tool_descriptions: bool,
+    /// Optional trusted producer; disabled for all existing construction paths.
+    repository_guidance: Option<GuidanceBinding>,
+    /// Original endpoint context; no runtime construction path installs it yet.
+    request_context: Option<Arc<dyn McpRequestContext>>,
 }
 
 impl WorkspaceMcpServer {
@@ -125,6 +136,8 @@ impl WorkspaceMcpServer {
             specialist_model_options: Vec::new(),
             is_sub_agent: false,
             compact_tool_descriptions: false,
+            repository_guidance: None,
+            request_context: None,
         }
     }
 
@@ -161,6 +174,48 @@ impl WorkspaceMcpServer {
     #[must_use]
     pub fn with_caller_agent_id(mut self, caller: Option<AgentId>) -> Self {
         self.caller_agent_id = caller;
+        self
+    }
+
+    /// Attach the trusted original endpoint context without granting access.
+    /// Each request captures it before any transport queue or spawned dispatch.
+    #[must_use]
+    pub fn with_request_context(mut self, context: Arc<dyn McpRequestContext>) -> Self {
+        self.request_context = Some(context);
+        self
+    }
+
+    pub(crate) fn capture_request_context(&self) -> CapturedRequestContext {
+        let caller = self
+            .caller_agent_id
+            .clone()
+            .map(|agent_id| intent_core::Caller::Agent { agent_id })
+            .or_else(intent_core::current_caller);
+        CapturedRequestContext::capture_with_budget(
+            caller,
+            self.request_context.as_deref(),
+            self.workspace_api_timeout
+                .saturating_mul(2)
+                .max(Duration::from_secs(120)),
+        )
+    }
+
+    /// Opt in a verified immutable session to the optional transport sidecar.
+    /// The source must independently admit each bound caller/context read; a
+    /// matching session ID is only a delivery correlation check, not permission.
+    /// No current runtime construction path enables this inactive integration.
+    #[must_use]
+    pub fn with_repository_guidance(
+        mut self,
+        session: &intent_core::AgentSession,
+        source: Arc<dyn RepositoryGuidanceSource>,
+    ) -> Self {
+        self.repository_guidance = GuidanceBinding::new(
+            session,
+            &self.workspace_id,
+            self.caller_agent_id.as_ref(),
+            source,
+        );
         self
     }
 
@@ -306,13 +361,68 @@ impl WorkspaceMcpServer {
 
     /// Handle one MCP JSON-RPC message. Returns `Some(response)` for requests and
     /// `None` for notifications (port of `MCPServer.handleMessage`).
+    ///
+    /// The whole message runs as the bridge's caller agent — not just the
+    /// `workspace_api` eval — so the service calls around it (output settings
+    /// read, retired-caller guard, feature lookups) reach the fail-closed
+    /// capability gates bound. The bridge listener dispatches every message
+    /// on a fresh task, which would otherwise arrive unbound. A bridge with no
+    /// caller agent leaves whatever caller the enclosing scope bound.
     pub async fn handle_message(&self, message: &Value) -> Option<Value> {
+        let response = self
+            .handle_message_response(message, false, self.capture_request_context())
+            .await?;
+        Some(response.into_direct().await.value)
+    }
+
+    pub(crate) async fn handle_message_for_bridge(
+        &self,
+        message: &Value,
+        context: CapturedRequestContext,
+    ) -> Option<BridgeResponse> {
+        let response = self.handle_message_response(message, true, context).await?;
+        Some(response.into_direct().await)
+    }
+
+    pub(crate) async fn handle_message_for_delivery(
+        &self,
+        message: &Value,
+        context: CapturedRequestContext,
+    ) -> Option<DeliveryResponse> {
+        self.handle_message_response(message, true, context).await
+    }
+
+    async fn handle_message_response(
+        &self,
+        message: &Value,
+        sidecar: bool,
+        context: CapturedRequestContext,
+    ) -> Option<DeliveryResponse> {
         let method = message.get("method").and_then(Value::as_str)?;
-        let id = message.get("id").cloned();
-        match id {
-            Some(id) => Some(self.handle_request(&id, method, message).await),
-            None => None,
-        }
+        let id = message.get("id").cloned()?;
+        let handled = async {
+            let value = self.handle_request(&id, method, message).await;
+            let mut response = BridgeResponse::plain(value);
+            if sidecar
+                && method == "tools/call"
+                && message.pointer("/params/name").and_then(Value::as_str) == Some("workspace_api")
+                && response
+                    .value
+                    .pointer("/result/content")
+                    .is_some_and(Value::is_array)
+            {
+                if let Some(binding) = &self.repository_guidance {
+                    response.guidance_request =
+                        binding.capture(&self.workspace_id, self.caller_agent_id.as_ref());
+                    if let Some(request) = &mut response.guidance_request {
+                        request.set_context(context.clone());
+                    }
+                }
+            }
+            response
+        };
+        let response = context.run(handled).await;
+        Some(DeliveryResponse::from_context(response, &context))
     }
 
     async fn handle_request(&self, id: &Value, method: &str, message: &Value) -> Value {
@@ -406,7 +516,7 @@ impl WorkspaceMcpServer {
 }
 
 // By-value: callers hand over freshly built payloads.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn ok(id: &Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }

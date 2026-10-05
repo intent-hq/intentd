@@ -4,7 +4,6 @@
 //! cannot bleed into other test files. Within this binary the tests still share
 //! one process, so they hold a global mutex while they tweak env vars.
 
-use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use intent_core::config::{
@@ -14,6 +13,7 @@ use intent_core::config::{
     MIN_WAKE_RESUME_THRESHOLD_SECONDS,
 };
 use intent_core::settings_file::DEFAULT_CONFIG_TEMPLATE;
+use tempfile::TempDir;
 
 /// Serializes env-mutating tests in this binary. Cargo runs `#[test]`s on
 /// multiple threads by default, so without this guard `INTENTD_*` reads and
@@ -27,28 +27,29 @@ fn env_lock() -> MutexGuard<'static, ()> {
     }
 }
 
-/// Returns a unique temp directory path (not necessarily created) for this
-/// test run. We do not need the directory to exist for `resolve()` to succeed,
-/// since `resolve()` only joins paths — it never reads from `data_dir` itself.
-fn unique_temp(prefix: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{prefix}-{}", uuid_like()))
-}
-
-fn uuid_like() -> String {
-    // Cheap unique-ish suffix without taking a uuid dependency in the test
-    // (uuid IS a dep of the crate, so use it via the same crate's surface).
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!("{nanos}-{:p}", &raw const nanos)
+/// A fresh RAII temp directory for `prefix` under the system temp root.
+/// `resolve()` only joins paths under `data_dir` and initializes the config
+/// file's parent, so a pre-existing dir does not change what it does. The
+/// returned guard removes the dir on drop (including on panic); set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+fn unique_temp(prefix: &str) -> TempDir {
+    let mut dir = tempfile::Builder::new()
+        .prefix(&format!("{prefix}-"))
+        .tempdir()
+        .expect("create test temp dir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        dir.disable_cleanup(true);
+    }
+    dir
 }
 
 #[test]
 fn resolve_honors_data_dir_and_config_env_overrides() {
     let _g = env_lock();
-    let data_dir = unique_temp("intentd-data");
-    let config_path = unique_temp("intentd-config").join("config.toml");
+    let data_dir_guard = unique_temp("intentd-data");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let config_dir = unique_temp("intentd-config");
+    let config_path = config_dir.path().join("config.toml");
 
     // Wipe any inherited overrides so this test owns the slot.
     std::env::remove_var("INTENTD_IDLE_REAP_MINUTES");
@@ -91,13 +92,13 @@ fn resolve_honors_data_dir_and_config_env_overrides() {
 
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
-    std::fs::remove_dir_all(config_path.parent().unwrap()).ok();
 }
 
 #[test]
 fn resolve_defaults_config_path_into_data_dir() {
     let _g = env_lock();
-    let data_dir = unique_temp("intentd-datadir-cfg");
+    let data_dir_guard = unique_temp("intentd-datadir-cfg");
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     std::env::remove_var("INTENTD_IDLE_REAP_MINUTES");
     std::env::remove_var("INTENTD_STREAM_RETENTION_HOURS");
@@ -112,16 +113,15 @@ fn resolve_defaults_config_path_into_data_dir() {
     );
 
     std::env::remove_var("INTENTD_DATA_DIR");
-    std::fs::remove_dir_all(&data_dir).ok();
 }
 
 #[test]
 fn resolve_fails_on_malformed_config_file() {
     let _g = env_lock();
-    let data_dir = unique_temp("intentd-data-bad");
+    let data_dir_guard = unique_temp("intentd-data-bad");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_dir = unique_temp("intentd-cfgdir-bad");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let config_path = config_dir.join("config.toml");
+    let config_path = config_dir.path().join("config.toml");
     std::fs::write(&config_path, "[agents]\nidleReapMinuets = 5\n").unwrap();
 
     std::env::remove_var("INTENTD_IDLE_REAP_MINUTES");
@@ -136,16 +136,15 @@ fn resolve_fails_on_malformed_config_file() {
 
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
-    std::fs::remove_dir_all(&config_dir).ok();
 }
 
 #[test]
 fn resolve_reads_config_file_when_present() {
     let _g = env_lock();
-    let data_dir = unique_temp("intentd-data2");
+    let data_dir_guard = unique_temp("intentd-data2");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_dir = unique_temp("intentd-cfgdir2");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let config_path = config_dir.join("config.toml");
+    let config_path = config_dir.path().join("config.toml");
     std::fs::write(
         &config_path,
         "[agents]\nidleReapMinutes = 7\n\n[events]\nstreamRetentionHours = 24\n\n[hooks]\nmaxPerAgent = 3\n\n[server]\nmaxOutstandingRpcs = 12\n\n[wakeResume]\nenabled = false\nthresholdSeconds = 30\n",
@@ -167,17 +166,15 @@ fn resolve_reads_config_file_when_present() {
 
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
-    std::fs::remove_file(&config_path).ok();
-    std::fs::remove_dir_all(&config_dir).ok();
 }
 
 #[test]
 fn resolve_clamps_zero_threshold_to_minimum() {
     let _g = env_lock();
-    let data_dir = unique_temp("intentd-data-thresh0");
+    let data_dir_guard = unique_temp("intentd-data-thresh0");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let config_dir = unique_temp("intentd-cfgdir-thresh0");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let config_path = config_dir.join("config.toml");
+    let config_path = config_dir.path().join("config.toml");
     // `thresholdSeconds = 0` would make the clock-skew detector flag every
     // ~1s sampling tick as a suspend; resolve() must clamp it up to the floor.
     std::fs::write(
@@ -204,15 +201,15 @@ fn resolve_clamps_zero_threshold_to_minimum() {
 
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
-    std::fs::remove_file(&config_path).ok();
-    std::fs::remove_dir_all(&config_dir).ok();
 }
 
 #[test]
 fn resolve_env_overrides_for_idle_and_retention_take_precedence() {
     let _g = env_lock();
-    let data_dir = unique_temp("intentd-data3");
-    let config_path = unique_temp("intentd-config3").join("config.toml");
+    let data_dir_guard = unique_temp("intentd-data3");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let config_dir = unique_temp("intentd-config3");
+    let config_path = config_dir.path().join("config.toml");
 
     std::env::set_var("INTENTD_DATA_DIR", &data_dir);
     std::env::set_var("INTENTD_CONFIG", &config_path);
@@ -234,5 +231,4 @@ fn resolve_env_overrides_for_idle_and_retention_take_precedence() {
     std::env::remove_var("INTENTD_STREAM_RETENTION_HOURS");
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
-    std::fs::remove_dir_all(config_path.parent().unwrap()).ok();
 }

@@ -35,24 +35,19 @@ const TOKEN: &str = "abababababababababababababababababababababababababababababa
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
-    scratch: PathBuf,
+    _data_dir: tempfile::TempDir,
+    scratch: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
-        let _ = std::fs::remove_dir_all(&self.scratch);
     }
 }
 
-fn scratch_dir(prefix: &str) -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-wt-{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir scratch dir");
-    dir
+fn scratch_dir(prefix: &str) -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", &format!("itd-wss-wt-{prefix}-"))
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -63,9 +58,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         common::enable_ws_api(data_dir);
     }
     common::seed_default_provider(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -174,10 +168,27 @@ async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    wss_send(ws, id, method, params).await;
+    wss_recv(ws, id, method).await
+}
+
+/// Send one request frame without waiting for its reply (pair with
+/// [`wss_recv`]); lets a test put several requests in flight at once.
+async fn wss_send<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
+}
+
+/// Await the successful `result` for request `id`, skipping unrelated frames.
+async fn wss_recv<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
         let next = timeout(Duration::from_secs(15), ws.next())
             .await
@@ -244,18 +255,18 @@ fn make_source_repo(dir: &Path) -> (PathBuf, String) {
 }
 
 async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir = scratch_dir("data");
+    let data_dir_guard = scratch_dir("data");
+    let data_dir = data_dir_guard.path().to_path_buf();
     let scratch = scratch_dir("scratch");
     let root_s = workspaces_root.to_string_lossy().to_string();
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_WORKSPACES_DIR", &root_s),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        _data_dir: data_dir_guard,
         scratch,
     };
     let socket = data_dir.join("intentd.sock");
@@ -281,9 +292,10 @@ async fn workspace_create_provisions_worktree_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("root");
+    let root_dir = scratch_dir("root");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
-    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut ws = connect_ws(port, cfg).await;
     let result = wss_rpc(
@@ -331,7 +343,6 @@ async fn workspace_create_provisions_worktree_over_wss() {
     );
     assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), head_sha);
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -345,9 +356,10 @@ async fn workspace_create_derives_repository_name_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("reponame");
+    let root_dir = scratch_dir("reponame");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
-    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut ws = connect_ws(port, cfg).await;
     let created = wss_rpc(
@@ -382,7 +394,87 @@ async fn workspace_create_derives_repository_name_over_wss() {
         "workspace.list round-trips the derived repositoryName"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// Two `workspace.create` requests carrying the same fresh `idempotencyKey`
+/// over the real WSS wire shape — two connections, both frames sent before
+/// either reply is read — are exactly-once: both replies name the same
+/// workspace (the second is a byte-equal replay of the first) and
+/// `workspace.list` shows a single workspace. Regression for the lookup → op
+/// → persist window in `with_idempotency`, where two concurrent callers both
+/// missed the lookup and provisioned two workspaces for one key.
+///
+/// What this proves: the exactly-once invariant holds end to end over WSS.
+/// What it does not force: server-side handler overlap — the client cannot
+/// control when each frame is read, so the first request may already have
+/// persisted before the second is dispatched. The deterministic overlap proof
+/// is `concurrent_same_key_creates_yield_one_workspace` in `intent-services`.
+/// Empirically this test failed 10/10 against the pre-lock tree.
+#[tokio::test]
+async fn workspace_create_concurrent_same_key_is_exactly_once_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root_dir = scratch_dir("samekey");
+    let root = root_dir.path().to_path_buf();
+    let (daemon, port, cfg) = boot(&root).await;
+    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
+
+    let mut ws_a = connect_ws(port, cfg.clone()).await;
+    let mut ws_b = connect_ws(port, cfg).await;
+
+    let key = Uuid::new_v4().to_string();
+    let params = json!({
+        "title": "Same Key",
+        "repositoryPath": repo.to_string_lossy(),
+        "repositoryName": "source-repo",
+        "baseRef": "main",
+        "initialAgent": { "prompt": "fix the auth flow" },
+        "idempotencyKey": key,
+    });
+
+    // Both frames leave before either reply is read (the real client wire
+    // shape); whether the handlers overlap inside the daemon is up to
+    // scheduling — see the doc comment.
+    wss_send(&mut ws_a, 2, "workspace.create", params.clone()).await;
+    wss_send(&mut ws_b, 3, "workspace.create", params).await;
+    let (first, second) = tokio::join!(
+        wss_recv(&mut ws_a, 2, "workspace.create"),
+        wss_recv(&mut ws_b, 3, "workspace.create"),
+    );
+
+    let id = first["workspace"]["id"].as_str().expect("workspace id");
+    assert_eq!(
+        second["workspace"]["id"].as_str(),
+        Some(id),
+        "both replies must name the same workspace"
+    );
+    assert_eq!(
+        serde_json::to_string(&second["workspace"]).unwrap(),
+        serde_json::to_string(&first["workspace"]).unwrap(),
+        "the replayed workspace object must be byte-equal to the first"
+    );
+
+    let list = wss_rpc(&mut ws_a, 4, "workspace.list", json!({})).await;
+    let workspaces = list["workspaces"].as_array().expect("workspaces array");
+    assert_eq!(
+        workspaces
+            .iter()
+            .filter(|w| w["id"].as_str() == Some(id))
+            .count(),
+        1,
+        "exactly one workspace with the shared id"
+    );
+    assert_eq!(
+        workspaces
+            .iter()
+            .filter(|w| w["title"] == json!("Same Key"))
+            .count(),
+        1,
+        "the second caller must not have provisioned a workspace under another id"
+    );
+
     drop(daemon);
 }
 
@@ -396,9 +488,10 @@ async fn workspace_delete_cleans_worktree_and_branch_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("delroot");
+    let root_dir = scratch_dir("delroot");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
-    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
     let mut ws = connect_ws(port, cfg).await;
 
     // Auto-generated branch: deleted with the workspace.
@@ -487,7 +580,6 @@ async fn workspace_delete_cleans_worktree_and_branch_over_wss() {
         "explicit branch preserved, got: {branches}"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -500,9 +592,10 @@ async fn workspace_delete_is_idempotent_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("idem");
+    let root_dir = scratch_dir("idem");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
-    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
     let mut ws = connect_ws(port, cfg).await;
 
     let created = wss_rpc(
@@ -536,7 +629,6 @@ async fn workspace_delete_is_idempotent_over_wss() {
     let second = wss_rpc(&mut ws, 4, "workspace.delete", json!({ "workspaceId": id })).await;
     assert_eq!(second, json!({ "success": true }));
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -551,9 +643,10 @@ async fn workspace_delete_sweeps_residual_workspace_directory_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("resid");
+    let root_dir = scratch_dir("resid");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
-    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
     let mut ws = connect_ws(port, cfg).await;
 
     let created = wss_rpc(
@@ -591,7 +684,6 @@ async fn workspace_delete_sweeps_residual_workspace_directory_over_wss() {
         "<root>/<id>/ (with residual content) fully removed"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -604,7 +696,8 @@ async fn workspace_delete_cleans_orphan_directory_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("orphan");
+    let root_dir = scratch_dir("orphan");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
     let mut ws = connect_ws(port, cfg).await;
 
@@ -627,7 +720,6 @@ async fn workspace_delete_cleans_orphan_directory_over_wss() {
     }
     assert!(!orphan.exists(), "orphan workspace directory removed");
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -642,9 +734,10 @@ async fn workspace_create_stores_empty_title_when_title_empty_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("titleempty");
+    let root_dir = scratch_dir("titleempty");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
-    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut ws = connect_ws(port, cfg).await;
     let created = wss_rpc(
@@ -682,7 +775,6 @@ async fn workspace_create_stores_empty_title_when_title_empty_over_wss() {
         "workspace.list round-trips the empty title"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -697,9 +789,10 @@ async fn workspace_create_stores_empty_title_when_title_omitted_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("titleomit");
+    let root_dir = scratch_dir("titleomit");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
-    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
 
     let mut ws = connect_ws(port, cfg).await;
     let created = wss_rpc(
@@ -735,7 +828,6 @@ async fn workspace_create_stores_empty_title_when_title_omitted_over_wss() {
         "workspace.list round-trips the omitted-title empty shape"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
 
@@ -751,9 +843,10 @@ async fn workspace_duplicate_provisions_worktree_over_wss() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("dupwt");
+    let root_dir = scratch_dir("dupwt");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
-    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, head_sha) = make_source_repo(daemon.scratch.path());
     let mut ws = connect_ws(port, cfg).await;
 
     // Seed a source workspace with a real worktree so `workspace.duplicate`
@@ -897,9 +990,10 @@ async fn workspace_duplicate_skips_worktree_when_source_skips() {
     if !gate() {
         return;
     }
-    let root = scratch_dir("dupskip");
+    let root_dir = scratch_dir("dupskip");
+    let root = root_dir.path().to_path_buf();
     let (daemon, port, cfg) = boot(&root).await;
-    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
     let mut ws = connect_ws(port, cfg).await;
 
     let created = wss_rpc(
@@ -938,6 +1032,5 @@ async fn workspace_duplicate_skips_worktree_when_source_skips() {
         "no baseCommitSha when no worktree is provisioned"
     );
 
-    let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }

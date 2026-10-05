@@ -28,15 +28,20 @@
 #   ~/setup-pnpm-*         per-slot pnpm dests — stale > 7 days
 #   ~/.install-action      legacy shared install-action dir — stale > 7 days
 # Shared caches (~/.cargo registry, ~/.rustup toolchains) are never touched.
-# In the age-based passes an entry is only deleted when nothing inside it
-# was modified within the window (recursive mtime check), so a running
-# job's target dir is never deleted; the LRU pass keeps that guarantee
-# with its own rails — it skips this runner's own slot and any dir with
-# activity within the last 15 minutes (a running job modifies its target
-# dir continuously), and orders candidates by last activity inside the dir
-# so warm slots are evicted last. Target dirs are warm caches only, so an
-# LRU eviction costs a rebuild, not correctness. Every deletion (or
-# dry-run candidate) is echoed. ci.yml's fail-fast preflight is the
+# A per-slot target dir carrying a fresh `.in-use` marker (written by every
+# tinybox job's CARGO_TARGET_DIR step in ci.yml, released at job end, valid
+# 4 h — scripts/ci-target-slot.sh, intent-hq/intent#5256) is never deleted
+# by any pass: a quiet compile phase can no longer make a live dir look
+# idle. In the age-based passes an entry is otherwise only deleted when
+# nothing inside it was modified within the window (recursive mtime check),
+# so an unmarked running job's target dir is not deleted either; the LRU
+# pass keeps that guarantee with its own rails — it skips this runner's own
+# slot and any dir with activity within the last 15 minutes (a running job
+# modifies its target dir continuously), and orders candidates by last
+# activity inside the dir so warm slots are evicted last. Target dirs are
+# warm caches only, so an LRU eviction costs a rebuild, not correctness.
+# Every deletion (or dry-run candidate) is echoed. ci.yml's fail-fast
+# preflight is the
 # emergency backstop between these scheduled runs — since the
 # 2026-08-20/08-21 exhaustions (monorepo#1253: /raid hit 0 GiB free with
 # every dir too fresh for the preflight's stale-only pass, which could
@@ -144,6 +149,11 @@ jobs:
           # the LRU pass's running-job guard (a running job modifies its
           # target dir continuously, so an active slot is never evicted).
           is_active() { [ -n "$(find "$1" -mmin -15 -print -quit 2>/dev/null || true)" ]; }
+          # In use = a `.in-use` marker younger than 4 h (intent-hq/intent#5256).
+          # Same marker name and validity as scripts/ci-target-slot.sh
+          # is-in-use, inlined because this workflow has no checkout; keep
+          # the two in step.
+          is_in_use() { [ -n "$(find "$1/.in-use" -maxdepth 0 -type f -mmin -240 -print -quit 2>/dev/null || true)" ]; }
           # Stale per-slot target dirs at exactly <root>/<repo>/<slot>/<job>,
           # oldest first; the case guard re-asserts the allowlist. $2 is the
           # ci-target root: /raid/ci-target (primary) or $HOME/ci-target
@@ -155,6 +165,10 @@ jobs:
             while IFS= read -r entry; do
               dir="${entry#* }"
               case "$dir" in "$root/"?*) ;; *) continue ;; esac
+              if is_in_use "$dir"; then
+                echo "skipping in use (.in-use marker < 4 h old): $dir"
+                continue
+              fi
               is_fresh "$dir" "$days" && continue
               remove "$dir"
             done < <(find "$root" -mindepth 3 -maxdepth 3 -type d -mmin +"$(( days * 1440 ))" -printf '%T@ %p\n' 2>/dev/null | sort -n)
@@ -190,6 +204,10 @@ jobs:
               case "$dir" in "$root/"?*) ;; *) continue ;; esac
               if [ -n "${RUNNER_NAME:-}" ]; then
                 case "$dir" in "$root"/*/"$RUNNER_NAME"/*) echo "skipping own slot: $dir"; continue ;; esac
+              fi
+              if is_in_use "$dir"; then
+                echo "skipping in use (.in-use marker < 4 h old): $dir"
+                continue
               fi
               if is_active "$dir"; then
                 echo "skipping active (modified < 15 min ago): $dir"

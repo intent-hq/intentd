@@ -134,6 +134,45 @@ fn chat_params_require_agent_id() {
 }
 
 #[test]
+fn chat_params_snapshot_limit_defaults_and_boundaries() {
+    for (params, expected) in [
+        (json!({"agentId":"a"}), 20),
+        (json!({"agentId":"a", "limit":null}), 20),
+        (json!({"agentId":"a", "limit":1}), 1),
+        (json!({"agentId":"a", "limit":5}), 5),
+        (json!({"agentId":"a", "limit":50}), 50),
+        (json!({"agentId":"a", "limit":200}), 200),
+    ] {
+        assert_eq!(
+            parse_chat_subscribe_params(params.as_object().unwrap())
+                .unwrap()
+                .limit,
+            expected
+        );
+    }
+}
+
+#[test]
+fn chat_params_reject_invalid_snapshot_limits() {
+    for limit in [
+        json!(0),
+        json!(-1),
+        json!(201),
+        json!(u64::MAX),
+        json!(1.5),
+        json!(5.0),
+        json!("50"),
+        json!(true),
+        json!([]),
+        json!({}),
+    ] {
+        let params = json!({"agentId": "a", "limit": limit});
+        let err = parse_chat_subscribe_params(params.as_object().unwrap()).unwrap_err();
+        assert!(err.contains("limit"), "{params}: {err}");
+    }
+}
+
+#[test]
 fn chat_params_since_message_id() {
     // A non-empty string is captured for the §7.1 resume path.
     let ok = parse(r#"{"agentId":"agent-1","sinceMessageId":"msg-42"}"#);
@@ -207,7 +246,7 @@ fn stamp_delta_encoding_echoes_only_incremental() {
 }
 
 #[test]
-fn chat_channel_tails_stream_family_and_message() {
+fn chat_channel_tails_stream_family_message_and_transcript_mutations() {
     let chat = channel_event_types(Channel::Chat);
     assert_eq!(
         chat,
@@ -216,9 +255,47 @@ fn chat_channel_tails_stream_family_and_message() {
             "agent:tool:call".to_string(),
             "agent:stream:end".to_string(),
             "agent:message".to_string(),
+            "agent:updated".to_string(),
         ]
     );
     assert!(!channel_is_global(Channel::Chat));
+}
+
+/// Multiplayer w3: every type a collaborator-callable subscription channel
+/// tails is on the collaborator event allowlist, so the match-time
+/// `collaborator_only` guard never silently starves a channel a guest may
+/// open (`note` / `task` / `agent` / `workspace` / `comment` / `chat` are all
+/// in `COLLABORATOR_METHODS`). A channel that starts tailing an owner-only
+/// type must either vet it in `COLLABORATOR_EVENT_TYPES` or be removed from
+/// the method allowlist.
+#[test]
+fn channel_event_types_are_all_collaborator_visible() {
+    for channel in [
+        Channel::Note,
+        Channel::Task,
+        Channel::Agent,
+        Channel::Workspace,
+        Channel::Comment,
+        Channel::Chat,
+    ] {
+        let types = channel_event_types(channel);
+        assert!(!types.is_empty(), "{channel:?} tails no types");
+        let hidden: Vec<&String> = types
+            .iter()
+            // A workspace channel consumes the global role invalidation
+            // internally and re-reads caller-scoped rows; it never forwards
+            // the event payload (including the unrelated principal id).
+            .filter(|t| {
+                !(channel == Channel::Workspace
+                    && t.as_str() == intent_core::events::HOST_MEMBERS_CHANGED)
+            })
+            .filter(|t| !intent_core::events::is_collaborator_event_type(t))
+            .collect();
+        assert!(
+            hidden.is_empty(),
+            "{channel:?} channel tails types outside COLLABORATOR_EVENT_TYPES: {hidden:?}"
+        );
+    }
 }
 
 #[test]
@@ -325,6 +402,269 @@ fn slow_snapshot_warn_logs_fractional_millis_for_marginal_breach() {
         rendered.contains("threshold_ms=200"),
         "threshold_ms present in {rendered}"
     );
+}
+
+#[test]
+fn chat_lifecycle_records_carry_the_triage_fields() {
+    let snapshot = json!({
+        "agentId": "agent-1",
+        "messages": [{ "id": "msg-1" }, { "id": "msg-2" }],
+        "resumed": true,
+    });
+    let lines = crate::protocol::test_capture::capture_events(|| {
+        trace_chat_subscribe("agent-1", "ws-sub-7", true);
+        trace_chat_snapshot("agent-1", "ws-sub-7", &snapshot);
+        trace_chat_forwarder_exit("agent-1", "ws-sub-7", "client_closed");
+        trace_chat_teardown("agent-1", "ws-sub-7");
+    });
+    assert_eq!(lines.len(), 4, "one record per stage: {lines:?}");
+    for (level, rendered) in &lines {
+        assert_eq!(*level, tracing::Level::INFO);
+        assert!(
+            rendered.contains("channel=\"chat\"")
+                && rendered.contains("scope=\"agent-1\"")
+                && rendered.contains("subscription_id=\"ws-sub-7\""),
+            "every stage carries channel/scope/subscription id: {rendered}"
+        );
+    }
+    assert!(lines[0].1.contains("stage=\"subscribe\"") && lines[0].1.contains("since=true"));
+    assert!(
+        lines[1].1.contains("stage=\"snapshot\"")
+            && lines[1].1.contains("resumed=true")
+            && lines[1].1.contains("page_size=2"),
+        "the snapshot record carries the resume result and page size: {}",
+        lines[1].1
+    );
+    assert!(
+        lines[2].1.contains("stage=\"forwarder_exit\"")
+            && lines[2].1.contains("reason=\"client_closed\""),
+        "the exit record names why the forwarder stopped: {}",
+        lines[2].1
+    );
+    assert!(lines[3].1.contains("stage=\"teardown\""));
+}
+
+#[test]
+fn chat_snapshot_record_keeps_resumed_tri_state() {
+    // `resumed` mirrors the snapshot key verbatim: a snapshot without it (no
+    // resume requested, or a page degraded by a read failure) omits the field
+    // so it stays distinguishable from a FAILED resume, which logs an
+    // explicit `false`. `page_size` still defaults to 0 rather than vanishing.
+    let lines = crate::protocol::test_capture::capture_events(|| {
+        trace_chat_snapshot("agent-1", "ws-sub-8", &json!({}));
+        trace_chat_snapshot(
+            "agent-1",
+            "ws-sub-9",
+            &json!({ "resumed": false, "messages": [] }),
+        );
+    });
+    assert_eq!(lines.len(), 2, "exactly two INFO events: {lines:?}");
+    let no_resume = &lines[0].1;
+    assert!(
+        !no_resume.contains("resumed=") && no_resume.contains("page_size=0"),
+        "an absent resume key omits the field, page_size still defaults: {no_resume}"
+    );
+    let failed_resume = &lines[1].1;
+    assert!(
+        failed_resume.contains("resumed=false") && failed_resume.contains("page_size=0"),
+        "a declined resume logs an explicit false: {failed_resume}"
+    );
+}
+
+/// Conn-level lifecycle wiring: a REAL `chat.subscribe` through
+/// [`crate::conn::handle_sub_fast_path`] under a capturing subscriber must
+/// emit `subscribe` + `snapshot` records whose `resumed`/`page_size` stay in
+/// sync with the emitted seq-0 frame (built by [`chat_snapshot`]),
+/// `chat.unsubscribe` and connection close (registry drop) must each close a
+/// chat entry with exactly one `teardown`, and a non-chat subscription must
+/// contribute NO lifecycle records — so a refactor that drops a call site or
+/// renames a snapshot key fails here, not in production triage.
+mod conn_lifecycle {
+    use std::sync::Arc;
+
+    use intent_core::{AgentId, BoxFuture, Result, WorkspaceApi, WorkspaceId};
+    use intent_services::EventBus;
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use crate::conn::{
+        handle_sub_fast_path, outbound_channel, ConnSubs, OutboundReceiver, OutboundSender,
+    };
+    use crate::subscriptions::classify;
+
+    /// Two persisted messages, no live turn: the seq-0 page is deterministic.
+    struct TwoMessageApi;
+
+    impl WorkspaceApi for TwoMessageApi {
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            _limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            _around_message_id: Option<String>,
+            _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [
+                        { "id": "m-1", "role": "user", "seq": 0 },
+                        { "id": "m-2", "role": "assistant", "seq": 1 },
+                    ],
+                    "truncated": false,
+                    "totalMessages": 2,
+                    "nextToken": Value::Null,
+                }))
+            })
+        }
+    }
+
+    /// Drive one classified subscribe frame through the real fast-path and
+    /// return the priority-lane reply plus the seq-0 `subscription.push`.
+    async fn subscribe(
+        raw: &Value,
+        api: &Arc<dyn WorkspaceApi>,
+        bus: &EventBus,
+        out_tx: &OutboundSender,
+        rx: &mut OutboundReceiver,
+        subs: &mut ConnSubs,
+    ) -> (Value, Value) {
+        let sub = classify(raw).expect("frame classifies as a fast-path subscribe");
+        assert!(handle_sub_fast_path(sub, api, bus, out_tx, subs).await);
+        let reply: Value = serde_json::from_str(&rx.priority.recv().await.unwrap()).unwrap();
+        let push: Value = serde_json::from_str(&rx.bulk.recv().await.unwrap()).unwrap();
+        (reply, push)
+    }
+
+    #[test]
+    fn real_chat_subscribe_emits_in_sync_lifecycle_records() {
+        // Current-thread runtime: every spawned task (bus delivery, chat
+        // forwarder) runs on THIS thread while `block_on` polls, so the
+        // thread-default capturing subscriber sees their records too.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut plain_snapshot = Value::Null;
+        let mut resume_snapshot = Value::Null;
+        let lines = crate::protocol::test_capture::capture_events(|| {
+            rt.block_on(async {
+                let dir = tempfile::Builder::new()
+                    .prefix("intent-transport-conn-lifecycle-")
+                    .tempdir()
+                    .unwrap();
+                let store = Store::open(&dir.path().join("bus.db")).await.unwrap();
+                let bus = EventBus::new(store);
+                let api: Arc<dyn WorkspaceApi> = Arc::new(TwoMessageApi);
+                let (out_tx, mut rx) = outbound_channel();
+                let mut subs = ConnSubs::default();
+
+                // 1. A plain chat.subscribe: no resume requested.
+                let (reply, push) = subscribe(
+                    &json!({"jsonrpc":"2.0","id":1,"method":"chat.subscribe",
+                            "params":{"agentId":"agent-1"}}),
+                    &api,
+                    &bus,
+                    &out_tx,
+                    &mut rx,
+                    &mut subs,
+                )
+                .await;
+                let chat_sub_id = reply["result"]["subscriptionId"]
+                    .as_str()
+                    .expect("reply carries the subscription id")
+                    .to_string();
+                plain_snapshot = push["params"]["snapshot"].clone();
+
+                // 2. A resume that misses the page: `resumed: false` on the wire.
+                let (_, push) = subscribe(
+                    &json!({"jsonrpc":"2.0","id":2,"method":"chat.subscribe",
+                            "params":{"agentId":"agent-1","sinceMessageId":"m-unknown"}}),
+                    &api,
+                    &bus,
+                    &out_tx,
+                    &mut rx,
+                    &mut subs,
+                )
+                .await;
+                resume_snapshot = push["params"]["snapshot"].clone();
+
+                // 3. A non-chat subscription: no lifecycle records of its own.
+                let sub = classify(&json!({"jsonrpc":"2.0","id":3,"method":"note.subscribe",
+                                           "params":{"workspaceId":"ws-1"}}))
+                .unwrap();
+                assert!(handle_sub_fast_path(sub, &api, &bus, &out_tx, &mut subs).await);
+                let _ = rx.priority.recv().await.unwrap();
+                let _ = rx.bulk.recv().await.unwrap();
+
+                // 4. A real chat.unsubscribe tears down the first subscription…
+                let sub = classify(&json!({"jsonrpc":"2.0","id":4,"method":"chat.unsubscribe",
+                                           "params":{"subscriptionId": chat_sub_id}}))
+                .unwrap();
+                assert!(handle_sub_fast_path(sub, &api, &bus, &out_tx, &mut subs).await);
+                let _ = rx.priority.recv().await.unwrap();
+
+                // 5. …and connection close (registry drop) tears down the rest:
+                // one record for the remaining chat entry, none for note.
+                drop(subs);
+            });
+        });
+
+        let records: Vec<&str> = lines
+            .iter()
+            .map(|(_, rendered)| rendered.as_str())
+            .filter(|rendered| rendered.contains("chat subscription lifecycle"))
+            .collect();
+        assert_eq!(
+            records.len(),
+            6,
+            "2 subscribes + 2 snapshots + 2 teardowns, chat only: {records:#?}"
+        );
+        assert!(
+            records[0].contains("stage=\"subscribe\"") && records[0].contains("since=false"),
+            "plain subscribe record: {}",
+            records[0]
+        );
+        // Snapshot record ↔ frame key sync: `page_size` counts the emitted
+        // `messages` array, and `resumed` mirrors the frame's key — omitted
+        // when the snapshot carries none, explicit `false` on a declined
+        // resume. A renamed key in `chat_snapshot` breaks this pairing.
+        assert_eq!(plain_snapshot["messages"].as_array().unwrap().len(), 2);
+        assert!(plain_snapshot.get("resumed").is_none());
+        assert!(
+            records[1].contains("stage=\"snapshot\"")
+                && records[1].contains("page_size=2")
+                && !records[1].contains("resumed="),
+            "no-resume snapshot record stays in sync with the frame: {}",
+            records[1]
+        );
+        assert!(
+            records[2].contains("stage=\"subscribe\"") && records[2].contains("since=true"),
+            "resume subscribe record: {}",
+            records[2]
+        );
+        assert_eq!(resume_snapshot["resumed"], json!(false));
+        assert!(
+            records[3].contains("stage=\"snapshot\"")
+                && records[3].contains("resumed=false")
+                && records[3].contains("page_size=2"),
+            "declined-resume snapshot record stays in sync with the frame: {}",
+            records[3]
+        );
+        assert!(
+            records[4].contains("stage=\"teardown\""),
+            "chat.unsubscribe closes the record: {}",
+            records[4]
+        );
+        assert!(
+            records[5].contains("stage=\"teardown\""),
+            "registry drop closes the record: {}",
+            records[5]
+        );
+    }
 }
 
 #[test]
@@ -527,14 +867,18 @@ fn channel_event_types_full_matrix() {
         "pr:linked",
         "pr:updated",
         "pr:unlinked",
+        "host:members-changed",
+        "note:created",
+        "note:updated",
+        "agent:message",
     ] {
         assert!(ws.iter().any(|s| s == t), "workspace missing {t}");
     }
-    assert_eq!(ws.len(), 10);
-    // Comment channel — single type.
+    assert_eq!(ws.len(), 14);
+    // Comment channel — creation and deletion refresh the affected thread.
     assert_eq!(
         channel_event_types(Channel::Comment),
-        vec!["comment:added".to_string()]
+        vec!["comment:added".to_string(), "comment:deleted".to_string()]
     );
 }
 
@@ -982,6 +1326,84 @@ fn chat_tool_delta_errored_tool_with_proposal_output_emits_no_extra_block() {
 }
 
 #[test]
+fn chat_tool_delta_error_preserves_registered_proposal_with_persisted_identity() {
+    for registered in [false, true] {
+        let mut state = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+        let item = proposal_output_item();
+        let mut event = tool_event_with_ids(
+            "msg-e",
+            "msg-e:0",
+            "tc-e",
+            "error",
+            Some(json!([item.clone()])),
+            Some("msg-e:3".to_string()),
+            vec!["msg-e:5".to_string()],
+        );
+        event.data["registeredAttachments"] = if registered {
+            json!([item.clone()])
+        } else {
+            json!([])
+        };
+        let delta = state.tool_delta(&event).unwrap();
+        let added = delta["added"].as_array().unwrap();
+        assert_eq!(added.len(), if registered { 3 } else { 2 });
+        assert_eq!(added[1]["block"]["is_error"], true);
+        if registered {
+            let persisted =
+                intent_services::tool_block::build_proposal_resource_block("msg-e:5", &item);
+            assert_eq!(added[2]["block"], persisted);
+        }
+    }
+}
+
+#[test]
+fn chat_tool_delta_status_only_preserves_registered_batch() {
+    for status in ["error", "completed"] {
+        for registered in [false, true] {
+            let mut state = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+            let first = proposal_output_item();
+            let mut second = first.clone();
+            second["resource"]["uri"] = json!("intent-proposal://settings-change/second");
+            let items = vec![first, second];
+            let mut event = tool_event_with_ids(
+                "msg-e",
+                "msg-e:0",
+                "tc-e",
+                status,
+                None,
+                None,
+                vec!["msg-e:3".to_string(), "msg-e:4".to_string()],
+            );
+            if registered {
+                event.data["registeredAttachments"] = json!(items);
+            }
+            let delta = state.tool_delta(&event).unwrap();
+            let added = delta["added"].as_array().unwrap();
+            assert_eq!(added.len(), if registered { 3 } else { 1 });
+            assert!(!added.iter().any(|e| e["block"]["type"] == "tool_result"));
+            if registered {
+                for (i, item) in items.iter().enumerate() {
+                    let persisted = intent_services::tool_block::build_proposal_resource_block(
+                        &format!("msg-e:{}", i + 3),
+                        item,
+                    );
+                    assert_eq!(added[i + 1]["block"], persisted);
+                }
+                // Canonical items without persisted IDs cannot fabricate live blocks.
+                event
+                    .data
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("proposalBlockIds");
+                let delta = state.tool_delta(&event).unwrap();
+                assert!(delta["added"].as_array().unwrap().is_empty());
+                assert_eq!(delta["updated"].as_array().unwrap().len(), 1);
+            }
+        }
+    }
+}
+
+#[test]
 fn chat_tool_delta_no_proposal_in_output_emits_no_extra_block() {
     let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let d = s
@@ -1238,6 +1660,46 @@ fn chat_tool_delta_without_result_id_emits_only_the_use_block() {
 }
 
 #[test]
+fn chat_snapshot_overlap_does_not_duplicate_queued_text_chunks() {
+    for encoding in [DeltaEncoding::Full, DeltaEncoding::Incremental] {
+        for kind in ["text", "thinking"] {
+            for streaming in [Some(true), Some(false), None] {
+                let mut state = ChatDeltaState::new(&agent(), encoding, None);
+                let mut row = json!({
+                    "id": "live",
+                    "contentBlocks": [{"id": "live:0", "type": kind, "text": "écho"}]
+                });
+                if let Some(streaming) = streaming {
+                    row["isStreaming"] = json!(streaming);
+                }
+                state.seed_from_snapshot(&json!({"messages": [row]}));
+                let mut queued = chunk_event("live", "live:0", kind, &json!("écho"));
+                queued.data["textOffset"] = json!(0);
+                assert!(state.chunk_delta(&queued).is_none());
+
+                let mut next = chunk_event("live", "live:0", kind, &json!("écho"));
+                next.data["textOffset"] = json!(5);
+                let delta = state.chunk_delta(&next).expect("new repeated text");
+                let block = &delta["updated"][0]["block"];
+                match encoding {
+                    DeltaEncoding::Full => assert_eq!(block["text"], "échoécho"),
+                    DeltaEncoding::Incremental => assert_eq!(block["textDelta"], "écho"),
+                }
+                assert!(state.chunk_delta(&next).is_none());
+                let mut overlap = chunk_event("live", "live:0", kind, &json!("écho!"));
+                overlap.data["textOffset"] = json!(5);
+                let delta = state.chunk_delta(&overlap).expect("unseen suffix");
+                let block = &delta["updated"][0]["block"];
+                match encoding {
+                    DeltaEncoding::Full => assert_eq!(block["text"], "échoécho!"),
+                    DeltaEncoding::Incremental => assert_eq!(block["textDelta"], "!"),
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn chat_seed_from_snapshot_primes_in_flight_message_state() {
     let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let snapshot = json!({
@@ -1439,6 +1901,127 @@ fn incremental_seed_from_snapshot_appends_fragments_after_the_snapshot_text() {
     );
 }
 
+/// A chunk event carrying `media` (§7.1 image dimension sidecar) travels on
+/// the text block: full mode emits the running UNION on every chunk once
+/// anything resolved; incremental mode emits only the chunk's own entries and
+/// omits the key on chunks that resolved nothing.
+#[test]
+fn chunk_delta_forwards_media_by_encoding() {
+    let with_media = |message_id: &str, block_id: &str, text: &str, media: Value| {
+        let mut ev = chunk_event(message_id, block_id, "text", &json!(text));
+        ev.data["media"] = media;
+        ev
+    };
+    let a = json!({ "a.png": { "width": 640, "height": 480 } });
+    let b = json!({ "docs/b.png": { "width": 8, "height": 9 } });
+    let union = json!({
+        "a.png": { "width": 640, "height": 480 },
+        "docs/b.png": { "width": 8, "height": 9 },
+    });
+
+    // §7.1: in BOTH encodings a chunk delta carries only the entries that
+    // chunk resolved — never the accumulated map — even though full mode
+    // carries the full accumulated text.
+    let mut full = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+    let d = full
+        .chunk_delta(&chunk_event("m", "m:0", "text", &json!("See ")))
+        .unwrap();
+    assert!(d["added"][0]["block"].get("media").is_none());
+    let d = full
+        .chunk_delta(&with_media("m", "m:0", "![a](a.png)", a.clone()))
+        .unwrap();
+    assert_eq!(d["updated"][0]["block"]["media"], a);
+    let d = full
+        .chunk_delta(&with_media("m", "m:0", " ![b](docs/b.png)", b.clone()))
+        .unwrap();
+    assert_eq!(
+        d["updated"][0]["block"]["text"],
+        json!("See ![a](a.png) ![b](docs/b.png)")
+    );
+    assert_eq!(
+        d["updated"][0]["block"]["media"], b,
+        "full mode: only the chunk's own entries travel: {d}"
+    );
+    let d = full
+        .chunk_delta(&chunk_event("m", "m:0", "text", &json!(" tail")))
+        .unwrap();
+    assert!(
+        d["updated"][0]["block"].get("media").is_none(),
+        "full mode omits media on chunks that resolved nothing: {d}"
+    );
+    let d = full
+        .chunk_delta(&chunk_event("m", "m:1", "text", &json!("next")))
+        .unwrap();
+    assert!(
+        d["added"][0]["block"].get("media").is_none(),
+        "media is per block: {d}"
+    );
+    assert_eq!(
+        full.media_acc.get("m:0").map(|m| Value::Object(m.clone())),
+        Some(union.clone()),
+        "the accumulator still holds the union for the terminal frame"
+    );
+
+    let mut inc = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental, None);
+    let d = inc
+        .chunk_delta(&with_media("m", "m:0", "![a](a.png)", a.clone()))
+        .unwrap();
+    assert_eq!(d["added"][0]["block"]["media"], a);
+    let d = inc
+        .chunk_delta(&with_media("m", "m:0", " ![b](docs/b.png)", b.clone()))
+        .unwrap();
+    assert_eq!(
+        d["updated"][0]["block"]["media"], b,
+        "incremental mode: only the chunk's own entries travel: {d}"
+    );
+    let d = inc
+        .chunk_delta(&chunk_event("m", "m:0", "text", &json!(" tail")))
+        .unwrap();
+    assert!(
+        d["updated"][0]["block"].get("media").is_none(),
+        "incremental mode omits media on chunks that resolved nothing: {d}"
+    );
+}
+
+/// A mid-turn resume seeds `media` from the snapshot's text blocks, so the
+/// full-mode union after the seed includes what resolved before the client
+/// subscribed.
+#[test]
+fn chat_seed_from_snapshot_primes_media() {
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+    s.seed_from_snapshot(&json!({
+        "agentId": "agent-1",
+        "messages": [{
+            "id": "msg-live",
+            "role": "assistant",
+            "isStreaming": true,
+            "contentBlocks": [{
+                "id": "msg-live:0", "type": "text", "text": "![a](a.png)",
+                "media": { "a.png": { "width": 1, "height": 2 } }
+            }]
+        }],
+    }));
+    let mut ev = chunk_event("msg-live", "msg-live:0", "text", &json!(" ![b](b.png)"));
+    ev.data["media"] = json!({ "b.png": { "width": 3, "height": 4 } });
+    let d = s.chunk_delta(&ev).expect("post-seed chunk");
+    assert_eq!(
+        d["updated"][0]["block"]["media"],
+        json!({ "b.png": { "width": 3, "height": 4 } }),
+        "the delta carries only what this chunk resolved (§7.1); the seeded entry \
+         already reached the client in the snapshot"
+    );
+    assert_eq!(
+        s.media_acc
+            .get("msg-live:0")
+            .map(|m| Value::Object(m.clone())),
+        Some(json!({
+            "a.png": { "width": 1, "height": 2 },
+            "b.png": { "width": 3, "height": 4 },
+        })),
+        "the seeded entry primes the accumulator so the terminal frame carries the union"
+    );
+}
+
 #[test]
 fn merge_live_turn_appends_in_flight_message_idempotently() {
     let mut snapshot = json!({
@@ -1450,7 +2033,14 @@ fn merge_live_turn_appends_in_flight_message_idempotently() {
         "messageId": "msg-live",
         "contentBlocks": [{ "id": "msg-live:0", "type": "text", "text": "partial" }],
     });
-    merge_live_turn(&mut snapshot, &agent(), &live, true, None);
+    merge_live_turn(
+        &mut snapshot,
+        &agent(),
+        &live,
+        true,
+        None,
+        CHAT_SNAPSHOT_MESSAGE_LIMIT,
+    );
     let messages = snapshot["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["id"], "msg-live");
@@ -1459,7 +2049,14 @@ fn merge_live_turn_appends_in_flight_message_idempotently() {
     assert_eq!(messages[0]["role"], "assistant");
     assert_eq!(snapshot["totalMessages"], 1);
     // Idempotent re-merge: same message id already present → no duplicate, no seq bump.
-    merge_live_turn(&mut snapshot, &agent(), &live, true, None);
+    merge_live_turn(
+        &mut snapshot,
+        &agent(),
+        &live,
+        true,
+        None,
+        CHAT_SNAPSHOT_MESSAGE_LIMIT,
+    );
     assert_eq!(snapshot["messages"].as_array().unwrap().len(), 1);
     assert_eq!(snapshot["totalMessages"], 1);
 }
@@ -1477,7 +2074,14 @@ fn merge_live_turn_merges_an_orphan_slot_as_not_streaming() {
         "messageId": "msg-orphan",
         "contentBlocks": [{ "id": "msg-orphan:0", "type": "text", "text": "partial" }],
     });
-    merge_live_turn(&mut snapshot, &agent(), &live, false, None);
+    merge_live_turn(
+        &mut snapshot,
+        &agent(),
+        &live,
+        false,
+        None,
+        CHAT_SNAPSHOT_MESSAGE_LIMIT,
+    );
     let messages = snapshot["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["id"], "msg-orphan");
@@ -1496,7 +2100,14 @@ fn merge_live_turn_skips_an_empty_orphan_but_not_an_empty_live_turn() {
     let empty = json!({ "messageId": "msg-live", "contentBlocks": [] });
 
     let mut orphan = json!({ "messages": [], "totalMessages": 0 });
-    merge_live_turn(&mut orphan, &agent(), &empty, false, None);
+    merge_live_turn(
+        &mut orphan,
+        &agent(),
+        &empty,
+        false,
+        None,
+        CHAT_SNAPSHOT_MESSAGE_LIMIT,
+    );
     assert!(
         orphan["messages"].as_array().unwrap().is_empty(),
         "an empty orphan slot adds no row: {orphan}"
@@ -1504,7 +2115,14 @@ fn merge_live_turn_skips_an_empty_orphan_but_not_an_empty_live_turn() {
     assert_eq!(orphan["totalMessages"], 0);
 
     let mut streaming = json!({ "messages": [], "totalMessages": 0 });
-    merge_live_turn(&mut streaming, &agent(), &empty, true, None);
+    merge_live_turn(
+        &mut streaming,
+        &agent(),
+        &empty,
+        true,
+        None,
+        CHAT_SNAPSHOT_MESSAGE_LIMIT,
+    );
     assert_eq!(streaming["messages"].as_array().unwrap().len(), 1);
     assert_eq!(streaming["messages"][0]["isStreaming"], true);
 }
@@ -1518,6 +2136,7 @@ fn merge_live_turn_noop_when_message_id_missing() {
         &json!({ "contentBlocks": [] }),
         true,
         None,
+        CHAT_SNAPSHOT_MESSAGE_LIMIT,
     );
     assert!(snapshot["messages"].as_array().unwrap().is_empty());
     assert_eq!(snapshot["totalMessages"], 0);
@@ -1532,6 +2151,7 @@ fn merge_live_turn_noop_when_snapshot_is_not_object() {
         &json!({ "messageId": "m", "contentBlocks": [] }),
         true,
         None,
+        CHAT_SNAPSHOT_MESSAGE_LIMIT,
     );
     assert_eq!(snapshot, json!([]));
 }
@@ -1561,6 +2181,7 @@ fn merge_live_turn_slims_in_flight_blocks_under_slim_projection() {
         &live,
         true,
         Some(ConversationProjection::Slim),
+        CHAT_SNAPSHOT_MESSAGE_LIMIT,
     );
     let blocks = slim["messages"][0]["contentBlocks"].as_array().unwrap();
     assert_eq!(blocks[0]["text"], "partial", "text untouched");
@@ -1577,7 +2198,14 @@ fn merge_live_turn_slims_in_flight_blocks_under_slim_projection() {
     );
 
     let mut full = json!({ "messages": [], "totalMessages": 0 });
-    merge_live_turn(&mut full, &agent(), &live, true, None);
+    merge_live_turn(
+        &mut full,
+        &agent(),
+        &live,
+        true,
+        None,
+        CHAT_SNAPSHOT_MESSAGE_LIMIT,
+    );
     let blocks = full["messages"][0]["contentBlocks"].as_array().unwrap();
     assert_eq!(
         blocks[1]["output"].as_str().unwrap().len(),
@@ -1633,6 +2261,7 @@ fn merge_live_turn_rebudgets_slim_page_evicting_oldest_persisted_rows() {
         &live,
         true,
         Some(ConversationProjection::Slim),
+        CHAT_SNAPSHOT_MESSAGE_LIMIT,
     );
     let arr = snapshot["messages"].as_array().unwrap();
     // The live turn survives as the newest row (the budget anchor)…
@@ -1670,7 +2299,7 @@ fn merge_live_turn_rebudgets_slim_page_evicting_oldest_persisted_rows() {
 }
 
 /// The merge-time re-budget is slim-only and fit-tolerant: a full-fidelity
-/// merge never evicts (mirroring the unbudgeted full read), and a slim merge
+/// merge within five rows never evicts (mirroring the unbudgeted full read), and a slim merge
 /// whose page already fits keeps every row and the original cursor.
 #[test]
 fn merge_live_turn_rebudget_noop_for_full_projection_and_fitting_pages() {
@@ -1691,7 +2320,14 @@ fn merge_live_turn_rebudget_noop_for_full_projection_and_fitting_pages() {
 
     // Full projection: the (over-budget) persisted row is untouched.
     let mut full = heavy_page.clone();
-    merge_live_turn(&mut full, &agent(), &live, true, None);
+    merge_live_turn(
+        &mut full,
+        &agent(),
+        &live,
+        true,
+        None,
+        CHAT_SNAPSHOT_MESSAGE_LIMIT,
+    );
     assert_eq!(full["messages"].as_array().unwrap().len(), 2);
     assert_eq!(full["truncated"], false);
 
@@ -1712,12 +2348,115 @@ fn merge_live_turn_rebudget_noop_for_full_projection_and_fitting_pages() {
         &live,
         true,
         Some(ConversationProjection::Slim),
+        CHAT_SNAPSHOT_MESSAGE_LIMIT,
     );
     assert_eq!(slim["messages"].as_array().unwrap().len(), 2);
     assert_eq!(
         slim["nextToken"], "tok-old",
         "fitting page keeps its cursor"
     );
+}
+
+/// The count cap applies even without slim projection. Cursor re-minting must
+/// work when a complete twenty-row transcript first gains an unpersisted row.
+#[test]
+fn twenty_message_live_overlay_caps_full_and_slim_pages_without_losing_history() {
+    for projection in [None, Some(ConversationProjection::Slim)] {
+        let messages: Vec<Value> = (0..20)
+            .map(|seq| {
+                json!({ "id": format!("m-{seq}"), "seq": seq,
+                "role": "user", "contentBlocks": [{ "type": "text", "text": "small" }] })
+            })
+            .collect();
+        let mut snapshot = json!({ "messages": messages, "totalMessages": 20,
+            "truncated": false, "nextToken": null });
+        let live = json!({ "messageId": "live", "contentBlocks": [] });
+        merge_live_turn(
+            &mut snapshot,
+            &agent(),
+            &live,
+            true,
+            projection,
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        );
+        assert_eq!(snapshot["messages"].as_array().unwrap().len(), 20);
+        assert_eq!(snapshot["messages"][0]["id"], "m-1");
+        assert_eq!(snapshot["messages"][19]["id"], "live");
+        assert_eq!(snapshot["totalMessages"], 21);
+        assert_eq!(snapshot["truncated"], true);
+        let older =
+            intent_services::pagination::page_window(20, Some(20), snapshot["nextToken"].as_str());
+        assert_eq!((older.start, older.end), (0, 1));
+        // A persist/slot-clear race must not count or append the same row twice.
+        let unchanged = snapshot.clone();
+        merge_live_turn(
+            &mut snapshot,
+            &agent(),
+            &live,
+            true,
+            projection,
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        );
+        assert_eq!(snapshot, unchanged);
+    }
+}
+
+/// Byte eviction can shorten a count-bounded page further. An oversized live
+/// anchor still serves alone, and every displaced persisted row is reachable.
+#[test]
+fn configured_live_overlay_preserves_byte_budget_and_one_message_floor() {
+    for limit in [1, 5, 20, 50] {
+        for live_bytes in [200 * 1024, 600 * 1024] {
+            let messages: Vec<Value> = (0..5)
+            .map(|seq| json!({ "id": format!("m-{seq}"), "seq": seq,
+                "role": "user", "contentBlocks": [{ "type": "text", "text": "p".repeat(90 * 1024) }] }))
+            .collect();
+            let mut snapshot = json!({ "messages": messages, "totalMessages": 5,
+            "truncated": false, "nextToken": null });
+            let live = json!({ "messageId": "live", "contentBlocks": [
+            { "type": "text", "text": "x".repeat(live_bytes) }] });
+            merge_live_turn(
+                &mut snapshot,
+                &agent(),
+                &live,
+                true,
+                Some(ConversationProjection::Slim),
+                limit,
+            );
+            let rows = snapshot["messages"].as_array().unwrap();
+            assert_eq!(
+                rows.len(),
+                if live_bytes > SLIM_PAGE_BUDGET_BYTES {
+                    1
+                } else {
+                    limit.min(4)
+                }
+            );
+            assert_eq!(rows.last().unwrap()["id"], "live");
+            let bytes: usize = rows
+                .iter()
+                .map(intent_services::pagination::serialized_size)
+                .sum();
+            assert!(bytes <= SLIM_PAGE_BUDGET_BYTES || rows.len() == 1);
+            assert_eq!(snapshot["totalMessages"], 6);
+            assert_eq!(snapshot["truncated"], true);
+            let older = intent_services::pagination::page_window(
+                5,
+                Some(5),
+                snapshot["nextToken"].as_str(),
+            );
+            assert_eq!(
+                older.end,
+                usize::try_from(rows[0]["seq"].as_u64().unwrap()).unwrap()
+            );
+            assert_eq!(older.start, 0);
+            eprintln!(
+                "five-message live overlay: rows={} message_bytes={bytes} older_end={}",
+                rows.len(),
+                older.end
+            );
+        }
+    }
 }
 
 // --- task_delta re-read arm (channel-mapping regression) ------------------
@@ -2074,6 +2813,464 @@ mod task_delta_re_read {
     }
 }
 
+// --- workspace_delta — the virtual Chief workspace never rides a delta -----
+
+mod workspace_delta_chief {
+    use super::*;
+    use intent_core::{
+        chief_workspace, BoxFuture, Result, Workspace, WorkspaceApi, WorkspaceId,
+        CHIEF_WORKSPACE_ID,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `get_workspace` answers EVERY id (Chief included, mirroring the
+    /// services' synthesized Chief shape) and counts its calls, so a test can
+    /// prove the Chief guard short-circuits before the re-read.
+    struct AnyWorkspaceApi {
+        reads: AtomicUsize,
+    }
+
+    impl WorkspaceApi for AnyWorkspaceApi {
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(Workspace {
+                    id,
+                    ..chief_workspace()
+                })
+            })
+        }
+    }
+
+    fn workspace_event(event_type: &str, workspace_id: &str, data_id: Option<&str>) -> Event {
+        Event {
+            id: "evt-1".into(),
+            event_type: event_type.to_string(),
+            timestamp: now_iso(),
+            workspace_id: WorkspaceId::from(workspace_id),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            actor: EventActor {
+                actor_type: ActorType::System,
+                ..Default::default()
+            },
+            data: match data_id {
+                Some(id) => json!({ "workspaceId": id }),
+                None => json!({}),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn chief_scoped_events_map_to_no_delta_without_a_re_read() {
+        // `workspace.list` and the seq-0 snapshot filter `__chief__` at the
+        // store; the delta path must agree or a Chief-scoped status event
+        // upserts the virtual workspace into subscribed clients' lists.
+        let api = AnyWorkspaceApi {
+            reads: AtomicUsize::new(0),
+        };
+        for event_type in [
+            WORKSPACE_CREATED,
+            WORKSPACE_UPDATED,
+            WORKSPACE_DELETED,
+            WORKSPACE_ACTIVITY_CHANGED,
+            WORKSPACE_ATTENTION_CHANGED,
+            WORKSPACE_DISPLAY_STATUS_CHANGED,
+            WORKSPACE_WAITING_CHANGED,
+            PR_LINKED,
+            PR_UPDATED,
+            PR_UNLINKED,
+        ] {
+            // Id resolved from `data.workspaceId` …
+            let from_data = workspace_event(event_type, "w", Some(CHIEF_WORKSPACE_ID));
+            assert!(
+                workspace_delta(&api, &from_data, None).await.is_none(),
+                "{event_type} with data.workspaceId=__chief__ must map to no delta"
+            );
+            // … and from the event's own `workspaceId` fallback.
+            let from_event = workspace_event(event_type, CHIEF_WORKSPACE_ID, None);
+            assert!(
+                workspace_delta(&api, &from_event, None).await.is_none(),
+                "{event_type} scoped to __chief__ must map to no delta"
+            );
+        }
+        assert_eq!(
+            api.reads.load(Ordering::SeqCst),
+            0,
+            "the Chief guard must short-circuit before the get_workspace re-read"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_workspace_events_still_map_to_deltas() {
+        let api = AnyWorkspaceApi {
+            reads: AtomicUsize::new(0),
+        };
+        let d = workspace_delta(
+            &api,
+            &workspace_event(WORKSPACE_UPDATED, "w", Some("w")),
+            None,
+        )
+        .await
+        .expect("real workspace update maps to a delta");
+        assert_eq!(d["updated"][0]["id"], "w", "delta: {d}");
+        let d = workspace_delta(&api, &workspace_event(WORKSPACE_CREATED, "w", None), None)
+            .await
+            .expect("real workspace create maps to a delta");
+        assert_eq!(d["added"][0]["id"], "w", "delta: {d}");
+        let d = workspace_delta(&api, &workspace_event(WORKSPACE_DELETED, "w", None), None)
+            .await
+            .expect("real workspace delete maps to a delta");
+        assert_eq!(d["removedIds"][0], "w", "delta: {d}");
+        assert_eq!(api.reads.load(Ordering::SeqCst), 2);
+    }
+}
+
+// --- workspace_delta rows carry the list projection (slim_for_list) --------
+
+mod workspace_delta_list_projection {
+    use super::*;
+    use intent_core::{
+        chief_workspace, BoxFuture, PullRequestInfo, PullRequestStatus, Result, SetupScript,
+        TokenUsage, Workspace, WorkspaceApi, WorkspaceId, WORKSPACE_LIST_PR_CAP,
+        WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_KEYS,
+    };
+
+    /// `get_workspace` serves the FULL detail row (`workspace.get` shape):
+    /// detail-only `tokenUsage` / `setupScript` / `contextLinks`, and a PR
+    /// pool over [`WORKSPACE_LIST_PR_CAP`] whose entries carry the detail-only
+    /// `headSha` / `author`.
+    struct DetailWorkspaceApi;
+
+    /// Pool length served by the detail read: over the list cap so the
+    /// truncation (and `pullRequestsTotal`) is exercised on the delta path.
+    const POOL_LEN: usize = WORKSPACE_LIST_PR_CAP + 3;
+
+    fn pr(number: usize) -> PullRequestInfo {
+        PullRequestInfo {
+            id: format!("pr-{number}"),
+            number: u64::try_from(number).expect("small"),
+            url: format!("https://github.com/o/r/pull/{number}"),
+            title: format!("PR {number}"),
+            status: PullRequestStatus::Open,
+            created_at: "t0".to_string(),
+            updated_at: format!("t{number}"),
+            base_ref: Some("main".to_string()),
+            head_ref: Some(format!("feat/{number}")),
+            head_sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            author: Some("octocat".to_string()),
+            mergeable: Some(true),
+            mergeable_state: Some("clean".to_string()),
+            is_draft: Some(false),
+            is_in_merge_queue: None,
+        }
+    }
+
+    impl WorkspaceApi for DetailWorkspaceApi {
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            Box::pin(async move {
+                Ok(Workspace {
+                    id,
+                    token_usage: Some(TokenUsage::default()),
+                    setup_script: Some(SetupScript {
+                        script: "npm install".to_string(),
+                        project_type: None,
+                        updated_at: 1,
+                        generated_by: None,
+                    }),
+                    context_links: Some(vec![]),
+                    active_pull_request: Some(pr(1)),
+                    pull_requests: Some((1..=POOL_LEN).map(pr).collect()),
+                    ..chief_workspace()
+                })
+            })
+        }
+    }
+
+    fn workspace_event(event_type: &str) -> Event {
+        Event {
+            id: "evt-1".into(),
+            event_type: event_type.to_string(),
+            timestamp: now_iso(),
+            workspace_id: WorkspaceId::from("w"),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            actor: EventActor {
+                actor_type: ActorType::System,
+                ..Default::default()
+            },
+            data: json!({ "workspaceId": "w" }),
+        }
+    }
+
+    #[tokio::test]
+    async fn delta_rows_are_slimmed_like_the_seq_0_snapshot() {
+        // The `workspace` channel re-reads via `workspace.get` (full detail
+        // row); the pushed `added` / `updated` row must nonetheless be the
+        // `slim_for_list` shape the lite seq-0 snapshot serves, so a delta
+        // never re-hydrates `tokenUsage` / `setupScript` / `contextLinks`
+        // or an uncapped PR pool into subscribed clients' lists.
+        for (event_type, key) in [
+            (WORKSPACE_CREATED, "added"),
+            (WORKSPACE_UPDATED, "updated"),
+            (PR_UPDATED, "updated"),
+        ] {
+            let d = workspace_delta(&DetailWorkspaceApi, &workspace_event(event_type), None)
+                .await
+                .expect("delta");
+            let row = &d[key][0];
+            let obj = row.as_object().expect("row object");
+            for detail in ["tokenUsage", "setupScript", "contextLinks", "diskUsage"] {
+                assert!(
+                    !obj.contains_key(detail),
+                    "{event_type}: delta row carries detail-only `{detail}`: {row}"
+                );
+            }
+            let unlisted: Vec<&str> = obj
+                .keys()
+                .map(String::as_str)
+                .filter(|k| !WORKSPACE_LIST_ROW_KEYS.contains(k))
+                .collect();
+            assert!(
+                unlisted.is_empty(),
+                "{event_type}: delta row carries keys outside WORKSPACE_LIST_ROW_KEYS: \
+                 {unlisted:?}: {row}"
+            );
+            let prs = row["pullRequests"].as_array().expect("pullRequests");
+            assert_eq!(prs.len(), WORKSPACE_LIST_PR_CAP, "{event_type}: {row}");
+            assert_eq!(
+                row["pullRequestsTotal"].as_u64().map(usize::try_from),
+                Some(Ok(POOL_LEN)),
+                "{event_type}: {row}"
+            );
+            for entry in prs.iter().chain(std::iter::once(&row["activePullRequest"])) {
+                let unlisted: Vec<&str> = entry
+                    .as_object()
+                    .expect("pr object")
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|k| !WORKSPACE_LIST_PR_KEYS.contains(k))
+                    .collect();
+                assert!(
+                    unlisted.is_empty(),
+                    "{event_type}: PR entry carries keys outside WORKSPACE_LIST_PR_KEYS: \
+                     {unlisted:?}: {entry}"
+                );
+            }
+        }
+    }
+}
+
+// --- agent_delta rows carry the list projection (intent-hq/intent#5383) ----
+
+mod agent_delta_list_projection {
+    use super::*;
+    use intent_core::{
+        format_key_bytes_table, serialized_key_bytes, AgentId, AgentLite, BoxFuture, Result,
+        WorkspaceApi, WorkspaceId, AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
+        AGENT_LIST_ROW_KEYS, AGENT_LIST_ROW_METADATA_KEYS,
+    };
+
+    const DETAIL_ONLY_ROW_KEYS: &[&str] = &[
+        "harnessFeatures",
+        "effortLevels",
+        "contextReferences",
+        "fileBlocks",
+        "stats",
+    ];
+    const DETAIL_ONLY_METADATA_KEYS: &[&str] = &["pendingProposals", "proposalResolutions"];
+
+    /// `agent_get` serves the FULL `agent.get` detail row: every detail-only
+    /// field populated and every render-preview string far over
+    /// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] — what the seq-0 `agent.list`
+    /// snapshot would have stripped and capped.
+    struct DetailAgentApi;
+
+    fn detail_row() -> AgentLite {
+        let big = "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 3);
+        let metadata = json!({
+            "isBackground": true,
+            "specialist": "implementor",
+            "createdByAgentId": "agent-parent",
+            "taskNoteId": "n-1",
+            "completionReport": big,
+            "completionReportTimestamp": "t1",
+            "attentionRequestKind": "discussion",
+            "attentionRequestReason": big,
+            "attentionRequestTimestamp": "t1",
+            "delegationDepth": 2,
+            "sandboxId": "sbx-1",
+            "sandboxPath": "/home/u/.sandboxes/sbx-1",
+            "sandboxBranch": "sandbox/sbx-1",
+            "dismissedQuestionsMessageId": "msg-q",
+            "pendingQuestionsMessageId": "msg-p",
+            "pendingProposals": [{ "proposalId": "prop-1", "messageId": "msg-1" }],
+            "proposalResolutions": { "prop-0": "applied" },
+            "lastSeenMessageId": "msg-seen",
+            "isInitialAgent": true,
+            "sponsorAgentId": "agent-sponsor",
+            "chiefPromptVersion": u32::MAX,
+        });
+        serde_json::from_value(json!({
+            "id": "agent-1",
+            "workspaceId": "w",
+            "parentAgentId": "agent-parent",
+            "backendSessionId": "agent-backend",
+            "acpSessionId": "acp-1",
+            "name": "Worker",
+            "nameExplicitlySet": true,
+            "model": "claude-sonnet-4-5",
+            "reasoningEffort": "medium",
+            "effortLevels": ["low", "medium", "high"],
+            "provider": "auggie",
+            "status": "active",
+            "isActive": true,
+            "waitingForAgentIds": ["agent-child"],
+            "waitingOnHooks": [{ "hookId": "h-1", "name": "Wait for CI" }],
+            "waitingOnPrMonitors": [{ "monitorId": "m-1", "prNumber": 1 }],
+            "lastStreamActivityAt": "t1",
+            "contextUsage": { "used": 1, "size": 2, "updatedAt": "t1" },
+            "stats": { "creditsUsed": 1.5, "messageCount": 3, "toolCount": 2 },
+            "createdAt": "t0",
+            "updatedAt": "t1",
+            "lastActivity": "t1",
+            "messageCount": 3,
+            "lastAgentResponse": big,
+            "lastUserMessage": big,
+            "lastMessageRole": "assistant",
+            "lastMessageId": "msg-1",
+            "lastToolUse": { "name": "str-replace-editor", "input": { "old_str_1": big } },
+            "digest": big,
+            "contextReferences": [{ "type": "file", "path": "src/lib.rs" }],
+            "fileBlocks": [{ "type": "file", "path": "docs/a.md", "size": 1200 }],
+            "stopReason": "end_turn",
+            "stopReasonTimestamp": "t1",
+            "pendingDeleteAt": "t9",
+            "retiredAt": "t9",
+            "notificationsMuted": true,
+            "harnessVersion": "1",
+            "harnessFeatures": { "hooks": true },
+            "metadata": metadata,
+        }))
+        .expect("agent.get detail row deserializes")
+    }
+
+    impl WorkspaceApi for DetailAgentApi {
+        fn agent_get(
+            &self,
+            _agent_id: AgentId,
+            _workspace_id: Option<WorkspaceId>,
+        ) -> BoxFuture<'_, Result<AgentLite>> {
+            Box::pin(async { Ok(detail_row()) })
+        }
+    }
+
+    fn agent_event(event_type: &str) -> Event {
+        Event {
+            id: "evt-1".into(),
+            event_type: event_type.to_string(),
+            timestamp: now_iso(),
+            workspace_id: WorkspaceId::from("w"),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            actor: EventActor {
+                actor_type: ActorType::System,
+                ..Default::default()
+            },
+            data: json!({ "agentId": "agent-1" }),
+        }
+    }
+
+    #[tokio::test]
+    async fn delta_rows_satisfy_the_agent_list_allowlist_and_row_budget() {
+        // The `agent` channel re-reads via `agent.get` (full detail row); the
+        // pushed `added` / `updated` row must nonetheless be the `agent.list`
+        // projection (`strip_detail_only_fields` + `cap_list_previews`): the
+        // same key allowlist goldens and row budget the seq-0 snapshot rows
+        // satisfy, so a delta never re-hydrates what the snapshot stripped.
+        let sanity = serde_json::to_value(detail_row()).unwrap();
+        assert!(
+            serialized_key_bytes(&sanity).0 > AGENT_LIST_ROW_BUDGET_BYTES,
+            "fixture must be over budget before projection"
+        );
+        for (event_type, key) in [
+            (AGENT_CREATED, "added"),
+            (AGENT_RESTORED, "added"),
+            (AGENT_STATUS_CHANGED, "updated"),
+            (AGENT_UPDATED, "updated"),
+            (AGENT_COMPLETED, "updated"),
+        ] {
+            let d = agent_delta(&DetailAgentApi, &agent_event(event_type))
+                .await
+                .expect("delta");
+            let row = &d[key][0];
+            let obj = row.as_object().expect("row object");
+            let meta = row["metadata"].as_object().expect("metadata object");
+            for detail in DETAIL_ONLY_ROW_KEYS {
+                assert!(
+                    !obj.contains_key(*detail),
+                    "{event_type}: delta row carries detail-only `{detail}`: {row}"
+                );
+            }
+            for detail in DETAIL_ONLY_METADATA_KEYS {
+                assert!(
+                    !meta.contains_key(*detail),
+                    "{event_type}: delta metadata carries detail-only `{detail}`: {row}"
+                );
+            }
+            for (label, object, allow) in [
+                ("row", obj, AGENT_LIST_ROW_KEYS),
+                ("metadata", meta, AGENT_LIST_ROW_METADATA_KEYS),
+            ] {
+                let unlisted: Vec<&str> = object
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|k| !allow.contains(k))
+                    .collect();
+                assert!(
+                    unlisted.is_empty(),
+                    "{event_type}: agent delta {label} carries keys outside the agent.list \
+                     allowlist golden: {unlisted:?}: {row}"
+                );
+            }
+            for (label, s) in [
+                ("lastAgentResponse", &row["lastAgentResponse"]),
+                ("lastUserMessage", &row["lastUserMessage"]),
+                ("digest", &row["digest"]),
+                (
+                    "metadata.completionReport",
+                    &row["metadata"]["completionReport"],
+                ),
+                (
+                    "metadata.attentionRequestReason",
+                    &row["metadata"]["attentionRequestReason"],
+                ),
+            ] {
+                assert_eq!(
+                    s.as_str().map(str::len),
+                    Some(AGENT_LIST_PREVIEW_BUDGET_BYTES),
+                    "{event_type}: `{label}` must be capped like an agent.list row"
+                );
+            }
+            assert_eq!(row["lastToolUse"]["inputTruncated"], json!(true));
+            let (total, per_key) = serialized_key_bytes(row);
+            assert!(
+                total <= AGENT_LIST_ROW_BUDGET_BYTES,
+                "{event_type}: agent delta row is {total} B, over AGENT_LIST_ROW_BUDGET_BYTES \
+                 ({AGENT_LIST_ROW_BUDGET_BYTES} B) — the delta must apply the same list \
+                 projection as agent.list.\n{}",
+                format_key_bytes_table(total, &per_key)
+            );
+        }
+    }
+}
+
 // --- chat_snapshot bounded seq-0 read (monorepo#958 regression) ------------
 
 mod chat_snapshot_bounded {
@@ -2156,7 +3353,7 @@ mod chat_snapshot_bounded {
     #[tokio::test]
     async fn chat_snapshot_reads_exactly_one_bounded_page_for_large_transcript() {
         let api = BoundedPageApi::new(false);
-        let snap = chat_snapshot(&api, &agent(), None, None).await;
+        let snap = chat_snapshot(&api, &agent(), None, None, CHAT_SNAPSHOT_MESSAGE_LIMIT).await;
         assert_eq!(
             api.calls.load(Ordering::SeqCst),
             1,
@@ -2181,7 +3378,7 @@ mod chat_snapshot_bounded {
     #[tokio::test]
     async fn chat_snapshot_merges_live_turn_on_truncated_page() {
         let api = BoundedPageApi::new(true);
-        let snap = chat_snapshot(&api, &agent(), None, None).await;
+        let snap = chat_snapshot(&api, &agent(), None, None, CHAT_SNAPSHOT_MESSAGE_LIMIT).await;
         assert_eq!(api.calls.load(Ordering::SeqCst), 1);
         // The in-flight message is appended after the bounded page with the
         // next monotonic seq (CS-0 D5) — truncation does not disable the merge.
@@ -2198,7 +3395,14 @@ mod chat_snapshot_bounded {
     #[tokio::test]
     async fn chat_snapshot_resume_serves_only_messages_after_since_id() {
         let api = BoundedPageApi::new(false);
-        let snap = chat_snapshot(&api, &agent(), Some("m-118"), None).await;
+        let snap = chat_snapshot(
+            &api,
+            &agent(),
+            Some("m-118"),
+            None,
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        )
+        .await;
         // Resume is a post-filter, never a second fetch.
         assert_eq!(api.calls.load(Ordering::SeqCst), 1);
         let messages = snap["messages"].as_array().unwrap();
@@ -2215,7 +3419,14 @@ mod chat_snapshot_bounded {
     #[tokio::test]
     async fn chat_snapshot_resume_at_newest_id_yields_empty_page() {
         let api = BoundedPageApi::new(false);
-        let snap = chat_snapshot(&api, &agent(), Some("m-119"), None).await;
+        let snap = chat_snapshot(
+            &api,
+            &agent(),
+            Some("m-119"),
+            None,
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        )
+        .await;
         assert_eq!(snap["messages"].as_array().unwrap().len(), 0);
         assert_eq!(snap["resumed"], true);
         assert_eq!(snap["truncated"], false);
@@ -2225,7 +3436,14 @@ mod chat_snapshot_bounded {
     #[tokio::test]
     async fn chat_snapshot_resume_unknown_id_falls_back_to_full_page() {
         let api = BoundedPageApi::new(false);
-        let snap = chat_snapshot(&api, &agent(), Some("msg-nope"), None).await;
+        let snap = chat_snapshot(
+            &api,
+            &agent(),
+            Some("msg-nope"),
+            None,
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        )
+        .await;
         // Still exactly one bounded read — no lookup follow-up.
         assert_eq!(api.calls.load(Ordering::SeqCst), 1);
         // The standard page is served intact; `resumed: false` tells the
@@ -2241,7 +3459,14 @@ mod chat_snapshot_bounded {
     #[tokio::test]
     async fn chat_snapshot_resume_keeps_live_turn_merge() {
         let api = BoundedPageApi::new(true);
-        let snap = chat_snapshot(&api, &agent(), Some("m-119"), None).await;
+        let snap = chat_snapshot(
+            &api,
+            &agent(),
+            Some("m-119"),
+            None,
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        )
+        .await;
         // The filter trims the persisted page to empty, then the in-flight
         // message is merged AFTER the filter, so it is never trimmed away.
         let messages = snap["messages"].as_array().unwrap();
@@ -2249,6 +3474,271 @@ mod chat_snapshot_bounded {
         assert_eq!(messages[0]["id"], "msg-live");
         assert_eq!(messages[0]["isStreaming"], true);
         assert_eq!(snap["resumed"], true);
+    }
+
+    /// Exercise the existing snapshot entry points against the SAME page-window
+    /// helper as the conversation service. Unlike `BoundedPageApi`'s fixed two
+    /// rows, this fixture observes the requested limit (including its default).
+    struct TranscriptPageApi {
+        rows: Vec<Value>,
+        limits: std::sync::Mutex<Vec<Option<i64>>>,
+        live: BoundedPageApi,
+    }
+
+    impl TranscriptPageApi {
+        fn new(busy: bool) -> Self {
+            Self {
+                rows: (0..120)
+                    .map(|seq| {
+                        json!({
+                            "id": format!("m-{seq}"), "role": "assistant", "seq": seq,
+                            "contentBlocks": [{ "type": "text", "text": format!("message {seq}") }],
+                        })
+                    })
+                    .collect(),
+                limits: std::sync::Mutex::new(Vec::new()),
+                live: BoundedPageApi::new(busy),
+            }
+        }
+    }
+
+    impl WorkspaceApi for TranscriptPageApi {
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            page_token: Option<String>,
+            around_message_id: Option<String>,
+            around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.limits.lock().unwrap().push(limit);
+            assert!(page_token.is_none(), "snapshot must not walk older pages");
+            assert!(around_message_id.is_none() && around_index.is_none());
+            let window = intent_services::pagination::page_window(self.rows.len(), limit, None);
+            Box::pin(async move {
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": self.rows[window.start..window.end],
+                    "totalMessages": self.rows.len(),
+                    "truncated": window.start > 0,
+                    "nextToken": window.next_token,
+                }))
+            })
+        }
+
+        fn agent_is_busy(&self, agent_id: AgentId) -> bool {
+            self.live.agent_is_busy(agent_id)
+        }
+
+        fn agent_live_turn(&self, agent_id: AgentId) -> Option<Value> {
+            self.live.agent_live_turn(agent_id)
+        }
+    }
+
+    fn assert_twenty_message_snapshot(api: &TranscriptPageApi, snapshot: &Value, busy: bool) {
+        let messages = snapshot["messages"].as_array().unwrap();
+        eprintln!(
+            "snapshot rows={} bytes={} requested_limits={:?}",
+            messages.len(),
+            serde_json::to_vec(snapshot).unwrap().len(),
+            api.limits.lock().unwrap()
+        );
+        assert_eq!(messages.len(), 20, "newest page includes any live-turn row");
+        assert_eq!(messages[0]["id"], if busy { "m-101" } else { "m-100" });
+        assert_eq!(messages[19]["id"], if busy { "msg-live" } else { "m-119" });
+        assert_eq!(snapshot["truncated"], true);
+        assert!(snapshot["nextToken"].is_string());
+        let limits = api.limits.lock().unwrap();
+        assert_eq!(limits.len(), 1, "one bounded read, no history walk");
+        assert_eq!(limits[0], Some(20));
+        // The next backward page includes every row evicted by the live overlay.
+        let older =
+            intent_services::pagination::page_window(120, Some(20), snapshot["nextToken"].as_str());
+        assert_eq!(older.end, if busy { 101 } else { 100 });
+    }
+
+    #[tokio::test]
+    async fn twenty_message_initial_snapshot_uses_the_newest_page() {
+        let api = TranscriptPageApi::new(false);
+        let snapshot = chat_snapshot(
+            &api,
+            &agent(),
+            None,
+            Some(ConversationProjection::Slim),
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        )
+        .await;
+        assert_twenty_message_snapshot(&api, &snapshot, false);
+        assert!(snapshot.get("resumed").is_none());
+    }
+
+    #[tokio::test]
+    async fn twenty_message_stale_resume_resets_to_the_newest_page() {
+        let api = TranscriptPageApi::new(false);
+        let snapshot = chat_snapshot(
+            &api,
+            &agent(),
+            Some("m-80"),
+            None,
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        )
+        .await;
+        assert_eq!(
+            snapshot["resumed"], false,
+            "anchor outside newest twenty must reset"
+        );
+        assert_twenty_message_snapshot(&api, &snapshot, false);
+    }
+
+    #[tokio::test]
+    async fn twenty_message_snapshot_includes_live_turn_within_the_budget() {
+        let api = TranscriptPageApi::new(true);
+        let snapshot = chat_snapshot(
+            &api,
+            &agent(),
+            None,
+            Some(ConversationProjection::Slim),
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        )
+        .await;
+        assert_twenty_message_snapshot(&api, &snapshot, true);
+        assert_eq!(snapshot["messages"][19]["isStreaming"], true);
+        assert_eq!(snapshot["totalMessages"], 121);
+    }
+
+    #[tokio::test]
+    async fn twenty_message_recovery_snapshot_uses_the_same_budget() {
+        let api = TranscriptPageApi::new(true);
+        let snapshot = chat_recovery_snapshot(
+            &api,
+            &agent(),
+            Some(ConversationProjection::Slim),
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        )
+        .await
+        .unwrap();
+        assert_twenty_message_snapshot(&api, &snapshot, true);
+    }
+
+    #[tokio::test]
+    async fn twenty_message_recent_resume_keeps_suffix_and_live_turn() {
+        let api = TranscriptPageApi::new(true);
+        let snapshot = chat_snapshot(
+            &api,
+            &agent(),
+            Some("m-105"),
+            None,
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        )
+        .await;
+        let ids: Vec<_> = snapshot["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        let mut expected: Vec<_> = (106..120).map(|seq| format!("m-{seq}")).collect();
+        expected.push("msg-live".into());
+        assert_eq!(ids, expected);
+        assert_eq!(snapshot["resumed"], true);
+        assert_eq!(snapshot["nextToken"], Value::Null);
+        assert_eq!(api.limits.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn configured_snapshot_limits_bound_initial_and_recovery_with_live_cursor() {
+        for limit in [1, 5, 20, 50, 200] {
+            for busy in [false, true] {
+                for recovery in [false, true] {
+                    let api = TranscriptPageApi::new(busy);
+                    let snapshot = if recovery {
+                        chat_recovery_snapshot(
+                            &api,
+                            &agent(),
+                            Some(ConversationProjection::Slim),
+                            limit,
+                        )
+                        .await
+                        .unwrap()
+                    } else {
+                        chat_snapshot(
+                            &api,
+                            &agent(),
+                            None,
+                            Some(ConversationProjection::Slim),
+                            limit,
+                        )
+                        .await
+                    };
+                    let total = 120 + usize::from(busy);
+                    let count = limit.min(total);
+                    let rows = snapshot["messages"].as_array().unwrap();
+                    assert_eq!(rows.len(), count);
+                    assert_eq!(rows[0]["seq"], total - count);
+                    assert_eq!(
+                        rows.last().unwrap()["id"],
+                        if busy { "msg-live" } else { "m-119" }
+                    );
+                    assert_eq!(snapshot["totalMessages"], total);
+                    assert_eq!(snapshot["truncated"], count < total);
+                    if count < total {
+                        let older = intent_services::pagination::page_window(
+                            120,
+                            Some(50),
+                            snapshot["nextToken"].as_str(),
+                        );
+                        assert_eq!(older.end, total - count, "cursor includes all evicted rows");
+                    } else {
+                        assert!(snapshot["nextToken"].is_null());
+                    }
+                    assert_eq!(
+                        *api.limits.lock().unwrap(),
+                        vec![Some(i64::try_from(limit).unwrap())],
+                        "one bounded read"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_snapshot_limit_resumes_inside_the_larger_window() {
+        for (since, count, resumed) in [("m-80", 40, true), ("m-60", 50, false)] {
+            let api = TranscriptPageApi::new(true);
+            let snapshot = chat_snapshot(
+                &api,
+                &agent(),
+                Some(since),
+                Some(ConversationProjection::Slim),
+                50,
+            )
+            .await;
+            let rows = snapshot["messages"].as_array().unwrap();
+            assert_eq!(rows.len(), count);
+            assert_eq!(rows[0]["seq"], 121 - count);
+            assert_eq!(rows.last().unwrap()["id"], "msg-live");
+            assert_eq!(snapshot["resumed"], resumed);
+            assert_eq!(snapshot["nextToken"].is_null(), resumed);
+            assert_eq!(*api.limits.lock().unwrap(), vec![Some(50)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_snapshot_limit_serves_short_or_empty_transcripts() {
+        for len in [0, 3] {
+            let mut api = TranscriptPageApi::new(false);
+            api.rows.truncate(len);
+            let snapshot =
+                chat_snapshot(&api, &agent(), None, Some(ConversationProjection::Slim), 50).await;
+            assert_eq!(snapshot["messages"].as_array().unwrap().len(), len);
+            assert_eq!(snapshot["totalMessages"], len);
+            assert_eq!(snapshot["truncated"], false);
+            assert!(snapshot["nextToken"].is_null());
+            assert_eq!(*api.limits.lock().unwrap(), vec![Some(50)]);
+        }
     }
 
     /// A `WorkspaceApi` that records the `projection` each conversation read
@@ -2298,9 +3788,22 @@ mod chat_snapshot_bounded {
     async fn snapshots_forward_subscription_projection() {
         use intent_core::ConversationProjection;
         let api = ProjectionRecordingApi::new();
-        chat_snapshot(&api, &agent(), None, Some(ConversationProjection::Slim)).await;
-        chat_snapshot(&api, &agent(), None, None).await;
-        chat_recovery_snapshot(&api, &agent(), Some(ConversationProjection::Slim)).await;
+        chat_snapshot(
+            &api,
+            &agent(),
+            None,
+            Some(ConversationProjection::Slim),
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        )
+        .await;
+        chat_snapshot(&api, &agent(), None, None, CHAT_SNAPSHOT_MESSAGE_LIMIT).await;
+        chat_recovery_snapshot(
+            &api,
+            &agent(),
+            Some(ConversationProjection::Slim),
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        )
+        .await;
         assert_eq!(
             *api.seen.lock().unwrap(),
             vec![
@@ -3012,7 +4515,7 @@ mod chat_snapshot_interrupt_window {
         let api = InterruptWindowApi::new();
 
         // Phase 1 — mid-turn: the partial turn is served from the live slot.
-        let mid = chat_snapshot(&api, &agent(), None, None).await;
+        let mid = chat_snapshot(&api, &agent(), None, None, CHAT_SNAPSHOT_MESSAGE_LIMIT).await;
         assert_eq!(assistant_ids(&mid), vec!["msg-live".to_string()]);
         assert_eq!(mid["messages"][1]["isStreaming"], true);
 
@@ -3020,7 +4523,7 @@ mod chat_snapshot_interrupt_window {
         // yet written, but the pinned slot is still published, so the snapshot
         // carries the same in-flight message.
         api.set(Phase::PinnedRowNotYetPersisted);
-        let gap = chat_snapshot(&api, &agent(), None, None).await;
+        let gap = chat_snapshot(&api, &agent(), None, None, CHAT_SNAPSHOT_MESSAGE_LIMIT).await;
         assert_eq!(
             assistant_ids(&gap),
             vec!["msg-live".to_string()],
@@ -3044,7 +4547,7 @@ mod chat_snapshot_interrupt_window {
         // the slot, so the content is served ONCE, as a persisted,
         // NON-streaming row.
         api.set(Phase::Flushed);
-        let after = chat_snapshot(&api, &agent(), None, None).await;
+        let after = chat_snapshot(&api, &agent(), None, None, CHAT_SNAPSHOT_MESSAGE_LIMIT).await;
         assert_eq!(assistant_ids(&after), vec!["msg-live".to_string()]);
         assert_eq!(
             after["totalMessages"], 2,
@@ -3066,7 +4569,14 @@ mod chat_snapshot_interrupt_window {
     /// orphaned slot never claims to be streaming.
     #[tokio::test]
     async fn chat_snapshot_serves_an_orphaned_slot_as_a_non_streaming_message() {
-        let snap = chat_snapshot(&OrphanSlotApi { populated: true }, &agent(), None, None).await;
+        let snap = chat_snapshot(
+            &OrphanSlotApi { populated: true },
+            &agent(),
+            None,
+            None,
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        )
+        .await;
         assert_eq!(
             assistant_ids(&snap),
             vec!["msg-orphan".to_string()],
@@ -3092,7 +4602,14 @@ mod chat_snapshot_interrupt_window {
     /// bubble is strictly worse than nothing).
     #[tokio::test]
     async fn chat_snapshot_skips_an_empty_orphaned_slot() {
-        let snap = chat_snapshot(&OrphanSlotApi { populated: false }, &agent(), None, None).await;
+        let snap = chat_snapshot(
+            &OrphanSlotApi { populated: false },
+            &agent(),
+            None,
+            None,
+            CHAT_SNAPSHOT_MESSAGE_LIMIT,
+        )
+        .await;
         assert!(
             assistant_ids(&snap).is_empty(),
             "an empty orphan slot must not surface at all: {snap}"
@@ -3117,7 +4634,7 @@ mod chat_snapshot_interrupt_window {
             busy: std::sync::atomic::AtomicBool::new(false),
         };
 
-        let snap = chat_snapshot(&api, &agent(), None, None).await;
+        let snap = chat_snapshot(&api, &agent(), None, None, CHAT_SNAPSHOT_MESSAGE_LIMIT).await;
 
         assert_eq!(
             assistant_ids(&snap),
@@ -3143,7 +4660,7 @@ mod chat_snapshot_interrupt_window {
         };
 
         // Mid-turn: served from the slot as usual, flagged in-flight.
-        let mid = chat_snapshot(&api, &agent(), None, None).await;
+        let mid = chat_snapshot(&api, &agent(), None, None, CHAT_SNAPSHOT_MESSAGE_LIMIT).await;
         assert_eq!(assistant_ids(&mid), vec!["msg-live".to_string()]);
         assert_eq!(mid["messages"][1]["isStreaming"], true);
 
@@ -3151,7 +4668,7 @@ mod chat_snapshot_interrupt_window {
         // not in the page and never will be; the slot is the only copy.
         api.flush_failed
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let after = chat_snapshot(&api, &agent(), None, None).await;
+        let after = chat_snapshot(&api, &agent(), None, None, CHAT_SNAPSHOT_MESSAGE_LIMIT).await;
         assert_eq!(
             assistant_ids(&after),
             vec!["msg-live".to_string()],
@@ -3621,6 +5138,36 @@ mod chat_terminal_reconcile_failure {
         assert_eq!(updated[0]["streamingComplete"], true);
     }
 
+    /// The degraded best-effort terminal frame carries the `media` union the
+    /// live chunks delivered (§7.1) — in incremental mode each chunk carried
+    /// only its own entries, so the terminal must rebuild the union.
+    #[tokio::test]
+    async fn incremental_best_effort_terminal_carries_the_media_union() {
+        let api = FailingConvApi::new();
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental, None);
+        let mut first = chunk_event("msg-1", "msg-1:0", "text", &json!("![a](a.png)"));
+        first.data["media"] = json!({ "a.png": { "width": 1, "height": 2 } });
+        let mut second = chunk_event("msg-1", "msg-1:0", "text", &json!(" ![b](b.png)"));
+        second.data["media"] = json!({ "b.png": { "width": 3, "height": 4 } });
+        s.chunk_delta(&first).expect("first chunk");
+        s.chunk_delta(&second).expect("second chunk");
+        let d = s
+            .delta(&api, &end_event("msg-1"))
+            .await
+            .expect("a failed reconcile must still emit a terminal frame");
+        let updated = d["updated"].as_array().unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0]["block"]["text"], "![a](a.png) ![b](b.png)");
+        assert_eq!(
+            updated[0]["block"]["media"],
+            json!({
+                "a.png": { "width": 1, "height": 2 },
+                "b.png": { "width": 3, "height": 4 },
+            }),
+            "the degraded frame carries the media union: {d}"
+        );
+    }
+
     #[tokio::test]
     async fn a_transient_failure_recovers_on_the_retry_with_the_authoritative_frame() {
         // First read fails, the retry succeeds → the AUTHORITATIVE terminal
@@ -3694,7 +5241,8 @@ mod chat_terminal_reconcile_failure {
         #[tokio::test]
         async fn a_persistent_read_failure_returns_none_after_one_retry() {
             let api = FailingConvApi::new();
-            let snapshot = chat_recovery_snapshot(&api, &agent(), None).await;
+            let snapshot =
+                chat_recovery_snapshot(&api, &agent(), None, CHAT_SNAPSHOT_MESSAGE_LIMIT).await;
             assert!(
                 snapshot.is_none(),
                 "a persistent failure must NOT degrade to an empty page"
@@ -3709,9 +5257,10 @@ mod chat_terminal_reconcile_failure {
         #[tokio::test]
         async fn a_transient_failure_recovers_on_the_retry() {
             let api = FailingConvApi::failing_once_then(conversation());
-            let snapshot = chat_recovery_snapshot(&api, &agent(), None)
-                .await
-                .expect("the retry served the page");
+            let snapshot =
+                chat_recovery_snapshot(&api, &agent(), None, CHAT_SNAPSHOT_MESSAGE_LIMIT)
+                    .await
+                    .expect("the retry served the page");
             assert_eq!(api.calls.load(Ordering::SeqCst), 2);
             assert_eq!(
                 snapshot["messages"][0]["contentBlocks"][0]["text"], "Hello, world",
@@ -3724,9 +5273,10 @@ mod chat_terminal_reconcile_failure {
             let api = FailingConvApi::failing_once_then(conversation());
             api.calls.store(1, Ordering::SeqCst); // consume the failing call
             let before = api.calls.load(Ordering::SeqCst);
-            let snapshot = chat_recovery_snapshot(&api, &agent(), None)
-                .await
-                .expect("healthy read");
+            let snapshot =
+                chat_recovery_snapshot(&api, &agent(), None, CHAT_SNAPSHOT_MESSAGE_LIMIT)
+                    .await
+                    .expect("healthy read");
             assert_eq!(
                 api.calls.load(Ordering::SeqCst) - before,
                 1,
@@ -3865,4 +5415,783 @@ mod chat_terminal_reconcile_failure {
             assert_eq!(updated[0]["streamingComplete"], true);
         }
     }
+}
+
+/// Multiplayer w3 delivery-time membership on the channel fast-paths: the
+/// per-agent `chat` channel maps chunk/tool deltas straight from the event
+/// payload, and the global `workspace` channel emits `workspace:deleted`
+/// tombstones without a re-read — both driven through the REAL
+/// [`crate::conn::handle_sub_fast_path`] under a non-administrator caller.
+mod channel_membership {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use futures::future::BoxFuture;
+    use intent_core::events::{
+        AGENT_DELETED, AGENT_TOOL_CALL, CHAT_STREAM_DELTA, NOTE_DELETED, WORKSPACE_DELETED,
+        WORKSPACE_UPDATED,
+    };
+    use intent_core::{
+        ActorType, AgentId, Caller, Error, EventActor, PrincipalId, Workspace, WorkspaceApi,
+        WorkspaceId,
+    };
+    use intent_services::EventBus;
+    use intent_store::{NewEvent, Store};
+    use serde_json::{json, Value};
+
+    use crate::conn::{handle_sub_fast_path, outbound_channel, ConnSubs, OutboundReceiver};
+    use crate::subscriptions::classify;
+
+    /// The service layer as a collaborator sees it: `workspace.get` /
+    /// `workspace.list` answer only the `members` workspaces, and
+    /// `agent.getConversation` is the guarded read — an empty page for a
+    /// member's agent, `NotFound` otherwise (agent `agent-N` lives in
+    /// `ws-N`) — while the live-turn overlay reads (`agent_live_turn`,
+    /// `agent_is_busy`) are NOT gated, exactly as in production.
+    struct MembershipApi {
+        members: Arc<Mutex<HashSet<String>>>,
+    }
+
+    /// Marker entry in `members`: the guarded conversation read fails
+    /// transiently (a store error inside `require_agent_member`) instead of
+    /// answering, for every caller.
+    const STORE_DOWN: &str = "!store-down";
+
+    impl MembershipApi {
+        fn allowed(&self, workspace_id: &str) -> bool {
+            !crate::context::is_non_administrator_caller()
+                || self.members.lock().unwrap().contains(workspace_id)
+        }
+
+        fn store_down(&self) -> bool {
+            self.members.lock().unwrap().contains(STORE_DOWN)
+        }
+    }
+
+    fn agent_workspace(agent_id: &str) -> String {
+        agent_id.replacen("agent-", "ws-", 1)
+    }
+
+    impl WorkspaceApi for MembershipApi {
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, intent_core::Result<Workspace>> {
+            let allowed = self.allowed(id.as_str());
+            Box::pin(async move {
+                if allowed {
+                    Ok(Workspace {
+                        id,
+                        ..intent_core::chief_workspace()
+                    })
+                } else {
+                    Err(Error::NotFound(format!("workspace {id}")))
+                }
+            })
+        }
+
+        fn list_workspaces(
+            &self,
+            _include_archived: bool,
+        ) -> BoxFuture<'_, intent_core::Result<Vec<Workspace>>> {
+            let mut ids: Vec<String> = self.members.lock().unwrap().iter().cloned().collect();
+            ids.sort();
+            Box::pin(async move {
+                Ok(ids
+                    .into_iter()
+                    .map(|id| Workspace {
+                        id: WorkspaceId::from(id),
+                        ..intent_core::chief_workspace()
+                    })
+                    .collect())
+            })
+        }
+
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            _limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            _around_message_id: Option<String>,
+            _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
+        ) -> BoxFuture<'_, intent_core::Result<Value>> {
+            let store_down = self.store_down();
+            let allowed = self.allowed(&agent_workspace(agent_id.as_str()));
+            Box::pin(async move {
+                if store_down {
+                    return Err(Error::Internal("membership lookup failed".into()));
+                }
+                if !allowed {
+                    return Err(Error::NotFound(format!("agent {agent_id}")));
+                }
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [],
+                    "truncated": false,
+                    "totalMessages": 0,
+                    "nextToken": Value::Null,
+                }))
+            })
+        }
+
+        fn agent_is_busy(&self, _agent_id: AgentId) -> bool {
+            true
+        }
+
+        fn agent_live_turn(&self, _agent_id: AgentId) -> Option<Value> {
+            Some(json!({
+                "messageId": "msg-live",
+                "contentBlocks": [
+                    { "id": "msg-live:0", "type": "text", "text": "live secret" }
+                ],
+            }))
+        }
+
+        /// The guarded `agent.get` (`require_agent_member`): the agent's
+        /// workspace for a member, `NotFound` otherwise.
+        fn agent_get(
+            &self,
+            agent_id: AgentId,
+            _workspace_id: Option<WorkspaceId>,
+        ) -> BoxFuture<'_, intent_core::Result<intent_core::AgentLite>> {
+            let workspace_id = agent_workspace(agent_id.as_str());
+            let allowed = self.allowed(&workspace_id);
+            Box::pin(async move {
+                if !allowed {
+                    return Err(Error::NotFound(format!("agent {agent_id}")));
+                }
+                let now = intent_core::now_iso();
+                Ok(serde_json::from_value(json!({
+                    "id": agent_id.as_str(),
+                    "workspaceId": workspace_id,
+                    "name": agent_id.as_str(),
+                    "status": "idle",
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "messageCount": 0,
+                    "metadata": { "isBackground": false },
+                }))
+                .expect("AgentLite from its wire shape"))
+            })
+        }
+    }
+
+    fn event(
+        event_type: &str,
+        workspace_id: &str,
+        session_id: Option<&str>,
+        data: Value,
+    ) -> NewEvent {
+        NewEvent {
+            workspace_id: WorkspaceId::from(workspace_id),
+            timestamp: intent_core::now_iso(),
+            event_type: event_type.to_string(),
+            actor: EventActor {
+                actor_type: ActorType::System,
+                id: Some("system".to_string()),
+                ..Default::default()
+            },
+            session_id: session_id.map(str::to_string),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data,
+        }
+    }
+
+    fn chunk(workspace_id: &str, agent_id: &str, text: &str) -> NewEvent {
+        event(
+            CHAT_STREAM_DELTA,
+            workspace_id,
+            Some(agent_id),
+            json!({
+                "agentId": agent_id,
+                "content": text,
+                "messageId": "m-1",
+                "blockIndex": 0,
+                "blockId": "m-1:0",
+                "blockType": "text",
+            }),
+        )
+    }
+
+    fn tool_call(workspace_id: &str, agent_id: &str) -> NewEvent {
+        event(
+            AGENT_TOOL_CALL,
+            workspace_id,
+            Some(agent_id),
+            json!({
+                "agentId": agent_id,
+                "messageId": "m-1",
+                "toolCallId": "tc-1",
+                "title": "ls",
+                "status": "pending",
+            }),
+        )
+    }
+
+    fn unshare(workspace_id: &str, principal_id: &str) -> NewEvent {
+        event(
+            WORKSPACE_UPDATED,
+            workspace_id,
+            None,
+            json!({ "changes": { "members": true, "removedPrincipalId": principal_id } }),
+        )
+    }
+
+    /// Every `subscription.push` delta on the bulk lane until it stays quiet.
+    async fn deltas(rx: &mut OutboundReceiver) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(300), rx.bulk.recv()).await
+        {
+            let v: Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(v["method"], "subscription.push");
+            out.push(v["params"]["delta"].clone());
+        }
+        out
+    }
+
+    struct Harness {
+        bus: EventBus,
+        rx: OutboundReceiver,
+        subs: ConnSubs,
+        members: Arc<Mutex<HashSet<String>>>,
+        subscription_id: String,
+        snapshot: Value,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Subscribe `raw` through the real fast path under `caller`, returning
+    /// the harness after the seq-0 snapshot has been received.
+    async fn subscribe(caller: Caller, members: &[&str], raw: Value) -> Harness {
+        let dir = tempfile::Builder::new()
+            .prefix("intent-transport-channel-membership-")
+            .tempdir()
+            .unwrap();
+        let store = Store::open(&dir.path().join("bus.db")).await.unwrap();
+        let bus = EventBus::new(store);
+        let members = Arc::new(Mutex::new(
+            members
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<HashSet<_>>(),
+        ));
+        let api: Arc<dyn WorkspaceApi> = Arc::new(MembershipApi {
+            members: Arc::clone(&members),
+        });
+        let (out_tx, mut rx) = outbound_channel();
+        let mut subs = ConnSubs::default();
+        let sub = classify(&raw).expect("classifies as a fast-path subscribe");
+        let (bus_ref, out_ref, subs_ref, api_ref) = (&bus, &out_tx, &mut subs, &api);
+        let accepted = crate::context::with_request_context(true, Some(caller), async move {
+            handle_sub_fast_path(sub, api_ref, bus_ref, out_ref, subs_ref).await
+        })
+        .await;
+        assert!(accepted);
+        let reply: Value = serde_json::from_str(&rx.priority.recv().await.unwrap()).unwrap();
+        let subscription_id = reply["result"]["subscriptionId"]
+            .as_str()
+            .expect("subscription id")
+            .to_string();
+        let push: Value = serde_json::from_str(&rx.bulk.recv().await.unwrap()).unwrap();
+        assert_eq!(push["params"]["seq"], 0, "{push}");
+        Harness {
+            bus,
+            rx,
+            subs,
+            members,
+            subscription_id,
+            snapshot: push["params"]["snapshot"].clone(),
+            _dir: dir,
+        }
+    }
+
+    fn guest() -> (PrincipalId, Caller) {
+        let principal_id = PrincipalId::new();
+        let caller = Caller::Wire {
+            principal_id: principal_id.clone(),
+            host_role: intent_core::HostRole::Guest,
+        };
+        (principal_id, caller)
+    }
+
+    fn chat_subscribe(agent_id: &str) -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":"chat.subscribe","params":{"agentId":agent_id}})
+    }
+
+    /// The seq-0 snapshot's live overlay follows the guarded page read: a
+    /// member connecting mid-turn gets the in-flight message, a non-member
+    /// gets the bare empty page — no live message, no streaming flag —
+    /// even though the overlay reads themselves are not gated.
+    #[tokio::test]
+    async fn chat_seq0_live_overlay_follows_the_guarded_read() {
+        let (_, caller) = guest();
+        let member = subscribe(caller.clone(), &["ws-1"], chat_subscribe("agent-1")).await;
+        assert_eq!(member.snapshot["messages"][0]["id"], "msg-live");
+        assert_eq!(
+            member.snapshot["messages"][0]["contentBlocks"][0]["text"],
+            "live secret"
+        );
+        drop(member.subs);
+
+        let stranger = subscribe(caller, &["ws-1"], chat_subscribe("agent-2")).await;
+        assert_eq!(
+            stranger.snapshot["messages"],
+            json!([]),
+            "{}",
+            stranger.snapshot
+        );
+        assert_eq!(stranger.snapshot["totalMessages"], 0);
+        assert!(
+            stranger.snapshot.get("isStreaming").is_none(),
+            "{}",
+            stranger.snapshot
+        );
+        drop(stranger.subs);
+    }
+
+    /// A transient failure of the guarded read has verified nothing: a
+    /// collaborator's seq-0 page then carries no live overlay, while the
+    /// administrator keeps the degrade-with-overlay contract.
+    #[tokio::test]
+    async fn chat_seq0_transient_guard_failure_skips_overlay_for_a_collaborator() {
+        let (_, caller) = guest();
+        let member = subscribe(caller, &["ws-1", STORE_DOWN], chat_subscribe("agent-1")).await;
+        assert_eq!(
+            member.snapshot["messages"],
+            json!([]),
+            "{}",
+            member.snapshot
+        );
+        assert!(
+            member.snapshot.get("isStreaming").is_none(),
+            "{}",
+            member.snapshot
+        );
+        drop(member.subs);
+
+        let owner = Caller::Wire {
+            principal_id: PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        };
+        let admin = subscribe(owner, &[STORE_DOWN], chat_subscribe("agent-1")).await;
+        assert_eq!(
+            admin.snapshot["messages"][0]["id"], "msg-live",
+            "{}",
+            admin.snapshot
+        );
+        drop(admin.subs);
+    }
+
+    /// A non-member's `chat.subscribe` to a private workspace's agent gets
+    /// the empty guarded snapshot and then NO live chunk or tool deltas.
+    #[tokio::test]
+    async fn chat_live_deltas_are_refused_to_a_non_member() {
+        let (_, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1"], chat_subscribe("agent-2")).await;
+        assert_eq!(h.snapshot["messages"], json!([]));
+        h.bus
+            .publish(&chunk("ws-2", "agent-2", "secret"))
+            .await
+            .unwrap();
+        h.bus.publish(&tool_call("ws-2", "agent-2")).await.unwrap();
+        assert!(deltas(&mut h.rx).await.is_empty(), "no live delta leaks");
+        drop(h.subs);
+    }
+
+    /// A member receives the live stream; its own removal from the agent's
+    /// workspace ends delivery AND exits the forwarder, while another
+    /// member's removal leaves the stream live.
+    #[tokio::test]
+    async fn chat_member_stream_is_torn_down_on_own_removal() {
+        let (principal_id, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1"], chat_subscribe("agent-1")).await;
+        h.bus
+            .publish(&chunk("ws-1", "agent-1", "Hel"))
+            .await
+            .unwrap();
+        let first = deltas(&mut h.rx).await;
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(first[0]["added"][0]["block"]["text"], "Hel", "{first:?}");
+
+        // Someone else's unshare of ws-1: still a member, still live.
+        h.bus
+            .publish(&unshare("ws-1", "someone-else"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.bus
+            .publish(&chunk("ws-1", "agent-1", "lo"))
+            .await
+            .unwrap();
+        assert_eq!(deltas(&mut h.rx).await.len(), 1);
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+
+        // Own removal: the service layer drops the row and publishes the
+        // unshare marker; the forwarder exits and nothing follows.
+        h.members.lock().unwrap().remove("ws-1");
+        h.bus
+            .publish(&unshare("ws-1", principal_id.as_str()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.bus.publish(&chunk("ws-1", "agent-1", "!")).await.unwrap();
+        h.bus.publish(&tool_call("ws-1", "agent-1")).await.unwrap();
+        assert!(
+            deltas(&mut h.rx).await.is_empty(),
+            "no delivery after removal"
+        );
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(true));
+        drop(h.subs);
+    }
+
+    /// The agent's workspace is resolved at subscribe time (guarded
+    /// `agent.get`), so a member removed BEFORE the agent's first stream
+    /// event is still torn down instead of lingering until a chunk names
+    /// the workspace.
+    #[tokio::test]
+    async fn chat_member_removed_before_first_event_is_torn_down() {
+        let (principal_id, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1"], chat_subscribe("agent-1")).await;
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+
+        h.members.lock().unwrap().remove("ws-1");
+        h.bus
+            .publish(&unshare("ws-1", principal_id.as_str()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(true));
+
+        h.bus.publish(&chunk("ws-1", "agent-1", "!")).await.unwrap();
+        assert!(
+            deltas(&mut h.rx).await.is_empty(),
+            "no delivery after removal"
+        );
+        drop(h.subs);
+    }
+
+    /// An administrator's chat stream is untouched by membership events.
+    #[tokio::test]
+    async fn chat_administrator_stream_ignores_membership() {
+        let principal_id = PrincipalId::new();
+        let owner = Caller::Wire {
+            principal_id: principal_id.clone(),
+            host_role: intent_core::HostRole::Owner,
+        };
+        let mut h = subscribe(owner, &[], chat_subscribe("agent-2")).await;
+        h.bus
+            .publish(&unshare("ws-2", principal_id.as_str()))
+            .await
+            .unwrap();
+        h.bus
+            .publish(&chunk("ws-2", "agent-2", "Hi"))
+            .await
+            .unwrap();
+        assert_eq!(deltas(&mut h.rx).await.len(), 1);
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+        drop(h.subs);
+    }
+
+    fn workspace_subscribe() -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":"workspace.subscribe","params":{}})
+    }
+
+    /// The global `workspace` channel under a guest: a `workspace:deleted`
+    /// tombstone is emitted only for a workspace the guest was shown (its
+    /// snapshot / an `updated` delta); a private workspace's deletion is
+    /// silent, and after the guest's own unshare so is that workspace's.
+    #[tokio::test]
+    async fn workspace_deleted_tombstones_are_scoped_to_visible_workspaces() {
+        let (principal_id, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1", "ws-3"], workspace_subscribe()).await;
+        let ids: Vec<&str> = h
+            .snapshot
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["ws-1", "ws-3"]);
+
+        // Private ws-2 deleted: nothing. Member ws-1 deleted: tombstone.
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-2",
+                None,
+                json!({ "workspaceId": "ws-2" }),
+            ))
+            .await
+            .unwrap();
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-1",
+                None,
+                json!({ "workspaceId": "ws-1" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["ws-1"] })]
+        );
+
+        // Own unshare of ws-3 is the final `removedIds`; its later deletion
+        // is silent.
+        h.members.lock().unwrap().remove("ws-3");
+        h.bus
+            .publish(&unshare("ws-3", principal_id.as_str()))
+            .await
+            .unwrap();
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-3",
+                None,
+                json!({ "workspaceId": "ws-3" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["ws-3"] })]
+        );
+        drop(h.subs);
+    }
+
+    /// A workspace the guest is added to after subscribing becomes visible
+    /// through its `updated` delta, so its later deletion IS tombstoned.
+    #[tokio::test]
+    async fn workspace_added_after_subscribe_is_tombstoned_on_delete() {
+        let (_, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1"], workspace_subscribe()).await;
+        h.members.lock().unwrap().insert("ws-2".to_string());
+        h.bus
+            .publish(&event(
+                WORKSPACE_UPDATED,
+                "ws-2",
+                None,
+                json!({ "workspaceId": "ws-2", "changes": { "members": true } }),
+            ))
+            .await
+            .unwrap();
+        let added = deltas(&mut h.rx).await;
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert_eq!(added[0]["updated"][0]["id"], "ws-2");
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-2",
+                None,
+                json!({ "workspaceId": "ws-2" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["ws-2"] })]
+        );
+        drop(h.subs);
+    }
+
+    fn channel_subscribe(method: &str, workspace_id: &str) -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":method,"params":{"workspaceId":workspace_id}})
+    }
+
+    fn note_deleted(workspace_id: &str, note_id: &str) -> NewEvent {
+        event(
+            NOTE_DELETED,
+            workspace_id,
+            None,
+            json!({ "workspaceId": workspace_id, "noteId": note_id }),
+        )
+    }
+
+    /// The workspace-scoped collection channels map `removedIds` from the
+    /// event alone, so a non-member's `note.subscribe` to a private
+    /// workspace must not receive its `note:deleted` tombstones.
+    #[tokio::test]
+    async fn note_deleted_tombstone_is_refused_to_a_non_member() {
+        let (_, caller) = guest();
+        let mut h = subscribe(
+            caller,
+            &["ws-1"],
+            channel_subscribe("note.subscribe", "ws-2"),
+        )
+        .await;
+        assert_eq!(h.snapshot, json!([]));
+        h.bus
+            .publish(&note_deleted("ws-2", "n-private"))
+            .await
+            .unwrap();
+        assert!(deltas(&mut h.rx).await.is_empty(), "no tombstone leaks");
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+        drop(h.subs);
+    }
+
+    /// A member's note channel tombstones deletions until its own removal
+    /// from the workspace, which ends the forwarder; another member's
+    /// removal leaves it live.
+    #[tokio::test]
+    async fn note_member_channel_ends_on_own_removal() {
+        let (principal_id, caller) = guest();
+        let mut h = subscribe(
+            caller,
+            &["ws-1"],
+            channel_subscribe("note.subscribe", "ws-1"),
+        )
+        .await;
+        h.bus.publish(&note_deleted("ws-1", "n-1")).await.unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["n-1"] })]
+        );
+
+        h.bus
+            .publish(&unshare("ws-1", "someone-else"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.bus.publish(&note_deleted("ws-1", "n-2")).await.unwrap();
+        assert_eq!(deltas(&mut h.rx).await.len(), 1);
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(false));
+
+        h.members.lock().unwrap().remove("ws-1");
+        h.bus
+            .publish(&unshare("ws-1", principal_id.as_str()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.bus.publish(&note_deleted("ws-1", "n-3")).await.unwrap();
+        assert!(deltas(&mut h.rx).await.is_empty(), "nothing after removal");
+        assert_eq!(h.subs.forwarder_finished(&h.subscription_id), Some(true));
+        drop(h.subs);
+    }
+
+    /// The generic TB-5 forwarder (`agent` channel here) takes the same
+    /// boundary: a private workspace's `agent:deleted` is silent for a
+    /// non-member and tombstoned for a member.
+    #[tokio::test]
+    async fn agent_deleted_tombstone_is_scoped_to_members() {
+        let (_, caller) = guest();
+        let deleted = |ws: &str, agent: &str| {
+            event(
+                AGENT_DELETED,
+                ws,
+                Some(agent),
+                json!({ "workspaceId": ws, "agentId": agent }),
+            )
+        };
+
+        let mut stranger = subscribe(
+            caller.clone(),
+            &["ws-1"],
+            channel_subscribe("agent.subscribe", "ws-2"),
+        )
+        .await;
+        stranger
+            .bus
+            .publish(&deleted("ws-2", "agent-2"))
+            .await
+            .unwrap();
+        assert!(
+            deltas(&mut stranger.rx).await.is_empty(),
+            "no tombstone leaks"
+        );
+        drop(stranger.subs);
+
+        let mut member = subscribe(
+            caller,
+            &["ws-1"],
+            channel_subscribe("agent.subscribe", "ws-1"),
+        )
+        .await;
+        member
+            .bus
+            .publish(&deleted("ws-1", "agent-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut member.rx).await,
+            vec![json!({ "removedIds": ["agent-1"] })]
+        );
+        drop(member.subs);
+    }
+
+    /// The administrator's global channel still tombstones every deletion.
+    #[tokio::test]
+    async fn workspace_administrator_receives_every_tombstone() {
+        let owner = Caller::Wire {
+            principal_id: PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        };
+        let mut h = subscribe(owner, &["ws-1"], workspace_subscribe()).await;
+        h.bus
+            .publish(&event(
+                WORKSPACE_DELETED,
+                "ws-9",
+                None,
+                json!({ "workspaceId": "ws-9" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            deltas(&mut h.rx).await,
+            vec![json!({ "removedIds": ["ws-9"] })]
+        );
+        drop(h.subs);
+    }
+}
+
+#[test]
+fn resource_context_keeps_unsubscribe_dispatch_and_chat_selectors() {
+    use serde_json::json;
+    for method in [
+        "events.unsubscribe",
+        "note.unsubscribe",
+        "task.unsubscribe",
+        "comment.unsubscribe",
+        "chat.unsubscribe",
+        "note.presence.unsubscribe",
+    ] {
+        for workspace in [None, Some("routing-context")] {
+            let mut params = json!({"subscriptionId":"owned-subscription"});
+            if let Some(ws) = workspace {
+                params["workspaceId"] = json!(ws);
+            }
+            let frame = json!({"jsonrpc":"2.0","id":7,"method":method,"params":params});
+            if method == "events.unsubscribe" {
+                assert!(matches!(
+                    crate::events::classify(&frame),
+                    Some(crate::events::FastPath::Unsubscribe { .. })
+                ));
+            } else {
+                assert!(matches!(
+                    classify(&frame),
+                    Some(SubFastPath::Unsubscribe { .. })
+                ));
+            }
+            assert_eq!(
+                crate::events::parse_unsubscribe_id(params.as_object().unwrap()).unwrap(),
+                "owned-subscription"
+            );
+        }
+    }
+    let legacy = json!({"jsonrpc":"2.0","id":1,"method":"agent.unsubscribe","params":{"subscriptionId":"s","workspaceId":"w"}});
+    assert!(classify(&legacy).is_none());
+    assert!(crate::events::classify(&legacy).is_none());
+    let params = json!({"agentId":"a","sinceMessageId":"cursor","deltaEncoding":"incremental","projection":"slim","replaceGroup":"chat"});
+    let plain = parse_chat_subscribe_params(params.as_object().unwrap()).unwrap();
+    let mut routed = params;
+    routed["workspaceId"] = json!("routing-context");
+    let routed = parse_chat_subscribe_params(routed.as_object().unwrap()).unwrap();
+    assert_eq!(plain.agent_id, routed.agent_id);
+    assert_eq!(plain.since_message_id, routed.since_message_id);
+    assert_eq!(plain.delta_encoding, routed.delta_encoding);
+    assert_eq!(plain.projection, routed.projection);
+    assert_eq!(plain.replace_group, routed.replace_group);
 }

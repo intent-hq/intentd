@@ -13,18 +13,24 @@
 //!    on failure fall back to `state.current_version`; nothing installed AND
 //!    check failed → exit non-zero with a clear message
 //! 2. spawn `versions/<current>/intentd` with all forwarded args verbatim,
-//!    inheriting stdio and environment. The sitter's one injection:
-//!    respawning a version different from the one that just ran in this
-//!    sitter's lifetime sets [`UPDATE_RESTART_ENV`]`=1` on the child, so
-//!    the daemon can tell an update-triggered restart apart from a first
-//!    spawn, a crash respawn, or a same-version SIGHUP restart (none of
-//!    which set it)
+//!    inheriting stdio and environment. The sitter injects two env
+//!    variables: respawning a version different from the one that just ran
+//!    in this sitter's lifetime sets [`UPDATE_RESTART_ENV`]`=1` on the
+//!    child, so the daemon can tell an update-triggered restart apart from
+//!    a first spawn, a crash respawn, or a same-version SIGHUP restart (none
+//!    of which set it); and serve mode on unix sets [`IDLE_RESTART_ENV`]`=1`
+//!    to advertise the idle-restart handshake (item 10), clearing it on
+//!    one-shot spawns and elsewhere
 //! 3. after every check, pick the next check uniformly at random in
 //!    [`SupervisorConfig::check_min`], [`SupervisorConfig::check_max`]) and
 //!    persist it to `state.json`
 //! 4. update found mid-run: download/verify/install first, then stop the
 //!    child gracefully (SIGTERM + kill timeout on unix; terminate on
-//!    windows) and respawn the new version with the same args
+//!    windows) and respawn the new version with the same args. A version
+//!    that is already installed and named by `state.json` but is not the
+//!    one running — staged by a SIGUSR2 check (item 10) the daemon has not
+//!    yet restarted into, or by a concurrent updater — counts as an update
+//!    found: the periodic check forces the same graceful stop + respawn
 //! 5. unexpected child exit (non-zero or signal) → respawn the same version
 //!    with exponential backoff — but not forever:
 //!    [`SupervisorConfig::give_up_after_failures`] consecutive failed
@@ -73,6 +79,27 @@
 //!    failed check, which is logged and non-fatal) leaves the daemon
 //!    running. A SIGUSR1 during a crash-backoff sleep cuts the wait
 //!    short, checks, and respawns
+//! 10. SIGUSR2 (unix only) is the idle-mode variant of item 9: the same
+//!     immediate check, but when a different version installs (or is found
+//!     staged) the child is not stopped — it is sent SIGUSR2 ("staged; exit
+//!     when idle") and supervision continues. The daemon exits with
+//!     [`RESTART_FOR_UPDATE_EXIT_CODE`] once idle; that exit is neither a
+//!     crash nor a clean exit: the sitter re-resolves the version from
+//!     `state.json`, resets the backoff and failure counter, and respawns
+//!     immediately (setting [`UPDATE_RESTART_ENV`] when the version
+//!     differs) — the SIGHUP path without the stop. Serve mode advertises
+//!     the handshake by setting [`IDLE_RESTART_ENV`]`=1` on the child; the
+//!     daemon only sends SIGUSR2 to a sitter that did. The daemon sends one
+//!     once no agent turn has been in flight for `updates.idleGraceSeconds`
+//!     (default 120 s), at most every `updates.idleCheckIntervalMinutes`
+//!     (default 60), so an idle daemon picks up a publish within about that
+//!     interval instead of waiting for item 3's 12–24 h schedule — which
+//!     stays the forced fallback: a daemon that never gets idle is caught by
+//!     item 4 at the next periodic check, busy or not. Setting
+//!     `updates.checkOnIdle=false` on the daemon stops the requests (live,
+//!     no restart) and leaves only the periodic path. A SIGUSR1 arriving
+//!     while the idle-mode check is in flight escalates it to item 9's
+//!     immediate restart; a SIGUSR2 never downgrades a SIGUSR1 check
 //!
 //! When the startup channel came from `config.toml` or the stable default
 //! (not the `--sitter-channel` flag or `INTENTD_CHANNEL` env), every update
@@ -114,6 +141,23 @@ pub const MANIFEST_BASE_URL_ENV: &str = "INTENTD_SITTER_MANIFEST_BASE_URL";
 /// The daemon reads it to force the startup interrupted-agent resume
 /// sweep after updates.
 pub const UPDATE_RESTART_ENV: &str = "INTENTD_UPDATE_RESTART";
+
+/// Set to `1` in a supervised (`serve`) child's environment on unix to
+/// advertise the idle-mode restart handshake: the daemon may send the sitter
+/// SIGUSR2 to stage an update, and will itself receive SIGUSR2 once a
+/// different version is staged, to exit with
+/// [`RESTART_FOR_UPDATE_EXIT_CODE`] when idle. Cleared on one-shot spawns
+/// and off unix.
+pub const IDLE_RESTART_ENV: &str = "INTENTD_SITTER_IDLE_RESTART";
+/// Signals that installer mutations are serialized with the daemon's exact updater.
+pub const EXACT_UPDATE_ENV: &str = "INTENTD_SITTER_EXACT_UPDATE";
+
+/// Exit code by which a supervised daemon asks to be respawned on the
+/// `state.json` version (its answer to SIGUSR2 once idle). Outside 0/1/2
+/// and the `128 + signal` range; mirrored in intentd. Neither a crash (no
+/// backoff, no failed-start re-check) nor a clean exit (the sitter keeps
+/// running).
+pub const RESTART_FOR_UPDATE_EXIT_CODE: i32 = 75;
 
 /// Test-only env overrides (integer milliseconds) for the timing knobs in
 /// [`SupervisorConfig`], so integration tests run at millisecond scale.
@@ -252,46 +296,60 @@ pub fn read_live_pid(path: &Path) -> Option<nix::unistd::Pid> {
     nix::sys::signal::kill(pid, None).is_ok().then_some(pid)
 }
 
-/// Pidfile guard: writes the sitter's own pid on creation and removes the
-/// file on drop — but only when it still holds this process's pid, so a
-/// later serve sitter's entry (last writer wins) is never deleted by an
-/// earlier one exiting. Serve mode only. On unix `intentd restart` reads it
-/// to find the supervising sitter; on Windows `install.ps1` reads it as the
-/// ownership witness tying the running daemon's process tree to the data
-/// dir being re-installed over.
+/// Exclusive serve ownership, held until after the PID record is removed.
+/// The separate lock file is never unlinked: removing a locked inode would
+/// let another process lock a replacement while the original is still held.
+/// On Unix the PID probe also protects older sitters that do not take the lock.
 struct PidFile {
     path: std::path::PathBuf,
+    #[cfg(unix)]
+    _lock: nix::fcntl::Flock<std::fs::File>,
+    #[cfg(not(unix))]
+    _lock: std::fs::File,
 }
 
 impl PidFile {
-    fn create(path: &Path) -> Option<Self> {
+    fn create(path: &Path) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
-        // Liveness probing is unix-only (`kill(pid, 0)` via nix); windows
-        // just overwrites — last writer wins either way.
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // An exclusive handle is the Windows lifetime ownership lock.
+            options.share_mode(0);
+        }
+        let lock = options.open(path.with_extension("lock"))?;
         #[cfg(unix)]
-        if let Some(pid) = read_live_pid(path) {
-            eprintln!(
-                "intentd-sitter: pidfile {} already names live pid {pid}; another \
-                 serve sitter appears to be running (overwriting — `intentd restart` \
-                 will target this sitter)",
-                path.display()
-            );
-        }
-        match std::fs::write(path, format!("{}\n", std::process::id())) {
-            Ok(()) => Some(Self {
-                path: path.to_path_buf(),
-            }),
-            Err(e) => {
-                eprintln!(
-                    "intentd-sitter: failed to write pidfile {}: {e} \
-                     (`intentd restart` will not find this sitter)",
-                    path.display()
-                );
-                None
+        let lock = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, error)| io::Error::from(error))?;
+        #[cfg(unix)]
+        {
+            let contents = match std::fs::read_to_string(path) {
+                Ok(contents) => contents,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(e),
+            };
+            if let Some(pid) = contents.trim().parse::<i32>().ok().filter(|pid| *pid > 0) {
+                // Only ESRCH proves the old owner is gone. In particular EPERM
+                // must not let a duplicate overwrite another user's live record.
+                if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                    != Err(nix::errno::Errno::ESRCH)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("another serve sitter owns {} (pid {pid})", path.display()),
+                    ));
+                }
             }
         }
+        std::fs::write(path, format!("{}\n", std::process::id()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            _lock: lock,
+        })
     }
 }
 
@@ -380,9 +438,54 @@ impl Supervisor {
         // version exactly once and their exit status passes through.
         let supervised = self.passthrough.first().is_some_and(|arg| arg == "serve");
 
+        let mut signals = match Signals::new() {
+            Ok(signals) => signals,
+            Err(e) => {
+                eprintln!("intentd-sitter: failed to install signal handlers: {e}");
+                return 1;
+            }
+        };
+        // Claim ownership before any startup update can mutate shared state.
+        // Publish only after handlers exist, so discovery cannot expose a
+        // sitter that would die to SIGHUP. Failure must not spawn a child.
+        let _pidfile = if supervised {
+            match PidFile::create(&self.paths.pid_path) {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    eprintln!("intentd-sitter: cannot claim serve ownership: {e}");
+                    return 1;
+                }
+            }
+        } else {
+            None
+        };
+
         let (mut current_version, mut next_check_at) = if supervised {
             // Startup check: always runs, regardless of the persisted schedule.
-            let startup = self.check().await;
+            // Signal handlers are already installed for PID discovery. Keep
+            // consuming them while network I/O is in flight, so service stop
+            // never waits for a manifest/download timeout or spawns a child.
+            let check = self.check();
+            tokio::pin!(check);
+            #[cfg_attr(
+                not(unix),
+                expect(clippy::never_loop, reason = "only the shutdown arm exists off unix")
+            )]
+            let startup = loop {
+                tokio::select! {
+                    biased;
+                    event = signals.recv() => match event {
+                        SignalEvent::Shutdown(signal) => return 128 + signal,
+                        // No child exists yet; startup already checks for an
+                        // update and will spawn the selected version once.
+                        #[cfg(unix)]
+                        SignalEvent::Restart | SignalEvent::CheckNow | SignalEvent::CheckNowIdle => {
+                            eprintln!("intentd-sitter: {} received; startup check is already running", event.name());
+                        }
+                    },
+                    outcome = &mut check => break outcome,
+                }
+            };
             let next_check_at = self.schedule_next_check();
             let version = match startup {
                 Ok(UpdateOutcome::Installed { version, previous }) => {
@@ -448,24 +551,6 @@ impl Supervisor {
             (version, Instant::now())
         };
 
-        let mut signals = match Signals::new() {
-            Ok(signals) => signals,
-            Err(e) => {
-                eprintln!("intentd-sitter: failed to install signal handlers: {e}");
-                return 1;
-            }
-        };
-        // `intentd restart` finds the serve sitter through this pidfile
-        // (and on Windows install.ps1 reads it as the ownership witness);
-        // written only after the signal handlers are installed so a reader
-        // can never SIGHUP a sitter that would still die to it. Removed on
-        // drop (any return path); a hard kill leaves a stale file, which
-        // readers detect via a liveness probe.
-        let _pidfile = if supervised {
-            PidFile::create(&self.paths.pid_path)
-        } else {
-            None
-        };
         let mut backoff = self.config.backoff_initial;
         // Failed starts since the last one that stayed up (see
         // `give_up_after_failures`); reset wherever the backoff resets.
@@ -496,6 +581,16 @@ impl Supervisor {
                 // launched with the marker set, a first spawn, crash
                 // respawn, or same-version restart must not carry it.
                 command.env_remove(UPDATE_RESTART_ENV);
+            }
+            // Advertise the SIGUSR2 idle-restart handshake only where the
+            // sitter honors it: a supervised child on unix. Clear it
+            // elsewhere so a one-shot never inherits a stale marker.
+            if cfg!(unix) && supervised {
+                command.env(IDLE_RESTART_ENV, "1");
+                command.env(EXACT_UPDATE_ENV, "1");
+            } else {
+                command.env_remove(IDLE_RESTART_ENV);
+                command.env_remove(EXACT_UPDATE_ENV);
             }
             let mut child = match command.spawn() {
                 Ok(child) => child,
@@ -555,14 +650,21 @@ impl Supervisor {
                         #[cfg(unix)]
                         BackoffOutcome::CheckNowRequested => {
                             match self
-                                .check_now(&current_version, &mut signals, &mut next_check_at)
+                                .check_now(
+                                    &current_version,
+                                    RestartStyle::Now,
+                                    &mut signals,
+                                    &mut next_check_at,
+                                )
                                 .await
                             {
                                 CheckNowOutcome::Shutdown(signal) => return 128 + signal,
                                 CheckNowOutcome::RestartRequested => {
                                     self.refresh_version_from_state(&mut current_version);
                                 }
-                                CheckNowOutcome::Respawn(version) => current_version = version,
+                                CheckNowOutcome::Respawn { version, .. } => {
+                                    current_version = version;
+                                }
                                 CheckNowOutcome::Unchanged => {}
                             }
                             backoff = self.config.backoff_initial;
@@ -592,6 +694,19 @@ impl Supervisor {
                         let what = match status {
                             Ok(status) if status.success() => return 0,
                             Ok(status) if !supervised => return exit_code(status),
+                            // The daemon's answer to SIGUSR2 (idle now):
+                            // respawn on the state.json version at once —
+                            // the SIGHUP path without the stop. Not a
+                            // failure: no backoff, no re-check, no counter.
+                            Ok(status) if is_restart_for_update(status) => {
+                                eprintln!(
+                                    "intentd-sitter: intentd {current_version} exited to restart for a staged update; respawning"
+                                );
+                                self.refresh_version_from_state(&mut current_version);
+                                backoff = self.config.backoff_initial;
+                                failures = 0;
+                                break; // respawn (possibly a new version)
+                            }
                             Ok(status) => format!(
                                 "intentd {current_version} exited unexpectedly ({})",
                                 describe_exit(status)
@@ -655,14 +770,14 @@ impl Supervisor {
                             #[cfg(unix)]
                             BackoffOutcome::CheckNowRequested => {
                                 match self
-                                    .check_now(&current_version, &mut signals, &mut next_check_at)
+                                    .check_now(&current_version, RestartStyle::Now, &mut signals, &mut next_check_at)
                                     .await
                                 {
                                     CheckNowOutcome::Shutdown(signal) => return 128 + signal,
                                     CheckNowOutcome::RestartRequested => {
                                         self.refresh_version_from_state(&mut current_version);
                                     }
-                                    CheckNowOutcome::Respawn(version) => current_version = version,
+                                    CheckNowOutcome::Respawn { version, .. } => current_version = version,
                                     CheckNowOutcome::Unchanged => {}
                                 }
                                 backoff = self.config.backoff_initial;
@@ -686,6 +801,25 @@ impl Supervisor {
                                 failures = 0;
                                 break; // respawn the new version
                             }
+                            // "Already current" relative to the manifest,
+                            // but not the version running: a staged install
+                            // (SIGUSR2 the daemon never answered, or a
+                            // concurrent updater). Force the restart the
+                            // idle handshake did not deliver.
+                            Ok(UpdateOutcome::AlreadyCurrent { version })
+                                if version != current_version
+                                    && self.paths.daemon_binary(&version).exists() =>
+                            {
+                                eprintln!(
+                                    "intentd-sitter: found staged intentd {version} (was {current_version}); restarting daemon"
+                                );
+                                next_check_at = self.schedule_next_check();
+                                self.graceful_stop(&mut child).await;
+                                current_version = version;
+                                backoff = self.config.backoff_initial;
+                                failures = 0;
+                                break; // respawn the staged version
+                            }
                             Ok(UpdateOutcome::AlreadyCurrent { .. }) => {}
                             Err(e) => eprintln!(
                                 "intentd-sitter: update check failed: {e}; will retry at the next scheduled check"
@@ -694,6 +828,7 @@ impl Supervisor {
                         next_check_at = self.schedule_next_check();
                     }
                     event = signals.recv() => {
+                        #[cfg_attr(not(unix), expect(clippy::infallible_destructuring_match, reason = "only the shutdown arm exists off unix"))]
                         let signal = match event {
                             // `intentd restart` (SIGHUP): stop the child
                             // gracefully and respawn it on the current
@@ -731,10 +866,10 @@ impl Supervisor {
                                 }
                                 eprintln!("intentd-sitter: SIGUSR1 received; checking for updates now");
                                 match self
-                                    .check_now(&current_version, &mut signals, &mut next_check_at)
+                                    .check_now(&current_version, RestartStyle::Now, &mut signals, &mut next_check_at)
                                     .await
                                 {
-                                    CheckNowOutcome::Respawn(version) => {
+                                    CheckNowOutcome::Respawn { version, .. } => {
                                         self.graceful_stop(&mut child).await;
                                         current_version = version;
                                         backoff = self.config.backoff_initial;
@@ -752,6 +887,47 @@ impl Supervisor {
                                     // Fall through to the shutdown handling
                                     // below, exactly as if the signal had
                                     // arrived outside the check.
+                                    CheckNowOutcome::Shutdown(signal) => signal,
+                                }
+                            }
+                            // `kill -USR2` (update when idle): the same
+                            // check, but a staged version is handed to the
+                            // daemon as SIGUSR2 instead of a SIGTERM; it
+                            // exits with RESTART_FOR_UPDATE_EXIT_CODE once
+                            // idle and the wait arm respawns it. The child
+                            // keeps running here whatever the check found —
+                            // unless a SIGUSR1 arrived mid-check and
+                            // escalated the restart to "now".
+                            #[cfg(unix)]
+                            SignalEvent::CheckNowIdle => {
+                                if !supervised {
+                                    eprintln!("intentd-sitter: ignoring SIGUSR2 (one-shot invocation)");
+                                    continue;
+                                }
+                                eprintln!("intentd-sitter: SIGUSR2 received; checking for updates now (restart when idle)");
+                                match self
+                                    .check_now(&current_version, RestartStyle::WhenIdle, &mut signals, &mut next_check_at)
+                                    .await
+                                {
+                                    CheckNowOutcome::Respawn { style: RestartStyle::WhenIdle, .. } => {
+                                        forward_signal(&child, nix::sys::signal::Signal::SIGUSR2 as i32);
+                                        continue; // keep supervising until it exits
+                                    }
+                                    CheckNowOutcome::Respawn { version, style: RestartStyle::Now } => {
+                                        self.graceful_stop(&mut child).await;
+                                        current_version = version;
+                                        backoff = self.config.backoff_initial;
+                                        failures = 0;
+                                        break; // respawn the new version
+                                    }
+                                    CheckNowOutcome::Unchanged => continue, // daemon untouched
+                                    CheckNowOutcome::RestartRequested => {
+                                        self.graceful_stop(&mut child).await;
+                                        self.refresh_version_from_state(&mut current_version);
+                                        backoff = self.config.backoff_initial;
+                                        failures = 0;
+                                        break; // respawn (possibly a new version)
+                                    }
                                     CheckNowOutcome::Shutdown(signal) => signal,
                                 }
                             }
@@ -796,6 +972,10 @@ impl Supervisor {
     fn schedule_next_check(&self) -> Instant {
         let delay = next_check_delay(self.config.check_min, self.config.check_max, random_u64());
         let now = OffsetDateTime::now_utc();
+        let Ok(_lock) = state::lock(&self.paths.state_path) else {
+            eprintln!("intentd-sitter: failed to lock update state; not persisting schedule");
+            return Instant::now() + delay;
+        };
         let mut state = state::load(&self.paths.state_path);
         state.last_check_at = Some(now);
         state.next_check_at = Some(now + delay);
@@ -805,10 +985,10 @@ impl Supervisor {
         Instant::now() + delay
     }
 
-    /// Re-resolve the version to respawn from `state.json` (the SIGHUP
-    /// semantics): picks up whatever `sitter channel --redownload`
-    /// force-installed, keeping the current version when `state.json`
-    /// names nothing installed.
+    /// Re-resolve the version to respawn from `state.json` (the SIGHUP and
+    /// restart-for-update semantics): picks up whatever `sitter channel
+    /// --redownload` force-installed or a SIGUSR2 check staged, keeping the
+    /// current version when `state.json` names nothing installed.
     fn refresh_version_from_state(&self, current_version: &mut String) {
         let state = state::load(&self.paths.state_path);
         match state
@@ -847,6 +1027,10 @@ impl Supervisor {
     ) -> FailedStartCheck {
         let check = self.check();
         tokio::pin!(check);
+        #[cfg_attr(
+            not(unix),
+            expect(clippy::never_loop, reason = "only the shutdown arm exists off unix")
+        )]
         let outcome = loop {
             tokio::select! {
                 outcome = &mut check => break outcome,
@@ -860,11 +1044,13 @@ impl Supervisor {
                         return FailedStartCheck::RestartRequested;
                     }
                     // A check is already in flight, which is exactly what
-                    // SIGUSR1 asks for: let it finish.
+                    // SIGUSR1/SIGUSR2 ask for: let it finish (there is no
+                    // running child to hand a staged version to anyway).
                     #[cfg(unix)]
-                    SignalEvent::CheckNow => {
+                    SignalEvent::CheckNow | SignalEvent::CheckNowIdle => {
                         eprintln!(
-                            "intentd-sitter: SIGUSR1 received; an update check is already running"
+                            "intentd-sitter: {} received; an update check is already running",
+                            event.name()
                         );
                     }
                 },
@@ -901,9 +1087,14 @@ impl Supervisor {
         }
     }
 
-    /// The SIGUSR1 ("update now") check: one immediate on-demand check on
-    /// top of the periodic schedule (which it re-arms, persisting
-    /// `state.json` exactly like a periodic check). Selects on
+    /// The SIGUSR1 ("update now") / SIGUSR2 ("update when idle") check: one
+    /// immediate on-demand check on top of the periodic schedule (which it
+    /// re-arms, persisting `state.json` exactly like a periodic check).
+    /// `style` is how a found version is to be taken: the caller performs
+    /// the stop or the SIGUSR2 hand-off per the style the outcome carries.
+    /// A SIGUSR1 arriving while an idle-mode check is in flight escalates
+    /// it to [`RestartStyle::Now`] (SIGUSR1's "update now" always wins); a
+    /// SIGUSR2 never downgrades an immediate check. Selects on
     /// `signals.recv()` while the check runs (like
     /// [`Supervisor::check_after_failed_start`]) so a stalled update
     /// endpoint — the updater's download timeout is minutes long — can never
@@ -914,6 +1105,7 @@ impl Supervisor {
     async fn check_now(
         &self,
         current_version: &str,
+        mut style: RestartStyle,
         signals: &mut Signals,
         next_check_at: &mut Instant,
     ) -> CheckNowOutcome {
@@ -931,10 +1123,26 @@ impl Supervisor {
                         return CheckNowOutcome::RestartRequested;
                     }
                     // A check is already in flight, which is exactly what
-                    // SIGUSR1 asks for: let it finish.
+                    // SIGUSR1 asks for: let it finish, but restart at once
+                    // when it finds something, even if the check started
+                    // as an idle-mode one.
                     SignalEvent::CheckNow => {
+                        if matches!(style, RestartStyle::WhenIdle) {
+                            eprintln!(
+                                "intentd-sitter: SIGUSR1 received; an update check is already \
+                                 running, escalating it to restart now"
+                            );
+                            style = RestartStyle::Now;
+                        } else {
+                            eprintln!(
+                                "intentd-sitter: SIGUSR1 received; an update check is already running"
+                            );
+                        }
+                    }
+                    // Never downgrades an immediate check to idle mode.
+                    SignalEvent::CheckNowIdle => {
                         eprintln!(
-                            "intentd-sitter: SIGUSR1 received; an update check is already running"
+                            "intentd-sitter: SIGUSR2 received; an update check is already running"
                         );
                     }
                 },
@@ -944,19 +1152,21 @@ impl Supervisor {
         match outcome {
             Ok(UpdateOutcome::Installed { version, previous }) => {
                 eprintln!(
-                    "intentd-sitter: installed intentd {version} (was {}); restarting daemon",
-                    previous.as_deref().unwrap_or("none")
+                    "intentd-sitter: installed intentd {version} (was {}); {}",
+                    previous.as_deref().unwrap_or("none"),
+                    style.describe()
                 );
-                CheckNowOutcome::Respawn(version)
+                CheckNowOutcome::Respawn { version, style }
             }
             Ok(UpdateOutcome::AlreadyCurrent { version })
                 if version != current_version && self.paths.daemon_binary(&version).exists() =>
             {
                 eprintln!(
                     "intentd-sitter: found concurrently installed intentd {version} \
-                     (was {current_version}); restarting daemon"
+                     (was {current_version}); {}",
+                    style.describe()
                 );
-                CheckNowOutcome::Respawn(version)
+                CheckNowOutcome::Respawn { version, style }
             }
             Ok(UpdateOutcome::AlreadyCurrent { version }) => {
                 eprintln!("intentd-sitter: intentd {version} is already current");
@@ -1023,9 +1233,15 @@ impl Supervisor {
                     eprintln!("intentd-sitter: SIGHUP received; restarting intentd");
                     BackoffOutcome::RestartRequested
                 }
+                // No child is running during a backoff, so there is nothing
+                // to hand a staged version to: SIGUSR2 checks and respawns
+                // exactly like SIGUSR1 here.
                 #[cfg(unix)]
-                SignalEvent::CheckNow => {
-                    eprintln!("intentd-sitter: SIGUSR1 received; checking for updates now");
+                SignalEvent::CheckNow | SignalEvent::CheckNowIdle => {
+                    eprintln!(
+                        "intentd-sitter: {} received; checking for updates now",
+                        event.name()
+                    );
                     BackoffOutcome::CheckNowRequested
                 }
             },
@@ -1076,12 +1292,41 @@ enum FailedStartCheck {
     Shutdown(i32),
 }
 
-/// How the SIGUSR1 on-demand update check ([`Supervisor::check_now`]) ended.
+/// How an on-demand check ([`Supervisor::check_now`]) takes a found
+/// version. The style a check starts with can only escalate (a SIGUSR1
+/// mid-check turns `WhenIdle` into `Now`); the outcome carries the
+/// effective one and the caller acts on it.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestartStyle {
+    /// SIGUSR1: stop the child and respawn the new version at once.
+    Now,
+    /// SIGUSR2: hand the child SIGUSR2 and respawn when it exits idle.
+    WhenIdle,
+}
+
+#[cfg(unix)]
+impl RestartStyle {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Now => "restarting daemon",
+            Self::WhenIdle => "asking daemon to restart when idle",
+        }
+    }
+}
+
+/// How an on-demand update check ([`Supervisor::check_now`]) ended.
 #[cfg(unix)]
 enum CheckNowOutcome {
     /// The check installed (or found concurrently installed) a different
-    /// version; respawn it with the backoff and failure counter reset.
-    Respawn(String),
+    /// version; the caller restarts onto it per the effective
+    /// [`RestartStyle`] — respawn now with the backoff and failure counter
+    /// reset, or hand the child SIGUSR2 and let the restart-for-update exit
+    /// drive the respawn.
+    Respawn {
+        version: String,
+        style: RestartStyle,
+    },
     /// Already current or the check failed; both non-fatal — the caller
     /// leaves the daemon alone.
     Unchanged,
@@ -1103,8 +1348,9 @@ enum BackoffOutcome {
     /// before respawning.
     #[cfg(unix)]
     RestartRequested,
-    /// An update-now request (SIGUSR1) cut the wait short; the caller must
-    /// run the check ([`Supervisor::check_now`]) and respawn — the new
+    /// An update-now request (SIGUSR1, or SIGUSR2 — with no child running
+    /// the idle hand-off degenerates to this) cut the wait short; the caller
+    /// must run the check ([`Supervisor::check_now`]) and respawn — the new
     /// version when one installed, the current one otherwise — with the
     /// backoff reset.
     #[cfg(unix)]
@@ -1126,6 +1372,25 @@ enum SignalEvent {
     /// different version installs (SIGUSR1).
     #[cfg(unix)]
     CheckNow,
+    /// Run the update check immediately; when a different version installs,
+    /// send the child SIGUSR2 and let it exit for the restart once idle
+    /// (SIGUSR2).
+    #[cfg(unix)]
+    CheckNowIdle,
+}
+
+#[cfg(unix)]
+impl SignalEvent {
+    /// The signal's name for log lines.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Shutdown(signal) => nix::sys::signal::Signal::try_from(*signal)
+                .map_or("shutdown signal", nix::sys::signal::Signal::as_str),
+            Self::Restart => "SIGHUP",
+            Self::CheckNow => "SIGUSR1",
+            Self::CheckNowIdle => "SIGUSR2",
+        }
+    }
 }
 
 /// Signals the sitter reacts to. `recv()` resolves to the requested
@@ -1136,6 +1401,7 @@ struct Signals {
     int: tokio::signal::unix::Signal,
     hup: tokio::signal::unix::Signal,
     usr1: tokio::signal::unix::Signal,
+    usr2: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
@@ -1147,6 +1413,7 @@ impl Signals {
             int: signal(SignalKind::interrupt())?,
             hup: signal(SignalKind::hangup())?,
             usr1: signal(SignalKind::user_defined1())?,
+            usr2: signal(SignalKind::user_defined2())?,
         })
     }
 
@@ -1156,6 +1423,7 @@ impl Signals {
             _ = self.int.recv() => SignalEvent::Shutdown(nix::sys::signal::Signal::SIGINT as i32),
             _ = self.hup.recv() => SignalEvent::Restart,
             _ = self.usr1.recv() => SignalEvent::CheckNow,
+            _ = self.usr2.recv() => SignalEvent::CheckNowIdle,
         }
     }
 }
@@ -1165,6 +1433,10 @@ struct Signals;
 
 #[cfg(not(unix))]
 impl Signals {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "mirrors the fallible unix constructor signature"
+    )]
     fn new() -> io::Result<Self> {
         Ok(Self)
     }
@@ -1203,6 +1475,12 @@ fn exit_code(status: ExitStatus) -> i32 {
         }
     }
     status.code().unwrap_or(1)
+}
+
+/// Whether a child exit is the daemon's restart-for-update handshake
+/// ([`RESTART_FOR_UPDATE_EXIT_CODE`]): an exit code, never a signal death.
+fn is_restart_for_update(status: ExitStatus) -> bool {
+    status.code() == Some(RESTART_FOR_UPDATE_EXIT_CODE)
 }
 
 /// Human-readable exit status for respawn logs.
@@ -1382,12 +1660,72 @@ mod tests {
     }
 
     #[test]
+    fn pidfile_guard_rejects_duplicate_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let owner = PidFile::create(&path).expect("first owner");
+        let duplicate = PidFile::create(&path);
+        let rejected = duplicate.is_err();
+        drop(duplicate);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap_or_default().trim(),
+            std::process::id().to_string(),
+            "duplicate cleanup must not remove the original record"
+        );
+        assert!(rejected, "a second owner must be rejected");
+        drop(owner);
+    }
+
+    #[test]
+    fn pidfile_lock_survives_missing_record_and_can_be_reacquired_after_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let owner = PidFile::create(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(PidFile::create(&path).is_err());
+        assert!(!path.exists(), "a duplicate must not invent ownership");
+        drop(owner);
+        let successor = PidFile::create(&path).expect("lock released on exit");
+        drop(successor);
+        assert!(!path.exists());
+        assert!(path.with_extension("lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pidfile_guard_preserves_live_legacy_owner_without_a_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let record = format!("{}\n", std::process::id());
+        std::fs::write(&path, &record).unwrap();
+        assert!(PidFile::create(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), record);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pidfile_guard_reclaims_dead_legacy_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let pid = dead.id();
+        dead.wait().unwrap();
+        std::fs::write(&path, pid.to_string()).unwrap();
+        let owner = PidFile::create(&path).expect("dead owner can be replaced");
+        assert_eq!(
+            read_live_pid(&path),
+            Some(nix::unistd::Pid::from_raw(std::process::id().cast_signed()))
+        );
+        drop(owner);
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn pidfile_guard_drop_leaves_another_sitters_pid_alone() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sitter.pid");
         let guard = PidFile::create(&path).expect("pidfile created");
-        // A later serve sitter overwrites the pidfile (last writer wins);
-        // this guard's drop must not delete that sitter's entry.
+        // An external writer replaces the record; cleanup must not delete it.
         std::fs::write(&path, "999999\n").unwrap();
         drop(guard);
         assert_eq!(
@@ -1406,5 +1744,27 @@ mod tests {
         assert_eq!(exit_code(ExitStatus::from_raw(15)), 143); // SIGTERM
         assert_eq!(describe_exit(ExitStatus::from_raw(7 << 8)), "exit code 7");
         assert_eq!(describe_exit(ExitStatus::from_raw(9)), "killed by signal 9");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_for_update_exit_is_the_code_and_only_the_code() {
+        use std::os::unix::process::ExitStatusExt;
+        assert!(is_restart_for_update(ExitStatus::from_raw(
+            RESTART_FOR_UPDATE_EXIT_CODE << 8
+        )));
+        assert!(!is_restart_for_update(ExitStatus::from_raw(0)));
+        assert!(!is_restart_for_update(ExitStatus::from_raw(1 << 8)));
+        assert!(!is_restart_for_update(ExitStatus::from_raw(7 << 8)));
+        // A signal death whose raw status happens to equal the code is a
+        // signal, not the handshake.
+        assert!(!is_restart_for_update(ExitStatus::from_raw(
+            RESTART_FOR_UPDATE_EXIT_CODE
+        )));
+        assert_eq!(
+            exit_code(ExitStatus::from_raw(RESTART_FOR_UPDATE_EXIT_CODE << 8)),
+            RESTART_FOR_UPDATE_EXIT_CODE,
+            "a one-shot exiting with the code passes it through unchanged"
+        );
     }
 }

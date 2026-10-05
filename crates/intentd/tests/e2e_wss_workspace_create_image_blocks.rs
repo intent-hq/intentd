@@ -9,7 +9,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -25,24 +24,16 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
     store: Store,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-imgblk-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-imgblk-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -63,7 +54,7 @@ async fn boot() -> Fixture {
         _ws: ws,
         port,
         store,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -127,7 +118,7 @@ async fn wss_rpc_err(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
 
 /// STAB-69: `workspace.create` with `initialAgent.imageBlocks` threads the images
 /// into the first turn so the ACP receives them.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_threads_image_blocks_to_first_turn() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -235,7 +226,7 @@ async fn workspace_create_threads_image_blocks_to_first_turn() {
 /// `agent.sendMessage`; persisted AS a reference (no bytes on the session or
 /// transcript row); and rejected with `-32602` for unknown ids and
 /// both/neither shape violations.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn image_reference_blocks_accepted_and_validated() {
     use base64::Engine as _;
 
@@ -245,10 +236,8 @@ async fn image_reference_blocks_accepted_and_validated() {
     // Workspace A: home of the attachment registry row. Needs a real
     // filesystem root for `file.placeAttachment` to land bytes in — this
     // harness's `workspace.create` yields pathless rows, so pin one on.
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let root_a = std::env::temp_dir().join(format!("intentd-imgref-{}", &short[..8]));
-    std::fs::create_dir_all(&root_a).unwrap();
-    let _root_a = TempDir(root_a.clone());
+    let root_a_dir = common::test_tempdir("intentd-imgref-");
+    let root_a = root_a_dir.path().to_path_buf();
     let created = wss_rpc(
         &mut rpc,
         1,

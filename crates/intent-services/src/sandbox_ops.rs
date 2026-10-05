@@ -1226,6 +1226,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
     }
@@ -1246,6 +1247,7 @@ mod tests {
             created_at: now.clone(),
             updated_at: now,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: Some(repo_path.to_string_lossy().to_string()),
@@ -1271,11 +1273,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 
@@ -1368,6 +1372,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1525,6 +1530,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1664,6 +1670,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1773,6 +1780,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1860,6 +1868,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 

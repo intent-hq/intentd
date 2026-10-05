@@ -27,8 +27,8 @@
 mod common;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,7 +43,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
@@ -57,7 +56,6 @@ type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
@@ -72,15 +70,11 @@ impl Drop for Daemon {
             let _ = signal::killpg(pid, Signal::SIGKILL);
         }
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-chatids-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-chatids-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -89,9 +83,13 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    // The reconcile assertion compares the user row's `author` (anonymous
+    // principal: null login/displayName/avatarUrl) against a fresh snapshot;
+    // a host `gh auth login` would hydrate the real login onto the primary
+    // principal mid-test and race it (intent-hq/intent#5645).
+    common::hermetic_github_identity(&mut cmd, data_dir);
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -304,6 +302,7 @@ async fn seed_workspace(data_dir: &Path) -> String {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -329,11 +328,13 @@ async fn seed_workspace(data_dir: &Path) -> String {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     };
     store.insert_workspace(&ws).await.expect("insert ws");
     id.0
@@ -429,6 +430,8 @@ fn apply_entity(messages: &mut Vec<Value>, entity: &Value) {
         ("role", "role"),
         ("messageSeq", "seq"),
         ("timestamp", "timestamp"),
+        ("metadata", "metadata"),
+        ("author", "author"),
     ] {
         if let Some(v) = entity.get(from) {
             msg[to] = v.clone();
@@ -679,20 +682,17 @@ async fn interleaved_text_tool_result_keeps_its_durable_block_id_over_wss() {
     let Some(script) = gate("WSS chat tool_result block-id E2E (interleaved)") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace(&data_dir).await;
     let behavior = behavior();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -753,20 +753,17 @@ async fn parallel_tool_results_keep_their_durable_block_ids_over_wss() {
     let Some(script) = gate("WSS chat tool_result block-id E2E (parallel)") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace(&data_dir).await;
     let behavior = behavior();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;

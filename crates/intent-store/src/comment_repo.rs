@@ -8,14 +8,14 @@
 
 use intent_core::{
     AgentId, Comment, CommentAnchor, CommentStatus, CommentThread, CommentType, Error, Note,
-    NoteId, Result, WorkspaceId,
+    NoteId, NoteVersionAuthor, Result, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
-use crate::{enum_from_db, enum_to_db, tags_to_db, Store};
+use crate::{enum_from_db, enum_to_db, Store};
 
 const COMMENT_COLUMNS: &str = "id, thread_id, note_id, kind, content, author, author_type, \
     status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at";
@@ -24,6 +24,10 @@ const COMMENT_COLUMNS: &str = "id, thread_id, note_id, kind, content, author, au
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ExtraFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author_principal_id: Option<intent_core::PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author_identity: Option<intent_core::PrincipalIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     anchor_before: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -45,7 +49,7 @@ struct ExtraFields {
 /// Tolerate wrong-typed legacy `isOrphaned` values preserved verbatim in
 /// `extra_json` by the legacy importer: anything but a JSON boolean decodes
 /// as `None` instead of failing the whole row.
-#[allow(clippy::unnecessary_wraps)] // serde deserialize_with requires the Result shape
+#[expect(clippy::unnecessary_wraps)] // serde deserialize_with requires the Result shape
 fn lenient_bool<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -60,7 +64,9 @@ impl ExtraFields {
     /// The camelCase keys this struct owns inside `extra_json`. Anything else
     /// in the blob is a preserved legacy/unknown key (see
     /// [`Store::insert_comment_with_extras`]) that updates must not drop.
-    const KNOWN_KEYS: [&'static str; 6] = [
+    const KNOWN_KEYS: [&'static str; 8] = [
+        "authorPrincipalId",
+        "authorIdentity",
         "anchorBefore",
         "anchorAfter",
         "suggestionOriginal",
@@ -100,6 +106,8 @@ fn encode_comment_json(
     let anchor_json = serde_json::to_string(&c.anchor)
         .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
     let extra = ExtraFields {
+        author_principal_id: c.author_principal_id.clone(),
+        author_identity: c.author_identity.clone(),
         anchor_before: c.anchor_before.clone(),
         anchor_after: c.anchor_after.clone(),
         suggestion_original: c.suggestion_original.clone(),
@@ -109,6 +117,12 @@ fn encode_comment_json(
     };
     let mut merged = extra.to_map()?;
     for (k, v) in legacy_extra {
+        if matches!(
+            k.as_str(),
+            "authorPrincipalId" | "authorIdentity" | "sourceAuthorPrincipalId"
+        ) {
+            continue;
+        }
         merged.entry(k.clone()).or_insert_with(|| v.clone());
     }
     let extra_json = extra_map_to_json(merged)?;
@@ -172,25 +186,28 @@ impl Store {
     }
 
     /// Atomically persist a `comment.add`: the anchor-marker note rewrite
-    /// (the same full-row UPDATE + unconditional `rev` bump as
-    /// [`Store::update_note`]) and the comment INSERT run in ONE transaction,
-    /// so a failure between the two can never leave anchor markers embedded
-    /// in the note with no comment row (monorepo#638). Returns the
-    /// post-rewrite note `rev` so the caller can echo the authoritative
-    /// value. `NotFound` if the note row is absent; nothing persists on any
-    /// error.
+    /// (the same full-row UPDATE + `rev` bump as
+    /// [`Store::update_note_with_version`], gated on `expected_version` when
+    /// `Some`), its version snapshot under the bumped rev (stamped with
+    /// `author`) and the comment INSERT run in ONE transaction, so a failure
+    /// between them can never leave anchor markers embedded in the note with
+    /// no comment row (monorepo#638), no reader can observe the new rev
+    /// before its snapshot, and a rewrite built on a rev another writer has
+    /// since replaced never overwrites that write (it conflicts, so the
+    /// caller can re-read and re-anchor). Returns the post-rewrite note `rev`
+    /// so the caller can echo the authoritative value; nothing persists on
+    /// any error.
     ///
     /// # Errors
     ///
-    /// Returns `Error::NotFound` if the note row is absent; `Error::InvalidInput` on a duplicate comment id; `Error::Internal` if encoding fields or the transaction fails.
-    pub async fn update_note_with_comment(&self, note: &Note, c: &Comment) -> Result<i64> {
-        let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
-        let task_json = note
-            .metadata
-            .task
-            .as_ref()
-            .map(crate::note_repo::encode_task_json)
-            .transpose()?;
+    /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note row is absent; `Error::InvalidInput` on a duplicate comment id; `Error::Internal` if encoding fields or the transaction fails.
+    pub async fn update_note_with_comment(
+        &self,
+        note: &Note,
+        expected_version: Option<i64>,
+        c: &Comment,
+        author: &NoteVersionAuthor,
+    ) -> Result<i64> {
         let (anchor_json, extra_json) = encode_comment_json(c, &Map::new())?;
 
         // IMMEDIATE mode: acquires the write lock upfront, avoiding the
@@ -208,43 +225,28 @@ impl Store {
 
         // Execute the transaction body; rollback explicitly on error.
         let result = async {
-            // Same statement as `update_note_versioned` (no expected_version
-            // gate): full-row replace scoped by (id, workspace_id) with the
-            // store-owned `rev = rev + 1` bump.
-            let res = sqlx::query(
-                "UPDATE note SET title=?, content=?, content_type=?, tags=?, \
-                 is_pinned=?, is_archived=?, is_default=?, parent_id=?, visibility=?, task_json=?, \
-                 created_at=?, updated_at=?, rev = rev + 1 WHERE id=? AND workspace_id=?",
+            // Same statement as `update_note_versioned`: full-row replace
+            // scoped by (id, workspace_id) with the store-owned `rev = rev + 1`
+            // bump, gated on `expected_version`. A miss (gate failed or note
+            // absent) is told apart after the rollback.
+            let Some(new_rev) = crate::note_repo::exec_update_note(
+                &mut *conn,
+                note,
+                expected_version,
+                crate::note_repo::NoteUpdateScope::FullRow,
             )
-            .bind(&note.title)
-            .bind(&note.content)
-            .bind(enum_to_db(&note.content_type)?)
-            .bind(tags_to_db(&note.tags)?)
-            .bind(i64::from(note.is_pinned))
-            .bind(i64::from(note.is_archived))
-            .bind(i64::from(note.is_default))
-            .bind(parent_id)
-            .bind(enum_to_db(&note.visibility)?)
-            .bind(task_json)
-            .bind(&note.created_at)
-            .bind(&note.updated_at)
-            .bind(&note.id.0)
-            .bind(&note.workspace_id.0)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("update note failed: {e}")))?;
-            if res.rows_affected() == 0 {
-                return Err(Error::NotFound(format!("note {}", note.id)));
-            }
-
-            let new_rev: i64 = sqlx::query("SELECT rev FROM note WHERE id=? AND workspace_id=?")
-                .bind(&note.id.0)
-                .bind(&note.workspace_id.0)
-                .fetch_one(&mut *conn)
-                .await
-                .map_err(|e| Error::Internal(format!("read back note rev failed: {e}")))?
-                .try_get("rev")
-                .map_err(|e| Error::Internal(format!("column rev: {e}")))?;
+            .await?
+            else {
+                return Ok(None);
+            };
+            crate::note_version_repo::insert_note_version(
+                &mut conn,
+                note,
+                author,
+                &note.updated_at,
+                new_rev,
+            )
+            .await?;
 
             let sql = format!(
                 "INSERT INTO comment ({COMMENT_COLUMNS}, workspace_id) \
@@ -282,7 +284,7 @@ impl Store {
                     }
                 })?;
 
-            Ok(new_rev)
+            Ok(Some(new_rev))
         }
         .await;
 
@@ -290,7 +292,12 @@ impl Store {
         // failure, if the COMMIT itself fails — monorepo#638) or roll back
         // the failed body (monorepo#680), so the sole write-pool connection
         // is never returned holding an open transaction.
-        crate::commit_with_rollback_guard(conn, result, "commit note+comment tx failed").await
+        match crate::commit_with_rollback_guard(conn, result, "commit note+comment tx failed")
+            .await?
+        {
+            Some(new_rev) => Ok(new_rev),
+            None => Err(self.note_update_miss(note).await),
+        }
     }
 
     /// Fetch a single comment by id, or `NotFound`.
@@ -328,6 +335,10 @@ impl Store {
         let anchor_json = serde_json::to_string(&c.anchor)
             .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
         let extra = ExtraFields {
+            // Creation attribution is immutable. Carry these from the stored
+            // row below, including absence on legacy comments.
+            author_principal_id: None,
+            author_identity: None,
             anchor_before: c.anchor_before.clone(),
             anchor_after: c.anchor_after.clone(),
             suggestion_original: c.suggestion_original.clone(),
@@ -352,7 +363,10 @@ impl Store {
                     // importer preserved verbatim (the store itself only ever
                     // encodes booleans here) — carry it over too.
                     let legacy_orphaned = k == "isOrphaned" && !matches!(v, Value::Bool(_));
-                    if !ExtraFields::KNOWN_KEYS.contains(&k.as_str()) || legacy_orphaned {
+                    if matches!(k.as_str(), "authorPrincipalId" | "authorIdentity")
+                        || !ExtraFields::KNOWN_KEYS.contains(&k.as_str())
+                        || legacy_orphaned
+                    {
                         merged.entry(k).or_insert(v);
                     }
                 }
@@ -404,6 +418,33 @@ impl Store {
             return Err(Error::NotFound(format!("comment {id}")));
         }
         Ok(())
+    }
+
+    /// Delete a comment within a note and return its authoritative thread ID.
+    /// The scope check and identity capture share the DELETE statement: a
+    /// concurrent same-ID replacement cannot be deleted outside this note or
+    /// cause a notification naming a thread read before the mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` for an absent or out-of-scope row;
+    /// `Error::Internal` if the database operation fails.
+    pub async fn delete_comment_in_note(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        id: &str,
+    ) -> Result<String> {
+        sqlx::query_scalar::<_, String>(
+            "DELETE FROM comment WHERE id = ? AND workspace_id = ? AND note_id = ? RETURNING thread_id",
+        )
+        .bind(id)
+        .bind(workspace_id.as_str())
+        .bind(note_id.as_str())
+        .fetch_optional(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("delete comment failed: {e}")))?
+        .ok_or_else(|| Error::NotFound(format!("comment {id}")))
     }
 
     /// List a note's comments, ordered by creation time.
@@ -537,6 +578,8 @@ fn map_comment_row(row: &SqliteRow) -> Result<Comment> {
         content: col(row, "content")?,
         author: col(row, "author")?,
         author_type: enum_from_db(&col::<String>(row, "author_type")?)?,
+        author_principal_id: extra.author_principal_id,
+        author_identity: extra.author_identity,
         status: enum_from_db::<CommentStatus>(&col::<String>(row, "status")?)?,
         parent_id: col(row, "parent_id")?,
         anchor,

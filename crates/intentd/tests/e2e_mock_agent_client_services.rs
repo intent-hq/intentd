@@ -40,6 +40,7 @@ fn workspace(id: &WorkspaceId, path: &std::path::Path) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts.clone(),
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: Some(path.display().to_string()),
         repository_path: None,
@@ -65,14 +66,19 @@ fn workspace(id: &WorkspaceId, path: &std::path::Path) -> Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
+/// Scratch layout: `<tmp>/intentd.db` plus the workspace checkout at
+/// `<tmp>/ws` (returned as the `PathBuf`); the returned guard removes both
+/// on drop.
 async fn setup_manager(
     script: &str,
     policy: PermissionPolicy,
@@ -81,7 +87,7 @@ async fn setup_manager(
     AgentManager,
     WorkspaceId,
     std::path::PathBuf,
-    std::path::PathBuf,
+    tempfile::TempDir,
 ) {
     assert!(
         intent_providers::resolve_on_path("node").is_some(),
@@ -92,20 +98,21 @@ async fn setup_manager(
         "script not found at {script}"
     );
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-client-{}.db", uuid::Uuid::new_v4()));
-    let ws_root = std::env::temp_dir().join(format!("itd-e2e-client-ws-{}", uuid::Uuid::new_v4()));
+    let tmp = common::test_tempdir("intentd-e2e-client-");
+    let db = tmp.path().join("intentd.db");
+    let ws_root = tmp.path().join("ws");
     std::fs::create_dir_all(&ws_root).expect("create ws root");
 
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(ws_root.parent().unwrap().to_path_buf())
+        .with_workspaces_root(tmp.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(&ws_root))
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
     store
-        .insert_workspace(&workspace(&ws, &ws_root.clone()))
+        .insert_workspace(&workspace(&ws, &ws_root))
         .await
         .expect("insert ws");
 
@@ -115,7 +122,7 @@ async fn setup_manager(
         .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"))
         .with_policy(policy);
 
-    (services_arc, manager, ws, ws_root, db)
+    (services_arc, manager, ws, ws_root, tmp)
 }
 
 async fn create_agent_session(
@@ -198,7 +205,7 @@ async fn run_turn(
         .to_string()
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn fs_read_write_round_trip() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
@@ -215,7 +222,7 @@ async fn fs_read_write_round_trip() {
         return;
     }
 
-    let (services, manager, ws, ws_root, db) =
+    let (services, manager, ws, ws_root, _tmp) =
         setup_manager(&script, PermissionPolicy::AllowAll).await;
 
     // Write a file first
@@ -260,13 +267,9 @@ async fn fs_read_write_round_trip() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn permission_request_allow() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
@@ -283,7 +286,7 @@ async fn permission_request_allow() {
         return;
     }
 
-    let (services, manager, ws, ws_root, db) =
+    let (services, manager, ws, ws_root, _tmp) =
         setup_manager(&script, PermissionPolicy::AllowAll).await;
 
     let behavior = serde_json::json!({
@@ -315,13 +318,9 @@ async fn permission_request_allow() {
     assert_eq!(stop, "end_turn", "turn completed with allow");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn permission_request_deny() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
@@ -338,7 +337,7 @@ async fn permission_request_deny() {
         return;
     }
 
-    let (services, manager, ws, ws_root, db) =
+    let (services, manager, ws, ws_root, _tmp) =
         setup_manager(&script, PermissionPolicy::DenyAll).await;
 
     let behavior = serde_json::json!({
@@ -370,13 +369,9 @@ async fn permission_request_deny() {
     assert_eq!(stop, "end_turn", "turn completed with deny");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg(unix)]
 async fn terminal_lifecycle() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -394,7 +389,7 @@ async fn terminal_lifecycle() {
         return;
     }
 
-    let (services, manager, ws, ws_root, db) =
+    let (services, manager, ws, ws_root, _tmp) =
         setup_manager(&script, PermissionPolicy::AllowAll).await;
 
     let behavior = serde_json::json!({
@@ -446,14 +441,10 @@ async fn terminal_lifecycle() {
     assert_eq!(stop, "end_turn", "turn completed");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
 /// Test terminal/kill on a running process (sleep).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg(unix)]
 async fn terminal_kill_running_process() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -471,7 +462,7 @@ async fn terminal_kill_running_process() {
         return;
     }
 
-    let (services, manager, ws, ws_root, db) =
+    let (services, manager, ws, ws_root, _tmp) =
         setup_manager(&script, PermissionPolicy::AllowAll).await;
 
     let behavior = serde_json::json!({
@@ -505,14 +496,10 @@ async fn terminal_kill_running_process() {
     assert_eq!(stop, "end_turn", "turn completed");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
 /// Test terminal output truncation when byte limit is exceeded.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg(unix)]
 async fn terminal_output_truncation() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -530,7 +517,7 @@ async fn terminal_output_truncation() {
         return;
     }
 
-    let (services, manager, ws, ws_root, db) =
+    let (services, manager, ws, ws_root, _tmp) =
         setup_manager(&script, PermissionPolicy::AllowAll).await;
 
     // Generate large output with a small byte limit (512 bytes).
@@ -582,14 +569,10 @@ async fn terminal_output_truncation() {
     assert_eq!(stop, "end_turn", "turn completed");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
 /// Test `wait_for_exit` on a process that exits with non-zero code.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg(unix)]
 async fn terminal_non_zero_exit() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -607,7 +590,7 @@ async fn terminal_non_zero_exit() {
         return;
     }
 
-    let (services, manager, ws, ws_root, db) =
+    let (services, manager, ws, ws_root, _tmp) =
         setup_manager(&script, PermissionPolicy::AllowAll).await;
 
     let behavior = serde_json::json!({
@@ -652,14 +635,10 @@ async fn terminal_non_zero_exit() {
     assert_eq!(stop, "end_turn", "turn completed");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
 /// Test error path: release unknown terminal ID.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg(unix)]
 async fn terminal_release_unknown() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -677,7 +656,7 @@ async fn terminal_release_unknown() {
         return;
     }
 
-    let (services, manager, ws, ws_root, db) =
+    let (services, manager, ws, ws_root, _tmp) =
         setup_manager(&script, PermissionPolicy::AllowAll).await;
 
     let behavior = serde_json::json!({
@@ -703,14 +682,10 @@ async fn terminal_release_unknown() {
     assert_eq!(stop, "end_turn", "turn completed");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
 /// Test error path: output on unknown terminal ID.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg(unix)]
 async fn terminal_output_unknown() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -728,7 +703,7 @@ async fn terminal_output_unknown() {
         return;
     }
 
-    let (services, manager, ws, ws_root, db) =
+    let (services, manager, ws, ws_root, _tmp) =
         setup_manager(&script, PermissionPolicy::AllowAll).await;
 
     let behavior = serde_json::json!({
@@ -754,14 +729,10 @@ async fn terminal_output_unknown() {
     assert_eq!(stop, "end_turn", "turn completed");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
 /// Test output after terminal has exited.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 #[cfg(unix)]
 async fn terminal_output_after_exit() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
@@ -779,7 +750,7 @@ async fn terminal_output_after_exit() {
         return;
     }
 
-    let (services, manager, ws, ws_root, db) =
+    let (services, manager, ws, ws_root, _tmp) =
         setup_manager(&script, PermissionPolicy::AllowAll).await;
 
     let behavior = serde_json::json!({
@@ -827,8 +798,4 @@ async fn terminal_output_after_exit() {
     assert_eq!(stop, "end_turn", "turn completed");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }

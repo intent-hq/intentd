@@ -5,10 +5,70 @@
 //! a later milestone when the `pr.*` methods land — this crate stays free of
 //! any wire concern (§3.2).
 
+/// Request-purpose-aware failure. No response body, URL or credential is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFailureKind {
+    /// The upstream rejected this connection's credential, regardless of endpoint purpose.
+    CredentialRejected,
+    /// The addressed project rejected access, including an access-hiding 404.
+    /// Consumers invalidate that project within the admitted connection scope.
+    ProjectDenied,
+    /// An item or endpoint rejected access, including an access-hiding 404.
+    /// This is not evidence that access to its parent project was lost.
+    ResourceDenied,
+    /// An optional signal was readable only with additional permission.
+    OptionalRestricted,
+    /// An optional signal is unavailable on this instance/version.
+    OptionalUnavailable,
+    /// Transport/server failure; cached success is not proof that this read passed.
+    Transient,
+    /// A response could not establish a known result.
+    Unknown,
+    /// The write may have reached the provider; reconcile instead of retrying blindly.
+    WriteUncertain,
+}
+
+/// Structured evidence for cache consumers; status is absent for transport failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("provider request failed ({kind:?}, status {status:?})")]
+pub struct ProviderFailure {
+    pub kind: ProviderFailureKind,
+    pub status: Option<u16>,
+}
+
+/// Local admission availability, never evidence that the upstream denied access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionUnavailable {
+    Missing,
+    Unverified,
+    Disconnected,
+    ChildDisabled,
+    Mutating,
+    Indeterminate,
+    AuthorityDenied,
+    AuthorityUnavailable,
+    BoundaryMismatch,
+    SecretChanged,
+    TimedOut,
+    Backoff,
+}
+
 /// Errors surfaced by [`crate::SourceControl`] implementations and the
 /// [`crate::SourceControlRegistry`].
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
+    /// A previously captured local grant retired; never an upstream auth failure.
+    #[error("repository admission retired")]
+    AdmissionRetired,
+
+    /// The local request cannot acquire a credential; does not trigger logout.
+    #[error("repository admission unavailable ({0:?})")]
+    AdmissionUnavailable(AdmissionUnavailable),
+
+    /// Structured provider denial/availability/uncertain-write classification.
+    #[error(transparent)]
+    Provider(#[from] ProviderFailure),
+
     /// No usable credential/configuration for the active provider. The daemon
     /// keeps running and source-control features report this (graceful per
     /// §8.3 / §7.3).
@@ -48,6 +108,22 @@ pub enum Error {
     /// Response (de)serialization failure.
     #[error("source control decode error: {0}")]
     Decode(String),
+
+    /// The instance does not offer the OAuth device authorization grant
+    /// (GitLab < 17.1 answers 404 on `/oauth/authorize_device`; no client id
+    /// is configured for a self-managed host). Carries the canonical host so
+    /// the caller can offer the PAT path for that instance instead.
+    #[error("device authorization grant unsupported on {0}; use a personal access token")]
+    DeviceGrantUnsupported(String),
+}
+
+impl Error {
+    /// A scope rejection already classified as a forge authorization error.
+    /// Preserve the legacy Auth variant for existing account/proof consumers.
+    #[must_use]
+    pub fn is_insufficient_scope(&self) -> bool {
+        matches!(self, Self::Auth(message) if message.contains("insufficient_scope") || message.contains("requires a token with"))
+    }
 }
 
 /// Result alias used throughout the crate.
@@ -76,16 +152,61 @@ fn classify_github_status(status: u16, msg: String) -> Error {
     }
 }
 
+/// The message carried onto an [`Error`] for a GitHub REST error body: the
+/// top-level `message` followed by each `errors[].message` detail (`"Validation
+/// Failed: <detail>; <detail>"`). GitHub's 422 bodies put the discriminating
+/// text (e.g. the unsearchable-scope rejection, the 1000-result window, the
+/// 256-character query limit) in `errors[]`, so callers matching on the reason
+/// need it folded in.
+fn github_error_message(message: &str, errors: Option<&[serde_json::Value]>) -> String {
+    let details: Vec<&str> = errors
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+        .filter(|m| !m.is_empty())
+        .collect();
+    if details.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message}: {}", details.join("; "))
+    }
+}
+
+/// The rate-limit message carried by a GitHub GraphQL error envelope, if any.
+///
+/// GitHub answers a GraphQL quota exhaustion as HTTP **200** with `data: null`
+/// and `errors: [{ "type": "RATE_LIMIT", "message": "API rate limit already
+/// exceeded" }]` — no status code to classify on, so the message text is the
+/// discriminator, as it is for the REST 403 body. Returns the `errors[]`
+/// messages joined for the [`Error::RateLimited`] payload when any of them
+/// names the rate limit; `None` for every other GraphQL error (schema
+/// rejections, unresolvable repositories, ...), which stay [`Error::Api`].
+fn graphql_rate_limit_message(messages: &[&str]) -> Option<String> {
+    messages
+        .iter()
+        .any(|m| m.to_ascii_lowercase().contains("rate limit"))
+        .then(|| messages.join("; "))
+}
+
 impl From<octocrab::Error> for Error {
     fn from(err: octocrab::Error) -> Self {
         // octocrab's error enum is large and version-sensitive; categorize on
-        // the `GitHub` variant's HTTP status where present, otherwise fall back
-        // to a generic API error. (Status-precise mapping can be refined when
-        // the wire layer needs it.)
-        if let octocrab::Error::GitHub { source, .. } = &err {
-            return classify_github_status(source.status_code.as_u16(), source.message.clone());
+        // the `GitHub` variant's HTTP status and the `Graphql` variant's
+        // error messages where present, otherwise fall back to a generic API
+        // error. (Status-precise mapping can be refined when the wire layer
+        // needs it.)
+        match &err {
+            octocrab::Error::GitHub { source, .. } => classify_github_status(
+                source.status_code.as_u16(),
+                github_error_message(&source.message, source.errors.as_deref()),
+            ),
+            octocrab::Error::Graphql { source, .. } => {
+                let messages: Vec<&str> = source.0.iter().map(|e| e.message.as_str()).collect();
+                graphql_rate_limit_message(&messages)
+                    .map_or_else(|| Error::Api(err.to_string()), Error::RateLimited)
+            }
+            _ => Error::Api(err.to_string()),
         }
-        Error::Api(err.to_string())
     }
 }
 
@@ -124,5 +245,60 @@ mod tests {
     fn classifies_429_as_rate_limited() {
         let err = classify_github_status(429, "too many requests".into());
         assert!(matches!(err, Error::RateLimited(_)));
+    }
+
+    #[test]
+    fn classifies_graphql_rate_limit_messages_as_rate_limited() {
+        // GitHub's GraphQL quota exhaustion wording (a `RATE_LIMIT` error on
+        // an HTTP 200 envelope) in both documented forms.
+        for msg in [
+            "API rate limit already exceeded",
+            "API rate limit exceeded for user ID 526899.",
+        ] {
+            assert_eq!(
+                graphql_rate_limit_message(&[msg]).as_deref(),
+                Some(msg),
+                "{msg}"
+            );
+        }
+        // Any rate-limit message among several marks the whole envelope.
+        assert_eq!(
+            graphql_rate_limit_message(&[
+                "Could not resolve to a Repository",
+                "API rate limit already exceeded",
+            ])
+            .as_deref(),
+            Some("Could not resolve to a Repository; API rate limit already exceeded")
+        );
+    }
+
+    #[test]
+    fn non_rate_limit_graphql_errors_stay_api_errors() {
+        for msgs in [
+            &["Could not resolve to a Repository"][..],
+            &["Field 'isInMergeQueue' doesn't exist on type 'PullRequest'"][..],
+            &[][..],
+        ] {
+            assert_eq!(graphql_rate_limit_message(msgs), None, "{msgs:?}");
+        }
+    }
+
+    #[test]
+    fn folds_error_details_into_the_message() {
+        assert_eq!(github_error_message("Not Found", None), "Not Found");
+        assert_eq!(
+            github_error_message("Validation Failed", Some(&[])),
+            "Validation Failed"
+        );
+        let errors = [
+            serde_json::json!({ "message": "first detail", "code": "invalid" }),
+            serde_json::json!({ "code": "missing_field" }),
+            serde_json::json!({ "message": "" }),
+            serde_json::json!({ "message": "second detail" }),
+        ];
+        assert_eq!(
+            github_error_message("Validation Failed", Some(&errors)),
+            "Validation Failed: first detail; second detail"
+        );
     }
 }

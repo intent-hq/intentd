@@ -215,7 +215,7 @@ fn enforce_symlink_containment(root: &str, full: &Path) -> Result<()> {
 /// [`enforce_symlink_containment`] gate. Every `file.*` op routes through
 /// here (or replicates both checks), so the returned path is safe to hand
 /// to IO that follows symlinks.
-fn resolve_within(root: &str, rel: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_within(root: &str, rel: &str) -> Result<PathBuf> {
     let full = node_resolve(root, rel);
     if !is_within(root, &full) {
         return Err(Error::Internal(ACCESS_DENIED.to_string()));
@@ -1239,7 +1239,7 @@ mod tests {
     /// multi-byte UTF-8 must not panic in `split_name` — placement and
     /// collision suffixing both work.
     #[test]
-    #[allow(clippy::many_single_char_names)] // sequential placement results a..e
+    #[expect(clippy::many_single_char_names)] // sequential placement results a..e
     fn place_attachment_multibyte_leading_names() {
         let t = TempRoot::new();
         let root = t.root();

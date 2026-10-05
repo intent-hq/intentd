@@ -24,6 +24,7 @@ const SESSION_ID = 'mock-session-1';
 // daemon resumes into sees `true`; a fresh `session/new` resets it. Drives the
 // `failPromptIfLoadedRpcError` behavior (monorepo#940 poisoned-session e2e).
 let sessionFromLoad = false;
+let clientSupportsNotices = false;
 // Optional stateful model selector. Prompts report this accepted state, not
 // the last requested value, so rejected selections expose default-model turns.
 let effectiveModel = null;
@@ -64,16 +65,23 @@ function log(msg) {
 }
 
 // Session-lifecycle log: one JSON line per session/new | session/load —
-// { method, sessionId, pid, meta, nodeOptions } — when MOCK_AGENT_SESSION_LOG
-// points at a file. Lets e2e tests assert exactly which session ids the daemon
-// offered to which child process (e.g. that a cross-provider switch never
-// issues session/load with the old provider's id — monorepo#907). `meta`
-// carries the request's `_meta` verbatim (null when absent) so tests can
-// assert the exact provider-specific payload on the wire (e.g. codex
-// `sessionTitle`, monorepo#3151). `nodeOptions` is the child's inherited
-// NODE_OPTIONS (null when unset) so tests can assert the daemon-injected V8
-// heap cap (`agents.acpNodeMaxOldSpaceMb`, intent-hq/intent#4330).
-function logSessionCall(method, sessionId, meta) {
+// { method, sessionId, pid, meta, nodeOptions, cwd, processCwd, argv } — when
+// MOCK_AGENT_SESSION_LOG points at a file. Lets e2e tests assert exactly
+// which session ids the daemon offered to which child process (e.g. that a
+// cross-provider switch never issues session/load with the old provider's id
+// — monorepo#907). `meta` carries the request's `_meta` verbatim (null when
+// absent) so tests can assert the exact provider-specific payload on the wire
+// (e.g. codex `sessionTitle`, monorepo#3151). `nodeOptions` is the child's
+// inherited NODE_OPTIONS (null when unset) so tests can assert the
+// daemon-injected V8 heap cap (`agents.acpNodeMaxOldSpaceMb`,
+// intent-hq/intent#4330). `cwd` is the request's `cwd` param (the ACP
+// session directory, null when absent) and `processCwd` this child's actual
+// working directory, so tests can prove the two are decoupled for npx
+// launches (intent-hq/intent#5738). `argv` records only the arguments passed
+// to this fixture, excluding the Node executable and script path, so tests
+// can verify provider selection. MOCK_AGENT_LOG_CODEX_POLICY opts into only
+// the daemon-owned policy JSON and selected CODEX_PATH, never other env values.
+function logSessionCall(method, sessionId, meta, cwd) {
   const path = process.env.MOCK_AGENT_SESSION_LOG;
   if (!path) return;
   try {
@@ -85,6 +93,16 @@ function logSessionCall(method, sessionId, meta) {
         pid: process.pid,
         meta: meta ?? null,
         nodeOptions: process.env.NODE_OPTIONS ?? null,
+        cwd: cwd ?? null,
+        processCwd: process.cwd(),
+        argv: process.argv.slice(2),
+        ...(process.env.MOCK_AGENT_LOG_CODEX_POLICY === '1'
+          ? { codexPolicy: {
+              config: process.env.CODEX_CONFIG ? JSON.parse(process.env.CODEX_CONFIG) : null,
+              pathPresent: Object.hasOwn(process.env, 'CODEX_PATH'),
+              codexPath: process.env.CODEX_PATH ?? null,
+            } }
+          : {}),
       }) + '\n'
     );
   } catch (err) {
@@ -342,7 +360,7 @@ function sessionConfigOptions(behavior = {}) {
         {
           id: 'effort', name: 'Effort', category: 'thought_level', type: 'select',
           currentValue: effectiveEffort,
-          options: ['low', 'medium', 'high'].map(value => ({ value, name: value })),
+          options: modelEffortValues(behavior).map(value => ({ value, name: value })),
         },
       ],
     };
@@ -365,6 +383,14 @@ function sessionConfigOptions(behavior = {}) {
       },
     ],
   };
+}
+
+function modelEffortValues(behavior) {
+  return behavior.modelSelection?.thinking?.[effectiveModel]?.values ?? ['low', 'medium', 'high'];
+}
+
+function modelDefaultEffort(behavior) {
+  return behavior.modelSelection?.thinking?.[effectiveModel]?.current ?? 'high';
 }
 
 async function handlePrompt(id, params) {
@@ -400,6 +426,18 @@ async function handlePrompt(id, params) {
     behavior = JSON.parse(process.env.MOCK_AGENT_BEHAVIOR || '{}');
   } catch {
     behavior = {};
+  }
+  // Model the adapter's capability-driven notice/text fallback, including
+  // warnings immediately before a fatal prompt response.
+  for (const notice of behavior.notices || []) {
+    note('session/update', {
+      sessionId: SESSION_ID,
+      update: clientSupportsNotices
+        ? { sessionUpdate: 'notice', ...notice }
+        : { sessionUpdate: 'agent_message_chunk', content: {
+            type: 'text', text: `Warning: ${notice.title}\n\n`,
+          } },
+    });
   }
   // Deterministic mid-turn failure: die while the prompt is in flight for the
   // first N attempts (counter persists across spawns via MOCK_AGENT_ATTEMPT_FILE).
@@ -647,6 +685,16 @@ async function handlePrompt(id, params) {
   if (ruleDelayMs > 0) {
     await new Promise((r) => setTimeout(r, ruleDelayMs));
   }
+  // Optional per-rule barrier: hold the turn open until `releaseFile` exists.
+  // Unlike `delayMs` this is not a timer — the test decides exactly when the
+  // turn may end (e.g. only after follow-up sends have provably queued behind
+  // it), so the interleaving it pins cannot drift under CPU load.
+  if (typeof active.releaseFile === 'string' && active.releaseFile.length > 0) {
+    log(`releaseFile: holding turn until ${active.releaseFile} exists`);
+    while (!fs.existsSync(active.releaseFile)) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
   const toolCalls = Array.isArray(active.toolCalls)
     ? active.toolCalls
     : active.toolCall
@@ -805,6 +853,8 @@ async function handlePrompt(id, params) {
       // collapsed text is truncated and corrupted so neither the resource
       // item nor a parseable {ok, proposal} payload survives — only the
       // turn-attachment registry (deterministic attach) can recover it.
+      // With omitToolOutput, emit a valid status-only terminal update: trusted
+      // registered attachments must survive even without a tool_result block.
       if (result && result.content && Array.isArray(result.content)) {
         let rawOutput = result.content;
         if (active.collapseToolOutput || active.garbleToolOutput) {
@@ -820,8 +870,8 @@ async function handlePrompt(id, params) {
           update: {
             sessionUpdate: 'tool_call_update',
             toolCallId,
-            status: result.isError ? 'error' : 'completed',
-            rawOutput,
+            status: result.isError ? 'failed' : 'completed',
+            ...(active.omitToolOutput ? {} : { rawOutput }),
           },
         });
       }
@@ -898,6 +948,9 @@ async function dispatch(msg) {
 
   switch (msg.method) {
     case 'initialize':
+      clientSupportsNotices = typeof msg.params?.clientCapabilities?.session?.notices === 'object'
+        && msg.params.clientCapabilities.session.notices !== null
+        && !Array.isArray(msg.params.clientCapabilities.session.notices);
       // Slow cold-start simulation (monorepo#616): delay the initialize reply
       // by `initializeDelayMs` so tests can prove the daemon's handshake
       // timeout tolerates a slow-to-start agent (or trips when pinned lower).
@@ -922,7 +975,7 @@ async function dispatch(msg) {
     case 'session/new': {
       if (behavior.modelSelection) {
         effectiveModel = behavior.modelSelection.defaultModel;
-        effectiveEffort = 'high';
+        effectiveEffort = modelDefaultEffort(behavior);
       }
       // Deterministic failure mode: ignore session/new for the first N attempts
       if (typeof behavior.ignoreSessionNewAttempts === 'number' && behavior.ignoreSessionNewAttempts > 0) {
@@ -933,6 +986,15 @@ async function dispatch(msg) {
           return;
         }
       }
+      // Deterministic session-setup rejection: fail EVERY session/new with
+      // the configured JSON-RPC error object (e.g. a bridge-wrapped 429 whose
+      // upstream body lives in `data`), modelling a provider whose allowance
+      // is already spent when the daemon opens the session — before any
+      // prompt — so spawn-path failure attribution can be pinned.
+      if (behavior.sessionNewRpcError) {
+        log(`failing session/new with JSON-RPC error ${behavior.sessionNewRpcError.code}`);
+        return send({ jsonrpc: '2.0', id: msg.id, error: behavior.sessionNewRpcError });
+      }
       // Stash the session-setup-delivered MCP servers (STAB-156) so
       // `callWorkspaceTool` can reach the bridge without an `--mcp-config`.
       // Always overwritten (defaulting to []) so a later session/new that
@@ -941,20 +1003,20 @@ async function dispatch(msg) {
         ? msg.params.mcpServers
         : [];
       sessionFromLoad = false;
-      logSessionCall('session/new', SESSION_ID, msg.params && msg.params._meta);
+      logSessionCall('session/new', SESSION_ID, msg.params && msg.params._meta, msg.params && msg.params.cwd);
       return result(msg.id, { sessionId: SESSION_ID, ...sessionConfigOptions(behavior) });
     }
     case 'session/load':
       if (behavior.modelSelection) {
         effectiveModel = behavior.modelSelection.defaultModel;
-        effectiveEffort = 'high';
+        effectiveEffort = behavior.loadedEffort ?? modelDefaultEffort(behavior);
       }
       // Mirror session/new's stash-overwrite so a loadSession-capable run (or
       // a test sending session/load first) can't observe a stale list.
       sessionMcpServers = Array.isArray(msg.params && msg.params.mcpServers)
         ? msg.params.mcpServers
         : [];
-      logSessionCall('session/load', msg.params && msg.params.sessionId, msg.params && msg.params._meta);
+      logSessionCall('session/load', msg.params && msg.params.sessionId, msg.params && msg.params._meta, msg.params && msg.params.cwd);
       // With `loadSession: true` behavior, accept ANY session id — including a
       // foreign one — modelling the worst-case provider monorepo#907 guards
       // against. With `advertiseLoadSession`, accept the resume (all
@@ -1005,8 +1067,8 @@ async function dispatch(msg) {
       // call ({ sessionId, configId, value }) — when MOCK_AGENT_CONFIG_LOG
       // points at a file, so e2e tests can assert the daemon issued the call
       // with the stored model exactly once per fresh session. The real
-      // adapter's response echoes the updated configOptions list; the daemon
-      // only checks for success, so a minimal echo suffices.
+      // adapter's response echoes the updated configOptions list; the
+      // modelSelection behavior includes model-specific thinking options.
       const configLog = process.env.MOCK_AGENT_CONFIG_LOG;
       if (configLog) {
         try {
@@ -1024,7 +1086,8 @@ async function dispatch(msg) {
       // Deterministic failure mode: reject the call (invalid params, e.g. an
       // unknown model id) so tests can assert the daemon logs a warning and
       // the turn still completes on the provider's default model.
-      if (behavior.rejectSetConfigOption) {
+      if (behavior.rejectSetConfigOption ||
+          (msg.params?.configId === 'effort' && behavior.rejectEffortValues?.includes(msg.params.value))) {
         return send({
           jsonrpc: '2.0',
           id: msg.id,
@@ -1035,7 +1098,8 @@ async function dispatch(msg) {
         const { configId, value } = msg.params || {};
         if (configId === 'model' && behavior.modelSelection.models.includes(value)) {
           effectiveModel = value;
-        } else if (configId === 'effort' && ['low', 'medium', 'high'].includes(value)) {
+          if (behavior.modelSelection.thinking) effectiveEffort = modelDefaultEffort(behavior);
+        } else if (configId === 'effort' && modelEffortValues(behavior).includes(value)) {
           effectiveEffort = value;
         } else {
           return send({
@@ -1179,6 +1243,10 @@ if (treePidFile) {
 // The literal token `<NEWLINE_ONLY>` on a line emits one chunk whose text is
 // a bare "\n" (the monorepo#3262 incident shape — a whitespace-only wake
 // response); plain whitespace-only lines stay filtered as before.
+// The poll fires only once it reads ≥1 non-empty line: an existing-but-empty
+// file is a writer caught between create and write (a non-atomic publish),
+// not a trigger, so keep polling instead of clearing on it and losing the
+// wake for the life of the process (intent-hq/intent#4943).
 const wakeTriggerFile = process.env.MOCK_AGENT_WAKE_TRIGGER_FILE;
 if (wakeTriggerFile) {
   const poll = setInterval(() => {
@@ -1190,6 +1258,9 @@ if (wakeTriggerFile) {
         .filter((l) => l.trim().length > 0);
     } catch {
       return; // trigger not created yet
+    }
+    if (lines.length === 0) {
+      return; // created but not yet written
     }
     clearInterval(poll);
     log(`wake trigger fired: emitting ${lines.length} unsolicited chunk(s)`);

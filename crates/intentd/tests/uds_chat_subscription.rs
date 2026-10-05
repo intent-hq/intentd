@@ -9,6 +9,8 @@
 //! and asserted to equal a fresh `agent.getConversation` snapshot (the
 //! reconciliation invariant).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;
@@ -29,13 +31,14 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+impl TempDb {
+    fn new() -> Self {
+        let dir = common::test_tempdir("intentd-uds-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -105,7 +108,7 @@ fn boot(
     );
     let api: Arc<dyn intent_core::WorkspaceApi> = services.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn({
+    let server = intent_core::spawn_daemon({
         let bus = bus.clone();
         let socket = socket.clone();
         async move {
@@ -129,9 +132,7 @@ async fn setup() -> (
     tempfile::TempDir,
     tempfile::TempDir,
 ) {
-    let tmp = TempDb {
-        path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
-    };
+    let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
     let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus);
@@ -158,9 +159,7 @@ async fn setup_with_bus() -> (
     tempfile::TempDir,
     tempfile::TempDir,
 ) {
-    let tmp = TempDb {
-        path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
-    };
+    let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
     let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus);
@@ -292,7 +291,7 @@ fn is_terminal_delta(delta: &Value) -> bool {
     })
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscribe_snapshot_matches_conversation_then_unsubscribe() {
     let (socket, server, shutdown_tx, _tmp, _services, _ws_root, _sock_dir) = setup().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
@@ -377,7 +376,7 @@ async fn chat_subscribe_snapshot_matches_conversation_then_unsubscribe() {
     let _ = server.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscribe_missing_agent_id_is_invalid_params() {
     let (socket, server, shutdown_tx, _tmp, _services, _ws_root, _sock_dir) = setup().await;
     let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
@@ -402,7 +401,7 @@ async fn chat_subscribe_missing_agent_id_is_invalid_params() {
     let _ = server.await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscribe_isolates_snapshot_per_agent() {
     let (socket, server, shutdown_tx, _tmp, _services, _ws_root, _sock_dir) = setup().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
@@ -464,7 +463,7 @@ async fn chat_subscribe_isolates_snapshot_per_agent() {
 /// coalesce onto one block (added → updated), a tool call (`tool_use` → `tool_use`
 /// updated + `tool_result` added), then trailing text — persists the assistant
 /// message exactly as `run_prompt_turn` would, and finally emits `stream:end`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
     let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -705,7 +704,7 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
 /// the live-turn slot. Its first continuing chunk carries the FULL accumulated
 /// text (proving the delta state was seeded from the snapshot), and the
 /// snapshot + deltas reconcile to a fresh `agent.getConversation` snapshot.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
     let (socket, server, shutdown_tx, _tmp, bus, services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -925,7 +924,6 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
     let _ = server.await;
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// monorepo#2104 — the end-to-end shape of the orphan-slot rule, deliberately
 /// superseding the Iter#1c heal-gate assertion this test used to make (that a
 /// live-turn slot with no busy claim is not merged AT ALL). The objection Iter#1c
@@ -935,7 +933,7 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
 /// is merged and `agent_is_busy` only decides the flag — over the wire, the
 /// orphan arrives as a NON-streaming message, and the STAB-125 turn-liveness
 /// fields stay gated on the busy claim, so nothing claims a turn is in flight.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_snapshot_serves_an_orphan_live_turn_as_a_non_streaming_message() {
     let (socket, server, shutdown_tx, _tmp, bus, services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -1066,12 +1064,11 @@ async fn chat_snapshot_serves_an_orphan_live_turn_as_a_non_streaming_message() {
     let _ = server.await;
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// CS-4 cross-agent isolation: a `chat.subscribe` for agent A must NOT receive
 /// agent B's `agent:stream:*` events — the forwarder filters on
 /// `sessionId == agentId`. B's chunk is published first (and dropped); the next
 /// (and only) delta A's subscription sees is A's own chunk.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscription_isolates_stream_across_agents() {
     let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -1164,7 +1161,7 @@ async fn chat_subscription_isolates_stream_across_agents() {
 /// `chat.subscribe` receives the block delta mapped from `chat:stream:delta`
 /// for the SAME turn — both fire for one chunk (the emit path publishes the
 /// delta plus, on the throttle's leading edge, the activity signal).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscription_coexists_with_events_firehose() {
     let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -1284,7 +1281,7 @@ async fn chat_subscription_coexists_with_events_firehose() {
 /// and clobbering the interleaved text block for the rest of the turn. This
 /// test asserts that too — `{mid}:2` must never be emitted as a `tool_result` —
 /// while still exercising the genuine-orphan self-heal path via `{mid}:4`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
     let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -1509,10 +1506,10 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
 /// monorepo#958: the seq-0 snapshot for a LARGE transcript is the bounded
 /// newest `agent.getConversation` page — not a re-hydration of the full
 /// history. With 120 persisted messages the snapshot carries exactly the
-/// newest 50 (the server default page), `truncated: true`,
+/// newest twenty (the chat-specific page), `truncated: true`,
 /// `totalMessages: 120`, and a non-null `nextToken` so older pages stay
 /// client-pulled via `agent.getConversation { nextToken }`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
     let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -1538,7 +1535,7 @@ async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
     let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
     let agent = AgentId::from(agent_id.as_str());
 
-    // A 120-message transcript — well past the 50-message default page.
+    // A 120-message transcript — well past the twenty-message chat page.
     let store = bus.store();
     for i in 0..120 {
         let mid = Uuid::now_v7().to_string();
@@ -1566,10 +1563,10 @@ async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
         &mut rpc_reader,
         12,
         "agent.getConversation",
-        json!({ "agentId": agent_id }),
+        json!({ "agentId": agent_id, "limit": 20 }),
     )
     .await;
-    assert_eq!(want["messages"].as_array().unwrap().len(), 50);
+    assert_eq!(want["messages"].as_array().unwrap().len(), 20);
 
     let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
     let mut sub_reader = tokio::io::BufReader::new(sub_read);
@@ -1592,12 +1589,12 @@ async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
     let messages = snapshot["messages"].as_array().expect("snapshot messages");
     assert_eq!(
         messages.len(),
-        50,
+        20,
         "snapshot is the bounded default page, not the full 120-message history"
     );
-    // The page is the NEWEST 50 (seq 70..=119, oldest→newest within the page).
-    assert_eq!(messages[0]["seq"], 70);
-    assert_eq!(messages[49]["seq"], 119);
+    // The page is the NEWEST twenty (seq 100..=119, oldest→newest within the page).
+    assert_eq!(messages[0]["seq"], 100);
+    assert_eq!(messages[19]["seq"], 119);
     assert_eq!(snapshot["truncated"], true);
     assert_eq!(snapshot["totalMessages"], 120);
     assert!(
@@ -1615,6 +1612,74 @@ async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
     want_obj.insert("waitingForAgentIds".into(), json!([]));
     assert_eq!(snap["params"]["snapshot"], want);
 
+    // Keep a larger window through explicit invalidation on the same subscription.
+    send(
+        &mut sub_write,
+        &json!({"jsonrpc":"2.0", "id":2, "method":"chat.subscribe",
+        "params":{"agentId":agent_id, "limit":50, "replaceGroup":"configured"}})
+        .to_string(),
+    )
+    .await;
+    let configured_response = read_json(&mut sub_reader).await;
+    assert_eq!(configured_response["id"], 2);
+    let configured_id = configured_response["result"]["subscriptionId"].clone();
+    let configured = read_json(&mut sub_reader).await;
+    let rows = configured["params"]["snapshot"]["messages"]
+        .as_array()
+        .unwrap();
+    assert_eq!(rows.len(), 50);
+    assert_eq!(rows[0]["seq"], 70);
+    assert_eq!(rows[49]["seq"], 119);
+
+    // Invalid requests must fail before replacing the existing group.
+    send(
+        &mut sub_write,
+        &json!({"jsonrpc":"2.0", "id":3, "method":"chat.subscribe",
+        "params":{"agentId":agent_id, "limit":0, "replaceGroup":"configured"}})
+        .to_string(),
+    )
+    .await;
+    let invalid = read_json(&mut sub_reader).await;
+    assert_eq!(invalid["id"], 3);
+    assert_eq!(invalid["error"]["code"], -32602);
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        intent_core::events::AGENT_UPDATED,
+        json!({"agentId":agent_id, "replacedCount":1}),
+    )
+    .await;
+    let mut recovered = std::collections::HashMap::new();
+    for _ in 0..2 {
+        let push = read_json(&mut sub_reader).await;
+        assert_eq!(push["params"]["kind"], "snapshot");
+        assert_eq!(push["params"]["seq"], 1);
+        assert_eq!(push["params"]["snapshot"]["resumed"], false);
+        recovered.insert(
+            push["params"]["subscriptionId"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            push,
+        );
+    }
+    assert_eq!(
+        recovered[configured_id.as_str().unwrap()]["params"]["snapshot"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        50
+    );
+    assert_eq!(
+        recovered[resp["result"]["subscriptionId"].as_str().unwrap()]["params"]["snapshot"]
+            ["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        20
+    );
+
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }
@@ -1630,7 +1695,7 @@ async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
 /// non-yielding `publish_transient` loop starves the delivery task, so the ring
 /// (capacity 1024) drops the oldest undelivered events — the tail published
 /// first — before the task ever runs.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
     let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
         setup_with_bus().await;
@@ -1657,6 +1722,19 @@ async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
 
     // A persisted user message anchors the seq-0 snapshot.
     let store = bus.store();
+    for seq in 0..60 {
+        store
+            .append_agent_message_with_id(
+                &AgentId::from(agent_id.as_str()),
+                &format!("history-{seq}"),
+                "user",
+                &json!([{"type":"text", "text":"history"}]),
+                None,
+                &now_iso(),
+            )
+            .await
+            .expect("append history");
+    }
     let user_id = Uuid::now_v7().to_string();
     store
         .append_agent_message_with_id(
@@ -1676,7 +1754,7 @@ async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
         &mut sub_write,
         &serde_json::to_string(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
-            "params": { "agentId": agent_id }
+            "params": { "agentId": agent_id, "limit": 50 }
         }))
         .unwrap(),
     )
@@ -1686,6 +1764,14 @@ async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
     let snap = read_json(&mut sub_reader).await;
     assert_eq!(snap["params"]["kind"], "snapshot");
     assert_eq!(snap["params"]["seq"], 0);
+
+    assert_eq!(
+        snap["params"]["snapshot"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        50
+    );
 
     // The turn starts normally: the first chunk arrives as delta seq 1.
     let mid = Uuid::now_v7().to_string();
@@ -1788,6 +1874,7 @@ async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
     want_obj.insert("isWaitingOnTool".into(), json!(false));
     want_obj.insert("isWaitingForOtherAgents".into(), json!(false));
     want_obj.insert("waitingForAgentIds".into(), json!([]));
+    want_obj.insert("resumed".into(), json!(false));
     assert_eq!(
         recovery["params"]["snapshot"], want,
         "recovery snapshot equals a fresh getConversation page"
@@ -1795,7 +1882,13 @@ async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
     let messages = recovery["params"]["snapshot"]["messages"]
         .as_array()
         .unwrap();
-    assert_eq!(messages.len(), 2, "user + persisted assistant message");
+    assert_eq!(
+        messages.len(),
+        50,
+        "lag recovery retains the requested window"
+    );
+    assert_eq!(messages[0]["seq"], 12);
+    assert_eq!(messages[49]["id"], mid);
     assert!(
         messages.iter().all(|m| m.get("isStreaming").is_none()),
         "the recovered transcript is not stranded mid-turn"

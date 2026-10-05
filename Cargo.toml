@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["vendor/pprof"]
+
+[patch.crates-io]
+# Also cover --manifest-path builds launched outside this directory, where
+# Cargo does not discover .cargo/config.toml (which covers package verification).
+pprof = { path = "vendor/pprof" }
 
 [workspace.package]
 edition = "2021"
@@ -11,9 +17,16 @@ license = "Apache-2.0"
 
 # Pedantic ratchet: `clippy::pedantic` is enabled workspace-wide at `warn` (enforced by
 # the `-D warnings` gate). The burndown is complete — new findings are fixed or given a
-# per-site `#[allow]` with a one-line justification. PERMANENT allows stay, with rationale.
+# per-site `#[expect]` (not `#[allow]`) with a one-line justification. An expectation
+# that no longer fires is reported as `unfulfilled_lint_expectations` and fails the gate,
+# so stale suppressions are deleted rather than accumulated. `allow_attributes` rejects
+# new outer `#[allow]`s on every platform, including inside `cfg_attr`; only the
+# crate-level `#![allow]` in test support stays. Expectations that hold on some
+# targets only are gated with `cfg_attr(<cond>, expect(...))`.
+# PERMANENT allows stay, with rationale.
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+allow_attributes = "warn"
 # PERMANENT: splitting hundreds of long functions is a risky mass refactor, not a warnings pass.
 too_many_lines = "allow"
 # PERMANENT: fixing means boxing futures broadly; a perf/architecture decision, out of scope.
@@ -40,7 +53,8 @@ serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.23"
 # `unstable_end_turn_token_usage` surfaces the optional end-of-turn `usage`
 # snapshot on `PromptResponse` (cumulative-per-session token counts).
-agent-client-protocol = { version = "2.0", features = ["unstable_end_turn_token_usage"] }
+# `unstable_session_notices` keeps provider diagnostics separate from assistant text.
+agent-client-protocol = { version = "2.0", features = ["unstable_end_turn_token_usage", "unstable_session_notices"] }
 octocrab = "0.54"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 git2 = { version = "0.21", features = ["https", "ssh"] }
@@ -87,6 +101,8 @@ debug = "line-tables-only"
 debug = "line-tables-only"
 [profile.dev.package.intent-linear]
 debug = "line-tables-only"
+[profile.dev.package.intent-nodes]
+debug = "line-tables-only"
 [profile.dev.package.intent-providers]
 debug = "line-tables-only"
 [profile.dev.package.intent-pty]
@@ -108,9 +124,13 @@ debug = "line-tables-only"
 [profile.dev.package.intentd-sitter]
 debug = "line-tables-only"
 
-# Strip debug symbols from all external dependencies
+# Skip debuginfo for all external dependencies. `debug = false` alone makes
+# cargo pass `-C strip=debuginfo`, and the stripped proc-macro dylibs (e.g.
+# rquickjs-macro) are rejected by macOS 27's dyld ("mis-aligned LINKEDIT
+# string pool", rust-lang/rust#157750). `strip = "none"` avoids the strip pass.
 [profile.dev.package."*"]
 debug = false
+strip = "none"
 
 # The profile that 'dist' will build with
 [profile.dist]

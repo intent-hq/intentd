@@ -3,16 +3,28 @@
 //! do) so no provider install is required.
 
 use std::path::PathBuf;
+use std::task::Poll;
 use std::time::Duration;
 
-use super::{run_one_shot_acp, run_one_shot_acp_in, OneShotCommand, OneShotError};
+use intent_acp::{Connection, ConnectionHooks, IncomingRequest};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
+use tokio::sync::mpsc;
+
+#[cfg(unix)]
+use super::run_one_shot_acp_in;
+use super::{
+    run_one_shot_acp, serve_requests_while, OneShotCommand, OneShotEffort, OneShotError, Responder,
+};
+#[cfg(unix)]
 use crate::acp_adapter::AdapterSlots;
+use crate::test_support::test_tempdir;
 
 /// Write `body` as an executable-by-node mock adapter script and return a
 /// launch command for it. The tempdir is returned so the caller keeps it
 /// alive for the duration of the run.
 fn mock_adapter(body: &str) -> (OneShotCommand, tempfile::TempDir) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = test_tempdir("intent-one-shot-");
     let script = dir.path().join("mock-one-shot-adapter.mjs");
     std::fs::write(&script, body).expect("write mock adapter");
     let cmd = OneShotCommand::binary(
@@ -20,6 +32,87 @@ fn mock_adapter(body: &str) -> (OneShotCommand, tempfile::TempDir) {
         vec![script.to_string_lossy().into_owned()],
     );
     (cmd, dir)
+}
+
+#[tokio::test]
+async fn fast_mode_one_shot_samples_after_model_selection_and_preserves_native_state() {
+    const FIXTURE: &str = include_str!("../../tests/fixtures/fast-mode.mjs");
+    for provider in ["claude-code", "codex", "pi"] {
+        for model in ["supported", "unsupported"] {
+            for enabled in [false, true, false] {
+                let log_dir = test_tempdir("fast-mode-one-shot-");
+                let log = log_dir.path().join("calls.jsonl");
+                let (cmd, _dir) = mock_adapter(&format!("const provider = {provider:?}; const failOff = false; const logPath = {};\n{FIXTURE}", json!(log)));
+                let sampled_log = log.clone();
+                let preference = Box::pin(async move {
+                    let calls = std::fs::read_to_string(&sampled_log).unwrap();
+                    assert!(
+                        calls.contains("\"configId\":\"model\""),
+                        "sample only after model selection"
+                    );
+                    enabled
+                });
+                let reply = run_one_shot_acp(
+                    Some((provider, preference)),
+                    cmd,
+                    "inspect",
+                    Some(model),
+                    None,
+                    Duration::from_secs(30),
+                    &OneShotEffort::default(),
+                )
+                .await
+                .unwrap();
+                let state: Value = serde_json::from_str(&reply).unwrap();
+                assert_eq!(state["model"], model);
+                assert_eq!(state["effort"], "medium");
+                if provider == "pi" || (provider == "claude-code" && model == "unsupported") {
+                    assert_eq!(state["controls"], json!([]));
+                } else {
+                    assert_eq!(
+                        state["controls"],
+                        json!([if enabled { "on" } else { "off" }])
+                    );
+                    assert_eq!(
+                        state["serviceTier"],
+                        if enabled && model == "supported" {
+                            json!("fast")
+                        } else {
+                            Value::Null
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn fast_mode_one_shot_failed_off_never_prompts_at_inherited_tier() {
+    for provider in ["claude-code", "codex"] {
+        let log_dir = test_tempdir("fast-mode-one-shot-fail-");
+        let log = log_dir.path().join("calls.jsonl");
+        let (cmd, _dir) = mock_adapter(&format!(
+            "const provider = {provider:?}; const failOff = true; const logPath = {};\n{}",
+            json!(log),
+            include_str!("../../tests/fixtures/fast-mode.mjs")
+        ));
+        let error = run_one_shot_acp(
+            Some((provider, Box::pin(async { false }))),
+            cmd,
+            "inspect",
+            Some("supported"),
+            None,
+            Duration::from_secs(30),
+            &OneShotEffort::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("could not apply Fast mode off"));
+        assert!(!std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("session/prompt"));
+    }
 }
 
 /// Shared preamble: an NDJSON JSON-RPC loop that answers `initialize` and
@@ -57,10 +150,172 @@ const onPrompt = (id) => {{
 }};
 "
     ));
-    let text = run_one_shot_acp(cmd, "say hi", None, Duration::from_secs(30))
-        .await
-        .expect("one-shot succeeds");
+    let text = run_one_shot_acp(
+        None,
+        cmd,
+        "say hi",
+        None,
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .expect("one-shot succeeds");
     assert_eq!(text, "Hello, world!");
+}
+
+/// Mock adapter that echoes the `session/new` params it received as the
+/// reply, so the wire shape of setup is assertable.
+const SESSION_NEW_ECHO_ADAPTER: &str = r"
+let sessionNew = null;
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'session/new') sessionNew = msg.params;
+});
+const onPrompt = (id) => {
+  chunk(JSON.stringify(sessionNew));
+  result(id, { stopReason: 'end_turn' });
+};
+";
+
+#[tokio::test]
+async fn session_meta_rides_session_new_verbatim() {
+    let (cmd, _dir) = mock_adapter(&format!("{ADAPTER_PRELUDE}{SESSION_NEW_ECHO_ADAPTER}"));
+    let meta = serde_json::json!({
+        "systemPrompt": "utility",
+        "claudeCode": { "options": { "tools": [] } },
+    });
+    let text = run_one_shot_acp(
+        None,
+        cmd,
+        "hello",
+        None,
+        Some(meta.clone()),
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .expect("one-shot succeeds");
+    let params: serde_json::Value = serde_json::from_str(&text).expect("echoed params parse");
+    assert_eq!(params["_meta"], meta);
+    assert_eq!(params["mcpServers"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn session_new_omits_meta_when_none_given() {
+    let (cmd, _dir) = mock_adapter(&format!("{ADAPTER_PRELUDE}{SESSION_NEW_ECHO_ADAPTER}"));
+    let text = run_one_shot_acp(
+        None,
+        cmd,
+        "hello",
+        None,
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .expect("one-shot succeeds");
+    let params: serde_json::Value = serde_json::from_str(&text).expect("echoed params parse");
+    assert!(
+        params.get("_meta").is_none(),
+        "no session_meta must mean no `_meta` key at all, got: {params}"
+    );
+    assert_eq!(params["mcpServers"], serde_json::json!([]));
+}
+
+/// Mock adapter that replies with the `session/new` params it received plus
+/// its own `process.cwd()`, that directory's entries, and the `package.json`
+/// found there (the npx launch sentinel).
+#[cfg(unix)]
+const CWD_ECHO_ADAPTER: &str = r"
+import fs from 'node:fs';
+let sessionNew = null;
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'session/new') sessionNew = msg.params;
+});
+const onPrompt = (id) => {
+  chunk(JSON.stringify({
+    sessionNew,
+    processCwd: process.cwd(),
+    entries: fs.readdirSync(process.cwd()),
+    manifest: JSON.parse(fs.readFileSync('package.json', 'utf8')),
+  }));
+  result(id, { stopReason: 'end_turn' });
+};
+";
+
+/// intent-hq/intent#5738 end to end for one-shots (`agent.completeOnce` with
+/// a workspace cwd): an npx launch from a `catalog:` workspace must not run
+/// npx inside it — npm rejects the manifest before the adapter can start — yet
+/// `session/new` still receives the workspace as `cwd`. The fake npx fails
+/// exactly like npm when its project root carries `catalog:` and otherwise
+/// execs the mock adapter; the launch dir is swept once the run is over.
+#[cfg(unix)]
+#[tokio::test]
+async fn one_shot_npx_launch_runs_outside_the_catalog_workspace_but_keeps_it_as_session_cwd() {
+    use crate::acp_adapter::npx_launch_tests::{
+        catalog_workspace, read_npx_report, write_fake_npx,
+    };
+
+    let tmp = test_tempdir("intent-one-shot-npx-");
+    let workspace = catalog_workspace(tmp.path());
+    let report = tmp.path().join("npx-report");
+    let npx = write_fake_npx(tmp.path());
+    let adapter = tmp.path().join("mock-one-shot-adapter.mjs");
+    std::fs::write(&adapter, format!("{ADAPTER_PRELUDE}{CWD_ECHO_ADAPTER}")).unwrap();
+    let cmd = OneShotCommand::npx(npx, "claude-agent-acp@0.0.0-test")
+        .cwd(workspace.clone())
+        .env("INTENTD_FAKE_NPX_REPORT", report.as_os_str())
+        .env("INTENTD_FAKE_NPX_ADAPTER", adapter.as_os_str());
+
+    let slots = AdapterSlots::new(1);
+    let text = run_one_shot_acp_in(
+        None,
+        &slots,
+        cmd,
+        "where",
+        None,
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .expect("npx one-shot from a catalog workspace succeeds");
+    let reply: Value = serde_json::from_str(&text).expect("echoed reply parses");
+    assert_eq!(
+        reply["sessionNew"]["cwd"],
+        json!(workspace.to_string_lossy()),
+        "session/new cwd must stay the workspace: {reply}"
+    );
+    let process_cwd = PathBuf::from(reply["processCwd"].as_str().expect("processCwd"));
+    assert_ne!(process_cwd, workspace, "npx ran inside the workspace");
+    assert!(
+        !process_cwd.starts_with(&workspace),
+        "adapter cwd {} is under the workspace",
+        process_cwd.display()
+    );
+    let entries: Vec<String> = serde_json::from_value(reply["entries"].clone()).unwrap();
+    assert_eq!(entries, ["package.json"], "{reply}");
+    let manifest = &reply["manifest"];
+    assert_eq!(manifest["private"], json!(true), "{reply}");
+    assert!(
+        manifest.get("dependencies").is_none() && manifest.get("workspaces").is_none(),
+        "sentinel must not declare dependencies or workspaces: {reply}"
+    );
+    let (npx_cwd, npx_entries) = read_npx_report(&report).await;
+    assert_eq!(
+        npx_cwd, process_cwd,
+        "the adapter inherits the npx launch dir"
+    );
+    assert_eq!(npx_entries, entries);
+    assert!(
+        !process_cwd.exists(),
+        "launch dir {} must be swept once the run is over",
+        process_cwd.display()
+    );
 }
 
 #[cfg(unix)]
@@ -68,8 +323,8 @@ const onPrompt = (id) => {{
 async fn prompt_timeout_reports_timeout_and_reaps_child() {
     // The adapter answers setup, then never resolves the prompt. The runner
     // must bound the prompt phase and leave no surviving process.
-    let pidfile =
-        std::env::temp_dir().join(format!("intent-one-shot-{}.pid", uuid::Uuid::new_v4()));
+    let scratch = test_tempdir("intent-one-shot-pid-");
+    let pidfile = scratch.path().join("adapter.pid");
     let (cmd, _dir) = mock_adapter(&format!(
         "import fs from 'node:fs';
 fs.writeFileSync({pidfile:?}, String(process.pid));
@@ -83,9 +338,18 @@ const onPrompt = () => {{}};
     // sibling tests for longer than 500ms, which would turn the asserted
     // PromptTimeout into a QueueTimeout (monorepo#2379).
     let slots = AdapterSlots::new(1);
-    let err = run_one_shot_acp_in(&slots, cmd, "hang", None, Duration::from_millis(500))
-        .await
-        .unwrap_err();
+    let err = run_one_shot_acp_in(
+        None,
+        &slots,
+        cmd,
+        "hang",
+        None,
+        None,
+        Duration::from_millis(500),
+        &OneShotEffort::default(),
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(err, OneShotError::PromptTimeout),
         "expected PromptTimeout, got {err}"
@@ -96,7 +360,6 @@ const onPrompt = () => {{}};
         .trim()
         .parse()
         .expect("pid parses");
-    std::fs::remove_file(&pidfile).ok();
     // `kill(pid, 0)` returns ESRCH once the reaped child is gone.
     for _ in 0..100 {
         if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
@@ -105,6 +368,313 @@ const onPrompt = () => {{}};
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("adapter pid {pid} still alive after the one-shot timed out");
+}
+
+/// Regression (monorepo#5465): a flooding adapter that stops READING its
+/// stdin while issuing thousands of client-served requests
+/// (`session/request_permission` and an unknown method, alternating) fills
+/// the transport's bounded writer channel (256 lines) plus the OS pipe.
+/// Before the fix the prompt-phase `select!` awaited each `auto_respond`
+/// inline, so the stalled response send starved the `session/prompt` timeout
+/// and the one-shot hung until the child exited (on main this test only ends
+/// when the 15 s harness guard fires). The phase budget must stay the hard
+/// ceiling: the caller sees `PromptTimeout` within budget + a bounded margin
+/// and the child is reaped.
+#[cfg(unix)]
+#[tokio::test]
+async fn flooding_non_reading_adapter_cannot_stall_prompt_past_its_budget() {
+    let scratch = test_tempdir("intent-one-shot-flood-");
+    let pidfile = scratch.path().join("adapter.pid");
+    let (cmd, _dir) = mock_adapter(&format!(
+        "import fs from 'node:fs';
+fs.writeFileSync({pidfile:?}, String(process.pid));
+{ADAPTER_PRELUDE}
+const onPrompt = () => {{
+  // Stop consuming stdin (keep it open) and flood client-served requests
+  // whose responses nobody will ever read; never resolve the prompt. Node
+  // queues whatever the stdout pipe cannot take immediately and keeps
+  // writing as the runner's reader drains it, so the flood reaches the
+  // runner early in the prompt budget, and the runner's 256-line writer
+  // channel + the unread stdin pipe wedge well inside it.
+  rl.pause();
+  process.stdin.pause();
+  for (let i = 0; i < 6000; i++) {{
+    if (i % 2 === 0) {{
+      send({{ jsonrpc: '2.0', id: 10000 + i, method: 'session/request_permission', params: {{ sessionId: 's1', options: [] }} }});
+    }} else {{
+      send({{ jsonrpc: '2.0', id: 10000 + i, method: 'x/unknown', params: {{}} }});
+    }}
+  }}
+  setInterval(() => {{}}, 1000);
+}};
+",
+        pidfile = pidfile.to_string_lossy(),
+    ));
+    let budget = Duration::from_millis(500);
+    // Upper bound = budget + spawn/setup + exit-observe/reap grace, with slack
+    // for a loaded host. Observed ~1.8 s on a quiet host; the hang this guards
+    // against never ends on its own.
+    let margin = Duration::from_secs(4);
+    let slots = AdapterSlots::new(1);
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(15),
+        run_one_shot_acp_in(
+            None,
+            &slots,
+            cmd,
+            "flood",
+            None,
+            None,
+            budget,
+            &OneShotEffort::default(),
+        ),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let err = outcome
+        .expect("a flooding non-reading adapter must not stall the one-shot past its budget")
+        .unwrap_err();
+    assert!(
+        matches!(err, OneShotError::PromptTimeout),
+        "expected PromptTimeout, got {err}"
+    );
+    assert!(elapsed >= budget, "finished before the budget: {elapsed:?}");
+    assert!(
+        elapsed < budget + margin,
+        "PromptTimeout arrived {elapsed:?} after start; budget {budget:?} + margin {margin:?}"
+    );
+
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("adapter wrote its pid")
+        .trim()
+        .parse()
+        .expect("pid parses");
+    for _ in 0..100 {
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("adapter pid {pid} still alive after the one-shot timed out");
+}
+
+/// An in-memory [`Connection`] whose adapter side the test drives directly:
+/// `peer_in` yields the lines the runner writes to the adapter's stdin and
+/// `peer_out` feeds the adapter's stdout. `pipe` bounds each direction in
+/// bytes, so a peer that never reads `peer_in` saturates the writer
+/// deterministically. The unbounded receiver is the runner's client-served
+/// request queue.
+fn in_memory_connection(
+    pipe: usize,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingRequest>,
+    Lines<BufReader<DuplexStream>>,
+    DuplexStream,
+) {
+    let (runner_stdin, peer_in) = tokio::io::duplex(pipe);
+    let (peer_out, runner_stdout) = tokio::io::duplex(pipe);
+    let (tx, rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        requests: Some(tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(runner_stdin, runner_stdout, None, hooks);
+    (conn, rx, BufReader::new(peer_in).lines(), peer_out)
+}
+
+/// Poll `fut` exactly once. A `Connection` request registers its pending
+/// slot and queues its line on that first poll, so this starts a phase
+/// request without driving it any further.
+async fn poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+    let mut fut = Some(fut);
+    std::future::poll_fn(move |cx| {
+        Poll::Ready(
+            fut.take()
+                .expect("poll_once's future is polled exactly once")
+                .poll(cx),
+        )
+    })
+    .await
+}
+
+/// Wedge `conn`'s writer while its peer is not reading: with the pipe full
+/// the writer task blocks inside a line, and further sends fill the bounded
+/// channel until one no longer completes. Returns the number of `x/fill`
+/// notifications that were accepted.
+async fn saturate_writer(conn: &Connection) -> usize {
+    let mut queued = 0usize;
+    loop {
+        assert!(queued < 10_000, "writer never saturated");
+        let fill = conn.notify("x/fill", json!({}));
+        tokio::pin!(fill);
+        match poll_once(fill.as_mut()).await {
+            Poll::Ready(res) => res.expect("writer open"),
+            // Pending is not yet proof: the writer task may still be moving a
+            // line out of the channel, or the task's cooperative budget may
+            // be spent. Yield (which also refills the budget); the send that
+            // stays pending after that is blocked by a full channel behind a
+            // full pipe, which nothing drains while the peer is not reading.
+            Poll::Pending => {
+                tokio::task::yield_now().await;
+                if poll_once(fill.as_mut()).await.is_pending() {
+                    break;
+                }
+            }
+        }
+        queued += 1;
+    }
+    assert!(
+        queued > 1,
+        "expected the channel to hold lines before saturating"
+    );
+    queued
+}
+
+/// Feed `conn` the given client-served requests from the peer and wait until
+/// the reader has forwarded all of them to the request queue.
+async fn feed_requests(conn: &Connection, peer_out: &mut DuplexStream, requests: &[Value]) {
+    let seq = conn.client_request_seq();
+    let mut lines = String::new();
+    for req in requests {
+        lines.push_str(&req.to_string());
+        lines.push('\n');
+    }
+    peer_out
+        .write_all(lines.as_bytes())
+        .await
+        .expect("peer write");
+    let expected = seq + requests.len() as u64;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while conn.client_request_seq() < expected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reader forwards every request");
+}
+
+fn permission_request(id: u64) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "method": "session/request_permission",
+            "params": { "sessionId": "s1", "options": [] } })
+}
+
+/// Regression for the bounded-send change: a response send that is still
+/// `Pending` when a phase resolves must be carried into the next phase, not
+/// dropped at the boundary. `Pending` there says nothing about the writer —
+/// Tokio's cooperative budget makes a bounded `send` yield even on an empty
+/// channel, and a full writer drains as soon as the adapter reads — so the
+/// old inline await's guarantee (a well-behaved adapter's request is always
+/// answered) only survives if the carried send keeps being polled. Here the
+/// writer is genuinely full while the first phase resolves (the peer is not
+/// reading), then the peer drains it during the next phase; the answer must
+/// arrive. Driven in memory with one `Responder` across both phases, as the
+/// runner's setup → model → prompt sequence does; the loop treats a phase
+/// resolving `Ok` and on its budget identically, and the budget is what
+/// makes the boundary ordering exact.
+#[tokio::test]
+async fn response_pending_at_a_phase_boundary_is_carried_into_the_next_phase() {
+    let (conn, mut requests, mut peer_in, mut peer_out) = in_memory_connection(256);
+    let mut responder = Responder::new(&conn);
+    saturate_writer(&conn).await;
+    feed_requests(&conn, &mut peer_out, &[permission_request(9001)]).await;
+
+    // First phase: the request is dequeued, its send pends on capacity, and
+    // the phase resolves while it is in flight.
+    serve_requests_while(
+        &mut responder,
+        &mut requests,
+        tokio::time::timeout(Duration::from_millis(50), std::future::pending::<()>()),
+    )
+    .await
+    .expect_err("the phase clock ends the first phase");
+    assert!(
+        responder.in_flight(),
+        "the pending send must survive the phase boundary"
+    );
+    assert!(requests.try_recv().is_err(), "the request was dequeued");
+
+    // Next phase on the same connection: the peer now reads, the writer
+    // drains, and the carried send must complete and reach the peer.
+    let answer = serve_requests_while(
+        &mut responder,
+        &mut requests,
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let line = peer_in
+                    .next_line()
+                    .await
+                    .expect("peer read")
+                    .expect("peer line");
+                let msg: Value = serde_json::from_str(&line).expect("json");
+                if msg["id"] == json!(9001) {
+                    return msg;
+                }
+                assert_eq!(msg["method"], "x/fill", "unexpected line: {line}");
+            }
+        }),
+    )
+    .await
+    .expect("the send carried across the phase boundary was never answered");
+    assert_eq!(answer["result"]["outcome"]["outcome"], "cancelled");
+    assert!(!responder.in_flight());
+}
+
+/// Deterministic backpressure counterpart of the flood regression above: the
+/// writer is provably wedged BEFORE the phase starts, so the response send
+/// the loop starts is pending on writer capacity for the whole budget. A
+/// 1-byte pipe nobody reads blocks the writer task inside its first line;
+/// further sends then fill the bounded channel until one no longer completes
+/// (see [`saturate_writer`]). Before the fix `serve_requests_while` awaited
+/// that send inline and never returned; the phase must resolve on its budget
+/// regardless.
+#[tokio::test]
+async fn phase_resolves_on_budget_while_a_response_send_is_pending_on_writer_capacity() {
+    let (conn, mut requests, _peer_in, mut peer_out) = in_memory_connection(1);
+    let mut responder = Responder::new(&conn);
+    saturate_writer(&conn).await;
+    feed_requests(
+        &conn,
+        &mut peer_out,
+        &[
+            permission_request(1),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "x/unknown", "params": {} }),
+        ],
+    )
+    .await;
+
+    let budget = Duration::from_millis(300);
+    let margin = Duration::from_secs(2);
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        serve_requests_while(
+            &mut responder,
+            &mut requests,
+            tokio::time::timeout(budget, std::future::pending::<()>()),
+        ),
+    )
+    .await
+    .expect("a response send pending on writer capacity must not stall the phase");
+    let elapsed = started.elapsed();
+    assert!(
+        outcome.is_err(),
+        "the phase clock, not the send, ends the phase"
+    );
+    assert!(elapsed >= budget, "finished before the budget: {elapsed:?}");
+    assert!(
+        elapsed < budget + margin,
+        "phase resolved {elapsed:?} after start; budget {budget:?} + margin {margin:?}"
+    );
+
+    // The first request was dequeued and its send left in flight (the loop
+    // pulls no further request while one is pending), so the second is still
+    // queued: the send really was blocked on capacity, not merely slow.
+    assert!(responder.in_flight(), "the blocked send is still in flight");
+    let still_queued = requests.try_recv().expect("second request still queued");
+    assert_eq!(still_queued.method, "x/unknown");
+    assert!(requests.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -127,9 +697,17 @@ const onPrompt = (id) => {{
 }};
 "
     ));
-    let text = run_one_shot_acp(cmd, "touch a file", None, Duration::from_secs(30))
-        .await
-        .expect("one-shot succeeds after the auto-deny");
+    let text = run_one_shot_acp(
+        None,
+        cmd,
+        "touch a file",
+        None,
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .expect("one-shot succeeds after the auto-deny");
     assert_eq!(text, "denied=\"cancelled\"");
 }
 
@@ -167,9 +745,17 @@ rl.on('line', (line) => {{
 }});
 "
     ));
-    let text = run_one_shot_acp(cmd, "hello", None, Duration::from_secs(30))
-        .await
-        .expect("setup-phase permission requests are auto-denied, not hung");
+    let text = run_one_shot_acp(
+        None,
+        cmd,
+        "hello",
+        None,
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .expect("setup-phase permission requests are auto-denied, not hung");
     assert_eq!(text, "setup-denials=2");
 }
 
@@ -195,9 +781,17 @@ const onPrompt = (id) => {{
 }};
 "
     ));
-    let text = run_one_shot_acp(cmd, "hello", Some("opus-x"), Duration::from_secs(30))
-        .await
-        .expect("one-shot succeeds");
+    let text = run_one_shot_acp(
+        None,
+        cmd,
+        "hello",
+        Some("opus-x"),
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .expect("one-shot succeeds");
     assert_eq!(text, "applied=model=opus-x@s1");
 }
 
@@ -221,9 +815,17 @@ const onPrompt = (id) => {{
 }};
 "
     ));
-    let text = run_one_shot_acp(cmd, "hello", Some("bogus-model"), Duration::from_secs(30))
-        .await
-        .expect("a rejected set_config_option must not fail the one-shot");
+    let text = run_one_shot_acp(
+        None,
+        cmd,
+        "hello",
+        Some("bogus-model"),
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .expect("a rejected set_config_option must not fail the one-shot");
     assert_eq!(text, "default-model-reply");
 }
 
@@ -234,9 +836,17 @@ async fn nonzero_exit_surfaces_typed_exited_error() {
         PathBuf::from("/bin/sh"),
         vec!["-c".to_string(), "echo boom >&2; exit 7".to_string()],
     );
-    let err = run_one_shot_acp(cmd, "anything", None, Duration::from_secs(30))
-        .await
-        .unwrap_err();
+    let err = run_one_shot_acp(
+        None,
+        cmd,
+        "anything",
+        None,
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .unwrap_err();
     let OneShotError::Exited(detail) = err else {
         panic!("expected Exited, got {err}");
     };
@@ -253,9 +863,17 @@ async fn garbage_stdout_surfaces_typed_transport_error() {
         PathBuf::from("/bin/sh"),
         vec!["-c".to_string(), "echo not json; exit 0".to_string()],
     );
-    let err = run_one_shot_acp(cmd, "anything", None, Duration::from_secs(30))
-        .await
-        .unwrap_err();
+    let err = run_one_shot_acp(
+        None,
+        cmd,
+        "anything",
+        None,
+        None,
+        Duration::from_secs(30),
+        &OneShotEffort::default(),
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(err, OneShotError::Transport(_)),
         "expected Transport, got {err}"
@@ -268,9 +886,17 @@ async fn missing_adapter_binary_surfaces_typed_spawn_error() {
         PathBuf::from("/nonexistent/intentd-one-shot-adapter"),
         Vec::new(),
     );
-    let err = run_one_shot_acp(cmd, "anything", None, Duration::from_secs(5))
-        .await
-        .unwrap_err();
+    let err = run_one_shot_acp(
+        None,
+        cmd,
+        "anything",
+        None,
+        None,
+        Duration::from_secs(5),
+        &OneShotEffort::default(),
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(err, OneShotError::Spawn(_)),
         "expected Spawn, got {err}"
@@ -354,9 +980,18 @@ const onPrompt = (id) => {{
     let runs: Vec<_> = (0..burst)
         .map(|_| {
             let cmd = launch();
-            tokio::spawn(
-                async move { run_one_shot_acp(cmd, "go", None, Duration::from_secs(30)).await },
-            )
+            tokio::spawn(async move {
+                run_one_shot_acp(
+                    None,
+                    cmd,
+                    "go",
+                    None,
+                    None,
+                    Duration::from_secs(30),
+                    &OneShotEffort::default(),
+                )
+                .await
+            })
         })
         .collect();
 
@@ -372,9 +1007,17 @@ const onPrompt = (id) => {{
 
     // A caller arriving into that full queue with a short timeout fails as a
     // queue timeout — and still spawns nothing.
-    let queued_out = run_one_shot_acp(launch(), "go", None, Duration::from_millis(300))
-        .await
-        .unwrap_err();
+    let queued_out = run_one_shot_acp(
+        None,
+        launch(),
+        "go",
+        None,
+        None,
+        Duration::from_millis(300),
+        &OneShotEffort::default(),
+    )
+    .await
+    .unwrap_err();
     let OneShotError::QueueTimeout {
         waited_ms,
         limit: reported,
@@ -410,4 +1053,69 @@ const onPrompt = (id) => {{
         burst,
         "every queued caller must eventually run"
     );
+}
+
+#[tokio::test]
+async fn fast_mode_one_shot_applies_after_quick_action_effort() {
+    for provider in ["claude-code", "codex"] {
+        for enabled in [false, true] {
+            let log_dir = test_tempdir("fast-mode-effort-");
+            let log = log_dir.path().join("calls.jsonl");
+            let (cmd, _dir) = mock_adapter(&format!(
+                "const provider = {provider:?}; const failOff = false; const logPath = {};\n{}",
+                json!(log),
+                include_str!("../../tests/fixtures/fast-mode.mjs")
+            ));
+            let sampled_log = log.clone();
+            let preference = Box::pin(async move {
+                let calls = std::fs::read_to_string(sampled_log).unwrap();
+                let last: Value = serde_json::from_str(calls.lines().last().unwrap()).unwrap();
+                assert_eq!(
+                    last["params"]["configId"], "effort",
+                    "sample only after effort selection"
+                );
+                assert_eq!(last["params"]["value"], "high");
+                enabled
+            });
+            let reply = run_one_shot_acp(
+                Some((provider, preference)),
+                cmd,
+                "inspect",
+                Some("supported"),
+                None,
+                Duration::from_secs(30),
+                &OneShotEffort {
+                    explicit: Some("high".into()),
+                    saved: vec![],
+                },
+            )
+            .await
+            .unwrap();
+            let state: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(state["model"], "supported");
+            assert_eq!(state["effort"], "high");
+            assert_eq!(state["fastMode"], enabled);
+            let calls: Vec<Value> = std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            let controls: Vec<&str> = calls
+                .iter()
+                .filter_map(|c| c["params"]["configId"].as_str())
+                .collect();
+            assert_eq!(
+                controls,
+                [
+                    "model",
+                    "effort",
+                    if provider == "claude-code" {
+                        "fast"
+                    } else {
+                        "fast-mode"
+                    }
+                ]
+            );
+        }
+    }
 }

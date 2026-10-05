@@ -814,23 +814,61 @@ mod tests {
     /// helpers exactly the way `gh auth setup-git` does on dev hosts
     /// (monorepo#3164). Written once per process and shared read-only by the
     /// tests in that process — under a per-test-process runner like nextest
-    /// each process writes its own pid-keyed dir. The dirs are not cleaned
-    /// up (a few bytes in the temp dir; a `Drop` guard cannot outlive the
-    /// `'static` sharing).
+    /// each process writes its own dir. The `'static` sharing outlives any
+    /// per-test `Drop` guard, so the `TempDir` is dropped from an `atexit`
+    /// handler ([`remove_poisoned_home`]) when the test process exits
+    /// instead; set `INTENTD_TEST_KEEP_TMP` (non-empty) to keep the dir
+    /// around for debugging.
     fn poisoned_home() -> &'static Path {
-        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        DIR.get_or_init(|| {
-            let dir = std::env::temp_dir().join(format!(
-                "intent-git-auth-poisoned-home-{}",
-                std::process::id()
-            ));
-            let poison = "[credential \"https://github.com\"]\n\thelper = \n\thelper = !/poisoned/gh auth git-credential\n";
-            std::fs::create_dir_all(dir.join("git")).expect("mkdir poisoned home");
-            std::fs::write(dir.join(".gitconfig"), poison).expect("write poisoned gitconfig");
-            std::fs::write(dir.join("git").join("config"), poison)
-                .expect("write poisoned xdg config");
-            dir
-        })
+        &POISONED_HOME
+            .get_or_init(|| {
+                let mut dir = tempfile::Builder::new()
+                    .prefix("intent-git-auth-poisoned-home-")
+                    .tempdir()
+                    .expect("mkdir poisoned home");
+                if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+                    dir.disable_cleanup(true);
+                }
+                let poison = "[credential \"https://github.com\"]\n\thelper = \n\thelper = !/poisoned/gh auth git-credential\n";
+                std::fs::create_dir_all(dir.path().join("git")).expect("mkdir poisoned xdg dir");
+                std::fs::write(dir.path().join(".gitconfig"), poison)
+                    .expect("write poisoned gitconfig");
+                std::fs::write(dir.path().join("git").join("config"), poison)
+                    .expect("write poisoned xdg config");
+                // SAFETY: `remove_poisoned_home` is a plain `extern "C" fn`
+                // with no arguments that touches only the static below.
+                let registered = unsafe { libc::atexit(remove_poisoned_home) };
+                if registered != 0 {
+                    eprintln!(
+                        "warning: could not register atexit cleanup for {}",
+                        dir.path().display()
+                    );
+                }
+                PoisonedHome {
+                    path: dir.path().to_path_buf(),
+                    dir: std::sync::Mutex::new(Some(dir)),
+                }
+            })
+            .path
+    }
+
+    /// The process-wide [`poisoned_home`] fixture: `path` stays borrowable
+    /// for `'static` while `dir` can be taken and dropped at exit.
+    struct PoisonedHome {
+        path: std::path::PathBuf,
+        dir: std::sync::Mutex<Option<tempfile::TempDir>>,
+    }
+
+    static POISONED_HOME: std::sync::OnceLock<PoisonedHome> = std::sync::OnceLock::new();
+
+    /// `atexit` handler removing the [`poisoned_home`] dir (the `TempDir`
+    /// honors `INTENTD_TEST_KEEP_TMP` via `disable_cleanup`).
+    extern "C" fn remove_poisoned_home() {
+        if let Some(home) = POISONED_HOME.get() {
+            if let Ok(mut dir) = home.dir.lock() {
+                drop(dir.take());
+            }
+        }
     }
 
     /// A `git` command reading config with `params` as the command-line scope
@@ -1011,10 +1049,10 @@ mod tests {
     fn daemon_helper_shell_invocation_survives_quoted_path() {
         use std::os::unix::fs::PermissionsExt;
         let dir = Scratch::new("shell-invocation");
-        let bin_dir = dir.0.join("in tent'd");
+        let bin_dir = dir.path().join("in tent'd");
         std::fs::create_dir_all(&bin_dir).expect("mkdir quoted bin dir");
         let stub = bin_dir.join("intentd");
-        let capture = dir.0.join("capture");
+        let capture = dir.path().join("capture");
         std::fs::write(
             &stub,
             format!(
@@ -1219,7 +1257,7 @@ mod tests {
     #[test]
     fn discover_github_helpers_sees_repository_local_helpers() {
         let dir = Scratch::new("discover");
-        let repo = dir.0.join("repo");
+        let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         assert!(Command::new("git")
             .args(["init", "-q"])
@@ -1360,7 +1398,7 @@ mod tests {
     #[test]
     fn daemon_helper_env_discovers_in_the_spawn_cwd() {
         let dir = Scratch::new("spawncwd");
-        let repo = dir.0.join("repo");
+        let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         assert!(Command::new("git")
             .args(["init", "-q"])
@@ -1416,7 +1454,7 @@ mod tests {
         let org = dir.stub("org", "printf 'username=alice\\npassword=org-pat\\n'\n");
         // Exactly what `intentd git-credential` does with nothing to offer.
         let silent = dir.stub("intentd", "exit 0\n");
-        let global = dir.0.join("gitconfig");
+        let global = dir.path().join("gitconfig");
         std::fs::write(
             &global,
             format!(
@@ -1492,19 +1530,27 @@ mod tests {
             .find_map(|l| l.strip_prefix("password=").map(str::to_string))
     }
 
-    /// Guard-cleaned scratch dir (no tempfile dev-dep in this crate), unique
-    /// per test so the suite can run them in parallel.
+    /// RAII scratch dir under the system temp root, unique per test so the
+    /// suite can run them in parallel. Removed on drop (including on panic);
+    /// set `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
     #[cfg(unix)]
-    struct Scratch(std::path::PathBuf);
+    struct Scratch(tempfile::TempDir);
 
     #[cfg(unix)]
     impl Scratch {
         fn new(name: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("intent-git-auth-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("mkdir scratch");
+            let mut dir = tempfile::Builder::new()
+                .prefix(&format!("intent-git-auth-{name}-"))
+                .tempdir()
+                .expect("mkdir scratch");
+            if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+                dir.disable_cleanup(true);
+            }
             Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self.0.path()
         }
 
         /// An executable credential-helper stub answering `get` with `body`
@@ -1512,7 +1558,7 @@ mod tests {
         /// well-behaved helper must.
         fn stub(&self, name: &str, body: &str) -> std::path::PathBuf {
             use std::os::unix::fs::PermissionsExt;
-            let path = self.0.join(name);
+            let path = self.path().join(name);
             // git passes the operation last, whether it invokes the helper
             // directly (`<path> get`) or through `sh -c` (`… git-credential get`).
             std::fs::write(
@@ -1527,20 +1573,13 @@ mod tests {
         /// A global gitconfig whose only setting is `credential.helper`,
         /// standing in for the config file an OS default lands in.
         fn global_config(&self, helper: &std::path::Path) -> std::path::PathBuf {
-            let path = self.0.join("gitconfig");
+            let path = self.path().join("gitconfig");
             std::fs::write(
                 &path,
                 format!("[credential]\n\thelper = {}\n", helper.display()),
             )
             .expect("write gitconfig");
             path
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 }

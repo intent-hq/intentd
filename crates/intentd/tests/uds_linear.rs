@@ -3,6 +3,8 @@
 //! injected so the slice never touches the network (no `LINEAR_API_KEY`, no
 //! GraphQL call) and the filter/param plumbing is asserted deterministically.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::{Path, PathBuf};
@@ -51,7 +53,7 @@ fn issue(identifier: &str) -> LinearIssueResult {
 /// `NotConfigured` (→ the daemon's "not configured" `-32603`); otherwise it
 /// records the typed `filter`/`query` it was called with and returns canned data.
 // Token recorders are `Option<Option<_>>`: never-called vs called-with-None.
-#[allow(clippy::option_option)]
+#[expect(clippy::option_option)]
 struct StubEngine {
     fail: bool,
     seen_filter: Arc<Mutex<Option<IssueFilter>>>,
@@ -269,7 +271,7 @@ async fn start(
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let serve_socket = socket.clone();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         serve_uds(services, bus, &serve_socket, None, async move {
             let _ = rx.await;
         })
@@ -285,7 +287,7 @@ async fn start(
     (socket, tx, base, ws_root)
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_linear_read_surface_round_trip() {
     let seen_filter = Arc::new(Mutex::new(None));
     let seen_query = Arc::new(Mutex::new(None));
@@ -500,7 +502,7 @@ async fn uds_linear_read_surface_round_trip() {
     assert_eq!(resp["error"]["code"], json!(-32602));
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn uds_linear_not_configured_is_internal() {
     let engine = Arc::new(StubEngine {
         fail: true,

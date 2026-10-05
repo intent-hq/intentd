@@ -4,7 +4,7 @@
 //!   to their pre-batch values and returns the failing key in the error
 //!   response;
 //! - retired `model.workspaceOverrides`: `settings.update` over WSS
-//!   tolerates-and-ignores the retired path while `settings.get` rejects it;
+//!   rejects the retired path atomically, as do `settings.get`/`settings.reset`;
 //! - default-provider switch (monorepo#3177): a `settings.update` batch
 //!   switching `model.defaultProvider` re-resolves `model.default` for the new
 //!   provider (cached catalog default, else cleared);
@@ -21,7 +21,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,7 +37,135 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
+
+#[tokio::test]
+async fn fast_mode_settings_contract_over_wss() {
+    let dir = temp_data_dir();
+    let data_dir = dir.path().to_path_buf();
+    let env = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let mut daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    let ack = wss_rpc(
+        &mut sub,
+        100,
+        "events.subscribe",
+        json!({"eventTypes":["settings:changed"]}),
+    )
+    .await;
+    assert_success_envelope(&ack, 100);
+    let list = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    assert_success_envelope(&list, 1);
+    let entry = list["result"]["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "providers.fastMode")
+        .unwrap();
+    assert_eq!(entry["type"], "object");
+    assert_eq!(entry["defaultValue"], json!({}));
+    assert_eq!(entry["value"], json!({}));
+    assert_eq!(entry["origin"], "default");
+    let catalog = wss_rpc(&mut ws, 2, "providers.catalog", json!({})).await;
+    assert_success_envelope(&catalog, 2);
+    for row in catalog["result"]["providers"].as_array().unwrap() {
+        assert_eq!(
+            row["supportsFastMode"],
+            matches!(row["id"].as_str(), Some("claude-code" | "codex"))
+        );
+    }
+    let prefs = json!({"claude-code":true,"codex":false});
+    let response = wss_rpc(
+        &mut ws,
+        3,
+        "settings.update",
+        json!({"changes":[{"path":"providers.fastMode","value":prefs}]}),
+    )
+    .await;
+    assert_success_envelope(&response, 3);
+    let changed = next_settings_changed(&mut sub).await;
+    assert_eq!(
+        changed
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["path"] == "providers.fastMode")
+            .count(),
+        1
+    );
+    assert_eq!(changed[0]["value"], prefs);
+    let before = std::fs::read_to_string(data_dir.join("config.toml")).unwrap();
+    for invalid in [
+        Value::Null,
+        json!([]),
+        json!({"codex":1}),
+        json!({"claude":true}),
+        json!({"auggie":false}),
+        json!({"unknown":true}),
+    ] {
+        let response = wss_rpc(&mut ws, 4, "settings.update", json!({"changes":[{"path":"git.autoCommit","value":false},{"path":"providers.fastMode","value":invalid}]})).await;
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("config.toml")).unwrap(),
+            before
+        );
+    }
+    let response = wss_rpc(
+        &mut ws,
+        5,
+        "settings.update",
+        json!({"changes":[{"path":"providers.fastMode.codex","value":true}]}),
+    )
+    .await;
+    assert_eq!(response["error"]["code"], -32602);
+    // A real daemon restart proves both independent values survive process state.
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    daemon.child = spawn_serve(&data_dir, "both", &env);
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut ws = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let got = wss_rpc(
+        &mut ws,
+        6,
+        "settings.get",
+        json!({"path":"providers.fastMode"}),
+    )
+    .await;
+    assert_success_envelope(&got, 6);
+    assert_eq!(got["result"]["value"], prefs);
+    assert_eq!(got["result"]["origin"], "file");
+    let reset = wss_rpc(
+        &mut ws,
+        7,
+        "settings.reset",
+        json!({"path":"providers.fastMode"}),
+    )
+    .await;
+    assert_success_envelope(&reset, 7);
+    assert_eq!(reset["result"]["value"], json!({}));
+    let got = wss_rpc(
+        &mut ws,
+        8,
+        "settings.get",
+        json!({"path":"providers.fastMode"}),
+    )
+    .await;
+    assert_eq!(got["result"]["origin"], "default");
+}
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -54,15 +182,11 @@ impl Drop for Daemon {
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-atomic-rb-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-atomic-rb-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -72,9 +196,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -230,8 +353,9 @@ where
 /// and returns the failing key in the error response (per AGENTS.md testing gate).
 #[tokio::test]
 async fn mixed_batch_rollback_over_wss() {
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     // Start daemon with both UDS and TCP (server.wsApi.enabled=true in config.toml)
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -339,14 +463,13 @@ async fn mixed_batch_rollback_over_wss() {
     );
 }
 
-/// Retired `model.workspaceOverrides` over WSS: `settings.update` writes to the
-/// retired path are tolerated-and-ignored (no `-32602`, `applied: []`, mixed
-/// batches still apply their live entries) and `settings.get` rejects the path
-/// as unknown — same wire contract as UDS (`legacy_workspace_overrides_discards_and_strips_on_boot`).
+/// Retired writes fail as unknown settings over WSS, including mixed batches.
+/// Legacy config import/strip remains covered by the UDS boot regression.
 #[tokio::test]
 async fn retired_workspace_overrides_over_wss() {
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -369,65 +492,46 @@ async fn retired_workspace_overrides_over_wss() {
     let cfg = client_config(&fingerprint);
     let mut ws = connect_ws(port, cfg).await;
 
-    // Old-client write of the retired path alone: tolerated, nothing applied.
-    let resp = wss_rpc(
-        &mut ws,
-        1,
-        "settings.update",
-        json!({
-            "changes": [
-                {"path": "model.workspaceOverrides", "value": {"ws-1": "gpt-5"}}
-            ]
-        }),
-    )
-    .await;
-    assert!(
-        resp.get("error").is_none(),
-        "retired-path update must not error: {resp}"
-    );
+    let before = wss_rpc(&mut ws, 1, "settings.get", json!({"path": "model.default"})).await;
+    let retired = json!({"path": "model.workspaceOverrides", "value": {"ws-1": "gpt-5"}});
+    let live = json!({"path": "model.default", "value": "claude-sonnet-4"});
+    for (i, changes) in [
+        json!([retired.clone()]),
+        json!([retired.clone(), live.clone()]),
+        json!([live, retired]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = 2 + i64::try_from(i).expect("request index fits i64");
+        let resp = wss_rpc(&mut ws, id, "settings.update", json!({"changes": changes})).await;
+        assert_eq!(resp["jsonrpc"], json!("2.0"));
+        assert_eq!(resp["id"], json!(id));
+        assert_eq!(resp["error"]["code"], json!(-32602), "{resp}");
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("unknown setting: model.workspaceOverrides"),
+            "{resp}"
+        );
+        assert!(resp.get("result").is_none(), "{resp}");
+    }
+    let after = wss_rpc(&mut ws, 5, "settings.get", json!({"path": "model.default"})).await;
     assert_eq!(
-        resp["result"]["applied"],
-        json!([]),
-        "retired path must not be echoed in applied"
+        after["result"], before["result"],
+        "mixed batches must not apply live entries"
     );
-
-    // Mixed batch: the live entry applies, the retired one is skipped.
-    let resp = wss_rpc(
-        &mut ws,
-        2,
-        "settings.update",
-        json!({
-            "changes": [
-                {"path": "model.workspaceOverrides", "value": {"ws-1": "gpt-5"}},
-                {"path": "model.default", "value": "claude-sonnet-4"}
-            ]
-        }),
-    )
-    .await;
-    assert!(
-        resp.get("error").is_none(),
-        "mixed batch with retired path must not error: {resp}"
-    );
-    let applied = resp["result"]["applied"].as_array().expect("applied array");
-    assert_eq!(applied.len(), 1, "only the live entry applies: {resp}");
-    assert_eq!(applied[0]["path"], json!("model.default"));
-
-    let resp = wss_rpc(&mut ws, 3, "settings.get", json!({"path": "model.default"})).await;
-    assert_eq!(resp["result"]["value"], json!("claude-sonnet-4"));
-
-    // The retired path is gone from the catalog: settings.get rejects it.
-    let resp = wss_rpc(
-        &mut ws,
-        4,
-        "settings.get",
-        json!({"path": "model.workspaceOverrides"}),
-    )
-    .await;
-    assert_eq!(
-        resp["error"]["code"],
-        json!(-32602),
-        "settings.get on the retired path must reject as unknown: {resp}"
-    );
+    for (id, method) in [(6, "settings.get"), (7, "settings.reset")] {
+        let resp = wss_rpc(
+            &mut ws,
+            id,
+            method,
+            json!({"path": "model.workspaceOverrides"}),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], json!(-32602), "{resp}");
+    }
 }
 
 /// `tokenImpact` over WSS (§5.12): every `agentFeatures.*` definition in
@@ -435,8 +539,9 @@ async fn retired_workspace_overrides_over_wss() {
 /// unannotated definitions omit the key entirely.
 #[tokio::test]
 async fn agent_features_token_impact_over_wss() {
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -512,6 +617,13 @@ async fn next_settings_changed<S>(ws: &mut WebSocketStream<S>) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    next_settings_changed_data(ws).await["changes"].clone()
+}
+
+async fn next_settings_changed_data<S>(ws: &mut WebSocketStream<S>) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -524,7 +636,7 @@ where
                 if v["method"] == json!("events.event")
                     && v["params"]["event"]["type"] == json!("settings:changed")
                 {
-                    return v["params"]["event"]["data"]["changes"].clone();
+                    return v["params"]["event"]["data"].clone();
                 }
             }
             Some(Ok(Message::Ping(p))) => {
@@ -558,7 +670,8 @@ fn model_default_values(changes: &Value) -> Vec<Value> {
 /// `model.default` in the batch is never overridden.
 #[tokio::test]
 async fn provider_switch_reresolves_default_model_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Warm the grok catalog cache pre-boot (grok's catalog version key is
     // constant/empty, so the seeded entry is current on any host).
     std::fs::write(
@@ -579,7 +692,7 @@ async fn provider_switch_reresolves_default_model_over_wss() {
         .expect("serialize seeded cache"),
     )
     .expect("seed models-cache.json");
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -715,8 +828,9 @@ async fn provider_switch_reresolves_default_model_over_wss() {
 /// and out-of-range values reject with `-32602`.
 #[tokio::test]
 async fn workspace_api_settings_round_trip_over_wss() {
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -880,8 +994,9 @@ async fn workspace_api_settings_round_trip_over_wss() {
 /// documented `result` / `error` shape).
 #[tokio::test]
 async fn model_default_reasoning_effort_round_trips_over_wss() {
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -983,8 +1098,9 @@ async fn model_default_reasoning_effort_round_trips_over_wss() {
 /// `-32602` (PROTOCOL §9).
 #[tokio::test]
 async fn agents_resume_interrupted_on_start_round_trips_over_wss() {
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -1074,10 +1190,12 @@ fn assert_success_envelope(resp: &Value, id: i64) {
     assert!(resp["result"].is_object(), "{resp}");
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// The `agents` memory knobs as clients actually receive them (monorepo#2109):
-/// `agents.memoryBudgetMb` advertises a machine-derived `max`, and
-/// `agents.idleReapMinutes` advertises the shipped 10-minute default.
+/// `agents.memoryBudgetMb` advertises a machine-derived `max` and the
+/// machine-derived auto budget as `defaultValue` (while its `value` stays
+/// null until the key is written), and `agents.idleReapMinutes` advertises
+/// the shipped 10-minute default.
 ///
 /// The bound assertions are deliberately host-independent — a CI runner's RAM
 /// is not knowable here — so this pins the contract rather than a number:
@@ -1089,13 +1207,14 @@ fn assert_success_envelope(resp: &Value, id: i64) {
 /// i.e. the catalog advertising a value the write path refuses.
 #[tokio::test]
 // The advertised max is a small whole-valued float: casts are exact.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn agent_memory_knobs_over_wss() {
     // The static bound `SettingsFile` enforces when parsing config.toml. The
     // catalog bound may sit below it (this machine's RAM) but never above.
     const PARSE_BOUND_MB: f64 = 1_024_000.0;
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -1134,17 +1253,20 @@ async fn agent_memory_knobs_over_wss() {
     assert_eq!(entry["type"], json!("number"));
     assert_eq!(entry["category"], json!("agents"));
     assert_eq!(entry["min"], json!(0.0), "{entry}");
-    // The default is the *absent* key (auto, monorepo#2063): the wire entry
-    // omits `defaultValue` entirely (indexing would read an absent key as
-    // null too, so assert on the object) while `value` is always present and
-    // explicitly null on a fresh install.
+    // The default is the *absent* key (auto, monorepo#2063): `value` is always
+    // present and explicitly null on a fresh install, while `defaultValue`
+    // carries the RAM-derived budget auto resolves to on this host — positive,
+    // never 0, so a client can tell auto apart from an explicit 0 (off).
     let entry_obj = entry.as_object().expect("entry is an object");
-    assert!(
-        !entry_obj.contains_key("defaultValue"),
-        "defaultValue must be omitted, not null: {entry}"
-    );
     assert!(entry_obj.contains_key("value"), "{entry}");
     assert_eq!(entry["value"], Value::Null, "{entry}");
+    let default = entry["defaultValue"].as_f64().unwrap_or_else(|| {
+        panic!("{budget} must advertise the auto budget as defaultValue: {entry}")
+    });
+    assert!(
+        default > 0.0,
+        "auto never resolves to off, so the advertised default is never 0: {entry}"
+    );
     let max = entry["max"]
         .as_f64()
         .unwrap_or_else(|| panic!("{budget} must advertise a max: {entry}"));
@@ -1153,6 +1275,35 @@ async fn agent_memory_knobs_over_wss() {
         max <= PARSE_BOUND_MB,
         "advertised max {max} exceeds the config.toml parse bound — settings.update would \
          accept a value the write path then rejects: {entry}",
+    );
+    // The advertised default is the budget this daemon actually installed for
+    // the absent key — `system.status` reports it in bytes — not merely some
+    // positive figure. Boot and the catalog must read the same RAM source: a
+    // catalog-side probe that failed where boot's succeeded once advertised
+    // the 4,096 MB floor on a host running a 12,288 MB budget. The default is
+    // also clamped to `max` so it stays writable through the schema it ships
+    // in; on this host that clamp binds only if RAM is under 4 GiB or over
+    // roughly 2 TiB.
+    let status = wss_rpc(&mut ws, 11, "system.status", json!({})).await;
+    assert_success_envelope(&status, 11);
+    let installed_bytes = status["result"]["agentMemoryBudgetBytes"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("auto installs a budget on a fresh install: {status}"));
+    // MiB counts above 2^53 do not occur; loss-free in f64.
+    #[expect(clippy::cast_precision_loss)]
+    let installed_mb = (installed_bytes / (1024 * 1024)) as f64;
+    // Both sides are whole MiB counts, exact in f64.
+    #[expect(clippy::float_cmp)]
+    let matches_installed = default == installed_mb.min(max);
+    assert!(
+        matches_installed,
+        "defaultValue {default} must equal the installed auto budget in MB (agentMemoryBudgetBytes \
+         {installed_bytes} = {installed_mb} MB), clamped to max {max}: {entry}",
+    );
+    assert!(
+        default <= max,
+        "defaultValue {default} above max {max} — the catalog advertises a default its own \
+         schema rejects: {entry}",
     );
 
     let entry = settings
@@ -1224,6 +1375,13 @@ async fn agent_memory_knobs_over_wss() {
     assert_success_envelope(&resp, 10);
     assert_eq!(resp["result"]["value"], Value::Null, "{resp}");
     assert_eq!(resp["result"]["origin"], json!("default"), "{resp}");
+    // ...and `settings.get` still advertises the effective auto budget, so a
+    // client reading a null value can render "Auto (N MB)" rather than "Off".
+    assert_eq!(
+        resp["result"]["definition"]["defaultValue"].as_f64(),
+        Some(default),
+        "{resp}"
+    );
 }
 
 /// Read one account straight from the daemon's secrets file, bypassing the
@@ -1243,12 +1401,12 @@ fn stored_secret(secrets_file: &Path, account: &str) -> Option<String> {
 async fn redaction_placeholder_round_trip_keeps_secret_over_wss() {
     const PLACEHOLDER: &str = "********";
     const SECRET: &str = "lin_api_original_0123456789";
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_file = data_dir.join("secrets.json");
     let secrets_file_str = secrets_file.to_string_lossy().into_owned();
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_SECRETS_FILE", &secrets_file_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -1371,15 +1529,39 @@ async fn redaction_placeholder_round_trip_keeps_secret_over_wss() {
         "echoing the placeholder must not clobber the stored secret"
     );
 
-    // A literal value still replaces.
+    // A literal secret and an ordinary setting still commit as one revision
+    // after secret persistence moves outside the global gate (#5554 part 2).
     let resp = wss_rpc(
         &mut ws,
         4,
         "settings.update",
-        json!({ "changes": [{ "path": "linear.token", "value": "lin_api_rotated" }] }),
+        json!({ "changes": [
+            { "path": "notifications.volume", "value": 0.75 },
+            { "path": "linear.token", "value": "lin_api_rotated" }
+        ] }),
     )
     .await;
     assert_success_envelope(&resp, 4);
+    let applied = json!([
+        { "path": "notifications.volume", "value": 0.75, "origin": "file" },
+        { "path": "linear.token", "value": PLACEHOLDER }
+    ]);
+    assert_eq!(resp["result"]["applied"], applied);
+    let event = next_settings_changed_data(&mut sub).await;
+    assert_eq!(event["changes"], applied);
+    assert_eq!(event["revision"], resp["result"]["revision"]);
+    let snapshot = wss_rpc(&mut ws, 5, "settings.list", json!({})).await;
+    assert_success_envelope(&snapshot, 5);
+    assert_eq!(snapshot["result"]["revision"], event["revision"]);
+    for expected in applied.as_array().unwrap() {
+        let entry = snapshot["result"]["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"] == expected["path"])
+            .unwrap();
+        assert_eq!(entry["value"], expected["value"]);
+    }
     assert_eq!(
         stored_secret(&secrets_file, "linear.token").as_deref(),
         Some("lin_api_rotated")
@@ -1391,12 +1573,12 @@ async fn redaction_placeholder_round_trip_keeps_secret_over_wss() {
 /// not applied and no secret is written.
 #[tokio::test]
 async fn redaction_placeholder_without_secret_rejects_batch_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_file = data_dir.join("secrets.json");
     let secrets_file_str = secrets_file.to_string_lossy().into_owned();
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_SECRETS_FILE", &secrets_file_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);

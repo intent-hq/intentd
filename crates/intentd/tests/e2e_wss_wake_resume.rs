@@ -24,8 +24,8 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,32 +40,27 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let log_path = self.data_dir.join("daemon.log");
+        let log_path = self.data_dir.path().join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-wake-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-wake-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -73,9 +68,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -281,6 +275,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -306,11 +301,13 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -323,30 +320,53 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 /// resume (child torn down, reloaded fresh).
 #[tokio::test]
 async fn suspend_interrupted_turn_enrolls_and_resumes_over_wss() {
+    assert_suspend_interrupted_turn_resumes(json!({
+        "code": -32603, "message": "Connection reset by peer"
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn timeout_interrupted_turn_enrolls_and_resumes_over_wss() {
+    assert_suspend_interrupted_turn_resumes(json!({
+        "code": -32603, "message": "The operation was aborted due to timeout"
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn terminated_interrupted_turn_enrolls_and_resumes_over_wss() {
+    assert_suspend_interrupted_turn_resumes(json!({
+        "code": -32603, "message": "Internal error", "data": { "details": "terminated" }
+    }))
+    .await;
+}
+
+async fn assert_suspend_interrupted_turn_resumes(prompt_error: Value) {
     let Some(script) = gate("WSS wake-resume E2E") else {
         return;
     };
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let attempt_file = data_dir.join("attempts.txt");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
     let session_log = data_dir.join("sessions.log");
     let session_log_s = session_log.to_string_lossy().into_owned();
-    // First prompt attempt fails with a transient (connection-class) RPC error
+    // First prompt attempt fails with a transient provider RPC error
     // after streaming a warning chunk; the retry (attempt 2, on the reloaded
     // session) succeeds. `loadSession: true` makes the resume's `session/load`
     // reachable.
     let behavior = json!({
         "loadSession": true,
-        "promptRpcError": { "code": -32603, "message": "Connection reset by peer" },
+        "promptRpcError": prompt_error,
         "promptRpcErrorAttempts": 1,
         "streamBeforeErrorText": "partial ",
         "response": "resumed after suspend",
     })
     .to_string();
-    let env: [(&str, &str); 8] = [
+    let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -359,7 +379,7 @@ async fn suspend_interrupted_turn_enrolls_and_resumes_over_wss() {
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -412,11 +432,18 @@ async fn suspend_interrupted_turn_enrolls_and_resumes_over_wss() {
     // resume drives the agent back to idle on a successful turn.
     let mut saw_suspend_end = false;
     let mut resumed_to_idle = false;
+    let mut saw_resumed_output = false;
     for _ in 0..400 {
         let frame = wss_event(&mut sub, 30).await;
         let event = &frame["params"]["event"];
         if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
             continue;
+        }
+        if saw_suspend_end
+            && event["type"].as_str() == Some("agent:last-message")
+            && event["data"]["lastAgentResponse"].as_str() == Some("resumed after suspend")
+        {
+            saw_resumed_output = true;
         }
         match event["type"].as_str() {
             Some("agent:failed") => {
@@ -450,6 +477,11 @@ async fn suspend_interrupted_turn_enrolls_and_resumes_over_wss() {
     assert!(
         resumed_to_idle,
         "the enrolled turn self-healed to a successful resumed completion (agent:idle)"
+    );
+
+    assert!(
+        saw_resumed_output,
+        "the resumed provider produced its continuation output"
     );
 
     // The interrupted list drains: the enrolled row was claimed and resolved by

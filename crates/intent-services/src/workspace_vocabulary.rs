@@ -87,7 +87,7 @@ pub(crate) async fn resolve_max_terms(store: &Store) -> usize {
 /// finite number is truncated and honored (`0` disables derivation); absent
 /// or malformed degrades to [`DEFAULT_MAX_TERMS`] — never an error.
 // Guarded finite + non-negative; the float→int cast saturates at usize::MAX.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn parse_max_terms_value(value: Option<&serde_json::Value>) -> usize {
     value
         .and_then(serde_json::Value::as_f64)
@@ -354,6 +354,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -379,11 +380,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 

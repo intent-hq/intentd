@@ -16,6 +16,37 @@ use crate::cli::Channel;
 /// Current `state.json` schema version.
 pub const STATE_SCHEMA_VERSION: u32 = 1;
 
+/// Serialize install/activation/prune and schedule mutations across updater processes.
+///
+/// # Errors
+/// Returns an I/O error if the lock cannot be created or acquired.
+pub fn lock(path: &Path) -> io::Result<StateLock> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    #[cfg(unix)]
+    {
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|(_, error)| io::Error::from(error))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(file)
+    }
+}
+
+/// RAII state lock. Exact remote updates are available on Unix only.
+#[cfg(unix)]
+pub type StateLock = nix::fcntl::Flock<fs::File>;
+/// Non-Unix sitters retain channel-only behavior.
+#[cfg(not(unix))]
+pub type StateLock = fs::File;
+
 /// Contents of `state.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SitterState {

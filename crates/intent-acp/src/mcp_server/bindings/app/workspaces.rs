@@ -7,7 +7,9 @@
 
 use std::sync::Arc;
 
-use intent_core::{PublishEvent, WorkspaceApi, WorkspaceId, WorkspaceStatus};
+use intent_core::{
+    GitRemoteUrl, PublishEvent, RepoRef, Workspace, WorkspaceApi, WorkspaceId, WorkspaceStatus,
+};
 use serde_json::{json, Value};
 
 use crate::mcp_server::bindings::{map_err, opt_bool, opt_str, opt_vec_str};
@@ -18,6 +20,10 @@ pub(crate) const PRELUDE: &str = r"
     ws.app.workspaces = {
         list: (options) => host({ method: 'app.workspaces.list', args: options || {} }),
         get: (id) => host({ method: 'app.workspaces.get', args: { id } }),
+        transfer: (id, options) => {
+            if (options !== undefined && (options === null || typeof options !== 'object' || Array.isArray(options))) throw new Error('transfer options must be an object');
+            return host({ method: 'app.workspaces.transfer', args: { ...(options || {}), id } });
+        },
         create: (params) => host({ method: 'app.workspaces.create', args: params || {} }),
         archive: (id) => host({ method: 'app.workspaces.archive', args: { id } }),
         delete: (id) => host({ method: 'app.workspaces.delete', args: { id } }),
@@ -36,12 +42,13 @@ pub(crate) async fn dispatch(
     // Chief-workspace gating: all ws.app.* methods require the caller to be
     // in the Chief workspace.
     if !workspace_id.is_chief() {
-        return Err("ws.app.* is only available in the Chief of Staff workspace".to_string());
+        return Err("ws.app.* is only available in the Assistant workspace".to_string());
     }
 
     match method {
         "list" => list(api, args).await,
         "get" => get(api, args).await,
+        "transfer" => transfer(api, args).await,
         "create" => create(api, args).await,
         "archive" => archive(api, args).await,
         "delete" => delete(api, args).await,
@@ -106,15 +113,8 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
                 continue;
             }
         }
-        if let Some(ref owner) = repository_owner {
-            if ws.repository_owner.as_deref() != Some(owner.as_str()) {
-                continue;
-            }
-        }
-        if let Some(ref name) = repository_name {
-            if ws.repository_name.as_deref() != Some(name.as_str()) {
-                continue;
-            }
+        if !repo_filter_matches(&ws, repository_owner.as_deref(), repository_name.as_deref()) {
+            continue;
         }
 
         // Tag filters
@@ -132,6 +132,7 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
         // Query filter (searches across multiple fields)
         if let Some(ref q) = query {
             let q_lower = q.to_lowercase();
+            // repo-slug-fold: allow — free-text substring search over display fields, not slug identity
             let matches = [
                 ws.id.as_str(),
                 &ws.title,
@@ -197,7 +198,111 @@ async fn get(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String>
     Ok(summarize_workspace(&workspace))
 }
 
-fn summarize_workspace(ws: &intent_core::Workspace) -> Value {
+/// Read-only proposal creation. Export and agent teardown belong to the
+/// desktop's existing transfer relay, after the user approves the card.
+async fn transfer(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
+    let params = args
+        .as_object()
+        .ok_or_else(|| "transfer arguments must be an object".to_string())?;
+    if let Some(key) = params
+        .keys()
+        .find(|key| !matches!(key.as_str(), "id" | "destination"))
+    {
+        return Err(format!("Unknown transfer option: {key}"));
+    }
+    let id = args
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| "id must be a non-empty string".to_string())?;
+    assert_mutable_workspace_id(id)?;
+    let destination = args
+        .get("destination")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "destination must be a non-empty string".to_string())
+        })
+        .transpose()?;
+    let workspace_id = WorkspaceId::from_string(id);
+    let workspace = api
+        .get_workspace(workspace_id.clone())
+        .await
+        .map_err(map_err)?;
+    if workspace.status == WorkspaceStatus::Deleted || workspace.pending_delete_at.is_some() {
+        return Err(
+            "Deleted workspaces or workspaces pending deletion cannot be transferred".to_string(),
+        );
+    }
+    let source_path = workspace
+        .worktree_path
+        .as_deref()
+        .or(workspace.repository_path.as_deref())
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| "Workspace has no source path to transfer".to_string())?;
+    let plan = api
+        .workspace_transfer_plan(workspace_id)
+        .await
+        .map_err(map_err)?;
+    let mut warnings: Vec<String> = plan
+        .warnings
+        .into_iter()
+        .map(|warning| warning.message)
+        .collect();
+    warnings.push("The source workspace will be archived after a successful transfer.".to_string());
+    warnings.push("Agents will not restart automatically on the destination.".to_string());
+    let title = if workspace.title.is_empty() {
+        id
+    } else {
+        &workspace.title
+    };
+    let mut payload = json!({
+        "operation": "workspace.transfer",
+        "workspaceId": id,
+        "sourceWorkspacePath": source_path,
+    });
+    if let Some(destination) = destination {
+        payload["destination"] = json!(destination);
+    }
+    proposal_result(&json!({
+        "kind": "workspace-transfer",
+        "applyToolCallId": format!("workspace-transfer-{}", uuid::Uuid::new_v4()),
+        "payload": payload,
+        "preview": {
+            "title": format!("Transfer {title}"),
+            "summary": format!("Transfer {title} from {source_path}. Review the destination before approving."),
+            "applyLabel": "Transfer",
+            "warnings": warnings,
+            "fields": [
+                { "key": "workspaceTitle", "label": "Project", "value": title, "editable": false },
+                { "key": "sourceWorkspacePath", "label": "Source path", "value": source_path, "editable": false },
+            ],
+        },
+    }))
+}
+
+/// Applies the `repositoryOwner` / `repositoryName` filters through [`RepoRef`]
+/// identity, so forge-slug casing (`Intent-HQ` vs `intent-hq`) never excludes a
+/// match. A half that is not filtered on is taken from the workspace row so the
+/// comparison stays a plain `RepoRef` equality.
+fn repo_filter_matches(ws: &Workspace, owner: Option<&str>, name: Option<&str>) -> bool {
+    match (owner, name) {
+        (None, None) => true,
+        (Some(owner), Some(name)) => ws.repo().as_ref() == Some(&RepoRef::new(owner, name)),
+        (Some(owner), None) => ws.repository_owner.as_deref().is_some_and(|row_owner| {
+            let row_name = ws.repository_name.as_deref().unwrap_or("");
+            RepoRef::new(owner, row_name) == RepoRef::new(row_owner, row_name)
+        }),
+        (None, Some(name)) => ws.repository_name.as_deref().is_some_and(|row_name| {
+            let row_owner = ws.repository_owner.as_deref().unwrap_or("");
+            RepoRef::new(row_owner, name) == RepoRef::new(row_owner, row_name)
+        }),
+    }
+}
+
+fn summarize_workspace(ws: &Workspace) -> Value {
     json!({
         "id": ws.id.as_str(),
         "title": if ws.title.is_empty() { "Untitled" } else { &ws.title },
@@ -286,7 +391,7 @@ fn proposal_resource_uri(proposal: &Value) -> String {
 }
 
 /// Return a proposal with dual text+resource content items.
-#[allow(clippy::unnecessary_wraps)] // dispatch arm helper; keeps the uniform Result shape
+#[expect(clippy::unnecessary_wraps)] // dispatch arm helper; keeps the uniform Result shape
 pub(crate) fn proposal_result(proposal: &Value) -> Result<Value, String> {
     // Build resource name from preview.title
     let name = proposal
@@ -328,7 +433,7 @@ fn assert_mutable_workspace_id(id: &str) -> Result<(), String> {
         return Err("workspace id is required".to_string());
     }
     if id == "__chief__" {
-        return Err("The Chief virtual workspace cannot be modified".to_string());
+        return Err("The Assistant virtual workspace cannot be modified".to_string());
     }
     Ok(())
 }
@@ -483,21 +588,12 @@ fn parse_github_pr_or_issue_url(url: &str) -> Option<(String, Option<u64>)> {
     Some((repo_url, (segment == "pull").then_some(n)))
 }
 
-/// Parse a GitHub URL (https, www, or git@ form) into lowercase
-/// `(owner, repo)` (TS `parseGithubOwnerRepo`).
-fn parse_github_owner_repo(github_url: &str) -> Option<(String, String)> {
-    let t = github_url.trim();
-    let stripped = strip_prefix_ci(t, "https://www.github.com/")
-        .or_else(|| strip_prefix_ci(t, "http://www.github.com/"))
-        .or_else(|| strip_prefix_ci(t, "https://github.com/"))
-        .or_else(|| strip_prefix_ci(t, "http://github.com/"))
-        .or_else(|| strip_prefix_ci(t, "git@github.com:"))
-        .unwrap_or(t);
-    let stripped = strip_git_suffix(stripped);
-    let mut segs = stripped.split('/').filter(|s| !s.is_empty());
-    let owner = segs.next()?;
-    let repo = segs.next()?;
-    Some((owner.to_lowercase(), repo.to_lowercase()))
+/// Whether a repository name (a workspace row's `repositoryName` or a
+/// checkout folder name) names the same repository as `wanted.name`, under
+/// [`RepoRef`] identity. The owner half is pinned to `wanted.owner` on both
+/// sides so the comparison stays a plain `RepoRef` equality on the name.
+fn repo_name_matches(wanted: &RepoRef, candidate: &str) -> bool {
+    RepoRef::new(wanted.owner.as_str(), strip_git_suffix(candidate)) == *wanted
 }
 
 /// Port of the TS `normalizeWorkspaceCreateFields`: derive the editable
@@ -654,7 +750,7 @@ async fn lookup_known_repo_local_path(
     api: &Arc<dyn WorkspaceApi>,
     github_url: &str,
 ) -> Option<String> {
-    let (owner, repo) = parse_github_owner_repo(github_url)?;
+    let wanted = GitRemoteUrl::parse(github_url)?.github_repo()?;
     let workspaces = api.list_workspaces(true).await.ok()?;
 
     let mut strict = Vec::new();
@@ -672,28 +768,25 @@ async fn lookup_known_repo_local_path(
         if path.contains("/.clones/") || path.contains("\\.clones\\") {
             continue;
         }
-        let entry_owner = ws
-            .repository_owner
-            .as_deref()
-            .filter(|o| !o.is_empty())
-            .map(str::to_lowercase);
-        let entry_name = ws
-            .repository_name
-            .as_deref()
-            .filter(|n| !n.is_empty())
-            .map(|n| strip_git_suffix(&n.to_lowercase()).to_string());
-        let entry_basename = path
-            .rsplit(['/', '\\'])
-            .next()
-            .map(|b| strip_git_suffix(&b.to_lowercase()).to_string());
+        let entry_owner = ws.repository_owner.as_deref().filter(|o| !o.is_empty());
+        let entry_name = ws.repository_name.as_deref().filter(|n| !n.is_empty());
+        let entry_basename = path.rsplit(['/', '\\']).next();
 
-        if entry_name.as_deref() == Some(repo.as_str()) {
-            if entry_owner.as_deref() == Some(owner.as_str()) {
+        if entry_name.is_some_and(|n| repo_name_matches(&wanted, n)) {
+            // Strict tier: the row's full slug under `RepoRef` identity
+            // (`ws.repo()` is `None` for ownerless rows, which fall through
+            // to the name-only tier).
+            let row = ws
+                .repo()
+                .map(|r| RepoRef::new(r.owner.as_str(), strip_git_suffix(&r.name)));
+            if row.as_ref() == Some(&wanted) {
                 strict.push(path.to_string());
             } else if entry_owner.is_none() {
                 name_only.push(path.to_string());
             }
-        } else if entry_basename.as_deref() == Some(repo.as_str()) && entry_owner.is_none() {
+        } else if entry_owner.is_none()
+            && entry_basename.is_some_and(|b| repo_name_matches(&wanted, b))
+        {
             basename_only.push(path.to_string());
         }
     }
@@ -1102,6 +1195,8 @@ mod tests {
     struct FakeApi {
         workspaces: Arc<Mutex<Vec<Workspace>>>,
         events: Arc<Mutex<Vec<PublishEvent>>>,
+        plan_calls: Arc<Mutex<Vec<WorkspaceId>>>,
+        plan_error: bool,
     }
 
     impl FakeApi {
@@ -1136,6 +1231,29 @@ mod tests {
                 Ok(())
             })
         }
+
+        fn workspace_transfer_plan(
+            &self,
+            id: WorkspaceId,
+        ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
+            self.plan_calls.lock().unwrap().push(id.clone());
+            Box::pin(async move {
+                if self.plan_error {
+                    return Err(Error::Internal("transfer plan unavailable".to_string()));
+                }
+                Ok(serde_json::from_value(json!({
+                    "manifest": {
+                        "formatVersion": 1, "creatingIntentdVersion": "test",
+                        "workspaceId": id, "createdAt": "2026-01-01T00:00:00Z",
+                        "tables": [], "assets": [], "attachments": [],
+                        "git": { "hasRepository": true, "dirtyFiles": ["file.txt"], "sandboxBranches": [] }
+                    },
+                    "totalSizeBytes": 0, "dbRowBytes": 0, "assetBytes": 0,
+                    "attachmentBytes": 0, "estimatedGitBundleBytes": 0,
+                    "warnings": [{ "code": "uncommitted-changes", "message": "Uncommitted file will be snapshotted." }]
+                })).unwrap())
+            })
+        }
     }
 
     fn make_workspace(id: &str, title: &str) -> Workspace {
@@ -1153,6 +1271,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: Some("/repo".to_string()),
@@ -1178,11 +1297,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 
@@ -1194,8 +1315,199 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "ws.app.* is only available in the Chief of Staff workspace"
+            "ws.app.* is only available in the Assistant workspace"
         );
+    }
+
+    #[tokio::test]
+    async fn transfer_rejects_non_chief_and_bad_arguments_before_planning() {
+        let fake = Arc::new(FakeApi::default());
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        let denied = dispatch(
+            &api,
+            &WorkspaceId::new(),
+            "transfer",
+            &json!({"id": "ws-1"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(denied.contains("only available in the Assistant"));
+        for args in [
+            json!(null),
+            json!({}),
+            json!({"id": 4}),
+            json!({"id": "  "}),
+            json!({"id": "__chief__"}),
+            json!({"id": "ws-1", "destination": null}),
+            json!({"id": "ws-1", "destination": 3}),
+            json!({"id": "ws-1", "destination": " "}),
+            json!({"id": "ws-1", "archiveSource": false}),
+        ] {
+            assert!(
+                dispatch(&api, &WorkspaceId::chief(), "transfer", &args)
+                    .await
+                    .is_err(),
+                "{args}"
+            );
+        }
+        assert!(fake.plan_calls.lock().unwrap().is_empty());
+        assert!(fake.published_events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transfer_rejects_ineligible_workspaces_before_planning() {
+        let fake = Arc::new(FakeApi::default());
+        let mut deleted = make_workspace("deleted", "Deleted");
+        deleted.status = WorkspaceStatus::Deleted;
+        let mut pending = make_workspace("pending", "Pending");
+        pending.pending_delete_at = Some("2026-01-01T00:00:00Z".into());
+        let mut pathless = make_workspace("pathless", "Pathless");
+        pathless.repository_path = None;
+        fake.workspaces
+            .lock()
+            .unwrap()
+            .extend([deleted, pending, pathless]);
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        for (id, message) in [
+            ("missing", "not found"),
+            ("deleted", "cannot be transferred"),
+            ("pending", "cannot be transferred"),
+            ("pathless", "no source path"),
+        ] {
+            let error = dispatch(&api, &WorkspaceId::chief(), "transfer", &json!({"id": id}))
+                .await
+                .unwrap_err();
+            assert!(error.contains(message), "{error}");
+        }
+        assert!(fake.plan_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transfer_returns_unique_readonly_proposals_with_plan_warnings() {
+        let fake = Arc::new(FakeApi::default());
+        let mut workspace = make_workspace("ws-1", "Project One");
+        workspace.worktree_path = Some("/repo/worktrees/project-one".into());
+        fake.workspaces.lock().unwrap().push(workspace.clone());
+        let before = serde_json::to_value(&workspace).unwrap();
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        let first = dispatch(
+            &api,
+            &WorkspaceId::chief(),
+            "transfer",
+            &json!({"id": "ws-1", "destination": "  Laptop  "}),
+        )
+        .await
+        .unwrap();
+        let second = dispatch(
+            &api,
+            &WorkspaceId::chief(),
+            "transfer",
+            &json!({"id": "ws-1"}),
+        )
+        .await
+        .unwrap();
+        let proposal = &first["proposal"];
+        assert_eq!(proposal["kind"], "workspace-transfer");
+        assert_eq!(
+            proposal["payload"],
+            json!({"operation": "workspace.transfer", "workspaceId": "ws-1", "sourceWorkspacePath": "/repo/worktrees/project-one", "destination": "Laptop"})
+        );
+        assert_eq!(proposal["preview"]["title"], "Transfer Project One");
+        assert_eq!(
+            proposal["preview"]["fields"][0],
+            json!({
+                "key": "workspaceTitle", "label": "Project", "value": "Project One", "editable": false
+            })
+        );
+        assert_eq!(
+            proposal["preview"]["fields"][1]["value"],
+            "/repo/worktrees/project-one"
+        );
+        assert!(proposal["preview"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("/repo/worktrees/project-one"));
+        assert_eq!(
+            proposal["preview"]["warnings"][0],
+            "Uncommitted file will be snapshotted."
+        );
+        assert!(proposal["preview"]["warnings"][1]
+            .as_str()
+            .unwrap()
+            .contains("archived"));
+        assert!(proposal["preview"]["warnings"][2]
+            .as_str()
+            .unwrap()
+            .contains("not restart"));
+        assert!(second["proposal"]["payload"].get("destination").is_none());
+        assert_ne!(
+            proposal["applyToolCallId"],
+            second["proposal"]["applyToolCallId"]
+        );
+        assert!(super::super::proposal::is_valid_proposal(proposal));
+        let resource = &first["__mcpContentItems"][1]["resource"];
+        assert_eq!(resource["mimeType"], "application/vnd.intent.proposal+json");
+        assert_eq!(
+            resource["uri"],
+            format!(
+                "intent-proposal://workspace-transfer/{}",
+                proposal["applyToolCallId"].as_str().unwrap()
+            )
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(resource["text"].as_str().unwrap()).unwrap(),
+            *proposal
+        );
+        assert_eq!(fake.plan_calls.lock().unwrap().len(), 2);
+        assert_eq!(
+            serde_json::to_value(&fake.workspaces.lock().unwrap()[0]).unwrap(),
+            before
+        );
+        assert!(fake.published_events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transfer_supports_archived_workspace_and_repository_path_fallback() {
+        let fake = Arc::new(FakeApi::default());
+        let mut workspace = make_workspace("ws-1", "Archived project");
+        workspace.status = WorkspaceStatus::Archived;
+        workspace.archived = true;
+        fake.workspaces.lock().unwrap().push(workspace);
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let result = dispatch(
+            &api,
+            &WorkspaceId::chief(),
+            "transfer",
+            &json!({"id": "ws-1"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result["proposal"]["payload"]["sourceWorkspacePath"],
+            "/repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_propagates_plan_failure_without_proposal() {
+        let fake = Arc::new(FakeApi {
+            plan_error: true,
+            ..Default::default()
+        });
+        fake.workspaces
+            .lock()
+            .unwrap()
+            .push(make_workspace("ws-1", "Project One"));
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let error = dispatch(
+            &api,
+            &WorkspaceId::chief(),
+            "transfer",
+            &json!({"id": "ws-1"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("transfer plan unavailable"));
     }
 
     #[tokio::test]
@@ -1299,6 +1611,134 @@ mod tests {
         let workspaces = result.as_array().unwrap();
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0].get("id").unwrap().as_str().unwrap(), "ws-1");
+    }
+
+    #[tokio::test]
+    async fn test_list_repository_filters_fold_slug_case() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            let mut ws_intent = make_workspace("ws-1", "intentd");
+            ws_intent.repository_owner = Some("intent-hq".to_string());
+            ws_intent.repository_name = Some("intentd".to_string());
+            workspaces.push(ws_intent);
+
+            let mut ws_other = make_workspace("ws-2", "other");
+            ws_other.repository_owner = Some("other-org".to_string());
+            ws_other.repository_name = Some("intentd".to_string());
+            workspaces.push(ws_other);
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let chief_id = WorkspaceId::chief();
+
+        let ids = |result: Value| -> Vec<String> {
+            result
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|w| w.get("id").unwrap().as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // Case-variant owner matches.
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "list",
+            &json!({ "filter": { "repositoryOwner": "Intent-HQ" } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids(result), vec!["ws-1".to_string()]);
+
+        // Case-variant name matches (both rows share the name).
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "list",
+            &json!({ "filter": { "repositoryName": "IntentD" } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids(result), vec!["ws-1".to_string(), "ws-2".to_string()]);
+
+        // Both halves, case-variant, still narrow to the one repository.
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "list",
+            &json!({ "filter": { "repositoryOwner": "INTENT-HQ", "repositoryName": "IntentD" } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids(result), vec!["ws-1".to_string()]);
+
+        // A different owner still excludes.
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "list",
+            &json!({ "filter": { "repositoryOwner": "someone-else" } }),
+        )
+        .await
+        .unwrap();
+        assert!(ids(result).is_empty());
+    }
+
+    /// `repo_filter_matches` over the full partial-filter matrix — neither /
+    /// owner-only / name-only / both — against fully-slugged, ownerless,
+    /// nameless, and slugless rows. A row missing the filtered half never
+    /// matches; a half that is not filtered on never excludes.
+    #[test]
+    fn test_repo_filter_matches_partial_filter_matrix() {
+        let full = make_workspace("full", "full");
+        let mut ownerless = make_workspace("ownerless", "ownerless");
+        ownerless.repository_owner = None;
+        let mut nameless = make_workspace("nameless", "nameless");
+        nameless.repository_name = None;
+        let mut slugless = make_workspace("slugless", "slugless");
+        slugless.repository_owner = None;
+        slugless.repository_name = None;
+        let mut empty_owner = make_workspace("empty-owner", "empty-owner");
+        empty_owner.repository_owner = Some(String::new());
+
+        // (row, neither, owner-only, name-only, both)
+        let matrix = [
+            (&full, true, true, true, true),
+            (&ownerless, true, false, true, false),
+            (&nameless, true, true, false, false),
+            (&slugless, true, false, false, false),
+            (&empty_owner, true, false, true, false),
+        ];
+        for (ws, neither, owner_only, name_only, both) in matrix {
+            let id = &ws.title;
+            assert_eq!(
+                repo_filter_matches(ws, None, None),
+                neither,
+                "{id}: neither"
+            );
+            assert_eq!(
+                repo_filter_matches(ws, Some("OWNER"), None),
+                owner_only,
+                "{id}: owner-only"
+            );
+            assert_eq!(
+                repo_filter_matches(ws, None, Some("Repo")),
+                name_only,
+                "{id}: name-only"
+            );
+            assert_eq!(
+                repo_filter_matches(ws, Some("Owner"), Some("REPO")),
+                both,
+                "{id}: both"
+            );
+        }
+
+        // A mismatching half excludes regardless of the other half.
+        assert!(!repo_filter_matches(&full, Some("other"), None));
+        assert!(!repo_filter_matches(&full, None, Some("other")));
+        assert!(!repo_filter_matches(&full, Some("owner"), Some("other")));
+        assert!(!repo_filter_matches(&full, Some("other"), Some("repo")));
     }
 
     #[tokio::test]
@@ -1843,6 +2283,108 @@ mod tests {
         assert!(fields.get("clonePath").is_none());
     }
 
+    /// The strict tier compares the row's full slug under `RepoRef`
+    /// identity: a case-variant owner AND name (with a `.git` suffix on the
+    /// row) still hydrates from the known workspace.
+    #[tokio::test]
+    async fn test_lookup_strict_tier_matches_case_variant_owner_and_name() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            let mut ws = make_workspace("ws-1", "Existing");
+            ws.repository_owner = Some("Intent-HQ".to_string());
+            ws.repository_name = Some("IntentD.git".to_string());
+            ws.repository_path = Some("/checkouts/IntentD".to_string());
+            workspaces.push(ws);
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+
+        for url in [
+            "https://github.com/intent-hq/intentd",
+            "https://GITHUB.COM/INTENT-HQ/INTENTD.git",
+            "git@github.com:Intent-hq/intentd.git",
+        ] {
+            assert_eq!(
+                lookup_known_repo_local_path(&api, url).await.as_deref(),
+                Some("/checkouts/IntentD"),
+                "{url}"
+            );
+        }
+        // A different owner with the same name is not a strict match, and
+        // the owner-bearing row never falls back to the name-only tier.
+        assert_eq!(
+            lookup_known_repo_local_path(&api, "https://github.com/someone-else/intentd").await,
+            None
+        );
+    }
+
+    /// Ownerless rows match through the name tier (then the path-basename
+    /// tier) under `RepoRef` folding of the name; the strict tier wins over
+    /// both and ambiguity within a tier yields `None`.
+    #[tokio::test]
+    async fn test_lookup_ownerless_tiers_fold_case_and_respect_priority() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            let mut by_name = make_workspace("ws-1", "ByName");
+            by_name.repository_owner = None;
+            by_name.repository_name = Some("Widget.GIT".to_string());
+            by_name.repository_path = Some("/checkouts/named".to_string());
+            let mut by_basename = make_workspace("ws-2", "ByBasename");
+            by_basename.repository_owner = None;
+            by_basename.repository_name = None;
+            by_basename.repository_path = Some("/checkouts/WIDGET".to_string());
+            workspaces.push(by_name);
+            workspaces.push(by_basename);
+        }
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+
+        // Name tier beats the basename tier.
+        assert_eq!(
+            lookup_known_repo_local_path(&api, "https://github.com/acme/widget")
+                .await
+                .as_deref(),
+            Some("/checkouts/named")
+        );
+
+        // With the name row gone, the case-variant basename row is found.
+        fake.workspaces.lock().unwrap().remove(0);
+        assert_eq!(
+            lookup_known_repo_local_path(&api, "https://github.com/Acme/Widget")
+                .await
+                .as_deref(),
+            Some("/checkouts/WIDGET")
+        );
+
+        // A strict (owner-bearing) row wins over the ownerless tiers.
+        {
+            let mut ws = make_workspace("ws-3", "Strict");
+            ws.repository_owner = Some("ACME".to_string());
+            ws.repository_name = Some("widget".to_string());
+            ws.repository_path = Some("/checkouts/strict".to_string());
+            fake.workspaces.lock().unwrap().push(ws);
+        }
+        assert_eq!(
+            lookup_known_repo_local_path(&api, "https://github.com/acme/widget")
+                .await
+                .as_deref(),
+            Some("/checkouts/strict")
+        );
+
+        // Two distinct strict paths (case-variant slugs) are ambiguous.
+        {
+            let mut ws = make_workspace("ws-4", "Strict2");
+            ws.repository_owner = Some("acme".to_string());
+            ws.repository_name = Some("WIDGET".to_string());
+            ws.repository_path = Some("/checkouts/strict-2".to_string());
+            fake.workspaces.lock().unwrap().push(ws);
+        }
+        assert_eq!(
+            lookup_known_repo_local_path(&api, "https://github.com/acme/widget").await,
+            None
+        );
+    }
+
     #[tokio::test]
     async fn test_create_hydration_no_match_leaves_paths_unset() {
         let fake = Arc::new(FakeApi::default());
@@ -2044,7 +2586,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "The Chief virtual workspace cannot be modified"
+            "The Assistant virtual workspace cannot be modified"
         );
     }
 
@@ -2100,7 +2642,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "The Chief virtual workspace cannot be modified"
+            "The Assistant virtual workspace cannot be modified"
         );
     }
 
@@ -2169,7 +2711,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "The Chief virtual workspace cannot be modified"
+            "The Assistant virtual workspace cannot be modified"
         );
     }
 
@@ -2315,7 +2857,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "The Chief virtual workspace cannot be modified"
+            "The Assistant virtual workspace cannot be modified"
         );
     }
 

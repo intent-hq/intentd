@@ -4,9 +4,8 @@
 //! initial create and the resume-impossible recreate path — so delegated
 //! Codex threads stop titling themselves from the prepended system prompt.
 //!
-//! The `codex` provider is resolved hermetically via a `providers.paths`
-//! override in `config.toml` pointing at a shell wrapper that execs the
-//! deterministic mock fixture (the cross-provider-history pattern), and the
+//! A process-local node/npx pair resolves the selected Codex package to the
+//! deterministic mock fixture without npm or model access, and the
 //! fixture's `MOCK_AGENT_SESSION_LOG` seam records each `session/new` /
 //! `session/load` WITH the request's `_meta` verbatim. Sequence proven on
 //! the wire: turn 1 `session/new` carries exactly
@@ -20,8 +19,7 @@
 
 mod common;
 
-use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +35,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -49,26 +46,22 @@ const AGENT_NAME: &str = "Codex Title E2E";
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let log_path = self.data_dir.join("daemon.log");
+        let log_path = self.data_dir.path().join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-codextitle-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-codextitle-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -76,9 +69,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -275,40 +267,6 @@ fn gate(test: &str) -> Option<String> {
     Some(script)
 }
 
-/// Write an executable shell wrapper that execs the mock fixture under `node`,
-/// discarding whatever base args the daemon passes for the impersonated
-/// codex provider — the fixture speaks ACP on stdio and ignores argv anyway.
-fn write_provider_wrapper(data_dir: &Path, script: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let node = intent_providers::resolve_on_path("node").expect("node on PATH (gated)");
-    let wrapper = data_dir.join("fake-codex");
-    std::fs::write(
-        &wrapper,
-        format!("#!/bin/sh\nexec \"{}\" \"{}\"\n", node.display(), script),
-    )
-    .expect("write wrapper");
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod wrapper");
-    wrapper
-}
-
-/// Seed `config.toml` with a `providers.paths` override pinning `codex` to the
-/// wrapper — the highest-precedence tier of provider binary resolution, so a
-/// real codex install (PATH or npx fallback) can never be picked up.
-fn seed_codex_path_override(data_dir: &Path, wrapper: &Path) {
-    let path = data_dir.join("config.toml");
-    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    let _ = write!(
-        text,
-        "\n[providers.paths]\ncodex = \"{}\"\n",
-        wrapper.display()
-    );
-    std::fs::write(&path, text).expect("write config.toml");
-}
-
 /// Parse the mock fixture's session-lifecycle log: one
 /// `{ method, sessionId, pid, meta }` JSON line per `session/new` /
 /// `session/load` the child received (`MOCK_AGENT_SESSION_LOG` seam), with
@@ -372,26 +330,29 @@ async fn codex_session_new_carries_session_title_meta_over_wss() {
         return;
     };
 
-    let data_dir = temp_data_dir();
-    let wrapper = write_provider_wrapper(&data_dir, &script);
-    seed_codex_path_override(&data_dir, &wrapper);
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let toolchain = common::codex_npx::install(&data_dir, &script);
     let pid_file = data_dir.join("pids.txt");
     let pid_file_s = pid_file.to_string_lossy().into_owned();
     let session_log = data_dir.join("sessions.txt");
     let session_log_s = session_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "CODEX_TITLE_E2E_REPLY" }).to_string();
-    let env: [(&str, &str); 6] = [
+    let mut env: Vec<(&str, &str)> = toolchain
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    env.extend([
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PID_FILE", &pid_file_s),
         ("MOCK_AGENT_SESSION_LOG", &session_log_s),
-    ];
+    ]);
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");

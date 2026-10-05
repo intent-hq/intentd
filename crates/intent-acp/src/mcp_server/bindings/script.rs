@@ -8,16 +8,43 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use intent_core::{ScriptCreateParams, ScriptMode, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, ScriptCreateParams, ScriptMode, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
 use super::{map_err, opt_bool, opt_i64, opt_str, req_str};
 
+/// Seconds held back from the `workspace_api` eval budget so `script.run`
+/// can return its `timedOut` envelope before the transport aborts the call.
+/// Covers the PTY host's 2s TERM grace before SIGKILL on a TERM-trapping
+/// child, the kill / straggler-reap / scrollback-read tail after the run
+/// timeout, and the eval time already spent before the binding is invoked.
+const RUN_TIMEOUT_MARGIN_SECS: u64 = 5;
+
+/// The largest `timeoutSeconds` one `ws.script.run` call can honor under
+/// `budget`: `floor(budget) - 5`, never below 1 (25s on the default 30s
+/// budget). `script_run` kills the process when its timeout elapses, so a
+/// wait longer than the eval budget would be aborted by the transport while
+/// the process keeps running — the binding rejects such requests up front
+/// instead of clamping them (monorepo#4703).
+fn run_timeout_ceiling_secs(budget: Duration) -> i64 {
+    let ceiling = budget
+        .as_secs()
+        .saturating_sub(RUN_TIMEOUT_MARGIN_SECS)
+        .max(1);
+    i64::try_from(ceiling).unwrap_or(i64::MAX)
+}
+
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.script = {
-        list: () => host({ method: 'script.list' }),
+        monitor: (scriptId, options) => host({ method: 'script.monitor', args: { scriptId, ...(options || {}) } }),
+        monitors: () => host({ method: 'script.monitors', args: {} }),
+        unmonitor: (monitorId) => host({ method: 'script.unmonitor', args: { monitorId } }),
+        list: (options) => host({ method: 'script.list', args: options || {} }),
+        archive: (scriptIds) => host({ method: 'script.archive', args: { scriptIds } }),
+        restore: (scriptIds) => host({ method: 'script.restore', args: { scriptIds } }),
         create: (name, command, mode, options) =>
             host({ method: 'script.create', args: { name, command, mode, ...(options || {}) } }),
         remove: (scriptId) => host({ method: 'script.remove', args: { scriptId } }),
@@ -32,14 +59,43 @@ pub(crate) const PRELUDE: &str = r"
     };
 ";
 
+/// `budget` is the caller's effective `workspace_api` eval budget; `run`
+/// derives its `timeoutSeconds` ceiling from it.
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    budget: Duration,
+    caller: Option<&AgentId>,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
     match method {
-        "list" => list(api, ws).await,
+        "monitor" => api
+            .script_monitor(
+                ws.clone(),
+                monitor_owner(caller)?,
+                req_str(args, "scriptId")?,
+                args.clone(),
+            )
+            .await
+            .map_err(map_err),
+        "monitors" => api
+            .script_monitor_list(ws.clone(), Some(monitor_owner(caller)?))
+            .await
+            .map(|v| v["monitors"].clone())
+            .map_err(map_err),
+        "unmonitor" => api
+            .script_monitor_cancel(
+                ws.clone(),
+                req_str(args, "monitorId")?,
+                Some(monitor_owner(caller)?),
+                false,
+            )
+            .await
+            .map_err(map_err),
+        "list" => list(api, ws, args).await,
+        "archive" => archive(api, ws, args, true).await,
+        "restore" => archive(api, ws, args, false).await,
         "create" => create(api, ws, args).await,
         "remove" => remove(api, ws, args).await,
         "start" => start(api, ws, args).await,
@@ -47,12 +103,38 @@ pub(crate) async fn dispatch(
         "restart" => restart(api, ws, args).await,
         "output" => output(api, ws, args).await,
         "status" => status(api, ws, args).await,
-        "run" => run(api, ws, args).await,
+        "run" => run(api, ws, budget, args).await,
         other => Err(format!("host: unknown method `script.{other}`")),
     }
 }
 
-async fn list(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
+fn monitor_owner(caller: Option<&AgentId>) -> Result<AgentId, String> {
+    caller
+        .cloned()
+        .ok_or_else(|| "script monitoring requires an authenticated agent caller".into())
+}
+
+async fn archive(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+    archive: bool,
+) -> Result<Value, String> {
+    let ids: Vec<String> =
+        serde_json::from_value(args.get("scriptIds").cloned().unwrap_or(Value::Null))
+            .map_err(|e| format!("Invalid scriptIds: {e}"))?;
+    if archive {
+        api.script_archive(ws.clone(), ids).await.map_err(map_err)
+    } else {
+        api.script_restore(ws.clone(), ids).await.map_err(map_err)
+    }
+}
+
+async fn list(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
     // The reference `ws.script.list()` (see `ws-script-api.ts`) returns a
     // bare array of scripts, but the production `WorkspaceApi::script_list`
     // (via `intent-services::ScriptManager::list`) wraps them as
@@ -60,7 +142,16 @@ async fn list(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, St
     // JS callers get the documented shape; fall back to the raw value for
     // forward-compatibility with any daemon that already returns a bare
     // array.
-    let raw = api.script_list(ws.clone()).await.map_err(map_err)?;
+    let archive = args
+        .get("archive")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|e| format!("Invalid archive: {e}"))?
+        .unwrap_or(intent_core::ScriptArchiveFilter::Active);
+    let raw = api
+        .script_list_filtered(ws.clone(), archive)
+        .await
+        .map_err(map_err)?;
     if let Some(inner) = raw.get("scripts") {
         return Ok(inner.clone());
     }
@@ -107,6 +198,11 @@ async fn create(
         }
     };
     let params = ScriptCreateParams {
+        purpose: args
+            .get("purpose")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|e| format!("Invalid purpose: {e}"))?,
         name,
         command,
         mode,
@@ -186,11 +282,33 @@ async fn status(
         .map_err(map_err)
 }
 
-async fn run(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, args: &Value) -> Result<Value, String> {
+async fn run(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    budget: Duration,
+    args: &Value,
+) -> Result<Value, String> {
     let script_id = req_str(args, "scriptId").map_err(|_| "scriptId is required".to_string())?;
     let max_lines = opt_i64(args, "maxLines");
-    // `timeoutSeconds` with the `timeout` alias (reference parity).
-    let timeout_seconds = opt_i64(args, "timeoutSeconds").or_else(|| opt_i64(args, "timeout"));
+    let ceiling = run_timeout_ceiling_secs(budget);
+    // `timeoutSeconds` with the `timeout` alias (reference parity). An
+    // omitted or non-positive timeout defaults to the ceiling: `None` and
+    // non-positive values both make the service layer wait unbounded, so the
+    // `timedOut` envelope would never be reachable within the budget.
+    let timeout_seconds = match opt_i64(args, "timeoutSeconds").or_else(|| opt_i64(args, "timeout"))
+    {
+        Some(requested) if requested > ceiling => {
+            return Err(format!(
+                "ws.script.run: timeoutSeconds {requested} exceeds what one workspace_api call \
+                 can wait for (ceiling {ceiling}s, budget {}s). Start the script with \
+                 ws.script.start(scriptId) and register ws.script.monitor with a required ttlMs; \
+                 then read ws.script.output(scriptId) after its wake.",
+                budget.as_secs()
+            ));
+        }
+        Some(requested) if requested > 0 => Some(requested),
+        _ => Some(ceiling),
+    };
     api.script_run(ws.clone(), script_id, max_lines, timeout_seconds)
         .await
         .map_err(map_err)
@@ -204,5 +322,20 @@ fn type_name(v: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_timeout_ceiling_is_budget_minus_margin_floored_at_one() {
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(30)), 25);
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_millis(30_900)), 25);
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(120)), 115);
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(6)), 1);
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(3)), 1);
+        assert_eq!(run_timeout_ceiling_secs(Duration::from_millis(250)), 1);
     }
 }

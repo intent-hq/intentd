@@ -24,13 +24,11 @@ const NEXT_STEPS_OFF: &str = "## Suggested Next Steps\n\n\
 const AUTO_COMMIT_CLAUSE: &str = " Auto-commit is enabled; do not include prompts about \
     committing or reviewing changes before committing.";
 
+/// The v2.3 row stays bundled after the bump so a "2.3"-stamped session
+/// keeps resolving its own doctrine (`v2_4_goldens` pins the current stamp).
 #[test]
-fn current_harness_version_is_v2_3() {
-    assert_eq!(intent_core::model::CURRENT_HARNESS_VERSION, "2.3");
-    assert_eq!(
-        crate::harness::resolve_entry(intent_core::model::CURRENT_HARNESS_VERSION).version,
-        "2.3"
-    );
+fn v2_3_stays_registered() {
+    assert_eq!(crate::harness::resolve_entry("2.3").version, "2.3");
 }
 
 /// Exact bytes of the reworded block, both auto-commit variants. The

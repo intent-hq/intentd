@@ -16,7 +16,7 @@
 mod common;
 
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,15 +33,11 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-reap-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-reap-")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -72,7 +68,7 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     let mut buf = String::new();
     timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
         .await
-        .expect("uds rpc timed out")
+        .unwrap_or_else(|_| panic!("UDS RPC {method} (id {id}) timed out waiting for response"))
         .expect("read uds response");
     serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
@@ -173,7 +169,9 @@ where
     loop {
         let next = timeout(Duration::from_secs(15), ws.next())
             .await
-            .expect("wss rpc timed out");
+            .unwrap_or_else(|_| {
+                panic!("WSS RPC {method} (id {id}) timed out waiting for response")
+            });
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -277,7 +275,8 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
         return;
     };
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let ws_id = "ws-reap-test";
 
@@ -298,12 +297,20 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
     let pid_file = data_dir.join("tree-pids.json");
     let behavior = json!({ "blockUntilCancel": true }).to_string();
     common::enable_ws_api(&data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    let mut cmd = common::serve_command();
+    common::hermetic_github_identity(&mut cmd, &data_dir);
+    // gh auth token can otherwise select an inherited enterprise credential.
+    cmd.env_remove("GH_HOST")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
         .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", "0")
         .env("MOCK_AGENT_SCRIPT_PATH", &script)
         .env("MOCK_AGENT_BEHAVIOR", &behavior)
         .env("MOCK_AGENT_TREE_PID_FILE", &pid_file)
@@ -314,8 +321,29 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
     // Own process group so the DaemonGuard's SIGKILL cannot leak mock children
     // if the test panics before the graceful path runs.
     cmd.process_group(0);
+    // Assert before boot so a missing override cannot fall back to shared state.
+    let explicit_env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+    let owned_workspaces = explicit_env.get(std::ffi::OsStr::new("INTENTD_WORKSPACES_DIR"))
+        == Some(&Some(data_dir.join("workspaces").as_os_str()));
+    let owned_secrets = explicit_env.get(std::ffi::OsStr::new("INTENTD_SECRETS_FILE"))
+        == Some(&Some(data_dir.join("secrets.json").as_os_str()));
+    let isolated_gh = explicit_env.get(std::ffi::OsStr::new("GH_CONFIG_DIR"))
+        == Some(&Some(data_dir.join("gh-config").as_os_str()));
+    let no_host_auth_env = [
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GH_HOST",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ]
+    .iter()
+    .all(|key| explicit_env.get(std::ffi::OsStr::new(key)) == Some(&None));
+    assert!(
+        owned_workspaces && owned_secrets && isolated_gh && no_host_auth_env,
+        "shutdown fixture isolation: owned workspaces={owned_workspaces}, owned secrets={owned_secrets}, disposable GH_CONFIG_DIR={isolated_gh}, removed credential env={no_host_auth_env}"
+    );
     let child = cmd.spawn().expect("spawn intentd serve");
-    let mut daemon = DaemonGuard::new(child, data_dir.clone(), true);
+    let mut daemon = DaemonGuard::process_only(child);
     if !await_uds(&socket).await {
         if let Ok(log) = std::fs::read_to_string(data_dir.join("daemon.log")) {
             eprintln!("Daemon log:\n{log}");
@@ -436,8 +464,11 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
         }
     })
     .await
-    .expect("daemon did not exit after system.shutdown");
-    assert!(exit_ok, "daemon exited non-zero");
+    .expect(
+        "daemon-exit phase timed out after system.shutdown acknowledgement and provider tree reap",
+    );
+    assert!(exit_ok, "daemon-exit phase returned a non-zero status");
+    eprintln!("shutdown complete: provider tree reaped; daemon exited successfully");
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
@@ -457,6 +488,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -482,10 +514,12 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }

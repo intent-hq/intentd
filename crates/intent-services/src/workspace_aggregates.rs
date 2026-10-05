@@ -111,7 +111,7 @@ impl WorkspaceAggregateCache {
             return;
         }
         let cache = Arc::clone(self);
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let _ = cache.cow_supported(workspaces_root).await;
         });
     }
@@ -141,7 +141,7 @@ impl WorkspaceAggregateCache {
                 flights.insert(key.clone(), receiver.clone());
                 let cache = Arc::clone(self);
                 let flight_key = key.clone();
-                tokio::spawn(async move {
+                intent_core::spawn_daemon(async move {
                     let _in_flight = CowInFlightGuard {
                         flights: Arc::clone(&cache.cow_in_flight),
                         key: flight_key,

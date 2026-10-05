@@ -8,7 +8,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -25,23 +24,15 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-clone-err-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-clone-err-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -60,7 +51,7 @@ async fn boot() -> Fixture {
     Fixture {
         _ws: ws,
         port,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -105,12 +96,12 @@ async fn spawn_401_server() -> u16 {
         .await
         .expect("bind 401 server");
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else {
                 break;
             };
-            tokio::spawn(async move {
+            intent_core::spawn_daemon(async move {
                 let mut buf = [0u8; 4096];
                 let _ = sock.read(&mut buf).await;
                 let _ = sock
@@ -130,7 +121,7 @@ async fn spawn_401_server() -> u16 {
 
 /// A `clonePath` whose target has no file name is rejected pre-clone with a
 /// typed `path-invalid` error (-32602) instead of a generic failure.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_invalid_clone_path_returns_path_invalid() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -172,7 +163,7 @@ async fn workspace_create_invalid_clone_path_returns_path_invalid() {
 /// disabled) surfaces as a typed `auth-required` error (-32603) whose message
 /// and `data.detail` carry the sanitized git stderr tail — never a bare
 /// "Internal error".
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_auth_required_clone_returns_typed_error() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -214,18 +205,14 @@ async fn workspace_create_auth_required_clone_returns_typed_error() {
 
 /// A clone target that already exists (and is non-empty) is rejected
 /// pre-clone with a typed `destination-exists-non-empty` error (-32602).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_create_existing_clone_target_returns_destination_exists() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
 
-    let occupied = std::env::temp_dir().join(format!(
-        "clone-err-occupied-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::create_dir_all(&occupied).unwrap();
     // Drop guard so a failing assertion below cannot leak the dir in /tmp.
-    let _occupied_guard = TempDir(occupied.clone());
+    let occupied_guard = common::test_tempdir("clone-err-occupied-");
+    let occupied = occupied_guard.path().to_path_buf();
     std::fs::write(occupied.join("keep.txt"), "occupied").unwrap();
 
     let resp = wss_rpc_raw(

@@ -162,6 +162,9 @@ fn logout_with(cli: &dyn GhCli, revoked: Option<SecretString>) -> GhLogoutOutcom
 /// caller's flow proceeds unaffected. Runs the blocking work (secret-store
 /// read + subprocesses) on the blocking pool, bounded by [`GH_SYNC_TIMEOUT`].
 pub async fn sync_token_to_gh(store: FileSecretStore) {
+    if !crate::token::gh_credential_access_allowed() {
+        return;
+    }
     let handle = tokio::task::spawn_blocking(move || {
         let token = store
             .load(SECRET_ACCOUNT)
@@ -212,6 +215,9 @@ pub async fn sync_token_to_gh(store: FileSecretStore) {
 /// unaffected. Runs the blocking work (subprocesses) on the blocking pool,
 /// bounded by [`GH_SYNC_TIMEOUT`].
 pub async fn logout_gh_after_revoke(revoked: Option<String>) {
+    if !crate::token::gh_credential_access_allowed() {
+        return;
+    }
     let revoked = revoked
         .filter(|t| !t.trim().is_empty())
         .map(SecretString::from);
@@ -380,7 +386,7 @@ mod tests {
     /// no real `gh` is ever spawned from tests.
     // Test mock: independent scenario bools, and `Option<Option<_>>` recorders
     // distinguishing "never called" from "called with None".
-    #[allow(clippy::struct_excessive_bools, clippy::option_option)]
+    #[expect(clippy::struct_excessive_bools, clippy::option_option)]
     struct MockGhCli {
         installed: bool,
         authenticated: bool,
@@ -465,7 +471,7 @@ mod tests {
         }
     }
 
-    #[allow(clippy::unnecessary_wraps)] // helper mirrors the Option the API under test takes
+    #[expect(clippy::unnecessary_wraps)] // helper mirrors the Option the API under test takes
     fn token() -> Option<SecretString> {
         Some(SecretString::from("gho_test_sync"))
     }
@@ -532,7 +538,7 @@ mod tests {
         sync_token_to_gh(store).await;
     }
 
-    #[allow(clippy::unnecessary_wraps)] // helper mirrors the Option the API under test takes
+    #[expect(clippy::unnecessary_wraps)] // helper mirrors the Option the API under test takes
     fn revoked() -> Option<SecretString> {
         Some(SecretString::from("gho_test_revoked"))
     }

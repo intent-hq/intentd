@@ -1,15 +1,16 @@
 //! Workspace repository: insert + list, mapping rows ↔ [`Workspace`] (§9.2).
 
 use intent_core::{
-    now_iso, CheckoutMode, ClientId, ContextLink, Error, PullRequestInfo, Result, SetupScript,
-    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
-    CHIEF_WORKSPACE_ID,
+    now_iso, AgentId, CheckoutMode, ClientId, ContextLink, Error, PullRequestInfo, Result,
+    SetupScript, TokenUsage, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
+    WorkspaceStatus, CHIEF_WORKSPACE_ID,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
 use crate::agent_repo::{
-    fetch_agent_usage_rows, UNREAD_TOP_LEVEL_SESSION_INDEX, UNREAD_TOP_LEVEL_SESSION_PREDICATE,
+    delete_in_bounded_batches, fetch_agent_usage_rows, DELETE_CASCADE_BATCH,
+    UNREAD_TOP_LEVEL_SESSION_INDEX, UNREAD_TOP_LEVEL_SESSION_PREDICATE,
 };
 use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, AgentUsageRow, Store};
 
@@ -18,7 +19,38 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
     tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode, \
-    browser_client_id";
+    browser_client_id, last_content_activity";
+
+// Shared with deletion query-cost regressions so they exercise the exact
+// production statements, including their candidate-selection work.
+pub(crate) const CLEAR_NOTE_PARENT_BATCH_SQL: &str =
+    "UPDATE note SET parent_id = NULL WHERE rowid IN \
+    (SELECT rowid FROM note WHERE workspace_id = ? AND parent_id IS NOT NULL LIMIT ?)";
+pub(crate) const DELETE_NOTE_COMMENT_BATCH_SQL: &str = "DELETE FROM comment WHERE rowid IN \
+    (SELECT rowid FROM comment WHERE workspace_id = ? AND note_id IS NOT NULL LIMIT ?)";
+pub(crate) const DELETE_WORKSPACE_BROWSER_BATCH_SQL: &str =
+    "DELETE FROM browser_tab WHERE rowid IN \
+    (SELECT rowid FROM browser_tab WHERE workspace_id = ? LIMIT ?) RETURNING tab_id";
+pub(crate) const DELETE_WORKSPACE_SQL: &str = "DELETE FROM workspace WHERE id = ?";
+
+/// Facts from the original Store deletion, never Services/cleanup completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepositoryWorkspaceDeleteDisposition {
+    /// The original initial query proved absence before deletion work began.
+    NoEffect,
+    /// The original final commit and owned Store completion were acknowledged.
+    Committed,
+    /// The original attempt has not established either of those facts.
+    Unknown,
+}
+
+/// Original result and independent Store-phase facts from the same operation.
+/// A later ownership/worker error does not erase an already acknowledged commit.
+#[derive(Debug)]
+pub struct RepositoryWorkspaceDeleteOutcome {
+    pub result: Result<()>,
+    pub disposition: RepositoryWorkspaceDeleteDisposition,
+}
 
 /// SQL behind [`Store::clear_workspace_unread_if_all_seen`], extracted so the
 /// monorepo#4190 plan-shape guard runs `EXPLAIN` on the exact production
@@ -33,6 +65,12 @@ pub(crate) fn clear_workspace_unread_if_all_seen_sql() -> String {
                  AND {UNREAD_TOP_LEVEL_SESSION_PREDICATE}\
            )"
     )
+}
+
+struct HostWorkspaceAdmission<'a> {
+    expected: &'a crate::RepositoryHostAuthoritySnapshot,
+    token_hash: Option<&'a str>,
+    admit: Box<dyn FnOnce() -> Result<()> + Send + 'a>,
 }
 
 impl Store {
@@ -60,11 +98,56 @@ impl Store {
         ws: &Workspace,
         auto_commit: Option<bool>,
     ) -> Result<()> {
+        self.insert_workspace_inner(ws, auto_commit, None).await
+    }
+
+    /// Insert from an original pre-workspace host admission. The durable facts
+    /// are compared while authority writers are serialized; the synchronous
+    /// callback admits the already-prepared insert after all pool waits.
+    ///
+    /// # Errors
+    /// Refuses changed original authority or a retired caller/source callback.
+    pub async fn insert_workspace_with_host_admission(
+        &self,
+        ws: &Workspace,
+        auto_commit: Option<bool>,
+        expected: &crate::RepositoryHostAuthoritySnapshot,
+        token_hash: Option<&str>,
+        admit: impl FnOnce() -> Result<()> + Send,
+    ) -> Result<()> {
+        self.insert_workspace_inner(
+            ws,
+            auto_commit,
+            Some(HostWorkspaceAdmission {
+                expected,
+                token_hash,
+                admit: Box::new(admit),
+            }),
+        )
+        .await
+    }
+
+    async fn insert_workspace_inner(
+        &self,
+        ws: &Workspace,
+        auto_commit: Option<bool>,
+        admission: Option<HostWorkspaceAdmission<'_>>,
+    ) -> Result<()> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let expected = admission.as_ref().map(|a| (a.expected, a.token_hash));
+        if let Some((expected, token_hash)) = expected {
+            let actual = self
+                .repository_host_authority_snapshot(&expected.principal_id, token_hash)
+                .await?;
+            if actual != *expected {
+                return Err(Error::Forbidden("Repository checkout unavailable".into()));
+            }
+        }
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
-        sqlx::query(&sql)
+        let query = sqlx::query(&sql)
             .bind(&ws.id.0)
             .bind(&ws.title)
             .bind(&ws.branch)
@@ -99,10 +182,26 @@ impl Store {
             .bind(setup_script_to_db(ws)?)
             .bind(checkout_mode_to_db(ws)?)
             .bind(ws.browser_client_id.as_ref().map(|c| c.0.clone()))
-            .bind(auto_commit.map(i64::from))
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
+            .bind(&ws.last_content_activity)
+            .bind(auto_commit.map(i64::from));
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(ws.id.clone())])?;
+        if let Some(admission) = admission {
+            let mut connection =
+                self.write_pool().acquire().await.map_err(|e| {
+                    Error::Internal(format!("insert workspace connection failed: {e}"))
+                })?;
+            (admission.admit)()?;
+            query
+                .execute(&mut *connection)
+                .await
+                .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
+        } else {
+            query
+                .execute(self.write_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
+        }
+        lifecycle.settle();
         Ok(())
     }
 
@@ -124,11 +223,13 @@ impl Store {
         }
     }
 
-    /// Update an existing workspace (full row replace, except `id` and the
-    /// guarded `last_activity`, see below), or `NotFound`. `activity` is
-    /// derived and never persisted (§9.9).
+    /// Update an existing workspace, preserving `branch`, `id`, the
+    /// guarded `last_activity` and archive lifecycle columns, or return
+    /// `NotFound`. Returns the stored branch.
+    /// `activity` is derived and never persisted (§9.9).
     ///
-    /// `last_activity` is the one exception to the full-row replace
+    /// Explicit branch changes use [`Self::update_workspace_with_branch`].
+    /// `last_activity` is one exception to the full-row replace
     /// (monorepo#1585): it goes through the same monotonic guard as
     /// [`Self::bump_workspace_last_activity`] — the candidate writes only when
     /// it parses AND the stored value is NULL, unparseable, or strictly older.
@@ -136,27 +237,66 @@ impl Store {
     /// read predated a concurrent bump can never silently revert it (the
     /// `attention` clobber shape fixed by #1481).
     ///
+    /// The archive lifecycle is another exception: `archived` /
+    /// `archived_at` are NEVER written here, and `status` holds whenever the
+    /// row is archived or the candidate is `Archived`. Those columns move
+    /// only through the scoped, fenced flips
+    /// ([`Self::archive_workspace_detaching_guests`] /
+    /// [`Self::unarchive_workspace_if_archived`]), so a full-row write from a
+    /// snapshot read before a concurrent archive can never resurrect the
+    /// workspace behind the archive's guest sweep (the `workspace.archive`
+    /// fence relies on this — see `ArchiveFence` in `intent-services`).
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
-    pub async fn update_workspace(&self, ws: &Workspace) -> Result<()> {
-        let res = sqlx::query(
-            "UPDATE workspace SET title=?, branch=?, base_ref=?, base_commit_sha=?, status=?, \
+    pub async fn update_workspace(&self, ws: &Workspace) -> Result<String> {
+        self.update_workspace_with_branch(ws, None).await
+    }
+
+    /// Update workspace fields and optionally apply an explicit branch edit.
+    /// Returns the stored branch so responses cannot echo a stale snapshot.
+    ///
+    /// # Errors
+    /// Returns `Error::NotFound` for a missing workspace or an error on database failure.
+    pub async fn update_workspace_with_branch(
+        &self,
+        ws: &Workspace,
+        branch: Option<&str>,
+    ) -> Result<String> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let current = self.get_workspace(&ws.id).await?;
+        if current.path != ws.path
+            || current.repository_path != ws.repository_path
+            || current.worktree_path != ws.worktree_path
+            || current.scope != ws.scope
+            || current.skip_worktree != ws.skip_worktree
+            || current.is_remote != ws.is_remote
+            || branch.is_some_and(|branch| current.branch != branch)
+        {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(ws.id.clone())])?;
+        }
+        let status = enum_to_db(&ws.status)?;
+        let row = sqlx::query(
+            "UPDATE workspace SET title=?, branch=COALESCE(?, branch), base_ref=?, base_commit_sha=?, \
+             status=CASE WHEN archived = 1 OR ? = ? THEN status ELSE ? END, \
              status_message=?, status_image_asset_id=?, attention=?, path=?, repository_path=?, \
              repository_owner=?, repository_name=?, worktree_path=?, scope=?, skip_worktree=?, \
              is_remote=?, default_model=?, pr_number=?, pr_url=?, pr_status=?, \
-             active_pull_request=?, pull_requests=?, context_links=?, archived=?, archived_at=?, \
+             active_pull_request=?, pull_requests=?, context_links=?, \
              tags=?, created_at=?, updated_at=?, \
              last_activity=CASE WHEN julianday(?) IS NOT NULL \
                AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
                OR julianday(last_activity) < julianday(?)) THEN ? ELSE last_activity END, \
-             token_usage=?, setup_script=?, checkout_mode=? WHERE id=?",
+             token_usage=?, setup_script=?, checkout_mode=? WHERE id=? RETURNING branch",
         )
         .bind(&ws.title)
-        .bind(&ws.branch)
+        .bind(branch)
         .bind(&ws.base_ref)
         .bind(&ws.base_commit_sha)
-        .bind(enum_to_db(&ws.status)?)
+        .bind(&status)
+        .bind(enum_to_db(&WorkspaceStatus::Archived)?)
+        .bind(&status)
         .bind(&ws.status_message)
         .bind(&ws.status_image_asset_id)
         .bind(enum_to_db(&ws.attention)?)
@@ -175,8 +315,6 @@ impl Store {
         .bind(active_pr_to_db(ws)?)
         .bind(pull_requests_to_db(ws)?)
         .bind(context_links_to_db(ws)?)
-        .bind(i64::from(ws.archived))
-        .bind(&ws.archived_at)
         .bind(tags_to_db(&ws.tags)?)
         .bind(&ws.created_at)
         .bind(&ws.updated_at)
@@ -187,13 +325,54 @@ impl Store {
         .bind(setup_script_to_db(ws)?)
         .bind(checkout_mode_to_db(ws)?)
         .bind(&ws.id.0)
-        .execute(self.write_pool())
+        .fetch_optional(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("update workspace failed: {e}")))?;
-        if res.rows_affected() == 0 {
-            return Err(Error::NotFound(format!("workspace {}", ws.id)));
+        lifecycle.settle();
+        match row {
+            Some(row) => col(&row, "branch"),
+            None => Err(Error::NotFound(format!("workspace {}", ws.id))),
         }
-        Ok(())
+    }
+
+    /// Reconcile an observed branch without overwriting concurrent workspace edits.
+    /// A renamed or switched branch is no longer eligible for automatic deletion.
+    ///
+    /// # Errors
+    /// Returns an error if the database write fails.
+    pub async fn reconcile_workspace_branch(
+        &self,
+        expected: &Workspace,
+        branch: &str,
+    ) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let changes: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM workspace WHERE id=? AND branch=? AND branch<>? AND worktree_path IS ? AND repository_path IS ? AND is_remote=0)",
+        ).bind(&expected.id.0).bind(&expected.branch).bind(branch)
+            .bind(&expected.worktree_path).bind(&expected.repository_path)
+            .fetch_one(self.read_pool()).await
+            .map_err(|e| Error::Internal(format!("read branch binding failed: {e}")))?;
+        if changes {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(
+                expected.id.clone(),
+            )])?;
+        }
+        let result = sqlx::query(
+            "UPDATE workspace SET branch = ?, branch_auto_generated = 0 \
+             WHERE id = ? AND branch = ? AND branch <> ? \
+             AND worktree_path IS ? AND repository_path IS ? AND is_remote = 0",
+        )
+        .bind(branch)
+        .bind(&expected.id.0)
+        .bind(&expected.branch)
+        .bind(branch)
+        .bind(&expected.worktree_path)
+        .bind(&expected.repository_path)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("reconcile workspace branch failed: {e}")))?;
+        lifecycle.settle();
+        Ok(result.rows_affected() != 0)
     }
 
     /// Scoped PR-linkage write: set ONLY the PR columns (`pr_number`,
@@ -211,24 +390,175 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn update_workspace_pr_linkage(&self, ws: &Workspace) -> Result<()> {
-        let res = sqlx::query(
-            "UPDATE workspace SET pr_number=?, pr_url=?, pr_status=?, \
-             active_pull_request=?, pull_requests=?, updated_at=? WHERE id=?",
-        )
-        .bind(ws.pr_number.map(u64::cast_signed))
-        .bind(&ws.pr_url)
-        .bind(pr_status_to_db(ws)?)
-        .bind(active_pr_to_db(ws)?)
-        .bind(pull_requests_to_db(ws)?)
-        .bind(&ws.updated_at)
-        .bind(&ws.id.0)
-        .execute(self.write_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("update workspace pr linkage failed: {e}")))?;
+        let res = pr_linkage_update(ws)?
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("update workspace pr linkage failed: {e}")))?;
         if res.rows_affected() == 0 {
             return Err(Error::NotFound(format!("workspace {}", ws.id)));
         }
         Ok(())
+    }
+
+    /// [`Self::update_workspace_pr_linkage`] rebased on the row at write
+    /// time (intent-hq/intent#5654): inside ONE `BEGIN IMMEDIATE` write-pool
+    /// transaction, read the stored `pull_requests`, hand it to the caller's
+    /// synchronous `rebase` closure together with the entity about to be
+    /// written, then perform the same scoped PR-columns `UPDATE` from the
+    /// (possibly amended) entity. The REST-only PR refreshes build their
+    /// list from a row read that predates the forge round trip, so a
+    /// signal-bearing fold landing in between would otherwise be clobbered;
+    /// the closure (intent-services owns the merge rule) re-derives the
+    /// `is_in_merge_queue` carry against the current row instead. Same
+    /// envelope and layering as [`Self::update_workspace_token_usage`];
+    /// a malformed stored list decodes to `None` (the closure then keeps
+    /// the entity's list). `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn update_workspace_pr_linkage_rebased<F>(
+        &self,
+        ws: &mut Workspace,
+        rebase: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut Workspace, Option<Vec<PullRequestInfo>>),
+    {
+        let mut conn = self.write_pool().acquire().await.map_err(|e| {
+            Error::Internal(format!("update workspace pr linkage acquire failed: {e}"))
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("update workspace pr linkage begin failed: {e}"))
+            })?;
+
+        let body_result = async {
+            let row = sqlx::query("SELECT pull_requests FROM workspace WHERE id = ?")
+                .bind(&ws.id.0)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("update workspace pr linkage read failed: {e}"))
+                })?;
+            let Some(row) = row else {
+                return Err(Error::NotFound(format!("workspace {}", ws.id)));
+            };
+            let persisted = row
+                .get::<Option<String>, _>("pull_requests")
+                .and_then(|s| serde_json::from_str::<Vec<PullRequestInfo>>(&s).ok());
+            rebase(ws, persisted);
+            let res = pr_linkage_update(ws)?
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("update workspace pr linkage failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("workspace {}", ws.id)));
+            }
+            Ok(())
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(
+            conn,
+            body_result,
+            "update workspace pr linkage commit failed",
+        )
+        .await
+    }
+
+    /// Project onto a workspace's persisted PR snapshots atomically
+    /// (intent-hq/intent#5654, the cache-hit fold): inside ONE
+    /// `BEGIN IMMEDIATE` write-pool transaction, read the stored
+    /// `pull_requests` and `active_pull_request`, hand both to the caller's
+    /// synchronous `project` closure, and — when it returns `true` — write
+    /// back ONLY those two columns plus `updated_at`. The closure never
+    /// sees a pre-read entity, so a REST refresh that committed between
+    /// the caller's row lookup and this write is what gets projected onto,
+    /// never rolled back; the linked scalars (`pr_number`, `pr_url`,
+    /// `pr_status`) are untouched. Returns the written pair on a committed
+    /// write, `None` when the closure declined. `NotFound` when the
+    /// workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails or a stored snapshot is malformed.
+    pub async fn project_workspace_pr_snapshots<F>(
+        &self,
+        id: &WorkspaceId,
+        updated_at: &str,
+        project: F,
+    ) -> Result<Option<(Option<Vec<PullRequestInfo>>, Option<PullRequestInfo>)>>
+    where
+        F: FnOnce(&mut Option<Vec<PullRequestInfo>>, &mut Option<PullRequestInfo>) -> bool,
+    {
+        let mut conn = self.write_pool().acquire().await.map_err(|e| {
+            Error::Internal(format!(
+                "project workspace pr snapshots acquire failed: {e}"
+            ))
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("project workspace pr snapshots begin failed: {e}"))
+            })?;
+
+        let body_result = async {
+            let row = sqlx::query(
+                "SELECT pull_requests, active_pull_request FROM workspace WHERE id = ?",
+            )
+            .bind(&id.0)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("project workspace pr snapshots read failed: {e}"))
+            })?;
+            let Some(row) = row else {
+                return Err(Error::NotFound(format!("workspace {id}")));
+            };
+            let mut pool = pull_requests_from_db(row.get::<Option<String>, _>("pull_requests"))?;
+            let mut active =
+                active_pr_from_db(row.get::<Option<String>, _>("active_pull_request"))?;
+            if !project(&mut pool, &mut active) {
+                return Ok(None);
+            }
+            let pool_json = pool
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| Error::Internal(format!("encode pull_requests failed: {e}")))?;
+            let active_json = active
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| Error::Internal(format!("encode active_pull_request failed: {e}")))?;
+            let res = sqlx::query(
+                "UPDATE workspace SET pull_requests=?, active_pull_request=?, updated_at=? \
+                 WHERE id=?",
+            )
+            .bind(pool_json)
+            .bind(active_json)
+            .bind(updated_at)
+            .bind(&id.0)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("project workspace pr snapshots failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("workspace {id}")));
+            }
+            Ok(Some((pool, active)))
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(
+            conn,
+            body_result,
+            "project workspace pr snapshots commit failed",
+        )
+        .await
     }
 
     /// Recompute-and-store a workspace's `token_usage` snapshot atomically
@@ -236,8 +566,9 @@ impl Store {
     /// per-session usage rows and the stored workspace `token_usage`, invoke
     /// the caller's synchronous `compute` closure with both, and — when it
     /// returns `Some(new_usage)` — perform a scoped
-    /// `UPDATE workspace SET token_usage=?, updated_at=?` (never a full-row
-    /// replace, so a concurrent title/status update is never clobbered).
+    /// `UPDATE workspace SET token_usage=?` (never a full-row replace, so a
+    /// concurrent title/status update is never clobbered). Usage bookkeeping
+    /// preserves activity timestamps: a background recount is not new work.
     /// Returns the written [`TokenUsage`] on a committed write, `None` when
     /// the closure declined. `NotFound` if the workspace row is absent.
     /// Layering: aggregation stays in intent-services via the closure; the
@@ -300,9 +631,8 @@ impl Store {
             };
             let json = serde_json::to_string(&new_usage)
                 .map_err(|e| Error::Internal(format!("encode token_usage failed: {e}")))?;
-            let res = sqlx::query("UPDATE workspace SET token_usage=?, updated_at=? WHERE id=?")
+            let res = sqlx::query("UPDATE workspace SET token_usage=? WHERE id=?")
                 .bind(json)
-                .bind(now_iso())
                 .bind(&workspace_id.0)
                 .execute(&mut *conn)
                 .await
@@ -433,6 +763,16 @@ impl Store {
         id: &WorkspaceId,
         updated_at: &str,
     ) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let archived: Option<bool> =
+            sqlx::query_scalar("SELECT archived FROM workspace WHERE id=?")
+                .bind(&id.0)
+                .fetch_optional(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("read archive binding failed: {e}")))?;
+        if archived == Some(true) {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(id.clone())])?;
+        }
         let res = sqlx::query(
             "UPDATE workspace SET status=?, archived=0, archived_at=NULL, updated_at=? \
              WHERE id=? AND archived=1",
@@ -444,6 +784,7 @@ impl Store {
         .await
         .map_err(|e| Error::Internal(format!("conditional unarchive failed: {e}")))?;
         if res.rows_affected() > 0 {
+            lifecycle.settle();
             return Ok(true);
         }
         // Zero rows: either the row is already active (no flip) or the
@@ -459,6 +800,7 @@ impl Store {
         if col::<i64>(&row, "present")? == 0 {
             return Err(Error::NotFound(format!("workspace {id}")));
         }
+        lifecycle.settle();
         Ok(false)
     }
 
@@ -524,22 +866,247 @@ impl Store {
     /// `recentlyDeletedWorkspaces` parity, persisted across restarts).
     /// Also removes the workspace's `draft` rows explicitly — `draft` has no
     /// workspace FK (opaque keys, PROTOCOL §5.16), so no cascade applies.
+    /// The `browser_tab` rows and their process-local `displayed`
+    /// overlay entries are removed together after each committed batch (see
+    /// `browser_tab_repo`).
     ///
-    /// Uses whole-transaction retry to eliminate `SQLITE_BUSY` (code 5) failures
-    /// during lock upgrade under concurrent load (STAB-7).
+    /// Callers must stop the workspace's runtime writers before deletion.
+    /// Histories and other growing children are swept in committed batches,
+    /// releasing the writer between steps (intent-hq/intent#5337). Failure or
+    /// cancellation can leave a live workspace with partially removed data;
+    /// retry resumes cleanup. Only the final row delete and tombstone are
+    /// atomic. Cleanup errors propagate without falling back to a cascade.
+    /// A started browser batch or final transaction finishes its commit and
+    /// overlay eviction even if the caller is cancelled.
+    ///
+    /// The final transaction uses whole-transaction retry to eliminate
+    /// `SQLITE_BUSY` (code 5) lock-upgrade failures under concurrent load (STAB-7).
     ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
-        let pool = self.write_pool();
-        let id = id.clone();
+        self.delete_workspace_with_outcome(id).await.result
+    }
 
-        crate::with_write_txn_retry(|| async {
+    /// Run the same deletion once, retaining facts before projecting its result.
+    ///
+    /// `NoEffect` is only the original initial absent observation. A later
+    /// zero-row delete may follow committed cleanup and remains `Unknown`.
+    /// `Committed` describes the acknowledged final commit and owned Store
+    /// completion, not earlier Services teardown or later filesystem cleanup.
+    /// Cancellation yields no returned outcome; it never proves settlement.
+    pub async fn delete_workspace_with_outcome(
+        &self,
+        id: &WorkspaceId,
+    ) -> RepositoryWorkspaceDeleteOutcome {
+        let mut disposition = RepositoryWorkspaceDeleteDisposition::Unknown;
+        let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = self
+            .delete_workspace_observed(id, &mut disposition, committed.clone())
+            .await;
+        if committed.load(std::sync::atomic::Ordering::Acquire) {
+            disposition = RepositoryWorkspaceDeleteDisposition::Committed;
+        }
+        RepositoryWorkspaceDeleteOutcome {
+            result,
+            disposition,
+        }
+    }
+
+    async fn delete_workspace_observed(
+        &self,
+        id: &WorkspaceId,
+        disposition: &mut RepositoryWorkspaceDeleteDisposition,
+        committed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        // In particular, a missing workspace must not delete opaque draft
+        // keys. The final transaction also checks existence for racing deletes.
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace WHERE id = ?)")
+                .bind(&id.0)
+                .fetch_one(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("delete workspace check failed: {e}")))?;
+        if !exists {
+            *disposition = RepositoryWorkspaceDeleteDisposition::NoEffect;
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(id.clone())])?;
+        // Preserve the existing bounded sweep's writer interleaving and nested
+        // agent deletion; the original barrier remains owned through completion.
+        lifecycle.release_serialization();
+        // With runtime writers stopped, drain recovery history once BEFORE
+        // deleting sessions. Match this workspace's rows, including orphans,
+        // but protect any live session owned by another workspace. A failed
+        // or cancelled batch leaves the sessions intact; retry drains the
+        // remainder before the internal session path skips recovery cleanup.
+        delete_in_bounded_batches(
+            self.write_pool(),
+            "DELETE FROM interrupted_agent WHERE rowid IN \
+             (SELECT rowid FROM interrupted_agent WHERE workspace_id = ?1 \
+              AND NOT EXISTS (SELECT 1 FROM agent_session \
+                              WHERE id = interrupted_agent.agent_id AND workspace_id != ?1) \
+              LIMIT ?2)",
+            &id.0,
+            DELETE_CASCADE_BATCH,
+        )
+        .await?;
+
+        // IDs only: never hydrate sessions or their transcripts. Each session
+        // uses the same bounded payload/message cleanup as agent.delete.
+        while let Some(agent_id) = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM agent_session WHERE workspace_id = ? LIMIT 1",
+        )
+        .bind(&id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("list workspace deletion agents failed: {e}")))?
+        {
+            self.delete_workspace_agent_session(id, &AgentId(agent_id))
+                .await?;
+            tokio::task::yield_now().await;
+        }
+
+        // These registries have no workspace FK. Retry keys must precede
+        // attachments (their FK is NO ACTION). A foreign workspace's
+        // reference must block deletion, never be swept.
+        for (table, predicate) in [
+            ("script", "workspace_id = ?1"),
+            (
+                "attachment_idempotency_keys",
+                "workspace_id = ?1 AND EXISTS (SELECT 1 FROM attachments \
+                 WHERE id = attachment_id AND workspace_id = ?1)",
+            ),
+            ("attachments", "workspace_id = ?1"),
+        ] {
+            let sql = format!(
+                "DELETE FROM {table} WHERE rowid IN \
+                 (SELECT rowid FROM {table} WHERE {predicate} LIMIT ?2)"
+            );
+            delete_in_bounded_batches(self.write_pool(), &sql, &id.0, DELETE_CASCADE_BATCH).await?;
+        }
+
+        // A note's parent-clear trigger can otherwise update every child in
+        // one statement. Clear the links first, then sweep its heavy children
+        // before the notes themselves. All predicates remain workspace-scoped.
+        delete_in_bounded_batches(
+            self.write_pool(),
+            CLEAR_NOTE_PARENT_BATCH_SQL,
+            &id.0,
+            DELETE_CASCADE_BATCH,
+        )
+        .await?;
+        // Partial indexes contain only remaining parent links and note-bound
+        // comments, so batches do not rescan processed notes or no-note rows.
+        // Preserve comments with no note (no cascade before).
+        delete_in_bounded_batches(
+            self.write_pool(),
+            DELETE_NOTE_COMMENT_BATCH_SQL,
+            &id.0,
+            DELETE_CASCADE_BATCH,
+        )
+        .await?;
+        for table in [
+            "note_version",
+            "note_line_attribution",
+            "note",
+            "tracked_changes",
+            "diffs",
+            "delegation_group",
+            "task_agent_link",
+            "agent_metrics",
+            "workspace_context_item",
+            "workspace_git_root",
+            "workspace_invite",
+            "workspace_mcp_disabled_server",
+            "draft",
+        ] {
+            let sql = format!(
+                "DELETE FROM {table} WHERE rowid IN \
+                 (SELECT rowid FROM {table} WHERE workspace_id = ? LIMIT ?)"
+            );
+            delete_in_bounded_batches(self.write_pool(), &sql, &id.0, DELETE_CASCADE_BATCH).await?;
+        }
+
+        // SQLite can commit RETURNING while fetch_all's caller is suspended.
+        // Give each started batch independent ownership through eviction;
+        // cancelling the caller detaches only that batch, not the whole sweep.
+        loop {
+            let store = self.clone();
+            let id = id.clone();
+            let deleted = tokio::spawn(async move {
+                // Keep the writer until eviction so a subsequent writer also
+                // observes the completed batch's overlay cleanup.
+                let mut conn = store.write_pool().acquire().await.map_err(|e| {
+                    Error::Internal(format!("delete workspace browser acquire failed: {e}"))
+                })?;
+                let tab_ids: Vec<String> = sqlx::query_scalar(DELETE_WORKSPACE_BROWSER_BATCH_SQL)
+                    .bind(&id.0)
+                    .bind(DELETE_CASCADE_BATCH)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("delete workspace browser tabs failed: {e}"))
+                    })?;
+                store
+                    .browser_tab_displayed
+                    .forget_all(tab_ids.iter().map(String::as_str));
+                Ok::<_, Error>(tab_ids.len())
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("delete workspace browser task failed: {e}")))??;
+            if i64::try_from(deleted) != Ok(DELETE_CASCADE_BATCH) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // The final commit can also remove late browser rows; its eviction
+        // must survive cancellation at the commit boundary for the same reason.
+        let store = self.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            let result = store.finish_workspace_delete(&id).await;
+            if result.is_ok() {
+                // Receipt only: the original commit and overlay eviction have
+                // completed. Preserve this fact even if ticket settlement panics.
+                committed.store(true, std::sync::atomic::Ordering::Release);
+            }
+            lifecycle.finish(result)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("delete workspace final task failed: {e}")))?
+    }
+
+    async fn finish_workspace_delete(&self, id: &WorkspaceId) -> Result<()> {
+        let pool = self.write_pool();
+
+        let tab_ids = crate::with_write_txn_retry(|| async {
             let mut tx = pool
                 .begin()
                 .await
                 .map_err(|e| Error::Internal(format!("delete workspace tx failed: {e}")))?;
+            // A newly created session after the pre-sweep must not silently
+            // reintroduce a workspace-wide history cascade. Let callers retry
+            // after fencing the writer that raced with deletion.
+            let new_session: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM agent_session WHERE workspace_id = ?)",
+            )
+            .bind(&id.0)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("check workspace deletion remainder failed: {e}"))
+            })?;
+            if new_session {
+                return Err(Error::Internal(format!(
+                    "workspace {id} gained an agent during deletion; retry cleanup"
+                )));
+            }
+            let tab_ids = crate::browser_tab_repo::workspace_tab_ids(&mut tx, id).await?;
             // Child-table cleanup first (defensive ordering); on the NotFound
             // early-return below the rollback undoes it.
             sqlx::query("DELETE FROM draft WHERE workspace_id = ?")
@@ -547,7 +1114,12 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("delete workspace drafts failed: {e}")))?;
-            let res = sqlx::query("DELETE FROM workspace WHERE id = ?")
+            sqlx::query("DELETE FROM settings WHERE key = ?")
+                .bind(crate::settings_repo::agent_creation_preferences_key(id))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("delete agent creation preferences: {e}")))?;
+            let res = sqlx::query(DELETE_WORKSPACE_SQL)
                 .bind(&id.0)
                 .execute(&mut *tx)
                 .await
@@ -566,9 +1138,12 @@ impl Store {
             tx.commit()
                 .await
                 .map_err(|e| Error::Internal(format!("delete workspace commit failed: {e}")))?;
-            Ok(())
+            Ok(tab_ids)
         })
-        .await
+        .await?;
+        self.browser_tab_displayed
+            .forget_all(tab_ids.iter().map(String::as_str));
+        Ok(())
     }
 
     /// Whether a workspace id was ever used — a live row exists **or** a
@@ -743,6 +1318,52 @@ impl Store {
             .map_err(|e| Error::Internal(format!("list workspaces failed: {e}")))?;
         rows.iter().map(map_workspace_row).collect()
     }
+
+    /// Ordinary workspace keys for inherited host access, without hydrating
+    /// rows or issuing a role lookup per workspace. Includes archived rows.
+    ///
+    /// # Errors
+    /// Returns `Internal` on a database failure.
+    pub async fn ordinary_workspace_ids(&self) -> Result<Vec<WorkspaceId>> {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM workspace WHERE id <> ?")
+            .bind(CHIEF_WORKSPACE_ID)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("workspace keys failed: {e}")))?;
+        Ok(ids.into_iter().map(WorkspaceId).collect())
+    }
+
+    /// Live (non-archived, non-remote) workspaces referencing a PR by URL —
+    /// linked via `pr_url` or carrying a `pull_requests` pool entry with that
+    /// URL — oldest first. Backs the passive `github.pulls.get` fold: the
+    /// match runs in SQL (`json_each` over the pool column) so only the
+    /// referencing rows are decoded, and compares `COLLATE NOCASE` because
+    /// forge slugs are case-insensitive while persisted URLs may carry a
+    /// client-supplied casing. The seeded virtual [`CHIEF_WORKSPACE_ID`]
+    /// row is excluded like [`Self::list_workspaces`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspaces_referencing_pr_url(&self, url: &str) -> Result<Vec<Workspace>> {
+        let sql = format!(
+            "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND archived = 0 \
+             AND is_remote = 0 AND (pr_url = ? COLLATE NOCASE OR (pull_requests IS NOT NULL \
+             AND json_valid(pull_requests) AND EXISTS (\
+             SELECT 1 FROM json_each(workspace.pull_requests) AS je \
+             WHERE je.value ->> '$.url' = ? COLLATE NOCASE))) ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(CHIEF_WORKSPACE_ID)
+            .bind(url)
+            .bind(url)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("list workspaces referencing pr url failed: {e}"))
+            })?;
+        rows.iter().map(map_workspace_row).collect()
+    }
 }
 
 fn col<'r, T>(row: &'r SqliteRow, name: &str) -> Result<T>
@@ -776,6 +1397,25 @@ fn active_pr_from_db(s: Option<String>) -> Result<Option<PullRequestInfo>> {
             .map_err(|e| Error::Internal(format!("decode active_pull_request failed: {e}")))
     })
     .transpose()
+}
+
+/// The scoped PR-columns `UPDATE` (PR columns + `updated_at`, never a
+/// full-row replace) shared by [`Store::update_workspace_pr_linkage`] and
+/// [`Store::update_workspace_pr_linkage_rebased`].
+fn pr_linkage_update(
+    ws: &Workspace,
+) -> Result<sqlx::query::Query<'_, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'_>>> {
+    Ok(sqlx::query(
+        "UPDATE workspace SET pr_number=?, pr_url=?, pr_status=?, \
+         active_pull_request=?, pull_requests=?, updated_at=? WHERE id=?",
+    )
+    .bind(ws.pr_number.map(u64::cast_signed))
+    .bind(&ws.pr_url)
+    .bind(pr_status_to_db(ws)?)
+    .bind(active_pr_to_db(ws)?)
+    .bind(pull_requests_to_db(ws)?)
+    .bind(&ws.updated_at)
+    .bind(&ws.id.0))
 }
 
 /// Encode the optional `pull_requests` snapshot list to a JSON TEXT column.
@@ -892,6 +1532,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
         last_activity: col(row, "last_activity")?,
+        last_content_activity: col(row, "last_content_activity")?,
         tags: tags_from_db(&col::<String>(row, "tags")?)?,
         path: col(row, "path")?,
         repository_path: col(row, "repository_path")?,
@@ -926,5 +1567,8 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         // disk_usage is computed on the emit path (intent-services), never persisted.
         disk_usage: None,
         pending_delete_at: None,
+        // pull_requests_total is set by the list-row slimming (intent-core), never persisted.
+        pull_requests_total: None,
+        membership: None,
     })
 }

@@ -18,8 +18,8 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +34,6 @@ use sha2::{Digest, Sha256};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use uuid::Uuid;
 
 use common::TlsWs;
 
@@ -53,7 +52,7 @@ fn next_id() -> i64 {
 /// dir removed on drop, with the daemon log echoed on failure.
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
@@ -66,20 +65,16 @@ impl Drop for Daemon {
         }
         let _ = self.child.wait();
         if std::thread::panicking() {
-            let log_path = self.data_dir.join("daemon.log");
+            let log_path = self.data_dir.path().join("daemon.log");
             if let Ok(log) = std::fs::read_to_string(&log_path) {
                 eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-archhook-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-archhook-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -87,9 +82,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -330,6 +324,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -355,11 +350,13 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         })
         .await
         .expect("insert ws");
@@ -400,18 +397,18 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
     })
     .to_string();
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -519,7 +516,12 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
     let fetched = wss_rpc(&mut rpc, "workspace.get", json!({ "workspaceId": ws_id })).await;
     assert_eq!(fetched["workspace"]["archived"], json!(true));
     assert_eq!(fetched["workspace"]["status"], json!("Archived"));
-    let listed = wss_rpc(&mut rpc, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        "hook.list",
+        json!({ "workspaceId": ws_id, "includeRetired": true }),
+    )
+    .await;
     let row = listed["hooks"]
         .as_array()
         .expect("hooks array")
@@ -538,8 +540,9 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
 /// hook-initiated archive must STAY PARKED behind the archived gate even when
 /// it lands while the hook owner is mid-turn.
 ///
-/// The archive tail's hook sweep wakes the owner; when the owner's turn is
-/// still in flight the wake takes `deliver_wake_message`'s fast enqueue
+/// The archive tail wakes the owner (the consolidated archive-watch notice
+/// naming the swept hook); when the owner's turn is still in flight the wake
+/// takes `deliver_wake_message`'s fast enqueue
 /// branch (busy → queue) — bypassing that path's archived gate, which only
 /// covers the idle-delivery arm. The owner's worker then popped the parked
 /// wake in its end-of-turn drain, whose `try_begin` re-claim auto-unarchived
@@ -590,18 +593,18 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
     })
     .to_string();
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -730,8 +733,9 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
     );
     assert_eq!(fetched["workspace"]["status"], json!("Archived"));
 
-    // ...and the cancel wake is still PARKED in the owner's queue — proof it
-    // was gated rather than consumed by a stray turn.
+    // ...and the consolidated archive-watch wake is still PARKED in the
+    // owner's queue — proof it was gated rather than consumed by a stray
+    // turn.
     let queue = wss_rpc(
         &mut rpc,
         "agent.getQueue",
@@ -742,7 +746,7 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
     assert!(
         entries.iter().any(|m| m["content"]
             .as_str()
-            .is_some_and(|c| c.contains("cancelled because its workspace was archived"))),
-        "the hook-cancel wake stays parked until unarchive: {queue}"
+            .is_some_and(|c| c.contains("was archived and has since been unarchived"))),
+        "the archive-watch wake stays parked until unarchive: {queue}"
     );
 }

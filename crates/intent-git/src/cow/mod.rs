@@ -103,7 +103,7 @@ pub fn cow_probe(src_dir: &Path, dst_dir: &Path) -> Result<CowSupport> {
     #[cfg(target_os = "linux")]
     let result = linux::probe(src_dir, dst_dir)?;
     #[cfg(target_os = "windows")]
-    let result = windows::probe(src_dir, dst_dir)?;
+    let result = windows::probe(src_dir, dst_dir);
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let result = {
         let _ = (src_dir, dst_dir);

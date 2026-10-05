@@ -11,9 +11,12 @@
 #![cfg(unix)]
 
 mod common;
+#[path = "e2e_wss_server_pairing/personal_pairing.rs"]
+mod personal_pairing;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,60 +31,45 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use uuid::Uuid;
 
 /// Fixed 64-char hex token (matching generated token shape) for e2e test.
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
-    child: Child,
-    data_dir: PathBuf,
+    child: GuardedChild,
 }
 
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
-    }
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-server-")
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-server-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
-}
-
-fn spawn_serve(data_dir: &Path) -> Child {
+fn spawn_serve(data_dir: &Path) -> GuardedChild {
     common::enable_ws_api(data_dir);
     spawn_serve_inner(data_dir, &[])
 }
 
 /// Spawn without enabling the WSS listener — the daemon serves UDS only, so
 /// `pairing.getInfo` fails with the listener-down error.
-fn spawn_serve_wss_disabled(data_dir: &Path) -> Child {
+fn spawn_serve_wss_disabled(data_dir: &Path) -> GuardedChild {
     spawn_serve_inner(data_dir, &[])
 }
 
 /// Spawn with the WSS listener enabled and a fake tailcat sidecar wired in
 /// via the `INTENTD_TAILCAT_BIN` seam, so `server.tunnel.enabled = true` can
 /// report a stable tc address without the real binary.
-fn spawn_serve_with_tailcat(data_dir: &Path, tailcat_bin: &Path) -> Child {
+fn spawn_serve_with_tailcat(data_dir: &Path, tailcat_bin: &Path) -> GuardedChild {
     common::enable_ws_api(data_dir);
     let bin = tailcat_bin.to_string_lossy().to_string();
     spawn_serve_inner(data_dir, &[("INTENTD_TAILCAT_BIN", &bin)])
 }
 
-fn spawn_serve_inner(data_dir: &Path, extra_env: &[(&str, &str)]) -> Child {
+fn spawn_serve_inner(data_dir: &Path, extra_env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_TCP_PORT", "0")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -90,7 +78,7 @@ fn spawn_serve_inner(data_dir: &Path, extra_env: &[(&str, &str)]) -> Child {
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 /// Write an executable fake-tailcat script into `dir`: `genkey` creates the
@@ -112,7 +100,7 @@ case "$1" in
     ;;
   serve)
     printf '{"listenAddr":"tc-%s"}\n' "$(cat "$key")"
-    sleep 600
+    exec sleep 600
     ;;
 esac
 "#;
@@ -269,10 +257,10 @@ async fn boot(data_dir: &Path) -> (u16, String) {
 
 #[tokio::test]
 async fn server_pairing_info_over_uds() {
-    let data_dir = temp_data_dir();
-    let mut daemon = Daemon {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
@@ -319,15 +307,18 @@ async fn server_pairing_info_over_uds() {
         assert!(model.is_string(), "hardwareModel: {response}");
     }
 
-    daemon.child.kill().ok();
+    daemon
+        .child
+        .signal_group(nix::sys::signal::Signal::SIGKILL)
+        .ok();
 }
 
 #[tokio::test]
 async fn server_rotate_token_env_fixed_rejects() {
-    let data_dir = temp_data_dir();
-    let mut daemon = Daemon {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (_port, _fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
@@ -342,15 +333,18 @@ async fn server_rotate_token_env_fixed_rejects() {
         .unwrap()
         .contains("cannot rotate token"));
 
-    daemon.child.kill().ok();
+    daemon
+        .child
+        .signal_group(nix::sys::signal::Signal::SIGKILL)
+        .ok();
 }
 
 #[tokio::test]
 async fn server_pairing_info_over_wss_rejects() {
-    let data_dir = temp_data_dir();
-    let mut daemon = Daemon {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);
@@ -364,15 +358,18 @@ async fn server_pairing_info_over_wss_rejects() {
     assert_eq!(error["code"].as_i64().unwrap(), -32001);
     assert!(error["message"].as_str().unwrap().contains("local"));
 
-    daemon.child.kill().ok();
+    daemon
+        .child
+        .signal_group(nix::sys::signal::Signal::SIGKILL)
+        .ok();
 }
 
 #[tokio::test]
 async fn pairing_get_info_loopback_default_errors_without_tunnel() {
-    let data_dir = temp_data_dir();
-    let mut daemon = Daemon {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
@@ -400,25 +397,27 @@ async fn pairing_get_info_loopback_default_errors_without_tunnel() {
         "must not be the listener-down error: {error}"
     );
 
-    daemon.child.kill().ok();
+    daemon
+        .child
+        .signal_group(nix::sys::signal::Signal::SIGKILL)
+        .ok();
 }
 
 #[tokio::test]
 async fn pairing_surfaces_report_tc_address_when_tunnel_up() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Persist server.tunnel.enabled BEFORE boot so the daemon auto-starts the
     // (fake) sidecar; enable_ws_api inside the spawn helper appends the
     // [server.wsApi] section to the same config.
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     std::fs::write(
         data_dir.join("config.toml"),
         "[server.tunnel]\nenabled = true\n",
     )
     .expect("seed config.toml with server.tunnel.enabled");
     let tailcat_bin = write_fake_tailcat(&data_dir);
-    let mut daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve_with_tailcat(&data_dir, &tailcat_bin),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
@@ -453,12 +452,16 @@ async fn pairing_surfaces_report_tc_address_when_tunnel_up() {
     let status = wss_call(port, client_config(&fp), &frame).await;
     assert_eq!(status["result"]["tcAddress"].as_str().unwrap(), tc);
 
-    daemon.child.kill().ok();
+    daemon
+        .child
+        .signal_group(nix::sys::signal::Signal::SIGKILL)
+        .ok();
 }
 
 #[tokio::test]
 async fn pairing_get_info_explicit_wide_bind_honored() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Persist an explicit wide bind BEFORE boot: the loopback default only
     // governs unset configs — an intentional 0.0.0.0 keeps the historical
     // behavior (bind all interfaces, advertise enumerated local IPs).
@@ -467,9 +470,8 @@ async fn pairing_get_info_explicit_wide_bind_honored() {
         "[server]\nbindAddress = \"0.0.0.0\"\n",
     )
     .expect("seed config.toml with wide bindAddress");
-    let mut daemon = Daemon {
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
@@ -504,15 +506,18 @@ async fn pairing_get_info_explicit_wide_bind_honored() {
         );
     }
 
-    daemon.child.kill().ok();
+    daemon
+        .child
+        .signal_group(nix::sys::signal::Signal::SIGKILL)
+        .ok();
 }
 
 #[tokio::test]
 async fn pairing_get_info_listener_down_over_uds() {
-    let data_dir = temp_data_dir();
-    let mut daemon = Daemon {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
         child: spawn_serve_wss_disabled(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -531,15 +536,18 @@ async fn pairing_get_info_listener_down_over_uds() {
         .contains("TCP listener is not running"));
     assert_eq!(error["data"]["code"].as_str().unwrap(), "listener-down");
 
-    daemon.child.kill().ok();
+    daemon
+        .child
+        .signal_group(nix::sys::signal::Signal::SIGKILL)
+        .ok();
 }
 
 #[tokio::test]
 async fn pairing_get_info_over_wss_rejects() {
-    let data_dir = temp_data_dir();
-    let mut daemon = Daemon {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);
@@ -554,15 +562,18 @@ async fn pairing_get_info_over_wss_rejects() {
     assert_eq!(error["code"].as_i64().unwrap(), -32001);
     assert!(error["message"].as_str().unwrap().contains("local"));
 
-    daemon.child.kill().ok();
+    daemon
+        .child
+        .signal_group(nix::sys::signal::Signal::SIGKILL)
+        .ok();
 }
 
 #[tokio::test]
 async fn server_rotate_token_over_wss_rejects() {
-    let data_dir = temp_data_dir();
-    let mut daemon = Daemon {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);
@@ -576,15 +587,18 @@ async fn server_rotate_token_over_wss_rejects() {
     assert_eq!(error["code"].as_i64().unwrap(), -32001);
     assert!(error["message"].as_str().unwrap().contains("local"));
 
-    daemon.child.kill().ok();
+    daemon
+        .child
+        .signal_group(nix::sys::signal::Signal::SIGKILL)
+        .ok();
 }
 
 #[tokio::test]
 async fn system_import_legacy_over_wss_rejects() {
-    let data_dir = temp_data_dir();
-    let mut daemon = Daemon {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let frame = json!({
@@ -601,15 +615,18 @@ async fn system_import_legacy_over_wss_rejects() {
         .as_str()
         .unwrap()
         .contains("UDS only"));
-    daemon.child.kill().ok();
+    daemon
+        .child
+        .signal_group(nix::sys::signal::Signal::SIGKILL)
+        .ok();
 }
 
 #[tokio::test]
 async fn system_git_credential_over_wss_rejects() {
-    let data_dir = temp_data_dir();
-    let mut daemon = Daemon {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     // system.gitCredential over WSS (TCP) is rejected with -32001: the
@@ -628,15 +645,18 @@ async fn system_git_credential_over_wss_rejects() {
         .as_str()
         .unwrap()
         .contains("UDS only"));
-    daemon.child.kill().ok();
+    daemon
+        .child
+        .signal_group(nix::sys::signal::Signal::SIGKILL)
+        .ok();
 }
 
 #[tokio::test]
 async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
-    let data_dir = temp_data_dir();
-    let mut daemon = Daemon {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
         child: spawn_serve(&data_dir),
-        data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);
@@ -695,5 +715,8 @@ async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
     assert_eq!(status["id"], 2, "{status}");
     assert_eq!(status["result"]["running"], true, "{status}");
 
-    daemon.child.kill().ok();
+    daemon
+        .child
+        .signal_group(nix::sys::signal::Signal::SIGKILL)
+        .ok();
 }

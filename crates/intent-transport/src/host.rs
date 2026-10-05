@@ -89,6 +89,9 @@ pub(crate) enum HostMethod {
 /// `params` is the raw params object (already coerced to an empty map when the
 /// frame had no params or non-object params), consumed by the methods that
 /// take input (`ListDirectory`/`CreateDirectory`/`DirectoryStatus`).
+/// Approved host/tool and provider-readiness reads accept optional `workspaceId`
+/// as routing metadata. It does not scope host results, change authorization,
+/// or suppress provider discovery's existing default-settings self-heal.
 pub(crate) struct HostRequest {
     pub method: HostMethod,
     pub id_present: bool,
@@ -156,7 +159,7 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
 /// prettyHostname, hasDisplay, locality, displayServer? }`. `displayServer` is
 /// omitted when no display server is detected. Pure (inputs injected) so it is
 /// unit-testable.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn host_status_json(
     os: &str,
     arch: &str,
@@ -212,7 +215,16 @@ pub(crate) async fn handle(
     is_local: bool,
     reverse: &ReverseChannel,
 ) -> Option<String> {
-    handle_with_host_environment(req, api, bus, None, is_local, reverse).await
+    handle_with_host_environment(
+        req,
+        api,
+        bus,
+        None,
+        is_local,
+        reverse,
+        &intent_services::host_exec::HostExecRuntime::default(),
+    )
+    .await
 }
 
 pub(crate) async fn handle_with_host_environment(
@@ -222,6 +234,7 @@ pub(crate) async fn handle_with_host_environment(
     host_environment: Option<HostEnvironment>,
     is_local: bool,
     reverse: &ReverseChannel,
+    exec_runtime: &intent_services::host_exec::HostExecRuntime,
 ) -> Option<String> {
     let HostRequest {
         method,
@@ -229,6 +242,36 @@ pub(crate) async fn handle_with_host_environment(
         id_echo,
         params,
     } = req;
+    // Preserve the guest display probes and owner host controls. The two
+    // shared provider reads additionally admit current durable host members;
+    // cached admission roles never grant this exception after revocation.
+    if crate::context::is_non_administrator_caller()
+        && !matches!(method, HostMethod::Status | HostMethod::ToolAvailability)
+    {
+        let member_read = matches!(
+            method,
+            HostMethod::ProviderDiscovery | HostMethod::ProviderAuthStatus
+        ) && match crate::context::current_caller()
+            .and_then(|caller| caller.principal_id().cloned())
+        {
+            Some(id) => api.principal_host_role(id).await.is_ok_and(|role| {
+                matches!(
+                    role,
+                    intent_core::HostRole::Owner | intent_core::HostRole::Member
+                )
+            }),
+            None => false,
+        };
+        if !member_read {
+            return id_present.then(|| {
+                error_frame(
+                    &id_echo,
+                    crate::catalog::FORBIDDEN_ERROR_CODE,
+                    crate::catalog::FORBIDDEN_ERROR_MESSAGE,
+                )
+            });
+        }
+    }
     let frame = match method {
         HostMethod::Status => {
             let hostname = host_environment
@@ -411,7 +454,7 @@ pub(crate) async fn handle_with_host_environment(
                         .collect()
                 })
                 .unwrap_or_default();
-            if !installed.is_empty() {
+            if !installed.is_empty() && !crate::context::is_non_administrator_caller() {
                 if let Err(e) = api.settings_heal_default_provider(installed).await {
                     tracing::warn!(error = %e, "default-provider settings self-heal failed");
                 }
@@ -453,10 +496,7 @@ pub(crate) async fn handle_with_host_environment(
             // (monorepo#1086). auggie follows the `host.checkAuggie`
             // precedence: `context.auggiePath` wins over
             // `providers.paths.auggie`.
-            let mut provider_paths = read_provider_paths(api).await;
-            if let Some(p) = read_setting_string(api, "context.auggiePath").await {
-                provider_paths.insert("auggie".to_string(), p);
-            }
+            let provider_paths = read_provider_paths(api).await;
             match intent_services::provider_auth::provider_auth_status(
                 provider_id.as_deref(),
                 force,
@@ -464,7 +504,10 @@ pub(crate) async fn handle_with_host_environment(
             )
             .await
             {
-                Ok(result) => success_frame(&id_echo, &result),
+                Ok(result) => {
+                    let _ = api.observe_execution_readiness(result.clone()).await;
+                    success_frame(&id_echo, &result)
+                }
                 Err(msg) => error_frame(&id_echo, -32602, &msg),
             }
         }
@@ -507,6 +550,7 @@ pub(crate) async fn handle_with_host_environment(
             // same V8 heap cap a real ACP spawn gets (intent-hq/intent#4330).
             let node_max_old_space_mb = read_setting_u32(api, "agents.acpNodeMaxOldSpaceMb").await;
             match intent_services::provider_test_prompt::provider_test_prompt(
+                Some(api),
                 &provider_id,
                 model.as_deref(),
                 &provider_paths,
@@ -604,7 +648,7 @@ pub(crate) async fn handle_with_host_environment(
                     return Some(error_frame(&id_echo, e.code, &e.message));
                 }
             };
-            match intent_services::host_exec::run_default(api, parsed).await {
+            match exec_runtime.run(api, parsed).await {
                 Ok(v) => success_frame(&id_echo, &v),
                 Err(e) => error_frame(&id_echo, e.code, &e.message),
             }
@@ -721,38 +765,14 @@ fn parse_write_stdin(params: &Map<String, Value>) -> Result<Option<Vec<u8>>, Str
 /// `None` when neither is set (the caller then uses
 /// `intent_services::auggie_discovery::find_auggie`).
 async fn configured_auggie_path(api: &dyn WorkspaceApi) -> Option<String> {
-    if let Some(v) = read_setting_string(api, "context.auggiePath").await {
-        return Some(v);
-    }
-    if let Ok(payload) = api.settings_get("providers.paths".to_string()).await {
-        if let Some(map) = payload.get("value").and_then(Value::as_object) {
-            if let Some(s) = map.get("auggie").and_then(Value::as_str) {
-                if !s.trim().is_empty() {
-                    return Some(s.to_string());
-                }
-            }
-        }
-    }
-    None
+    api.execution_provider_paths().await.ok()?.remove("auggie")
 }
 
 /// Read the full `providers.paths` settings map (provider key → configured
 /// binary path), skipping blank values. Empty when unset or when the lookup
 /// fails — discovery then behaves exactly as before (auto-detection only).
 async fn read_provider_paths(api: &dyn WorkspaceApi) -> std::collections::HashMap<String, String> {
-    let mut paths = std::collections::HashMap::new();
-    if let Ok(payload) = api.settings_get("providers.paths".to_string()).await {
-        if let Some(map) = payload.get("value").and_then(Value::as_object) {
-            for (key, value) in map {
-                if let Some(s) = value.as_str() {
-                    if !s.trim().is_empty() {
-                        paths.insert(key.clone(), s.to_string());
-                    }
-                }
-            }
-        }
-    }
-    paths
+    api.execution_provider_paths().await.unwrap_or_default()
 }
 
 /// Read a single string-valued setting; returns `None` for missing / null /
@@ -771,11 +791,7 @@ async fn read_setting_string(api: &dyn WorkspaceApi, path: &str) -> Option<Strin
 /// non-whole / out-of-`u32`-range values, or when the lookup itself fails.
 /// `settings.get` reports `Number` settings as floats (`8192.0`), so the value
 /// is read via `as_f64` — `as_u64` would always be `None` on the wire shape.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::float_cmp
-)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn read_setting_u32(api: &dyn WorkspaceApi, path: &str) -> Option<u32> {
     let payload = api.settings_get(path.to_string()).await.ok()?;
     let n = payload.get("value")?.as_f64()?;
@@ -1046,7 +1062,7 @@ impl std::error::Error for OpenInEditorError {}
 /// silent failure. On a remote connection the intent is dispatched to the
 /// connected frontend as an FE-served reverse RPC (`host.openInEditor`) so the
 /// editor opens on the user's laptop (mirroring `host.openExternal`).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn open_in_editor(
     editor_id: &str,
     path: &str,

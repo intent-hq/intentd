@@ -237,25 +237,15 @@ fn claude_code_version() -> String {
     intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE.to_string()
 }
 
-/// codex source: ACP probe via a resolved `codex-acp` binary, else the pinned
-/// npx fallback.
+/// codex source: ACP probe via the pinned npx adapter.
 fn codex_fetch() -> BoxFuture<'static, ModelFetchResult> {
     provider_models_fetch("codex")
 }
 
-/// codex is pinned only when the probe falls back to the npx adapter; a
-/// resolved `codex-acp` binary has no pin (mirrors the fetch dispatch in
-/// [`crate::provider_models::fetch_codex_models`]). The binary is resolved
-/// here and again inside the fetch — intentionally independent: the two
-/// resolutions are milliseconds apart, so at worst an install/uninstall
-/// mid-request stores one cache entry under the other branch's key, which
-/// the next request's key mismatch simply treats as a miss.
+/// Codex always uses this adapter pin. Native/custom adapter installations
+/// cannot change the model source or reuse their old unpinned cache entries.
 fn codex_version() -> String {
-    if intent_providers::find_provider_binary("codex", "codex-acp", None).is_some() {
-        String::new()
-    } else {
-        intent_providers::config::CODEX_ACP_NPX_PACKAGE.to_string()
-    }
+    intent_providers::config::CODEX_ACP_NPX_PACKAGE.to_string()
 }
 
 /// pi source: ACP probe via the pinned npx adapter.
@@ -414,6 +404,8 @@ pub(crate) struct ModelCatalogCache {
     /// ([`MODELS_BACKGROUND_REFRESH_CONCURRENCY`]); the production daemon
     /// holds one cache, so this is the daemon-wide refresher cap the RPC
     /// cost contract requires. Never closed.
+    installed: Mutex<HashMap<String, InstalledSelection>>,
+    installed_refresh: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     refresh_permits: tokio::sync::Semaphore,
 }
 
@@ -437,11 +429,46 @@ impl crate::Services {
 
 impl ModelCatalogReader<'_> {
     fn version_key(&self, source: &ModelSource) -> String {
-        if source.provider_id == "antigravity" {
+        if intent_providers::installed_cli::InstalledCli::for_provider(source.provider_id).is_some()
+        {
+            self.cache
+                .installed_key(source.provider_id)
+                .unwrap_or_else(|| {
+                    // Test-only synthetic seeding retains registry-based fixtures.
+                    #[cfg(test)]
+                    {
+                        (source.version_key)()
+                    }
+                    #[cfg(not(test))]
+                    {
+                        "installed-unobserved".to_owned()
+                    }
+                })
+        } else if source.provider_id == "antigravity" {
             AntigravityModelSource::resolve(self.antigravity_path.as_deref()).version_key
         } else {
             (source.version_key)()
         }
+    }
+
+    /// Destination evidence for a destructive import fallback. Unlike the
+    /// ownership guards, an aged last-good list or a failed refresh must not
+    /// prove that a transferred model/effort has disappeared. Cache-only:
+    /// import never starts a provider or makes a model request.
+    pub(crate) fn fresh_catalog(&self, provider_id: &str) -> Option<Vec<Value>> {
+        let source = source_for(provider_id)?;
+        let version = self.version_key(source);
+        let now = ModelCatalogCache::now_ms();
+        if self
+            .cache
+            .negative_reason(provider_id, &version, now)
+            .is_some()
+        {
+            return None;
+        }
+        self.cache
+            .fresh_hit(provider_id, &version, now)
+            .filter(|rows| !rows.is_empty())
     }
 
     /// Cached-catalog ownership evidence for one provider (monorepo#607):
@@ -479,11 +506,8 @@ impl ModelCatalogReader<'_> {
     /// or trigger a fetch — an unregistered provider, cold cache, stale-pin
     /// entry, or a catalog with no marked row all return `None` (the provider
     /// CLI default applies). The registry version-key function runs only when
-    /// a cached entry with a marked row exists — for codex it resolves the
-    /// `codex-acp` binary (an enhanced-PATH scan whose first call can block on
-    /// the login-shell PATH capture), a cost the cold-cache fall-through must
-    /// not pay; it also runs outside the cache lock so a slow first capture
-    /// never stalls other cache readers.
+    /// a cached entry with a marked row exists, and outside the cache lock so
+    /// executable-based source resolution never stalls other cache readers.
     pub(crate) fn cached_default_model(&self, provider_id: &str) -> Option<String> {
         let source = source_for(provider_id)?;
         let (entry_version_key, default_id) = {
@@ -550,11 +574,14 @@ impl ModelCatalogReader<'_> {
             Some((prefix, bare)) if source_for(prefix).is_some() => (Some(prefix), bare),
             _ => (None, model_id),
         };
+        // Release the entries lock before reading source identities: catalog
+        // publication takes the installed-identity lock before the entry lock.
         let entries = self
             .cache
             .entries
             .lock()
-            .expect("model catalog cache poisoned");
+            .expect("model catalog cache poisoned")
+            .clone();
         for source in SOURCES {
             if scoped_provider.is_some_and(|p| p != source.provider_id) {
                 continue;
@@ -601,7 +628,117 @@ impl ModelCatalogReader<'_> {
     }
 }
 
+/// Identity observations are refreshed at explicit refreshes and at most once
+/// per minute on ordinary reads. The command owns its isolated profile and the
+/// exact environment used for its version observation and subsequent probe.
+#[derive(Clone)]
+struct InstalledSelection {
+    observed: tokio::time::Instant,
+    key: String,
+    command: Result<crate::acp_adapter::AcpAdapterCommand, String>,
+}
+
 impl ModelCatalogCache {
+    fn installed_key(&self, provider: &str) -> Option<String> {
+        self.installed
+            .lock()
+            .expect("installed catalog poisoned")
+            .get(provider)
+            .map(|s| s.key.clone())
+    }
+
+    pub(crate) async fn resolve_installed(
+        self: &Arc<Self>,
+        provider: &str,
+        force: bool,
+    ) -> ResolvedModels {
+        let requested = tokio::time::Instant::now();
+        let lock = self
+            .installed_refresh
+            .lock()
+            .expect("installed refresh map poisoned")
+            .entry(provider.to_owned())
+            .or_default()
+            .clone();
+        let selection = {
+            let _guard = lock.lock().await;
+            let prior = self
+                .installed
+                .lock()
+                .expect("installed catalog poisoned")
+                .get(provider)
+                .cloned();
+            if let Some(prior) = prior.filter(|s| {
+                s.observed >= requested
+                    || !force && s.observed.elapsed() < std::time::Duration::from_secs(60)
+            }) {
+                prior
+            } else {
+                let command = crate::provider_models::installed_model_command(provider).await;
+                let key = command
+                    .as_ref()
+                    .ok()
+                    .and_then(crate::acp_adapter::AcpAdapterCommand::installed_key)
+                    .unwrap_or_else(|| format!("installed-unavailable:{provider}"));
+                let selection = InstalledSelection {
+                    observed: tokio::time::Instant::now(),
+                    key,
+                    command,
+                };
+                self.installed
+                    .lock()
+                    .expect("installed catalog poisoned")
+                    .insert(provider.to_owned(), selection.clone());
+                selection
+            }
+        };
+        let key = selection.key.clone();
+        let cache = self.clone();
+        let provider_owned = provider.to_owned();
+        let fetch_key = key.clone();
+        let result = resolve_with_cache(self, provider, &key, force, Self::now_ms(), move || {
+            Box::pin(async move {
+                let command = match selection.command {
+                    Ok(c) => c,
+                    Err(reason) => {
+                        return ModelFetchResult {
+                            models: None,
+                            warning: Some(reason),
+                        }
+                    }
+                };
+                let fetched =
+                    crate::provider_models::fetch_installed_models_at(&provider_owned, command)
+                        .await;
+                // A post-probe runtime/auth change invalidates even the last-good
+                // entry: it no longer belongs to the current execution context.
+                if fetched
+                    .warning
+                    .as_deref()
+                    .is_some_and(|w| w.contains(crate::provider_models::INSTALLED_SOURCE_CHANGED))
+                {
+                    let mut active = cache.installed.lock().expect("installed catalog poisoned");
+                    if active
+                        .get(&provider_owned)
+                        .is_some_and(|s| s.key == fetch_key)
+                    {
+                        active.remove(&provider_owned);
+                    }
+                }
+                from_provider_fetch(fetched)
+            })
+        })
+        .await;
+        if self.installed_key(provider).as_deref() != Some(&key) {
+            return ResolvedModels {
+                models: None,
+                stale: false,
+                warning: Some(crate::provider_models::INSTALLED_SOURCE_CHANGED.to_owned()),
+            };
+        }
+        result
+    }
+
     pub(crate) fn reader(&self, antigravity_path: Option<String>) -> ModelCatalogReader<'_> {
         ModelCatalogReader {
             cache: self,
@@ -621,6 +758,8 @@ impl ModelCatalogCache {
             persist_path,
             negative: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
+            installed: Mutex::new(HashMap::new()),
+            installed_refresh: Mutex::new(HashMap::new()),
             refresh_permits: tokio::sync::Semaphore::new(MODELS_BACKGROUND_REFRESH_CONCURRENCY),
         }
     }
@@ -684,7 +823,11 @@ impl ModelCatalogCache {
         if let Some(path) = &self.persist_path {
             let persisted = PersistedCache {
                 version: PERSIST_VERSION,
-                entries: entries.clone(),
+                entries: entries
+                    .iter()
+                    .filter(|(_, e)| !e.version_key.starts_with("installed-"))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
             };
             if let Ok(bytes) = serde_json::to_vec(&persisted) {
                 let tmp = path.with_extension("json.tmp");
@@ -951,6 +1094,15 @@ where
         .await
         .clone();
     cache.finish_inflight(provider_id, version_key, &cell);
+    if version_key.starts_with("installed-")
+        && cache.installed_key(provider_id).as_deref() != Some(version_key)
+    {
+        return ResolvedModels {
+            models: None,
+            stale: false,
+            warning: Some(crate::provider_models::INSTALLED_SOURCE_CHANGED.to_owned()),
+        };
+    }
     if let Some(models) = fetched.models {
         ResolvedModels {
             models: Some(models),
@@ -976,6 +1128,17 @@ fn record_probe_outcome(
     fetched: &ModelFetchResult,
     now_ms: u64,
 ) {
+    // Keep selection stable until the entry is recorded. Otherwise an old
+    // finisher could pass this check, race a new selection, then overwrite it.
+    let active = version_key
+        .starts_with("installed-")
+        .then(|| cache.installed.lock().expect("installed catalog poisoned"));
+    if active
+        .as_ref()
+        .is_some_and(|a| a.get(provider_id).is_none_or(|s| s.key != version_key))
+    {
+        return;
+    }
     if let Some(models) = &fetched.models {
         cache.clear_negative(provider_id);
         if !models.is_empty() {
@@ -1022,7 +1185,7 @@ fn spawn_background_refresh<F>(
     let cache = Arc::clone(cache);
     let provider_id = provider_id.to_string();
     let version_key = version_key.to_string();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         let started = tokio::time::Instant::now();
         let outcome_ms = |started: tokio::time::Instant| {
             now_ms.saturating_add(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))

@@ -58,7 +58,7 @@ If you cannot proceed with your assignment, raise attention explicitly instead o
 
 `reason` is required. Both work for every agent (delegated or not, with or without a linked task). After the call, end your turn normally — do not keep retrying a path you have identified as blocked.
 
-Do **NOT** use `ws.agent.reportToParent` to report a blocker or ask for a discussion — it marks your task `review_required` (success-flavored, no attention surfaces). Reserve it for completed or progressing work.
+Do **NOT** use `ws.agent.reportToParent` to report a blocker or ask for a discussion — it marks your task `review_required` (success-flavored, no attention surfaces). Reserve it for completed or progressing work. Neither `ws.agent.reportToParent` nor `ws.task.updateNoteStatus` ever moves your own task out of `complete`/`cancelled`: `reportToParent` returns its ordinary report result, and a `ws.task.updateNoteStatus` call asking for a different status is refused as a no-op whose result carries an `advisory` (a same-status write is the ordinary no-op with no `advisory`).
 
 ## Waiting on External Conditions
 
@@ -68,7 +68,7 @@ Never block or sleep in your turn waiting for something external (CI, another re
 - Timer ("continue in X min"): `delayMs` = X min, return `{dispatch:true,message}`; in the immediate validation run return `{dispatch:false,state:{armed:true}}`.
 - Prefer `ws.event.subscribe` (files/tasks/git), `ws.agent.watch` (sibling agents), `ws.pr.monitor` (PRs) over hooks.
 - Hygiene: max 5 hooks, slowest useful cadence, cancel stale hooks; set `ttlMs` to expected time-to-fire + margin, not the 24 h cap.
-- Delegated agents: before waiting, `ws.agent.reportToParent` what you're watching and set your task note status to `waiting`.
+- Delegated agents: before waiting, `ws.agent.reportToParent` what you're watching and set your task note status to `waiting` unless it is already `complete`/`cancelled` — the daemon ignores a linked agent's writes from a terminal status and returns an `advisory`; never try to reopen your own task, ask the coordinator/user instead.
 
 ## Response Organization
 

@@ -12,7 +12,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -28,23 +27,15 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-uictx-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-uictx-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -63,7 +54,7 @@ async fn boot() -> Fixture {
     Fixture {
         _ws: ws,
         port,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -107,7 +98,7 @@ async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
 /// `workspace.getUiContext` starts null; `workspace.updateUiContext` persists
 /// the caller-supplied blob verbatim (including arbitrary nested fields) and
 /// round-trips byte-for-byte. No shape interpretation, no coercion.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_ui_context_round_trip() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
@@ -194,7 +185,7 @@ async fn workspace_ui_context_round_trip() {
 }
 
 /// Unknown workspace → -32602 Invalid params (same as workspace.get).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn workspace_ui_context_unknown_workspace() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;

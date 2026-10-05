@@ -32,7 +32,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
@@ -43,25 +42,20 @@ const ENV_SECRET: &str = "supersecret_env_value_9876543210";
 /// The §5.22 redaction placeholder returned in place of env/headers values.
 const PLACEHOLDER: &str = "********";
 
-/// Live `intentd serve` process; killed and its data dir removed on drop.
+/// Live `intentd serve` process; killed on drop.
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-mcp-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-mcp-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -70,9 +64,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -259,9 +252,20 @@ fn node_available() -> bool {
 /// Spawn the mock MCP server in `--http` mode and return (child, base url).
 /// The fixture announces its ephemeral port as `PORT=<n>` on stdout.
 async fn spawn_http_fixture(script: &str) -> (tokio::process::Child, String) {
-    let mut child = tokio::process::Command::new("node")
-        .arg(script)
-        .arg("--http")
+    spawn_http_fixture_with_auth(script, None).await
+}
+
+/// Spawn the HTTP fixture with an optional exact Authorization requirement.
+async fn spawn_http_fixture_with_auth(
+    script: &str,
+    required_auth: Option<&str>,
+) -> (tokio::process::Child, String) {
+    let mut command = tokio::process::Command::new("node");
+    command.arg(script).arg("--http");
+    if let Some(required_auth) = required_auth {
+        command.env("MOCK_MCP_REQUIRED_AUTH", required_auth);
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -300,13 +304,11 @@ async fn mcp_servers_remote_probe_over_wss() {
     }
     let (_fixture, base_url) = spawn_http_fixture(script).await;
 
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -461,6 +463,111 @@ async fn mcp_servers_remote_probe_over_wss() {
     assert_eq!(list["servers"].as_array().expect("servers array").len(), 0);
 }
 
+/// OAuth-aware remote lifecycle over production WSS: the unauthenticated
+/// probe reports `auth_required`; a presence-only token write followed by
+/// `mcp.servers.restart` performs a real re-probe with the daemon-owned token
+/// and recovers the server to `running` without exposing token material.
+#[tokio::test]
+async fn mcp_servers_oauth_auth_required_and_restart_recovery_over_wss() {
+    const OAUTH_TOKEN: &str = "wss-lifecycle-oauth-token";
+    let Some(script) = node_available().then_some(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mock-mcp-server.mjs"
+    )) else {
+        eprintln!("skipping mcp oauth lifecycle WSS E2E: node not on PATH");
+        return;
+    };
+    if !PathBuf::from(script).exists() {
+        eprintln!("skipping mcp oauth lifecycle WSS E2E: fixture missing");
+        return;
+    }
+    let (_fixture, base_url) =
+        spawn_http_fixture_with_auth(script, Some(&format!("Bearer {OAUTH_TOKEN}"))).await;
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("u16 port");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint");
+    let cfg = client_config(fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let _ = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["mcp.servers:status-changed"] }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "mcp.servers.create",
+        json!({ "config": {
+            "name": "OAuth HTTP",
+            "transport": "http",
+            "url": base_url,
+            "enabled": false,
+        } }),
+    )
+    .await;
+    let server_id = created["server"]["id"].as_str().expect("id").to_string();
+
+    let enabled = wss_rpc(
+        &mut rpc,
+        3,
+        "mcp.servers.toggle",
+        json!({ "serverId": server_id, "enabled": true }),
+    )
+    .await;
+    assert_eq!(enabled["status"]["state"], json!("auth_required"));
+    assert!(!enabled.to_string().contains(OAUTH_TOKEN));
+    let auth_event = wait_for_state(&mut sub, &server_id, "auth_required").await;
+    assert!(!auth_event.to_string().contains(OAUTH_TOKEN));
+
+    let stored = wss_rpc(
+        &mut rpc,
+        4,
+        "mcp.oauth.set",
+        json!({ "serverId": server_id, "tokenBag": {
+            "access_token": OAUTH_TOKEN,
+            "token_type": "bearer",
+        } }),
+    )
+    .await;
+    assert_eq!(stored["value"], json!(PLACEHOLDER));
+    assert!(!stored.to_string().contains(OAUTH_TOKEN));
+
+    let restarted = wss_rpc(
+        &mut rpc,
+        5,
+        "mcp.servers.restart",
+        json!({ "serverId": server_id }),
+    )
+    .await;
+    assert_eq!(restarted["status"]["state"], json!("running"));
+    assert_eq!(restarted["status"]["toolCount"], json!(2));
+    assert!(!restarted.to_string().contains(OAUTH_TOKEN));
+    let _ = wait_for_state(&mut sub, &server_id, "running").await;
+
+    let got = wss_rpc(
+        &mut rpc,
+        6,
+        "mcp.servers.getStatus",
+        json!({ "serverId": server_id }),
+    )
+    .await;
+    assert_eq!(got["status"]["state"], json!("running"));
+}
+
 /// Spawn the mock MCP server in `--http --log-auth` mode: (child, stdout line
 /// reader, base url). After the `PORT=` line the fixture prints one
 /// `AUTH=<authorization|none>` line per POST it receives.
@@ -541,13 +648,11 @@ async fn mcp_servers_update_preserves_redacted_secrets_over_wss() {
     }
     let (_fixture, mut auth_lines, base_url) = spawn_logging_http_fixture(script).await;
 
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -686,13 +791,11 @@ async fn mcp_servers_update_preserves_redacted_secrets_over_wss() {
 /// placeholder with the §9 `-32602` envelope, and nothing is persisted.
 #[tokio::test]
 async fn mcp_servers_create_rejects_redaction_placeholder_over_wss() {
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -804,13 +907,11 @@ async fn mcp_test_connection_over_wss() {
     }
     let (_fixture, base_url) = spawn_http_fixture(script).await;
 
-    let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -882,14 +983,12 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
 /// envelope while the scoped read stays lenient.
 #[tokio::test]
 async fn mcp_servers_workspace_scoped_toggle_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
+    let _daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;

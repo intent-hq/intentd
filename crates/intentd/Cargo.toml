@@ -1,6 +1,6 @@
 [package]
 name = "intentd"
-version = "0.9.38"
+version = "0.10.14"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -9,6 +9,7 @@ homepage.workspace = true
 description = "Intent backend daemon — local-first JSON-RPC daemon for the Intent domain model"
 
 [dependencies]
+intentd-sitter = { path = "../intentd-sitter", version = "0.1.23" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -23,15 +24,16 @@ tracing-appender = { workspace = true }
 directories = { workspace = true }
 sqlx = { workspace = true }
 
-intent-core = { path = "../intent-core", version = "0.9.38" }
-intent-store = { path = "../intent-store", version = "0.9.38" }
-intent-services = { path = "../intent-services", version = "0.9.38" }
-intent-acp = { path = "../intent-acp", version = "0.9.38" }
-intent-providers = { path = "../intent-providers", version = "0.9.38" }
-intent-git = { path = "../intent-git", version = "0.9.38" }
-intent-context = { path = "../intent-context", version = "0.9.38" }
-intent-transport = { path = "../intent-transport", version = "0.9.38" }
-intent-js = { path = "../intent-js", version = "0.9.38", optional = true }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.10.14", optional = true }
+intent-core = { path = "../intent-core", version = "0.10.14" }
+intent-store = { path = "../intent-store", version = "0.10.14" }
+intent-services = { path = "../intent-services", version = "0.10.14" }
+intent-acp = { path = "../intent-acp", version = "0.10.14" }
+intent-providers = { path = "../intent-providers", version = "0.10.14" }
+intent-git = { path = "../intent-git", version = "0.10.14" }
+intent-context = { path = "../intent-context", version = "0.10.14" }
+intent-transport = { path = "../intent-transport", version = "0.10.14" }
+intent-js = { path = "../intent-js", version = "0.10.14", optional = true }
 qrcode = "0.14.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
@@ -41,20 +43,27 @@ default = []
 # WSAPI-1 spike: link the QuickJS-backed JS engine. Off by default so the
 # baseline binary is unchanged; enable to measure size / build impact.
 js-engine = ["dep:intent-js"]
+# Explicit cold loopback descriptors for the real GitLab auth socket tests.
+# Packaging and ordinary daemon builds must leave this feature disabled.
+repository-test-fixtures = ["intent-services/repository-test-fixtures", "dep:intent-sourcecontrol"]
+
+[[test]]
+name = "e2e_wss_gitlab_auth"
+required-features = ["repository-test-fixtures"]
 
 [dev-dependencies]
 uuid = { workspace = true }
-intent-services = { path = "../intent-services", version = "0.9.38" }
-intent-acp = { path = "../intent-acp", version = "0.9.38" }
-intent-providers = { path = "../intent-providers", version = "0.9.38" }
-intent-core = { path = "../intent-core", version = "0.9.38" }
-intent-store = { path = "../intent-store", version = "0.9.38" }
+intent-services = { path = "../intent-services", version = "0.10.14", features = ["repository-test-fixtures"] }
+intent-acp = { path = "../intent-acp", version = "0.10.14" }
+intent-providers = { path = "../intent-providers", version = "0.10.14" }
+intent-core = { path = "../intent-core", version = "0.10.14" }
+intent-store = { path = "../intent-store", version = "0.10.14" }
 # `uds_linear.rs` injects a stub `LinearEngine` so the `linear.*` e2e slice
 # never touches the network (no `LINEAR_API_KEY`, no GraphQL call).
-intent-linear = { path = "../intent-linear", version = "0.9.38" }
+intent-linear = { path = "../intent-linear", version = "0.10.14" }
 # `uds_sentry.rs` injects a stub `SentryEngine` so the `sentry.*` e2e slice
 # never touches the network (no token, no REST call).
-intent-sentry = { path = "../intent-sentry", version = "0.9.38" }
+intent-sentry = { path = "../intent-sentry", version = "0.10.14" }
 # `e2e_wss_voice_transcribe.rs` injects a stub `VoiceEngine` so the
 # `voice.transcribe` e2e slice never touches the network (no key, no HTTP).
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
@@ -76,13 +85,23 @@ chrono = "0.4"
 ctor = "1.0.10"
 tempfile = "3"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.38" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.10.14" }
+# `e2e_pty_job_control.rs` boots the daemon inside a real PTY session as a
+# member of a background process group (intent-hq/intent#4231 hazard class).
+portable-pty = { workspace = true }
+# In-process `Services` tests run as `Caller::Daemon` (fail-closed gates).
+intent-test-macros = { path = "../intent-test-macros" }
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs"] }
 # No-echo terminal input for `intentd settings <sensitive>` prompts
 # (termios); already in the workspace dependency tree via intent-core.
 libc = { workspace = true }
+
+[target."cfg(unix)".dev-dependencies]
+# Shared process-group child guard + release-file barrier for the e2e suites
+# that spawn the real daemon; never a runtime dependency.
+intentd-test-support = { path = "../intentd-test-support" }
 
 # Static musl release targets have no system OpenSSL; macOS has no system OpenSSL
 # headers/dylibs we can rely on either (Homebrew paths break on machines without it).

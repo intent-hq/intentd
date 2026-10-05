@@ -12,7 +12,7 @@ use std::sync::Arc;
 use intent_core::{AgentId, AgentStatus, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
-use crate::mcp_server::bindings::{map_err, opt_bool, opt_i64, opt_str};
+use crate::mcp_server::bindings::{map_err, opt_bool, opt_i64, opt_str, strip_agent_hidden_fields};
 
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
@@ -40,7 +40,23 @@ const MAX_READ_LIMIT: i64 = 100;
 /// message limit. 100 messages at worst-case one message per 512 KiB page.
 const READ_PAGE_WALK_CAP: usize = 100;
 
+/// Every `ws.app.agents.*` result passes through
+/// [`strip_agent_hidden_fields`] (see `bindings/mod.rs`), like `ws.agent.*` /
+/// `ws.event.*`: `readConversation` copies message rows verbatim, so a hidden
+/// key in `messageMetadata` would otherwise reach the chief agent.
 pub(crate) async fn dispatch(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace_id: &WorkspaceId,
+    caller: Option<&AgentId>,
+    method: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    let mut out = dispatch_inner(api, workspace_id, caller, method, args).await?;
+    strip_agent_hidden_fields(&mut out);
+    Ok(out)
+}
+
+async fn dispatch_inner(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
     caller: Option<&AgentId>,
@@ -50,7 +66,7 @@ pub(crate) async fn dispatch(
     // Chief-workspace gating: all ws.app.* methods require the caller to be
     // in the Chief workspace.
     if !workspace_id.is_chief() {
-        return Err("ws.app.* is only available in the Chief of Staff workspace".to_string());
+        return Err("ws.app.* is only available in the Assistant workspace".to_string());
     }
 
     match method {
@@ -137,7 +153,7 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
     let workspaces = if let Some(ws_id) = filter_workspace_id {
         // Single workspace request
         if ws_id.is_chief() {
-            return Err("Chief workspace has no agent threads".to_string());
+            return Err("Assistant workspace has no agent threads".to_string());
         }
         let ws = api.get_workspace(ws_id.clone()).await.map_err(map_err)?;
         vec![ws]
@@ -746,6 +762,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -771,11 +788,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 
@@ -804,6 +823,7 @@ mod tests {
             waiting_for_agent_ids: vec![],
             waiting_on_hooks: vec![],
             waiting_on_pr_monitors: vec![],
+            waiting_on_script_monitors: vec![],
             turn_in_flight: false,
             last_stream_activity_at: None,
             context_usage: None,
@@ -825,6 +845,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             metadata: AgentMetadata {
                 is_background: false,
                 specialist: None,
@@ -846,6 +867,7 @@ mod tests {
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
+                chief_prompt_version: None,
             },
         }
     }
@@ -915,7 +937,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "ws.app.* is only available in the Chief of Staff workspace"
+            "ws.app.* is only available in the Assistant workspace"
         );
     }
 
@@ -1332,7 +1354,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "ws.app.* is only available in the Chief of Staff workspace"
+            "ws.app.* is only available in the Assistant workspace"
         );
     }
 

@@ -19,7 +19,8 @@ touch; treat the full list as the definition of done for a new provider.
       (`workspace_naming_tool_reference`, `crates/intent-services/src/agent_manager.rs`)
 - [ ] Tool-name/kind derivation extended from captured ACP traffic
       (`derive_tool_name` / `tool_kind_word`, `crates/intent-acp/src/session.rs`)
-- [ ] Policy items: native-subagent denial, V8 heap cap (`runtime`), model-id resolution
+- [x] Codex native-subagent denial through the selected npx runtime (§6)
+- [ ] Policy items for new providers: native-subagent denial, V8 heap cap (`runtime`), model-id resolution
 - [ ] Unit tests per area + WSS e2e (`crates/intentd/tests/`), gates green
       (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`)
 - [ ] End-to-end smoke test via `make dev` (see last section)
@@ -58,9 +59,7 @@ needs. Fields that matter most:
   flag; providers whose adapter exposes the model as a `configOptions[id="model"]` select
   (claude-code, pi, codex) set `supports_config_option_model: true` instead; see
   `AgentManager::maybe_apply_session_model`
-  (`crates/intent-services/src/agent_manager.rs`). codex also emits `-c model=…` config
-  overrides for the native binary path — `apply_codex_config_args`
-  (`crates/intent-providers/src/args.rs`) — and sets
+  (`crates/intent-services/src/agent_manager.rs`). codex sets
   `config_option_model_strips_effort: true` so a `{base}/{effort}` id is stripped to its
   base before it is sent as the config-option value.
 - **`remove_tool_flag`** — CLI-side tool stripping (auggie: `--remove-tool`), used for
@@ -70,18 +69,32 @@ needs. Fields that matter most:
   `parse_grok_models_command_output` in `crates/intent-providers/src/models.rs`),
   `auth_error_patterns` (stderr matching), `login_command_hint`, `login_docs_url`.
 - **npx fields** — `fallback_npx_package` (spawn `npx -y <pkg>` only when no local binary
-  resolves; codex) vs `npx_only_package` (spawn via npx with a version we pin, skipping
-  auto-discovery entirely; claude-code, pi). The one npx-only exception, for providers
-  that opt in via `npx_only_honors_path_override` (claude-code), is a valid
-  `providers.paths[id]` override (absolute + executable): it is exec'd directly in place
-  of the pinned npx spawn (`resolve_npx_only_override`, intent-hq/monorepo#4352) and the
-  same override drives discovery's `installed`, the one-shot / test-prompt launches, and
-  the claude-code ACP auth fallback probe, so every launch surface runs the same adapter
-  (the model-catalog fetch stays on the pinned package). pi does not opt in: its adapter
-  also depends on the version-gated real `pi` CLI, so it keeps pinned-npx-only
-  semantics. Resolution:
-  `resolve_npx_only` in `crates/intent-services/src/agent_manager.rs` and the
-  `npx_fallback_*` fields on `SpawnOptions` (`crates/intent-acp/src/spawn.rs`).
+  resolves) vs `npx_only_package` (spawn via npx with a version we pin, skipping
+  adapter auto-discovery entirely; claude-code, codex, pi). Codex and Claude always
+  use their reviewed adapter pins with the execution host's canonical `codex` / `claude`
+  executable, resolved from enhanced PATH. Both the installed CLI and npx are required;
+  there is no bundled-runtime fallback. Legacy `providers.paths.codex` and
+  `providers.paths["claude-code"]` adapter overrides are ignored on all launch/catalog
+  paths, with one warning per provider per daemon process. Remove those settings and
+  install the canonical CLI on the execution host. `CODEX_PATH` and
+  `CLAUDE_CODE_EXECUTABLE` are daemon-owned outputs, not runtime selectors.
+  `npx_only_honors_path_override` remains available to other registry entries that
+  deliberately opt in. pi retains pinned-npx-only semantics and its secondary CLI check.
+  See `installed_cli` in intent-providers and intent-services and `resolve_npx_only`
+  in `crates/intent-services/src/agent_manager.rs`.
+
+  Installed model catalogs use adapter + runtime version/metadata + auth/config identity.
+  Fresh bounded version checks run with the launch environment at refresh/launch boundaries;
+  publication rechecks that identity after the probe. Cache-only readers never start a CLI.
+  Ordinary catalog requests reuse identity observations for up to one minute; explicit
+  refresh forces a new observation. Last-good fallback belongs only to the same identity,
+  and installed-provider entries stay in memory because auth fingerprints are process-private.
+  A cold daemon restart has no installed-provider last-good list: its first catalog read
+  must probe again. Login-shell PATH and captured credentials retain their daemon-restart
+  refresh behavior. When changing either adapter contract, run the opt-in
+  `e2e_wss_installed_cli` test with the actual packages (prerequisites in README.md).
+  That test doubles only the installed CLI protocol; it does not replace the ACP adapter.
+  Keep live-account and real-platform evidence separate from this controlled proof.
 
 **Binary discovery** — `find_provider_binary` (`crates/intent-providers/src/discover.rs`)
 resolves in precedence order: (1) explicit `providers.paths[id]` setting (must be absolute
@@ -213,6 +226,27 @@ certainly needs new normalization arms:
     `OPENCODE_CONFIG_CONTENT` (`build_provider_env`, `crates/intent-providers/src/args.rs`).
   - claude-code: `disallowedTools: ["Task"]` in the `session/new` `_meta`
     (`build_session_meta`, `crates/intent-services/src/agent_session.rs`).
+  - codex: every daemon entrypoint selects the reviewed `CODEX_ACP_NPX_PACKAGE`
+    from `crates/intent-providers/src/config.rs` through `npx -y`, including
+    persistent agents, model probes, one-shot requests, and test prompts.
+    Installed native or JS `codex-acp` binaries and `providers.paths.codex`
+    overrides are bypassed.
+    After all environment merges, the shared `CODEX_SUBAGENT_POLICY_CONFIG`
+    policy (`crates/intent-providers/src/config.rs`) sets `CODEX_PATH` to the
+    resolved installed CLI and replaces `CODEX_CONFIG` with
+    `{"agents":{"enabled":false},"features":{"multi_agent_v2":false}}`.
+    Both values are JSON booleans: the V2 feature setting can otherwise
+    override the agents setting. Native `-c agents.enabled=false` is not a
+    compatible substitute. Node.js and npm/npx are required even on hosts
+    with a native adapter; missing prerequisites produce an actionable error.
+    The unchanged frontend may still offer Codex on a native-only host; the
+    daemon launch error explains the missing toolchain. The adapter package
+    stays pinned while the independently installed Codex can be upgraded; validation
+    records its actual version. Existing children acquire
+    this policy on their next normal restart or relaunch. New, recreated,
+    and resumed sessions must keep Intent tools and prior conversation
+    context; cross-adapter continuity requires live resume or history-replay
+    evidence. The daemon does not edit user configuration files.
   Audit the new provider for an equivalent (config key, CLI flag, or `_meta` option) and
   wire it into whichever delivery mechanism the provider already uses. Independent of
   this, the MCP-side denylist (`WorkspaceMcpServer::for_agent_type` →
@@ -227,8 +261,9 @@ certainly needs new normalization arms:
   Model discovery is fully dynamic (`models.list` sources,
   `crates/intent-services/src/model_catalog.rs`); there is no static tier catalog.
   Fuzzy model matching against a dynamic pool goes through
-  `resolve_preferred_model`. codex additionally splits reasoning effort from
-  the model id (`parse_codex_reasoning_effort`).
+  `resolve_preferred_model`. codex additionally normalizes legacy model/effort
+  ids before applying ACP session configuration (`split_codex_model_effort`
+  and `session_model_effort`, `crates/intent-services/src/agent_manager.rs`).
 
 ## 7. Tests and gates
 

@@ -25,9 +25,57 @@
 //! (`intent-transport`'s tool deltas and live-turn snapshot merge), so a slim
 //! subscriber's accumulated state stays byte-identical to a fresh slim
 //! snapshot — the same invariant the factory above upholds for block shape.
+//! [`degrade_inline_file_blocks`] (v10.0) is the matching serve-time pass for
+//! legacy inline file blocks, applied to every persisted read regardless of
+//! projection.
 
 use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
 use serde_json::{json, Map, Value};
+
+/// Degrade legacy inline file blocks in place (PROTOCOL §5.5, v10.0). A
+/// persisted user-row block of shape `{ type: "file", data, fileName?, … }`
+/// with no non-empty `attachmentId` predates the attachment registry; the
+/// inline arm is no longer accepted on input, and no surface serves its
+/// bytes any more. Such a block is replaced by
+/// `{ type: "text", text: "Attached file: <fileName>" }` (`"Attached file"`
+/// when `fileName` is missing or blank), carrying over only the block's `id`
+/// when it has one so identity is stable across reads. Attachment-reference
+/// file blocks and every other block type pass through untouched. Serve-time
+/// only — stored rows are never rewritten.
+pub fn degrade_inline_file_blocks(blocks: &mut [Value]) {
+    for block in blocks.iter_mut() {
+        if block.get("type").and_then(Value::as_str) != Some("file") {
+            continue;
+        }
+        let has_ref = block
+            .get("attachmentId")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if has_ref {
+            continue;
+        }
+        let text = match block
+            .get("fileName")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            Some(name) => format!("Attached file: {name}"),
+            None => "Attached file".to_string(),
+        };
+        let mut degraded = Map::new();
+        if let Some(id) = block
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            degraded.insert("id".to_string(), Value::String(id.to_string()));
+        }
+        degraded.insert("type".to_string(), Value::String("text".to_string()));
+        degraded.insert("text".to_string(), Value::String(text));
+        *block = Value::Object(degraded);
+    }
+}
 
 /// Apply the slim conversation projection (PROTOCOL §5.5, the wire default
 /// since v8.0) to one served message's content blocks: oversized
@@ -401,6 +449,47 @@ fn build_proposal_resource_item(proposal: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v10.0: a legacy inline file block (no `attachmentId`) degrades to a
+    /// text block naming the file with the bytes dropped and its id kept;
+    /// a nameless one falls back to `"Attached file"`; reference file
+    /// blocks and every other block type are untouched.
+    #[test]
+    fn degrade_inline_file_blocks_projects_legacy_entries_to_text() {
+        let mut blocks = vec![
+            json!({ "type": "text", "text": "hi" }),
+            json!({ "id": "m:1", "type": "file", "data": "QQ==", "mimeType": "text/plain",
+                    "fileName": "a.txt" }),
+            json!({ "type": "file", "data": "QQ==", "mimeType": "text/plain" }),
+            json!({ "type": "file", "data": "QQ==", "fileName": "   " }),
+            json!({ "type": "file", "data": "QQ==", "attachmentId": "  ", "fileName": "blank.txt" }),
+            json!({ "type": "file", "attachmentId": "att-1", "fileName": "ref.pdf", "size": 3 }),
+            json!({ "type": "image", "data": "QQ==", "mimeType": "image/png" }),
+        ];
+        let before_ref = blocks[5].clone();
+        let before_img = blocks[6].clone();
+        degrade_inline_file_blocks(&mut blocks);
+        assert_eq!(blocks[0], json!({ "type": "text", "text": "hi" }));
+        assert_eq!(
+            blocks[1],
+            json!({ "id": "m:1", "type": "text", "text": "Attached file: a.txt" })
+        );
+        assert_eq!(
+            blocks[2],
+            json!({ "type": "text", "text": "Attached file" })
+        );
+        assert_eq!(
+            blocks[3],
+            json!({ "type": "text", "text": "Attached file" })
+        );
+        assert_eq!(
+            blocks[4],
+            json!({ "type": "text", "text": "Attached file: blank.txt" })
+        );
+        assert_eq!(blocks[5], before_ref, "reference block untouched");
+        assert_eq!(blocks[6], before_img, "image block untouched");
+        assert!(blocks[..5].iter().all(|b| b.get("data").is_none()));
+    }
 
     /// The unbounded-keys regression (PR #1304 review): a `tool_use.input`
     /// with thousands of keys must still serialize within a small constant

@@ -40,8 +40,8 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,7 +56,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
@@ -64,7 +63,7 @@ type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
@@ -72,19 +71,15 @@ impl Drop for Daemon {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if std::thread::panicking() {
-            if let Ok(log) = std::fs::read_to_string(self.data_dir.join("daemon.log")) {
+            if let Ok(log) = std::fs::read_to_string(self.data_dir.path().join("daemon.log")) {
                 eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-watch-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-watch-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -92,9 +87,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -330,6 +324,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -355,11 +350,13 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         })
         .await
         .expect("insert ws");
@@ -381,18 +378,18 @@ async fn boot_daemon(
     sub_event_types: Value,
     budget: Budget,
 ) -> Setup {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", script),
         ("MOCK_AGENT_BEHAVIOR", behavior),
     ];
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     // Startup is clamped to the same whole-test budget: the shared
@@ -478,16 +475,23 @@ async fn await_idle(sub: &mut TlsWs, agent_id: &str, deadline: tokio::time::Inst
     let _ = await_idle_event(sub, agent_id, deadline).await;
 }
 
-/// Serialized conversation text for an agent.
-async fn conversation_text(rpc: &mut TlsWs, id: i64, ws_id: &str, agent_id: &str) -> String {
-    let convo = wss_rpc(
+/// The `agent.getConversation` page for an agent.
+async fn conversation_page(rpc: &mut TlsWs, id: i64, ws_id: &str, agent_id: &str) -> Value {
+    wss_rpc(
         rpc,
         id,
         "agent.getConversation",
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
     )
-    .await;
-    convo.to_string()
+    .await
+}
+
+/// Serialized conversation text for an agent (substring assertions only —
+/// cross-time equality goes through `common::conversation_fingerprint`).
+async fn conversation_text(rpc: &mut TlsWs, id: i64, ws_id: &str, agent_id: &str) -> String {
+    conversation_page(rpc, id, ws_id, agent_id)
+        .await
+        .to_string()
 }
 
 /// Poll the watcher's conversation until `needle` appears (or panic at the
@@ -515,21 +519,31 @@ async fn await_conversation_contains(
 }
 
 /// Poll until the agent's conversation stops changing across two consecutive
-/// reads 400ms apart (all queued wake turns drained). Returns the settled text.
+/// reads 400ms apart with no turn in flight (all queued wake turns drained).
+/// "Changing" is judged on the `common::conversation_fingerprint` (persisted
+/// row identity/content), not the raw payload, so read-time `author`
+/// hydration cannot keep the loop spinning (intent-hq/intent#5603). A turn
+/// persists nothing until it ends, so the page-level `turnInFlight` flag
+/// (dropped by the fingerprint) is checked separately: matching fingerprints
+/// while a wake turn is still running do not count as settled. Returns the
+/// settled page.
 async fn await_conversation_settled(
     rpc: &mut TlsWs,
     req_id: &mut i64,
     ws_id: &str,
     agent_id: &str,
     deadline: tokio::time::Instant,
-) -> String {
-    let mut prev = conversation_text(rpc, *req_id, ws_id, agent_id).await;
+) -> Value {
+    let mut prev = conversation_page(rpc, *req_id, ws_id, agent_id).await;
     *req_id += 1;
     loop {
         tokio::time::sleep(Duration::from_millis(400)).await;
-        let next = conversation_text(rpc, *req_id, ws_id, agent_id).await;
+        let next = conversation_page(rpc, *req_id, ws_id, agent_id).await;
         *req_id += 1;
-        if next == prev {
+        let turn_in_flight = next["turnInFlight"].as_bool() == Some(true);
+        if !turn_in_flight
+            && common::conversation_fingerprint(&next) == common::conversation_fingerprint(&prev)
+        {
             return next;
         }
         prev = next;
@@ -1124,15 +1138,20 @@ async fn agent_unwatch_stops_further_wakes_over_wss() {
         budget.step(60),
     )
     .await;
-    // Drain any wake turns still in flight before taking the baseline.
-    let baseline = await_conversation_settled(
-        &mut fx.setup.rpc,
-        &mut fx.req_id,
-        &fx.ws_id,
-        &fx.watcher,
-        budget.step(60),
-    )
-    .await;
+    // Drain any wake turns still in flight before taking the baseline. The
+    // baseline/after comparison is on the row fingerprint (id/seq/role/
+    // contentBlocks/timestamp): the read-time `author` projection may hydrate
+    // between the two reads and must not count as a wake (#5603).
+    let baseline = common::conversation_fingerprint(
+        &await_conversation_settled(
+            &mut fx.setup.rpc,
+            &mut fx.req_id,
+            &fx.ws_id,
+            &fx.watcher,
+            budget.step(60),
+        )
+        .await,
+    );
     let sent = wss_rpc(
         &mut fx.setup.rpc,
         60,
@@ -1153,8 +1172,14 @@ async fn agent_unwatch_stops_further_wakes_over_wss() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(800)).await;
-    let after = conversation_text(&mut fx.setup.rpc, 61, &fx.ws_id, &fx.watcher).await;
-    assert_eq!(baseline, after, "no wake may be delivered after unwatch");
+    let after = common::conversation_fingerprint(
+        &conversation_page(&mut fx.setup.rpc, 61, &fx.ws_id, &fx.watcher).await,
+    );
+    assert!(
+        baseline == after,
+        "no wake may be delivered after unwatch; changed rows:\n{}",
+        common::fingerprint_diff(&baseline, &after)
+    );
 }
 
 /// WATCH-2d: the target's terminal failure wakes the watcher ("Watched agent
@@ -1500,7 +1525,8 @@ async fn agent_waiting_defers_completion_watch_until_chain_settles_over_wss() {
     tokio::time::sleep(Duration::from_millis(800)).await;
     let text =
         await_conversation_settled(&mut setup.rpc, &mut req_id, &ws_id, &coord, budget.step(60))
-            .await;
+            .await
+            .to_string();
     assert!(
         !text.contains("Watched agent") && !text.contains("Child agent"),
         "no completion wake may be delivered on the interim idle: {text}"
@@ -1674,7 +1700,8 @@ async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
         &watcher,
         budget.step(60),
     )
-    .await;
+    .await
+    .to_string();
     assert!(
         !text.contains("Watched agent") && !text.contains("Child agent"),
         "re-arm on an idle-but-waiting target must not fire synthetically: {text}"
@@ -2050,7 +2077,8 @@ async fn in_turn_progress_is_followed_by_terminal_wake_over_wss() {
         &parent,
         budget.step(60),
     )
-    .await;
+    .await
+    .to_string();
     assert!(
         text.contains("completed."),
         "same-cycle terminal wake must be distinct from progress: {text}"
@@ -2250,7 +2278,8 @@ async fn agent_watch_on_reported_hook_waiting_child_defers_over_wss() {
         &watcher,
         budget.step(60),
     )
-    .await;
+    .await
+    .to_string();
     assert!(
         !text.contains("Watched agent") && !text.contains("Child agent"),
         "watch on a reported hook-waiting child must not fire instantly: {text}"
@@ -2359,7 +2388,7 @@ async fn wake_rows_serialized(
         .collect()
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// monorepo#2528: the immediate `agent.reportToParent` wake over the real
 /// transport says "reported" (a report is not necessarily a completion) and
 /// keeps the parent's ungrouped completion watch armed across progress:
@@ -2551,7 +2580,8 @@ async fn report_wake_disclosure_tracks_progress_and_terminal_watch_over_wss() {
         &parent,
         budget.step(60),
     )
-    .await;
+    .await
+    .to_string();
     assert!(
         text.contains("completed."),
         "the reported child's idle delivers the terminal wake: {text}"
@@ -2630,7 +2660,6 @@ async fn report_wake_disclosure_tracks_progress_and_terminal_watch_over_wss() {
     );
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Monitoring-idle advisory persistence (intent-hq/intent#4254): a child
 /// that goes idle while only externally monitoring (an active background
 /// hook here — the cheapest external wait to arrange hermetically; PR
@@ -2894,7 +2923,8 @@ async fn monitoring_idle_advisories_leave_watch_armed_until_genuine_completion_o
         &parent,
         budget.step(60),
     )
-    .await;
+    .await
+    .to_string();
     assert!(
         !text.contains("completed."),
         "no completion wake while the child still monitors: {text}"

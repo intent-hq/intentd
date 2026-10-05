@@ -18,9 +18,28 @@ use serde_json::{json, Value};
 use crate::events::{error_frame, success_frame};
 use intent_core::{Error, Result};
 
+/// Pairing services explicitly installed by a trusted composition root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingServices {
+    /// Existing providers retain rotation, aliases and invite composition.
+    Full,
+    /// Only `server.pairingInfo`, still guarded by actual UDS locality.
+    LocalInfoOnly,
+}
+
+impl PairingServices {
+    pub(crate) fn admits(self, method: &ServerMethod) -> bool {
+        self == Self::Full || matches!(method, ServerMethod::PairingInfo)
+    }
+}
+
 /// Pairing information provider: implemented by the composition root (`intentd`).
 /// Provides access to token store, data dir, and port snapshot for pairing RPCs.
 pub trait ServerPairingInfo: Send + Sync {
+    /// Select installed services; ordinary daemon implementations stay full.
+    fn services(&self) -> PairingServices {
+        PairingServices::Full
+    }
     /// Get the current bound WSS port, or `None` if the listener is stopped.
     fn pairing_snapshot(&self) -> Pin<Box<dyn Future<Output = PairingSnapshot> + Send + '_>>;
     /// Cached host identity, refreshed by the composition root off the RPC path.
@@ -335,3 +354,26 @@ pub fn collect_local_ips() -> Vec<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    #[test]
+    fn typed_pairing_registration_preserves_classification() {
+        for method in ["server.pairingInfo", "server.rotateToken"] {
+            for id in [Some(json!(7)), None] {
+                let mut frame = json!({"jsonrpc":"2.0","method":method,"params":{}});
+                if let Some(id) = id {
+                    frame["id"] = id;
+                }
+                let req = classify(&frame).unwrap();
+                assert!(PairingServices::Full.admits(&req.method));
+                assert_eq!(
+                    PairingServices::LocalInfoOnly.admits(&req.method),
+                    method == "server.pairingInfo"
+                );
+            }
+        }
+        assert!(classify(&json!({"method":"server.pairingInfo"})).is_none());
+    }
+}

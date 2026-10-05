@@ -114,7 +114,7 @@ impl Operation {
         };
         let shared = Arc::clone(&operation.shared);
         let cancel = operation.cancel.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let result = connect(&shared, &cancel, home, explicit).await;
             finish(&shared, &cancel, result);
         });
@@ -171,7 +171,7 @@ impl Operation {
         };
         let shared = Arc::clone(&self.shared);
         let cancel = self.cancel.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let result = login(&binary, &cancel, open_url).await;
             let result = match result {
                 Ok(()) => checked_models(&binary, &cancel).await,

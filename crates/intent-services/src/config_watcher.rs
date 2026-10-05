@@ -1,11 +1,14 @@
-//! Live-reload of `config.toml` (§9.8): a `notify` watch on the config file's
-//! **parent directory** feeds a debounced strict re-parse through
+//! Live-reload of `config.toml` (§9.8): a non-recursive watch on the config
+//! file's **parent directory** feeds a debounced strict re-parse through
 //! [`SettingsRegistry::reload`].
 //!
 //! Watching the directory (not the file) survives editor rename/atomic-save
 //! patterns (vim, VS Code write-then-rename): a watch attached to the file's
 //! inode dies when the editor renames a temp file over it, while
-//! directory-level events keep reporting the config file's name. Events are
+//! directory-level events keep reporting the config file's name. The watch
+//! rides the daemon's [`SharedWatchHub`] rather than owning a `notify`
+//! watcher of its own (intent-hq/intent#4953: on Linux each watcher is one
+//! inotify instance against `fs.inotify.max_user_instances`). Events are
 //! filtered to the config file, coalesced within [`DEBOUNCE`], and then the
 //! file is read once ([`process_config_change`], the testable core):
 //!
@@ -36,15 +39,73 @@
 //! trade-offs for a human-timescale file; the next external edit wins again.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use intent_core::{Error, Result};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::RecursiveMode;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::settings_registry::{SettingsChanged, SettingsRegistry};
+use crate::events::shared_watch::{
+    os_watch_limits, SharedWatchHub, SubHandle, CREATE_RETRY_CAP, CREATE_RETRY_INITIAL,
+};
+use crate::settings_registry::{SettingsChanged, SettingsRegistry, SettingsSnapshot};
+
+tokio::task_local! {
+    // Only the watcher installs this scope, after a reload has committed.
+    // Spawned children do not inherit it; they must register their own tail.
+    static ADMITTED_CALLBACK: ();
+}
+
+pub(crate) fn owns_admitted_callback() -> bool {
+    ADMITTED_CALLBACK.try_with(|()| ()).is_ok()
+}
+
+/// The original watcher's stop admission, carried through prepared lock waits.
+/// Only the watcher constructs it; it supplies no settings or credential authority.
+pub struct PreparedReloadAdmission {
+    stopped: tokio::sync::watch::Receiver<bool>,
+}
+
+impl PreparedReloadAdmission {
+    pub(crate) fn new(stopped: tokio::sync::watch::Receiver<bool>) -> Self {
+        Self { stopped }
+    }
+
+    fn stopped() -> Error {
+        Error::Internal("config watcher stopped before reload admission".into())
+    }
+
+    pub(crate) async fn wait<T>(&mut self, future: impl Future<Output = T>) -> Result<T> {
+        if *self.stopped.borrow() {
+            return Err(Self::stopped());
+        }
+        tokio::select! {
+            biased;
+            _ = self.stopped.changed() => Err(Self::stopped()),
+            value = future => Ok(value),
+        }
+    }
+
+    pub(crate) fn publish<T>(&self, publish: impl FnOnce() -> Result<T>) -> Result<T> {
+        // Serialize shutdown with the last synchronous admission/publication
+        // interval. No asynchronous lock wait or callback is inside this watch borrow.
+        let stopped = self.stopped.borrow();
+        if *stopped {
+            return Err(Self::stopped());
+        }
+        publish()
+    }
+
+    pub(crate) async fn finish<T>(self, tail: impl Future<Output = T>) -> T {
+        // Publication has finished. Shutdown must join the original hooks and
+        // settlement; cancellation is no longer an uncommitted edit refusal.
+        let result = ADMITTED_CALLBACK.scope((), tail).await;
+        drop(self);
+        result
+    }
+}
 
 /// Debounce window: the file is read once, this long after the *last* raw
 /// event (editors emit create+modify+rename flurries per save).
@@ -69,7 +130,12 @@ pub(crate) enum ReloadOutcome {
 /// it can be unit-tested deterministically: read the config file, suppress
 /// self-writes, and strictly reload the registry. Never panics or drops
 /// settings — every failure path keeps last-good values and logs a WARN.
-pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcome {
+fn read_config_text(
+    registry: &SettingsRegistry,
+) -> std::result::Result<(String, Arc<SettingsSnapshot>), ReloadOutcome> {
+    // Capture before both the read and self-write classification. This same
+    // snapshot must still own preparation and final publication after awaits.
+    let expected = registry.snapshot();
     let path = registry.config_path();
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -79,7 +145,7 @@ pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcom
                 error = %e,
                 "config.toml missing or unreadable; keeping last-good settings"
             );
-            return ReloadOutcome::Missing;
+            return Err(ReloadOutcome::Missing);
         }
     };
     if registry.is_self_write(&text) {
@@ -87,9 +153,21 @@ pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcom
             file = %path.display(),
             "config.toml event matches our own write-back; skipping reload"
         );
-        return ReloadOutcome::SelfWrite;
+        return Err(ReloadOutcome::SelfWrite);
     }
-    match registry.reload(&text) {
+    Ok((text, expected))
+}
+
+pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcome {
+    let (text, expected) = match read_config_text(registry) {
+        Ok(text) => text,
+        Err(outcome) => return outcome,
+    };
+    let path = registry.config_path();
+    match registry
+        .prepare_repository_reload_at(&text, expected)
+        .and_then(|candidate| registry.publish_repository_reload(candidate, None))
+    {
         Ok(notice) if notice.changed.is_empty() => ReloadOutcome::Unchanged,
         Ok(notice) => {
             tracing::info!(
@@ -110,35 +188,133 @@ pub(crate) fn process_config_change(registry: &SettingsRegistry) -> ReloadOutcom
     }
 }
 
-/// A live watch over `config.toml`'s parent directory. Holds the `notify`
-/// watcher (the OS subscription ends when it drops) and the debounce task
-/// (aborted on drop), so dropping the [`ConfigWatcher`] tears the whole
-/// pipeline down — the clean-shutdown contract for `serve`.
+type PreparedReload = Arc<
+    dyn Fn(
+            String,
+            Arc<SettingsSnapshot>,
+            PreparedReloadAdmission,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<SettingsChanged>> + Send>>
+        + Send
+        + Sync,
+>;
+
+async fn process_prepared_config_change(
+    registry: &SettingsRegistry,
+    reload: &PreparedReload,
+    stopped: &tokio::sync::watch::Receiver<bool>,
+) -> ReloadOutcome {
+    let (text, expected) = match read_config_text(registry) {
+        Ok(text) => text,
+        Err(outcome) => return outcome,
+    };
+    match reload(
+        text,
+        expected,
+        PreparedReloadAdmission::new(stopped.clone()),
+    )
+    .await
+    {
+        Ok(notice) if notice.changed.is_empty() => ReloadOutcome::Unchanged,
+        Ok(notice) => ReloadOutcome::Applied(notice),
+        Err(error) => {
+            tracing::warn!(%error, "prepared config reload rejected; keeping last-good settings");
+            ReloadOutcome::Invalid
+        }
+    }
+}
+
+/// A live watch over `config.toml`'s parent directory. Holds the hub
+/// subscription (the directory is unwatched when it drops, unless another
+/// subscriber still needs it) and the debounce task (aborted on drop), so
+/// dropping the [`ConfigWatcher`] tears the whole pipeline down — the
+/// clean-shutdown contract for `serve`. The subscription sits behind a mutex
+/// because the debounce task replaces it when the watch is lost (see
+/// [`watch_loop`]).
 pub struct ConfigWatcher {
-    _watcher: RecommendedWatcher,
+    sub: Arc<Mutex<Option<SubHandle>>>,
     task: JoinHandle<()>,
+    stopping: tokio::sync::watch::Sender<bool>,
 }
 
 impl Drop for ConfigWatcher {
     fn drop(&mut self) {
         self.task.abort();
+        *lock(&self.sub) = None;
     }
 }
 
+fn lock(sub: &Mutex<Option<SubHandle>>) -> std::sync::MutexGuard<'_, Option<SubHandle>> {
+    sub.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl ConfigWatcher {
-    /// Start watching the parent directory of `registry.config_path()`.
-    /// `on_change` runs after each debounced **valid external** edit that
-    /// changed effective values (the registry has already been reloaded and
-    /// its subscribers notified); the composition root uses it to apply
+    /// Stop new reloads and join the already-admitted callback, including its
+    /// runtime hooks and durable event. Unread file changes reload on restart.
+    pub async fn shutdown(&mut self) {
+        self.stopping.send_replace(true);
+        let _ = (&mut self.task).await;
+        *lock(&self.sub) = None;
+    }
+
+    /// Start watching the parent directory of `registry.config_path()` over
+    /// `hub`. `on_change` runs after each debounced **valid external** edit
+    /// that changed effective values (the registry has already been reloaded
+    /// and its subscribers notified); the composition root uses it to apply
     /// server runtime hooks and emit `settings:changed`.
+    ///
+    /// The OS registration itself is deferred to the hub's registrar thread,
+    /// so this returns without blocking and the watch is NOT yet live; a
+    /// caller that reports readiness awaits [`Self::ready`] first. A
+    /// registration failure is logged by the debounce task rather than
+    /// returned.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Internal` if the config path has no parent directory or file name, or if the file watcher cannot be created or registered.
+    /// Returns `Error::Internal` if the config path has no parent directory or file name.
     pub fn start<F, Fut>(
+        hub: &Arc<SharedWatchHub>,
         registry: Arc<SettingsRegistry>,
         revision_gate: Arc<tokio::sync::RwLock<()>>,
         on_change: F,
+    ) -> Result<Self>
+    where
+        F: Fn(SettingsChanged) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        Self::start_with_reload(hub, registry, revision_gate, on_change, None)
+    }
+
+    /// Start with an original settings owner that acquires its credential gate
+    /// BEFORE the revision gate, validates the captured candidate, and publishes
+    /// the existing change notification. No lock is held while calling it here.
+    ///
+    /// # Errors
+    /// Returns an error when the configuration path has no parent or filename.
+    pub fn start_prepared_reload<F, Fut>(
+        hub: &Arc<SharedWatchHub>,
+        registry: Arc<SettingsRegistry>,
+        revision_gate: Arc<tokio::sync::RwLock<()>>,
+        reload: F,
+    ) -> Result<Self>
+    where
+        F: Fn(String, Arc<SettingsSnapshot>, PreparedReloadAdmission) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: Future<Output = Result<SettingsChanged>> + Send + 'static,
+    {
+        let reload: PreparedReload =
+            Arc::new(move |text, expected, admission| Box::pin(reload(text, expected, admission)));
+        Self::start_with_reload(hub, registry, revision_gate, |_| async {}, Some(reload))
+    }
+
+    fn start_with_reload<F, Fut>(
+        hub: &Arc<SharedWatchHub>,
+        registry: Arc<SettingsRegistry>,
+        revision_gate: Arc<tokio::sync::RwLock<()>>,
+        on_change: F,
+        prepared_reload: Option<PreparedReload>,
     ) -> Result<Self>
     where
         F: Fn(SettingsChanged) -> Fut + Send + 'static,
@@ -157,68 +333,193 @@ impl ConfigWatcher {
                 Error::Internal(format!("config path has no file name: {}", path.display()))
             })?
             .to_os_string();
-        // The notify callback is synchronous and runs off the tokio runtime,
-        // so it forwards ticks over an unbounded channel to the debounce loop.
-        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<()>();
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let event = match res {
-                Ok(event) => event,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "config.toml watcher callback error; settings changes may be missed"
-                    );
-                    return;
-                }
-            };
-            // Access events carry no mutation; everything else (create,
-            // modify, rename, remove) can affect the file's content.
-            if matches!(event.kind, notify::EventKind::Access(_)) {
-                return;
-            }
-            if event
-                .paths
-                .iter()
-                .any(|p| p.file_name() == Some(file_name.as_os_str()))
-            {
-                let _ = raw_tx.send(());
-            }
-        })
-        .map_err(|e| Error::Internal(format!("config.toml watcher: {e}")))?;
-        watcher
-            .watch(&dir, RecursiveMode::NonRecursive)
-            .map_err(|e| Error::Internal(format!("config.toml watch on {}: {e}", dir.display())))?;
-        let task = tokio::spawn(watch_loop(registry, revision_gate, raw_rx, on_change));
+        let (sub, raw_rx, _) = hub.subscribe_with(&dir, RecursiveMode::NonRecursive);
+        let sub = Arc::new(Mutex::new(Some(sub)));
+        let (stopping, stopped) = tokio::sync::watch::channel(false);
+        let task = intent_core::spawn_daemon(watch_loop(
+            Arc::clone(hub),
+            registry,
+            revision_gate,
+            dir,
+            file_name,
+            Arc::clone(&sub),
+            raw_rx,
+            on_change,
+            stopped,
+            prepared_reload,
+        ));
         Ok(Self {
-            _watcher: watcher,
+            sub,
             task,
+            stopping,
         })
+    }
+
+    /// Resolve once the deferred directory registration has settled: `true`
+    /// when the OS watch is live, `false` when it failed or the registrar has
+    /// not answered within the hub's establish timeout. Owned, so the caller
+    /// can await it while the watcher itself stays parked elsewhere.
+    pub fn ready(&self) -> impl Future<Output = bool> + Send + 'static {
+        let established = lock(&self.sub).as_ref().map(SubHandle::established);
+        async move {
+            match established {
+                Some(established) => established.await,
+                None => false,
+            }
+        }
+    }
+
+    /// Detach a probe for the hub subscription this watcher currently rides,
+    /// so a test can await the directory watch going live before mutating it.
+    /// `None` while the loop is between a lost watch and its re-subscription.
+    #[cfg(test)]
+    fn probe(&self) -> Option<crate::events::shared_watch::RegistrationProbe> {
+        lock(&self.sub).as_ref().map(SubHandle::probe)
     }
 }
 
 /// Coalesce raw file events within [`DEBOUNCE`], then run the reload core
-/// once per burst. Returns when the watcher (and its channel sender) drops.
+/// once per burst.
+///
+/// The directory watch can fail to register, or be lost later: the hub
+/// re-registers the directory when a recursive co-tenant above it retires and
+/// closes this loop's channel if that re-registration fails. Either way the
+/// loop drops the dead subscription and re-subscribes with the hub's capped
+/// backoff, as [`super::events::root_watch`] does — parking on the closed
+/// channel would end config live-reload for the process lifetime after a
+/// transient failure. Each live subscription starts with a catch-up read
+/// (see [`debounce`]) so an edit made while unwatched is not left stale.
+/// Runs until the [`ConfigWatcher`] aborts it.
+#[expect(clippy::too_many_arguments)]
 async fn watch_loop<F, Fut>(
+    hub: Arc<SharedWatchHub>,
     registry: Arc<SettingsRegistry>,
     revision_gate: Arc<tokio::sync::RwLock<()>>,
-    mut raw_rx: mpsc::UnboundedReceiver<()>,
-    on_change: F,
+    dir: std::path::PathBuf,
+    file_name: std::ffi::OsString,
+    sub: Arc<Mutex<Option<SubHandle>>>,
+    mut raw_rx: mpsc::UnboundedReceiver<notify::Event>,
+    mut on_change: F,
+    mut stopped: tokio::sync::watch::Receiver<bool>,
+    prepared_reload: Option<PreparedReload>,
 ) where
     F: Fn(SettingsChanged) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let mut deadline: Option<tokio::time::Instant> = None;
+    let mut backoff = CREATE_RETRY_INITIAL;
     loop {
+        if *stopped.borrow() {
+            return;
+        }
+        let established = lock(&sub).as_ref().map(SubHandle::established);
+        let live = match established {
+            Some(established) => tokio::select! {
+                biased;
+                _ = stopped.changed() => return,
+                live = established => live,
+            },
+            None => false,
+        };
+        let reason = if live {
+            backoff = CREATE_RETRY_INITIAL;
+            debounce(
+                &registry,
+                &revision_gate,
+                &file_name,
+                &mut raw_rx,
+                &mut on_change,
+                &mut stopped,
+                prepared_reload.as_ref(),
+            )
+            .await;
+            "config directory watch lost; re-registering"
+        } else {
+            "config directory watch failed to register; retrying"
+        };
+        if *stopped.borrow() {
+            return;
+        }
+        *lock(&sub) = None;
+        tracing::warn!(
+            dir = %dir.display(),
+            retry_in = ?backoff,
+            os_watch_limits = %os_watch_limits(),
+            "{reason}"
+        );
         tokio::select! {
+            biased;
+            _ = stopped.changed() => return,
+            () = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(CREATE_RETRY_CAP);
+        let (fresh, rx, _) = hub.subscribe_with(&dir, RecursiveMode::NonRecursive);
+        raw_rx = rx;
+        *lock(&sub) = Some(fresh);
+    }
+}
+
+/// The debounce loop over one live subscription; returns when its channel
+/// closes.
+///
+/// Entry arms one catch-up read: an edit that landed while the directory was
+/// unwatched (between `start` and the deferred registration going live, or
+/// inside a lost watch's backoff) produced no event, so it is read here
+/// through the same revision gate, strict reload, and self-write check as an
+/// event-triggered read — a no-op when nothing changed.
+async fn debounce<F, Fut>(
+    registry: &SettingsRegistry,
+    revision_gate: &tokio::sync::RwLock<()>,
+    file_name: &std::ffi::OsStr,
+    raw_rx: &mut mpsc::UnboundedReceiver<notify::Event>,
+    on_change: &mut F,
+    stopped: &mut tokio::sync::watch::Receiver<bool>,
+    prepared_reload: Option<&PreparedReload>,
+) where
+    F: Fn(SettingsChanged) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let mut deadline: Option<tokio::time::Instant> = Some(tokio::time::Instant::now() + DEBOUNCE);
+    loop {
+        if *stopped.borrow() {
+            return;
+        }
+        tokio::select! {
+            biased;
+            _ = stopped.changed() => return,
             maybe = raw_rx.recv() => match maybe {
-                Some(()) => deadline = Some(tokio::time::Instant::now() + DEBOUNCE),
+                Some(event) => {
+                    // Access events carry no mutation; everything else
+                    // (create, modify, rename, remove) can affect the file's
+                    // content.
+                    if matches!(event.kind, notify::EventKind::Access(_)) {
+                        continue;
+                    }
+                    if event
+                        .paths
+                        .iter()
+                        .any(|p| p.file_name() == Some(file_name))
+                    {
+                        deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
+                    }
+                }
                 None => return,
             },
             () = sleep_until(deadline), if deadline.is_some() => {
                 deadline = None;
-                let _revision_guard = revision_gate.write().await;
-                if let ReloadOutcome::Applied(notice) = process_config_change(&registry) {
-                    on_change(notice).await;
+                if *stopped.borrow() { return; }
+                if let Some(reload) = prepared_reload {
+                    process_prepared_config_change(registry, reload, stopped).await;
+                } else {
+                    let _revision_guard = tokio::select! {
+                        biased;
+                        _ = stopped.changed() => return,
+                        guard = revision_gate.write() => guard,
+                    };
+                    if *stopped.borrow() { return; }
+                    if let ReloadOutcome::Applied(notice) = process_config_change(registry) {
+                        let callback = ADMITTED_CALLBACK.sync_scope((), || on_change(notice));
+                        ADMITTED_CALLBACK.scope((), callback).await;
+                    }
                 }
             }
         }
@@ -245,6 +546,199 @@ mod tests {
         }
         let reg = Arc::new(SettingsRegistry::load(&path).expect("load"));
         (dir, reg)
+    }
+
+    #[tokio::test]
+    async fn prepared_watcher_callback_owns_revision_and_publication() {
+        let (_dir, registry) = temp_registry(Some("[git]\nautoCommit = true\n"));
+        let revision = Arc::new(tokio::sync::RwLock::new(()));
+        let notice = registry.subscribe();
+        std::fs::write(registry.config_path(), "[git]\nautoCommit = false\n").unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let finished = Arc::new(Mutex::new(Some(tx)));
+        let reload: PreparedReload = Arc::new({
+            let registry = registry.clone();
+            let revision = revision.clone();
+            move |text, expected, _admission| {
+                let registry = registry.clone();
+                let revision = revision.clone();
+                let finished = finished.clone();
+                Box::pin(async move {
+                    assert_eq!(registry.get("git.autoCommit"), Some(json!(true)));
+                    let candidate = registry.prepare_repository_reload_at(&text, expected)?;
+                    let guard = revision
+                        .try_write()
+                        .expect("watcher must not acquire revision before the prepared owner");
+                    let notice = registry.publish_repository_reload(candidate, None)?;
+                    drop(guard);
+                    drop(finished.lock().unwrap().take());
+                    Ok(notice)
+                })
+            }
+        });
+        let (_stop_sender, mut stopped) = tokio::sync::watch::channel(false);
+        let mut legacy = |_| async { panic!("prepared reload owns its notification") };
+        tokio::time::timeout(
+            crate::events::LIVENESS,
+            debounce(
+                &registry,
+                &revision,
+                std::ffi::OsStr::new("config.toml"),
+                &mut rx,
+                &mut legacy,
+                &mut stopped,
+                Some(&reload),
+            ),
+        )
+        .await
+        .expect("prepared callback must finish without a revision deadlock");
+        assert_eq!(registry.get("git.autoCommit"), Some(json!(false)));
+        assert!(notice.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn prepared_watcher_preserves_self_write_missing_and_invalid_outcomes() {
+        let (_stopping, stopped) = tokio::sync::watch::channel(false);
+        let (_dir, registry) = temp_registry(None);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reload: PreparedReload = Arc::new({
+            let registry = registry.clone();
+            let calls = calls.clone();
+            move |text, expected, _admission| {
+                let registry = registry.clone();
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    let candidate = registry.prepare_repository_reload_at(&text, expected)?;
+                    registry.publish_repository_reload(candidate, None)
+                })
+            }
+        });
+        registry
+            .apply(&[("rtk.enabled".into(), json!(true))])
+            .unwrap();
+        let snapshot = registry.snapshot();
+        assert!(matches!(
+            process_prepared_config_change(&registry, &reload, &stopped).await,
+            ReloadOutcome::SelfWrite
+        ));
+        std::fs::remove_file(registry.config_path()).unwrap();
+        assert!(matches!(
+            process_prepared_config_change(&registry, &reload, &stopped).await,
+            ReloadOutcome::Missing
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        std::fs::write(registry.config_path(), "[git]\nautoCommit = 'invalid'\n").unwrap();
+        assert!(matches!(
+            process_prepared_config_change(&registry, &reload, &stopped).await,
+            ReloadOutcome::Invalid
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&snapshot, &registry.snapshot()));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn prepared_watcher_read_before_rpc_keeps_the_newer_snapshot() {
+        use intent_core::WorkspaceApi;
+
+        for restore_value in [false, true] {
+            let (_stopping, stopped) = tokio::sync::watch::channel(false);
+            let (dir, registry) = temp_registry(Some("[git]\nautoCommit = true\n"));
+            let store = intent_store::Store::open(&dir.path().join("settings.db"))
+                .await
+                .unwrap();
+            let services = crate::Services::new(store).with_settings_registry(registry.clone());
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let reload: PreparedReload = Arc::new({
+                let services = services.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                move |text, expected, admission| {
+                    let services = services.clone();
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    Box::pin(async move {
+                        entered.notify_one();
+                        release.acquire().await.unwrap().forget();
+                        services
+                            .apply_prepared_settings_reload(text, expected, admission)
+                            .await
+                    })
+                }
+            });
+            let task = intent_core::spawn_daemon({
+                let registry = registry.clone();
+                {
+                    let stopped = stopped.clone();
+                    async move { process_prepared_config_change(&registry, &reload, &stopped).await }
+                }
+            });
+            tokio::time::timeout(crate::events::LIVENESS, entered.notified())
+                .await
+                .expect("original watcher read reached its callback");
+            let applied = services
+                .settings_update(json!([{"path":"git.autoCommit","value":false}]))
+                .await
+                .unwrap();
+            assert_eq!(applied["applied"][0]["value"], false);
+            if restore_value {
+                services
+                    .settings_update(json!([{"path":"git.autoCommit","value":true}]))
+                    .await
+                    .unwrap();
+            }
+            let before = services
+                .settings_get("git.autoCommit".into())
+                .await
+                .unwrap();
+            let snapshot = registry.snapshot();
+            let persisted = std::fs::read_to_string(registry.config_path()).unwrap();
+            let notice = registry.subscribe();
+            release.add_permits(1);
+            let outcome = tokio::time::timeout(crate::events::LIVENESS, task)
+                .await
+                .expect("original callback must settle")
+                .unwrap();
+            let after = services
+                .settings_get("git.autoCommit".into())
+                .await
+                .unwrap();
+            eprintln!("stale reload restore={restore_value} outcome={outcome:?} before={before} after={after}");
+            assert!(matches!(outcome, ReloadOutcome::Invalid));
+            assert_eq!(before["value"], restore_value);
+            assert_eq!(after, before, "stale text must not publish a new revision");
+            assert!(Arc::ptr_eq(&snapshot, &registry.snapshot()));
+            assert!(!notice.has_changed().unwrap());
+            assert_eq!(
+                std::fs::read_to_string(registry.config_path()).unwrap(),
+                persisted
+            );
+
+            // A new read still adopts a genuinely new external edit. Keep the
+            // rejected callback separate from this fresh observation.
+            std::fs::write(
+                registry.config_path(),
+                format!("{persisted}\n[rtk]\nenabled = true\n"),
+            )
+            .unwrap();
+            let fresh: PreparedReload = Arc::new({
+                let services = services.clone();
+                move |text, expected, admission| {
+                    let services = services.clone();
+                    Box::pin(async move {
+                        services
+                            .apply_prepared_settings_reload(text, expected, admission)
+                            .await
+                    })
+                }
+            });
+            assert!(matches!(
+                process_prepared_config_change(&registry, &fresh, &stopped).await,
+                ReloadOutcome::Applied(_)
+            ));
+            assert_eq!(registry.get("rtk.enabled"), Some(json!(true)));
+            assert_eq!(registry.get("git.autoCommit"), Some(json!(restore_value)));
+        }
     }
 
     #[test]
@@ -375,15 +869,452 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn debounce_shutdown_cancels_pending_revision_gate() {
+        assert_debounce_revision_gate_schedule(true, false).await;
+    }
+
+    async fn prepared_shutdown_lock_schedule(credential: bool, release: bool) {
+        use std::task::{Context, Waker};
+
+        let (dir, registry) =
+            temp_registry(Some("[sourceControl.gitlab]\noauthClientId = 'before'\n"));
+        let store = intent_store::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let services = crate::Services::new(store).with_settings_registry(registry.clone());
+        let snapshot = registry.snapshot();
+        let notice = registry.subscribe();
+        let revision = services
+            .settings_revision
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let edited = "[sourceControl.gitlab]\noauthClientId = 'after'\n";
+        std::fs::write(registry.config_path(), edited).unwrap();
+        let mut credential_held = if credential {
+            Some(services.gitlab_credential_gate.lock().await)
+        } else {
+            None
+        };
+        let mut revision_held = if credential {
+            None
+        } else {
+            Some(services.settings_revision_gate.write().await)
+        };
+        let reload: PreparedReload = Arc::new({
+            let services = services.clone();
+            move |text, expected, admission| {
+                let services = services.clone();
+                Box::pin(async move {
+                    services
+                        .apply_prepared_settings_reload(text, expected, admission)
+                        .await
+                })
+            }
+        });
+        let (_raw_tx, mut raw_rx) = mpsc::unbounded_channel();
+        let (stopping, mut stopped) = tokio::sync::watch::channel(false);
+        let mut legacy = |_| async { panic!("actual prepared owner handles publication") };
+        let mut worker = Box::pin(debounce(
+            &registry,
+            &services.settings_revision_gate,
+            std::ffi::OsStr::new("config.toml"),
+            &mut raw_rx,
+            &mut legacy,
+            &mut stopped,
+            Some(&reload),
+        ));
+        tokio::time::pause();
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        tokio::time::advance(DEBOUNCE + Duration::from_millis(1)).await;
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        assert!(Arc::ptr_eq(&snapshot, &registry.snapshot()));
+        stopping.send_replace(true);
+        if release {
+            drop(credential_held.take());
+            drop(revision_held.take());
+            if credential {
+                assert!(
+                    services.gitlab_credential_gate.try_lock().is_err(),
+                    "original credential waiter was queued"
+                );
+            } else {
+                assert!(
+                    services.settings_revision_gate.try_read().is_err(),
+                    "original revision waiter was queued"
+                );
+            }
+        }
+        let stopped = worker.as_mut().poll(&mut cx).is_ready();
+        drop(worker);
+        tokio::time::resume();
+        drop(credential_held);
+        drop(revision_held);
+        assert!(
+            Arc::ptr_eq(&snapshot, &registry.snapshot()),
+            "stopped prepared candidate must never publish"
+        );
+        assert!(!notice.has_changed().unwrap());
+        assert_eq!(
+            services
+                .settings_revision
+                .load(std::sync::atomic::Ordering::SeqCst),
+            revision
+        );
+        assert_eq!(
+            std::fs::read_to_string(registry.config_path()).unwrap(),
+            edited
+        );
+        assert!(
+            stopped,
+            "shutdown must cancel the original prepared lock wait"
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn prepared_shutdown_cancels_credential_wait() {
+        prepared_shutdown_lock_schedule(true, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn prepared_shutdown_cancels_revision_wait() {
+        prepared_shutdown_lock_schedule(false, false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn prepared_shutdown_wins_simultaneous_lock_release() {
+        prepared_shutdown_lock_schedule(true, true).await;
+        prepared_shutdown_lock_schedule(false, true).await;
+    }
+
+    struct PreparedRuntimeHook {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl intent_core::ServerControl for PreparedRuntimeHook {
+        fn start_ws_listener(&self) -> intent_core::BoxFuture<'_, Result<u16>> {
+            assert!(
+                owns_admitted_callback(),
+                "hook construction follows publication"
+            );
+            Box::pin(async move {
+                assert!(owns_admitted_callback(), "hook execution stays admitted");
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.entered.notify_one();
+                self.release.acquire().await.unwrap().forget();
+                Ok(8787)
+            })
+        }
+        fn stop_ws_listener(&self) -> intent_core::BoxFuture<'_, ()> {
+            Box::pin(async { panic!("not the selected setting hook") })
+        }
+        fn ws_listener_port(&self) -> intent_core::BoxFuture<'_, Option<u16>> {
+            Box::pin(async { None })
+        }
+        fn is_tcp_connection(&self) -> bool {
+            false
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn prepared_shutdown_joins_published_runtime_hook_and_durable_event() {
+        let (dir, registry) = temp_registry(Some("[server.wsApi]\nenabled = false\n"));
+        let store = intent_store::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let bus = crate::events::bus::EventBus::new(store.clone());
+        let services = crate::Services::new(store.clone())
+            .with_settings_registry(registry.clone())
+            .with_event_bus(bus.clone());
+        let control = Arc::new(PreparedRuntimeHook {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        services.attach_server_control(control.clone());
+        let mut watcher = ConfigWatcher::start_prepared_reload(
+            &SharedWatchHub::new(),
+            registry.clone(),
+            services.settings_revision_gate(),
+            {
+                let services = services.clone();
+                move |text, expected, admission| {
+                    assert!(
+                        !owns_admitted_callback(),
+                        "preparation is not committed callback authority"
+                    );
+                    let services = services.clone();
+                    async move {
+                        services
+                            .apply_prepared_settings_reload(text, expected, admission)
+                            .await
+                    }
+                }
+            },
+        )
+        .unwrap();
+        assert!(watcher.ready().await);
+        std::fs::write(registry.config_path(), "[server.wsApi]\nenabled = true\n").unwrap();
+        tokio::time::timeout(crate::events::LIVENESS, control.entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(registry.get("server.wsApi.enabled"), Some(json!(true)));
+        assert!(
+            services.settings_revision_gate.try_read().is_err(),
+            "published callback retains the original revision guard"
+        );
+        let shutdown = watcher.shutdown();
+        tokio::pin!(shutdown);
+        let escaped = tokio::select! { biased; () = &mut shutdown => true, () = std::future::ready(()) => false };
+        control.release.add_permits(1);
+        tokio::time::timeout(crate::events::LIVENESS, &mut shutdown)
+            .await
+            .unwrap();
+        assert!(!escaped, "shutdown must join an already published callback");
+        assert_eq!(control.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(services.settings_revision_gate.try_write().is_ok());
+        bus.shutdown().await.unwrap();
+        store.close().await;
+        let reopened = intent_store::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == "settings:changed")
+                .count(),
+            1
+        );
+        reopened.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_applies_after_pending_revision_gate_releases() {
+        assert_debounce_revision_gate_schedule(false, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounce_shutdown_wins_when_revision_gate_also_releases() {
+        assert_debounce_revision_gate_schedule(true, true).await;
+    }
+
+    async fn assert_debounce_revision_gate_schedule(stop: bool, release: bool) {
+        use std::cell::RefCell;
+        use std::task::{Context, Poll, Waker};
+
+        let (_dir, reg) = temp_registry(Some("[git]\nautoCommit = true\n"));
+        let mut notices = reg.subscribe();
+        let generation = reg.generation();
+        let edited = "[git]\nautoCommit = false\n";
+        std::fs::write(reg.config_path(), edited).unwrap();
+        let revision_gate = tokio::sync::RwLock::new(());
+        let mut held = Some(revision_gate.write().await);
+        let (raw_tx, mut raw_rx) = mpsc::unbounded_channel();
+        let (stopping, mut stopped) = tokio::sync::watch::channel(false);
+        let calls = RefCell::new(Vec::new());
+        let mut on_change = |notice| {
+            assert!(
+                owns_admitted_callback(),
+                "callback construction is admitted"
+            );
+            let calls = &calls;
+            let gate = &revision_gate;
+            let reg = &reg;
+            async move {
+                assert!(owns_admitted_callback(), "callback execution is admitted");
+                assert!(gate.try_write().is_err(), "callback owns the revision gate");
+                assert_eq!(reg.get("git.autoCommit"), Some(json!(false)));
+                calls.borrow_mut().push(notice);
+            }
+        };
+        let mut worker = Box::pin(debounce(
+            &reg,
+            &revision_gate,
+            std::ffi::OsStr::new("config.toml"),
+            &mut raw_rx,
+            &mut on_change,
+            &mut stopped,
+            None,
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        // Only the real catch-up timer can become ready: both input channels
+        // stay open and empty, and the revision gate remains held.
+        tokio::time::advance(DEBOUNCE).await;
+        assert!(worker.as_mut().poll(&mut cx).is_pending());
+        assert!(calls.borrow().is_empty());
+        assert_eq!(reg.get("git.autoCommit"), Some(json!(true)));
+        assert!(!notices.has_changed().unwrap());
+        if stop {
+            stopping.send_replace(true);
+        }
+        if release {
+            drop(held.take());
+            // Tokio's FIFO gate excludes readers behind the queued writer.
+            // This proves the due timer reached lock acquisition, rather than
+            // leaving the worker pending on its timer or empty event channel.
+            assert!(
+                revision_gate.try_read().is_err(),
+                "watcher queued its writer"
+            );
+        }
+        let outcome = worker.as_mut().poll(&mut cx);
+        if !stop {
+            assert!(matches!(outcome, Poll::Pending));
+            let expected = SettingsChanged {
+                generation,
+                changed: ["git.autoCommit".to_owned()].into_iter().collect(),
+            };
+            assert_eq!(*calls.borrow(), vec![expected.clone()]);
+            assert_eq!(reg.get("git.autoCommit"), Some(json!(false)));
+            assert!(notices.has_changed().unwrap());
+            assert_eq!(*notices.borrow_and_update(), expected);
+            assert_eq!(reg.generation(), generation, "reload is not a self-write");
+            stopping.send_replace(true);
+            assert!(worker.as_mut().poll(&mut cx).is_ready());
+            assert_eq!(calls.borrow().len(), 1);
+        }
+        // Keep the event sender and (in the regression) original write guard
+        // alive through the stop poll. Drop the future before failing so the
+        // negative control leaves no pending lock waiter or background task.
+        drop(worker);
+        drop(raw_tx);
+        if stop {
+            assert!(calls.borrow().is_empty());
+            assert_eq!(reg.get("git.autoCommit"), Some(json!(true)));
+            assert_eq!(reg.generation(), generation);
+            assert!(!notices.has_changed().unwrap());
+            assert_eq!(std::fs::read_to_string(reg.config_path()).unwrap(), edited);
+            if !release {
+                assert!(
+                    held.is_some(),
+                    "stop was polled with the original guard held"
+                );
+            }
+        }
+        drop(held);
+        if stop {
+            assert!(
+                outcome.is_ready(),
+                "shutdown must cancel a pending revision-gate acquisition"
+            );
+        }
+    }
+
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
+    async fn shutdown_joins_an_admitted_config_callback() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (dir, reg) = temp_registry(Some("[git]\nautoCommit = true\n"));
+        let store = intent_store::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let bus = crate::events::bus::EventBus::new(store.clone());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut watcher = ConfigWatcher::start(
+            &SharedWatchHub::new(),
+            reg.clone(),
+            Arc::new(tokio::sync::RwLock::new(())),
+            {
+                let (entered, release, store, bus, calls) = (
+                    entered.clone(),
+                    release.clone(),
+                    store.clone(),
+                    bus.clone(),
+                    calls.clone(),
+                );
+                move |_| {
+                    let (entered, release, store, bus, calls) = (
+                        entered.clone(),
+                        release.clone(),
+                        store.clone(),
+                        bus.clone(),
+                        calls.clone(),
+                    );
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        entered.notify_one();
+                        release.notified().await;
+                        store
+                            .set_setting("test.callback", "finished")
+                            .await
+                            .unwrap();
+                        bus.publish(&crate::settings_changed_event(
+                            &[json!({"path":"git.autoCommit","value":false})],
+                            1,
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                }
+            },
+        )
+        .unwrap();
+        watcher
+            .probe()
+            .unwrap()
+            .wait_live(crate::events::LIVENESS)
+            .await;
+        std::fs::write(reg.config_path(), "[git]\nautoCommit = false\n").unwrap();
+        tokio::time::timeout(crate::events::LIVENESS, entered.notified())
+            .await
+            .unwrap();
+        let shutdown = watcher.shutdown();
+        tokio::pin!(shutdown);
+        let escaped = tokio::select! {
+            biased;
+            () = &mut shutdown => true,
+            () = std::future::ready(()) => false,
+        };
+        std::fs::write(reg.config_path(), "[git]\nautoCommit = true\n").unwrap();
+        release.notify_one();
+        if !escaped {
+            tokio::time::timeout(crate::events::LIVENESS, &mut shutdown)
+                .await
+                .unwrap();
+        }
+        bus.shutdown().await.unwrap();
+        store.close().await;
+        let reopened = intent_store::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let outcome = reopened.get_setting("test.callback").await.unwrap();
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        reopened.close().await;
+        assert_eq!(
+            outcome.as_deref(),
+            Some("finished"),
+            "shutdown abandoned an admitted config callback"
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "settings:changed"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!escaped);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
     async fn watcher_detects_rename_style_atomic_save() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (dir, reg) = temp_registry(Some("[git]\nautoCommit = true\n"));
         let (tx, mut rx) = mpsc::unbounded_channel::<SettingsChanged>();
-        let _watcher = ConfigWatcher::start(
+        let watcher = ConfigWatcher::start(
+            &SharedWatchHub::new(),
             reg.clone(),
             Arc::new(tokio::sync::RwLock::new(())),
             move |notice| {
@@ -394,8 +1325,14 @@ mod tests {
             },
         )
         .expect("start watcher");
-        // Give the OS watch a moment to establish before mutating the dir.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Registration is deferred to the hub's registrar thread, so wait for
+        // the watch to be LIVE before mutating the dir: a write that lands
+        // first produces no event and the wait below hangs.
+        watcher
+            .probe()
+            .expect("subscribed")
+            .wait_live(crate::events::LIVENESS)
+            .await;
         // Editor-style atomic save: write a temp file, rename over config.toml.
         let tmp = dir.path().join(".config.toml.editor-save");
         std::fs::write(&tmp, "[git]\nautoCommit = false\n").expect("write tmp");
@@ -406,5 +1343,176 @@ mod tests {
             .expect("watcher task alive");
         assert!(notice.changed.contains("git.autoCommit"), "{notice:?}");
         assert_eq!(reg.get("git.autoCommit"), Some(json!(false)));
+    }
+
+    /// The config directory's registration is reset when a recursive
+    /// co-tenant above it retires (Linux global inotify group); should that
+    /// re-registration fail, the hub closes the watcher's channel. The
+    /// watcher must re-subscribe and keep live-reloading rather than park on
+    /// the closed channel with a dead handle.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn watcher_re_subscribes_after_a_failed_re_registration() {
+        use crate::events::shared_watch::WatchFault;
+        use crate::events::LIVENESS;
+
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = tempfile::tempdir().expect("tempdir");
+        let ancestor = base.path().join("parent");
+        let cfg_dir = ancestor.join("cfg");
+        std::fs::create_dir_all(&cfg_dir).expect("mk cfg");
+        let path = cfg_dir.join("config.toml");
+        std::fs::write(&path, "[git]\nautoCommit = true\n").expect("seed config");
+        let reg = Arc::new(SettingsRegistry::load(&path).expect("load"));
+
+        // The recursive co-tenant's pruned walk registers `cfg` first; the
+        // watcher registers it on start (2nd); the third `watch()` is the
+        // survivor re-registration the ancestor's retirement sends; the
+        // fourth is the watcher's own re-subscription.
+        let fault = WatchFault::nth("cfg", 3);
+        let hub = SharedWatchHub::with_watch_fault(&fault);
+        let (sub_ancestor, _rx_ancestor, _) =
+            hub.subscribe_with(&ancestor, RecursiveMode::NonRecursive);
+        sub_ancestor.wait_established(LIVENESS).await;
+        let (sub_wide, _rx_wide, _) = hub.subscribe_with(&ancestor, RecursiveMode::Recursive);
+        sub_wide.wait_established(LIVENESS).await;
+        drop(sub_wide);
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<SettingsChanged>();
+        let watcher = ConfigWatcher::start(
+            &hub,
+            reg.clone(),
+            Arc::new(tokio::sync::RwLock::new(())),
+            move |notice| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(notice);
+                }
+            },
+        )
+        .expect("start watcher");
+        watcher
+            .probe()
+            .expect("subscribed")
+            .wait_live(LIVENESS)
+            .await;
+        assert_eq!(fault.attempts(), 2);
+        // Let the spawned loop observe the live registration and park in its
+        // debounce before the ancestor retires, so the recovery under test is
+        // the closed-channel path rather than a first poll that already finds
+        // the registration reset.
+        tokio::task::yield_now().await;
+
+        drop(sub_ancestor);
+
+        // The re-subscription lands as the fourth `watch()` on `cfg`; the
+        // fresh handle is stored right after it is enqueued.
+        let probe = tokio::time::timeout(LIVENESS, async {
+            loop {
+                if fault.attempts() >= 4 {
+                    if let Some(probe) = watcher.probe() {
+                        break probe;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("watcher must re-subscribe after its channel is closed");
+        probe.wait_live(LIVENESS).await;
+
+        let tmp = cfg_dir.join(".config.toml.editor-save");
+        std::fs::write(&tmp, "[git]\nautoCommit = false\n").expect("write tmp");
+        std::fs::rename(&tmp, reg.config_path()).expect("rename over config");
+        let notice = tokio::time::timeout(LIVENESS, rx.recv())
+            .await
+            .expect("the re-subscribed watcher should observe the atomic save")
+            .expect("watcher task alive");
+        assert!(notice.changed.contains("git.autoCommit"), "{notice:?}");
+        assert_eq!(reg.get("git.autoCommit"), Some(json!(false)));
+    }
+
+    /// An edit made while the directory is unwatched — after the survivor
+    /// re-registration failed, during the watcher's backoff — produces no
+    /// event. The re-subscription's catch-up read must apply it without a
+    /// second edit.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn watcher_catches_up_on_an_edit_made_while_unwatched() {
+        use crate::events::shared_watch::WatchFault;
+        use crate::events::LIVENESS;
+
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = tempfile::tempdir().expect("tempdir");
+        let ancestor = base.path().join("parent");
+        let cfg_dir = ancestor.join("cfg");
+        std::fs::create_dir_all(&cfg_dir).expect("mk cfg");
+        let path = cfg_dir.join("config.toml");
+        std::fs::write(&path, "[git]\nautoCommit = true\n").expect("seed config");
+        let reg = Arc::new(SettingsRegistry::load(&path).expect("load"));
+
+        // Same `watch()` sequence on `cfg` as the test above: pruned walk,
+        // start, failing survivor re-registration, re-subscription.
+        let fault = WatchFault::nth("cfg", 3);
+        let hub = SharedWatchHub::with_watch_fault(&fault);
+        let (sub_ancestor, _rx_ancestor, _) =
+            hub.subscribe_with(&ancestor, RecursiveMode::NonRecursive);
+        sub_ancestor.wait_established(LIVENESS).await;
+        let (sub_wide, _rx_wide, _) = hub.subscribe_with(&ancestor, RecursiveMode::Recursive);
+        sub_wide.wait_established(LIVENESS).await;
+        drop(sub_wide);
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<SettingsChanged>();
+        let watcher = ConfigWatcher::start(
+            &hub,
+            reg.clone(),
+            Arc::new(tokio::sync::RwLock::new(())),
+            move |notice| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(notice);
+                }
+            },
+        )
+        .expect("start watcher");
+        watcher
+            .probe()
+            .expect("subscribed")
+            .wait_live(LIVENESS)
+            .await;
+        assert_eq!(fault.attempts(), 2);
+        tokio::task::yield_now().await;
+
+        drop(sub_ancestor);
+
+        // The loop has dropped its dead handle and is sleeping out the backoff
+        // before the fourth `watch()`: nothing watches `cfg` right now.
+        tokio::time::timeout(LIVENESS, async {
+            while !(fault.attempts() == 3 && watcher.probe().is_none()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("watcher must enter its re-subscription backoff");
+        std::fs::write(&path, "[git]\nautoCommit = false\n").expect("edit while unwatched");
+
+        // No second edit: only the catch-up read on re-establishment can
+        // surface the change.
+        let notice = tokio::time::timeout(LIVENESS, rx.recv())
+            .await
+            .expect("the re-subscribed watcher must catch up on the unwatched edit")
+            .expect("watcher task alive");
+        assert!(notice.changed.contains("git.autoCommit"), "{notice:?}");
+        assert_eq!(reg.get("git.autoCommit"), Some(json!(false)));
+        assert!(
+            fault.attempts() >= 4,
+            "catch-up must ride the re-subscription"
+        );
     }
 }

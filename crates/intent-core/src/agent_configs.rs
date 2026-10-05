@@ -8,11 +8,36 @@
 //! (monorepo#1302 class (a)). Placing them under `<data_dir>/agent-configs`
 //! makes them daemon-owned, so a startup sweep (before any agent spawns, when
 //! nothing inside is live) reclaims whatever a previous run left behind.
+//!
+//! The one exception is an npx launch dir ([`NPX_LAUNCH_DIR_PREFIX`]): the
+//! same root hosts the neutral directory each npx provider launch starts in
+//! (intent-hq/intent#5738), and a daemon whose runtime shut down before the
+//! bounded process-tree kill finished retains that directory on purpose —
+//! npx / Node descendants may still be running in it, and they fail on a
+//! removed cwd. "Nothing inside is live" therefore does not hold for it at
+//! the next start, so [`sweep_agent_configs`] leaves it alone.
 
 use std::path::{Path, PathBuf};
 
 /// Directory under the data dir that holds per-agent generated config files.
 pub(crate) const AGENT_CONFIGS_DIR_NAME: &str = "agent-configs";
+
+/// File-name prefix of the neutral directory an npx provider launch starts
+/// in (`<prefix><uuid>`, created under the agent-configs root). Directories
+/// so named are skipped by [`sweep_agent_configs`]: one may be the cwd of a
+/// process tree the previous run could not finish killing, and nothing at
+/// startup can tell a retained live tree from a dead one without trusting
+/// reused pids. Each holds a single sentinel `package.json`, so a retained
+/// orphan costs one small directory per interrupted teardown.
+pub const NPX_LAUNCH_DIR_PREFIX: &str = "intentd-npx-";
+
+/// Whether `name` is the file name of an npx launch dir a previous run may
+/// have retained for a possibly live process tree.
+#[must_use]
+pub fn is_npx_launch_dir_name(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes()
+        .starts_with(NPX_LAUNCH_DIR_PREFIX.as_bytes())
+}
 
 /// The agent-configs root for a data dir: `<data_dir>/agent-configs`.
 #[must_use]
@@ -46,6 +71,11 @@ pub fn create_agent_configs_dir(dir: &Path) -> std::io::Result<()> {
 /// anything present at daemon startup — before any agent spawns — was leaked
 /// by a previous run that died before drop. A missing directory is a no-op.
 ///
+/// Npx launch dirs ([`is_npx_launch_dir_name`]) are retained, not leaked:
+/// the previous run kept one on purpose when its process-tree kill could not
+/// finish, and its descendants may still be running in it (see the module
+/// doc for the disk cost).
+///
 /// # Errors
 ///
 /// Returns the first I/O error from listing or removing entries (a missing directory is a no-op success).
@@ -56,6 +86,13 @@ pub fn sweep_agent_configs(dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
+            if is_npx_launch_dir_name(&entry.file_name()) {
+                tracing::debug!(
+                    path = %entry.path().display(),
+                    "keeping npx launch dir retained by a previous run"
+                );
+                continue;
+            }
             std::fs::remove_dir_all(entry.path())?;
         } else {
             std::fs::remove_file(entry.path())?;
@@ -108,6 +145,29 @@ mod tests {
         std::fs::create_dir(dir.join("stale-dir")).unwrap();
         sweep_agent_configs(&dir).unwrap();
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A launch dir retained by a previous run (its process-tree kill never
+    /// finished, so npx descendants may still run in it) survives the sweep;
+    /// ordinary leftovers beside it do not.
+    #[test]
+    fn sweep_retains_npx_launch_dirs() {
+        let base = std::env::temp_dir().join(format!("intentd-agent-cfg-{}", uuid::Uuid::new_v4()));
+        let dir = agent_configs_root(&base);
+        create_agent_configs_dir(&dir).unwrap();
+        let retained = dir.join(format!("{NPX_LAUNCH_DIR_PREFIX}{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&retained).unwrap();
+        std::fs::write(retained.join("package.json"), b"{}").unwrap();
+        std::fs::write(dir.join("intentd-mcp-stale.json"), b"{}").unwrap();
+        std::fs::create_dir(dir.join("stale-dir")).unwrap();
+        sweep_agent_configs(&dir).unwrap();
+        let left: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(left, vec![retained.clone()], "only the launch dir survives");
+        assert!(retained.join("package.json").is_file());
         std::fs::remove_dir_all(&base).ok();
     }
 

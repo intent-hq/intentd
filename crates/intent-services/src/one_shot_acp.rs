@@ -25,20 +25,39 @@
 //! (`configOptions[id="model"]`, the same mechanism the persistent agent
 //! path uses for claude-code and pi); a failed or unsupported attempt is
 //! logged and the completion proceeds on the adapter's default model.
+//! Effort uses the resulting live thought-level selector: explicit invalid
+//! or failed values stop before the prompt; saved defaults fall back safely.
+//!
+//! The caller may attach a provider-specific `session/new` `_meta` (the
+//! claude-code utility shape that replaces the preset system prompt and
+//! disables the built-in tools, see `complete_ops::one_shot_session_shape`);
+//! the runner sends it verbatim and omits the key entirely when none is given,
+//! so providers without a slimming shape see the exact request they always did.
 
 use std::time::Duration;
 
+use intent_acp::session::SessionConfigOption;
 use intent_acp::{Connection, IncomingRequest, JsonRpcError, PermissionOutcome};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::acp_adapter::{
-    adapter_slots, exited_detail, initialize_params, observe_exit_status, reap_child,
-    spawn_adapter_in, AcpAdapterCommand, AdapterSlots, SpawnError,
+    adapter_slots, exited_detail, initialize_params, observe_exit_status, spawn_adapter_in,
+    AcpAdapterCommand, AdapterSlots, SpawnError,
 };
+
+use crate::agent_session::{discover_thought_level, ThoughtLevelOption};
 
 /// The one-shot launch description (shared with the model probe).
 pub(crate) use crate::acp_adapter::AcpAdapterCommand as OneShotCommand;
+
+/// Keep the explicit request and both saved candidates until model selection
+/// finishes. Cached effort metadata may describe a different model.
+#[derive(Debug, Default)]
+pub(crate) struct OneShotEffort {
+    pub explicit: Option<String>,
+    pub saved: Vec<String>,
+}
 
 /// Machine-readable one-shot failure reasons. The caller maps these onto the
 /// `agent.completeOnce` contract (`{ available: false, reason }` vs an error).
@@ -48,6 +67,10 @@ pub(crate) enum OneShotError {
     /// adapter bound — nothing was ever spawned, and no model was ever asked
     /// (monorepo#2062).
     QueueTimeout { waited_ms: u64, limit: u32 },
+    /// Explicit effort is not supported by the actual live session.
+    InvalidEffort(String),
+    /// Explicit effort could not be applied; do not send the prompt.
+    ApplyEffort(String),
     /// The adapter process could not be spawned.
     Spawn(String),
     /// A request failed at the transport level or timed out.
@@ -73,6 +96,7 @@ impl std::fmt::Display for OneShotError {
                 "timed out after {waited_ms}ms waiting for a free adapter slot \
                  (limit {limit}); no completion was started"
             ),
+            OneShotError::InvalidEffort(e) | OneShotError::ApplyEffort(e) => f.write_str(e),
             OneShotError::Spawn(e) => write!(f, "failed to spawn adapter: {e}"),
             OneShotError::Transport(e) => write!(f, "one-shot transport failed: {e}"),
             OneShotError::Rpc(e) => write!(f, "adapter returned an error: {e}"),
@@ -86,6 +110,12 @@ impl std::fmt::Display for OneShotError {
     }
 }
 
+/// Lazy setting read, polled only after session and model setup.
+pub(crate) type FastModePreference<'a> = (
+    &'a str,
+    std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>,
+);
+
 /// Run one ephemeral ACP completion: claim a slot in the daemon-wide adapter
 /// bound, spawn `cmd`, drive the turn with `prompt` as a single text content
 /// block, and return the concatenated assistant text. `prompt_timeout` bounds
@@ -93,7 +123,10 @@ impl std::fmt::Display for OneShotError {
 /// `session/prompt` phase — setup uses the launch's npx-aware staged budgets,
 /// as before. `config_option_model`, when set, is applied best-effort after
 /// `session/new` via `session/set_config_option` (a failure never fails the
-/// completion). The child is reaped before returning on every path.
+/// completion). `session_meta`, when set, rides `session/new` as `_meta`
+/// verbatim (absent otherwise). The child is reaped before returning on
+/// every path. `fast_mode` reads the daemon preference only at the pre-prompt
+/// boundary, so changes made while queued or opening the session are included.
 ///
 /// Reusing the caller's own timeout as the queue budget keeps the contract
 /// legible — you wait for a slot at most as long as you were willing to wait
@@ -101,17 +134,23 @@ impl std::fmt::Display for OneShotError {
 /// [`OneShotError::QueueTimeout`], never a hang and never something a client
 /// could mistake for a slow model.
 pub(crate) async fn run_one_shot_acp(
+    fast_mode: Option<FastModePreference<'_>>,
     cmd: OneShotCommand,
     prompt: &str,
     config_option_model: Option<&str>,
+    session_meta: Option<Value>,
     prompt_timeout: Duration,
+    effort: &OneShotEffort,
 ) -> Result<String, OneShotError> {
     run_one_shot_acp_in(
+        fast_mode,
         adapter_slots(),
         cmd,
         prompt,
         config_option_model,
+        session_meta,
         prompt_timeout,
+        effort,
     )
     .await
 }
@@ -122,12 +161,16 @@ pub(crate) async fn run_one_shot_acp(
 /// private [`AdapterSlots`], so slot pressure from sibling tests sharing the
 /// global bound cannot turn its asserted failure into a queue timeout
 /// (monorepo#2379).
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn run_one_shot_acp_in(
+    fast_mode: Option<FastModePreference<'_>>,
     slots: &AdapterSlots,
     cmd: OneShotCommand,
     prompt: &str,
     config_option_model: Option<&str>,
+    session_meta: Option<Value>,
     prompt_timeout: Duration,
+    effort: &OneShotEffort,
 ) -> Result<String, OneShotError> {
     let mut adapter = spawn_adapter_in(slots, &cmd, prompt_timeout)
         .await
@@ -140,13 +183,16 @@ pub(crate) async fn run_one_shot_acp_in(
         })?;
 
     let result = drive_one_shot(
+        fast_mode,
         &adapter.conn,
         &mut adapter.notifications,
         &mut adapter.requests,
         &cmd,
         prompt,
         config_option_model,
+        session_meta,
         prompt_timeout,
+        effort,
     )
     .await;
 
@@ -154,35 +200,45 @@ pub(crate) async fn run_one_shot_acp_in(
         Ok(text) => Ok(text),
         Err(err) => Err(attribute_early_exit(err, &mut adapter.child, &adapter.conn).await),
     };
-    reap_child(&mut adapter.child).await;
+    adapter.child.reap().await;
     result
 }
 
 /// `initialize` → `session/new` (both under the launch's staged setup cap) →
 /// best-effort model application → one `session/prompt` bounded by
 /// `prompt_timeout`, accumulating `agent_message_chunk` text while answering
-/// agent→client requests inline through every phase.
+/// agent→client requests concurrently through every phase.
+#[expect(clippy::too_many_arguments)]
 async fn drive_one_shot(
+    fast_mode: Option<FastModePreference<'_>>,
     conn: &Connection,
     notifications: &mut mpsc::UnboundedReceiver<intent_acp::IncomingNotification>,
     requests: &mut mpsc::UnboundedReceiver<IncomingRequest>,
     cmd: &AcpAdapterCommand,
     prompt: &str,
     config_option_model: Option<&str>,
+    session_meta: Option<Value>,
     prompt_timeout: Duration,
+    effort: &OneShotEffort,
 ) -> Result<String, OneShotError> {
+    // One responder for the whole lifecycle: a response send still pending
+    // when a phase resolves is carried into the next phase's loop instead of
+    // being dropped at the boundary (see `Responder`).
+    let mut responder = Responder::new(conn);
+
     // Setup is serviced too: an adapter that sends
     // `session/request_permission` during `initialize` or `session/new`
     // still gets the immediate auto-deny instead of stalling setup into a
     // misreported SetupTimeout.
-    let session_id = serve_requests_while(
-        conn,
+    let (session_id, mut thought_level, mut config_options) = serve_requests_while(
+        &mut responder,
         requests,
         tokio::time::timeout(
             cmd.setup_timeout(),
             setup_session(
                 conn,
                 cmd.working_dir(),
+                session_meta,
                 cmd.initialize_timeout(),
                 cmd.session_new_timeout(),
             ),
@@ -192,25 +248,57 @@ async fn drive_one_shot(
     .unwrap_or(Err(OneShotError::SetupTimeout))?;
 
     if let Some(model) = config_option_model {
-        apply_config_option_model(
-            conn,
+        if let Some(response) = apply_config_option_model(
+            &mut responder,
             requests,
             &session_id,
             model,
             cmd.session_new_timeout(),
         )
-        .await;
+        .await
+        {
+            crate::fast_mode::refresh_options(&mut config_options, Some(&response));
+            // A valid replacement list without thought_level clears the old
+            // selector. Missing/malformed lists preserve it for old adapters.
+            if let Some(options) = parse_config_options(&response) {
+                thought_level = discover_thought_level(Some(&options));
+            }
+        }
+    }
+    apply_effort(
+        &mut responder,
+        requests,
+        &session_id,
+        thought_level.as_ref(),
+        effort,
+        cmd.session_new_timeout(),
+    )
+    .await?;
+    // Fast preferences are sampled after both model and effort selection.
+    if let Some((provider, preference)) = fast_mode {
+        let enabled = preference.await;
+        serve_requests_while(
+            &mut responder,
+            requests,
+            crate::fast_mode::apply(conn, &session_id, provider, enabled, &mut config_options),
+        )
+        .await
+        .map_err(|e| OneShotError::Transport(e.to_string()))?;
     }
 
     let params = json!({
         "sessionId": session_id,
         "prompt": [{ "type": "text", "text": prompt }],
     });
-    // `prompt_timeout` is passed as the transport request timeout, so it is
-    // the single bound on the prompt phase. Dropping the request future on
-    // timeout is cancel-safe — the transport's drop guard removes the
-    // pending entry.
-    let prompt_fut = conn.request_timeout("session/prompt", params, prompt_timeout);
+    // `prompt_timeout` is the single bound on the prompt phase. The transport
+    // request timeout only starts once the line is queued to the writer, so
+    // the outer timeout also covers the send itself (a writer channel wedged
+    // by a non-reading adapter). Dropping the request future on timeout is
+    // cancel-safe — the transport's drop guard removes the pending entry.
+    let prompt_fut = tokio::time::timeout(
+        prompt_timeout,
+        conn.request_timeout("session/prompt", params, prompt_timeout),
+    );
     tokio::pin!(prompt_fut);
 
     let mut text = String::new();
@@ -227,14 +315,15 @@ async fn drive_one_shot(
                 // branch so the select! cannot busy-spin.
                 None => notifications_open = false,
             },
-            req = requests.recv(), if requests_open => match req {
-                Some(req) => auto_respond(conn, req).await,
+            () = responder.flush(), if responder.in_flight() => {}
+            req = requests.recv(), if requests_open && !responder.in_flight() => match req {
+                Some(req) => responder.start(req),
                 None => requests_open = false,
             },
         }
     };
 
-    match outcome {
+    match outcome.unwrap_or_else(|_| Err(intent_acp::AcpError::Timeout("session/prompt".into()))) {
         Ok(_) => {
             // Drain any chunk that raced the prompt response into the channel
             // before deciding the turn produced nothing.
@@ -252,11 +341,13 @@ async fn drive_one_shot(
     }
 }
 
-/// Drive `fut` to completion while answering agent→client requests inline
+/// Drive `fut` to completion while answering agent→client requests concurrently
 /// (the same auto-deny/refuse posture as the prompt phase), so no phase of
 /// the one-shot lifecycle can hang on an unanswered client-served request.
+/// A send still in flight when `fut` resolves stays in `responder` for the
+/// caller's next phase to finish.
 async fn serve_requests_while<F: std::future::Future>(
-    conn: &Connection,
+    responder: &mut Responder<'_>,
     requests: &mut mpsc::UnboundedReceiver<IncomingRequest>,
     fut: F,
 ) -> F::Output {
@@ -265,12 +356,69 @@ async fn serve_requests_while<F: std::future::Future>(
     loop {
         tokio::select! {
             out = &mut fut => return out,
-            req = requests.recv(), if requests_open => match req {
-                Some(req) => auto_respond(conn, req).await,
+            () = responder.flush(), if responder.in_flight() => {}
+            req = requests.recv(), if requests_open && !responder.in_flight() => match req {
+                Some(req) => responder.start(req),
                 // Channel closed (connection dropped the sender): disable
                 // this branch so the select! cannot busy-spin.
                 None => requests_open = false,
             },
+        }
+    }
+}
+
+/// The at-most-one in-flight [`auto_respond`] send of the one-shot's serving
+/// loops, polled as its own `select!` branch rather than awaited inside a
+/// handler.
+///
+/// Response sends go through the transport's bounded writer channel, so an
+/// adapter that floods client-served requests without reading its stdin
+/// eventually makes a send block. Awaiting that send inline would stop the
+/// loop polling the phase future — and with it the phase timeout — turning a
+/// hostile adapter into an unbounded hang (monorepo#5465). Kept as a sibling
+/// branch, a stalled send never delays the phase; the budgets stay the hard
+/// ceiling. While a send is in flight the loop stops pulling further requests
+/// (their queue is unbounded and the transport reader keeps draining, so
+/// nothing deadlocks), preserving the in-order answer the auto-deny posture
+/// always gave.
+///
+/// One responder lives for the whole lifecycle (setup → model → prompt): a
+/// send still pending when a phase resolves is carried into the next phase's
+/// loop rather than dropped at the boundary. `Pending` there says nothing
+/// about the writer — Tokio's cooperative budget makes a bounded `send`
+/// yield even on an empty channel, and a briefly full writer drains as soon
+/// as the adapter reads — so the send keeps being polled under the following
+/// budget. Only the send pending when the final phase resolves is abandoned,
+/// together with the adapter.
+struct Responder<'c> {
+    conn: &'c Connection,
+    in_flight: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'c>>>,
+}
+
+impl<'c> Responder<'c> {
+    fn new(conn: &'c Connection) -> Self {
+        Self {
+            conn,
+            in_flight: None,
+        }
+    }
+
+    fn in_flight(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    fn start(&mut self, req: IncomingRequest) {
+        debug_assert!(self.in_flight.is_none());
+        self.in_flight = Some(Box::pin(auto_respond(self.conn, req)));
+    }
+
+    /// Drive the in-flight send to completion and clear it. Only polled
+    /// under an `in_flight()` precondition; the pending future is left in
+    /// place when this is dropped mid-poll, so it resumes on the next call.
+    async fn flush(&mut self) {
+        if let Some(fut) = self.in_flight.as_mut() {
+            fut.await;
+            self.in_flight = None;
         }
     }
 }
@@ -282,52 +430,167 @@ async fn serve_requests_while<F: std::future::Future>(
 /// completion proceeds on the adapter's default model — a best-effort model
 /// is never an error.
 async fn apply_config_option_model(
-    conn: &Connection,
+    responder: &mut Responder<'_>,
     requests: &mut mpsc::UnboundedReceiver<IncomingRequest>,
     session_id: &str,
     model: &str,
     timeout: Duration,
-) {
+) -> Option<Value> {
+    let conn = responder.conn;
     let params = json!({ "sessionId": session_id, "configId": "model", "value": model });
+    // The outer timeout also bounds the send itself (see the prompt phase).
     let outcome = serve_requests_while(
-        conn,
+        responder,
         requests,
-        conn.request_timeout("session/set_config_option", params, timeout),
+        tokio::time::timeout(
+            timeout,
+            conn.request_timeout("session/set_config_option", params, timeout),
+        ),
     )
-    .await;
-    if let Err(err) = outcome {
-        tracing::debug!(
-            "one-shot session/set_config_option(model={model}) failed; \
+    .await
+    .unwrap_or_else(|_| {
+        Err(intent_acp::AcpError::Timeout(
+            "session/set_config_option".into(),
+        ))
+    });
+    match outcome {
+        Ok(response) => Some(response),
+        Err(err) => {
+            tracing::debug!(
+                "one-shot session/set_config_option(model={model}) failed; \
              continuing with the adapter default: {err}"
-        );
+            );
+            None
+        }
     }
 }
 
-/// `initialize` then `session/new` with no MCP servers, returning the
-/// adapter's session id.
+/// `initialize` then `session/new` with no MCP servers (plus the caller's
+/// `_meta`, when given), returning the adapter's session id.
 async fn setup_session(
     conn: &Connection,
     cwd: std::path::PathBuf,
+    session_meta: Option<Value>,
     initialize_timeout: Duration,
     session_new_timeout: Duration,
-) -> Result<String, OneShotError> {
+) -> Result<(String, Option<ThoughtLevelOption>, Option<Value>), OneShotError> {
     conn.request_timeout("initialize", initialize_params(), initialize_timeout)
         .await
         .map_err(map_acp_error)?;
 
-    let session_params = json!({
+    let mut session_params = json!({
         "cwd": cwd.to_string_lossy(),
         "mcpServers": [],
     });
+    if let Some(meta) = session_meta {
+        session_params["_meta"] = meta;
+    }
     let result = conn
         .request_timeout("session/new", session_params, session_new_timeout)
         .await
         .map_err(map_acp_error)?;
-    result
+    let session_id = result
         .get("sessionId")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| OneShotError::Transport("session/new returned no sessionId".to_string()))
+        .ok_or_else(|| OneShotError::Transport("session/new returned no sessionId".to_string()))?;
+    let thought_level =
+        parse_config_options(&result).and_then(|options| discover_thought_level(Some(&options)));
+    Ok((
+        session_id,
+        thought_level,
+        result.get("configOptions").cloned(),
+    ))
+}
+
+fn parse_config_options(response: &Value) -> Option<Vec<SessionConfigOption>> {
+    serde_json::from_value(response.get("configOptions")?.clone()).ok()
+}
+
+/// Validate against the final live selector and apply before any prompt.
+/// Explicit errors stop execution. Stale saved defaults degrade gracefully.
+async fn apply_effort(
+    responder: &mut Responder<'_>,
+    requests: &mut mpsc::UnboundedReceiver<IncomingRequest>,
+    session_id: &str,
+    selector: Option<&ThoughtLevelOption>,
+    effort: &OneShotEffort,
+    timeout: Duration,
+) -> Result<(), OneShotError> {
+    let candidates: Vec<&str> = match effort.explicit.as_deref() {
+        Some(value) => vec![value],
+        None => effort.saved.iter().map(String::as_str).collect(),
+    };
+    for requested in candidates {
+        let supported = selector.and_then(|s| {
+            s.values
+                .iter()
+                .find(|v| v.eq_ignore_ascii_case(requested))
+                .map(String::as_str)
+                .or_else(|| s.values.is_empty().then_some(requested))
+                .map(|value| (s, value))
+        });
+        let Some((selector, value)) = supported else {
+            if effort.explicit.is_some() {
+                let detail = selector.map_or_else(
+                    || "effort is unsupported by this session".to_owned(),
+                    |s| format!("available choices: {}", s.values.join(", ")),
+                );
+                return Err(OneShotError::InvalidEffort(format!(
+                    "reasoningEffort {requested:?} is not supported; {detail}"
+                )));
+            }
+            tracing::warn!(
+                effort = requested,
+                "unsupported saved quick-action effort; trying the next default"
+            );
+            continue;
+        };
+        if selector.current_value.eq_ignore_ascii_case(value) {
+            return Ok(());
+        }
+        let conn = responder.conn;
+        let params =
+            json!({"sessionId": session_id, "configId": selector.config_id, "value": value});
+        let result = serve_requests_while(
+            responder,
+            requests,
+            tokio::time::timeout(
+                timeout,
+                conn.request_timeout("session/set_config_option", params, timeout),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(intent_acp::AcpError::Timeout(
+                "session/set_config_option".into(),
+            ))
+        });
+        let failure = match result {
+            Err(err) => Some(err.to_string()),
+            Ok(response) => response
+                .get("configOptions")
+                .and_then(Value::as_array)
+                .and_then(|options| options.iter().find(|o| o["id"] == selector.config_id))
+                .and_then(|o| o["currentValue"].as_str())
+                .filter(|actual| !actual.eq_ignore_ascii_case(value))
+                .map(|actual| format!("provider returned {actual:?} instead of {value:?}")),
+        };
+        if let Some(failure) = failure {
+            if effort.explicit.is_some() {
+                return Err(OneShotError::ApplyEffort(format!(
+                    "failed to apply reasoningEffort: {failure}"
+                )));
+            }
+            tracing::warn!(
+                effort = requested,
+                error = failure,
+                "saved quick-action effort could not be applied; keeping provider default"
+            );
+        }
+        return Ok(());
+    }
+    Ok(())
 }
 
 /// Append the text of an `agent_message_chunk` `session/update` to the
@@ -391,7 +654,11 @@ async fn attribute_early_exit(
 ) -> OneShotError {
     if matches!(
         err,
-        OneShotError::Spawn(_) | OneShotError::Rpc(_) | OneShotError::QueueTimeout { .. }
+        OneShotError::Spawn(_)
+            | OneShotError::Rpc(_)
+            | OneShotError::QueueTimeout { .. }
+            | OneShotError::InvalidEffort(_)
+            | OneShotError::ApplyEffort(_)
     ) {
         return err;
     }
@@ -419,3 +686,6 @@ fn map_acp_error(err: intent_acp::AcpError) -> OneShotError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod effort_tests;

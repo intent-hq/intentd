@@ -12,6 +12,117 @@ use super::*;
 use crate::auth::TokenStore;
 use crate::server::PairingSnapshot;
 
+struct SelfApi {
+    valid: std::sync::atomic::AtomicBool,
+    revoke_on_profile: bool,
+}
+
+impl WorkspaceApi for SelfApi {
+    fn primary_principal_id(&self) -> intent_core::BoxFuture<'_, Result<intent_core::PrincipalId>> {
+        Box::pin(async { Ok(intent_core::PrincipalId::from("owner")) })
+    }
+    fn principal_host_role(
+        &self,
+        _id: intent_core::PrincipalId,
+    ) -> intent_core::BoxFuture<'_, Result<intent_core::HostRole>> {
+        Box::pin(async { Ok(intent_core::HostRole::Guest) })
+    }
+    fn resolve_principal_credential(
+        &self,
+        hash: String,
+    ) -> intent_core::BoxFuture<'_, Result<Option<intent_core::PrincipalId>>> {
+        Box::pin(async move {
+            Ok((self.valid.load(std::sync::atomic::Ordering::SeqCst)
+                && hash == crate::hash_token("personal"))
+            .then(|| intent_core::PrincipalId::from("person")))
+        })
+    }
+    fn principal_me(&self) -> intent_core::BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if self.revoke_on_profile {
+                self.valid.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(json!({"id":"person","hostRole":"guest"}))
+        })
+    }
+}
+
+#[tokio::test]
+async fn self_pairing_revalidates_after_profile_and_never_falls_back() {
+    use intent_core::{AgentId, HostRole, PrincipalId};
+    let (provider, _dir) = provider(Some(5181), "personal_refusals", "owner-secret");
+    let api: Arc<dyn WorkspaceApi> = Arc::new(SelfApi {
+        valid: true.into(),
+        revoke_on_profile: true,
+    });
+    let person = Caller::Wire {
+        principal_id: PrincipalId::from("person"),
+        host_role: HostRole::Guest,
+    };
+    let mut connection = ConnectionPairing {
+        admitted: Some(crate::auth::AdmittedCredential::new(
+            crate::auth::ResolvedCredential::Principal(PrincipalId::from("person")),
+            "personal".into(),
+            crate::auth::LegacyRotation::new(provider.token_store(), "personal"),
+        )),
+        revoked: false,
+    };
+    let req =
+        || classify_self(&json!({"jsonrpc":"2.0","id":1,"method":"pairing.getSelfInfo"})).unwrap();
+    let reply = crate::context::with_request_context(
+        true,
+        Some(person.clone()),
+        handle_self(req(), &provider, &api, &mut connection),
+    )
+    .await
+    .unwrap();
+    let value: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(value["error"]["code"], -32003);
+    assert_eq!(value["error"]["data"]["code"], "access-revoked");
+    assert!(connection.revoked);
+    assert!(!reply.contains("owner-secret") && !reply.contains("personal"));
+    for (tcp, caller) in [
+        (true, Some(person.clone())),
+        (false, Some(person)),
+        (
+            false,
+            Some(Caller::Agent {
+                agent_id: AgentId::new(),
+            }),
+        ),
+        (false, Some(Caller::Daemon)),
+        (false, None),
+    ] {
+        let mut absent = ConnectionPairing::default();
+        let reply = crate::context::with_request_context(
+            tcp,
+            caller,
+            handle_self(req(), &provider, &api, &mut absent),
+        )
+        .await
+        .unwrap();
+        let value: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(value["error"]["data"]["code"], "access-revoked");
+        assert!(absent.revoked);
+        assert!(!reply.contains("owner-secret"));
+    }
+}
+
+#[tokio::test]
+async fn self_pairing_notifications_validate_and_close_without_a_reply() {
+    let (provider, _dir) = provider(Some(5181), "personal_notification", "owner-secret");
+    let api: Arc<dyn WorkspaceApi> = Arc::new(SelfApi {
+        valid: false.into(),
+        revoke_on_profile: false,
+    });
+    let mut state = ConnectionPairing::default();
+    let req = classify_self(&json!({"jsonrpc":"2.0","method":"pairing.getSelfInfo"})).unwrap();
+    assert!(handle_self(req, &provider, &api, &mut state)
+        .await
+        .is_none());
+    assert!(state.revoked);
+}
+
 /// In-memory token store for tests.
 #[derive(Default, Clone)]
 struct MemoryStore {
@@ -74,7 +185,11 @@ impl ServerPairingInfo for MockPairingInfo {
     }
 }
 
-fn provider(port: Option<u16>, dir: &str, token: &str) -> (Arc<dyn ServerPairingInfo>, PathBuf) {
+fn provider(
+    port: Option<u16>,
+    dir: &str,
+    token: &str,
+) -> (Arc<dyn ServerPairingInfo>, tempfile::TempDir) {
     provider_full(port, None, None, dir, token)
 }
 
@@ -83,30 +198,33 @@ fn provider_with_bind(
     bind_addresses: Option<Vec<std::net::IpAddr>>,
     dir: &str,
     token: &str,
-) -> (Arc<dyn ServerPairingInfo>, PathBuf) {
+) -> (Arc<dyn ServerPairingInfo>, tempfile::TempDir) {
     provider_full(port, bind_addresses, None, dir, token)
 }
 
+/// Builds a mock provider over a fresh RAII data dir for `dir`. The returned
+/// guard removes the dir on drop (including on panic); set
+/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
 fn provider_full(
     port: Option<u16>,
     bind_addresses: Option<Vec<std::net::IpAddr>>,
     tc_address: Option<String>,
     dir: &str,
     token: &str,
-) -> (Arc<dyn ServerPairingInfo>, PathBuf) {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let tmpdir =
-        std::env::temp_dir().join(format!("intentd-test-{}-{nanos}-{dir}", std::process::id()));
-    std::fs::create_dir_all(&tmpdir).unwrap();
+) -> (Arc<dyn ServerPairingInfo>, tempfile::TempDir) {
+    let mut tmpdir = tempfile::Builder::new()
+        .prefix(&format!("intentd-test-{dir}-"))
+        .tempdir()
+        .expect("create test temp dir");
+    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+        tmpdir.disable_cleanup(true);
+    }
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with(token)));
     let p: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
         port,
         bind_addresses,
         tc_address,
-        data_dir: tmpdir.clone(),
+        data_dir: tmpdir.path().to_path_buf(),
         token_store: store,
     });
     (p, tmpdir)
@@ -175,7 +293,7 @@ fn classify_ignores_other_methods_and_bad_envelope() {
 #[tokio::test]
 async fn handle_get_info_local_success_shape() {
     let token = "abababababababababababababababababababababababababababababababab";
-    let (provider, tmpdir) = provider(Some(5181), "pairing_get_info_local", token);
+    let (provider, _tmpdir) = provider(Some(5181), "pairing_get_info_local", token);
     let req = PairingRequest {
         id_present: true,
         id_echo: json!(1),
@@ -202,13 +320,12 @@ async fn handle_get_info_local_success_shape() {
     // carries no tc= param.
     assert!(result.get("tcAddress").is_none());
     assert!(!result["uri"].as_str().unwrap().contains("&tc="));
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
 #[tokio::test]
 async fn handle_get_info_includes_tc_address_when_tunnel_up() {
     let token = "abababababababababababababababababababababababababababababababab";
-    let (provider, tmpdir) = provider_full(
+    let (provider, _tmpdir) = provider_full(
         Some(5181),
         None,
         Some("tc7f2a91.tailcat.net".to_string()),
@@ -228,12 +345,11 @@ async fn handle_get_info_includes_tc_address_when_tunnel_up() {
         uri.ends_with("&tc=tc7f2a91.tailcat.net"),
         "tc= is the additive last param: {uri}"
     );
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
 #[tokio::test]
 async fn handle_get_info_remote_rejects() {
-    let (provider, tmpdir) = provider(Some(5181), "pairing_get_info_remote", "tok");
+    let (provider, _tmpdir) = provider(Some(5181), "pairing_get_info_remote", "tok");
     let req = PairingRequest {
         id_present: true,
         id_echo: json!(1),
@@ -245,12 +361,11 @@ async fn handle_get_info_remote_rejects() {
         .as_str()
         .unwrap()
         .contains("local-only"));
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
 #[tokio::test]
 async fn handle_get_info_no_tcp_listener_errors() {
-    let (provider, tmpdir) = provider(None, "pairing_get_info_no_tcp", "tok");
+    let (provider, _tmpdir) = provider(None, "pairing_get_info_no_tcp", "tok");
     let req = PairingRequest {
         id_present: true,
         id_echo: json!(1),
@@ -265,7 +380,6 @@ async fn handle_get_info_no_tcp_listener_errors() {
     // Machine-readable discriminator so `intentd pair` stops matching on
     // prose (monorepo#1822).
     assert_eq!(parsed["error"]["data"]["code"], "listener-down");
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
 #[tokio::test]
@@ -275,7 +389,7 @@ async fn handle_get_info_specific_bind_advertises_only_that_host() {
     // does not answer on (monorepo#2900).
     let token = "abababababababababababababababababababababababababababababababab";
     let bind: std::net::IpAddr = "192.168.1.23".parse().unwrap();
-    let (provider, tmpdir) =
+    let (provider, _tmpdir) =
         provider_with_bind(Some(5181), Some(vec![bind]), "pairing_bind_specific", token);
     let req = PairingRequest {
         id_present: true,
@@ -288,7 +402,6 @@ async fn handle_get_info_specific_bind_advertises_only_that_host() {
     let fp = parsed["result"]["fingerprint"].as_str().unwrap();
     let expected_uri = build_pairing_uri(&hosts, 5181, fp, token, None);
     assert_eq!(parsed["result"]["uri"].as_str().unwrap(), expected_uri);
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
 #[tokio::test]
@@ -299,7 +412,7 @@ async fn handle_get_info_loopback_bind_without_tunnel_errors() {
     // payload no other device can connect through.
     let token = "abababababababababababababababababababababababababababababababab";
     let bind: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-    let (provider, tmpdir) =
+    let (provider, _tmpdir) =
         provider_with_bind(Some(5181), Some(vec![bind]), "pairing_bind_loopback", token);
     let req = PairingRequest {
         id_present: true,
@@ -316,7 +429,6 @@ async fn handle_get_info_loopback_bind_without_tunnel_errors() {
         msg.contains("server.bindAddress") && msg.contains("server.tunnel.enabled"),
         "guidance names both remediations: {msg}"
     );
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
 #[tokio::test]
@@ -325,7 +437,7 @@ async fn handle_get_info_loopback_bind_with_tunnel_pairs_hostless() {
     // carries it, and the host list stays empty (loopback never advertised).
     let token = "abababababababababababababababababababababababababababababababab";
     let bind: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-    let (provider, tmpdir) = provider_full(
+    let (provider, _tmpdir) = provider_full(
         Some(5181),
         Some(vec![bind]),
         Some("tc7f2a91.tailcat.net".to_string()),
@@ -344,5 +456,4 @@ async fn handle_get_info_loopback_bind_with_tunnel_pairs_hostless() {
     let fp = parsed["result"]["fingerprint"].as_str().unwrap();
     let expected_uri = build_pairing_uri(&hosts, 5181, fp, token, Some("tc7f2a91.tailcat.net"));
     assert_eq!(parsed["result"]["uri"].as_str().unwrap(), expected_uri);
-    let _ = std::fs::remove_dir_all(&tmpdir);
 }

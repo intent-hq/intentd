@@ -32,7 +32,7 @@ pub(crate) async fn dispatch(
     // Chief-workspace gating: all ws.app.* methods require the caller to be
     // in the Chief workspace.
     if !workspace_id.is_chief() {
-        return Err("ws.app.* is only available in the Chief of Staff workspace".to_string());
+        return Err("ws.app.* is only available in the Assistant workspace".to_string());
     }
 
     match method {
@@ -147,7 +147,7 @@ fn proposal_resource_uri(proposal: &Value) -> String {
 }
 
 /// Return a proposal with dual text+resource content items.
-#[allow(clippy::unnecessary_wraps)] // dispatch arm helper; keeps the uniform Result shape
+#[expect(clippy::unnecessary_wraps)] // dispatch arm helper; keeps the uniform Result shape
 fn proposal_result(proposal: &Value) -> Result<Value, String> {
     // Build resource name from preview.title
     let name = proposal
@@ -410,7 +410,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "ws.app.* is only available in the Chief of Staff workspace"
+            "ws.app.* is only available in the Assistant workspace"
         );
     }
 
@@ -551,7 +551,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
-            "ws.app.* is only available in the Chief of Staff workspace"
+            "ws.app.* is only available in the Assistant workspace"
         );
     }
 

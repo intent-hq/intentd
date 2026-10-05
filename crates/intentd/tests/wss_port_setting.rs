@@ -21,7 +21,6 @@ use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 /// Mock `ServerControl` that captures port from `start_ws_listener` calls
 /// and tracks tailcat tunnel start/stop for the `server.tunnel.*` hooks.
@@ -127,20 +126,19 @@ impl ServerControl for MockPortServerControl {
 }
 
 struct TempDb {
+    dir: tempfile::TempDir,
     path: PathBuf,
 }
 impl TempDb {
     fn new() -> Self {
-        Self {
-            path: std::env::temp_dir().join(format!("intentd-port-{}.db", Uuid::new_v4())),
-        }
+        let dir = common::test_tempdir("intentd-port-");
+        let path = dir.path().join("intentd.db");
+        Self { dir, path }
     }
-}
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+
+    /// A UDS socket path inside the guarded dir, swept with the db.
+    fn socket_path(&self, name: &str) -> PathBuf {
+        self.dir.path().join(format!("{name}.sock"))
     }
 }
 
@@ -197,9 +195,9 @@ async fn rpc(
 }
 
 /// Test that server.wsApi.port setting exists and can be read/updated
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 // Port values are small whole-valued floats: casts are exact.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn port_setting_crud() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
@@ -212,11 +210,11 @@ async fn port_setting_crud() {
 
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
-    let socket_path = std::env::temp_dir().join(format!("port-{}.sock", Uuid::new_v4().simple()));
+    let socket_path = tmpdb.socket_path("port");
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         serve_uds(api, bus, &socket_path_clone, None, async {
             shutdown_rx.await.ok();
         })
@@ -278,9 +276,9 @@ async fn port_setting_crud() {
 }
 
 /// Test that changing port while listener is running triggers restart
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 // Port values are small whole-valued floats: casts are exact.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn port_change_restarts_listener() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
@@ -302,11 +300,11 @@ async fn port_change_restarts_listener() {
 
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
-    let socket_path = std::env::temp_dir().join(format!("port-r-{}.sock", Uuid::new_v4().simple()));
+    let socket_path = tmpdb.socket_path("port-r");
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         serve_uds(api, bus, &socket_path_clone, None, async {
             shutdown_rx.await.ok();
         })
@@ -345,7 +343,7 @@ async fn port_change_restarts_listener() {
 }
 
 /// Test that port bind failures return friendly error messages
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn port_bind_failure_friendly_error() {
     let tmpdb = TempDb::new();
     let store = Store::open(&tmpdb.path).await.expect("open store");
@@ -367,11 +365,11 @@ async fn port_bind_failure_friendly_error() {
 
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
-    let socket_path = std::env::temp_dir().join(format!("port-e-{}.sock", Uuid::new_v4().simple()));
+    let socket_path = tmpdb.socket_path("port-e");
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         serve_uds(api, bus, &socket_path_clone, None, async {
             shutdown_rx.await.ok();
         })
@@ -448,10 +446,10 @@ async fn setup_uds(
     services.attach_server_control(mock_control);
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
-    let socket_path = std::env::temp_dir().join(format!("{tag}-{}.sock", Uuid::new_v4().simple()));
+    let socket_path = tmpdb.socket_path(tag);
     let socket_path_clone = socket_path.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    tokio::spawn(async move {
+    intent_core::spawn_daemon(async move {
         serve_uds(api, bus, &socket_path_clone, None, async {
             shutdown_rx.await.ok();
         })
@@ -469,7 +467,7 @@ async fn setup_uds(
 
 /// server.tunnel.enabled toggles the tunnel through `ServerControl` and
 /// persists; disabling stops it.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_enabled_toggles_sidecar() {
     let tunnel_running = Arc::new(tokio::sync::Mutex::new(false));
     let mock_control = Arc::new(MockPortServerControl {
@@ -515,7 +513,7 @@ async fn tunnel_enabled_toggles_sidecar() {
 
 /// A tunnel start failure surfaces as a friendly settings.update error and
 /// the setting does not flip on.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_start_failure_friendly_error() {
     let mock_control = Arc::new(MockPortServerControl {
         listener_port: Some(5181),
@@ -555,7 +553,7 @@ async fn tunnel_start_failure_friendly_error() {
 
 /// Changing server.tunnel.derpUrl while the tunnel runs restarts the sidecar;
 /// while stopped it only persists.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_derp_url_restarts_running_sidecar() {
     let tunnel_running = Arc::new(tokio::sync::Mutex::new(false));
     let tunnel_starts = Arc::new(tokio::sync::Mutex::new(0));
@@ -613,7 +611,7 @@ async fn tunnel_derp_url_restarts_running_sidecar() {
 /// Disabling server.wsApi.enabled stops a running tunnel too (it forwards to
 /// the listener), and re-enabling it restarts the tunnel when the persisted
 /// server.tunnel.enabled is still true.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn ws_disable_stops_running_tunnel_and_reenable_restarts_it() {
     let tunnel_running = Arc::new(tokio::sync::Mutex::new(false));
     let tunnel_starts = Arc::new(tokio::sync::Mutex::new(0));
@@ -674,7 +672,7 @@ async fn ws_disable_stops_running_tunnel_and_reenable_restarts_it() {
 
 /// Changing server.wsApi.port while the tunnel runs restarts the sidecar so
 /// it forwards to the new port; a stopped tunnel is left alone.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn port_change_restarts_running_tunnel() {
     let tunnel_running = Arc::new(tokio::sync::Mutex::new(false));
     let tunnel_starts = Arc::new(tokio::sync::Mutex::new(0));
@@ -728,7 +726,7 @@ async fn port_change_restarts_running_tunnel() {
 
 /// A derpUrl change whose restart fails rolls back the setting AND brings the
 /// previously working tunnel back up on the prior settings.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn derp_url_rollback_restores_running_tunnel() {
     let tunnel_running = Arc::new(tokio::sync::Mutex::new(false));
     let tunnel_starts = Arc::new(tokio::sync::Mutex::new(0));
@@ -792,7 +790,7 @@ async fn derp_url_rollback_restores_running_tunnel() {
 /// server.tunnel.only hooks: a UDS caller can toggle it (listener restarts
 /// while running; persists only while stopped); a TCP caller enabling it is
 /// refused (loopback rebind would self-terminate).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn tunnel_only_restart_persist_and_tcp_guard() {
     // Listener running, UDS caller: toggle restarts the listener.
     let listener_starts = Arc::new(tokio::sync::Mutex::new(0));

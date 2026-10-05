@@ -8,11 +8,90 @@
 
 use std::collections::{HashMap, HashSet};
 
-use intent_core::events::{AGENT_TOOL_CALL, FILE_CHANGED};
-use intent_core::{
-    ActorType, AgentActivity, Event, FileActivity, TopChangedFile, WorkspaceEventSummary,
+use intent_core::events::{
+    is_collaborator_event_type, AGENT_TOOL_CALL, COLLABORATOR_EVENT_TYPES, FILE_CHANGED,
 };
+use intent_core::{
+    ActorType, AgentActivity, Caller, Event, FileActivity, TopChangedFile, WorkspaceEventSummary,
+};
+use intent_store::EventQuery;
 use serde_json::Value;
+
+/// Whether the current request is bound to a **non-administrator** wire
+/// caller — a collaborator connection whose durable event reads are narrowed
+/// to [`COLLABORATOR_EVENT_TYPES`] (multiplayer w3). Agents and the daemon
+/// act on their own authority (their reads are governed by the agent
+/// subscription rules, not the collaborator allowlist); an unbound request is
+/// never a collaborator here because the transport binds every wire caller.
+pub(crate) fn is_collaborator_caller() -> bool {
+    matches!(
+        intent_core::current_caller(),
+        Some(Caller::Wire {
+            host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
+            ..
+        })
+    )
+}
+
+/// Narrow a durable event read to the collaborator allowlist plus permission
+/// types (whose workspace grants are enforced separately in SQL) when the caller
+/// is a collaborator ([`is_collaborator_caller`]); a no-op for everyone
+/// else. The narrowing is pushed into the SQL type filter so paging and
+/// limits stay exact: an explicit type list keeps only allowlisted entries,
+/// a `prefix:*` category is expanded to the allowlisted types under it, and
+/// an unfiltered query becomes the whole allowlist. Returns `false` when the
+/// narrowed query can match nothing (the caller should return an empty
+/// result without hitting the store).
+pub(crate) fn narrow_query_for_caller(q: &mut EventQuery, member: bool) -> bool {
+    if !is_collaborator_caller() {
+        return true;
+    }
+    if !q.event_types.is_empty() {
+        q.event_types.retain(|t| {
+            is_collaborator_event_type(t.as_str())
+                || intent_core::events::is_permission_event_type(t)
+                || (member && intent_core::events::is_member_execution_event_type(t))
+        });
+        return !q.event_types.is_empty();
+    }
+    let allowed = COLLABORATOR_EVENT_TYPES.iter().map(|(t, _)| *t).chain(
+        intent_core::events::MEMBER_EVENT_TYPES
+            .iter()
+            .copied()
+            .filter(|t| member || intent_core::events::is_permission_event_type(t)),
+    );
+    q.event_types = match q.event_type_prefix.take() {
+        Some(prefix) => allowed
+            .filter(|t| t.starts_with(prefix.as_str()))
+            .map(str::to_string)
+            .collect(),
+        None => allowed.map(str::to_string).collect(),
+    };
+    !q.event_types.is_empty()
+}
+
+impl crate::Services {
+    pub(crate) async fn narrow_event_query_for_caller(
+        &self,
+        q: &mut EventQuery,
+    ) -> intent_core::Result<bool> {
+        let member = match intent_core::current_caller() {
+            Some(Caller::Wire { principal_id, .. }) if is_collaborator_caller() => {
+                let member = matches!(
+                    self.store.get_host_role(&principal_id).await?,
+                    intent_core::HostRole::Member | intent_core::HostRole::Owner
+                );
+                if !member {
+                    q.guest_permission_principal_id = Some(principal_id.clone());
+                    q.client_principal_id = Some(principal_id);
+                }
+                member
+            }
+            _ => false,
+        };
+        Ok(narrow_query_for_caller(q, member))
+    }
+}
 
 /// The lowercase wire string for an [`ActorType`] (matches the serde form).
 fn actor_type_str(actor_type: ActorType) -> &'static str {
@@ -146,7 +225,7 @@ pub(crate) fn build_workspace_summary(
         .collect();
     let active_agents = aggregate_agent_activity(&agent_events);
     // Event counts and window sizes are far below 2^53: loss-free in f64.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     let event_rate = all_events.len() as f64 / minutes_ago as f64;
 
     let mut order: Vec<String> = Vec::new();
@@ -225,7 +304,17 @@ const EVENT_ROW_TRIM_FIELDS: [&str; 6] = [
 pub(crate) fn serialize_event_rows(
     events: Vec<Event>,
 ) -> std::result::Result<Vec<Value>, serde_json::Error> {
-    events.into_iter().map(serde_json::to_value).collect()
+    let caller = intent_core::current_caller();
+    events
+        .into_iter()
+        .map(|event| {
+            let mut row = serde_json::to_value(event)?;
+            if let Some(Caller::Agent { agent_id }) = &caller {
+                intent_core::redact_self_queue_events(&mut row, agent_id);
+            }
+            Ok(row)
+        })
+        .collect()
 }
 
 /// Bound the serialized size of an `event.query` row set (monorepo#3347).

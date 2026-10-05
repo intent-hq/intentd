@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{Result as CoreResult, WorkspaceApi};
+use intent_git::repo_cache::{cache_path_for, cache_root_for};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
 use intent_transport::{
@@ -124,25 +125,17 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 struct Fixture {
-    _ws: WsApiServer,
+    ws: WsApiServer,
     port: u16,
     cfg: Arc<ClientConfig>,
     root: PathBuf,
-    _dir: TempDir,
+    dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-warm-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-warm-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -164,11 +157,11 @@ async fn boot() -> Fixture {
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Fixture {
-        _ws: ws,
+        ws,
         port,
         cfg,
         root: workspaces_root,
-        _dir: TempDir(dir),
+        dir: dir_guard,
     }
 }
 
@@ -238,46 +231,102 @@ fn owner_repo_of(dir: &std::path::Path) -> (String, String) {
     (owner, repo)
 }
 
-/// Poll `repo.warmCache` until the detached warm completes: an accepted
-/// re-warm proves the in-flight flag cleared; the populated cache slot
-/// proves the ensure ran.
-async fn wait_for_warm_completion(ws: &mut TlsWs, root: &std::path::Path, url: &str, base: i64) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let mut id = base;
-    loop {
-        let v = wss_rpc(ws, id, "repo.warmCache", json!({ "githubUrl": url })).await;
-        id += 1;
-        if let Some(result) = v.get("result").filter(|r| !r.is_null()) {
-            let cache = root
-                .join(".repo-cache")
-                .join(result["owner"].as_str().unwrap())
-                .join(result["repo"].as_str().unwrap());
-            assert!(cache.join(".git").exists(), "repo cache populated");
-            return;
+/// The on-disk cache slot for `owner`/`repo`: the daemon case-folds both
+/// segments while the RPC result echoes the raw case, so derive the slot
+/// through the daemon's own `cache_path_for` rather than joining.
+fn cache_slot(root: &std::path::Path, owner: &str, repo: &str) -> PathBuf {
+    cache_path_for(&cache_root_for(root), owner, repo)
+}
+
+/// Observe the original ensure under its per-repo lock. Merely seeing `.git`
+/// can race with clone/refresh, and issuing another warm RPC starts more work.
+/// All ensure filesystem writes and git child waits finish before this lock is
+/// released. A probe that wins the lock before the warm starts must retry.
+async fn wait_for_warm_completion(root: &std::path::Path, owner: &str, repo: &str) {
+    let cache = cache_slot(root, owner, repo);
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let path = cache.clone();
+            let populated = intent_git::repo_cache::with_cache_lock_blocking(&cache, move || {
+                Ok(path.join(".git").is_dir())
+            })
+            .await
+            .expect("observe warm cache under its lock");
+            if populated {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert_eq!(
-            v["error"]["data"]["code"],
-            json!("warm-in-flight"),
-            "only the busy error is expected while polling: {v}"
-        );
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "warm did not complete in time"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    })
+    .await
+    .expect("warm did not complete in time");
+}
+
+/// Exercise natural fixture disposal after the last cache writer has settled.
+/// Retention remains an explicit supported mode, using the common guard's rule.
+async fn finish(fx: Fixture, rpc: TlsWs) {
+    drop(rpc);
+    fx.ws.stop().await;
+    let dir = fx.dir.path().to_path_buf();
+    drop(fx);
+    let keep = std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty());
+    assert_eq!(
+        dir.exists(),
+        keep,
+        "fixture directory retention: {}",
+        dir.display()
+    );
+}
+
+/// `.git` may already exist while the original warm still owns a writer.
+/// Settlement must wait for that writer, without launching another ensure.
+#[tokio::test]
+async fn warm_completion_waits_for_cache_writer_before_teardown() {
+    let dir = common::test_tempdir("intentd-warm-settlement-");
+    let root = dir.path().join("workspaces");
+    let cache = cache_slot(&root, "owner", "repo");
+    let path = cache.clone();
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = tokio::spawn(async move {
+        intent_git::repo_cache::with_cache_lock_blocking(&cache, move || {
+            std::fs::create_dir_all(path.join(".git")).unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().expect("release writer");
+            std::fs::write(path.join("finished"), "done").unwrap();
+            Ok(())
+        })
+        .await
+    });
+    held_rx.await.unwrap();
+    let completion = wait_for_warm_completion(&root, "owner", "repo");
+    tokio::pin!(completion);
+    assert!(futures_util::poll!(&mut completion).is_pending());
+    release_tx.send(()).unwrap();
+    completion.await;
+    assert!(cache_slot(&root, "owner", "repo")
+        .join("finished")
+        .is_file());
+    writer.await.unwrap().unwrap();
 }
 
 /// Happy path over WSS: `repo.warmCache` returns the documented
 /// `{ started: true, owner, repo }` result immediately, and the detached
 /// ensure populates `<root>/.repo-cache/<owner>/<repo>` from the `file://`
 /// fixture.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn repo_warm_cache_starts_and_populates_cache_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(&fx).await;
 
-    let repo_dir = fx.root.parent().unwrap().join("warm-fixture-src");
+    // Mixed-case owner/repo segments: the daemon echoes them raw but stores
+    // the cache at the case-folded slot.
+    let repo_dir = fx
+        .root
+        .parent()
+        .unwrap()
+        .join("Warm-Owner")
+        .join("Warm-Fixture-Src");
     seed_repo(&repo_dir);
     let (owner, repo) = owner_repo_of(&repo_dir);
     let url = format!("file://{}", repo_dir.to_string_lossy());
@@ -291,29 +340,35 @@ async fn repo_warm_cache_starts_and_populates_cache_over_wss() {
         "result shape per PROTOCOL §5.6"
     );
 
-    wait_for_warm_completion(&mut rpc, &fx.root, &url, 100).await;
+    wait_for_warm_completion(&fx.root, &owner, &repo).await;
+    finish(fx, rpc).await;
 }
 
 /// Busy rejection over WSS: with the warm's ensure parked behind the held
 /// per-repo cache lock, a second `repo.warmCache` is rejected with `-32603`
 /// carrying `error.data = { code: "warm-in-flight", owner, repo }`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 2)]
 async fn repo_warm_cache_busy_rejection_envelope_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(&fx).await;
 
-    let repo_dir = fx.root.parent().unwrap().join("warm-busy-src");
+    let repo_dir = fx
+        .root
+        .parent()
+        .unwrap()
+        .join("Warm-Owner")
+        .join("Warm-Busy-Src");
     seed_repo(&repo_dir);
     let (owner, repo) = owner_repo_of(&repo_dir);
     let url = format!("file://{}", repo_dir.to_string_lossy());
 
     // Hold the per-repo cache lock (same in-process lock map as the daemon
-    // services) so the accepted warm's ensure parks and the in-flight window
-    // is deterministic.
-    let cache_path = fx.root.join(".repo-cache").join(&owner).join(&repo);
+    // services, keyed by the case-folded slot) so the accepted warm's ensure
+    // parks and the in-flight window is deterministic.
+    let cache_path = cache_slot(&fx.root, &owner, &repo);
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
-    let lock_holder = tokio::spawn(async move {
+    let lock_holder = intent_core::spawn_daemon(async move {
         intent_git::repo_cache::with_cache_lock_blocking(&cache_path, move || {
             held_tx.send(()).unwrap();
             release_rx.recv().unwrap();
@@ -338,12 +393,13 @@ async fn repo_warm_cache_busy_rejection_envelope_over_wss() {
 
     release_tx.send(()).unwrap();
     lock_holder.await.unwrap().unwrap();
-    wait_for_warm_completion(&mut rpc, &fx.root, &url, 100).await;
+    wait_for_warm_completion(&fx.root, &owner, &repo).await;
+    finish(fx, rpc).await;
 }
 
 /// Invalid URL over WSS: a `githubUrl` with no owner/repo pair is `-32602`,
 /// and a missing `githubUrl` param is `-32602` as well.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn repo_warm_cache_invalid_params_over_wss() {
     let fx = boot().await;
     let mut rpc = connect(&fx).await;

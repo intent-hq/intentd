@@ -13,7 +13,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,20 +29,18 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -51,9 +49,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -181,15 +178,14 @@ async fn connect_ws(
 /// return the guard, WSS port, pinned client config, UDS socket path, and
 /// stderr log path.
 async fn boot(prefix: &str, envs: &[(&str, &str)]) -> (Daemon, u16, Arc<ClientConfig>, PathBuf) {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
-    let mut env: Vec<(&str, &str)> = vec![("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let data_dir_guard = common::test_tempdir_in("/tmp", &format!("{prefix}-"));
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let mut env: Vec<(&str, &str)> = vec![("INTENTD_AUTH_TOKEN", TOKEN)];
     env.extend_from_slice(envs);
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -319,12 +315,8 @@ async fn await_profile_rows(log_path: &Path, offset: usize, methods: &[&str]) ->
     }
 }
 
-/// Statements `method`'s single profile row in `segment` attributes to the
-/// aggregate plan itself. The read pool grows lazily (min 0, max 32), so an
-/// aggregate fan-out may open new connections mid-dispatch; how many depends on
-/// scheduling, and each one runs sqlx's connection-setup PRAGMA statement
-/// inside the dispatch span. Those setup rows are subtracted so the budget
-/// measures the plan, not pool growth.
+/// The profiler already excludes lazy pool connection setup. Use its count
+/// unchanged: subtracting setup rows again would hide real handler work.
 fn plan_statements(segment: &str, method: &str) -> u64 {
     let rows = statement_counts(segment, method);
     assert_eq!(
@@ -332,16 +324,15 @@ fn plan_statements(segment: &str, method: &str) -> u64 {
         1,
         "one {method} profile row; segment:\n{segment}"
     );
-    let span = format!("rpc_dispatch{{method=\"{method}\"}}");
-    let connection_setup = strip_ansi(segment)
-        .lines()
-        .filter(|line| {
-            line.contains(&span)
-                && line.contains("sqlx::query")
-                && line.contains("summary=\"PRAGMA journal_mode = WAL;")
-        })
-        .count();
-    rows[0] - u64::try_from(connection_setup).unwrap()
+    rows[0]
+}
+
+#[test]
+fn profiled_plan_does_not_subtract_connection_setup_twice() {
+    let log = r#"DEBUG rpc_dispatch{method="workspace.list"}: sqlx::query: summary="PRAGMA journal_mode = WAL; …"
+WARN rpc dispatch exceeded SQL statement budget method=workspace.list statements=12
+"#;
+    assert_eq!(plan_statements(log, "workspace.list"), 12);
 }
 
 async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
@@ -380,20 +371,24 @@ where
 /// grow SQL statement count.
 #[tokio::test]
 async fn workspace_list_and_subscribe_statement_counts_are_constant_over_wss() {
-    const MAX_STATEMENTS: u64 = 11;
+    // Ten bulk workspace/aggregate reads, one indexed invitation-expiry
+    // probe, and one scalar membership projection. No invitations are due
+    // in this fixture; expiry maintenance is covered by the store tests.
+    const MAX_STATEMENTS: u64 = 12;
     let (daemon, port, cfg, socket) = boot(
         "itd-wscost",
         &[
             ("INTENTD_RPC_STATEMENT_WARN_THRESHOLD", "0"),
-            // Surface every `sqlx::query` row so [`plan_statements`] can
-            // tell read-pool connection setup apart from the aggregate plan.
+            // Retain every query in assertion diagnostics so an added
+            // statement can be traced to its actual SQL.
             ("RUST_LOG", "info,sqlx::query=debug"),
         ],
     )
     .await;
-    let log_path = daemon.data_dir.join("daemon.log");
+    let log_path = daemon.data_dir.path().join("daemon.log");
     let mut seeded = 0;
     let mut observed = Vec::new();
+    let mut segments = Vec::new();
 
     for target in [1, 10, 100] {
         while seeded < target {
@@ -453,21 +448,34 @@ async fn workspace_list_and_subscribe_statement_counts_are_constant_over_wss() {
         .await;
         let list_count = plan_statements(&segment, "workspace.list");
         let subscribe_count = plan_statements(&segment, "workspace.subscribe");
+        eprintln!("workspace cost: rows={target} list={list_count} subscribe={subscribe_count}");
+        observed.push((target, list_count, subscribe_count));
+        segments.push(segment);
+    }
+
+    for ((target, list_count, subscribe_count), segment) in observed.iter().zip(&segments) {
         assert!(
-            list_count <= MAX_STATEMENTS,
+            *list_count <= MAX_STATEMENTS,
             "{target} rows: {list_count}; log segment:\n{segment}"
         );
         assert!(
-            subscribe_count <= MAX_STATEMENTS,
+            *subscribe_count <= MAX_STATEMENTS,
             "{target} rows: {subscribe_count}; log segment:\n{segment}"
         );
-        observed.push((target, list_count, subscribe_count));
     }
 
     assert_eq!(
         observed.iter().map(|row| row.0).collect::<Vec<_>>(),
         [1, 10, 100]
     );
+    let (_, baseline_list, baseline_subscribe) = observed[0];
+    for (target, list_count, subscribe_count) in observed {
+        assert_eq!(
+            (list_count, subscribe_count),
+            (baseline_list, baseline_subscribe),
+            "statement counts must stay constant at {target} rows"
+        );
+    }
 }
 
 /// End-to-end: with the threshold lowered to 0, a real `note.subscribe` over
@@ -500,7 +508,7 @@ async fn lowered_threshold_fires_snapshot_warn_over_wss() {
 
     // The WARN is emitted just after the seq-0 frame is queued; poll briefly
     // to absorb stderr write scheduling.
-    let log_path = daemon.data_dir.join("daemon.log");
+    let log_path = daemon.data_dir.path().join("daemon.log");
     let deadline = tokio::time::Instant::now() + common::rpc_read_timeout();
     let needles: [&str; 4] = [
         "subscribe fast-path snapshot exceeded duration budget",
@@ -545,7 +553,7 @@ async fn default_threshold_stays_quiet_over_wss() {
 
     // The WARN (were it wrongly emitted) lands on stderr before the seq-0
     // frame is written, so a single read after the snapshot is sufficient.
-    let log_path = daemon.data_dir.join("daemon.log");
+    let log_path = daemon.data_dir.path().join("daemon.log");
     let log = std::fs::read_to_string(&log_path).expect("read daemon log");
     assert_eq!(
         count_lines(&log, &["intent_transport::subscribe_profile"]),

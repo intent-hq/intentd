@@ -11,7 +11,9 @@ use super::parse::{
 use super::parse::{
     is_auth_required_error, parse_acp_models, parse_codex_acp_models, parse_opencode_models,
 };
-use super::probe::{exit_attribution, ProbeError};
+#[cfg(unix)]
+use super::probe::exit_attribution;
+use super::probe::ProbeError;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -601,6 +603,7 @@ async fn antigravity_auth_accepts_valid_empty_catalog_and_detects_browser_guard(
 /// timeout); under full-suite parallel load an unserialized child can be
 /// starved past its budget, flaking the probe. `unwrap_or_else(into_inner)`
 /// recovers from a poisoned lock so one panicking test does not cascade.
+#[cfg(unix)]
 static CHILD_SPAWN_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Recorded (trimmed) response from
@@ -1337,6 +1340,71 @@ fn parse_codex_models_collapse_live_1_9_0_new_model_catalog() {
 }
 
 #[test]
+fn codex_sol_and_luna_catalog_preserves_model_specific_effort_selection() {
+    use crate::agent_ops::{ensure_bare_model_matches_provider, ensure_effort_supported_by_model};
+    use crate::model_catalog::{source_for, ModelCatalogCache};
+
+    // The 1.13.1 ACP shape was captured with an authenticated account on
+    // 2026-09-24 (GPT-5.6 Sol/Luna). GPT-6 rows are fixtures: their IDs and
+    // effort sets come from Codex rust-v0.156.1 models-manager/models.json,
+    // not a claim that the test account can execute those models.
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "gpt-6-sol[low]", "name": "6 Sol (low)" },
+            { "modelId": "gpt-6-sol[medium]", "name": "6 Sol (medium)" },
+            { "modelId": "gpt-6-sol[high]", "name": "6 Sol (high)" },
+            { "modelId": "gpt-6-sol[xhigh]", "name": "6 Sol (xhigh)" },
+            { "modelId": "gpt-6-sol[max]", "name": "6 Sol (max)" },
+            { "modelId": "gpt-6-sol[ultra]", "name": "6 Sol (ultra)" },
+            { "modelId": "gpt-6-luna[low]", "name": "6 Luna (low)" },
+            { "modelId": "gpt-6-luna[medium]", "name": "6 Luna (medium)" },
+            { "modelId": "gpt-6-luna[high]", "name": "6 Luna (high)" },
+            { "modelId": "gpt-6-luna[xhigh]", "name": "6 Luna (xhigh)" },
+            { "modelId": "gpt-6-luna[max]", "name": "6 Luna (max)" }
+        ] },
+        "configOptions": [
+            { "id": "model", "category": "model", "type": "select", "options": [
+                { "value": "gpt-6-sol", "name": "6 Sol" },
+                { "value": "gpt-6-luna", "name": "6 Luna" }
+            ] }
+        ]
+    });
+    let levels = ["low", "medium", "high", "xhigh", "max", "ultra"];
+    let rows = parse_codex_acp_models(&payload);
+    assert_eq!(
+        rows,
+        vec![
+            json!({ "id": "gpt-6-sol", "name": "6 Sol", "provider": "codex",
+                    "effortLevels": levels }),
+            json!({ "id": "gpt-6-luna", "name": "6 Luna", "provider": "codex",
+                    "effortLevels": levels[..5] }),
+        ]
+    );
+
+    // Drive the same catalog-backed guards used by agent creation and
+    // delegation. Sol's ultra must not leak into Luna's allowed efforts.
+    let cache = ModelCatalogCache::new(None);
+    let version = (source_for("codex").unwrap().version_key)();
+    cache.store_for_test("codex", &version, rows);
+    let reader = cache.reader(None);
+    for (model, supported) in [("gpt-6-sol", &levels[..]), ("gpt-6-luna", &levels[..5])] {
+        ensure_bare_model_matches_provider("agent.create", &reader, "codex", model).unwrap();
+        let scoped = format!("codex:{model}");
+        for effort in supported {
+            ensure_effort_supported_by_model("agent.create", &reader, Some(&scoped), effort)
+                .unwrap();
+        }
+    }
+    assert!(ensure_effort_supported_by_model(
+        "agent.create",
+        &reader,
+        Some("codex:gpt-6-luna"),
+        "ultra",
+    )
+    .is_err());
+}
+
+#[test]
 fn parse_codex_models_none_only_variant_has_no_effort_evidence() {
     let payload = json!({
         "models": { "availableModels": [
@@ -1621,7 +1689,7 @@ fn grok_outcome_rows_win_over_failed_exit() {
 // Holds CHILD_SPAWN_SERIAL across the spawn/await on purpose: the guard must
 // cover the whole child-spawning body so these fake-CLI execs never run
 // concurrently and starve one another.
-#[allow(clippy::await_holding_lock)]
+#[expect(clippy::await_holding_lock)]
 async fn opencode_models_cli_child_path_includes_binary_dir() {
     use std::os::unix::fs::PermissionsExt;
     // A fake opencode whose success is gated on its own parent dir being on
@@ -1653,7 +1721,7 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
+#[expect(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn grok_models_cli_child_path_includes_binary_dir() {
     use std::os::unix::fs::PermissionsExt;
     // Same enhanced-path contract as the opencode CLI spawn: the fake grok
@@ -1679,7 +1747,7 @@ async fn grok_models_cli_child_path_includes_binary_dir() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
+#[expect(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn grok_cli_timeout_flows_into_attributed_warning() {
     use std::os::unix::fs::PermissionsExt;
     // A wedged `grok models` must be cut short and the timeout reason must
@@ -1858,32 +1926,37 @@ async fn acp_probe_child_receives_env_overrides() {
 }
 
 #[test]
-fn codex_probe_launch_npx_fallback_strips_codex_env() {
-    // The pinned npx fallback is daemon-managed: CODEX_PATH / CODEX_CONFIG
-    // must be removed from its child env (#555).
-    let cmd = super::codex_probe_launch(None, Some(std::path::PathBuf::from("/usr/local/bin/npx")))
-        .expect("npx fallback must produce a probe command");
+fn codex_probe_launch_enforces_both_subagent_settings() {
+    let cmd = super::codex_probe_launch(Some(std::path::PathBuf::from("/usr/local/bin/npx")))
+        .expect("npx must produce a probe command");
     let removed = cmd.removed_env_vars();
-    assert!(removed.iter().any(|k| k == "CODEX_PATH"));
-    assert!(removed.iter().any(|k| k == "CODEX_CONFIG"));
+    assert!(!removed.iter().any(|k| k == "CODEX_PATH"));
+    assert!(!removed.iter().any(|k| k == "CODEX_CONFIG"));
+    let config = cmd
+        .env_vars()
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "CODEX_CONFIG");
+    let value = config.map(|(_, value)| {
+        serde_json::from_str::<serde_json::Value>(value.to_str().unwrap()).unwrap()
+    });
+    assert_eq!(
+        value,
+        Some(json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}))
+    );
 }
 
 #[test]
-fn codex_probe_launch_resolved_binary_keeps_codex_env() {
-    // A resolved codex-acp binary (providers.paths override / PATH scan) is
-    // the user's escape hatch — its env must be left untouched.
-    let cmd = super::codex_probe_launch(
-        Some(std::path::PathBuf::from("/custom/codex-acp")),
-        Some(std::path::PathBuf::from("/usr/local/bin/npx")),
-    )
-    .expect("resolved binary must produce a probe command");
-    assert!(cmd.removed_env_vars().is_empty());
-    assert!(cmd.env_vars().is_empty());
+fn codex_probe_launch_uses_selected_npx() {
+    let npx = std::path::PathBuf::from("/usr/local/bin/npx");
+    let cmd =
+        super::codex_probe_launch(Some(npx.clone())).expect("npx must produce a probe command");
+    assert_eq!(cmd.program(), npx.as_path());
 }
 
 #[test]
-fn codex_probe_launch_without_binary_or_npx_is_none() {
-    assert!(super::codex_probe_launch(None, None).is_none());
+fn codex_probe_launch_without_npx_is_none() {
+    assert!(super::codex_probe_launch(None).is_none());
 }
 
 #[cfg(unix)]
@@ -2011,6 +2084,36 @@ fn exit_attribution_rewrites_generic_errors_on_unsuccessful_exit() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn probe_preserves_npm_missing_package_cause_before_boilerplate() {
+    use super::probe::{run_acp_probe, AcpProbeCommand};
+    // Reproduce the captured npm output without invoking npm or touching a cache.
+    let script = r"cat >&2 <<'STDERR'
+npm error code ENOENT
+npm error syscall open
+npm error path /Users/clement/.npm/_npx/39d488c67d3fe4d0/package.json
+npm error errno -2
+npm error enoent Could not read package.json: Error: ENOENT: no such file or directory, open '/Users/clement/.npm/_npx/39d488c67d3fe4d0/package.json'
+npm error enoent This is related to npm not being able to find a file.
+npm error enoent
+npm error A complete log of this run can be found in: /Users/clement/.npm/_logs/2026-10-04T23_21_43_314Z-debug-0.log
+STDERR
+exit 254";
+    let cmd = AcpProbeCommand::binary("/bin/sh".into(), vec!["-c".into(), script.into()]);
+    let fetch = finish("codex", run_acp_probe(cmd, |_| Vec::new()).await);
+    assert!(fetch.models.is_none());
+    let warning = fetch.warning.expect("failed probe must have a warning");
+    assert!(warning.starts_with("codex: adapter exited before reporting models"));
+    assert!(warning.contains("254"), "{warning}");
+    assert!(warning.contains("ENOENT"), "{warning}");
+    assert!(warning.contains("open"), "{warning}");
+    assert!(
+        warning.contains("/Users/clement/.npm/_npx/39d488c67d3fe4d0/package.json"),
+        "{warning}"
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn exit_attribution_passes_through_spawn_rpc_clean_exit_and_live_child() {
     // Rpc must survive a dead child: auth detection keys off it.
@@ -2076,7 +2179,7 @@ async fn probe_rpc_error_survives_dead_child() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
+#[expect(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
     use std::os::unix::fs::PermissionsExt;
     // A wedged `opencode models` must be reaped when the timeout elapses and
@@ -2129,7 +2232,7 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
+#[expect(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn opencode_timeout_flows_into_attributed_warning() {
     use std::os::unix::fs::PermissionsExt;
     // The timeout reason must surface through the fetch result attribution
@@ -2191,7 +2294,7 @@ fn parse_param_count_billions_handles_dense_and_moe_names() {
 
 #[test]
 // Small test constants: float→int casts are exact and saturating.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn fits_within_ram_applies_the_seventy_percent_threshold() {
     // A 20B dense model: ~20e9 * 0.6 + 1GiB headroom ≈ 12.99 GB. Comfortably
     // under 70% of 32 GiB (~22.4 GB).
@@ -2207,7 +2310,7 @@ fn fits_within_ram_applies_the_seventy_percent_threshold() {
 
 #[test]
 // Small test constants: float↔int casts are exact and saturating.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
@@ -2361,4 +2464,47 @@ fn auth_required_detection() {
     assert!(is_auth_required_error(-32000, "please sign in first"));
     assert!(!is_auth_required_error(-32000, "internal error"));
     assert!(!is_auth_required_error(0, "model not found"));
+}
+
+#[test]
+fn installed_cli_probe_copies_routing_credentials_but_not_tools_or_hooks() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"
+profile = "gateway"
+[profiles.gateway]
+model = "new-model"
+model_provider = "gateway"
+model_reasoning_effort = "high"
+[model_providers.gateway]
+name = "Gateway"
+base_url = "https://gateway.example/v1"
+env_key = "GATEWAY_TOKEN"
+wire_api = "responses"
+[model_providers.gateway.env_http_headers]
+X-Token = "HEADER_TOKEN"
+[mcp_servers.untrusted]
+command = "must-not-run"
+[hooks]
+command = "must-not-run"
+"#,
+    )
+    .unwrap();
+    let seed = super::minimal_codex_config_seed(&path).unwrap();
+    let parsed: toml_edit::DocumentMut = seed.parse().unwrap();
+    assert_eq!(parsed["model"].as_str(), Some("new-model"));
+    assert_eq!(parsed["model_reasoning_effort"].as_str(), Some("high"));
+    assert_eq!(parsed["model_provider"].as_str(), Some("gateway"));
+    assert_eq!(
+        parsed["model_providers"]["gateway"]["env_key"].as_str(),
+        Some("GATEWAY_TOKEN")
+    );
+    assert_eq!(
+        parsed["model_providers"]["gateway"]["env_http_headers"]["X-Token"].as_str(),
+        Some("HEADER_TOKEN")
+    );
+    assert!(parsed.get("mcp_servers").is_none());
+    assert!(parsed.get("hooks").is_none());
 }

@@ -47,13 +47,13 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
-    AgentReverseDispatch, ClientId, ReverseDispatchError, ReverseTarget, WorkspaceApi, WorkspaceId,
+    AgentReverseDispatch, ClientId, PrincipalId, ReverseDispatchError, ReverseTarget, WorkspaceApi,
+    WorkspaceId,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -66,16 +66,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// Owns the fixture's scratch directory and removes it on drop so a panicking
-/// test does not leak files under the system tempdir (matches the pattern
-/// used by `TempDir` in `uds_specialist.rs`).
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 struct Fixture {
     ws: WsApiServer,
     api: Arc<dyn WorkspaceApi>,
@@ -84,7 +74,8 @@ struct Fixture {
     /// test can poll `len()` until the closing client's guard has actually
     /// dropped, instead of waiting on an arbitrary sleep.
     registry: Arc<PrimaryReverseRegistry>,
-    _dir: TempDir,
+    owner_id: PrincipalId,
+    _dir: tempfile::TempDir,
 }
 
 async fn boot() -> Fixture {
@@ -94,10 +85,10 @@ async fn boot() -> Fixture {
 /// [`boot`] with caller-supplied listener options (`base_port` and
 /// `bind_addresses` are always overridden to an ephemeral loopback port).
 async fn boot_with(opts: WsOptions) -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-sticky-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-sticky-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
+    let owner_id = store.get_primary_principal().await.expect("primary").id;
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
@@ -120,7 +111,8 @@ async fn boot_with(opts: WsOptions) -> Fixture {
         api,
         port,
         registry,
-        _dir: TempDir(dir),
+        owner_id,
+        _dir: dir_guard,
     }
 }
 
@@ -418,7 +410,7 @@ async fn answer_reverse(ws: &mut PlainWs, dur: Duration, result: Value) -> Value
     frame
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_browser_exec_routes_to_first_client_and_fails_over_on_disconnect() {
     let fx = boot().await;
     // Deterministic arrival-order barrier: connect A and complete a
@@ -450,7 +442,7 @@ async fn agent_browser_exec_routes_to_first_client_and_fails_over_on_disconnect(
 
     // First round: call from the "agent" side. Client A is primary and must
     // see the reverse RPC; client B must see nothing.
-    let call_a = tokio::spawn({
+    let call_a = intent_core::spawn_daemon({
         let api = fx.api.clone();
         let ws_id = ws_id.clone();
         async move {
@@ -487,7 +479,7 @@ async fn agent_browser_exec_routes_to_first_client_and_fails_over_on_disconnect(
     // A's `PrimaryReverseGuard` has been released and B is now the sole
     // eligible client.
     close_and_await_deregistration(a, &fx.registry, 1).await;
-    let call_b = tokio::spawn({
+    let call_b = intent_core::spawn_daemon({
         let api = fx.api.clone();
         async move {
             api.browser_exec(
@@ -512,7 +504,7 @@ async fn agent_browser_exec_routes_to_first_client_and_fails_over_on_disconnect(
     fx.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_browser_exec_without_any_client_reports_no_client_error() {
     let fx = boot().await;
     let err = fx
@@ -530,7 +522,7 @@ async fn agent_browser_exec_without_any_client_reports_no_client_error() {
     fx.ws.stop().await;
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_screenshot_timeout_returns_before_outer_deadline() {
     let fx = boot().await;
     let mut client = connect(fx.port).await;
@@ -542,7 +534,7 @@ async fn agent_screenshot_timeout_returns_before_outer_deadline() {
     )
     .await;
     let started = Instant::now();
-    let call = tokio::spawn({
+    let call = intent_core::spawn_daemon({
         let api = fx.api.clone();
         async move {
             api.browser_exec(
@@ -584,7 +576,7 @@ async fn agent_screenshot_timeout_returns_before_outer_deadline() {
 /// auxiliary `JsonRpcClient` (hellos without `browserExec`) — must never
 /// receive the agent's `browser.exec`; the desktop that hellos with the
 /// capability gets it even though it arrived last.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_browser_exec_skips_clients_without_the_browser_exec_capability() {
     let fx = boot().await;
     // iOS-like: connected, never sends `client.hello`. Barrier on `host.status`
@@ -628,7 +620,7 @@ async fn agent_browser_exec_skips_clients_without_the_browser_exec_capability() 
     assert_eq!(fx.registry.len(), 3);
     assert!(fx.registry.is_connected());
 
-    let call = tokio::spawn({
+    let call = intent_core::spawn_daemon({
         let api = fx.api.clone();
         async move {
             api.browser_exec(
@@ -667,7 +659,7 @@ async fn agent_browser_exec_skips_clients_without_the_browser_exec_capability() 
 /// `ReverseTarget::Pinned` (the per-workspace browser-client pin) routes to
 /// the named client's connection regardless of arrival order, and the
 /// registry's `resolve` probe reports the same answer with the hello `name`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pinned_target_routes_to_the_named_client_regardless_of_arrival_order() {
     let fx = boot().await;
     let mut a = connect(fx.port).await;
@@ -692,7 +684,7 @@ async fn pinned_target_routes_to_the_named_client_regardless_of_arrival_order() 
         "desktop-a"
     );
 
-    let call = tokio::spawn({
+    let call = intent_core::spawn_daemon({
         let registry = fx.registry.clone();
         async move {
             registry
@@ -730,7 +722,7 @@ async fn pinned_target_routes_to_the_named_client_regardless_of_arrival_order() 
 /// A pinned client that has disconnected (or never connected) yields the
 /// typed `ClientOffline { pinned: true }` error — no silent fallback to the
 /// remaining eligible client, which keeps serving `Default`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pinned_target_offline_reports_typed_error_without_fallback() {
     let fx = boot().await;
     let mut a = connect(fx.port).await;
@@ -780,7 +772,7 @@ async fn pinned_target_offline_reports_typed_error_without_fallback() {
     );
 
     // `Default` (what `Services::browser_exec` uses today) still reaches A.
-    let call = tokio::spawn({
+    let call = intent_core::spawn_daemon({
         let api = fx.api.clone();
         async move {
             api.browser_exec(
@@ -804,10 +796,10 @@ async fn pinned_target_offline_reports_typed_error_without_fallback() {
 
 /// `client:connected` / `client:disconnected` (global, no `workspaceId`)
 /// reach an `events.subscribe` subscriber with
-/// `data: { clientId, name?, capabilities }` — once per logical client, not
+/// the device fields and server-bound person — once per logical client, not
 /// per connection: a second connection of the same `clientId` is silent, and
 /// `client:disconnected` fires only when the last one goes away.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn client_connected_and_disconnected_events_are_published_per_logical_client() {
     let fx = boot().await;
     let mut sub = connect(fx.port).await;
@@ -830,6 +822,8 @@ async fn client_connected_and_disconnected_events_are_published_per_logical_clie
             "clientId": "desktop-a",
             "name": "Intent Desktop @ desktop-a",
             "capabilities": { "browserExec": true },
+            "principalId": fx.owner_id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null,
         })
     );
 
@@ -865,11 +859,18 @@ async fn client_connected_and_disconnected_events_are_published_per_logical_clie
 /// normal epilogue — the registry entry is dropped by RAII. That departure
 /// must still be announced: `client:disconnected` reaches the subscriber and
 /// the client is gone from `live_clients()`.
-#[tokio::test]
+///
+/// The abort is forced, not raced: [`WsOptions::heartbeat_gate`] holds the
+/// reaper's abort back until the test has observed the connected state, so
+/// no amount of scheduling delay between the hello and that observation can
+/// let the 200ms pong deadline win (intent-hq/intent#4851).
+#[intent_test_macros::daemon_test]
 async fn heartbeat_abort_publishes_client_disconnected() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
     let fx = boot_with(WsOptions {
         heartbeat_interval: Duration::from_millis(100),
         heartbeat_timeout: Duration::from_millis(200),
+        heartbeat_gate: Some(gate_rx),
         ..WsOptions::default()
     })
     .await;
@@ -883,8 +884,11 @@ async fn heartbeat_abort_publishes_client_disconnected() {
     .await;
     assert!(ack.get("error").is_none(), "subscribe failed: {ack}");
 
-    // Hello with the capability, then never poll the socket again so no
-    // pong is ever answered; the reaper aborts the server task.
+    // Hello with the capability, then never poll the socket again, so no
+    // pong is ever answered. The gate is still closed: the reaper keeps
+    // pinging but cannot abort, so the connected state is observed on a
+    // connection that is guaranteed to still be registered — however long
+    // the hello reply or the subscriber's frame took to arrive.
     let silent = {
         let mut silent = connect(fx.port).await;
         let _ = wss_rpc(&mut silent, 1, "client.hello", hello("desktop-a", true)).await;
@@ -893,7 +897,17 @@ async fn heartbeat_abort_publishes_client_disconnected() {
     let ev = await_event(&mut sub, "client:connected", Duration::from_secs(2)).await;
     assert_eq!(ev["data"]["clientId"], "desktop-a");
     assert!(fx.registry.is_connected());
+    // Well past the pong deadline the held-back reaper has still not fired.
+    assert!(
+        try_read_text(&mut sub, Duration::from_millis(600))
+            .await
+            .is_none(),
+        "reaper aborted while gated"
+    );
+    assert!(fx.registry.is_connected());
 
+    // Release the reaper; the next tick past the deadline aborts the task.
+    gate_tx.send(true).expect("gate receiver alive");
     let ev = await_event(&mut sub, "client:disconnected", Duration::from_secs(5)).await;
     assert_eq!(
         ev["data"],
@@ -901,6 +915,8 @@ async fn heartbeat_abort_publishes_client_disconnected() {
             "clientId": "desktop-a",
             "name": "Intent Desktop @ desktop-a",
             "capabilities": { "browserExec": true },
+            "principalId": fx.owner_id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null,
         })
     );
     await_registry_len(&fx.registry, 1).await;
@@ -920,7 +936,7 @@ async fn heartbeat_abort_publishes_client_disconnected() {
 /// closing loop after its cleanup emits them the other way round). A
 /// re-hello that moves a connection to another `clientId` likewise yields
 /// the old client's disconnect before the new one's connect.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn client_events_keep_registry_order_across_reconnect_and_rehello() {
     let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
     let fx = boot_with(WsOptions {
@@ -1022,7 +1038,7 @@ async fn client_events_keep_registry_order_across_reconnect_and_rehello() {
 /// pinned-offline message instead of falling back to the default client. The
 /// pin is set over the wire as setup only — the RPC contract lives in
 /// `e2e_wss_browser_client_pin.rs`.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn pinned_workspace_browser_exec_routes_to_pinned_client_and_fails_typed_when_gone() {
     let fx = boot().await;
     let mut a = connect(fx.port).await;
@@ -1059,7 +1075,7 @@ async fn pinned_workspace_browser_exec_routes_to_pinned_client_and_fails_typed_w
 
     // An agent browser.exec in the pinned workspace reaches desktop-b's
     // eligible connection (`b`), not `a` and not the auxiliary socket.
-    let call = tokio::spawn({
+    let call = intent_core::spawn_daemon({
         let api = fx.api.clone();
         let ws_id = ws_id.clone();
         async move {
@@ -1131,7 +1147,7 @@ async fn pinned_workspace_browser_exec_routes_to_pinned_client_and_fails_typed_w
 /// `hostClientId` / `hostConnected` — and neither socket sees a reverse
 /// call. `browser.navigateTab` on the unclaimed tab routes to its physical
 /// host (desktop-a) as a `navigate` action carrying the tab's attribution.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn agent_browser_exec_routes_to_the_claimed_tabs_host_and_list_tabs_aggregates_hosts() {
     let fx = boot().await;
     let mut a = connect(fx.port).await;
@@ -1205,7 +1221,7 @@ async fn agent_browser_exec_routes_to_the_claimed_tabs_host_and_list_tabs_aggreg
     // (b) An agent batch — even one naming desktop-a's own tab — goes to the
     // driving client desktop-b (host of the claimed tab), not first-connected
     // desktop-a.
-    let call = tokio::spawn({
+    let call = intent_core::spawn_daemon({
         let api = fx.api.clone();
         let ws_id = ws_id.clone();
         async move {
@@ -1285,7 +1301,7 @@ async fn agent_browser_exec_routes_to_the_claimed_tabs_host_and_list_tabs_aggreg
 /// the host is gone a plain close is the typed `-32603` offline error and a
 /// `force` close tombstones the row, publishing `browser:tab-closed` and
 /// dropping the tab from the registry.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn close_tab_routes_to_the_host_and_force_tombstones_an_offline_host() {
     let fx = boot().await;
     let mut a = connect(fx.port).await;
@@ -1366,7 +1382,7 @@ async fn close_tab_routes_to_the_host_and_force_tombstones_an_offline_host() {
 /// agent as owner (`browser:tab-updated { changes: { hostClientId,
 /// ownerAgentId } }`). Pinning the workspace to desktop-b afterwards
 /// migrates the claimed tab there again.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn successful_claim_rehomes_the_tab_to_the_driving_client_and_pin_changes_migrate() {
     let fx = boot().await;
     let mut a = connect(fx.port).await;
@@ -1391,7 +1407,7 @@ async fn successful_claim_rehomes_the_tab_to_the_driving_client_and_pin_changes_
     )
     .await;
 
-    let call = tokio::spawn({
+    let call = intent_core::spawn_daemon({
         let api = fx.api.clone();
         let ws_id = ws_id.clone();
         async move {

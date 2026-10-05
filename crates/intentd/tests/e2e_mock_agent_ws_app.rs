@@ -40,6 +40,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>, title: &str) ->
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: path.as_ref().map(|p| p.to_string_lossy().to_string()),
         repository_path: None,
@@ -65,11 +66,13 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>, title: &str) ->
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
+        pull_requests_total: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -93,11 +96,12 @@ fn gate() -> Option<String> {
 
 /// Gap 1 (P2): Chief-workspace agent calls ws.app.workspaces.list via MCP and
 /// receives 2+ seeded user workspaces (never __chief__).
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chief_agent_ws_app_workspaces_list() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-ws-app-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-e2e-ws-app-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -266,22 +270,17 @@ async fn chief_agent_ws_app_workspaces_list() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// Gap 2 (P2): Chief-workspace agent calls ws.app.proposal.show and the
 /// persisted transcript contains the application/vnd.intent.proposal+json
 /// resource content item.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chief_agent_ws_app_proposal_resource_persisted() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!(
-        "intentd-e2e-ws-app-prop-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_dir = common::test_tempdir("intentd-e2e-ws-app-prop-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -441,23 +440,18 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// intent-hq/monorepo#511 regression class: a provider that collapses the MCP
 /// content items into `{ output: "<stringified {ok, proposal}>" }` (auggie's
 /// shape — the resource item is dropped entirely) still yields the standalone
 /// proposal-resource block in the persisted transcript via the fallback lift.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!(
-        "intentd-e2e-ws-app-collapse-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_dir = common::test_tempdir("intentd-e2e-ws-app-collapse-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -613,9 +607,6 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
     assert_eq!(parsed["payload"]["key"], "test.setting");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// §7.1 deterministic attach: a provider whose tool echo is GARBLED beyond
@@ -626,14 +617,12 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
 /// `ws.app.proposal.show`'s dispatch registered the canonical payload in the
 /// turn-attachment registry in-process and the transcript writer claims it
 /// when the tool call completes.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!(
-        "intentd-e2e-ws-app-garble-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_dir = common::test_tempdir("intentd-e2e-ws-app-garble-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -793,9 +782,6 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
     assert_eq!(parsed["payload"]["value"], "new-value");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// Regression e2e (monorepo#2637): the agent's JS DISCARDS the proposal
@@ -805,14 +791,12 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
 /// Drives the full mock-ACP path (`tool_call_update` → transcript writer) and
 /// asserts the standalone proposal-resource block is still persisted from
 /// the binding-time registration + FIFO claim.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!(
-        "intentd-e2e-ws-app-discard-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_dir = common::test_tempdir("intentd-e2e-ws-app-discard-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -971,9 +955,6 @@ async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
     assert_eq!(parsed["payload"]["value"], "new-value");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// Regression e2e (intent-hq/intent#4491): the auggie provider titles a
@@ -986,14 +967,12 @@ async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
 /// JS saw `ok: true`. Asserts the completed `agent:tool:call` event carries
 /// `registeredAttachments` + `proposalBlockIds`, records the call as
 /// `workspace_api`, and the transcript has the standalone proposal block.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn chief_agent_ws_app_proposal_attached_on_auggie_shaped_tool_call() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!(
-        "intentd-e2e-ws-app-auggie-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_dir = common::test_tempdir("intentd-e2e-ws-app-auggie-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -1211,21 +1190,16 @@ async fn chief_agent_ws_app_proposal_attached_on_auggie_shaped_tool_call() {
     assert_eq!(parsed["payload"]["value"], "new-value");
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// Gap 3 (P3): Non-chief workspace agent calls ws.app.* and receives the
 /// gating error through the MCP tool result.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn non_chief_agent_ws_app_gating_error() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!(
-        "intentd-e2e-ws-app-gate-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_dir = common::test_tempdir("intentd-e2e-ws-app-gate-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -1377,12 +1351,9 @@ async fn non_chief_agent_ws_app_gating_error() {
         .as_str()
         .expect("error should be a string");
     assert!(
-        error_msg.contains("ws.app.* is only available in the Chief of Staff workspace"),
+        error_msg.contains("ws.app.* is only available in the Assistant workspace"),
         "Expected gating error message in tool output, got: {error_msg}"
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }

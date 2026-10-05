@@ -93,7 +93,9 @@ impl AgentListProjectionCache {
         state.projections = None;
     }
 
-    fn current_epoch(&self, workspace_id: &str) -> u64 {
+    /// Transcript mutation revision, also used by token reconciliation so
+    /// same-length replacements cannot hide behind an unchanged row count.
+    pub(crate) fn current_epoch(&self, workspace_id: &str) -> u64 {
         self.states
             .lock()
             .unwrap()
@@ -237,6 +239,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -262,11 +265,13 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 
@@ -322,6 +327,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 

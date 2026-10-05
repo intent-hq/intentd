@@ -26,9 +26,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
+use super::linked_watch::{uncovered_directories, ScopedLinkedWatches};
 use super::root_watch::{watch_root, RootWatch};
 use super::shared_watch::{watch_tiers, SharedWatchHub, TierWatch};
-use crate::specialists::SpecialistsService;
+use crate::specialists::{claude_agents, SpecialistsService};
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
 
@@ -54,6 +55,11 @@ impl Drop for SpecialistsWatcher {
 }
 
 impl SpecialistsWatcher {
+    pub(super) async fn shutdown(mut self) {
+        let _ = self.raw_tx.send(SpecialistsMsg::Stop);
+        let _ = (&mut self.task).await;
+    }
+
     /// Start watching specialist directories for all workspaces.
     /// `workspaces` is a list of (`workspace_id`, `workspace_path`) pairs.
     pub(super) fn start(
@@ -77,7 +83,7 @@ impl SpecialistsWatcher {
         // Start the user-tier watcher (affects all workspaces)
         let mut user_watchers = Vec::new();
         if let Some(root) = &user_dir {
-            user_watchers.push(watch_directory(root.clone(), None, raw_tx.clone()));
+            user_watchers.push(watch_directory(hub, root.clone(), None, raw_tx.clone()));
         }
 
         // Start project-tier watchers (per-workspace)
@@ -89,7 +95,14 @@ impl SpecialistsWatcher {
             );
         }
 
-        let task = tokio::spawn(debounce_loop(bus, workspaces, user_dir, raw_rx));
+        let task = intent_core::spawn_daemon(debounce_loop(
+            bus,
+            workspaces,
+            user_dir,
+            raw_rx,
+            Arc::clone(hub),
+            raw_tx.clone(),
+        ));
 
         Self {
             hub: Arc::clone(hub),
@@ -115,16 +128,29 @@ impl SpecialistsWatcher {
         }
     }
 
-    /// Await the user-tier root watch actually being established. Its
-    /// registration is deferred off the caller's thread (monorepo#1572), so
-    /// tests must wait for it before mutating that directory. The project tier
-    /// rides the shared stream and needs no separate sync point — subscribing is
-    /// synchronous bookkeeping.
+    /// Await the user-tier root watch and every project-tier shared watch
+    /// actually being established. Both registrations are deferred off the
+    /// caller's thread (monorepo#1572) — subscribing to the shared stream is
+    /// synchronous bookkeeping, but the OS `watch()` behind it is not — so
+    /// tests must wait for both before mutating either tier
+    /// (intent-hq/intent#4852). Panics with a diagnostic on a dead watch or on
+    /// `timeout`, which bounds ALL the tiers together, not each one afresh.
     #[cfg(test)]
-    #[allow(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
+    #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     async fn wait_established(&self, timeout: Duration) {
+        let budget = crate::events::TestBudget::new(timeout);
         for watch in &self._user_watchers {
-            watch.wait_established(timeout).await;
+            watch.wait_established(budget.remaining()).await;
+        }
+        let probes: Vec<_> = self
+            .workspace_watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(TierWatch::probe)
+            .collect();
+        for probe in &probes {
+            probe.wait_live(budget.remaining()).await;
         }
     }
 
@@ -190,6 +216,7 @@ fn start_project_watch(
 /// (de)registration of a workspace (#611).
 #[derive(Debug, Clone)]
 enum SpecialistsMsg {
+    Stop,
     /// Raw change from a root watch; `None` = user tier (all workspaces).
     Change(Option<WorkspaceId>),
     /// Workspace registered after start.
@@ -209,17 +236,21 @@ enum SpecialistsMsg {
 /// nearest existing ancestor is promoted to a recursive watch on the root
 /// once it appears.
 fn watch_directory(
+    hub: &Arc<SharedWatchHub>,
     root: PathBuf,
     workspace_id: Option<WorkspaceId>,
     tx: mpsc::UnboundedSender<SpecialistsMsg>,
 ) -> RootWatch {
-    watch_root(root, is_md, move || {
+    watch_root(hub, root, is_md, move || {
         let _ = tx.send(SpecialistsMsg::Change(workspace_id.clone()));
     })
 }
 
 fn is_md(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("md")
+        || path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_symlink())
 }
 
 /// Default user-tier specialists directory (`~/.intent/specialists/`).
@@ -228,7 +259,7 @@ fn default_user_dir() -> Option<PathBuf> {
 }
 
 /// The project-tier specialists directory, relative to the workspace root.
-const PROJECT_TIERS: &[&str] = &[".intent/specialists"];
+const PROJECT_TIERS: &[&str] = &[".intent/specialists", ".claude/agents"];
 
 /// The project-tier specialists directory for a workspace.
 #[cfg(test)]
@@ -247,14 +278,20 @@ fn home_dir() -> Option<PathBuf> {
 /// serialized `specialist.list` view (ids + tier-resolved content), so an
 /// event is emitted only when the resolved set actually changed (analogous to
 /// `check_skills_changed`).
-fn specialists_fingerprint(user_dir: Option<&PathBuf>, workspace_path: &Path) -> u64 {
-    let svc = SpecialistsService::new(user_dir.cloned(), None);
-    let list = svc
-        .list(Some(workspace_path))
-        .unwrap_or(serde_json::Value::Null);
-    let mut hasher = DefaultHasher::new();
-    list.to_string().hash(&mut hasher);
-    hasher.finish()
+async fn specialists_fingerprint(user_dir: Option<&PathBuf>, workspace_path: &Path) -> u64 {
+    let user_dir = user_dir.cloned();
+    let workspace_path = workspace_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let svc = SpecialistsService::new(user_dir, None);
+        let list = svc
+            .list(Some(&workspace_path))
+            .unwrap_or(serde_json::Value::Null);
+        let mut hasher = DefaultHasher::new();
+        list.to_string().hash(&mut hasher);
+        hasher.finish()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Debounce loop that coalesces rapid specialist file changes per workspace.
@@ -265,59 +302,76 @@ async fn debounce_loop(
     workspaces: Vec<(WorkspaceId, PathBuf)>,
     user_dir: Option<PathBuf>,
     mut raw_rx: mpsc::UnboundedReceiver<SpecialistsMsg>,
+    hub: Arc<SharedWatchHub>,
+    raw_tx: mpsc::UnboundedSender<SpecialistsMsg>,
 ) {
     let mut pending: HashMap<WorkspaceId, tokio::time::Instant> = HashMap::new();
     let mut workspace_paths: HashMap<WorkspaceId, PathBuf> = workspaces.into_iter().collect();
 
     // Prime the per-workspace fingerprints so the first flush compares against
     // the set as it stood at watcher start (no spurious first event).
-    let mut fingerprints: HashMap<WorkspaceId, u64> = workspace_paths
-        .iter()
-        .map(|(ws_id, path)| {
-            (
-                ws_id.clone(),
-                specialists_fingerprint(user_dir.as_ref(), path),
-            )
-        })
-        .collect();
+    let mut fingerprints: HashMap<WorkspaceId, u64> = HashMap::new();
+    for (id, path) in &workspace_paths {
+        fingerprints.insert(
+            id.clone(),
+            specialists_fingerprint(user_dir.as_ref(), path).await,
+        );
+    }
+
+    let mut linked = ScopedLinkedWatches::new(hub, move |scope| {
+        let _ = raw_tx.send(SpecialistsMsg::Change(scope));
+    });
+    refresh_claude_user_watches(user_dir.as_deref(), &mut linked).await;
+    let mut user_deadline: Option<tokio::time::Instant> = None;
+    for (id, path) in &workspace_paths {
+        refresh_claude_watches(id, path, &mut linked).await;
+    }
 
     loop {
-        let next_deadline = pending.values().copied().min();
+        let next_deadline = pending.values().copied().chain(user_deadline).min();
 
         tokio::select! {
             maybe = raw_rx.recv() => match maybe {
+                Some(SpecialistsMsg::Stop) => raw_rx.close(),
                 Some(SpecialistsMsg::Change(workspace_id)) => {
                     let deadline = tokio::time::Instant::now() + DEBOUNCE;
                     match workspace_id {
                         // User-tier change: affects all workspaces
                         None => {
+                            user_deadline.get_or_insert(deadline);
                             for ws_id in workspace_paths.keys() {
-                                pending.insert(ws_id.clone(), deadline);
+                                pending.entry(ws_id.clone()).or_insert(deadline);
                             }
                         }
                         // Project-tier change: affects specific workspace
                         Some(ws_id) => {
-                            pending.insert(ws_id, deadline);
+                            if workspace_paths.contains_key(&ws_id) {
+                                pending.entry(ws_id).or_insert(deadline);
+                            }
                         }
                     }
                 }
                 Some(SpecialistsMsg::Add(ws_id, path)) => {
                     // Prime the fingerprint like the start-time priming above.
-                    fingerprints.insert(ws_id.clone(), specialists_fingerprint(user_dir.as_ref(), &path));
+                    fingerprints.insert(ws_id.clone(), specialists_fingerprint(user_dir.as_ref(), &path).await);
+                    refresh_claude_watches(&ws_id, &path, &mut linked).await;
                     workspace_paths.insert(ws_id, path);
                 }
                 Some(SpecialistsMsg::Remove(ws_id)) => {
                     workspace_paths.remove(&ws_id);
                     fingerprints.remove(&ws_id);
                     pending.remove(&ws_id);
+                    linked.remove(&ws_id);
                 }
                 Some(SpecialistsMsg::Pause(ws_id)) => {
                     // Path drop stops emission (user-tier fan-out and flushes
                     // both key on `workspace_paths`); the fingerprint stays.
                     workspace_paths.remove(&ws_id);
                     pending.remove(&ws_id);
+                    linked.remove(&ws_id);
                 }
                 Some(SpecialistsMsg::Resume(ws_id, path)) => {
+                    refresh_claude_watches(&ws_id, &path, &mut linked).await;
                     workspace_paths.insert(ws_id.clone(), path);
                     // Catch-up: flush after the normal debounce so the
                     // re-registered watch's own events coalesce into it.
@@ -330,10 +384,64 @@ async fn debounce_loop(
                 }
             },
             () = sleep_until(next_deadline), if next_deadline.is_some() => {
+                if user_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+                    user_deadline = None;
+                    refresh_claude_user_watches(user_dir.as_deref(), &mut linked).await;
+                }
+                for (id, deadline) in &pending {
+                    if *deadline <= tokio::time::Instant::now() {
+                        if let Some(path) = workspace_paths.get(id) {
+                            refresh_claude_watches(id, path, &mut linked).await;
+                        }
+                    }
+                }
                 flush_due(&bus, &workspace_paths, user_dir.as_ref(), &mut fingerprints, &mut pending).await;
             }
         }
     }
+}
+
+async fn refresh_claude_user_watches(user_dir: Option<&Path>, linked: &mut ScopedLinkedWatches) {
+    let root = claude_agents::user_root(user_dir);
+    if let Ok(directories) = tokio::task::spawn_blocking(move || {
+        root.map_or_else(Vec::new, |root| {
+            let directories = claude_agents::watch_directories(&root);
+            directories
+                .ordinary
+                .into_iter()
+                .chain(directories.linked)
+                .collect()
+        })
+    })
+    .await
+    {
+        linked.sync_user(directories);
+    }
+}
+
+async fn refresh_claude_watches(
+    id: &WorkspaceId,
+    workspace_path: &Path,
+    linked: &mut ScopedLinkedWatches,
+) {
+    let workspace = workspace_path.to_path_buf();
+    let Ok(directories) = tokio::task::spawn_blocking(move || {
+        let workspace = workspace.canonicalize().unwrap_or(workspace);
+        let root = workspace.join(".claude/agents");
+        let covered: Vec<_> = PROJECT_TIERS
+            .iter()
+            .map(|tier| workspace.join(tier))
+            .collect();
+        let directories = claude_agents::watch_directories(&root);
+        let mut supplemental = uncovered_directories(directories.ordinary, &covered);
+        supplemental.extend(directories.linked);
+        supplemental
+    })
+    .await
+    else {
+        return;
+    };
+    linked.sync_project(id.clone(), directories);
 }
 
 async fn flush_due(
@@ -381,7 +489,7 @@ async fn emit_specialists_changed(
     fingerprints: &mut HashMap<WorkspaceId, u64>,
 ) {
     // Re-resolve the set to check if it actually changed
-    let fingerprint = specialists_fingerprint(user_dir, workspace_path);
+    let fingerprint = specialists_fingerprint(user_dir, workspace_path).await;
     let changed = fingerprints.get(workspace_id) != Some(&fingerprint);
     fingerprints.insert(workspace_id.clone(), fingerprint);
 
@@ -517,11 +625,15 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn tier_directory_deletion_emits_event() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Registration recovery and the event wait share ONE liveness budget
+        // so the test always fails with a diagnostic before nextest's 180s
+        // kill (intent-hq/intent#4852).
+        let budget = crate::events::TestBudget::liveness();
         let (_db, bus, mut sub) = bus_and_sub().await;
         let user = TempDir::new("rmdir-user");
         let ws = TempDir::new("rmdir-ws");
@@ -539,14 +651,15 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
-        watcher.wait_established(LIVENESS).await;
+        watcher.wait_established(budget.remaining()).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // `rm -rf` of the whole tier directory: possibly only directory-level
         // events surface, which the filter must still forward (#612).
         std::fs::remove_dir_all(&proj).expect("remove tier dir");
 
-        let events = drain_specialists_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
+        let events =
+            drain_specialists_events(&mut sub, Duration::from_secs(2), budget.remaining()).await;
         assert_eq!(
             events.len(),
             1,
@@ -556,7 +669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn missing_root_promotes_on_creation_and_detects_changes() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -607,7 +720,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn project_tier_burst_debounces_to_one_event() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -651,7 +764,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn user_tier_change_fans_out_to_all_workspaces() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -692,7 +805,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn unchanged_set_emits_nothing() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -746,7 +859,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn workspace_added_after_start_gains_watching_and_removal_stops_it() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -818,7 +931,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn pause_retains_fingerprint_so_resume_only_emits_on_real_change() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()

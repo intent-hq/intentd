@@ -333,6 +333,14 @@ literally (`intentd -- restart` sends `restart` to the daemon).
 - Automatic checks are strictly **newer-only** — they never downgrade. The only
   downgrade path is an explicit `intentd sitter channel <channel> --redownload`
   (see [Channels](#channels)).
+- Idle daemons update sooner than that cadence: once no agent has had a turn in
+  flight for `updates.idleGraceSeconds` (default 120 s), the daemon asks its sitter to
+  check right away (via `SIGUSR2`, at most every `updates.idleCheckIntervalMinutes`,
+  default 60), the sitter stages any newer version, and the daemon restarts into it
+  the next moment no turn is in flight — so an idle daemon picks up a publish within
+  about an hour, while a continuously busy daemon still gets the forced 12–24 h
+  restart. `updates.checkOnIdle=false` (a live setting, no restart) disables the
+  idle-triggered path and leaves only the periodic one.
 - `intentd update` forces a check right away — no waiting on the 12–24 h cadence and
   no restart required; `intentd update --check` reports what would happen without
   installing (see [Channels](#channels)).
@@ -372,6 +380,121 @@ cargo run -p intentd -- doctor   # data-dir writable + SQLite/migrations current
 Paths are resolved via the `directories` crate and can be overridden with the
 `INTENTD_DATA_DIR` and `INTENTD_CONFIG` environment variables. The data dir holds the SQLite
 database (`intentd.db`) and the socket (`intentd.sock`).
+
+### Installed Codex and Claude CLIs
+
+Install and authenticate the canonical `codex` or `claude` executable on the
+execution host. In remote workspaces this is the daemon/worker host, not the desktop.
+Intent resolves executable files through PATH, supported installer/version-manager
+locations and captured login-shell PATH; aliases and shell functions do not qualify.
+Node.js and npx remain prerequisites for the pinned upstream ACP adapters.
+
+Upgrade the installed CLI and refresh the model picker to discover its current model
+advertisements. Intent keeps the adapter pin fixed and supplies the resolved absolute
+CLI path through `CODEX_PATH` or `CLAUDE_CODE_EXECUTABLE`. Inherited overrides cannot
+redirect it. Missing or incompatible CLIs fail explicitly; bundled adapter dependencies
+never supply a fallback runtime or model. A future CLI protocol change can still require
+an adapter update. Catalog membership does not establish account entitlement.
+
+Provider authentication/configuration and network environment are preserved. Captured
+login-shell values are below inherited daemon values (including empty values), then
+trusted daemon overrides and the selected runtime/policy take precedence. Codex custom
+credential variables referenced by its configuration are included. Login-shell capture
+is cached: restart the daemon after changing shell-only environment or PATH. Intent
+always enforces its Codex native-subagent denial and Claude tool restrictions.
+
+Codex model probes use private temporary profiles, copy supported auth/routing
+configuration, and exclude user MCP servers/hooks. Claude model probes retain user
+settings for authentication (`settingSources: ["user"]`), disable tools (`tools: []`),
+and enforce `strictMcpConfig: true` with no MCP servers; they do not strip user hooks.
+Neither provider's model probes send prompts or initiate login. The installed executable,
+bounded version observation, adapter pin and private auth/config fingerprint identify
+each cached catalog. Explicit refresh observes changes even behind
+an unchanged CLI wrapper. Last-good fallback is confined to that identity. Codex/Claude
+catalogs are memory-only; the first request after daemon restart must probe again.
+Catalog fingerprinting inspects relevant credential/configuration files with a 1 MiB
+limit per file. An unreadable or oversized file makes catalog discovery unavailable
+without reusing a previous account's models; these catalog inspection limits do not
+block ordinary installed-CLI launches.
+Existing sessions retain their process; new/recreated launches resolve the installed CLI
+again. Resuming across upgrades remains subject to adapter/CLI compatibility.
+
+The opt-in functional test runs the actual pinned adapters against synthetic installed
+CLIs over authenticated, fingerprint-pinned WSS. It replaces only CLI executables, checks
+catalog refresh, selected-model turns and same-process continuity across CLI replacements,
+and never uses provider accounts. Prepare the exact packages named by `crates/intent-providers/src/config.rs` outside the checkout,
+including their optional dependencies. Set `INTENTD_TEST_CODEX_ADAPTER` and
+`INTENTD_TEST_CLAUDE_ADAPTER` to their package directories (containing `package.json`), then:
+
+```bash
+cargo nextest run -p intentd --test e2e_wss_installed_cli --run-ignored all --test-threads 1
+```
+
+This Unix fixture requires Node and Python 3. It excludes host tracing only for its
+synthetic processes; production timeouts remain unchanged. It is adapter compatibility
+proof with controlled CLIs, not a live account or cross-platform certification.
+
+### Codex diagnostics
+
+`intentd doctor` reports the pinned managed Codex ACP adapter, Node/npx prerequisites,
+and the canonical installed Codex path with a bounded `--version` observation. Production
+selection ignores `providers.paths.codex`, local `codex-acp` installations and inherited
+`CODEX_PATH`; the daemon sets its selected runtime path and fixed `CODEX_CONFIG` policy.
+
+The configured adapter pin is configuration, not a measured version. Ordinary doctor
+does not resolve or install its npm package, so the adapter version remains unknown.
+Package metadata applies only to an established selected entrypoint and is labeled
+**metadata, not measured**. The runtime measurement comes from the installed CLI, never
+from a neighboring bundled dependency. Failed version checks remain explicitly unknown.
+
+On Linux, `/bin/bash` is required for private process supervision during both
+normal installed-CLI launch version checks and diagnostic probes. If it is unavailable,
+normal launch checks fail and diagnostic results remain unknown. Intent does not install
+Bash or fall back to another shell.
+
+On macOS, diagnostics report the selected launch and configured managed pin without
+resolving the package or inspecting ignored local adapters. Adapter and catalog diagnostic process probes are explicitly unsupported because
+detached-child cleanup cannot be guaranteed. The normal installed-CLI version check
+remains enabled and bounded, with direct-child/process-group cleanup on a best-effort
+basis; escaped detached descendants are not guaranteed to be contained. Even with `--codex-models`, macOS performs no diagnostic
+authentication capture, npm resolution, or temporary probe setup; catalog comparison
+remains inconclusive. This does not change normal agent/provider execution.
+
+Ordinary doctor adds no npm resolution or live model request. On Linux and Windows,
+compare fresh catalogs with:
+
+```bash
+intentd doctor --codex-models
+```
+
+This opt-in can resolve/download the selected managed npm package. It reports ACP
+advertisements and the verified runtime's `model/list` separately, preserving original
+IDs, raw model aliases, hidden flags, and each row's source. ACP choices may be
+synthesized by the adapter. Missing advertisements, explicitly empty catalogs, withheld
+IDs, and failed probes are distinct results; either side can succeed independently.
+Membership uses exact IDs/aliases without guessing effort suffixes. Model presence does
+not verify entitlement, and absence does not establish an account restriction or fix
+model access. No prompts, login, or token-refresh requests are sent.
+
+The probe copies existing file authentication from `CODEX_HOME/auth.json` (otherwise
+`$HOME/.codex/auth.json`, with `USERPROFILE` as the home fallback) and selected
+`OPENAI_API_KEY`, `CODEX_API_KEY`, or `CODEX_ACCESS_TOKEN` environment credentials into
+private temporary state. It also preserves supported provider routing/credential configuration and relevant
+provider/network environment. It does not import keyring-only credentials, MCP servers,
+hooks, unrelated user/project configuration, or cached model catalogs. Authentication may therefore be
+unavailable even when an ordinary session is logged in. Do not paste credentials into
+diagnostic commands. Output contains safe report fields and fixed failure messages,
+never raw provider errors or account metadata.
+
+Each local inspection/version operation has a three-second deadline and a 16 KiB stdout
+limit. ACP startup/conversation and raw startup/conversation each have their own
+30-second deadline and 1 MiB limit per output stream. Catalogs are bounded to 2,000 rows;
+raw pagination allows at most ten pages and rejects repeated cursors. Authentication and
+entrypoint files are bounded to 64 KiB. Local inspection, process startup and cleanup
+have separate budgets (cleanup confirmation allows five seconds), so the whole command
+can take longer than 30 seconds. Unconfirmed cleanup retains temporary state and reports
+that fact. All provider diagnostic failures remain advisory; existing daemon-health
+failures, such as an unusable database or occupied port, still make doctor exit nonzero.
 
 ### Settings
 
@@ -435,6 +558,59 @@ daemon's `settings.update` pipeline (the same path the settings UI uses), which 
 starts the listener immediately — no restart needed. Interactively this is a `[Y/n]`
 prompt; unattended runs (non-TTY stdin) must pass `--yes`/`-y` to opt in, otherwise the
 command fails with guidance.
+
+### Durable evidence for long saved commands (Unix)
+
+Use the opt-in wrapper for noninteractive validation that must retain its actual
+OS exit across daemon loss. Give every invocation a fresh ID and an explicit
+execution bound (1–86400 seconds). The same command can be a saved command's body:
+
+```bash
+intentd command-run --record-dir "$HOME/command-evidence" \
+  --invocation validation-20260930-001 --timeout-seconds 3600 -- make check
+intentd command-result --record-dir "$HOME/command-evidence" \
+  --invocation validation-20260930-001
+```
+
+An independent session owns the child and its wait status. Stopping the saved
+script or daemon stops the caller, **but this opted-in worker continues until the
+command exits, its timeout expires, or `command-stop` requests termination**. stdin is closed; stdout and stderr go to
+`stdout.log` and `stderr.log` inside the invocation directory. Each stream retains at most 8 MiB by default
+(`--max-output-bytes`, maximum 64 MiB per stream). Excess output is drained and
+discarded; `stdoutTruncated`/`stderrTruncated` report the loss. `invocation.json`
+records the exact argv, cwd, start time and timeout. The worker atomically writes
+`result.json` only after observing the direct child's OS status (or a spawn
+failure). Existing invocation directories are refused; retain them until their
+evidence is no longer needed. Arguments are recorded, so use environment variables
+or files for secrets.
+
+Both commands print JSON and return 0 for an observed successful exit, 1 for a
+known failure, or 2 when evidence is unavailable. `outcome` distinguishes `exited`,
+`timedOut`, `stopped`, `spawnFailed`, and `unknown`; actual exit code and terminating signal
+are separate fields. After a daemon restart, `script.status` remains honestly
+lost: use `command-result` with the original directory and invocation ID. Missing,
+partial or mismatched records stay unknown, including a still-running command or
+a killed worker. Passing test reports and missing PIDs never establish success.
+
+Use `intentd command-stop --record-dir <dir> --invocation <id>` to request a stop
+from the owning worker. It kills and reaps the direct child and its process group,
+then records `stopped` with the observed status. The stop client waits up to five
+seconds; if the worker is lost or cannot settle, evidence remains unknown. It
+never signals a PID recovered from disk.
+
+After exporting needed evidence, run `intentd command-clean --record-dir <dir>
+--invocation <id>` to delete that settled run's logs and records. Cleanup refuses
+active or unknown runs, and leaves an empty tombstone directory to prevent ID
+reuse. Call this at the end of validation to bound retention; no background timer
+deletes evidence while a user is reviewing it. A lost worker's files require
+manual inspection/cleanup because absence cannot prove settlement.
+
+This boundary covers the direct child, not completion of all descendants. Timeout
+kills its process group and direct child; descendants that deliberately escape
+that group are outside this guarantee. Machine loss or killing the worker can
+still prevent a receipt. Files are local evidence, not protection against another
+process running as the same user. These CLI helpers do not open the daemon store
+or apply migrations.
 
 ## Current status
 
@@ -624,4 +800,3 @@ The design docs live in the monorepo under `docs/`:
 
 - [intent-hq/intent](https://github.com/intent-hq/intent) — engineering monorepo
   that mounts this repo at `packages/intentd` and holds the cross-cutting docs and tooling.
-

@@ -52,11 +52,8 @@ jobs:
       # The notifier script reads squash-merged PR bodies on this repo via
       # `gh pr view` with the default GITHUB_TOKEN (job-level GH_TOKEN).
       pull-requests: read
-    # Serialize alpha.json updates so two tags pushed close together cannot
-    # interleave and leave the manifest pointing at the older release.
-    concurrency:
-      group: intentd-alpha-manifest-publish
-      cancel-in-progress: false
+    # v-release.yml holds intentd-release-writers across the entire release.
+    # Do not reacquire it here: the reusable caller would wait on itself.
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PLAN: ${{ inputs.plan }}

@@ -13,7 +13,7 @@ use intent_core::{
     new_attachment_id, now_iso, AgentId, AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry,
     WorkspaceApi, WorkspaceId, ATTACHMENT_ID_KEY,
 };
-use intent_js::{eval as js_eval, BoxFuture, EvalOptions, HostFn, JsError};
+use intent_js::{eval as js_eval, eval_guarded, BoxFuture, EvalOptions, HostFn, JsError};
 use serde_json::{json, Value};
 
 /// Per-invocation collector of turn attachments stamped at binding call time
@@ -105,6 +105,10 @@ impl Drop for StageSentinel {
     }
 }
 
+use super::private_results::{
+    refusal_tool_result, ArtifactAccounting, ArtifactOutcome, McpPrivateBoundaryKind,
+    McpPrivateInvocation, SealedPrivateOutput,
+};
 use super::WorkspaceMcpServer;
 
 /// Wall-clock budget for one `workspace_api` invocation — matches the 30s
@@ -176,6 +180,7 @@ impl WorkspaceMcpServer {
             self.turn_attachments.clone(),
             effective_features.clone(),
             self.is_sub_agent,
+            self.workspace_api_timeout,
             pending.clone(),
         );
         // Wrap user code so the engine sees a small `{__k, __v}` envelope,
@@ -213,10 +218,44 @@ impl WorkspaceMcpServer {
         );
         tracing::trace!("workspace_api dispatch: eval starting");
         let eval_started = Instant::now();
-        let eval_result = js_eval(&full_code, &opts, Some(host)).await;
+        // Bind the calling agent as the request's caller for every `ws.*`
+        // call the script makes (multiplayer w1); host calls run inline on
+        // this task, so the task-local scope covers them. A bridge with no
+        // caller agent leaves whatever caller the enclosing scope bound.
+        let invocation = McpPrivateInvocation::current();
+        let eval = async {
+            match &invocation {
+                Some(invocation) => {
+                    eval_guarded(&full_code, &opts, Some(invocation.guarded_host(host))).await
+                }
+                None => js_eval(&full_code, &opts, Some(host)).await,
+            }
+        };
+        let eval_result = match &self.caller_agent_id {
+            Some(agent_id) => {
+                intent_core::with_caller(
+                    intent_core::Caller::Agent {
+                        agent_id: agent_id.clone(),
+                    },
+                    eval,
+                )
+                .await
+            }
+            None => eval.await,
+        };
         let eval_ms = u64::try_from(eval_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let eval_ok = eval_result.is_ok();
         tracing::trace!(eval_ms, eval_ok, "workspace_api dispatch: eval finished");
+        // QuickJS has cleaned up its pending host futures. Seal before ANY
+        // output publication, independent of what the script returned/caught.
+        let output = match invocation
+            .as_ref()
+            .map(McpPrivateInvocation::seal)
+            .transpose()
+        {
+            Ok(output) => output.flatten(),
+            Err(()) => return refusal_tool_result(),
+        };
         // Drain the binding-time collection unconditionally: the attachments
         // were stamped and handed to the agent's JS with `ok: true`, so they
         // register no matter what the script did afterwards — discarded the
@@ -229,7 +268,13 @@ impl WorkspaceMcpServer {
         let result = match eval_result {
             Ok(v) => match v.get("__k").and_then(Value::as_str) {
                 Some("u") => {
-                    self.register_pending_attachments(pending_batch);
+                    if self
+                        .register_pending_attachments(pending_batch, output.as_ref())
+                        .await
+                        .is_err()
+                    {
+                        return refusal_tool_result();
+                    }
                     workspace_api_success("(no return value)")
                 }
                 Some("v") => {
@@ -247,15 +292,29 @@ impl WorkspaceMcpServer {
                         // call time (nonce in `pending_batch`) are not
                         // re-stamped or re-registered. No-op unless both the
                         // registry and a caller agent are wired.
-                        let content_items =
-                            self.register_turn_attachments(content_items, pending_batch);
+                        let Ok(content_items) = self
+                            .register_turn_attachments(
+                                content_items,
+                                pending_batch,
+                                output.as_ref(),
+                            )
+                            .await
+                        else {
+                            return refusal_tool_result();
+                        };
                         // Return MCP content items directly
                         json!({
                             "content": content_items,
                             "isError": false,
                         })
                     } else {
-                        self.register_pending_attachments(pending_batch);
+                        if self
+                            .register_pending_attachments(pending_batch, output.as_ref())
+                            .await
+                            .is_err()
+                        {
+                            return refusal_tool_result();
+                        }
                         // Error results and the `__mcpContentItems` pass-through
                         // above are exempt from both knobs: only the plain
                         // success body is TOON-encoded / size-limited.
@@ -275,7 +334,7 @@ impl WorkspaceMcpServer {
                         tracing::trace!("workspace_api dispatch: output finalize starting");
                         let stage_started = Instant::now();
                         let out = self
-                            .finalize_workspace_api_output(body, ext, max_chars)
+                            .finalize_workspace_api_output(body, ext, max_chars, output.as_ref())
                             .await;
                         finalize_ms = Some(
                             u64::try_from(stage_started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -284,12 +343,24 @@ impl WorkspaceMcpServer {
                     }
                 }
                 _ => {
-                    self.register_pending_attachments(pending_batch);
+                    if self
+                        .register_pending_attachments(pending_batch, output.as_ref())
+                        .await
+                        .is_err()
+                    {
+                        return refusal_tool_result();
+                    }
                     workspace_api_error("Error: engine: unexpected workspace_api envelope")
                 }
             },
             Err(e) => {
-                self.register_pending_attachments(pending_batch);
+                if self
+                    .register_pending_attachments(pending_batch, output.as_ref())
+                    .await
+                    .is_err()
+                {
+                    return refusal_tool_result();
+                }
                 workspace_api_error(&format_js_error(&e))
             }
         };
@@ -350,7 +421,7 @@ impl WorkspaceMcpServer {
                 .filter(|n| n.is_finite() && *n >= 0.0)
                 .map_or(DEFAULT_MAX_OUTPUT_CHARS, |n| {
                     // Guarded finite + non-negative; float→int casts saturate.
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let n = n as usize;
                     n
                 }),
@@ -374,6 +445,7 @@ impl WorkspaceMcpServer {
         text: String,
         ext: &str,
         max_chars: usize,
+        output: Option<&SealedPrivateOutput>,
     ) -> Value {
         if max_chars == 0 {
             return workspace_api_success(&text);
@@ -382,7 +454,7 @@ impl WorkspaceMcpServer {
         if total_chars <= max_chars {
             return workspace_api_success(&text);
         }
-        match self.write_oversized_output(&text, ext).await {
+        match self.write_oversized_output(&text, ext, output).await {
             Ok(path) => {
                 let preview: String = text.chars().take(OUTPUT_PREVIEW_CHARS).collect();
                 workspace_api_success(&format!(
@@ -395,11 +467,16 @@ impl WorkspaceMcpServer {
                      whole.\n\nFirst {OUTPUT_PREVIEW_CHARS} characters:\n{preview}"
                 ))
             }
-            Err(reason) => {
-                tracing::warn!(
-                    "workspace_api: oversized output ({total_chars} chars > {max_chars}) \
+            Err(SpillError::Refused) => refusal_tool_result(),
+            Err(SpillError::Failed(reason)) => {
+                // A qualified error can contain a private path. It is shaped
+                // privately below and must pass the separate response boundary.
+                if output.is_none() {
+                    tracing::warn!(
+                        "workspace_api: oversized output ({total_chars} chars > {max_chars}) \
                      could not be redirected to a file ({reason}); returning truncated head"
-                );
+                    );
+                }
                 let head: String = text.chars().take(max_chars).collect();
                 workspace_api_success(&format!(
                     "Output too large: {total_chars} characters (limit: {max_chars}). \
@@ -427,30 +504,47 @@ impl WorkspaceMcpServer {
         &self,
         text: &str,
         ext: &str,
-    ) -> std::result::Result<String, String> {
+        output: Option<&SealedPrivateOutput>,
+    ) -> std::result::Result<String, SpillError> {
         let ws = self
             .api
             .get_workspace(self.workspace_id.clone())
             .await
-            .map_err(|e| format!("get_workspace: {e}"))?;
-        let checkout = ws
-            .effective_path()
-            .ok_or_else(|| "workspace has no on-disk checkout path".to_string())?;
+            .map_err(|e| SpillError::Failed(format!("get_workspace: {e}")))?;
+        let checkout = ws.effective_path().ok_or_else(|| {
+            SpillError::Failed("workspace has no on-disk checkout path".to_string())
+        })?;
         let folder = std::path::Path::new(checkout)
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
-            .ok_or_else(|| format!("checkout path `{checkout}` has no parent directory"))?;
+            .ok_or_else(|| {
+                SpillError::Failed(format!(
+                    "checkout path `{checkout}` has no parent directory"
+                ))
+            })?;
         let dir = folder.join("tool-outputs");
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| format!("create {}: {e}", dir.display()))?;
         let stamp = now_iso().replace(':', "-");
         let short_id = uuid::Uuid::new_v4().simple().to_string();
         let file = dir.join(format!("{stamp}-{}.{ext}", &short_id[..8]));
-        tokio::fs::write(&file, text)
-            .await
-            .map_err(|e| format!("write {}: {e}", file.display()))?;
-        Ok(file.to_string_lossy().into_owned())
+        // One bounded writer job per invocation; prepare all bytes/name/location
+        // before START. No create/write occurs inside an admission action.
+        let job = ArtifactJob {
+            dir,
+            file,
+            bytes: text.as_bytes().to_vec(),
+            outcome: ArtifactOutcome::NotStarted,
+            accounting: output.map(SealedPrivateOutput::artifact_accounting),
+        };
+        let job = match output {
+            Some(output) => output
+                .transfer_prepared(McpPrivateBoundaryKind::ArtifactStart, || {
+                    StartedArtifactJob(job)
+                })
+                .await
+                .map_err(|()| SpillError::Refused)?,
+            None => StartedArtifactJob(job),
+        };
+        job.run().await.map_err(SpillError::Failed)
     }
 
     /// §7.1 deterministic attach — registration side. For every well-formed
@@ -472,31 +566,116 @@ impl WorkspaceMcpServer {
     /// by the time the provider can echo the tool's completion. Pass-through
     /// (no clone mutation, no registration) when the registry or caller agent
     /// is unwired.
-    fn register_turn_attachments(
+    async fn register_turn_attachments(
         &self,
         items: &[Value],
         pending_batch: Vec<TurnAttachment>,
-    ) -> Vec<Value> {
+        output: Option<&SealedPrivateOutput>,
+    ) -> Result<Vec<Value>, ()> {
         let (Some(registry), Some(agent_id)) = (&self.turn_attachments, &self.caller_agent_id)
         else {
-            return items.to_vec();
+            return Ok(items.to_vec());
         };
         let known: HashSet<String> = pending_batch.iter().map(|a| a.id.clone()).collect();
         let mut out = items.to_vec();
         let new_entries = stamp_and_collect(&mut out, &known);
         let mut batch = pending_batch;
         batch.extend(new_entries);
+        let batch = prepare_attachment_publication(batch, output).await?;
         registry.register_all(agent_id, batch);
-        out
+        Ok(out)
     }
 
     /// Register the binding-time attachment batch on the result paths that do
     /// NOT return `__mcpContentItems` — the agent's JS discarded (or threw
     /// past) the envelope, but the proposals it produced still attach to the
     /// tool result via the `workspace_api` FIFO claim (monorepo#2637).
-    fn register_pending_attachments(&self, pending_batch: Vec<TurnAttachment>) {
+    async fn register_pending_attachments(
+        &self,
+        pending_batch: Vec<TurnAttachment>,
+        output: Option<&SealedPrivateOutput>,
+    ) -> Result<(), ()> {
         if let (Some(registry), Some(agent_id)) = (&self.turn_attachments, &self.caller_agent_id) {
+            let pending_batch = prepare_attachment_publication(pending_batch, output).await?;
             registry.register_all(agent_id, pending_batch);
+        }
+        Ok(())
+    }
+}
+
+async fn prepare_attachment_publication(
+    batch: Vec<TurnAttachment>,
+    output: Option<&SealedPrivateOutput>,
+) -> Result<Vec<TurnAttachment>, ()> {
+    match output {
+        Some(output) if !batch.is_empty() => {
+            output
+                .transfer(McpPrivateBoundaryKind::Attachments, batch)
+                .await
+        }
+        _ => Ok(batch),
+    }
+}
+
+enum SpillError {
+    Refused,
+    Failed(String),
+}
+
+struct ArtifactJob {
+    dir: std::path::PathBuf,
+    file: std::path::PathBuf,
+    bytes: Vec<u8>,
+    outcome: ArtifactOutcome,
+    accounting: Option<ArtifactAccounting>,
+}
+
+// Creating this envelope is a pure ownership move in the START action. Its
+// drop accounts for admitted-but-unobserved work even when admission's future
+// is cancelled before releasing its guards. It never performs filesystem I/O.
+struct StartedArtifactJob(ArtifactJob);
+
+impl StartedArtifactJob {
+    async fn run(mut self) -> Result<String, String> {
+        // Tokio filesystem work can outlive a cancelled await. Once START was
+        // admitted, cancellation means unknown, never a claim of no file effect.
+        self.0.outcome = ArtifactOutcome::Unknown;
+        if let Some(accounting) = &self.0.accounting {
+            accounting.record(ArtifactOutcome::Unknown);
+        }
+        let result = async {
+            tokio::fs::create_dir_all(&self.0.dir)
+                .await
+                .map_err(|e| format!("create {}: {e}", self.0.dir.display()))?;
+            tokio::fs::write(&self.0.file, &self.0.bytes)
+                .await
+                .map_err(|e| format!("write {}: {e}", self.0.file.display()))?;
+            Ok(self.0.file.to_string_lossy().into_owned())
+        }
+        .await;
+        self.0.outcome = if result.is_ok() {
+            ArtifactOutcome::Written
+        } else {
+            ArtifactOutcome::Failed
+        };
+        if let Some(accounting) = &self.0.accounting {
+            accounting.record(self.0.outcome);
+        }
+        result
+    }
+}
+
+impl Drop for StartedArtifactJob {
+    fn drop(&mut self) {
+        if matches!(
+            self.0.outcome,
+            ArtifactOutcome::NotStarted | ArtifactOutcome::Unknown
+        ) {
+            if let Some(accounting) = &self.0.accounting {
+                accounting.record(ArtifactOutcome::Unknown);
+            }
+            // Accounting only: no logging/I/O in a destructor that can run
+            // inside a transfer action. Never remove a successor or retry.
         }
     }
 }
@@ -626,6 +805,10 @@ fn stamp_and_collect(items: &mut [Value], known: &HashSet<String>) -> Vec<TurnAt
 /// `pub` (re-exported as `intent_acp::make_workspace_host_for_bridge`) so
 /// the background hook scheduler in `intent-services` applies the same
 /// sub-agent gate to hooks owned by background/delegated sessions.
+/// `eval_budget` is the wall-clock budget of the enclosing eval (the hook
+/// runner's per-run timeout); bindings that bound a wait by the eval budget
+/// (`ws.script.run`) derive their ceiling from it, so every caller must pass
+/// its real budget.
 pub fn make_workspace_host_for_bridge(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -633,6 +816,7 @@ pub fn make_workspace_host_for_bridge(
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: AgentFeaturesSettings,
     is_sub_agent: bool,
+    eval_budget: Duration,
 ) -> HostFn {
     make_workspace_host_with_pending(
         api,
@@ -641,6 +825,7 @@ pub fn make_workspace_host_for_bridge(
         turn_attachments,
         agent_features,
         is_sub_agent,
+        eval_budget,
         None,
     )
 }
@@ -650,7 +835,12 @@ pub fn make_workspace_host_for_bridge(
 /// result carries `__mcpContentItems` gets its resource items nonce-stamped
 /// and collected immediately, so `dispatch_workspace_api` registers them at
 /// the tool result regardless of what the agent's JS returns. Private —
-/// only the `workspace_api` dispatch wires a collector.
+/// only the `workspace_api` dispatch wires a collector. `eval_budget` is the
+/// wall-clock budget of the enclosing eval, threaded to the bindings; its
+/// clock starts HERE (both callers build the host immediately before the
+/// eval), so a binding dispatched late in the eval sees only the remaining
+/// time (intent-hq/intent#5387).
+#[expect(clippy::too_many_arguments)]
 fn make_workspace_host_with_pending(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -658,9 +848,11 @@ fn make_workspace_host_with_pending(
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: AgentFeaturesSettings,
     is_sub_agent: bool,
+    eval_budget: Duration,
     pending: Option<PendingAttachments>,
 ) -> HostFn {
     let features = Arc::new(agent_features);
+    let eval_budget = super::bindings::EvalBudget::starting_now(eval_budget);
     Arc::new(move |arg| {
         let api = api.clone();
         let workspace_id = workspace_id.clone();
@@ -686,6 +878,7 @@ fn make_workspace_host_with_pending(
                 registry,
                 &features,
                 is_sub_agent,
+                eval_budget,
                 arg,
             )
             .await;
@@ -721,15 +914,23 @@ fn collect_binding_attachments(value: &mut Value, pending: &PendingAttachments, 
 }
 
 /// The dispatch-layer denial for a sub-agent's `app.question.*` frame —
-/// names the two methods a sub-agent should use instead.
+/// routes routine questions to conversation and reserves attention for stalled work.
 pub(super) const SUB_AGENT_QUESTION_DENIED: &str =
-    "ws.app.question.ask is only available to top-level agents — raise \
-     ws.agent.requestDiscussion when you need user/coordinator input, or report \
-     progress with ws.agent.reportToParent";
+    "ws.app.question.ask is only available to top-level agents — use ordinary conversation \
+     with your parent for routine clarification and plan approval; reserve \
+     ws.agent.requestDiscussion for an issue in concrete assigned work that leaves you \
+     unsure how to proceed without a user/coordinator decision. Check available context \
+     and use your judgment for routine choices first; report completed or progressing \
+     work with ws.agent.reportToParent";
 
 /// The dispatch-layer denial for a sub-agent's sibling-workspace proposal.
 pub(super) const SUB_AGENT_PROPOSE_SIBLING_DENIED: &str =
     "ws.workspace.proposeSibling is only available to foreground top-level agents — report the opportunity to your parent with ws.agent.reportToParent";
+
+/// The dispatch-layer denial for a sub-agent's proposal apply: only the
+/// foreground top-level agent that proposed a sibling can apply it.
+pub(super) const SUB_AGENT_APPLY_PROPOSAL_DENIED: &str =
+    "ws.workspace.applyProposal is only available to foreground top-level agents — a proposal can only be applied by the agent that proposed it on the user's instruction";
 
 /// The dispatch-layer denial for a sub-agent's `agent.create` frame with
 /// `topLevel: true` — creating independent top-level agents is a
@@ -742,6 +943,7 @@ pub(super) const SUB_AGENT_CREATE_TOP_LEVEL_DENIED: &str =
 /// [`super::bindings::try_dispatch`], which owns the per-namespace method →
 /// trait mapping. Sub-agent `app.question.*` frames and methods gated by a
 /// disabled `[agentFeatures]` toggle are denied before dispatch.
+#[expect(clippy::too_many_arguments)]
 async fn workspace_host_dispatch(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -749,6 +951,7 @@ async fn workspace_host_dispatch(
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: &AgentFeaturesSettings,
     is_sub_agent: bool,
+    eval_budget: super::bindings::EvalBudget,
     arg: Value,
 ) -> std::result::Result<Value, String> {
     let method = arg
@@ -764,6 +967,9 @@ async fn workspace_host_dispatch(
     }
     if is_sub_agent && method == "workspace.proposeSibling" {
         return Err(format!("host: {SUB_AGENT_PROPOSE_SIBLING_DENIED}"));
+    }
+    if is_sub_agent && method == "workspace.applyProposal" {
+        return Err(format!("host: {SUB_AGENT_APPLY_PROPOSAL_DENIED}"));
     }
     // Top-level-only rule for creating independent top-level agents (the
     // arg-conditional `agent.create` + `topLevel: true` path): like the
@@ -799,14 +1005,15 @@ async fn workspace_host_dispatch(
     // boundary), so without this check the retiring turn could keep issuing
     // workspace_api calls after the mark landed. Fail closed on every
     // subsequent frame from a retired caller — the same inertness the
-    // service layer enforces for inbound interaction.
-    if let Some(caller) = caller_agent_id.as_ref() {
-        if api.agent_is_retired(caller.clone()).await {
-            return Err(
-                "host: this agent session is retired — the session is inert and no further \
-                 workspace_api calls run (only the user can restore it via agent.restore)"
-                    .to_string(),
-            );
+    // service layer enforces for inbound interaction. The send bindings run
+    // this same read INSIDE their spawned, budget-bounded delivery
+    // (`RETIRED_SEND_METHODS`): awaited here it would be one more
+    // cancellable store read on the send path (intent-hq/intent#5387).
+    if !super::bindings::RETIRED_SEND_METHODS.contains(&method) {
+        if let Some(caller) = caller_agent_id.as_ref() {
+            if api.agent_is_retired(caller.clone()).await {
+                return Err(retired_caller_error());
+            }
         }
     }
     let args = arg.get("args").cloned().unwrap_or(Value::Null);
@@ -817,6 +1024,7 @@ async fn workspace_host_dispatch(
         turn_attachments.as_ref(),
         agent_features,
         is_sub_agent,
+        eval_budget,
         method,
         &args,
     )
@@ -825,6 +1033,14 @@ async fn workspace_host_dispatch(
         return Ok(v);
     }
     Err(format!("host: unknown method `{method}`"))
+}
+
+/// The error every `workspace_api` frame from a retired caller fails with —
+/// shared by the dispatch guard above and the send bindings' deferred check.
+pub(crate) fn retired_caller_error() -> String {
+    "host: this agent session is retired — the session is inert and no further \
+     workspace_api calls run (only the user can restore it via agent.restore)"
+        .to_string()
 }
 
 /// Success MCP tool result for `workspace_api`: a single text content block
