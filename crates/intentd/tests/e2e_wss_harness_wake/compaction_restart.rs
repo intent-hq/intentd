@@ -2,6 +2,7 @@
 //! automatic recovery over WSS. Only the empty workspace is seeded in storage.
 use super::*;
 use intentd_test_support::GuardedChild;
+use sqlx::Connection;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 
@@ -92,6 +93,23 @@ impl RestartFixture {
         self.child.take();
         // A stale socket can make await_uds observe the previous listener.
         let _ = std::fs::remove_file(self.root.path().join("intentd.sock"));
+    }
+
+    async fn durable_content(&self, agent: &str) -> Vec<String> {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(self.root.path().join("intentd.db"))
+            .read_only(true);
+        let mut connection = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        let content =
+            sqlx::query_scalar("SELECT content FROM agent_message WHERE agent_id = ? ORDER BY seq")
+                .bind(agent)
+                .fetch_all(&mut connection)
+                .await
+                .unwrap();
+        connection.close().await.unwrap();
+        content
     }
 
     fn prompts(&self) -> Vec<Value> {
@@ -300,13 +318,25 @@ async fn active_compaction(
     (fixture, workspace, agent, rpc, sub, queued_id)
 }
 
-async fn run_restart_case(graceful: bool, queued: bool, load_session: bool, prompt_owned: bool) {
-    let (mut fixture, workspace, agent, mut rpc, mut sub, queued_id) =
+enum CompactionOwner {
+    Prompt,
+    Harness,
+}
+
+async fn run_restart_case(
+    graceful: bool,
+    queued: bool,
+    load_session: bool,
+    owner: CompactionOwner,
+) {
+    let prompt_owned = matches!(owner, CompactionOwner::Prompt);
+    let (mut fixture, workspace, agent, _initial_rpc, mut sub, queued_id) =
         active_compaction(load_session, queued, prompt_owned).await;
     let resume_index = 1 + usize::from(prompt_owned);
     let expected_prompts = resume_index + 1 + usize::from(queued);
     // Observe across three production quiet windows: unfinished native tools
-    // must not settle or drain user input held under edit. This is a negative event
+    // must not settle or drain ordinary input behind a prompt owner,
+    // or input held under edit behind an unsolicited wake. This is a negative event
     // assertion with a deadline, not a sleep used to order the test.
     let premature = timeout(Duration::from_secs(6), async {
         loop {
@@ -330,7 +360,23 @@ async fn run_restart_case(graceful: bool, queued: bool, load_session: bool, prom
         resume_index,
         "queue must not preempt compaction"
     );
+    // Read-only evidence distinguishes durable context from a live WSS preview.
+    // Never seed recovery rows or assume that SIGKILL ran the graceful flush.
+    let before_stop = fixture.durable_content(&agent).await;
+    let partial_was_durable = before_stop.iter().any(|row| row.contains(PARTIAL));
+    assert!(before_stop.iter().any(|row| row.contains(CONTEXT)));
+    if prompt_owned {
+        assert!(before_stop.iter().any(|row| row.contains(OWNED_PROMPT)));
+    }
     fixture.stop(graceful).await;
+    let after_stop = fixture.durable_content(&agent).await;
+    for row in &before_stop {
+        assert!(after_stop.contains(row), "termination lost durable context");
+    }
+    if prompt_owned && graceful {
+        assert!(after_stop.iter().any(|row| row.contains(PARTIAL)));
+    }
+    eprintln!("restart evidence: graceful={graceful}, prompt_owned={prompt_owned}, partial durable before={partial_was_durable}, after={}", after_stop.iter().any(|row| row.contains(PARTIAL)));
 
     for generation in 2..=3 {
         let gate_path = fixture
@@ -343,7 +389,7 @@ async fn run_restart_case(graceful: bool, queued: bool, load_session: bool, prom
             .await
             .expect("startup sweep reaches gate")
             .unwrap();
-        rpc = fixture.connect().await;
+        let mut rpc = fixture.connect().await;
         sub = subscribe(&fixture, &workspace).await;
         let queue = wss_rpc(&mut rpc, 10, "agent.getQueue", json!({"agentId": agent})).await;
         let entries = queue["queue"].as_array().unwrap();
@@ -408,7 +454,7 @@ async fn run_restart_case(graceful: bool, queued: bool, load_session: bool, prom
                 // Graceful shutdown flushes LiveTurn into the durable
                 // transcript. SIGKILL cannot flush the in-memory partial;
                 // crash recovery must retain all available durable context.
-                if graceful {
+                if graceful || partial_was_durable {
                     assert!(
                         resumed.contains(PARTIAL),
                         "checkpointed assistant tail reaches model: {resumed}"
@@ -479,36 +525,36 @@ async fn run_restart_case(graceful: bool, queued: bool, load_session: bool, prom
 
 #[tokio::test]
 async fn native_compaction_graceful_restart_without_queue() {
-    run_restart_case(true, false, false, false).await;
+    run_restart_case(true, false, false, CompactionOwner::Harness).await;
 }
 #[tokio::test]
 async fn unsolicited_compaction_graceful_restart_with_edit_hold() {
-    run_restart_case(true, true, false, false).await;
+    run_restart_case(true, true, false, CompactionOwner::Harness).await;
 }
 #[tokio::test]
 async fn native_compaction_crash_restart_without_queue() {
-    run_restart_case(false, false, false, false).await;
+    run_restart_case(false, false, false, CompactionOwner::Harness).await;
 }
 #[tokio::test]
 async fn unsolicited_compaction_crash_restart_with_edit_hold() {
-    run_restart_case(false, true, false, false).await;
+    run_restart_case(false, true, false, CompactionOwner::Harness).await;
 }
 
 #[tokio::test]
 async fn native_compaction_graceful_load_without_queue() {
-    run_restart_case(true, false, true, false).await;
+    run_restart_case(true, false, true, CompactionOwner::Harness).await;
 }
 #[tokio::test]
 async fn unsolicited_compaction_graceful_load_with_edit_hold() {
-    run_restart_case(true, true, true, false).await;
+    run_restart_case(true, true, true, CompactionOwner::Harness).await;
 }
 #[tokio::test]
 async fn native_compaction_crash_load_without_queue() {
-    run_restart_case(false, false, true, false).await;
+    run_restart_case(false, false, true, CompactionOwner::Harness).await;
 }
 #[tokio::test]
 async fn unsolicited_compaction_crash_load_with_edit_hold() {
-    run_restart_case(false, true, true, false).await;
+    run_restart_case(false, true, true, CompactionOwner::Harness).await;
 }
 
 /// Ready-to-send input retains the existing preemption contract. This is
@@ -566,17 +612,17 @@ async fn native_compaction_ready_send_preempts_without_restart() {
 
 #[tokio::test]
 async fn prompt_owned_compaction_graceful_restart_with_ordinary_queue() {
-    run_restart_case(true, true, false, true).await;
+    run_restart_case(true, true, false, CompactionOwner::Prompt).await;
 }
 #[tokio::test]
 async fn prompt_owned_compaction_crash_restart_with_ordinary_queue() {
-    run_restart_case(false, true, false, true).await;
+    run_restart_case(false, true, false, CompactionOwner::Prompt).await;
 }
 #[tokio::test]
 async fn prompt_owned_compaction_graceful_load_with_ordinary_queue() {
-    run_restart_case(true, true, true, true).await;
+    run_restart_case(true, true, true, CompactionOwner::Prompt).await;
 }
 #[tokio::test]
 async fn prompt_owned_compaction_crash_load_with_ordinary_queue() {
-    run_restart_case(false, true, true, true).await;
+    run_restart_case(false, true, true, CompactionOwner::Prompt).await;
 }
