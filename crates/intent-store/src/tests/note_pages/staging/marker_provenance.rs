@@ -237,6 +237,28 @@ async fn inherited_marker_survives_dirty_prefix_shift_and_seal_replay_after_dele
             .await
             .unwrap();
     assert!(!proof.is_empty());
+    let retained: String = sqlx::query_scalar("SELECT json_extract(value,'$.markerWitness') FROM note_stage_validation WHERE kind='live' AND id='0'")
+        .fetch_one(store.read_pool()).await.unwrap();
+    let witness: Value = serde_json::from_str(&retained).unwrap();
+    assert_eq!(witness["version"], 1);
+    assert_eq!(witness["canonicalId"], ID);
+    assert_eq!(witness["threadId"], ID);
+    assert_eq!(witness["type"], "point");
+    assert_eq!(
+        witness["rootRange"],
+        json!({"start":START,"end":START+units(LITERAL)})
+    );
+    let (view, root, pin): (String, String, String) =
+        sqlx::query_as("SELECT view_id,root_key,marker_admission FROM note_stage")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(witness["viewId"], view);
+    assert_eq!(witness["rootKey"], root);
+    assert_eq!(
+        witness["admission"],
+        serde_json::from_str::<Value>(&pin).unwrap()
+    );
     store.delete_comment(&note.workspace_id, ID).await.unwrap();
     assert_eq!(store.seal_note_stage("alice", &seal).await.unwrap(), sealed);
     let after: Vec<(String, String, String)> =
@@ -306,4 +328,65 @@ async fn before_seal_ownership_epoch_change_refuses_without_refreshing_begin_pin
             .unwrap();
         assert_eq!(after, pin);
     }
+}
+
+#[tokio::test]
+async fn final_marker_witness_failure_rolls_back_entire_seal_and_retry_uses_same_upload() {
+    let (store, _tmp, note) = setup(&format!("😀{LITERAL}tail")).await;
+    store
+        .insert_comment(&note.workspace_id, &sample_comment(&note.id, ID, ID))
+        .await
+        .unwrap();
+    let begin = stage(&store, Edit::Shift).await;
+    let seal = seal_request(&store, &begin).await;
+    let uploaded: Vec<String> = sqlx::query_scalar(
+        "SELECT value FROM note_stage_record ORDER BY stream,chunk_sequence,ordinal",
+    )
+    .fetch_all(store.read_pool())
+    .await
+    .unwrap();
+    sqlx::query("CREATE TRIGGER reject_marker_witness BEFORE UPDATE OF value ON note_stage_validation WHEN new.kind='live' AND json_type(new.value,'$.markerWitness')='object' BEGIN SELECT RAISE(ABORT,'injected final marker witness'); END")
+        .execute(store.write_pool()).await.unwrap();
+    let error = store.seal_note_stage("alice", &seal).await.unwrap_err();
+    assert!(
+        matches!(&error, Error::Internal(message) if message.contains("injected final marker witness")),
+        "{error:?}"
+    );
+    let state: (String, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT phase,payload_digest,view_id FROM note_stage")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(state, ("staging".into(), None, None));
+    for table in [
+        "note_stage_view",
+        "note_stage_view_piece",
+        "note_stage_validation",
+    ] {
+        assert_eq!(count(&store, table).await, 0, "{table}");
+    }
+    let cached: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_text WHERE sha256 IS NOT NULL")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(cached, 0);
+    let after: Vec<String> = sqlx::query_scalar(
+        "SELECT value FROM note_stage_record ORDER BY stream,chunk_sequence,ordinal",
+    )
+    .fetch_all(store.read_pool())
+    .await
+    .unwrap();
+    assert_eq!(after, uploaded);
+    sqlx::query("DROP TRIGGER reject_marker_witness")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let sealed = store.seal_note_stage("alice", &seal).await.unwrap();
+    assert_eq!(sealed["phase"], "sealed");
+    assert_eq!(sealed["payloadDigest"], seal.payload_digest);
+    let witnesses:i64=sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation WHERE kind='live' AND json_type(value,'$.markerWitness')='object'")
+        .fetch_one(store.read_pool()).await.unwrap();
+    assert_eq!(witnesses, 1);
+    assert_eq!(store.seal_note_stage("alice", &seal).await.unwrap(), sealed);
 }
