@@ -16,6 +16,9 @@ mod common;
 #[path = "e2e_wss_agent_lifecycle/creation_preferences.rs"]
 mod creation_preferences;
 
+#[path = "e2e_wss_agent_lifecycle/managed_provider.rs"]
+mod managed_provider;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;

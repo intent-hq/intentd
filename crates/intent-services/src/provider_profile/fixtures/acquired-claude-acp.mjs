@@ -10,6 +10,7 @@ import { createRequire } from 'node:module';
 
 const modules = path.resolve(process.argv[2]);
 const harness = path.resolve(process.argv[3]), testName = process.argv[4];
+const wss = process.argv[5] === 'wss';
 const native = path.join(modules, '@anthropic-ai/claude-agent-sdk-linux-x64/claude');
 for (const [pkg, version] of [['@agentclientprotocol/claude-agent-acp', '0.81.1'], ['@anthropic-ai/claude-agent-sdk', '0.3.280']]) {
   assert.equal(JSON.parse(await fs.readFile(path.join(modules, pkg, 'package.json'))).version, version);
@@ -69,16 +70,23 @@ const instructionMarkers = ['ANCESTOR','ROOT','PROJECT-CLAUDE','LOCAL','IMPORTED
 await write(path.join(cwd, 'approved.json'), JSON.stringify({ approved: mcp('approved'), 'workspace-mcp': mcp('bridge') }));
 const seen = [];
 let shouldCallTool = false;
+let shouldCallBridge = wss;
 const server = http.createServer(async (req, res) => {
   let raw = ''; for await (const chunk of req) raw += chunk;
   if (!req.url.startsWith('/v1/messages') || req.url.includes('count_tokens')) { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"input_tokens":1}'); return; }
-  const body = JSON.parse(raw); seen.push({ body, key: req.headers['x-api-key'] });
-  const tool = shouldCallTool && (body.tools ?? []).find(t => t.name === 'mcp__approved__echo');
+  const body = JSON.parse(raw);
+  const phase = wss ? await fs.readFile(path.join(root, 'wss-phase'), 'utf8') : null;
+  seen.push({ body, key: req.headers['x-api-key'], phase });
+  const bridgeTool = shouldCallBridge && phase === '0' && (body.tools ?? []).find(t => t.name === 'mcp__workspace-mcp__workspace_api');
+  if (bridgeTool) shouldCallBridge = false;
+  const tool = bridgeTool || (shouldCallTool && (body.tools ?? []).find(t => t.name === 'mcp__approved__echo'));
   shouldCallTool = false;
+  const toolInput = bridgeTool ? {code:'return await ws.workspace.info()',summary:'Verify the managed workspace bridge'} : {};
   const block = tool ? { type: 'tool_use', id: 'tool_fixture', name: tool.name, input: {} } : { type: 'text', text: '' };
   const events = [
     ['message_start', { type: 'message_start', message: { id: 'msg_fixture', type: 'message', role: 'assistant', model: body.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } }],
     ['content_block_start', { type: 'content_block_start', index: 0, content_block: block }],
+    ...(tool ? [['content_block_delta', {type:'content_block_delta',index:0,delta:{type:'input_json_delta',partial_json:JSON.stringify(toolInput)}}]] : []),
     ...(!tool ? [['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Fixture complete.' } }]] : []),
     ['content_block_stop', { type: 'content_block_stop', index: 0 }],
     ['message_delta', { type: 'message_delta', delta: { stop_reason: tool ? 'tool_use' : 'end_turn', stop_sequence: null }, usage: { output_tokens: 1 } }],
@@ -163,26 +171,38 @@ sock.on('error',()=>process.exit(1));sock.on('close',()=>process.exit(0));
 await fs.chmod(bridge, 0o700);
 async function managerFixture() {
   const before = seen.length;
-  const child = spawn('bwrap', [...namespace, harness, '--exact', 'agent_manager::tests::managed_interactive_native_lifecycle', '--ignored', '--nocapture'], {
+  const child = spawn('bwrap', [...namespace, harness, '--exact', wss ? testName : 'agent_manager::tests::managed_interactive_native_lifecycle', '--ignored', '--nocapture'], {
     cwd, env: { ...env, INTENT_MANAGED_SESSION_FIXTURE:'1', INTENT_MANAGED_BRIDGE:bridge }, stdio:['ignore','pipe','pipe'],
   });
   let stdout='', stderr=''; child.stdout.on('data', x=>stdout+=x); child.stderr.on('data', x=>stderr+=x);
   const code = await new Promise(resolve=>child.once('close',resolve));
   assert.equal(code,0,stdout+'\n'+stderr);
-  assert(stdout.includes('PASS actual AgentManager'));
+  assert(stdout.includes(wss ? 'PASS actual WSS managed lifecycle' : 'PASS actual AgentManager'));
+  if (wss) console.log(stdout);
   const requests = seen.slice(before);
   // Native Claude also sends tool-free warmup/title requests. Check isolation
   // on every request; the two actual conversation turns must carry our bridge.
   const turns = [];
-  for(const {body,key} of requests) {
-    assert.equal(key,env.ANTHROPIC_API_KEY); assert.equal(body.model,'claude-sonnet-4-6');
+  let deferredTurns = 0;
+  for(const {body,key,phase} of requests) {
+    assert.equal(key,env.ANTHROPIC_API_KEY);
+    if(!wss) assert.equal(body.model,'claude-sonnet-4-6');
     const tools=(body.tools??[]).map(t=>t.name); assert.equal(new Set(tools).size,tools.length);
+    const content=body.messages?.at(-1)?.content;
+    if(wss && phase === '3') {
+      if(!tools.length) continue;
+      deferredTurns++;
+      assert(tools.includes('mcp__approved__echo'), 'deferred external catalog keeps existing delivery');
+      continue;
+    }
+    assert.notEqual(phase, '2', 'denied managed turn must not reach the model');
     assert(!tools.some(t=>t.startsWith('mcp__ambient__')||t.startsWith('mcp__host__')));
     assert(!JSON.stringify(body.system).includes('HOST-SKILL-MARKER'));
-    const content=body.messages?.at(-1)?.content;
-    if(Array.isArray(content) && content.some(b=>['MANAGED-FIRST-TURN','MANAGED-RESUMED-TURN'].includes(b.text))) {
+    if(wss && !tools.length) continue;
+    if(Array.isArray(content) && content.some(b=>['MANAGED-FIRST-TURN','MANAGED-RESUMED-TURN'].some(marker=>b.text?.includes(marker)))) {
       turns.push(body);
-      assert(tools.some(t=>t.startsWith('mcp__workspace-mcp__')));
+      assert.equal(body.model,'claude-sonnet-4-6');
+      assert(tools.some(t=>t.startsWith('mcp__workspace-mcp__')), JSON.stringify({tools, content}));
       assert(JSON.stringify(body.system).includes('AMBIENT-SKILL-MARKER'));
       for (const marker of instructionMarkers) assert.equal(JSON.stringify(body.system).split(marker).length-1, 1, `managed new/load must preserve ${marker} once`);
       assert(!JSON.stringify(body.system).includes('CODE-IMPORT-MUST-NOT-LOAD'));
@@ -190,12 +210,21 @@ async function managerFixture() {
     }
   }
   assert.equal(turns.length,2,'both actual conversation turns must reach the model');
+  if(wss) {
+    assert.equal(deferredTurns,1,'deferred external conversation reaches the model');
+    assert.equal(shouldCallBridge,false,'model invoked the actual workspace bridge');
+    assert(requests.some(({body,phase})=>phase==='0' && body.messages?.some(m=>Array.isArray(m.content)&&m.content.some(b=>b.type==='tool_result' && JSON.stringify(b.content).includes(cwd)))), 'workspace bridge returned the actual workspace path: '+JSON.stringify(requests.filter(r=>r.phase==='0').map(r=>r.body.messages).flat().filter(m=>m.content?.some?.(b=>b.type==='tool_result'))));
+  }
   assert(JSON.stringify(turns.at(-1).messages).includes('MANAGED-FIRST-TURN'));
-  for(const name of ['host','ambient']) assert.equal(await fs.stat(path.join(root,name)).catch(()=>null),null);
+  if(!wss) for(const name of ['host','ambient']) assert.equal(await fs.stat(path.join(root,name)).catch(()=>null),null);
   console.log('PASS actual AgentManager new/load/respawn and effective catalog');
 }
 let active, held;
 try {
+  if (wss) {
+    await managerFixture();
+    console.log('PASS native WSS managed lifecycle and model inventory');
+  } else {
   let sessionId;
   for (const mode of ['new', 'load', 'ephemeral']) {
     held = await acquired(mode === 'ephemeral');
@@ -255,6 +284,7 @@ try {
   await held.release(); held = null;
   console.log('PASS managed new/load instruction sources match pinned native baseline');
   console.log('PASS acquired ACP new/load/respawn and ephemeral inventory');
+  }
 } finally {
   if (active) await active.stop();
   if (held) await held.release();
