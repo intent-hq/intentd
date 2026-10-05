@@ -17,6 +17,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Spawned-session integration consumes the separate scoped skill API next"
+    )
+)]
+pub(crate) mod spawned;
+
 const SKILL_FILENAME: &str = "SKILL.md";
 const MAX_SCAN_DEPTH: usize = 4;
 const MAX_SCANNED_DIRECTORIES: usize = 2000;
@@ -69,13 +78,13 @@ struct ParsedSkillFile {
 #[derive(Debug, Clone)]
 struct DiscoveredSkill {
     metadata: SkillMetadata,
-    precedence: u8,
+    precedence: usize,
 }
 
 #[derive(Debug, Clone)]
 struct ScanTarget {
     root: PathBuf,
-    precedence: u8,
+    precedence: usize,
     scope: String, // "project" or "user"
 }
 
@@ -97,6 +106,7 @@ struct CachePayload {
     fingerprints: Vec<PathFingerprint>,
     watch_directories: Vec<PathBuf>,
     project_watch_directories: Vec<PathBuf>,
+    diagnostics: Vec<String>,
 }
 
 struct CacheEntry {
@@ -130,6 +140,7 @@ pub(crate) fn discover_skills_sync(
 /// Filesystem events are authoritative even when size and mtime were restored.
 /// Keep an in-flight scan's dirty flag so it cannot overwrite this invalidation.
 pub(crate) fn invalidate_skills_cache(workspace_path: &Path) {
+    spawned::invalidate();
     let key = normalize_workspace_path(&workspace_path.to_string_lossy());
     let mut cache = DISCOVERY_CACHE.lock().unwrap();
     if let Some(entry) = cache.get_mut(key.as_deref().unwrap_or(NO_WORKSPACE_CACHE_KEY)) {
@@ -323,6 +334,7 @@ async fn load_skills_payload_with_home(
                         fingerprints: Vec::new(),
                         watch_directories: Vec::new(),
                         project_watch_directories: Vec::new(),
+                        diagnostics: Vec::new(),
                     }),
                     dirty: false,
                     load_promise: Some(load_lock.clone()),
@@ -375,18 +387,24 @@ async fn scan_skills_with_home(
 
 /// Internal: scan skills with optional home directory override (for tests)
 fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>) -> CachePayload {
+    scan_targets(get_scan_targets(workspace_path, home_override), false)
+}
+
+fn scan_targets(targets: Vec<ScanTarget>, canonical_ties: bool) -> CachePayload {
+    let mut diagnostics = Vec::new();
     let mut observed_paths = std::collections::HashSet::new();
     let mut discovered_by_name = BTreeMap::new();
     let mut scan_state = ScanState::default();
     let mut project_watch_directories = HashSet::new();
 
     // Visit the winning tier first so canonical deduplication cannot erase it.
-    for target in get_scan_targets(workspace_path, home_override)
-        .into_iter()
-        .rev()
-    {
+    for target in targets.into_iter().rev() {
         observed_paths.insert(target.root.clone());
-        let skill_files = find_skill_files(&target.root, &mut observed_paths, &mut scan_state);
+        let mut skill_files = find_skill_files(&target.root, &mut observed_paths, &mut scan_state);
+        if canonical_ties {
+            skill_files
+                .sort_by_cached_key(|path| path.canonicalize().unwrap_or_else(|_| path.clone()));
+        }
         // Project tiers are visited first. Capture their paths before user
         // discovery adds shared directories to the same bounded scan state.
         if target.scope == "project" {
@@ -399,16 +417,21 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
 
                 if let Some(existing) = discovered_by_name.get(&name) {
                     let existing: &DiscoveredSkill = existing;
+                    diagnostics.push(format!("Skill name collision at {}", skill_file.display()));
+                    let replace = target.precedence > existing.precedence
+                        || (!canonical_ties && target.precedence == existing.precedence);
                     eprintln!(
                         "WARN: Skill name collision detected, keeping higher-precedence skill: name={}, kept={}, shadowed={}",
                         name,
-                        if target.precedence >= existing.precedence { &parsed.metadata.location } else { &existing.metadata.location },
-                        if target.precedence >= existing.precedence { &existing.metadata.location } else { &parsed.metadata.location }
+                        if replace { &parsed.metadata.location } else { &existing.metadata.location },
+                        if replace { &existing.metadata.location } else { &parsed.metadata.location }
                     );
                 }
 
                 if !discovered_by_name.contains_key(&name)
-                    || target.precedence >= discovered_by_name[&name].precedence
+                    || target.precedence > discovered_by_name[&name].precedence
+                    || (!canonical_ties
+                        && target.precedence == discovered_by_name[&name].precedence)
                 {
                     discovered_by_name.insert(
                         name.clone(),
@@ -421,6 +444,11 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
                         },
                     );
                 }
+            } else {
+                diagnostics.push(format!(
+                    "Unreadable, oversized, or malformed skill: {}",
+                    skill_file.display()
+                ));
             }
         }
     }
@@ -449,6 +477,7 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
         fingerprints,
         watch_directories,
         project_watch_directories: project_watch_directories.into_iter().collect(),
+        diagnostics,
     }
 }
 

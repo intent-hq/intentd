@@ -221,6 +221,7 @@ mod principal_ops;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
 pub mod provider_models;
+pub mod provider_profile;
 pub mod provider_test_prompt;
 mod rate_limit;
 pub mod repo_config;
@@ -234,6 +235,14 @@ mod sentry_ops;
 mod settings;
 mod settings_registry;
 mod shell;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Spawned catalog orchestration is a separate integration task"
+    )
+)]
+pub(crate) mod spawned_provider_catalog;
 pub(crate) mod stack_sample;
 mod task_effort;
 mod terminal_ops;
