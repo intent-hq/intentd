@@ -21344,6 +21344,163 @@ mod harness_wake_tests {
         );
     }
 
+    /// A fresh Send after the failure event can race provider disposal.
+    /// Exercise the actual wake worker exit, not a synthetic released slot.
+    #[tokio::test]
+    async fn failed_compaction_wake_redrives_send_during_disposal() {
+        let (tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let script = mock_agent_script();
+        let sessions_log = tmp.path.with_extension("sessions.jsonl");
+        let prompt_log = tmp.path.with_extension("prompts.jsonl");
+        let _env = EnvGuard::set_all(&[
+            ("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS", "400"),
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("MOCK_AGENT_SESSION_LOG", sessions_log.to_str().unwrap()),
+            ("MOCK_AGENT_PROMPT_LOG", prompt_log.to_str().unwrap()),
+        ]);
+        mgr.services.attach_agent_manager(&mgr);
+        set_session_provider(&mgr, &ws, &id, "mock").await;
+        let (earlier, _) = mgr.services.enqueue_message(
+            &id,
+            "earlier durable instruction".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        mgr.services
+            .agent_queues
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()[0]
+            .editing = true;
+        mgr.services.persist_queue_snapshot(&id).await;
+        let pause = Arc::new(super::super::TurnStartPause::default());
+        *mgr.failed_wake_disposal_pause.lock().unwrap() = Some(pause.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        note_tx.send(compaction_note("in_progress")).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        timeout(Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("failed wake reaches provider disposal");
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:failed")
+        })
+        .await;
+        assert!(events.iter().any(|e| e.event_type == "agent:failed"));
+        assert!(!events.iter().any(|e| e.event_type == "agent:idle"));
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session_status(&id)
+                .await
+                .unwrap(),
+            AgentStatus::Error
+        );
+        assert!(mgr.is_busy(&id), "disposal still owns the slot");
+        let sent = mgr
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "fresh recovery instruction".into(),
+                None,
+                super::super::TurnOptions {
+                    origin: MessageOrigin::User,
+                    ..super::super::TurnOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent["queued"], true);
+        assert_eq!(
+            mgr.services.parked_recovery_send(&id).as_deref(),
+            sent["queuedMessage"]["id"].as_str()
+        );
+        let durable = mgr.services.store.load_all_agent_queues().await.unwrap();
+        assert_eq!(durable.len(), 2, "both accepted entries survive cleanup");
+        assert!(durable.iter().any(|q| q.id == earlier.id));
+        // Make the older input eligible without another send/drain kick. The
+        // recovery marker must select the fresh Send first, then drain it.
+        mgr.services
+            .agent_queues
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()[0]
+            .editing = false;
+        mgr.services.persist_queue_snapshot(&id).await;
+        pause.resume.notify_one();
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:idle")
+        })
+        .await;
+        assert!(
+            events.iter().any(|e| e.event_type == "agent:idle"),
+            "fresh Send during failed-wake disposal must run without a second send or retry"
+        );
+        assert!(!events
+            .iter()
+            .any(|e| e.event_type == "agent:idle" && e.data["reason"] == "harness_wake_complete"));
+        let prompts: Vec<Value> = std::fs::read_to_string(prompt_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "each instruction reaches the provider exactly once"
+        );
+        assert!(prompts[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("fresh recovery instruction"));
+        assert!(!prompts[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("earlier durable instruction"));
+        assert!(prompts[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("earlier durable instruction"));
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        let user_messages: Vec<_> = messages.iter().filter(|m| m.role == "user").collect();
+        assert_eq!(user_messages.len(), 2);
+        assert!(user_messages[0]
+            .content
+            .to_string()
+            .contains("fresh recovery instruction"));
+        assert!(user_messages[1]
+            .content
+            .to_string()
+            .contains("earlier durable instruction"));
+        assert!(mgr
+            .services
+            .store
+            .load_all_agent_queues()
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(mgr.services.parked_recovery_send(&id).is_none());
+        assert_eq!(
+            std::fs::read_to_string(sessions_log)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "recovery spawns one fresh provider"
+        );
+        mgr.stop(&id).await;
+    }
+
     #[tokio::test]
     async fn unfinished_compaction_silence_is_bounded() {
         let (tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;

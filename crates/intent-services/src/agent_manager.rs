@@ -2781,6 +2781,8 @@ pub struct AgentManager {
     user_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
     #[cfg(test)]
     worker_finish_pause: Mutex<Option<Arc<TurnStartPause>>>,
+    #[cfg(test)]
+    failed_wake_disposal_pause: Mutex<Option<Arc<TurnStartPause>>>,
 }
 
 fn spawn_unsloth_status_publisher(
@@ -2891,6 +2893,8 @@ impl AgentManager {
             user_persist_pause: Mutex::new(None),
             #[cfg(test)]
             worker_finish_pause: Mutex::new(None),
+            #[cfg(test)]
+            failed_wake_disposal_pause: Mutex::new(None),
         }
     }
 
@@ -9173,9 +9177,21 @@ impl AgentManager {
                 // Failure was persisted before its terminal events. Keep Error
                 // and the durable queue intact, dispose of the hung provider,
                 // and never publish a successful idle to completion watchers.
+                #[cfg(test)]
+                {
+                    let pause = mgr.failed_wake_disposal_pause.lock().unwrap().take();
+                    if let Some(pause) = pause {
+                        pause.reached.notify_one();
+                        pause.resume.notified().await;
+                    }
+                }
                 mgr.kill_child_only(&id).await;
                 mgr.clear_worker(&id);
                 mgr.release_in_flight_slot(&id);
+                // A fresh Send can park after Error is published while
+                // disposal still holds the slot. Complete that handoff only
+                // after deregistering this worker and releasing ownership.
+                mgr.redrive_parked_recovery_send(&id, &ws).await;
                 return;
             }
             // Empty-wake recovery (intent-hq/monorepo#3262): a wake turn
