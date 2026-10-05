@@ -11,6 +11,7 @@ use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, Sq
 use sqlx::{Row, SqlitePool};
 
 pub use intent_core::{Error, Result};
+pub use note_mutation_repo::{NoteMutationAdmission, NoteMutationWrite};
 pub use note_page_repo::{
     ArtifactJournalLease, ArtifactJournalPurge, ArtifactJournalRecord, ArtifactJournalRecordCost,
     ArtifactJournalStatus, ArtifactSourceGrant, CanonicalSourceBinding, CanonicalSourceHold,
@@ -41,6 +42,7 @@ mod message_thumbnails;
 mod metrics_repo;
 mod node_repo;
 mod note_line_attribution_repo;
+mod note_mutation_repo;
 mod note_page_html;
 mod note_page_index;
 mod note_page_repo;

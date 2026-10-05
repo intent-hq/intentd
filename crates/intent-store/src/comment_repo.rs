@@ -558,7 +558,7 @@ where
         .map_err(|e| Error::Internal(format!("column {name}: {e}")))
 }
 
-fn map_comment_row(row: &SqliteRow) -> Result<Comment> {
+pub(crate) fn map_comment_row(row: &SqliteRow) -> Result<Comment> {
     let note_id: Option<String> = col(row, "note_id")?;
     // Replies store `null` (they anchor via their thread/parent, monorepo#729);
     // legacy reply rows and all roots store the anchor object.

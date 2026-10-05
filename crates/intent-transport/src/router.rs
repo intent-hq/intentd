@@ -98,6 +98,15 @@ fn not_found(message: impl Into<String>) -> RpcErr {
 /// surface as `-32603 "Internal error"` carrying the original cause in `data`.
 fn domain_to_rpc(e: Error) -> RpcErr {
     match e {
+        Error::NoteMutation(kind) => RpcErr {
+            code: if kind == intent_core::note_mutation::NoteMutationError::Conflict {
+                -32005
+            } else {
+                -32602
+            },
+            message: "Note mutation unavailable".into(),
+            data: Some(json!({"code":kind.wire_code()})),
+        },
         Error::NotePage(kind) => RpcErr {
             code: if kind == intent_core::note_page::NotePageError::Stale {
                 -32005

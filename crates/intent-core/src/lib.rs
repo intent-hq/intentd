@@ -36,6 +36,7 @@ pub mod model;
 pub mod native_review;
 pub mod nodes;
 pub mod note_artifact;
+pub mod note_mutation;
 pub mod note_page;
 pub mod note_source_session;
 pub mod path_utils;

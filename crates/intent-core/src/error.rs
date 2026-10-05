@@ -8,6 +8,9 @@
 /// Domain error type for intentd.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Partial mutation failure, with no current-note or submitted text attached.
+    #[error("{}", .0.wire_code())]
+    NoteMutation(crate::note_mutation::NoteMutationError),
     /// Bounded note page failure; never carries source content.
     #[error("{}", .0.wire_code())]
     NotePage(crate::note_page::NotePageError),
@@ -530,7 +533,8 @@ impl Error {
                 _ => -32603,
             },
 
-            Error::NotePage(crate::note_page::NotePageError::Stale)
+            Error::NoteMutation(crate::note_mutation::NoteMutationError::Conflict)
+            | Error::NotePage(crate::note_page::NotePageError::Stale)
             | Error::Conflict { .. } => -32005,
             Error::IdentityMismatch
             | Error::IdentityInUse
@@ -540,7 +544,8 @@ impl Error {
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
             | Error::NotAFile { .. }
-            | Error::NotePage(_) => -32602,
+            | Error::NotePage(_)
+            | Error::NoteMutation(_) => -32602,
             Error::CloneFailed { category, .. } => match category {
                 CloneErrorCategory::PathInvalid | CloneErrorCategory::DestinationExistsNonEmpty => {
                     -32602
