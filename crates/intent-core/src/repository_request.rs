@@ -31,6 +31,13 @@ pub enum RepositoryReadReplyKind {
 
 /// One original authenticated connection, independent of client and RPC ids.
 pub trait RepositoryReadConnection: Send + Sync {
+    /// Pre-workspace host authority, captured on this original native socket.
+    fn capture_checkout(
+        &self,
+        _frame: &crate::repository_checkout::CheckoutFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        None
+    }
     /// Independent explicit resource reads; unsupported owners fail closed.
     fn capture_resource(
         &self,

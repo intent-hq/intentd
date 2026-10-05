@@ -36,7 +36,7 @@ impl Server {
     pub async fn new() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
-        let host = GitlabHost::parse("gitlab.test")
+        let host = GitlabHost::parse("https://gitlab.test/forge")
             .unwrap()
             .with_api_origin(&origin)
             .unwrap();

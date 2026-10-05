@@ -439,7 +439,7 @@ async fn newer_startup_owns_both_response_orders() {
         let reused = svc.gitlab_connect_device(b.host.clone()).await.unwrap();
         assert_eq!(reused["flowId"], new_result["flowId"]);
         let guard = svc.gitlab_auth.lock().await;
-        assert_eq!(guard.flow.as_ref().unwrap().host, b.host.host());
+        assert_eq!(guard.flow.as_ref().unwrap().host, b.host.logical_base_url());
         assert_eq!(
             svc.gitlab_secret_store
                 .load(GITLAB_SECRET_ACCOUNT)

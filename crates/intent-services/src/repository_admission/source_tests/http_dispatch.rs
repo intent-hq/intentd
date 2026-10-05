@@ -369,10 +369,7 @@ impl EffectServer {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         // Choose the disposable endpoint BEFORE Services creates/adopts its
         // original owner. No installed reader, binding or endpoint is retargeted.
-        fixture.host = intent_sourcecontrol::GitlabHost::parse("gitlab.test")
-            .unwrap()
-            .with_api_origin(&endpoint)
-            .unwrap();
+        fixture.host = fixture.host.clone().with_api_origin(&endpoint).unwrap();
         fixture.descriptor = intent_sourcecontrol::GitlabDescriptor::with_loopback_endpoint(
             fixture.descriptor.instance().clone(),
             &endpoint,

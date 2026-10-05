@@ -109,7 +109,7 @@ pub use principal_repo::{
 };
 pub use repository_authority_repo::{
     AuthorityRevision, RepositoryAuthoritySnapshot, RepositoryCredentialAuthority,
-    RepositoryPrincipalAuthority, RepositoryWorkspaceAuthority,
+    RepositoryHostAuthoritySnapshot, RepositoryPrincipalAuthority, RepositoryWorkspaceAuthority,
     RepositoryWorkspaceAuthoritySnapshot, VersionedAuthority,
 };
 pub use repository_selection_repo::{
