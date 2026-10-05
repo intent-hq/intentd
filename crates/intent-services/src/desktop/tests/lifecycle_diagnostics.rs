@@ -233,3 +233,53 @@ fn desktop_lifecycle_reason_projection_is_safe_and_idempotent() {
     assert_eq!(stopped["message"], STOP_HINT);
     assert_eq!(stopped["reason"], "user_stop");
 }
+
+#[tokio::test]
+async fn desktop_lifecycle_invalid_native_result_reports_outcome_unknown_reason() {
+    for method in ["listDisplay", "screenshot"] {
+        let h = Harness::new().await;
+        h.remember().await;
+        let active = h.agent("startControl", json!({})).await.unwrap();
+        let mut events = h
+            .services
+            .event_bus
+            .as_ref()
+            .unwrap()
+            .subscribe(SubscriptionFilter {
+                workspace_id: Some(h.workspace.0.clone()),
+                event_types: vec![DESKTOP_SESSION_CHANGED.into()],
+                ..Default::default()
+            });
+        *h.executor.result.lock().unwrap() = Some(json!({"unexpected":"result shape"}));
+        let failure = h.agent(method, json!({})).await.unwrap_err();
+        assert_eq!(failure.code, "desktop-execution-failed");
+        assert_eq!(failure.detail, "Invalid native desktop result");
+        assert_eq!(failure.execution.as_deref(), Some("unknown"));
+        assert_eq!(h.services.desktop.state(&h.agent), DesktopState::Inactive);
+        let ended = tokio::time::timeout(Duration::from_secs(10), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended[0].data["sessionId"], active["sessionId"]);
+        assert_eq!(ended[0].data["reason"], "outcome_unknown");
+        let message = outcome(&h, "sessionId", active["sessionId"].as_str().unwrap()).await;
+        assert_eq!(message["metadata"]["outcome"], "revoked");
+        assert!(!visible_text(&message).contains("rescinded by the user"));
+        assert_eq!(
+            h.agent(method, json!({})).await.unwrap_err().code,
+            "desktop-not-active"
+        );
+        assert_eq!(
+            h.executor
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p["operation"] == "execute")
+                .count(),
+            1
+        );
+        assert_eq!(message["metadata"]["reason"], "outcome_unknown");
+        assert!(visible_text(&message).contains("outcome_unknown"));
+    }
+}
