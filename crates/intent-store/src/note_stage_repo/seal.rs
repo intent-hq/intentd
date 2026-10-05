@@ -1271,6 +1271,114 @@ pub(super) async fn validate_attribute_graph(
     }
 }
 
+/// Resolve the live stream into an operation-owned structural ledger. Requires
+/// this exact operation's `PreparedView`, verified manifest/text cache and the
+/// SAME immutable caller-owned writer transaction. The owner must still enforce
+/// canonical marker provenance, supported output adapters, authorization and
+/// original expiry/cancellation before publishing any sealed authority.
+///
+/// Detail JSON is <=16KiB, records use indexed one-record seeks, parent existence
+/// uses the ledger PK, and attribute graphs use their external traversal stack.
+/// Native ranges stay in native units; no source/native coordinate conversion or
+/// node/mark allowlist is inferred here. All errors require outer rollback.
+pub(super) async fn validate_live_descriptors(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    view: &PreparedView,
+) -> Result<()> {
+    let (generation,length):(i64,i64)=sqlx::query_as("SELECT generation,length FROM note_stage_view WHERE operation_key=? ORDER BY generation DESC LIMIT 1")
+        .bind(operation).fetch_optional(&mut *conn).await.map_err(db)?.ok_or_else(invalid)?;
+    if extent(generation)? != view.generation || extent(length)? != view.length {
+        return Err(invalid());
+    }
+    let prior: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM note_stage_validation WHERE operation_key=? AND kind='live')",
+    )
+    .bind(operation)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(db)?;
+    if prior {
+        return Err(invalid());
+    }
+    let mut after = (-1, -1);
+    let mut next_ordinal = 0;
+    while let Some(record) = next_record(conn, operation, "live", &mut after).await? {
+        let NoteStageRecord::Projection {
+            ordinal,
+            source_range,
+            role,
+            canonical_id,
+            detail,
+        } = record
+        else {
+            return Err(invalid());
+        };
+        if ordinal != next_ordinal
+            || ordinal >= SAFE_LENGTH
+            || source_range.start > source_range.end
+        {
+            return Err(invalid());
+        }
+        next_ordinal = sum(ordinal, 1)?;
+        verify_reference(conn, operation, &detail).await?;
+        let value = metadata_resource(conn, operation, &detail.text_id).await?;
+        let descriptor = projection_descriptor(&value, ordinal)?;
+        if let Some(parent) = descriptor.parent_ordinal {
+            let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM note_stage_validation WHERE operation_key=? AND kind='live' AND id=? AND state='done')")
+                .bind(operation).bind(parent.to_string()).fetch_one(&mut *conn).await.map_err(db)?;
+            if !exists {
+                return Err(invalid());
+            }
+        }
+        view_boundary(
+            conn,
+            operation,
+            view.generation,
+            view.length,
+            source_range.start,
+        )
+        .await?;
+        view_boundary(
+            conn,
+            operation,
+            view.generation,
+            view.length,
+            source_range.end,
+        )
+        .await?;
+        if let Some(reference) = descriptor.attributes_ref {
+            validate_attribute_graph(conn, operation, reference).await?;
+        }
+        let role = match role {
+            intent_core::note_stage::NoteStageRole::SelectionOwner => "selection-owner",
+            intent_core::note_stage::NoteStageRole::ParagraphSeam => "paragraph-seam",
+            intent_core::note_stage::NoteStageRole::InlineSpan => "inline-span",
+            intent_core::note_stage::NoteStageRole::MarkerOccurrence => "marker-occurrence",
+        };
+        let mut metadata = serde_json::json!({"generation":view.generation,"sourceRange":{"start":source_range.start,"end":source_range.end},"nativeRange":{"from":descriptor.native_from,"to":descriptor.native_to},"parentOrdinal":descriptor.parent_ordinal,"nodeType":descriptor.node_type,"role":role});
+        if let Some(id) = canonical_id {
+            metadata["canonicalId"] = Value::String(id);
+        }
+        if let Some(reference) = descriptor.attributes_ref {
+            metadata["attributesRef"] = Value::String(reference.to_owned());
+        }
+        claim_metadata(
+            conn,
+            operation,
+            "live",
+            &ordinal.to_string(),
+            Some(&detail.text_id),
+            Some(ordinal),
+            &metadata,
+        )
+        .await?;
+        sqlx::query("UPDATE note_stage_validation SET state='done' WHERE operation_key=? AND kind='live' AND id=?")
+            .bind(operation).bind(ordinal.to_string()).execute(&mut *conn).await.map_err(db)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "seal_tests.rs"]
 mod tests;

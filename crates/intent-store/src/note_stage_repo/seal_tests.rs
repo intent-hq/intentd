@@ -532,8 +532,8 @@ async fn stage_seal_one_group_across_chunks_uses_original_input_coordinates() {
     }
 }
 
-// Actual Store migrations/admission/append/COW source integration. View DDL is
-// deliberately test-local until the migration owner registers the agreed schema.
+// Actual Store migrations/admission/append/COW source integration. Uses the
+// production view/cache schema; only synthetic SQLite fixtures supply local DDL.
 #[tokio::test]
 async fn stage_seal_current_store_migrations_keep_pinned_source_and_cascade_views() {
     use intent_core::{
@@ -621,12 +621,6 @@ async fn stage_seal_current_store_migrations_keep_pinned_source_and_cascade_view
         .begin_with("BEGIN IMMEDIATE")
         .await
         .unwrap();
-    // Same schema agreed with the migration owner; only new view/cache objects.
-    for ddl in [
-        "ALTER TABLE note_stage_text ADD COLUMN sha256 TEXT CHECK(sha256 IS NULL OR length(sha256)=64)",
-        "CREATE TABLE note_stage_view(operation_key TEXT NOT NULL REFERENCES note_stage(operation_key) ON DELETE CASCADE,generation INTEGER NOT NULL,input_generation INTEGER,history_group TEXT,length INTEGER NOT NULL,PRIMARY KEY(operation_key,generation))",
-        "CREATE TABLE note_stage_view_piece(operation_key TEXT NOT NULL,generation INTEGER NOT NULL,start INTEGER NOT NULL,end INTEGER NOT NULL,origin_kind TEXT NOT NULL,origin_id TEXT NOT NULL,origin_start INTEGER NOT NULL,PRIMARY KEY(operation_key,generation,start),FOREIGN KEY(operation_key,generation) REFERENCES note_stage_view(operation_key,generation) ON DELETE CASCADE)",
-    ] {sqlx::query(ddl).execute(&mut *tx).await.unwrap();}
     let (operation,root):(String,String)=sqlx::query_as("SELECT s.operation_key,s.root_key FROM note_stage s JOIN note_operation o USING(operation_key) WHERE o.operation_id=?")
         .bind(&begin.operation_id).fetch_one(&mut *tx).await.unwrap();
     let mut entries = vec![];
@@ -1334,4 +1328,189 @@ async fn stage_seal_metadata_published_canonical_byte_fixture() {
         !unrelated,
         "unrelated uploaded raw text is not a metadata graph edge"
     );
+}
+
+fn live_record(ordinal: u64, id: &str, text: &str) -> Value {
+    json!({"kind":"projection","ordinal":ordinal,"sourceRange":{"start":0,"end":4},"role":"selection-owner","detail":text_reference(id,text)})
+}
+async fn live_fixture(
+    descriptors: Vec<String>,
+    attributes: Vec<(String, String)>,
+) -> (SqliteConnection, PreparedView) {
+    let mut conn = view_fixture("A😀B").await;
+    for sql in GRAPH_SCHEMA.split(';').filter(|sql| !sql.is_empty()) {
+        sqlx::query(sql).execute(&mut conn).await.unwrap();
+    }
+    for (id, text) in attributes {
+        upload_resource(&mut conn, &id, &text).await;
+    }
+    for (ordinal, text) in descriptors.iter().enumerate() {
+        let id = format!("descriptor-{ordinal}");
+        upload_resource(&mut conn, &id, text).await;
+        upload(
+            &mut conn,
+            NoteStageStream::Live,
+            vec![live_record(u64::try_from(ordinal).unwrap(), &id, text)],
+        )
+        .await;
+    }
+    let request = manifest(&mut conn).await;
+    let prepared = prepare_frozen_view(&mut conn, "op", &header(), &request, "root")
+        .await
+        .unwrap();
+    (conn, prepared)
+}
+fn live_descriptor(parent: Option<u64>) -> Value {
+    json!({"version":1,"nodeType":"configured-editor-node","parentOrdinal":parent,"nativeRange":{"from":10,"to":30}})
+}
+
+#[tokio::test]
+async fn stage_seal_live_resolves_parent_and_graph_without_native_source_substitution() {
+    let mut parent = live_descriptor(None);
+    parent["attributesRef"] = json!("attributes");
+    let mut child = live_descriptor(Some(0));
+    child["nativeRange"] = json!({"from":12,"to":12});
+    child["attributesRef"] = json!("attributes");
+    let (mut conn, view) = live_fixture(
+        vec![resource(&parent), resource(&child)],
+        vec![
+            ("attributes".into(), object_root("empty")),
+            ("empty".into(), directory(vec![], None)),
+        ],
+    )
+    .await;
+    validate_live_descriptors(&mut conn, "op", &view)
+        .await
+        .unwrap();
+    let rows:Vec<(String,String)>=sqlx::query_as("SELECT owner,value FROM note_stage_validation WHERE operation_key='op' AND kind='live' ORDER BY position").fetch_all(&mut conn).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "descriptor-0");
+    assert_eq!(rows[1].0, "descriptor-1");
+    let child: Value = serde_json::from_str(&rows[1].1).unwrap();
+    assert_eq!(child["parentOrdinal"], 0);
+    assert_eq!(child["sourceRange"], json!({"start":0,"end":4}));
+    assert_eq!(child["nativeRange"], json!({"from":12,"to":12}));
+    assert_eq!(child["nodeType"], "configured-editor-node");
+    assert!(child.get("canonicalId").is_none());
+    let graphs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation WHERE kind='entry'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(graphs, 1);
+    assert!(
+        validate_live_descriptors(&mut conn, "op", &view)
+            .await
+            .is_err(),
+        "completed live pass cannot silently reuse prior partial state"
+    );
+    let plan=sqlx::query("EXPLAIN QUERY PLAN SELECT 1 FROM note_stage_validation WHERE operation_key='op' AND kind='live' AND id='0' AND state='done'").fetch_all(&mut conn).await.unwrap().iter().map(|row|row.get::<String,_>("detail")).collect::<Vec<_>>().join(" ");
+    assert!(plan.contains("SEARCH"), "{plan}");
+    assert!(!plan.contains("SCAN"), "{plan}");
+}
+
+#[tokio::test]
+async fn stage_seal_live_rejects_invalid_details_and_rolls_back_graph_writes() {
+    let mut unknown = live_descriptor(None);
+    unknown["version"] = json!(2);
+    let mut attrs = live_descriptor(None);
+    attrs["attributesRef"] = json!("missing");
+    for bad in [resource(&live_descriptor(Some(1))),resource(&unknown),resource(&attrs),format!(" {}",resource(&live_descriptor(None))),"{\"nativeRange\":{\"from\":0,\"to\":0},\"nodeType\":\"x\",\"nodeType\":\"x\",\"parentOrdinal\":null,\"version\":1}".into(),"x".repeat(16385)] {
+        let mut first=live_descriptor(None);first["attributesRef"]=json!("attributes");
+        let(mut conn,view)=live_fixture(vec![resource(&first),bad],vec![("attributes".into(),object_root("empty")),("empty".into(),directory(vec![],None))]).await;
+        let mut tx=conn.begin().await.unwrap();
+        assert!(validate_live_descriptors(&mut tx,"op",&view).await.is_err());
+        let written:i64=sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation").fetch_one(&mut *tx).await.unwrap();assert!(written>0);
+        tx.rollback().await.unwrap();
+        let remaining:i64=sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation").fetch_one(&mut conn).await.unwrap();assert_eq!(remaining,0);
+    }
+}
+
+#[tokio::test]
+async fn stage_seal_live_rechecks_extent_scope_digest_and_scalar_boundaries() {
+    let (mut conn, mut view) = live_fixture(vec![resource(&live_descriptor(None))], vec![]).await;
+    assert!(validate_live_descriptors(&mut conn, "foreign", &view)
+        .await
+        .is_err());
+    let mut newer = conn.begin().await.unwrap();
+    sqlx::query("INSERT INTO note_stage_view(operation_key,generation,input_generation,history_group,length) VALUES('op',1,0,'later',4)").execute(&mut *newer).await.unwrap();
+    assert!(
+        validate_live_descriptors(&mut newer, "op", &view)
+            .await
+            .is_err(),
+        "an older same-length generation is not the frozen dirty view"
+    );
+    newer.rollback().await.unwrap();
+    view.length += 1;
+    assert!(validate_live_descriptors(&mut conn, "op", &view)
+        .await
+        .is_err());
+    view.length -= 1;
+    view.generation += 1;
+    assert!(validate_live_descriptors(&mut conn, "op", &view)
+        .await
+        .is_err());
+    view.generation -= 1;
+    for (path, value) in [
+        ("$.sourceRange.start", json!(2)),
+        ("$.sourceRange.end", json!(5)),
+        ("$.detail.sha256", json!("0".repeat(64))),
+        ("$.detail.textId", json!("foreign-only")),
+    ] {
+        let mut tx = conn.begin().await.unwrap();
+        sqlx::query("UPDATE note_stage_record SET value=json_set(value,?,json(?)) WHERE operation_key='op' AND stream='live'").bind(path).bind(value.to_string()).execute(&mut *tx).await.unwrap();
+        assert!(validate_live_descriptors(&mut tx, "op", &view)
+            .await
+            .is_err());
+        tx.rollback().await.unwrap();
+    }
+    validate_live_descriptors(&mut conn, "op", &view)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stage_seal_live_late_sql_error_rolls_back_and_empty_stream_is_valid() {
+    let (mut empty, view) = live_fixture(vec![], vec![]).await;
+    validate_live_descriptors(&mut empty, "op", &view)
+        .await
+        .unwrap();
+    let (mut conn, view) = live_fixture(
+        vec![
+            resource(&live_descriptor(None)),
+            resource(&live_descriptor(Some(0))),
+        ],
+        vec![],
+    )
+    .await;
+    sqlx::query("CREATE TEMP TRIGGER fail_live BEFORE INSERT ON note_stage_validation WHEN NEW.kind='live' AND NEW.id='1' BEGIN SELECT RAISE(ABORT,'injected live ledger failure'); END").execute(&mut conn).await.unwrap();
+    let mut tx = conn.begin().await.unwrap();
+    let error = validate_live_descriptors(&mut tx, "op", &view)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("injected live ledger failure"),
+        "{error}"
+    );
+    let partial: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation WHERE kind='live'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(partial, 1);
+    tx.rollback().await.unwrap();
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+    sqlx::query("DROP TRIGGER fail_live")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let mut tx = conn.begin().await.unwrap();
+    validate_live_descriptors(&mut tx, "op", &view)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 }
