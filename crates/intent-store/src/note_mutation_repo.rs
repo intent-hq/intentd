@@ -4,12 +4,16 @@
 use intent_core::{
     note_mutation::{NoteApplySplices, NoteMutationError, NoteSourceHistory, NoteSplice},
     note_page::NoteScope,
-    Comment, Error, Note, NoteVersionAuthor, Result,
+    Comment, Error, Note, NoteId, NoteVersionAuthor, Result,
 };
 use serde_json::{json, Value};
 use sqlx::{Row, Sqlite, Transaction};
 
 use crate::Store;
+
+// Preserve the existing metadata decoder without loading unrelated source
+// bodies into the transaction's conversion workspace snapshot.
+const NOTE_METADATA_COLUMNS: &str = "id,workspace_id,title,'' AS content,content_type,tags,is_pinned,is_archived,is_default,parent_id,visibility,task_json,created_at,rev,updated_at";
 
 fn db(error: impl std::fmt::Display) -> Error {
     Error::Internal(format!("note operation storage: {error}"))
@@ -291,18 +295,77 @@ impl NoteMutationWrite {
             .collect()
     }
 
-    /// Read conversion candidates in this write snapshot. This is deliberate
-    /// document/workspace-sized write planning, never a paging read primitive.
+    /// Read conversion metadata in this write snapshot. Content is projected
+    /// to an empty string in SQL, never fetched and then discarded. This still
+    /// retains workspace-sized metadata; it is not a bounded paging read.
     ///
     /// # Errors
     /// Returns a storage/legacy decoding error.
-    pub async fn workspace_notes(&mut self) -> Result<Vec<Note>> {
-        let rows = sqlx::query("SELECT * FROM note WHERE workspace_id=? ORDER BY created_at,id")
-            .bind(&self.request.workspace_id)
-            .fetch_all(&mut *self.transaction)
-            .await
-            .map_err(db)?;
+    pub async fn workspace_note_metadata(&mut self) -> Result<Vec<Note>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {NOTE_METADATA_COLUMNS} FROM note WHERE workspace_id=? ORDER BY created_at,id"
+        ))
+        .bind(&self.request.workspace_id)
+        .fetch_all(&mut *self.transaction)
+        .await
+        .map_err(db)?;
         rows.iter().map(crate::note_repo::map_note_row).collect()
+    }
+
+    /// Persist a service-validated relation update within the conversion
+    /// savepoint. Read current metadata so repeated updates to a reused child
+    /// preserve its latest revision and all unrelated fields. Empty lists here
+    /// are final planned values, not requests to clear rejected references.
+    /// The returned metadata-only note is for publication after outer commit;
+    /// an identical update returns None and changes neither time nor revision.
+    ///
+    /// # Errors
+    /// Rejects a missing savepoint, a foreign/non-child/non-task target, or SQL
+    /// failure. Callers must propagate/drop or successfully `rollback_conversion`
+    /// before committing any earlier canonical phase.
+    pub async fn persist_conversion_relations(
+        &mut self,
+        note_id: &NoteId,
+        depends_on: &[NoteId],
+        conflicts_with: &[NoteId],
+        date: &str,
+    ) -> Result<Option<Note>> {
+        if self.conversion.is_none() || note_id == &self.note.id {
+            return Err(fail(NoteMutationError::Invalid));
+        }
+        let row = sqlx::query(&format!(
+            "SELECT {NOTE_METADATA_COLUMNS} FROM note WHERE workspace_id=? AND id=?"
+        ))
+        .bind(&self.request.workspace_id)
+        .bind(&note_id.0)
+        .fetch_optional(&mut *self.transaction)
+        .await
+        .map_err(db)?
+        .ok_or_else(|| fail(NoteMutationError::Conflict))?;
+        let mut note = crate::note_repo::map_note_row(&row)?;
+        if note.parent_id.as_ref() != Some(&self.note.id) {
+            return Err(fail(NoteMutationError::Invalid));
+        }
+        let task = note
+            .metadata
+            .task
+            .as_mut()
+            .ok_or_else(|| fail(NoteMutationError::Invalid))?;
+        if task.depends_on == depends_on && task.conflicts_with == conflicts_with {
+            return Ok(None);
+        }
+        task.depends_on = depends_on.to_vec();
+        task.conflicts_with = conflicts_with.to_vec();
+        note.updated_at = date.into();
+        note.rev = crate::note_repo::exec_update_note(
+            &mut self.transaction,
+            &note,
+            Some(note.rev),
+            crate::note_repo::NoteUpdateScope::Metadata,
+        )
+        .await?
+        .ok_or_else(|| fail(NoteMutationError::Conflict))?;
+        Ok(Some(note))
     }
 
     /// Flip only orphan state/time, retaining creation authorship and all legacy

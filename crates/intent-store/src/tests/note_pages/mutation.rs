@@ -376,6 +376,197 @@ async fn note_mutation_failed_savepoint_rollback_drops_the_outer_write() {
 }
 
 #[tokio::test]
+async fn note_mutation_relation_updates_preserve_source_and_stamp_each_changed_revision() {
+    let (store, _tmp, original) = setup("base").await;
+    let mut child = original.clone();
+    child.id = NoteId("reused-child".into());
+    child.parent_id = Some(original.id.clone());
+    child.content = "unrelated😀\r\n".repeat(4096);
+    child.metadata.task = Some(intent_core::TaskMetadata {
+        estimated_effort: Some("2d".into()),
+        ..Default::default()
+    });
+    store.insert_note(&child).await.unwrap();
+    let mut target = child.clone();
+    target.id = NoteId("target".into());
+    store.insert_note(&target).await.unwrap();
+    let request = request(&store, vec![edit(0, 4, "caller")]).await;
+    let mut write = begin(&store, request).await;
+    let snapshot = write.workspace_note_metadata().await.unwrap();
+    assert_eq!(snapshot.len(), 3);
+    assert!(snapshot.iter().all(|note| note.content.is_empty()));
+    assert_eq!(
+        snapshot
+            .iter()
+            .find(|note| note.id == child.id)
+            .unwrap()
+            .metadata,
+        child.metadata
+    );
+    assert!(write
+        .persist_conversion_relations(&child.id, &[], &[], "2026-01-01T00:00:00Z")
+        .await
+        .is_err());
+    write
+        .persist_source(&author(), &intent_core::now_iso())
+        .await
+        .unwrap();
+    write.begin_conversion().await.unwrap();
+    let first = write
+        .persist_conversion_relations(
+            &child.id,
+            std::slice::from_ref(&target.id),
+            &[],
+            "2026-01-01T00:00:01Z",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(first.content.is_empty());
+    assert_eq!(first.updated_at, "2026-01-01T00:00:01Z");
+    assert_eq!(first.rev, child.rev + 1);
+    assert!(write
+        .persist_conversion_relations(
+            &child.id,
+            std::slice::from_ref(&target.id),
+            &[],
+            "2026-01-01T00:00:02Z",
+        )
+        .await
+        .unwrap()
+        .is_none());
+    let second = write
+        .persist_conversion_relations(
+            &child.id,
+            std::slice::from_ref(&target.id),
+            std::slice::from_ref(&target.id),
+            "2026-01-01T00:00:03Z",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.rev, child.rev + 2);
+    assert_eq!(second.updated_at, "2026-01-01T00:00:03Z");
+    write.finish_conversion().await.unwrap();
+    write.commit().await.unwrap();
+    let actual = store
+        .get_note(&child.workspace_id, &child.id)
+        .await
+        .unwrap();
+    assert_eq!(actual.content, child.content);
+    assert_eq!(actual.rev, second.rev);
+    assert_eq!(actual.updated_at, second.updated_at);
+    assert_eq!(
+        actual
+            .metadata
+            .task
+            .as_ref()
+            .unwrap()
+            .estimated_effort
+            .as_deref(),
+        Some("2d")
+    );
+    assert_eq!(
+        actual.metadata.task.as_ref().unwrap().depends_on,
+        vec![target.id.clone()]
+    );
+    assert_eq!(
+        actual.metadata.task.as_ref().unwrap().conflicts_with,
+        vec![target.id]
+    );
+    let source: String = sqlx::query_scalar("SELECT group_concat(text,'') FROM (SELECT text FROM note_page_piece WHERE workspace_id='pages' AND note_id='reused-child' ORDER BY start)")
+        .fetch_one(store.read_pool()).await.unwrap();
+    assert_eq!(source, child.content);
+}
+
+#[tokio::test]
+async fn note_mutation_relation_failure_rolls_back_prior_relations_and_created_children() {
+    let (store, _tmp, original) = setup("base").await;
+    let mut first = original.clone();
+    first.id = NoteId("first-child".into());
+    first.parent_id = Some(original.id.clone());
+    first.metadata.task = Some(intent_core::TaskMetadata::default());
+    store.insert_note(&first).await.unwrap();
+    let mut second = first.clone();
+    second.id = NoteId("second-child".into());
+    store.insert_note(&second).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_second_relation BEFORE UPDATE OF task_json ON note WHEN NEW.id='second-child' BEGIN SELECT RAISE(ABORT,'injected relation failure'); END")
+        .execute(store.write_pool()).await.unwrap();
+    let request = request(&store, vec![edit(0, 4, "caller")]).await;
+    let mut write = begin(&store, request).await;
+    write
+        .persist_source(&author(), &intent_core::now_iso())
+        .await
+        .unwrap();
+    write.begin_conversion().await.unwrap();
+    let mut created = first.clone();
+    created.id = NoteId("created-child".into());
+    write
+        .insert_conversion_child(&created, &author())
+        .await
+        .unwrap();
+    write
+        .persist_conversion_relations(
+            &first.id,
+            std::slice::from_ref(&created.id),
+            &[],
+            "2026-01-01T00:00:01Z",
+        )
+        .await
+        .unwrap();
+    assert!(write
+        .persist_conversion_relations(
+            &second.id,
+            std::slice::from_ref(&created.id),
+            &[],
+            "2026-01-01T00:00:02Z",
+        )
+        .await
+        .is_err());
+    // ABORT affects only the failing statement. Recovery must undo the first
+    // child's metadata/index revision and the newly inserted child as well.
+    write.rollback_conversion().await.unwrap();
+    write.commit().await.unwrap();
+    assert_eq!(
+        store
+            .get_note(&first.workspace_id, &first.id)
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        store
+            .get_note(&second.workspace_id, &second.id)
+            .await
+            .unwrap(),
+        second
+    );
+    assert_eq!(
+        page(&store, json!({"kind":"source"})).await["text"],
+        "caller"
+    );
+    for table in ["note", "note_page_head", "note_version"] {
+        let key = if table == "note" { "id" } else { "note_id" };
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE {key}='created-child'"
+        ))
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    let effects: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM note_operation_item WHERE kind='effects'")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(effects, 0);
+    let revision: i64 = sqlx::query_scalar("SELECT current_rev FROM note_page_head WHERE workspace_id='pages' AND note_id='first-child'")
+        .fetch_one(store.read_pool()).await.unwrap();
+    assert_eq!(revision, first.rev);
+}
+
+#[tokio::test]
 async fn note_mutation_uncaught_phase_version_failure_drops_all_prior_phases() {
     let (store, _tmp, _) = setup("base").await;
     sqlx::query("CREATE TRIGGER fail_second_version BEFORE INSERT ON note_version WHEN NEW.note_id='spec' AND NEW.v>1 BEGIN SELECT RAISE(ABORT,'injected version failure'); END")
