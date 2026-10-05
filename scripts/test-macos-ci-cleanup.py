@@ -30,6 +30,9 @@ class CleanupTests(unittest.TestCase):
         self.guard = patch.object(cleanup, 'assert_idle_runner')
         self.guard_mock = self.guard.start()
         self.addCleanup(self.guard.stop)
+        self.output = patch.object(cleanup, 'emit')
+        self.output.start()
+        self.addCleanup(self.output.stop)
         self.space = patch.object(cleanup, 'free_bytes', return_value=0)
         self.free = self.space.start()
         self.addCleanup(self.space.stop)
@@ -113,6 +116,35 @@ class CleanupTests(unittest.TestCase):
         self.run_cleanup()
         self.assertTrue((outside / 'keep').exists())
 
+    def test_relative_and_parent_traversal_paths_rejected(self):
+        for path in [Path('relative'), self.home / '..' / self.home.name]:
+            with self.subTest(path=path), self.assertRaises(cleanup.Refusal):
+                cleanup.validate_directory(path, self.home)
+
+    def test_group_writable_profile_rejected(self):
+        self.profile.chmod(0o775)
+        with self.assertRaises(cleanup.Refusal):
+            self.run_cleanup()
+        self.assertTrue((self.profile / 'deps/old.rmeta').exists())
+
+    def test_hardlinked_cargo_lock_rejected(self):
+        os.link(self.profile / '.cargo-lock', self.home / 'other-lock')
+        with self.assertRaises(cleanup.Refusal):
+            self.run_cleanup()
+
+    def test_cleaner_lock_held_by_other_process_refuses(self):
+        lock = self.root / '.macos-cleanup.lock'
+        lock.touch()
+        code = 'import fcntl,sys; f=open(sys.argv[1], "r+"); fcntl.flock(f,fcntl.LOCK_EX); print("ready",flush=True); sys.stdin.read()'
+        proc = subprocess.Popen(['python3', '-c', code, str(lock)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(proc.stdout.readline().strip(), 'ready')
+            with self.assertRaises(cleanup.Refusal):
+                self.run_cleanup()
+            self.assertTrue(self.profile.exists())
+        finally:
+            proc.communicate(timeout=5)
+
     def test_lock_symlink_rejected(self):
         victim = self.home / 'keep'
         victim.write_text('keep')
@@ -120,6 +152,29 @@ class CleanupTests(unittest.TestCase):
         with self.assertRaises((cleanup.Refusal, OSError)):
             self.run_cleanup()
         self.assertEqual(victim.read_text(), 'keep')
+
+    def test_all_cargo_lock_inodes_preserved(self):
+        files = [self.profile / name for name in ['.cargo-lock', '.cargo-artifact-lock', '.cargo-build-lock']]
+        for path in files:
+            path.touch()
+        inodes = [path.stat().st_ino for path in files]
+        self.free.side_effect = [0, 0, 200, 200]
+        self.run_cleanup()
+        self.assertEqual([path.stat().st_ino for path in files], inodes)
+
+    def test_modern_cargo_locks_held_by_live_process_refuse(self):
+        for name in ['.cargo-artifact-lock', '.cargo-build-lock']:
+            lock = self.profile / name
+            lock.touch()
+            code = 'import fcntl,sys; f=open(sys.argv[1], "r+"); fcntl.flock(f,fcntl.LOCK_EX); print("ready",flush=True); sys.stdin.read()'
+            proc = subprocess.Popen(['python3', '-c', code, str(lock)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(proc.stdout.readline().strip(), 'ready')
+                with self.subTest(name=name), self.assertRaisesRegex(cleanup.Refusal, 'Lock held'):
+                    self.run_cleanup()
+                self.assertTrue((self.profile / 'deps/old.rmeta').exists())
+            finally:
+                proc.communicate(timeout=5)
 
     def test_cargo_lock_held_by_live_process_refuses(self):
         code = 'import fcntl,sys; f=open(sys.argv[1], "r+"); fcntl.flock(f,fcntl.LOCK_EX); print("ready",flush=True); sys.stdin.read()'

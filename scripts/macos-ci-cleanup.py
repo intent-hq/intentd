@@ -26,6 +26,7 @@ import stat
 import subprocess
 
 GIB = 1024 ** 3
+CARGO_LOCKS = ('.cargo-lock', '.cargo-artifact-lock', '.cargo-build-lock')
 PROFILES = ('debug', 'release', 'aarch64-apple-darwin/debug', 'aarch64-apple-darwin/release')
 
 
@@ -133,7 +134,8 @@ def clean(home, min_free_bytes=40 * GIB, apply=False):
             with ExitStack() as locks:
                 for profile in profiles:
                     validate_profile(profile, root, home)
-                    locks.enter_context(lock_file(profile / '.cargo-lock'))
+                    for name in CARGO_LOCKS:
+                        locks.enter_context(lock_file(profile / name, create=name != '.cargo-lock'))
                 profiles.sort(key=lambda path: (path.stat().st_mtime_ns, str(path)))
                 report['candidates'] = [str(path) for path in profiles]
                 for profile in profiles:
@@ -148,7 +150,7 @@ def clean(home, min_free_bytes=40 * GIB, apply=False):
                     # Never unlink Cargo's lock or its parent: a Cargo process
                     # starting now must block on this same locked inode.
                     for child in sorted(profile.iterdir()):
-                        if child.name == '.cargo-lock':
+                        if child.name in CARGO_LOCKS:
                             continue
                         if child.is_dir() and not child.is_symlink():
                             shutil.rmtree(child)
