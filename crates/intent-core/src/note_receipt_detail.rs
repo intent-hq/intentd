@@ -66,7 +66,8 @@ pub struct NoteOperationReceiptRead {
     pub note_id: String,
     pub note_instance_id: String,
     pub operation_id: String,
-    pub payload_digest: String,
+    pub payload_digest: Option<String>,
+    pub header_digest: Option<String>,
     pub kind: ReceiptDetailKind,
     #[serde(rename = "ref")]
     pub reference: String,
@@ -86,6 +87,8 @@ pub struct ReceiptDetailQuery {
     pub scope: NoteScope,
     pub operation_id: String,
     pub payload_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_digest: Option<String>,
     pub kind: ReceiptDetailKind,
     pub reference: String,
     #[serde(skip)]
@@ -116,12 +119,14 @@ impl ReceiptDetailQuery {
                     .clone()
                     .unwrap_or_else(|| "0".repeat(64)),
             ),
-            header_digest: None,
+            header_digest: self.header_digest.clone(),
         };
         identity.validate()?;
-        if (self.operation_envelope && self.payload_digest.is_none())
+        if (self.operation_envelope
+            && self.payload_digest.is_some() == self.header_digest.is_some())
             || (!self.operation_envelope
                 && (self.payload_digest.is_some()
+                    || self.header_digest.is_some()
                     || if self.context_envelope {
                         self.kind != ReceiptDetailKind::Detail
                     } else {
@@ -174,6 +179,7 @@ impl NoteGetReceiptRequest {
             },
             operation_id: self.page.operation_id,
             payload_digest: None,
+            header_digest: None,
             kind: self.page.kind,
             reference: self.page.reference,
             cursor: self.page.cursor,
@@ -190,7 +196,7 @@ impl NoteGetReceiptRequest {
     }
 }
 impl NoteOperationReceiptRead {
-    /// Normalize the inline committed-receipt arm of note.operation.read.
+    /// Normalize a committed-receipt read, including staged header identity.
     /// # Errors
     /// Rejects invalid identity, kind and page budgets.
     pub fn query(self) -> Result<ReceiptDetailQuery, NoteMutationError> {
@@ -202,7 +208,8 @@ impl NoteOperationReceiptRead {
                 note_instance_id: self.note_instance_id,
             },
             operation_id: self.operation_id,
-            payload_digest: Some(self.payload_digest),
+            payload_digest: self.payload_digest,
+            header_digest: self.header_digest,
             kind: self.kind,
             reference: self.reference,
             cursor: self.cursor,
@@ -275,6 +282,7 @@ impl NoteGetReceiptContextRequest {
             },
             operation_id,
             payload_digest: None,
+            header_digest: None,
             kind: ReceiptDetailKind::Detail,
             reference: self.page.context_ref.clone(),
             cursor: self.page.cursor.clone(),

@@ -25077,6 +25077,12 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(self.seal_note_stage(request))
     }
+    fn note_operation_commit(
+        &self,
+        request: intent_core::note_stage::NoteStageCommit,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.commit_note_stage(request))
+    }
     fn read_note_stage_source(
         &self,
         request: intent_core::note_stage_read::NoteStageRead,

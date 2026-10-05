@@ -761,3 +761,9 @@ async fn staged_source_output_requires_captured_output_before_hydration() {
         ));
     }
 }
+
+#[path = "staged_commit.rs"]
+mod commit;
+
+#[path = "staged_commit_groups.rs"]
+mod commit_groups;

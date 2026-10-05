@@ -2,8 +2,8 @@
 //! receipt share one writer; publication happens only after its consuming commit.
 use crate::{note_conversion_plan, note_ops, Services};
 use intent_core::{
-    note_mutation::NoteApplySplices, Caller, Comment, Error, Note, NoteVersionAuthor, Result,
-    TaskStatus, WorkspaceId,
+    note_mutation::NoteApplySplices, AgentId, Caller, Comment, Error, Note, NoteVersionAuthor,
+    Result, TaskStatus, WorkspaceId,
 };
 use intent_store::{
     note_annotation_repo::{AnchorOccurrence, SourceRange},
@@ -163,11 +163,22 @@ impl Services {
             .begin_note_mutation(&principal, request, &intent_core::now_iso())
             .await?;
         self.require_member(&workspace).await?;
-        let mut write = match admission {
+        let write = match admission {
             NoteMutationAdmission::Replay(receipt) => return Ok(receipt),
             NoteMutationAdmission::Write(write) => write,
         };
         replacements_valid?;
+        self.finish_note_mutation(write, workspace, agent, author)
+            .await
+    }
+
+    pub(crate) async fn finish_note_mutation(
+        &self,
+        mut write: Box<NoteMutationWrite>,
+        workspace: WorkspaceId,
+        agent: Option<AgentId>,
+        author: NoteVersionAuthor,
+    ) -> Result<Value> {
         write.retain_source_state("callerResult").await?;
         reanchor(&mut write, &author).await?;
         write.retain_source_state("preConversionCanonical").await?;

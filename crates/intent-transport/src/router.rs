@@ -475,6 +475,7 @@ pub(crate) async fn prepare_message(
                 | "note.operation.append"
                 | "note.operation.cancel"
                 | "note.operation.seal"
+                | "note.operation.commit"
         )
     ) || annotation.is_some()
         || receipt_read
@@ -605,6 +606,7 @@ pub(crate) async fn prepare_message(
                     | "note.operation.append"
                     | "note.operation.cancel"
                     | "note.operation.seal"
+                    | "note.operation.commit"
             ) {
                 4096
             } else if method == "note.operation.read" {
@@ -699,6 +701,7 @@ fn encode_dispatch_result(
                 | "note.operation.append"
                 | "note.operation.cancel"
                 | "note.operation.seal"
+                | "note.operation.commit"
         ) {
             error_frame(
                 id,
@@ -859,7 +862,13 @@ async fn dispatch_note_receipt(
             .await
             .map_err(bounded_note_operation_error);
     }
-    if method == "note.operation.read" && params.contains_key("headerDigest") {
+    if method == "note.operation.read"
+        && params.contains_key("headerDigest")
+        && !matches!(
+            params.get("kind").and_then(Value::as_str),
+            Some("inverse" | "inverseText" | "mapping" | "effects" | "detail")
+        )
+    {
         let request: intent_core::note_stage_read::NoteStageRead =
             serde_json::from_value(Value::Object(params.clone()))
                 .map_err(|_| invalid_params("Invalid staged output request"))?;
@@ -1581,6 +1590,17 @@ async fn dispatch_other(
                 .validate()
                 .map_err(|e| domain_to_rpc(Error::NoteMutation(e)))?;
             api.note_operation_seal(request)
+                .await
+                .map_err(bounded_note_operation_error)
+        }
+        "note.operation.commit" => {
+            let request: intent_core::note_stage::NoteStageCommit =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid note stage commit"))?;
+            request
+                .validate()
+                .map_err(|e| domain_to_rpc(Error::NoteMutation(e)))?;
+            api.note_operation_commit(request)
                 .await
                 .map_err(bounded_note_operation_error)
         }

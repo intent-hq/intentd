@@ -22,6 +22,7 @@ async fn fixture() -> (tempfile::TempDir, Store, ReceiptDetailQuery) {
         },
         operation_id: OP.into(),
         payload_digest: Some("a".repeat(64)),
+        header_digest: None,
         kind: ReceiptDetailKind::Mapping,
         reference: format!("{KEY}:mapping"),
         cursor: None,

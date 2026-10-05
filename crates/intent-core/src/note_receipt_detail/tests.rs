@@ -36,10 +36,29 @@ fn receipt_detail_operation_requires_digest_and_binds_budgets() {
     );
     let mut bad = value.clone();
     bad.as_object_mut().unwrap().remove("payloadDigest");
-    assert!(serde_json::from_value::<NoteOperationReceiptRead>(bad).is_err());
-    let mut bad = value;
-    bad["headerDigest"] = json!("b".repeat(64));
-    assert!(serde_json::from_value::<NoteOperationReceiptRead>(bad).is_err());
+    assert!(serde_json::from_value::<NoteOperationReceiptRead>(bad)
+        .unwrap()
+        .query()
+        .is_err());
+    let mut staged = value;
+    staged["headerDigest"] = json!("b".repeat(64));
+    assert!(
+        serde_json::from_value::<NoteOperationReceiptRead>(staged.clone())
+            .unwrap()
+            .query()
+            .is_err()
+    );
+    staged.as_object_mut().unwrap().remove("payloadDigest");
+    let query = serde_json::from_value::<NoteOperationReceiptRead>(staged.clone())
+        .unwrap()
+        .query()
+        .unwrap();
+    assert_eq!(query.header_digest, Some("b".repeat(64)));
+    staged["headerDigest"] = json!("malformed");
+    assert!(serde_json::from_value::<NoteOperationReceiptRead>(staged)
+        .unwrap()
+        .query()
+        .is_err());
 }
 
 #[test]

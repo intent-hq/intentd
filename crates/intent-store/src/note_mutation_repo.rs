@@ -12,6 +12,14 @@ use sqlx::{Row, Sqlite, Transaction};
 use crate::Store;
 
 mod canonical;
+mod staged;
+mod staged_inverse;
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static STAGED_COMMIT_NOW: i128;
+}
+pub use staged::{StageCommitAdmission, StageCommitReservation};
 
 // Preserve the existing metadata decoder without loading unrelated source
 // bodies into the transaction's conversion workspace snapshot.
@@ -45,6 +53,7 @@ pub struct NoteMutationWrite {
     converted_count: u64,
     persisted_phases: u32,
     conversion: Option<ConversionSavepoint>,
+    staged: Option<staged::StagedWriteContext>,
 }
 
 struct ConversionSavepoint {
@@ -54,6 +63,7 @@ struct ConversionSavepoint {
     effects_len: usize,
     converted_count: u64,
     persisted_phases: u32,
+    staged: Option<staged::StagedWriteContext>,
 }
 
 impl Store {
@@ -158,6 +168,7 @@ impl Store {
             converted_count: 0,
             persisted_phases: 0,
             conversion: None,
+            staged: None,
         })))
     }
 
@@ -438,6 +449,14 @@ impl NoteMutationWrite {
         {
             return Err(fail(NoteMutationError::Budget));
         }
+        if let Some(staged) = self.staged.as_mut() {
+            // An operation without user groups may still receive canonical
+            // source changes. Its receipt-owned inverse is not a native gesture.
+            let newest = staged
+                .newest_history
+                .get_or_insert_with(|| NoteSourceHistory::new(self.history.source().to_owned()));
+            newest.apply_phase(edits).map_err(fail)?;
+        }
         self.history.apply_phase(edits).map_err(fail)?;
         self.effects.extend(effects);
         Ok(())
@@ -495,6 +514,7 @@ impl NoteMutationWrite {
             effects_len: self.effects.len(),
             converted_count: self.converted_count,
             persisted_phases: self.persisted_phases,
+            staged: self.staged.clone(),
         });
         Ok(())
     }
@@ -525,6 +545,7 @@ impl NoteMutationWrite {
         self.effects.truncate(saved.effects_len);
         self.converted_count = saved.converted_count;
         self.persisted_phases = saved.persisted_phases;
+        self.staged = saved.staged;
         Ok(())
     }
 
@@ -568,12 +589,16 @@ impl NoteMutationWrite {
         if revision == self.request.base_revision {
             return Err(fail(NoteMutationError::Invalid));
         }
-        let receipt = json!({"kind":"noteCommitReceipt","outcome":"committed","scope":self.request.scope(),
+        let mut receipt = json!({"kind":"noteCommitReceipt","outcome":"committed","scope":self.request.scope(),
             "operationId":self.request.operation_id,"payloadDigest":self.request.payload_digest,
             "beforeRevision":self.request.base_revision,"afterRevision":revision,
             "sourceLength":head.try_get::<i64,_>("source_length").map_err(db)?,
             "mappingRef":format!("{}:mapping",self.operation_key),"effectsRef":format!("{}:effects",self.operation_key),
             "inverseRef":format!("{}:inverse",self.operation_key),"receiptExpiresAt":self.receipt_expires_at,"invalidation":"all"});
+        if let Some(staged) = &self.staged {
+            receipt["headerDigest"] = json!(staged.header_digest);
+            receipt["viewId"] = json!(staged.view_id);
+        }
         // Reserve room for the maximum bounded RPC id and envelope framing.
         if receipt.to_string().len() > 3584 {
             return Err(fail(NoteMutationError::Budget));
@@ -588,6 +613,9 @@ impl NoteMutationWrite {
                 &serde_json::to_value(item).map_err(db)?,
             )
             .await?;
+            if self.staged.is_some() {
+                continue;
+            }
             final_position += item.start - base_position;
             let text_id = format!("{}:text:{sequence}", self.operation_key);
             let replacement = self
@@ -610,6 +638,9 @@ impl NoteMutationWrite {
             base_position = item.end;
             final_position += item.inserted_length;
         }
+        if self.staged.is_some() {
+            self.write_staged_inverse(&revision).await?;
+        }
         for sequence in 0..self.effects.len() {
             self.insert_item("effects", sequence, &self.effects[sequence].clone())
                 .await?;
@@ -628,6 +659,29 @@ impl NoteMutationWrite {
             .execute(&mut *self.transaction)
             .await
             .map_err(db)?;
+        if self.staged.is_some() {
+            let published = sqlx::query(
+                "UPDATE note_stage SET phase='committed' WHERE operation_key=? AND phase='sealed'",
+            )
+            .bind(&self.operation_key)
+            .execute(&mut *self.transaction)
+            .await
+            .map_err(db)?;
+            if published.rows_affected() != 1 {
+                return Err(fail(NoteMutationError::Invalid));
+            }
+            let now = intent_core::parse_iso(&intent_core::now_iso())
+                .ok_or_else(|| fail(NoteMutationError::Invalid))?;
+            let deadline = self.request.deadline().map_err(fail)?;
+            let expired = deadline <= now;
+            #[cfg(test)]
+            let expired = STAGED_COMMIT_NOW
+                .try_with(|now| deadline.unix_timestamp_nanos() <= *now)
+                .unwrap_or(expired);
+            if expired {
+                return Err(fail(NoteMutationError::Expired));
+            }
+        }
         self.transaction.commit().await.map_err(db)?;
         Ok(receipt)
     }

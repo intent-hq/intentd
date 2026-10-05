@@ -216,7 +216,7 @@ impl Store {
         if !workspace {
             return Err(Error::NotFound("Workspace not found".into()));
         }
-        let row=sqlx::query("SELECT operation_key,payload_digest,retain_until,outcome,converted_count FROM note_operation WHERE principal=? AND backend_id=? AND workspace_id=? AND note_id=? AND instance_id=? AND operation_id=?")
+        let row=sqlx::query("SELECT operation_key,method_kind,payload_digest,retain_until,outcome,converted_count FROM note_operation WHERE principal=? AND backend_id=? AND workspace_id=? AND note_id=? AND instance_id=? AND operation_id=?")
             .bind(principal).bind(&query.scope.backend_id).bind(&query.scope.workspace_id).bind(&query.scope.note_id)
             .bind(&query.scope.note_instance_id).bind(&query.operation_id).fetch_optional(&mut *tx).await.map_err(db)?.ok_or_else(invalid)?;
         let retain_until: i64 = row.get("retain_until");
@@ -240,6 +240,19 @@ impl Store {
             || receipt["payloadDigest"] != digest
         {
             return Err(invalid());
+        }
+        let staged = row.get::<String, _>("method_kind") == "staged";
+        if query.operation_envelope {
+            if staged {
+                if !self::digest(&receipt["headerDigest"])
+                    || !token(&receipt["viewId"])
+                    || query.header_digest.as_deref() != receipt["headerDigest"].as_str()
+                {
+                    return Err(Error::NoteMutation(NoteMutationError::Mismatch));
+                }
+            } else if query.header_digest.is_some() {
+                return Err(Error::NoteMutation(NoteMutationError::Mismatch));
+            }
         }
         let receipt_expiry = receipt["receiptExpiresAt"]
             .as_str()
@@ -292,6 +305,13 @@ impl Store {
             out["payloadDigest"] = json!(digest);
             out["sourceLength"] = length;
             out["expiresAt"] = receipt["receiptExpiresAt"].clone();
+            if staged {
+                let envelope = out.as_object_mut().ok_or_else(invalid)?;
+                envelope.remove("beforeRevision");
+                envelope.remove("afterRevision");
+                out["headerDigest"] = receipt["headerDigest"].clone();
+                out["viewId"] = receipt["viewId"].clone();
+            }
         } else if query.context_envelope {
             out = json!({"kind":"noteContextPage","scope":query.scope,"sourceRevision":receipt["afterRevision"],"snapshotId":operation_key,"expiresAt":receipt["receiptExpiresAt"],"items":[],"nextCursor":null});
         } else {

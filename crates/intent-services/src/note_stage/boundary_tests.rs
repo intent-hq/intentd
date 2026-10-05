@@ -41,7 +41,7 @@ pub(super) async fn after_store(result: &Result<Value>) {
         boundary.release.notified().await;
     }
 }
-async fn guest(service: &Services, workspace: &WorkspaceId) -> Caller {
+pub(super) async fn guest(service: &Services, workspace: &WorkspaceId) -> Caller {
     let principal = Principal {
         id: PrincipalId::new(),
         identity: None,
@@ -149,6 +149,13 @@ async fn call(service: &Services, method: u8, begin: NoteStageBegin) -> Result<V
                 .read_stage_source(serde_json::from_value(request).unwrap(), json!(1))
                 .await
         }
+        6 => {
+            let mut request = serde_json::to_value(query).unwrap();
+            request["payloadDigest"] = json!("0".repeat(64));
+            service
+                .commit_note_stage(serde_json::from_value(request).unwrap())
+                .await
+        }
         _ => service.read_note_stage_status(query).await,
     }
 }
@@ -252,7 +259,7 @@ pub(super) async fn before_authorize() {
 }
 #[tokio::test]
 async fn staged_service_admits_before_pending_authorization_and_releases_on_denial() {
-    for method in 0..6 {
+    for method in 0..7 {
         let (_tmp, service, workspace, note) = setup("source").await;
         let caller = guest(&service, &workspace).await;
         let request = begin_request(&service, &workspace, &note).await;

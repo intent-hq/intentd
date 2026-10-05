@@ -14,10 +14,10 @@ use sha2::{Digest, Sha256};
 fn reference(id: &str, text: &str) -> Value {
     json!({"textId":id,"length":text.encode_utf16().count(),"utf8Bytes":text.len(),"sha256":format!("{:x}",Sha256::digest(text.as_bytes()))})
 }
-fn dirty(sequence: u64, ordinal: u64, start: u64, end: u64, replacement: Value) -> Value {
+fn dirty(sequence: u64, ordinal: u64, start: u64, end: u64, replacement: &Value) -> Value {
     json!({"kind":"splice","localSequence":sequence,"ordinal":ordinal,"start":start,"end":end,"replacement":replacement})
 }
-fn mutation(ordinal: u64, start: u64, end: u64, replacement: Value) -> Value {
+fn mutation(ordinal: u64, start: u64, end: u64, replacement: &Value) -> Value {
     json!({"kind":"splice","ordinal":ordinal,"start":start,"end":end,"replacement":replacement})
 }
 
@@ -116,7 +116,7 @@ fn query(receipt: &Value, kind: ReceiptDetailKind, reference: &str) -> ReceiptDe
     ReceiptDetailQuery {
         scope: serde_json::from_value(receipt["scope"].clone()).unwrap(),
         operation_id: receipt["operationId"].as_str().unwrap().into(),
-        payload_digest: Some(receipt["payloadDigest"].as_str().unwrap().into()),
+        payload_digest: None,
         header_digest: Some(receipt["headerDigest"].as_str().unwrap().into()),
         kind,
         reference: reference.into(),
@@ -281,8 +281,8 @@ async fn staged_real_receipt_retains_newest_dirty_noop_and_earlier_history() {
         2,
         &[("upper", "B"), ("bang", "!")],
         vec![
-            dirty(1, 0, 1, 2, reference("upper", "B")),
-            dirty(2, 0, 4, 4, reference("bang", "!")),
+            dirty(1, 0, 1, 2, &reference("upper", "B")),
+            dirty(2, 0, 4, 4, &reference("bang", "!")),
         ],
         vec![],
     )
@@ -318,8 +318,8 @@ async fn staged_real_receipt_retains_explicit_noop_mutation_and_earlier_dirty() 
         &store,
         1,
         &[("upper", "B"), ("empty", "")],
-        vec![dirty(1, 0, 1, 2, reference("upper", "B"))],
-        vec![mutation(0, 0, 0, reference("empty", ""))],
+        vec![dirty(1, 0, 1, 2, &reference("upper", "B"))],
+        vec![mutation(0, 0, 0, &reference("empty", ""))],
     )
     .await;
     let write = writer(&store, &request).await;
@@ -344,10 +344,10 @@ async fn staged_real_receipt_normalizes_earlier_adjacent_deletions_and_replaceme
             1,
             &[("empty", ""), ("replacement", replacement), ("bang", "!")],
             vec![
-                dirty(1, 0, 0, 1, reference("empty", "")),
-                dirty(1, 1, 1, 3, reference("replacement", replacement)),
+                dirty(1, 0, 0, 1, &reference("empty", "")),
+                dirty(1, 1, 1, 3, &reference("replacement", replacement)),
             ],
-            vec![mutation(0, end, end, reference("bang", "!"))],
+            vec![mutation(0, end, end, &reference("bang", "!"))],
         )
         .await;
         let final_source = format!("{dirty_source}!");
@@ -384,7 +384,7 @@ async fn staged_real_commit_accepts_forty_splices_without_inline_batch_ceiling()
         Err(NoteMutationError::Budget)
     );
     let records = (0..40)
-        .map(|i| mutation(i, i * 2, i * 2 + 1, reference("replacement", "b")))
+        .map(|i| mutation(i, i * 2, i * 2 + 1, &reference("replacement", "b")))
         .collect();
     let request = capture(&store, 0, &[("replacement", "b")], vec![], records).await;
     let write = writer(&store, &request).await;
@@ -419,7 +419,7 @@ async fn staged_real_commit_accepts_large_logical_replacement_across_upload_chun
         0,
         &[("large", &replacement)],
         vec![],
-        vec![mutation(0, 0, 3, reference("large", &replacement))],
+        vec![mutation(0, 0, 3, &reference("large", &replacement))],
     )
     .await;
     let write = writer(&store, &request).await;

@@ -1125,6 +1125,14 @@ pub trait WorkspaceApi: Send + Sync {
         let _ = request;
         Box::pin(async { Err(crate::Error::Unsupported("note operation seal".into())) })
     }
+    /// Commit a sealed staged operation with exact source CAS and a durable receipt.
+    fn note_operation_commit(
+        &self,
+        request: crate::note_stage::NoteStageCommit,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = request;
+        Box::pin(async { Err(crate::Error::Unsupported("note operation commit".into())) })
+    }
     /// Read bounded immutable staged output under current caller authorization.
     fn read_note_stage_source(
         &self,

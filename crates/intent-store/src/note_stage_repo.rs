@@ -14,7 +14,7 @@ mod read;
 mod seal;
 mod source;
 mod status;
-mod view_read;
+pub(crate) mod view_read;
 mod write;
 fn db(error: impl std::fmt::Display) -> Error {
     Error::Internal(format!("note stage storage: {error}"))

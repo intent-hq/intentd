@@ -1,10 +1,12 @@
-//! Staged upload admission. No source write or feature activation happens here.
+//! Staged operation admission. Source writes share the canonical mutation path;
+//! individual route support does not activate the complete paging capability.
 use crate::Services;
 use intent_core::{
     note_mutation::{NoteMutationError, NoteOperationStatusQuery},
     note_page::NoteScope,
     note_stage::{
-        NoteStageAppend, NoteStageBegin, NoteStageCancel, NoteStageSeal, NoteStageStream,
+        NoteStageAppend, NoteStageBegin, NoteStageCancel, NoteStageCommit, NoteStageSeal,
+        NoteStageStream,
     },
     Caller, Error, Result, WorkspaceId,
 };
@@ -100,6 +102,9 @@ fn principal() -> Result<String> {
     }
 }
 fn state_at_return(mut value: Value) -> Result<Value> {
+    if value["kind"] == "noteCommitReceipt" {
+        return receipt_at_return(value);
+    }
     if value["kind"] == "noteStageState"
         && matches!(value["phase"].as_str(), Some("staging" | "sealed"))
     {
@@ -116,7 +121,65 @@ fn state_at_return(mut value: Value) -> Result<Value> {
     }
     Ok(value)
 }
+
+// No await may follow this check before returning the receipt. Its retention
+// deadline is distinct from the original staging admission deadline.
+fn receipt_at_return(receipt: Value) -> Result<Value> {
+    let deadline = receipt["receiptExpiresAt"]
+        .as_str()
+        .and_then(intent_core::parse_iso)
+        .ok_or(Error::NoteMutation(NoteMutationError::Invalid))?;
+    let now = time::OffsetDateTime::now_utc();
+    #[cfg(test)]
+    let now = commit_tests::return_now(now);
+    if deadline <= now {
+        return Err(Error::NoteMutation(NoteMutationError::Expired));
+    }
+    Ok(receipt)
+}
 impl Services {
+    pub(crate) async fn commit_note_stage(&self, request: NoteStageCommit) -> Result<Value> {
+        request.validate().map_err(Error::NoteMutation)?;
+        let workspace = WorkspaceId(request.workspace_id.clone());
+        let _workspace = self.workspace_mutations.enter(&workspace)?;
+        let principal = principal()?;
+        let _admission = self.stage_request_admission.enter(
+            &principal,
+            &request.scope(),
+            &request.operation_id,
+            None,
+        )?;
+        self.stage_authorize(&workspace).await?;
+        let agent = match intent_core::current_caller() {
+            Some(Caller::Agent { agent_id }) => Some(agent_id),
+            _ => None,
+        };
+        let author = crate::resolve_note_version_author(&self.store, agent.as_ref()).await;
+        let reserved = self
+            .store
+            .reserve_note_stage_commit(&principal, &request)
+            .await;
+        #[cfg(test)]
+        commit_tests::after_reservation(&reserved).await;
+        self.stage_authorize(&workspace).await?;
+        let reservation = match reserved? {
+            intent_store::StageCommitAdmission::Replay(receipt) => {
+                return receipt_at_return(receipt)
+            }
+            intent_store::StageCommitAdmission::Reserved(reservation) => reservation,
+        };
+        let writer = reservation
+            .into_mutation(crate::note_ops::reject_numbered_read_presentation)
+            .await?;
+        self.stage_authorize(&workspace).await?;
+        let result = self
+            .finish_note_mutation(writer, workspace.clone(), agent, author)
+            .await;
+        #[cfg(test)]
+        commit_tests::after_commit(&result).await;
+        self.stage_authorize(&workspace).await?;
+        receipt_at_return(result?)
+    }
     async fn stage_authorize(&self, workspace: &WorkspaceId) -> Result<()> {
         #[cfg(test)]
         boundary_tests::before_authorize().await;
@@ -314,3 +377,6 @@ mod tests {
 
 #[cfg(test)]
 mod boundary_tests;
+
+#[cfg(test)]
+mod commit_tests;

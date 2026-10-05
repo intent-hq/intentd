@@ -1830,3 +1830,176 @@ async fn bounded_staged_upload_cancel_and_status_over_wss() {
     rpc.close(None).await.unwrap();
     fx.ws.stop().await;
 }
+
+#[tokio::test]
+async fn bounded_staged_commit_canonical_receipt_and_inverse_over_wss() {
+    use intent_core::note_stage::{NoteStageAppend, NoteStageBegin, NoteStageSeal};
+    use std::fmt::Write as _;
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"title":"stage commit","path":"."}),
+    )
+    .await;
+    let ws = workspace["workspace"]["id"].as_str().unwrap();
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({"workspaceId":ws,"title":"staged","content":"base😀"}),
+    )
+    .await;
+    let note = created["note"]["id"].as_str().unwrap();
+    let page = wss_rpc(
+        &mut rpc,
+        3,
+        "note.get",
+        json!({"workspaceId":ws,"noteId":note,"page":{"kind":"source"}}),
+    )
+    .await;
+    let mut begin = page["scope"].clone();
+    begin["operationId"] = json!(uuid::Uuid::new_v4().to_string());
+    begin["expiresAt"] = json!(format!(
+        "{}.000Z",
+        &intent_core::iso_ms_from_now(60_000)[..19]
+    ));
+    begin["headerDigest"] = json!("0".repeat(64));
+    begin["header"] = json!({"baseRevision":page["sourceRevision"],"editorSessionId":"commit-wss","localEditSequence":0,"liveGeneration":0,"selectionGeneration":0,"action":"mutate","output":"source","selection":"all"});
+    let mut typed: NoteStageBegin = serde_json::from_value(begin).unwrap();
+    typed.header_digest = typed.computed_digest().unwrap();
+    wss_rpc(
+        &mut rpc,
+        4,
+        "note.operation.begin",
+        serde_json::to_value(&typed).unwrap(),
+    )
+    .await;
+    let mut identity = page["scope"].clone();
+    identity["operationId"] = json!(typed.operation_id);
+    identity["headerDigest"] = json!(typed.header_digest);
+    let inserted = "\n@@@task key=child\n# Child\nbody\n@@@\n";
+    let mut inserted_sha256 = String::with_capacity(64);
+    for byte in Sha256::digest(inserted.as_bytes()) {
+        write!(&mut inserted_sha256, "{byte:02x}").unwrap();
+    }
+    let mut upload = identity.clone();
+    upload["stream"] = json!("text");
+    upload["sequence"] = json!(0);
+    upload["previousDigest"] = Value::Null;
+    upload["records"] = json!([{"kind":"text","id":"task","offset":0,"text":inserted}]);
+    upload["chunkDigest"] = json!("0".repeat(64));
+    let mut text: NoteStageAppend = serde_json::from_value(upload).unwrap();
+    text.chunk_digest = text.computed_digest().unwrap();
+    wss_rpc(
+        &mut rpc,
+        5,
+        "note.operation.append",
+        serde_json::to_value(&text).unwrap(),
+    )
+    .await;
+    let mut mutation = text.clone();
+    mutation.stream = intent_core::note_stage::NoteStageStream::Mutation;
+    mutation.records = vec![
+        json!({"kind":"splice","ordinal":0,"start":6,"end":6,"replacement":{"textId":"task","length":inserted.encode_utf16().count(),"utf8Bytes":inserted.len(),"sha256":inserted_sha256}}),
+    ];
+    mutation.chunk_digest = mutation.computed_digest().unwrap();
+    wss_rpc(
+        &mut rpc,
+        6,
+        "note.operation.append",
+        serde_json::to_value(&mutation).unwrap(),
+    )
+    .await;
+    let mut seal = identity.clone();
+    seal["payloadDigest"] = json!("0".repeat(64));
+    seal["manifest"] = json!([
+        {"stream":"text","chunks":1,"records":1,"lastDigest":text.chunk_digest},
+        {"stream":"dirty","chunks":0,"records":0,"lastDigest":null},
+        {"stream":"selection","chunks":0,"records":0,"lastDigest":null},
+        {"stream":"mutation","chunks":1,"records":1,"lastDigest":mutation.chunk_digest},
+        {"stream":"live","chunks":0,"records":0,"lastDigest":null}
+    ]);
+    let mut seal: NoteStageSeal = serde_json::from_value(seal).unwrap();
+    seal.payload_digest = seal.computed_digest().unwrap();
+    wss_rpc(
+        &mut rpc,
+        7,
+        "note.operation.seal",
+        serde_json::to_value(&seal).unwrap(),
+    )
+    .await;
+    let mut evt = connect(fx.port, fx.cfg.clone()).await;
+    wss_rpc(
+        &mut evt,
+        8,
+        "events.subscribe",
+        json!({"workspaceId":ws,"eventTypes":["note:updated"]}),
+    )
+    .await;
+    let mut commit = identity.clone();
+    commit["payloadDigest"] = json!(seal.payload_digest);
+    let frame = wss_rpc_raw(&mut rpc, 9, "note.operation.commit", commit.clone()).await;
+    assert!(frame.to_string().len() <= 4096);
+    let receipt = frame["result"].clone();
+    assert_eq!(receipt["kind"], "noteCommitReceipt");
+    assert_eq!(receipt["headerDigest"], identity["headerDigest"]);
+    assert_eq!(receipt["payloadDigest"], commit["payloadDigest"]);
+    assert!(receipt["viewId"].is_string());
+    assert_eq!(receipt["beforeRevision"], page["sourceRevision"]);
+    assert_ne!(receipt["afterRevision"], page["sourceRevision"]);
+    assert_eq!(
+        wss_rpc(&mut rpc, 10, "note.operation.commit", commit.clone()).await,
+        receipt
+    );
+    assert_eq!(
+        wss_rpc(&mut rpc, 11, "note.operationStatus", commit.clone()).await,
+        receipt
+    );
+    assert_eq!(
+        wss_rpc(&mut rpc, 12, "note.operation.cancel", identity).await,
+        receipt
+    );
+    let current = wss_rpc(
+        &mut rpc,
+        13,
+        "note.get",
+        json!({"workspaceId":ws,"noteId":note}),
+    )
+    .await;
+    let source = current["note"]["content"].as_str().unwrap();
+    assert!(source.starts_with("base😀"));
+    assert!(!source.contains("@@@task"));
+    let mut read = page["scope"].clone();
+    read["operationId"] = commit["operationId"].clone();
+    read["headerDigest"] = commit["headerDigest"].clone();
+    read["kind"] = json!("inverse");
+    read["ref"] = receipt["inverseRef"].clone();
+    read["maxWireBytes"] = json!(4096);
+    let inverse = wss_rpc_raw(&mut rpc, 14, "note.operation.read", read.clone()).await;
+    assert!(inverse.to_string().len() <= 4096);
+    assert_eq!(inverse["result"]["headerDigest"], receipt["headerDigest"]);
+    assert_eq!(inverse["result"]["viewId"], receipt["viewId"]);
+    assert!(inverse["result"].get("beforeRevision").is_none());
+    let items = inverse["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["inputState"], receipt["afterRevision"]);
+    assert_eq!(items[0]["outputState"], receipt["beforeRevision"]);
+    assert_eq!(items[0]["start"], 6);
+    assert_eq!(items[0]["end"], source.encode_utf16().count());
+    read["kind"] = json!("inverseText");
+    read["textId"] = items[0]["replacement"]["textId"].clone();
+    read["offset"] = json!(0);
+    let removed = wss_rpc_raw(&mut rpc, 15, "note.operation.read", read).await;
+    assert!(removed.to_string().len() <= 4096);
+    assert!(removed["result"]["nextCursor"].is_null());
+    let published = drain_note_updated(&mut evt, note, Duration::from_millis(500)).await;
+    assert!(!published.is_empty());
+    let hello = wss_rpc(&mut rpc, 16, "client.hello", json!({})).await;
+    assert!(hello["server"]["capabilities"].get("notePaging").is_none());
+    evt.close(None).await.unwrap();
+    rpc.close(None).await.unwrap();
+    fx.ws.stop().await;
+}

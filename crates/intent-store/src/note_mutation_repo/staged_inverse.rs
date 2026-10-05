@@ -478,6 +478,9 @@ impl super::NoteMutationWrite {
                     format!("{}:mutation", self.operation_key),
                 )
             } else if let Some(group) = latest_dirty.take() {
+                if group.generation != generation {
+                    return Err(invalid());
+                }
                 (
                     group.input_generation,
                     group.input_length,

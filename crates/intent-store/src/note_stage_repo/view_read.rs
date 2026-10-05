@@ -53,7 +53,7 @@ fn byte_at(text: &str, offset: u64) -> Result<usize> {
 /// Each indexed seek loads one descriptor and at most two root pieces or one
 /// text piece (each <=4096 bytes). Output is <=16384 bytes. Work is proportional
 /// to returned scalars/pieces, never the total view or its preceding prefix.
-pub(super) async fn read_piece(
+pub(crate) async fn read_piece(
     conn: &mut SqliteConnection,
     operation: &str,
     generation: u64,
