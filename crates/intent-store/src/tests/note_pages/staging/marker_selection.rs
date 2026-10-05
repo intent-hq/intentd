@@ -55,6 +55,17 @@ async fn fixture(left: &str, right: &str, start: u64, end: u64) -> Fixture {
 }
 
 async fn fixture_with_dirty(left: &str, right: &str, start: u64, end: u64, dirty: bool) -> Fixture {
+    fixture_with_fence(left, right, start, end, dirty, u64::from(dirty)).await
+}
+
+async fn fixture_with_fence(
+    left: &str,
+    right: &str,
+    start: u64,
+    end: u64,
+    dirty: bool,
+    local_sequence: u64,
+) -> Fixture {
     let source = format!("{PREFIX}{left}{LITERAL}{right}\n\ntail");
     let (store, tmp, note) = setup(&source).await;
     store
@@ -65,7 +76,7 @@ async fn fixture_with_dirty(left: &str, right: &str, start: u64, end: u64, dirty
     begin.header.action = intent_core::note_stage::NoteStageAction::Read;
     begin.header.output = intent_core::note_stage::NoteStageOutput::SelectionMarkdown;
     begin.header.selection = intent_core::note_stage::NoteStageSelection::Ranges;
-    begin.header.local_edit_sequence = u64::from(dirty);
+    begin.header.local_edit_sequence = local_sequence;
     begin.header.live_generation = 1;
     begin.header.selection_generation = 1;
     begin.header_digest = begin.computed_digest().unwrap();
@@ -287,4 +298,20 @@ async fn marker_selection_cursor_binds_scope_kind_budgets_and_original_deadline(
 async fn marker_selection_refuses_sealed_dirty_view_without_restoration_authority() {
     let f = fixture_with_dirty("A", "B", 0, 2 + units(LITERAL), true).await;
     assert!(matches!(read(&f).await, Err(Error::Unsupported(_))));
+}
+
+#[tokio::test]
+async fn marker_selection_accepts_clean_view_with_nonzero_history_fence() {
+    let f = fixture_with_fence("A", "B", 0, 2 + units(LITERAL), false, 7).await;
+    let (fence, dirty): (i64, i64) = sqlx::query_as(
+        "SELECT json_extract(s.header,'$.localEditSequence'),d.records FROM note_stage s JOIN note_stage_stream d USING(operation_key) WHERE s.operation_key=? AND d.stream='dirty' AND s.phase='sealed'",
+    )
+    .bind(&f.operation)
+    .fetch_one(f.store.read_pool())
+    .await
+    .unwrap();
+    assert_eq!((fence, dirty), (7, 0));
+    let page = read(&f).await.unwrap();
+    assert_eq!(page["items"], json!([{"offset":0,"text":"AB"}]));
+    assert!(page["nextCursor"].is_null());
 }
