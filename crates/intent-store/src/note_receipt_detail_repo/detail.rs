@@ -60,7 +60,7 @@ pub(super) fn valid_record(item: &Value) -> bool {
     }
 }
 
-fn utf16_byte(text: &str, units: u64) -> Result<usize> {
+pub(super) fn utf16_byte(text: &str, units: u64) -> Result<usize> {
     let mut at = 0;
     for (byte, ch) in text.char_indices() {
         if at == units {

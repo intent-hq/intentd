@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 mod context;
 mod detail;
+mod scalar;
 
 const RECORD_PAGE_SQL: &str = "SELECT sequence,value FROM note_operation_item WHERE operation_key=? AND kind=? AND sequence>=? ORDER BY sequence LIMIT ?";
 
@@ -232,15 +233,14 @@ impl Store {
             return Err(invalid());
         }
         let operation_key: String = row.get("operation_key");
-        let owns_reference = if query.kind == ReceiptDetailKind::Detail {
-            sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM note_operation_reference WHERE operation_key=? AND reference=?)")
-                .bind(&operation_key).bind(&query.reference).fetch_one(&mut *tx).await.map_err(db)?
+        let scalar = if query.kind == ReceiptDetailKind::Detail {
+            scalar::resolve(&mut tx, &operation_key, query).await?
         } else {
-            receipt[query.kind.reference_field()] == query.reference
+            if receipt[query.kind.reference_field()] != query.reference {
+                return Err(invalid());
+            }
+            None
         };
-        if !owns_reference {
-            return Err(invalid());
-        }
         let key: Vec<u8> = backend.get("token_key");
         let binding: [u8; 32] = Sha256::digest(
             serde_json::to_vec(&json!([
@@ -292,7 +292,11 @@ impl Store {
             }
             out["convertedCount"] = json!(converted);
         }
-        if query.kind == ReceiptDetailKind::InverseText {
+        if let Some(scalar) = scalar {
+            scalar
+                .page(&mut tx, &operation_key, query, &mut out, rpc_id)
+                .await?;
+        } else if query.kind == ReceiptDetailKind::InverseText {
             detail::inverse_text(
                 &mut tx,
                 &operation_key,

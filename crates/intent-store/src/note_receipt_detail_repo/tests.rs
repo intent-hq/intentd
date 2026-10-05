@@ -482,3 +482,167 @@ async fn receipt_detail_requires_registered_reachability_and_supports_empty_refe
         "must not leak"
     );
 }
+
+async fn scalar_fixture(store: &Store, text: &str) -> String {
+    let id = format!("{KEY}:metadata:0");
+    let reference = format!("{id}:value");
+    let phase = format!("d:{id}");
+    let length = i64::try_from(text.encode_utf16().count()).unwrap();
+    register_reference(store, &reference).await;
+    sqlx::query("INSERT INTO note_operation_scalar(operation_key,reference,id,field,phase,length) VALUES(?,?,?,?,?,?)")
+        .bind(KEY).bind(&reference).bind(&id).bind("actualField").bind(&phase).bind(length)
+        .execute(store.write_pool()).await.unwrap();
+    let mut part = String::new();
+    let mut start = 0_i64;
+    for ch in text.chars() {
+        if part.len() + ch.len_utf8() > 4096 {
+            let end = start + i64::try_from(part.encode_utf16().count()).unwrap();
+            sqlx::query("INSERT INTO note_operation_source(operation_key,phase,start,end,text) VALUES(?,?,?,?,?)")
+                .bind(KEY).bind(&phase).bind(start).bind(end).bind(&part).execute(store.write_pool()).await.unwrap();
+            start = end;
+            part.clear();
+        }
+        part.push(ch);
+    }
+    if !part.is_empty() {
+        sqlx::query("INSERT INTO note_operation_source(operation_key,phase,start,end,text) VALUES(?,?,?,?,?)")
+            .bind(KEY).bind(&phase).bind(start).bind(length).bind(&part).execute(store.write_pool()).await.unwrap();
+    }
+    reference
+}
+
+#[tokio::test]
+async fn receipt_scalar_fragments_reconstruct_exact_unicode_with_bounded_frames_and_context() {
+    use intent_core::note_receipt_detail::NoteGetReceiptContextRequest;
+    let (_dir, store, mut query) = fixture().await;
+    let text = "😀\r\n\\\"\t漢é".repeat(3000);
+    let root = scalar_fixture(&store, &text).await;
+    query.kind = ReceiptDetailKind::Detail;
+    query.reference = root.clone();
+    query.max_items = 1;
+    query.max_wire_bytes = 4096;
+    query.max_source_bytes = 16384;
+    let rpc_id = json!("\"\\\n".repeat(20));
+    let mut restored = String::new();
+    let mut offset = 0;
+    loop {
+        let page = store
+            .read_note_receipt_detail("alice", &query, &rpc_id)
+            .await
+            .unwrap();
+        assert!(frame_len(&page, &rpc_id) <= 4096);
+        assert_eq!(page["sourceLength"], 10);
+        assert!(page["nextCursor"].is_null());
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        let fragment = &items[0];
+        assert_eq!(fragment["field"], "actualField");
+        assert_eq!(fragment["offset"], offset);
+        let part = fragment["text"].as_str().unwrap();
+        assert!(!part.is_empty());
+        assert!(part.len() <= query.max_source_bytes);
+        restored.push_str(part);
+        offset += part.encode_utf16().count();
+        let Some(next) = fragment["nextRef"].as_str() else {
+            break;
+        };
+        assert_eq!(next, format!("{root}@{offset}"));
+        let request: NoteGetReceiptContextRequest = serde_json::from_value(json!({
+            "backendId":query.scope.backend_id,"workspaceId":"ws","noteId":"deleted-note","noteInstanceId":"original",
+            "sourceRevision":"after","page":{"kind":"context","contextRef":next,"maxWireBytes":4096}
+        })).unwrap();
+        let context = store
+            .read_note_receipt_context("alice", &request, &rpc_id)
+            .await
+            .unwrap();
+        assert_eq!(context["items"][0]["offset"], offset);
+        assert_eq!(context["sourceRevision"], "after");
+        assert!(frame_len(&context, &rpc_id) <= 4096);
+        query.reference = next.into();
+    }
+    assert_eq!(restored, text);
+    assert_eq!(
+        Sha256::digest(restored.as_bytes()),
+        Sha256::digest(text.as_bytes())
+    );
+    let refs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM note_operation_reference WHERE operation_key=?")
+            .bind(KEY)
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(refs, 1, "only the immutable root is registered");
+}
+
+#[tokio::test]
+async fn receipt_scalar_offsets_reject_surrogate_splits_forged_suffixes_and_directory_cursors() {
+    let (_dir, store, mut query) = fixture().await;
+    let root = scalar_fixture(&store, "😀abcdef").await;
+    query.kind = ReceiptDetailKind::Detail;
+    query.reference = root.clone();
+    query.max_source_bytes = 4;
+    assert_eq!(read(&store, &query).await["items"][0]["text"], "😀");
+    for suffix in ["1", "01", "+2", "-1", "9", "9007199254740992", "2@3", ""] {
+        query.reference = format!("{root}@{suffix}");
+        assert!(matches!(
+            store
+                .read_note_receipt_detail("alice", &query, &json!(1))
+                .await,
+            Err(Error::NotePage(NotePageError::CursorInvalid))
+        ));
+    }
+    query.reference = root.clone();
+    query.offset = Some(1);
+    assert!(store
+        .read_note_receipt_detail("alice", &query, &json!(1))
+        .await
+        .is_err());
+    query.offset = Some(2);
+    assert_eq!(read(&store, &query).await["items"][0]["text"], "abcd");
+    query.reference = format!("{root}@3");
+    assert!(store
+        .read_note_receipt_detail("alice", &query, &json!(1))
+        .await
+        .is_err());
+    query.offset = None;
+    query.cursor = Some("not-a-directory-cursor".into());
+    assert!(store
+        .read_note_receipt_detail("alice", &query, &json!(1))
+        .await
+        .is_err());
+    query.cursor = None;
+    query.reference = format!("{root}@8");
+    let eof = read(&store, &query).await;
+    assert_eq!(eof["items"][0]["text"], "");
+    assert!(eof["items"][0]["nextRef"].is_null());
+    let directory = format!("{KEY}:directory");
+    register_reference(&store, &directory).await;
+    query.reference = format!("{directory}@0");
+    assert!(store
+        .read_note_receipt_detail("alice", &query, &json!(1))
+        .await
+        .is_err());
+    query.reference = root.clone();
+    sqlx::query("DELETE FROM note_operation_reference WHERE operation_key=? AND reference=?")
+        .bind(KEY)
+        .bind(&root)
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert!(store
+        .read_note_receipt_detail("alice", &query, &json!(1))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn receipt_scalar_empty_value_has_a_terminal_fragment() {
+    let (_dir, store, mut query) = fixture().await;
+    query.kind = ReceiptDetailKind::Detail;
+    query.reference = scalar_fixture(&store, "").await;
+    let page = read(&store, &query).await;
+    assert_eq!(page["items"][0]["offset"], 0);
+    assert_eq!(page["items"][0]["text"], "");
+    assert!(page["items"][0]["nextRef"].is_null());
+    assert!(page["nextCursor"].is_null());
+}
