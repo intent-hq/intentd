@@ -2,7 +2,9 @@ use super::Services;
 use crate::tests::setup;
 use intent_core::{
     note_mutation::{NoteMutationError, NoteOperationStatusQuery},
-    note_stage::{NoteStageAppend, NoteStageBegin},
+    note_stage::{
+        NoteStageAppend, NoteStageBegin, NoteStageManifestEntry, NoteStageSeal, NOTE_STAGE_STREAMS,
+    },
     with_caller, Caller, Error, HostRole, Principal, PrincipalId, Result, WorkspaceId,
     WorkspaceRole,
 };
@@ -117,12 +119,34 @@ async fn call(service: &Services, method: u8, begin: NoteStageBegin) -> Result<V
                 )
                 .await
         }
+        4 => {
+            let mut request = NoteStageSeal {
+                backend_id: begin.backend_id,
+                workspace_id: begin.workspace_id,
+                note_id: begin.note_id,
+                note_instance_id: begin.note_instance_id,
+                operation_id: begin.operation_id,
+                header_digest: begin.header_digest,
+                payload_digest: String::new(),
+                manifest: NOTE_STAGE_STREAMS
+                    .into_iter()
+                    .map(|stream| NoteStageManifestEntry {
+                        stream,
+                        chunks: 0,
+                        records: 0,
+                        last_digest: None,
+                    })
+                    .collect(),
+            };
+            request.payload_digest = request.computed_digest().unwrap();
+            service.seal_note_stage(request).await
+        }
         _ => service.read_note_stage_status(query).await,
     }
 }
 #[tokio::test]
 async fn staged_service_rechecks_authority_after_store_success_and_mismatch() {
-    for method in 0..4 {
+    for method in 0..5 {
         for mismatch in [false, true] {
             let (_tmp, service, workspace, note) = setup("source😀").await;
             let caller = guest(&service, &workspace).await;
@@ -188,6 +212,8 @@ async fn staged_service_rechecks_authority_after_store_success_and_mismatch() {
                 retained["phase"],
                 if method == 2 && !mismatch {
                     "cancelled"
+                } else if method == 4 && !mismatch {
+                    "sealed"
                 } else {
                     "staging"
                 }
@@ -218,7 +244,7 @@ pub(super) async fn before_authorize() {
 }
 #[tokio::test]
 async fn staged_service_admits_before_pending_authorization_and_releases_on_denial() {
-    for method in 0..4 {
+    for method in 0..5 {
         let (_tmp, service, workspace, note) = setup("source").await;
         let caller = guest(&service, &workspace).await;
         let request = begin_request(&service, &workspace, &note).await;
@@ -291,7 +317,7 @@ pub(super) fn return_now(real: time::OffsetDateTime) -> time::OffsetDateTime {
 }
 #[tokio::test]
 async fn staged_service_observes_original_expiry_after_store_result() {
-    for method in [0, 3] {
+    for method in [0, 3, 4] {
         let (_tmp, service, workspace, note) = setup("source").await;
         let caller = guest(&service, &workspace).await;
         let request = begin_request(&service, &workspace, &note).await;
@@ -328,7 +354,8 @@ async fn staged_service_observes_original_expiry_after_store_result() {
             .await
             .unwrap();
         assert_eq!(
-            original["phase"], "staging",
+            original["phase"],
+            if method == 4 { "sealed" } else { "staging" },
             "only this response clock advanced, no global time or retained state mutation"
         );
     }

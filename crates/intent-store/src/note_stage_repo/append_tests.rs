@@ -10,7 +10,7 @@ const SCHEMA:&str="
 CREATE TABLE note_stage_chunk(operation_key TEXT,stream TEXT,sequence INTEGER,previous_digest TEXT,chunk_digest TEXT,record_count INTEGER,PRIMARY KEY(operation_key,stream,sequence));
 CREATE TABLE note_stage_record(operation_key TEXT,stream TEXT,chunk_sequence INTEGER,ordinal INTEGER,value TEXT,PRIMARY KEY(operation_key,stream,chunk_sequence,ordinal),FOREIGN KEY(operation_key,stream,chunk_sequence) REFERENCES note_stage_chunk(operation_key,stream,sequence));
 CREATE TABLE note_stage_stream(operation_key TEXT,stream TEXT,next_sequence INTEGER,last_digest TEXT,records INTEGER,tail TEXT,PRIMARY KEY(operation_key,stream));
-CREATE TABLE note_stage_text(operation_key TEXT,text_id TEXT,length INTEGER,utf8_bytes INTEGER,PRIMARY KEY(operation_key,text_id));
+CREATE TABLE note_stage_text(operation_key TEXT,text_id TEXT,length INTEGER,utf8_bytes INTEGER,sha256 TEXT,PRIMARY KEY(operation_key,text_id));
 CREATE TABLE note_stage_text_piece(operation_key TEXT,text_id TEXT,start INTEGER,end INTEGER,text TEXT CHECK(length(CAST(text AS BLOB))<=4096),PRIMARY KEY(operation_key,text_id,start),FOREIGN KEY(operation_key,text_id) REFERENCES note_stage_text(operation_key,text_id));
 ";
 fn header() -> NoteStageHeader {

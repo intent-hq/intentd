@@ -474,6 +474,7 @@ pub(crate) async fn prepare_message(
                 | "note.operation.begin"
                 | "note.operation.append"
                 | "note.operation.cancel"
+                | "note.operation.seal"
         )
     ) || annotation.is_some()
         || receipt_read
@@ -603,6 +604,7 @@ pub(crate) async fn prepare_message(
                     | "note.operation.begin"
                     | "note.operation.append"
                     | "note.operation.cancel"
+                    | "note.operation.seal"
             ) {
                 4096
             } else if method == "note.operation.read" {
@@ -696,6 +698,7 @@ fn encode_dispatch_result(
                 | "note.operation.begin"
                 | "note.operation.append"
                 | "note.operation.cancel"
+                | "note.operation.seal"
         ) {
             error_frame(
                 id,
@@ -1555,6 +1558,17 @@ async fn dispatch_other(
                 )));
             }
             api.note_operation_append(request)
+                .await
+                .map_err(bounded_note_operation_error)
+        }
+        "note.operation.seal" => {
+            let request: intent_core::note_stage::NoteStageSeal =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid note stage seal"))?;
+            request
+                .validate()
+                .map_err(|e| domain_to_rpc(Error::NoteMutation(e)))?;
+            api.note_operation_seal(request)
                 .await
                 .map_err(bounded_note_operation_error)
         }

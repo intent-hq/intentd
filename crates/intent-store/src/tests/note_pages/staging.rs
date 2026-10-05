@@ -410,3 +410,181 @@ async fn stage_cancel_failure_rolls_back_phase_and_committed_outcome_is_never_ca
         .unwrap();
     assert_eq!(phase, "committed");
 }
+
+async fn seal_request(
+    store: &Store,
+    begin: &NoteStageBegin,
+) -> intent_core::note_stage::NoteStageSeal {
+    use intent_core::note_stage::{NoteStageManifestEntry, NOTE_STAGE_STREAMS};
+    let key: String =
+        sqlx::query_scalar("SELECT operation_key FROM note_operation WHERE operation_id=?")
+            .bind(&begin.operation_id)
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+    let mut manifest = Vec::new();
+    for stream in NOTE_STAGE_STREAMS {
+        let name = serde_json::to_value(stream).unwrap();
+        let (chunks,records,last_digest):(i64,i64,Option<String>)=sqlx::query_as("SELECT next_sequence,records,last_digest FROM note_stage_stream WHERE operation_key=? AND stream=?")
+            .bind(&key).bind(name.as_str().unwrap()).fetch_one(store.read_pool()).await.unwrap();
+        manifest.push(NoteStageManifestEntry {
+            stream,
+            chunks: u64::try_from(chunks).unwrap(),
+            records: u64::try_from(records).unwrap(),
+            last_digest,
+        });
+    }
+    let mut seal = intent_core::note_stage::NoteStageSeal {
+        backend_id: begin.backend_id.clone(),
+        workspace_id: begin.workspace_id.clone(),
+        note_id: begin.note_id.clone(),
+        note_instance_id: begin.note_instance_id.clone(),
+        operation_id: begin.operation_id.clone(),
+        header_digest: begin.header_digest.clone(),
+        manifest,
+        payload_digest: String::new(),
+    };
+    seal.payload_digest = seal.computed_digest().unwrap();
+    seal
+}
+
+#[tokio::test]
+async fn stage_seal_is_atomic_replayable_after_remote_write_and_reopen() {
+    let (store, tmp, mut note) = setup("base😀\r\n").await;
+    let begin = request(&store).await;
+    store.begin_note_stage("alice", &begin).await.unwrap();
+    store
+        .append_note_stage("alice", &append(&begin, "unused text"))
+        .await
+        .unwrap();
+    let seal = seal_request(&store, &begin).await;
+    note.content = "remote".into();
+    store.update_note(&note).await.unwrap();
+    let state = store.seal_note_stage("alice", &seal).await.unwrap();
+    assert_eq!(state["phase"], "sealed");
+    assert_eq!(state["viewLength"], 8);
+    assert_eq!(state["payloadDigest"], seal.payload_digest);
+    assert_eq!(state["expiresAt"], begin.expires_at);
+    assert_eq!(state["streams"].as_array().unwrap().len(), 5);
+    assert_eq!(count(&store, "note_stage_view").await, 1);
+    assert_eq!(count(&store, "note_stage_view_piece").await, 1);
+    assert_eq!(count(&store, "note_version").await, 0);
+    assert!(matches!(
+        store.seal_note_stage("bob", &seal).await,
+        Err(Error::NoteMutation(NoteMutationError::Invalid))
+    ));
+    let mut changed = seal.clone();
+    changed.manifest[0].records = 0;
+    changed.payload_digest = changed.computed_digest().unwrap();
+    assert!(matches!(
+        store.seal_note_stage("alice", &changed).await,
+        Err(Error::NoteMutation(NoteMutationError::Mismatch))
+    ));
+    assert!(matches!(
+        store
+            .append_note_stage("alice", &append(&begin, "unused text"))
+            .await,
+        Err(Error::NoteMutation(NoteMutationError::Invalid))
+    ));
+    drop(store);
+    let store = Store::open(&tmp.path).await.unwrap();
+    assert_eq!(store.seal_note_stage("alice", &seal).await.unwrap(), state);
+    assert_eq!(count(&store, "note_stage_view").await, 1);
+    assert_eq!(
+        store
+            .get_note(&note.workspace_id, &note.id)
+            .await
+            .unwrap()
+            .content,
+        "remote"
+    );
+    store
+        .cancel_note_stage("alice", &cancel_request(&begin))
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.seal_note_stage("alice", &seal).await,
+        Err(Error::NoteMutation(NoteMutationError::Expired))
+    ));
+}
+
+#[tokio::test]
+async fn stage_seal_failed_publication_rolls_back_views_cache_and_phase() {
+    let (store, _tmp, _note) = setup("source").await;
+    let begin = request(&store).await;
+    store.begin_note_stage("alice", &begin).await.unwrap();
+    store
+        .append_note_stage("alice", &append(&begin, "x"))
+        .await
+        .unwrap();
+    let seal = seal_request(&store, &begin).await;
+    sqlx::query("CREATE TRIGGER injected_seal_publication BEFORE UPDATE ON note_operation WHEN json_extract(new.outcome,'$.phase')='sealed' BEGIN SELECT RAISE(ABORT,'seal publication'); END").execute(store.write_pool()).await.unwrap();
+    assert!(matches!(
+        store.seal_note_stage("alice", &seal).await,
+        Err(Error::Internal(_))
+    ));
+    assert_eq!(count(&store, "note_stage_view").await, 0);
+    assert_eq!(count(&store, "note_stage_view_piece").await, 0);
+    assert_eq!(count(&store, "note_stage_validation").await, 0);
+    let digest: Option<String> = sqlx::query_scalar("SELECT sha256 FROM note_stage_text")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert!(digest.is_none());
+    assert_eq!(
+        store
+            .note_stage_status("alice", &status_query(&begin))
+            .await
+            .unwrap()["phase"],
+        "staging"
+    );
+    sqlx::query("DROP TRIGGER injected_seal_publication")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.seal_note_stage("alice", &seal).await.unwrap()["phase"],
+        "sealed"
+    );
+}
+
+#[tokio::test]
+async fn stage_seal_incomplete_reference_can_be_completed_without_partial_view() {
+    use sha2::{Digest, Sha256};
+    let (store, _tmp, _note) = setup("base").await;
+    let mut begin = request(&store).await;
+    begin.header.local_edit_sequence = 1;
+    begin.header_digest = begin.computed_digest().unwrap();
+    store.begin_note_stage("alice", &begin).await.unwrap();
+    let mut dirty = append(&begin, "");
+    dirty.stream = intent_core::note_stage::NoteStageStream::Dirty;
+    dirty.records = vec![
+        json!({"kind":"splice","localSequence":1,"ordinal":0,"start":1,"end":3,"replacement":{"textId":"insert","length":2,"utf8Bytes":4,"sha256":format!("{:x}",Sha256::digest("😀".as_bytes()))}}),
+    ];
+    dirty.chunk_digest = dirty.computed_digest().unwrap();
+    store.append_note_stage("alice", &dirty).await.unwrap();
+    let missing = seal_request(&store, &begin).await;
+    assert!(matches!(
+        store.seal_note_stage("alice", &missing).await,
+        Err(Error::NoteMutation(NoteMutationError::Invalid))
+    ));
+    assert_eq!(count(&store, "note_stage_view").await, 0);
+    store
+        .append_note_stage("alice", &append(&begin, "😀"))
+        .await
+        .unwrap();
+    let complete = seal_request(&store, &begin).await;
+    assert_eq!(
+        store.seal_note_stage("alice", &complete).await.unwrap()["viewLength"],
+        4
+    );
+    let retained: Vec<(i64, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT generation,input_generation,history_group FROM note_stage_view ORDER BY generation",
+    )
+    .fetch_all(store.read_pool())
+    .await
+    .unwrap();
+    assert_eq!(retained.len(), 2);
+    assert_eq!(retained[1].1, Some(0));
+    assert!(retained[1].2.is_some());
+}

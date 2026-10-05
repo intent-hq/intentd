@@ -10,7 +10,7 @@ const SCHEMA:&str="
 CREATE TABLE note_stage_chunk(operation_key TEXT,stream TEXT,sequence INTEGER,previous_digest TEXT,chunk_digest TEXT,record_count INTEGER,PRIMARY KEY(operation_key,stream,sequence));
 CREATE TABLE note_stage_record(operation_key TEXT,stream TEXT,chunk_sequence INTEGER,ordinal INTEGER,value TEXT,PRIMARY KEY(operation_key,stream,chunk_sequence,ordinal));
 CREATE TABLE note_stage_stream(operation_key TEXT,stream TEXT,next_sequence INTEGER,last_digest TEXT,records INTEGER,tail TEXT,PRIMARY KEY(operation_key,stream));
-CREATE TABLE note_stage_text(operation_key TEXT,text_id TEXT,length INTEGER,utf8_bytes INTEGER,PRIMARY KEY(operation_key,text_id));
+CREATE TABLE note_stage_text(operation_key TEXT,text_id TEXT,length INTEGER,utf8_bytes INTEGER,sha256 TEXT,PRIMARY KEY(operation_key,text_id));
 CREATE TABLE note_stage_text_piece(operation_key TEXT,text_id TEXT,start INTEGER,end INTEGER,text TEXT,PRIMARY KEY(operation_key,text_id,start));
 ";
 fn header() -> NoteStageHeader {
@@ -210,7 +210,7 @@ async fn stage_seal_text_accepts_owned_empty_and_rejects_gaps_overlaps_and_wrong
         actual.sha256,
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     );
-    sqlx::query("INSERT INTO note_stage_text VALUES('op','value',4,6)")
+    sqlx::query("INSERT INTO note_stage_text(operation_key,text_id,length,utf8_bytes) VALUES('op','value',4,6)")
         .execute(&mut conn)
         .await
         .unwrap();
@@ -287,7 +287,6 @@ fn stage_seal_projection_checks_shape_and_native_coordinates_without_source_unit
 }
 
 const VIEW_SCHEMA: &str = "
-ALTER TABLE note_stage_text ADD COLUMN sha256 TEXT;
 CREATE TABLE note_stage_root(root_key TEXT PRIMARY KEY,workspace_id TEXT,note_id TEXT,content_generation TEXT,source_length INTEGER);
 CREATE TABLE note_stage_base_piece(root_key TEXT,start INTEGER,end INTEGER,text TEXT,PRIMARY KEY(root_key,start));
 CREATE TABLE note_page_piece(workspace_id TEXT,note_id TEXT,content_generation TEXT,start INTEGER,end INTEGER,text TEXT,PRIMARY KEY(workspace_id,note_id,content_generation,start));
@@ -982,7 +981,8 @@ async fn stage_seal_metadata_exact_canonical_resources_and_directory_byte_item_b
     assert_eq!(over.len(), 16_385);
     let mut conn = graph_fixture(vec![("exact".into(), exact), ("over".into(), over)]).await;
     let value = metadata_resource(&mut conn, "op", "exact").await.unwrap();
-    assert_eq!(metadata_directory(&value, true).unwrap().items.len(), 64);
+    assert!(metadata_directory(&value, true).is_ok());
+    assert_eq!(value["items"].as_array().unwrap().len(), 64);
     assert!(matches!(
         metadata_resource(&mut conn, "op", "over").await,
         Err(Error::NoteMutation(NoteMutationError::Budget))

@@ -1117,6 +1117,14 @@ pub trait WorkspaceApi: Send + Sync {
         let _ = request;
         Box::pin(async { Err(crate::Error::Unsupported("note operation append".into())) })
     }
+    /// Validate and atomically freeze an operation-owned source view.
+    fn note_operation_seal(
+        &self,
+        request: crate::note_stage::NoteStageSeal,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = request;
+        Box::pin(async { Err(crate::Error::Unsupported("note operation seal".into())) })
+    }
     /// Close uncommitted staging or return its retained committed receipt.
     fn note_operation_cancel(
         &self,

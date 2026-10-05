@@ -1048,7 +1048,6 @@ async fn save_metadata_frame(
 }
 
 struct MetadataDirectory {
-    items: Vec<String>,
     next: Option<String>,
 }
 fn metadata_directory(value: &Value, first: bool) -> Result<MetadataDirectory> {
@@ -1063,10 +1062,9 @@ fn metadata_directory(value: &Value, first: bool) -> Result<MetadataDirectory> {
     if items.len() > 64 {
         return Err(Error::NoteMutation(NoteMutationError::Budget));
     }
-    let items = items
-        .iter()
-        .map(|value| token_value(value).map(str::to_owned))
-        .collect::<Result<Vec<_>>>()?;
+    for item in items {
+        token_value(item)?;
+    }
     let next = match object.get("nextRef") {
         Some(Value::Null) => None,
         Some(value) => Some(token_value(value)?.to_owned()),
@@ -1075,7 +1073,7 @@ fn metadata_directory(value: &Value, first: bool) -> Result<MetadataDirectory> {
     if items.is_empty() && (!first || next.is_some()) {
         return Err(invalid());
     }
-    Ok(MetadataDirectory { items, next })
+    Ok(MetadataDirectory { next })
 }
 
 struct MetadataKeyReader {

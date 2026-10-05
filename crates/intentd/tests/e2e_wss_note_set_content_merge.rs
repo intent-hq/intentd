@@ -1687,7 +1687,7 @@ async fn bounded_public_splices_commit_replay_and_status_over_wss() {
 
 #[tokio::test]
 async fn bounded_staged_upload_cancel_and_status_over_wss() {
-    use intent_core::note_stage::{NoteStageAppend, NoteStageBegin};
+    use intent_core::note_stage::{NoteStageAppend, NoteStageBegin, NoteStageSeal};
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
     let workspace = wss_rpc(
@@ -1752,6 +1752,31 @@ async fn bounded_staged_upload_cancel_and_status_over_wss() {
     let status = wss_rpc(&mut rpc, 7, "note.operationStatus", identity.clone()).await;
     assert_eq!(status["phase"], "staging");
     assert_eq!(status["streams"][0]["nextSequence"], 1);
+    let mut seal = identity.clone();
+    seal["manifest"] = json!([
+        {"stream":"text","chunks":1,"records":1,"lastDigest":typed.chunk_digest},
+        {"stream":"dirty","chunks":0,"records":0,"lastDigest":null},
+        {"stream":"selection","chunks":0,"records":0,"lastDigest":null},
+        {"stream":"mutation","chunks":0,"records":0,"lastDigest":null},
+        {"stream":"live","chunks":0,"records":0,"lastDigest":null}
+    ]);
+    seal["payloadDigest"] = json!("0".repeat(64));
+    let mut seal: NoteStageSeal = serde_json::from_value(seal).unwrap();
+    seal.payload_digest = seal.computed_digest().unwrap();
+    let seal = serde_json::to_value(seal).unwrap();
+    let sealed = wss_rpc_raw(&mut rpc, 20, "note.operation.seal", seal.clone()).await;
+    assert!(sealed.to_string().len() <= 4096);
+    assert_eq!(sealed["result"]["phase"], "sealed");
+    assert_eq!(sealed["result"]["viewLength"], 13);
+    assert_eq!(sealed["result"]["expiresAt"], begin["expiresAt"]);
+    assert_eq!(
+        wss_rpc(&mut rpc, 21, "note.operation.seal", seal).await,
+        sealed["result"]
+    );
+    assert_eq!(
+        wss_rpc(&mut rpc, 22, "note.operationStatus", identity.clone()).await,
+        sealed["result"]
+    );
     let cancelled = wss_rpc_raw(&mut rpc, 8, "note.operation.cancel", identity.clone()).await;
     assert!(cancelled.to_string().len() <= 4096);
     assert_eq!(cancelled["result"]["phase"], "cancelled");

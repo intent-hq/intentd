@@ -104,3 +104,41 @@ CREATE TABLE note_stage_text_piece (
     PRIMARY KEY(operation_key,text_id,start),
     FOREIGN KEY(operation_key,text_id) REFERENCES note_stage_text(operation_key,text_id) ON DELETE CASCADE
 );
+
+-- Seal preparation retains history as external piece generations. Each group
+-- keeps its input generation for precise inverse history, rather than flattening
+-- all acknowledged edits into a single final text diff.
+ALTER TABLE note_stage_text ADD COLUMN sha256 TEXT CHECK(sha256 IS NULL OR length(sha256)=64);
+CREATE TABLE note_stage_view (
+    operation_key TEXT NOT NULL REFERENCES note_stage(operation_key) ON DELETE CASCADE,
+    generation INTEGER NOT NULL CHECK(generation>=0),
+    input_generation INTEGER CHECK(input_generation IS NULL OR input_generation>=0),
+    history_group TEXT,
+    length INTEGER NOT NULL CHECK(length>=0),
+    PRIMARY KEY(operation_key,generation)
+);
+CREATE TABLE note_stage_view_piece (
+    operation_key TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    start INTEGER NOT NULL CHECK(start>=0),
+    end INTEGER NOT NULL CHECK(end>start),
+    origin_kind TEXT NOT NULL CHECK(origin_kind IN ('root','text')),
+    origin_id TEXT NOT NULL,
+    origin_start INTEGER NOT NULL CHECK(origin_start>=0),
+    PRIMARY KEY(operation_key,generation,start),
+    FOREIGN KEY(operation_key,generation) REFERENCES note_stage_view(operation_key,generation) ON DELETE CASCADE
+);
+-- Operation-owned external graph traversal and identity ledger. Input entry and
+-- directory JSON is limited to 16KiB before parsing; these 32KiB work rows also
+-- hold bounded continuation state, never a whole graph or long decoded key.
+CREATE TABLE note_stage_validation (
+    operation_key TEXT NOT NULL REFERENCES note_stage(operation_key) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK(kind IN ('entry','entryId','directory','stack','live')),
+    id TEXT NOT NULL,
+    owner TEXT,
+    position INTEGER,
+    state TEXT NOT NULL CHECK(state IN ('active','done')),
+    value TEXT NOT NULL CHECK(length(CAST(value AS BLOB))<=32768),
+    PRIMARY KEY(operation_key,kind,id)
+);
+CREATE INDEX note_stage_validation_stack ON note_stage_validation(operation_key,kind,position);

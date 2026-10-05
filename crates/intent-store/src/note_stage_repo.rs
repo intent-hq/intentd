@@ -8,7 +8,9 @@ use intent_core::{
 use serde_json::{json, Value};
 use sqlx::Row;
 mod append;
+mod freeze;
 mod read;
+mod seal;
 mod source;
 mod status;
 mod write;

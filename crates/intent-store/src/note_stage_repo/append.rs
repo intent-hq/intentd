@@ -151,7 +151,7 @@ async fn append_text(
         .ok_or_else(invalid)?;
     if row.is_some() {
         sqlx::query(
-            "UPDATE note_stage_text SET length=?,utf8_bytes=? WHERE operation_key=? AND text_id=?",
+            "UPDATE note_stage_text SET length=?,utf8_bytes=?,sha256=NULL WHERE operation_key=? AND text_id=?",
         )
         .bind(end)
         .bind(bytes)
