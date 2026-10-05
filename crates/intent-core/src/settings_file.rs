@@ -1997,8 +1997,10 @@ maxPerAgent = 5
 # observe before its consolidated wake is delivered (minimum 10).
 debounceSeconds = 60
 # PR monitor poll seconds -- tick cadence (in seconds) of the centralized loop
-# and the per-PR poll interval floor (minimum 10).
-pollSeconds = 30
+# and the active per-PR poll interval floor (minimum 10). Idle workspaces
+# back off to 120/300/600/900 seconds at 15m/1h/6h/24h without content work.
+# Running agents restore active cadence; slower configured intervals win.
+pollSeconds = 60
 # PR monitor hourly request budget -- forge REST calls per hour the loop
 # plans to spend across all monitored PRs. A cadence cost model, not a hard
 # ceiling: each PR poll is costed at 3 calls (a single-page estimate), so the
@@ -2954,6 +2956,7 @@ mod tests {
             parsed.pr_monitor.poll_seconds,
             DEFAULT_PR_MONITOR_POLL_SECONDS
         );
+        assert_eq!(parsed.pr_monitor.poll_seconds, 60);
         assert_eq!(
             parsed.pr_monitor.hourly_request_budget,
             DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET

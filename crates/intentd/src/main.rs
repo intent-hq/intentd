@@ -2202,7 +2202,7 @@ async fn cmd_serve(
     // (~30 min). Safe when source control is unconfigured (a sweep with due
     // workspaces logs and swallows the missing-provider error). Aborted on
     // clean shutdown.
-    let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(180));
+    let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60));
     // Centralized PR-monitor loop (`ws.pr.monitor`): every `[prMonitor]
     // pollSeconds` (read live, floor 10s), poll the due active monitors —
     // each PR on an effective interval stretched to fit the `[prMonitor]

@@ -124,7 +124,7 @@ pub(crate) const PR_MONITOR_REQUESTS_PER_POLL: u64 = 3;
 /// per hour — `max(poll_secs, ceil(distinct_prs × PR_MONITOR_REQUESTS_PER_POLL
 /// × 3600 / hourly_budget))`. Both inputs are clamped to their floors first
 /// (the budget's ceiling is applied by the settings getter). At the defaults
-/// (30s, 1500/h) up to 4 PRs keep the configured 30s; 10 PRs → 72s, 20 PRs
+/// (60s, 1500/h) up to 8 PRs keep the configured 60s; 10 PRs → 72s, 20 PRs
 /// → 144s. The budget is a cost model that sets the cadence; it is not a
 /// limiter that counts or blocks requests.
 pub(crate) fn effective_pr_monitor_interval_secs(
@@ -304,6 +304,7 @@ fn pr_key_for(repo_ref: &RepoRef, pr_number: i64) -> PrKey {
 pub(crate) struct DueCandidate {
     pub(crate) anchor: Option<time::OffsetDateTime>,
     pub(crate) catch_up: bool,
+    pub(crate) interval: time::Duration,
     pub(crate) monitor: PrMonitor,
 }
 
@@ -328,7 +329,9 @@ fn catch_up_unattempted(
 
 /// Pick the monitors one due-sweep tick polls. Monitors are grouped per
 /// distinct PR: a PR's anchor is the OLDEST anchor among its sibling
-/// monitors and it is due when that anchor is older than `interval` (or
+/// monitors; the fastest interested workspace supplies the idle interval.
+/// A PR is due when its anchor exceeds both that interval and the global
+/// budget/configuration floor `interval` (or
 /// missing, or any sibling is catch-up-unattempted). Due PRs are ordered
 /// oldest anchor first (PR key breaks ties), the first `cap` are kept, and
 /// EVERY active monitor on a kept PR is returned in that order — siblings
@@ -344,6 +347,7 @@ pub(crate) fn select_due_pr_monitors(
     struct Group {
         anchor: Option<time::OffsetDateTime>,
         catch_up: bool,
+        interval: time::Duration,
         monitors: Vec<PrMonitor>,
     }
     let mut index: HashMap<PrKey, usize> = HashMap::new();
@@ -356,6 +360,7 @@ pub(crate) fn select_due_pr_monitors(
                 group.anchor = c.anchor;
             }
             group.catch_up |= c.catch_up;
+            group.interval = group.interval.min(c.interval);
             group.monitors.push(c.monitor);
         } else {
             index.insert(key.clone(), groups.len());
@@ -364,6 +369,7 @@ pub(crate) fn select_due_pr_monitors(
                 Group {
                     anchor: c.anchor,
                     catch_up: c.catch_up,
+                    interval: c.interval,
                     monitors: vec![c.monitor],
                 },
             ));
@@ -371,7 +377,11 @@ pub(crate) fn select_due_pr_monitors(
     }
     let mut due: Vec<(Option<time::OffsetDateTime>, PrKey, Vec<PrMonitor>)> = groups
         .into_iter()
-        .filter(|(_, g)| g.catch_up || g.anchor.is_none_or(|at| now - at >= interval))
+        .filter(|(_, g)| {
+            g.catch_up
+                || g.anchor
+                    .is_none_or(|at| now - at >= interval.max(g.interval))
+        })
         .map(|(key, g)| (g.anchor, key, g.monitors))
         .collect();
     due.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
@@ -3250,7 +3260,8 @@ impl Services {
         };
         let monitors = if skip_fresh {
             let quota = self.pr_monitor_quota_window(&sc, probed).await;
-            self.select_due_pr_monitors(monitors, quota)
+            self.select_due_pr_monitors(monitors, quota, time::OffsetDateTime::now_utc())
+                .await
         } else {
             monitors
         };
@@ -3353,10 +3364,11 @@ impl Services {
     /// spacing has not elapsed since the newest poll
     /// ([`pr_monitor_fetches_per_tick`]), so a stale or catch-up backlog
     /// drains within the planned budget instead of one PR per tick.
-    fn select_due_pr_monitors(
+    async fn select_due_pr_monitors(
         &self,
         monitors: Vec<PrMonitor>,
         quota: Option<QuotaWindow>,
+        now: time::OffsetDateTime,
     ) -> Vec<PrMonitor> {
         let distinct_prs = monitors.iter().map(pr_key).collect::<HashSet<_>>().len();
         let poll_secs = self.pr_monitor_poll_interval().as_secs();
@@ -3382,13 +3394,37 @@ impl Services {
         };
         self.note_pr_monitor_cadence(distinct_prs, effective_secs, poll_secs, budget_secs, quota);
         let interval = time::Duration::seconds(effective_secs.cast_signed());
-        let now = time::OffsetDateTime::now_utc();
+        let workspace_ids: Vec<_> = monitors
+            .iter()
+            .map(|m| m.workspace_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let intervals = match self
+            .workspace_automatic_check_intervals(&workspace_ids, now)
+            .await
+        {
+            Ok(intervals) => intervals,
+            Err(error) => {
+                tracing::warn!(%error, "pr monitor activity read failed; skipping tick");
+                return Vec::new();
+            }
+        };
         let catch_up = self.pr_monitor_catch_up.lock().unwrap().clone();
         let candidates: Vec<DueCandidate> = monitors
             .into_iter()
             .map(|monitor| DueCandidate {
                 anchor: monitor.last_polled_at.as_deref().and_then(parse_iso),
                 catch_up: catch_up_unattempted(&monitor, &catch_up),
+                interval: time::Duration::seconds(
+                    i64::try_from(
+                        intervals
+                            .get(&monitor.workspace_id)
+                            .copied()
+                            .unwrap_or(poll_secs),
+                    )
+                    .unwrap_or(i64::MAX),
+                ),
                 monitor,
             })
             .collect();
@@ -9790,6 +9826,258 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn idle_due_selection_has_exact_boundaries_and_quota_precedence() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let mut monitor = register(&svc, &ws, &owner).await;
+        let now = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let ago = |seconds| intent_core::iso_from_unix_secs(now.unix_timestamp() - seconds);
+        for (idle, interval) in [
+            (899, 60),
+            (900, 120),
+            (3599, 120),
+            (3600, 300),
+            (21599, 300),
+            (21600, 600),
+            (86399, 600),
+            (86400, 900),
+        ] {
+            sqlx::query("UPDATE workspace SET last_content_activity = ? WHERE id = ?")
+                .bind(ago(idle))
+                .bind(&ws.0)
+                .execute(svc.store().write_pool())
+                .await
+                .unwrap();
+            monitor.last_polled_at = Some(ago(interval - 1));
+            assert!(
+                svc.select_due_pr_monitors(vec![monitor.clone()], None, now)
+                    .await
+                    .is_empty(),
+                "idle={idle}, before due"
+            );
+            monitor.last_polled_at = Some(ago(interval));
+            assert_eq!(
+                svc.select_due_pr_monitors(vec![monitor.clone()], None, now)
+                    .await
+                    .len(),
+                1,
+                "idle={idle}, exactly due"
+            );
+        }
+        // The 15-minute idle cap never shortens a longer quota or user floor.
+        let quota = Some(QuotaWindow {
+            remaining: 6,
+            reset_in_secs: 1800,
+        });
+        assert!(svc
+            .select_due_pr_monitors(vec![monitor.clone()], quota, now)
+            .await
+            .is_empty());
+        let slower = svc.clone().with_pr_monitor_poll_seconds(1800);
+        assert!(slower
+            .select_due_pr_monitors(vec![monitor.clone()], None, now)
+            .await
+            .is_empty());
+        monitor.last_polled_at = Some(ago(1800));
+        assert_eq!(
+            svc.select_due_pr_monitors(vec![monitor.clone()], quota, now)
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            slower
+                .select_due_pr_monitors(vec![monitor.clone()], None, now)
+                .await
+                .len(),
+            1
+        );
+        // Missing stamps and restart catch-up cannot spend a zero quota share.
+        monitor.last_polled_at = None;
+        svc.pr_monitor_catch_up
+            .lock()
+            .unwrap()
+            .insert(monitor.monitor_id.clone(), now);
+        assert!(svc
+            .select_due_pr_monitors(
+                vec![monitor.clone()],
+                Some(QuotaWindow {
+                    remaining: 0,
+                    reset_in_secs: 1800
+                }),
+                now
+            )
+            .await
+            .is_empty());
+        assert_eq!(
+            svc.select_due_pr_monitors(vec![monitor], None, now)
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_workspace_does_not_poll_at_active_cadence() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let monitor = register(&svc, &ws, &owner).await;
+        sqlx::query("UPDATE workspace SET created_at = '2020-01-01T00:00:00Z', last_content_activity = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(&ws.0)
+            .execute(svc.store().write_pool()).await.unwrap();
+        age_all(&svc, 120).await;
+        forge.take_fetched_numbers();
+        let before = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        svc.poll_due_pr_monitors().await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "a day-idle workspace waits fifteen minutes"
+        );
+        assert_eq!(
+            svc.store()
+                .get_pr_monitor(&monitor.monitor_id)
+                .await
+                .unwrap()
+                .last_polled_at,
+            before.last_polled_at
+        );
+    }
+
+    async fn make_workspace_idle(svc: &Services, ws: &WorkspaceId) {
+        sqlx::query("UPDATE workspace SET created_at = '2020-01-01T00:00:00Z', last_content_activity = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(&ws.0)
+            .execute(svc.store().write_pool()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_monitor_resumes_for_note_conversation_and_running_work() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        register(&svc, &ws, &owner).await;
+        forge.take_fetched_numbers();
+        for work in ["note", "user", "assistant", "running"] {
+            make_workspace_idle(&svc, &ws).await;
+            age_all(&svc, 120).await;
+            svc.poll_due_pr_monitors().await;
+            assert!(
+                forge.take_fetched_numbers().is_empty(),
+                "idle before {work}"
+            );
+            match work {
+                "note" => {
+                    let mut note =
+                        task_note(&ws, "resumed-work", intent_core::TaskStatus::NotStarted);
+                    note.parent_id = None;
+                    svc.store().insert_note(&note).await.unwrap();
+                }
+                "running" => svc.agent_activity_begin(&ws).await,
+                role => {
+                    svc.store()
+                        .append_agent_message(&owner, role, &json!([]), &now_iso())
+                        .await
+                        .unwrap();
+                }
+            }
+            svc.poll_due_pr_monitors().await;
+            assert_eq!(forge.take_fetched_numbers(), vec![42], "resumed by {work}");
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_poll_and_metadata_do_not_reset_content_clock() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        register(&svc, &ws, &owner).await;
+        make_workspace_idle(&svc, &ws).await;
+        age_all(&svc, 901).await;
+        forge.take_fetched_numbers();
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(forge.take_fetched_numbers(), vec![42]);
+        let persisted = svc.store().get_workspace(&ws).await.unwrap();
+        assert_eq!(
+            persisted.last_content_activity.as_deref(),
+            Some("2020-01-01T00:00:00Z")
+        );
+        sqlx::query("UPDATE workspace SET updated_at = ?, last_activity = ? WHERE id = ?")
+            .bind(now_iso())
+            .bind(now_iso())
+            .bind(&ws.0)
+            .execute(svc.store().write_pool())
+            .await
+            .unwrap();
+        age_all(&svc, 120).await;
+        svc.poll_due_pr_monitors().await;
+        assert!(forge.take_fetched_numbers().is_empty());
+        let intervals = svc
+            .workspace_automatic_check_intervals(
+                &[ws.clone(), WorkspaceId::from("missing")],
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(intervals[&ws], 900);
+        assert_eq!(intervals[&WorkspaceId::from("missing")], 60);
+    }
+
+    #[tokio::test]
+    async fn shared_pr_uses_active_workspace_cadence_and_one_fetch() {
+        let (_db, _root, svc, forge, active, owner) = setup().await;
+        register(&svc, &active, &owner).await;
+        let idle = WorkspaceId::new();
+        svc.store()
+            .insert_workspace(&workspace(&idle))
+            .await
+            .unwrap();
+        let idle_owner = AgentId::from("idle-owner");
+        svc.store()
+            .insert_agent_session(&agent(&idle, &idle_owner.0))
+            .await
+            .unwrap();
+        svc.pr_monitor_register(&idle, &idle_owner, "o", "r", 42)
+            .await
+            .unwrap();
+        svc.pr_monitor_register(&idle, &idle_owner, "o", "r", 43)
+            .await
+            .unwrap();
+        make_workspace_idle(&svc, &idle).await;
+        age_all(&svc, 120).await;
+        forge.take_fetched_numbers();
+        let started = time::OffsetDateTime::now_utc();
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![42],
+            "active sibling admits one shared fetch; idle-only PR waits"
+        );
+        let rows = svc.store().load_active_pr_monitors().await.unwrap();
+        let shared: Vec<_> = rows.iter().filter(|r| r.pr_number == 42).collect();
+        let a = shared[0]
+            .last_polled_at
+            .as_deref()
+            .and_then(parse_iso)
+            .unwrap();
+        let b = shared[1]
+            .last_polled_at
+            .as_deref()
+            .and_then(parse_iso)
+            .unwrap();
+        assert!(
+            a >= started && b >= started,
+            "both siblings stamped by one tick"
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.pr_number == 43)
+                .unwrap()
+                .last_polled_at
+                .as_deref()
+                .and_then(parse_iso)
+                .unwrap()
+                < a
+        );
+    }
+
     /// Ten distinct PRs at the defaults stretch the interval to 72s, so one
     /// tick fetches only ceil(10 × 30 / 72) = 5 PRs — the five with the
     /// oldest `lastPolledAt`, in strictly oldest-first forge-call order and
@@ -11513,6 +11801,9 @@ mod tests {
         for id in &ids {
             backdate(&svc, id, &forty_minutes_ago).await;
         }
+        // Idle clocks cannot bypass quota deferral; restart still catches up
+        // immediately once the quota gate opens.
+        make_workspace_idle(&svc, &ws).await;
         // And catch-up marked, as after a daemon restart.
         assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 3);
         assert_eq!(marked(), 3);
@@ -12079,6 +12370,7 @@ mod tests {
         let candidate = |anchor, catch_up, pr| DueCandidate {
             anchor,
             catch_up,
+            interval: time::Duration::ZERO,
             monitor: mk(pr),
         };
         let interval = time::Duration::seconds(60);
