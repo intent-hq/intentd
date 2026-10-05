@@ -12,6 +12,7 @@ use intent_core::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+mod context;
 mod detail;
 
 const RECORD_PAGE_SQL: &str = "SELECT sequence,value FROM note_operation_item WHERE operation_key=? AND kind=? AND sequence>=? ORDER BY sequence LIMIT ?";
@@ -277,6 +278,8 @@ impl Store {
             out["payloadDigest"] = json!(digest);
             out["sourceLength"] = length;
             out["expiresAt"] = receipt["receiptExpiresAt"].clone();
+        } else if query.context_envelope {
+            out = json!({"kind":"noteContextPage","scope":query.scope,"sourceRevision":receipt["afterRevision"],"snapshotId":operation_key,"expiresAt":receipt["receiptExpiresAt"],"items":[],"nextCursor":null});
         } else {
             out["kind"] = json!(if query.kind == ReceiptDetailKind::Mapping {
                 "noteMappingPage"

@@ -29,6 +29,7 @@ async fn fixture() -> (tempfile::TempDir, Store, ReceiptDetailQuery) {
         max_wire_bytes: 4096,
         max_source_bytes: 16384,
         operation_envelope: true,
+        context_envelope: false,
         text_id: None,
         offset: None,
     };
@@ -368,4 +369,46 @@ async fn receipt_detail_fragment_source_budget_applies_to_whole_page() {
         query.cursor = Some(next.into());
     }
     assert_eq!(seen, 40);
+}
+
+#[tokio::test]
+async fn receipt_context_uses_original_scope_and_retained_revision_without_live_note() {
+    use intent_core::note_receipt_detail::NoteGetReceiptContextRequest;
+    let (_dir, store, query) = fixture().await;
+    let reference = format!("{KEY}:inverse-detail:0");
+    sqlx::query("INSERT INTO note_operation_detail(operation_key,reference,sequence,value) VALUES(?,?,0,?)")
+        .bind(KEY).bind(&reference)
+        .bind(json!({"kind":"fragment","id":"text","field":"value","offset":0,"text":"original detail","nextRef":null}).to_string())
+        .execute(store.write_pool()).await.unwrap();
+    let request: NoteGetReceiptContextRequest = serde_json::from_value(json!({
+        "backendId":query.scope.backend_id,"workspaceId":"ws","noteId":"deleted-note","noteInstanceId":"original",
+        "sourceRevision":"after","page":{"kind":"context","contextRef":reference}
+    })).unwrap();
+    let page = store
+        .read_note_receipt_context("alice", &request, &json!(1))
+        .await
+        .unwrap();
+    assert_eq!(page["kind"], "noteContextPage");
+    assert_eq!(page["sourceRevision"], "after");
+    assert_eq!(page["snapshotId"], KEY);
+    assert_eq!(page["scope"], serde_json::to_value(&query.scope).unwrap());
+    assert_eq!(page["items"][0]["text"], "original detail");
+    assert!(page["nextCursor"].is_null());
+    for change in 0..4 {
+        let mut bad = request.clone();
+        match change {
+            0 => bad.source_revision = "current".into(),
+            1 => bad.note_instance_id = "recreated".into(),
+            2 => bad.page.context_ref = format!("{KEY}:missing"),
+            _ => bad.page.context_ref = "not-an-owner:detail".into(),
+        }
+        assert!(store
+            .read_note_receipt_context("alice", &bad, &json!(1))
+            .await
+            .is_err());
+    }
+    assert!(store
+        .read_note_receipt_context("bob", &request, &json!(1))
+        .await
+        .is_err());
 }

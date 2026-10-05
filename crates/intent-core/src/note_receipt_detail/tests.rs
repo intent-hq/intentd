@@ -65,3 +65,22 @@ fn receipt_inverse_text_requires_named_text_and_omits_offset_on_continuation() {
         .query()
         .is_err());
 }
+
+#[test]
+fn receipt_context_selects_retained_revision_and_rejects_other_selectors() {
+    let value = json!({"backendId":"b","workspaceId":"w","noteId":"n","noteInstanceId":"i",
+        "sourceRevision":"after","page":{"kind":"context","contextRef":"owner:detail:0"}});
+    let request: NoteGetReceiptContextRequest = serde_json::from_value(value.clone()).unwrap();
+    let query = request
+        .query("11111111-1111-4111-8111-111111111111".into())
+        .unwrap();
+    assert!(query.context_envelope);
+    assert!(!query.operation_envelope);
+    assert_eq!(query.kind, ReceiptDetailKind::Detail);
+    let mut bad = value.clone();
+    bad["payloadDigest"] = json!("a".repeat(64));
+    assert!(serde_json::from_value::<NoteGetReceiptContextRequest>(bad).is_err());
+    let mut bad = value;
+    bad["page"]["maxSourceBytes"] = json!(4096);
+    assert!(serde_json::from_value::<NoteGetReceiptContextRequest>(bad).is_err());
+}

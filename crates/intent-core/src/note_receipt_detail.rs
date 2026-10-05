@@ -94,6 +94,7 @@ pub struct ReceiptDetailQuery {
     pub max_wire_bytes: usize,
     pub max_source_bytes: usize,
     pub operation_envelope: bool,
+    pub context_envelope: bool,
     pub text_id: Option<String>,
     #[serde(skip)]
     pub offset: Option<u64>,
@@ -121,10 +122,14 @@ impl ReceiptDetailQuery {
         if (self.operation_envelope && self.payload_digest.is_none())
             || (!self.operation_envelope
                 && (self.payload_digest.is_some()
-                    || !matches!(
-                        self.kind,
-                        ReceiptDetailKind::Mapping | ReceiptDetailKind::Effects
-                    )))
+                    || if self.context_envelope {
+                        self.kind != ReceiptDetailKind::Detail
+                    } else {
+                        !matches!(
+                            self.kind,
+                            ReceiptDetailKind::Mapping | ReceiptDetailKind::Effects
+                        )
+                    }))
             || [&self.reference]
                 .into_iter()
                 .chain(self.cursor.iter())
@@ -133,7 +138,8 @@ impl ReceiptDetailQuery {
         {
             return Err(NoteMutationError::Invalid);
         }
-        if (self.kind == ReceiptDetailKind::InverseText) != self.text_id.is_some()
+        if (self.context_envelope && self.operation_envelope)
+            || (self.kind == ReceiptDetailKind::InverseText) != self.text_id.is_some()
             || (self.offset.is_some()
                 && (self.cursor.is_some()
                     || !matches!(
@@ -175,6 +181,7 @@ impl NoteGetReceiptRequest {
             max_wire_bytes: self.page.max_wire_bytes.unwrap_or(65536),
             max_source_bytes: 16384,
             operation_envelope: false,
+            context_envelope: false,
             text_id: None,
             offset: None,
         };
@@ -203,11 +210,68 @@ impl NoteOperationReceiptRead {
             max_wire_bytes: self.max_wire_bytes.unwrap_or(65536),
             max_source_bytes: self.max_source_bytes.unwrap_or(16384),
             operation_envelope: true,
+            context_envelope: false,
             text_id: self.text_id,
             offset: self.offset,
         };
         q.validate()?;
         Ok(q)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReceiptContextPage {
+    pub kind: String,
+    pub context_ref: String,
+    pub cursor: Option<String>,
+    pub max_items: Option<usize>,
+    pub max_wire_bytes: Option<usize>,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NoteGetReceiptContextRequest {
+    pub backend_id: String,
+    pub workspace_id: String,
+    pub note_id: String,
+    pub note_instance_id: String,
+    pub source_revision: String,
+    pub page: ReceiptContextPage,
+}
+impl NoteGetReceiptContextRequest {
+    /// Normalize after the Store resolves the opaque reference's original operation.
+    /// # Errors
+    /// Rejects invalid context shape, retained revision identity or budgets.
+    pub fn query(&self, operation_id: String) -> Result<ReceiptDetailQuery, NoteMutationError> {
+        if self.page.kind != "context"
+            || self.source_revision.is_empty()
+            || self.source_revision.len() > 256
+            || self.source_revision.contains('\0')
+        {
+            return Err(NoteMutationError::Invalid);
+        }
+        let query = ReceiptDetailQuery {
+            scope: NoteScope {
+                backend_id: self.backend_id.clone(),
+                workspace_id: self.workspace_id.clone(),
+                note_id: self.note_id.clone(),
+                note_instance_id: self.note_instance_id.clone(),
+            },
+            operation_id,
+            payload_digest: None,
+            kind: ReceiptDetailKind::Detail,
+            reference: self.page.context_ref.clone(),
+            cursor: self.page.cursor.clone(),
+            max_items: self.page.max_items.unwrap_or(128),
+            max_wire_bytes: self.page.max_wire_bytes.unwrap_or(65536),
+            max_source_bytes: 16384,
+            operation_envelope: false,
+            context_envelope: true,
+            text_id: None,
+            offset: None,
+        };
+        query.validate()?;
+        Ok(query)
     }
 }
 
