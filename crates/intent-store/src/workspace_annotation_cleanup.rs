@@ -26,7 +26,10 @@ const HEAD_CHILDREN: [(&str, &str, i64); 9] = [
 /// One scalar statement, nine indexed EXISTS probes, at most 32 owner keys.
 /// Do not COUNT rows or inspect another workspace's preceding head prefix.
 fn presence_query(heads: &[i64]) -> QueryBuilder<'static, Sqlite> {
-    debug_assert!(!heads.is_empty() && heads.len() <= COMMENT_BATCH as usize);
+    debug_assert!(
+        !heads.is_empty()
+            && heads.len() <= usize::try_from(COMMENT_BATCH).expect("positive bounded head batch")
+    );
     let mut query = QueryBuilder::new("SELECT ");
     for (index, (table, _, _)) in HEAD_CHILDREN.iter().enumerate() {
         if index != 0 {

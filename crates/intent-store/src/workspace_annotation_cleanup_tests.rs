@@ -57,7 +57,7 @@ async fn child_count(store: &Store, table: &str, head: i64) -> i64 {
 async fn empty_presence_uses_indexed_owner_probes_and_preserves_keeper() {
     let (_dir, store, doomed, keeper) = fixture().await;
     seed_lines(&store, keeper, 10_000).await;
-    let heads = vec![doomed; COMMENT_BATCH as usize];
+    let heads = vec![doomed; usize::try_from(COMMENT_BATCH).expect("positive bounded head batch")];
     let mut conn = store.read_pool().acquire().await.unwrap();
     let steps = Arc::new(AtomicU64::new(0));
     let counter = Arc::clone(&steps);
@@ -191,7 +191,7 @@ async fn retired_empty_probe_cannot_be_invalidated_by_admitted_annotation_writer
         workspace_id: workspace.clone(),
         note_id: note.clone(),
         computed_at: "t0".into(),
-        attributions: Default::default(),
+        attributions: std::collections::BTreeMap::default(),
     };
     assert!(store
         .publish_note_attribution(&ticket, "x", &data)
