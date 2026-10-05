@@ -11,6 +11,7 @@ use std::sync::{
     Arc,
 };
 
+mod anchor_lifecycle;
 mod artifact_crash;
 mod artifact_pins;
 mod artifact_response;

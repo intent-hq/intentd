@@ -19,7 +19,7 @@ pub(crate) use comments::publish_anchors_in_transaction;
 pub use page::{
     AnchorFilter, AnnotationContextRequest, AnnotationKind, AnnotationPageRequest, AnnotationRange,
 };
-pub(crate) use source_anchors::rebuild_note_anchors;
+pub(crate) use source_anchors::{rebuild_note_anchors, rebuild_pending_source_anchors};
 #[cfg(test)]
 pub(crate) use source_anchors::{FinalizerPause, FINALIZER_PAUSE};
 

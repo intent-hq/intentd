@@ -434,20 +434,16 @@ impl Store {
         // and leave the read pool cold until the first actual read.
         let note_pages = std::sync::Arc::new(
             Box::pin(async {
-                let mut index_conn = write_pool
-                    .acquire()
-                    .await
-                    .map_err(|e| Error::Internal(format!("note index open: {e}")))?;
-                sqlx::query("BEGIN IMMEDIATE")
-                    .execute(&mut *index_conn)
-                    .await
-                    .map_err(|e| Error::Internal(format!("note index begin: {e}")))?;
+                let mut index_conn =
+                    note_write_connection::NoteWriteConnection::begin_pool(&write_pool).await?;
                 let indexed = async {
                     note_page_index::retire_changed_profiles(&mut index_conn).await?;
-                    note_page_index::rebuild_pending(&mut index_conn).await
+                    note_page_index::rebuild_pending(&mut index_conn).await?;
+                    note_annotation_repo::rebuild_pending_source_anchors(&mut index_conn).await
                 }
                 .await;
-                commit_with_rollback_guard(index_conn, indexed, "note index backfill commit")
+                index_conn
+                    .finish(indexed, "note index backfill commit")
                     .await?;
                 note_page_repo::Runtime::open(&write_pool).await
             })

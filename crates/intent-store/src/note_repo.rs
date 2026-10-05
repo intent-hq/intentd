@@ -753,15 +753,7 @@ impl Store {
         let workspace_id = workspace_id.clone();
 
         crate::with_write_txn_retry(|| async {
-            let mut conn = self
-                .write_pool()
-                .acquire()
-                .await
-                .map_err(|e| Error::Internal(format!("adopt_spec acquire failed: {e}")))?;
-            sqlx::query("BEGIN IMMEDIATE")
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| Error::Internal(format!("begin adopt_spec tx failed: {e}")))?;
+            let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
 
             let body_result = async {
                 // Re-check the "no `id='spec'`" precondition *inside* the tx: the
@@ -884,12 +876,21 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("move spec comments failed: {e}")))?;
                 crate::note_page_index::rebuild_pending(&mut conn).await?;
+                // The direct children's parent update also invalidates their
+                // annotation heads. Finalize after every identity/root move.
+                let affected: Vec<String> = sqlx::query_scalar(
+                    "SELECT id FROM note WHERE workspace_id=? AND (id='spec' OR parent_id='spec') ORDER BY id",
+                ).bind(workspace_id.as_str()).fetch_all(&mut *conn).await
+                    .map_err(|e| Error::Internal(format!("read adopted note scopes: {e}")))?;
+                for id in affected {
+                    crate::note_annotation_repo::rebuild_note_anchors(&mut conn, &workspace_id, &NoteId(id), None).await?;
+                }
+
                 Ok(Some((NoteId(old_id), title)))
             }
             .await;
 
-            crate::commit_with_rollback_guard(conn, body_result, "commit adopt_spec tx failed")
-                .await
+            conn.finish(body_result, "commit adopt_spec tx failed").await
         })
         .await
     }

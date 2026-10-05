@@ -147,6 +147,23 @@ pub(crate) async fn rebuild_note_anchors(
     publish_anchors_in_transaction(conn, workspace, note, &epochs, &occurrences).await
 }
 
+/// Startup-only repair of derived readiness. The keyset retains one note's
+/// identity and body at a time; retirement is durable and must not be resumed
+/// by publishing partial annotations. This remains write-sized backfill work.
+pub(crate) async fn rebuild_pending_source_anchors(conn: &mut SqliteConnection) -> Result<()> {
+    let mut after = 0_i64;
+    loop {
+        let next: Option<(i64, String, String)> = sqlx::query_as(
+            "SELECT h.id,h.workspace_id,h.note_id FROM note_annotation_head h WHERE h.id>? AND h.anchors_rev!=h.source_rev AND NOT EXISTS(SELECT 1 FROM note_annotation_workspace_retirement r WHERE r.workspace_id=h.workspace_id) ORDER BY h.id LIMIT 1"
+        ).bind(after).fetch_optional(&mut *conn).await.map_err(db_error)?;
+        let Some((id, workspace, note)) = next else {
+            return Ok(());
+        };
+        rebuild_note_anchors(conn, &WorkspaceId(workspace), &NoteId(note), None).await?;
+        after = id;
+    }
+}
+
 #[cfg(test)]
 #[path = "source_anchors_tests.rs"]
 mod tests;

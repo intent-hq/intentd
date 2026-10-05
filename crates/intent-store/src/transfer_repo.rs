@@ -575,6 +575,7 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("transfer import begin failed: {e}")))?;
         reclaim_imported_metadata(&mut tx, rows).await?;
+        let mut anchor_notes = std::collections::BTreeSet::<(String, String)>::new();
         let mut inserted = 0usize;
         for (table, _) in TRANSFER_TABLES {
             let Some((_, objects)) = rows.iter().find(|(t, _)| t == table) else {
@@ -707,9 +708,26 @@ impl Store {
                 } else {
                     None
                 };
-                query.execute(&mut *tx).await.map_err(|e| {
+                let written = query.execute(&mut *tx).await.map_err(|e| {
                     Error::Internal(format!("transfer import insert into {table} failed: {e}"))
                 })?;
+                // Resolve the actual stored identity (including SQLite's
+                // coercions), not unvalidated archive labels. Keep IDs only.
+                let scope_sql = match *table {
+                    "note" => Some("SELECT workspace_id,id FROM note WHERE rowid=?"),
+                    "comment" => Some("SELECT workspace_id,note_id FROM comment WHERE rowid=?"),
+                    _ => None,
+                };
+                if let Some(scope_sql) = scope_sql {
+                    let (workspace, note): (String, Option<String>) = sqlx::query_as(scope_sql)
+                        .bind(written.last_insert_rowid())
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(|e| Error::Internal(format!("read imported note scope: {e}")))?;
+                    if let Some(note) = note {
+                        anchor_notes.insert((workspace, note));
+                    }
+                }
                 if *table == "note" {
                     crate::note_page_index::rebuild_pending(&mut tx).await?;
                 }
@@ -840,6 +858,17 @@ impl Store {
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("materialize imported counts failed: {e}")))?;
+        }
+        // Comments arrive after notes. Publish only after the last imported
+        // root/reply, hydrating one affected note at a time inside this writer.
+        for (workspace, note) in anchor_notes {
+            crate::note_annotation_repo::rebuild_note_anchors(
+                &mut tx,
+                &WorkspaceId(workspace),
+                &intent_core::NoteId(note),
+                None,
+            )
+            .await?;
         }
         tx.commit()
             .await
@@ -2011,12 +2040,93 @@ mod tests {
         );
     }
 
+    // Bootstrap history is portable workspace state, not a daemon-local ID.
+    // An intentionally empty registry must remain initialized after transfer;
+    // older archives without the marker retain the schema default, with an
+    // imported script establishing initialization through the existing trigger.
+    #[tokio::test]
+    async fn transfer_preserves_script_initialization_and_legacy_defaults() {
+        let source_db = TempDb::new();
+        let source = Store::open(&source_db.path).await.unwrap();
+        let workspace = serde_json::json!({
+            "id":"script-history", "title":"Scripts", "branch":"main",
+            "created_at":"t0", "updated_at":"t0"
+        });
+        let script = serde_json::json!({
+            "id":"script-history-command", "workspace_id":"script-history",
+            "name":"Command", "command":"true", "mode":"command",
+            "source":"user", "created_at":"t0"
+        });
+        source
+            .transfer_import_rows(&[
+                ("workspace".into(), vec![workspace]),
+                ("script".into(), vec![script.clone()]),
+            ])
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM script WHERE workspace_id = 'script-history'")
+            .execute(source.write_pool())
+            .await
+            .unwrap();
+        let mut exported = source
+            .transfer_export_rows(&WorkspaceId::from("script-history"))
+            .await
+            .unwrap();
+        let workspace_row = &exported
+            .iter()
+            .find(|(table, _)| table == "workspace")
+            .unwrap()
+            .1[0];
+        assert_eq!(workspace_row["scripts_initialized"], 1);
+        assert!(exported
+            .iter()
+            .find(|(table, _)| table == "script")
+            .unwrap()
+            .1
+            .is_empty());
+        for (legacy, with_script, expected) in
+            [(false, false, 1_i64), (true, false, 0), (true, true, 1)]
+        {
+            if legacy {
+                exported
+                    .iter_mut()
+                    .find(|(table, _)| table == "workspace")
+                    .unwrap()
+                    .1[0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("scripts_initialized");
+            }
+            if with_script {
+                exported
+                    .iter_mut()
+                    .find(|(table, _)| table == "script")
+                    .unwrap()
+                    .1
+                    .push(script.clone());
+            }
+            let target_db = TempDb::new();
+            let target = Store::open(&target_db.path).await.unwrap();
+            target.transfer_import_rows(&exported).await.unwrap();
+            let initialized: i64 = sqlx::query_scalar(
+                "SELECT scripts_initialized FROM workspace WHERE id = 'script-history'",
+            )
+            .fetch_one(target.read_pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                initialized, expected,
+                "legacy={legacy}, with_script={with_script}"
+            );
+        }
+    }
+
     /// Expected column list of every [`TRANSFER_TABLES`] table, in
     /// declaration order. Regenerate from the failure output of
     /// `transferred_table_columns_match_snapshot` after deciding what the
     /// column change means for transfer (see that test's message).
     const TRANSFERRED_COLUMNS: &str = "\
-workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, browser_client_id, legacy_author_principal_id, owner_principal_id, last_content_activity
+workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, browser_client_id, legacy_author_principal_id, owner_principal_id, last_content_activity, scripts_initialized
 note: id, workspace_id, title, content, content_type, tags, is_pinned, is_archived, is_default, parent_id, visibility, task_json, created_at, updated_at, rev
 note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content, rev
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json

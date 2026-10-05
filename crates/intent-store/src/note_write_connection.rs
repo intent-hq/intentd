@@ -13,8 +13,11 @@ pub(crate) struct NoteWriteConnection(Option<PoolConnection<Sqlite>>);
 
 impl NoteWriteConnection {
     pub(crate) async fn begin(store: &Store) -> Result<Self> {
-        let conn = store
-            .write_pool()
+        Self::begin_pool(store.write_pool()).await
+    }
+
+    pub(crate) async fn begin_pool(pool: &sqlx::SqlitePool) -> Result<Self> {
+        let conn = pool
             .acquire()
             .await
             .map_err(|e| Error::Internal(format!("acquire connection failed: {e}")))?;
