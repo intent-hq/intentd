@@ -3701,6 +3701,192 @@ async fn context_recovery_groups_over_wss(
     drop(daemon);
 }
 
+/// Fresh direct sources must keep their persisted row identity through
+/// capture and recovery, so restart cannot replay the original huge text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn context_recovery_fresh_direct_prepend_over_wss() {
+    fresh_direct_context_recovery_over_wss(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn context_recovery_fresh_direct_both_over_wss() {
+    fresh_direct_context_recovery_over_wss(true).await;
+}
+
+async fn fresh_direct_context_recovery_over_wss(oversized_current: bool) {
+    let Some(script) = gate("WSS fresh direct recovery sources") else {
+        return;
+    };
+    let tmp = temp_data_dir();
+    let data_dir = tmp.path();
+    let (workspace_id, _) = seed_workspace_with_guest(data_dir).await;
+    let held = data_dir.join("fresh-source-held");
+    let source = format!("fresh-direct-source {}", "S".repeat(33 * 1024));
+    let current = format!(
+        "fresh-direct-current {}",
+        "C".repeat(if oversized_current { 33 * 1024 } else { 64 })
+    );
+    let images = json!([{"type":"image","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==","mimeType":"image/png"}]);
+    let error = json!({"code":-32603,"message":"HTTP 413 context too large"});
+    let rules = [
+        json!({"ifPromptContains":"fresh-direct-current","promptRpcError":error}),
+        json!({"ifPromptContains":"fresh-direct-source","releaseFile":held}),
+    ];
+    let Booted {
+        daemon,
+        port,
+        cfg,
+        prompt_log,
+    } = boot_daemon(data_dir, &script, 0, None, &rules).await;
+    let mut rpc = connect_ws(port, cfg).await;
+    let created = wss_rpc(&mut rpc, 1, "agent.create", json!({"workspaceId":workspace_id,"name":"Fresh recovery","provider":"mock","model":"default"})).await;
+    let agent = created["agent"]["id"].as_str().unwrap();
+    let first = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.sendMessage",
+        json!({"workspaceId":workspace_id,"agentId":agent,"content":source,"imageBlocks":images}),
+    )
+    .await;
+    assert_eq!(first["queued"], false);
+    await_prompts(&prompt_log, 1).await;
+    let second = wss_rpc(&mut rpc, 3, "agent.sendMessage", json!({"workspaceId":workspace_id,"agentId":agent,"content":current,"imageBlocks":images,"priority":"interrupt"})).await;
+    assert_eq!(second["queued"], false);
+    await_prompts(&prompt_log, 2).await;
+    let recovered = await_recovery_queue(&mut rpc, agent).await;
+    assert_eq!(recovered["queue"].as_array().unwrap().len(), 1);
+    let groups = recovered["queue"][0]["deliveryGroups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert!(groups[0]["content"].as_str().unwrap().chars().count() < 1024);
+    if oversized_current {
+        assert!(groups[1]["content"].as_str().unwrap().chars().count() < 1024);
+    } else {
+        assert_eq!(groups[1]["content"], current);
+    }
+    for group in groups {
+        assert_eq!(group["imageBlocks"], images);
+    }
+    drop(rpc);
+    drop(daemon);
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    let rows = store.load_all_agent_queues().await.unwrap();
+    let saved = rows
+        .iter()
+        .find(|row| row.agent_id.0 == agent)
+        .unwrap()
+        .payload
+        .clone();
+    assert_eq!(saved["deliveryGroups"][0]["sourceId"], first["messageId"]);
+    assert_eq!(saved["deliveryGroups"][1]["sourceId"], second["messageId"]);
+    assert_ne!(first["messageId"], second["messageId"]);
+    assert_eq!(saved["deliveryGroups"][0]["isPrepend"], true);
+    assert_eq!(saved["deliveryGroups"][1]["isPrepend"], false);
+    drop(store);
+    // Empty contains marker would not select a rule. A space matches every
+    // assembled prompt, forcing a second context failure of the recovered turn.
+    let repeat = json!({"ifPromptContains":" ","promptRpcError":error});
+    let Booted {
+        daemon,
+        port,
+        cfg,
+        prompt_log,
+    } = boot_daemon(data_dir, &script, 0, None, &[repeat]).await;
+    let mut rpc = connect_ws(port, cfg).await;
+    let restarted = wss_rpc(&mut rpc, 4, "agent.getQueue", json!({"agentId":agent})).await;
+    assert_eq!(
+        restarted["queue"][0]["deliveryGroups"],
+        recovered["queue"][0]["deliveryGroups"]
+    );
+    assert_eq!(
+        restarted["queue"][0]["turnId"],
+        recovered["queue"][0]["turnId"]
+    );
+    wss_rpc(
+        &mut rpc,
+        5,
+        "agent.sendQueuedMessageNow",
+        json!({"workspaceId":workspace_id,"agentId":agent,"messageId":restarted["queue"][0]["id"]}),
+    )
+    .await;
+    await_prompts(&prompt_log, 3).await;
+    let repeated = await_recovery_queue(&mut rpc, agent).await;
+    assert_eq!(repeated["queue"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        repeated["queue"][0]["deliveryGroups"],
+        recovered["queue"][0]["deliveryGroups"]
+    );
+    drop(rpc);
+    drop(daemon);
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    let rows = store.load_all_agent_queues().await.unwrap();
+    let after = rows
+        .iter()
+        .find(|row| row.agent_id.0 == agent)
+        .unwrap()
+        .payload
+        .clone();
+    assert_eq!(after["deliveryGroups"], saved["deliveryGroups"]);
+    assert_eq!(after["recoverySources"], saved["recoverySources"]);
+    drop(store);
+    let records: Vec<Value> = std::fs::read_to_string(&prompt_log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let blocks = records.last().unwrap()["blocks"].as_array().unwrap();
+    assert!(!blocks.iter().any(|block| block["text"]
+        .as_str()
+        .is_some_and(|text| text.contains(&source))));
+    if oversized_current {
+        assert!(!blocks.iter().any(|block| block["text"]
+            .as_str()
+            .is_some_and(|text| text.contains(&current))));
+    }
+    assert_eq!(
+        blocks
+            .iter()
+            .filter(|block| block["type"] == "image")
+            .count(),
+        2
+    );
+    let mut previous = None;
+    for group in groups {
+        let positions: Vec<_> = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(group["content"].as_str().unwrap()))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(positions.len(), 1);
+        let index = positions[0];
+        assert_eq!(blocks[index + 1]["type"], "image");
+        assert_eq!(blocks[index + 1]["data"], images[0]["data"]);
+        if let Some(previous) = previous {
+            assert!(index > previous);
+        }
+        previous = Some(index);
+    }
+    let name = if oversized_current {
+        "fresh-direct-both"
+    } else {
+        "fresh-direct-prepend"
+    };
+    let artifact = save_group_artifact(
+        data_dir,
+        &format!("context-recovery-{name}.json"),
+        &json!({"firstSend":first,"interruptSend":second,"recoveredQueue":recovered,"restartedQueue":restarted,"repeatedQueue":repeated,"persistedRecovery":saved,"repeatedPersistence":after,"prompts":records}),
+    );
+    eprintln!("CONTEXT_RECOVERY_GROUPS_ARTIFACT {}", artifact.display());
+}
+
 /// Keep repeatable evidence outside temporary daemon data when requested.
 fn save_group_artifact(data_dir: &Path, name: &str, evidence: &serde_json::Value) -> PathBuf {
     let directory = std::env::var_os("INTENT_QUEUED_GROUP_ARTIFACT_DIR")
