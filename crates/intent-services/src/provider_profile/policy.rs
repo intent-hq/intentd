@@ -196,6 +196,29 @@ impl ServerMatcher {
 }
 
 impl HostPolicySnapshot {
+    /// Native Claude URL matching includes origin/path/normalization/expansion
+    /// semantics beyond the candidate parser. Production staging defers these
+    /// policies as a whole until that matcher is proven, never raw-string denies.
+    pub(super) fn has_unverified_claude_matchers(&self) -> bool {
+        self.restrictions.iter().any(|r| {
+            r.allow_semantics == AllowSemantics::ClaudeTransportSelectors
+                && r.allow
+                    .iter()
+                    .flatten()
+                    .chain(&r.deny)
+                    .any(|m| match &m.identity {
+                        Identity::Url(_) => true,
+                        Identity::Command { executable, args } => {
+                            executable.contains("${")
+                                || args.iter().flatten().any(
+                                    |v| matches!(v, ValueMatcher::Exact(s) if s.contains("${")),
+                                )
+                        }
+                        _ => false,
+                    })
+        })
+    }
+
     /// Validate expanded original identity, before transport/cwd wrappers.
     /// # Errors
     /// Denied when any applicable allowlist or deny rule rejects this server.

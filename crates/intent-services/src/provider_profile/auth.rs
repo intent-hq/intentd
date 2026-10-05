@@ -124,12 +124,17 @@ pub fn project_claude_settings(value: &Value) -> ProfileResult<Value> {
     let object = value
         .as_object()
         .ok_or(ProfileError::InvalidAuth("invalid Claude settings"))?;
-    if object
-        .get("apiKeyHelper")
-        .is_some_and(|v| v.as_str() != Some(""))
+    if [
+        "apiKeyHelper",
+        "awsAuthRefresh",
+        "awsCredentialExport",
+        "gcpAuthRefresh",
+    ]
+    .iter()
+    .any(|key| object.get(*key).is_some_and(|v| v.as_str() != Some("")))
     {
         return Err(ProfileError::InvalidAuth(
-            "apiKeyHelper requires an explicitly authorized credential integration",
+            "authentication helpers require an explicitly authorized credential integration",
         ));
     }
     let mut projected = Map::new();
@@ -144,6 +149,11 @@ pub fn project_claude_settings(value: &Value) -> ProfileResult<Value> {
         ))?;
         let mut safe = Map::new();
         for (key, value) in env {
+            if unsupported_claude_route(key) {
+                return Err(ProfileError::InvalidAuth(
+                    "unsupported Claude credential route",
+                ));
+            }
             if credential_env_allowed("claude-code", key) {
                 if !value.is_string() {
                     return Err(ProfileError::InvalidAuth(
@@ -279,4 +289,18 @@ impl CredentialKind {
             Self::Grok => ("grok", "auth.json"),
         }
     }
+}
+
+// These routes carry refresh, hand-off or credential precedence semantics that
+// the current managed profile does not acquire. Never silently drop them.
+pub(super) fn unsupported_claude_route(key: &str) -> bool {
+    key.starts_with("CLAUDE_CODE_USE_")
+        || matches!(
+            key,
+            "ANTHROPIC_AUTH_TOKEN"
+                | "ANTHROPIC_PROFILE"
+                | "ANTHROPIC_CONFIG_DIR"
+                | "CLAUDE_CODE_OAUTH_TOKEN"
+                | "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"
+        )
 }

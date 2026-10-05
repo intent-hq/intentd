@@ -43,22 +43,26 @@ impl DeferredReason {
 /// Missing local files alone do not justify `LocalFilesOnly`. For organization
 /// accounts supply effective restrictions (native precedence already resolved)
 /// through additional sources; otherwise use `Unresolved`. No default is provided.
+#[cfg(test)]
 #[derive(Clone, Copy)]
-pub enum PolicyAuthority {
+pub(super) enum PolicyAuthority {
     LocalFilesOnly,
+    #[cfg(test)]
     EffectiveSourcesResolved,
+    #[cfg(test)]
     Unresolved,
 }
 
-pub struct PolicyAcquisition<'a> {
+pub(super) struct PolicyAcquisition<'a> {
     /// Actual system root (normally /etc); injection exists for fixture hosts.
     pub etc_root: &'a Path,
+    #[cfg(test)]
     pub authority: PolicyAuthority,
     /// Host-wide Intent policy and resolved effective native sources, if any.
     pub additional: &'a [policy::PolicySource],
 }
 
-pub struct SelectionRequest<'a> {
+pub(super) struct SelectionRequest<'a> {
     pub provider: &'a str,
     pub runtime: RuntimeIdentity<'a>,
     /// Mandatory for the verified Claude ACP path; native CLI needs no SDK.
@@ -123,7 +127,7 @@ pub(super) fn runtime_decision(
 /// Policy denial of a particular catalog is checked by the selected builder and
 /// cannot become a legacy fallback.
 #[must_use]
-pub fn select(request: SelectionRequest<'_>) -> ProfileSelection<'_> {
+pub(super) fn select(request: SelectionRequest<'_>) -> ProfileSelection<'_> {
     if let Err(reason) = runtime_decision(
         request.provider,
         &request.runtime,
@@ -132,6 +136,7 @@ pub fn select(request: SelectionRequest<'_>) -> ProfileSelection<'_> {
     ) {
         return ProfileSelection::Deferred(reason);
     }
+    #[cfg(test)]
     if matches!(request.policy.authority, PolicyAuthority::Unresolved) {
         return ProfileSelection::Deferred(DeferredReason::PolicyAuthority);
     }
@@ -143,7 +148,12 @@ pub fn select(request: SelectionRequest<'_>) -> ProfileSelection<'_> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return ProfileSelection::Deferred(DeferredReason::PolicyAcquisition),
         }
-        if request.auth_model.endpoint.is_some()
+        if request
+            .auth_model
+            .credential_environment
+            .keys()
+            .any(|key| auth::unsupported_claude_route(key))
+            || request.auth_model.endpoint.is_some()
             || request.auth_model.codex_routing_toml.is_some()
             || request
                 .auth_model
@@ -161,6 +171,9 @@ pub fn select(request: SelectionRequest<'_>) -> ProfileSelection<'_> {
     ) else {
         return ProfileSelection::Deferred(DeferredReason::PolicyAcquisition);
     };
+    if policy.has_unverified_claude_matchers() {
+        return ProfileSelection::Deferred(DeferredReason::PolicyAcquisition);
+    }
     ProfileSelection::Managed(Box::new(ManagedProfilePlan { request, policy }))
 }
 
