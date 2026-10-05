@@ -2,7 +2,7 @@
 //! This tests server admission/lifetime, not configured native-editor capture.
 use super::{boot, connect, wss_rpc, wss_rpc_raw};
 use intent_core::note_stage::{NoteStageAppend, NoteStageBegin, NoteStageSeal};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
@@ -16,7 +16,7 @@ fn reference(id: &str, text: &str) -> Value {
             });
     json!({"textId":id,"length":text.encode_utf16().count(),"utf8Bytes":text.len(),"sha256":hash})
 }
-fn resource(id: &str, value: Value) -> (Value, Value) {
+fn resource(id: &str, value: &Value) -> (Value, Value) {
     let text = intent_core::note_artifact::canonical::canonical_json(&value.to_string()).unwrap();
     (
         json!({"kind":"text","id":id,"offset":0,"text":text}),
@@ -91,7 +91,7 @@ async fn public_staged_inherited_marker_seal_pins_ownership_and_preserves_replay
         identity["headerDigest"] = json!(begin.header_digest);
         let (descriptor, detail) = resource(
             "descriptor",
-            json!({"version":1,"nodeType":"commentAnchor","parentOrdinal":null,"nativeRange":{"from":3,"to":4},"attributesRef":"attrs"}),
+            &json!({"version":1,"nodeType":"commentAnchor","parentOrdinal":null,"nativeRange":{"from":3,"to":4},"attributesRef":"attrs"}),
         );
         let mut texts = vec![descriptor];
         for (id, value) in [
@@ -116,7 +116,7 @@ async fn public_staged_inherited_marker_seal_pins_ownership_and_preserves_replay
                 json!({"id":"type-attribute","parentId":"root","key":"type","type":"string","valueRef":"type-value"}),
             ),
         ] {
-            texts.push(resource(id, value).0);
+            texts.push(resource(id, &value).0);
         }
         for (id, text) in [
             ("comment-value", root.to_owned()),
