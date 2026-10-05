@@ -4,8 +4,8 @@
 use intent_core::{
     note_mutation::NoteMutationError,
     note_stage::{
-        NoteStageAppend, NoteStageHeader, NoteStageSeal, NoteStageStream, NoteStageTail,
-        NOTE_STAGE_STREAMS,
+        NoteStageAppend, NoteStageHeader, NoteStageRecord, NoteStageSeal, NoteStageStream,
+        NoteStageTail, NoteStageTextReference, NOTE_STAGE_STREAMS,
     },
     Error, Result,
 };
@@ -15,6 +15,18 @@ use sqlx::{Row, SqliteConnection};
 
 fn db(error: impl std::fmt::Display) -> Error {
     Error::Internal(format!("note stage seal: {error}"))
+}
+fn hex_digest(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|b| {
+            [
+                char::from(HEX[usize::from(b >> 4)]),
+                char::from(HEX[usize::from(b & 15)]),
+            ]
+        })
+        .collect()
 }
 fn invalid() -> Error {
     Error::NoteMutation(NoteMutationError::Invalid)
@@ -228,11 +240,7 @@ pub(super) async fn verify_text(
     if position != length || bytes != utf8_bytes {
         return Err(invalid());
     }
-    let sha256 = hash
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let sha256 = hex_digest(hash.finalize().as_ref());
     Ok(VerifiedText {
         length,
         utf8_bytes,
@@ -322,6 +330,421 @@ pub(super) fn projection_descriptor(
         native_from,
         native_to,
         attributes_ref,
+    })
+}
+
+const SAFE_LENGTH: u64 = 9_007_199_254_740_991;
+
+/// A prepared immutable piece view, not a published sealed operation. Resolved
+/// live descriptor/metadata graph and provenance checks must finish before the
+/// owning transaction may publish it. The wrapper checks current authorization,
+/// cancellation and ORIGINAL expiry again immediately before publication.
+#[derive(Debug)]
+pub(super) struct PreparedView {
+    pub(super) view_id: String,
+    pub(super) length: u64,
+    pub(super) generation: u64,
+}
+
+fn integer(value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|_| invalid())
+}
+fn extent(value: i64) -> Result<u64> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value <= SAFE_LENGTH)
+        .ok_or_else(invalid)
+}
+fn sum(a: u64, b: u64) -> Result<u64> {
+    a.checked_add(b)
+        .filter(|value| *value <= SAFE_LENGTH)
+        .ok_or_else(invalid)
+}
+
+/// Verify all text IDs once at seal, keeping their digests in indexed storage.
+/// Appends must clear a text's cache on mutation. Do not reuse this cache outside
+/// the enclosing immutable seal transaction until the operation is sealed.
+async fn cache_text_digests(conn: &mut SqliteConnection, operation: &str) -> Result<()> {
+    let mut after: Option<String> = None;
+    loop {
+        let id:Option<String> = match &after {
+            None => sqlx::query_scalar("SELECT text_id FROM note_stage_text WHERE operation_key=? ORDER BY text_id LIMIT 1")
+                .bind(operation).fetch_optional(&mut *conn).await.map_err(db)?,
+            Some(after) => sqlx::query_scalar("SELECT text_id FROM note_stage_text WHERE operation_key=? AND text_id>? ORDER BY text_id LIMIT 1")
+                .bind(operation).bind(after).fetch_optional(&mut *conn).await.map_err(db)?,
+        };
+        let Some(id) = id else {
+            break;
+        };
+        if id.is_empty() || id.len() > 256 || id.contains('\0') {
+            return Err(invalid());
+        }
+        let verified = verify_text(conn, operation, &id).await?;
+        sqlx::query("UPDATE note_stage_text SET sha256=? WHERE operation_key=? AND text_id=?")
+            .bind(verified.sha256)
+            .bind(operation)
+            .bind(&id)
+            .execute(&mut *conn)
+            .await
+            .map_err(db)?;
+        after = Some(id);
+    }
+    Ok(())
+}
+
+async fn verify_reference(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    reference: &NoteStageTextReference,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT length,utf8_bytes,sha256 FROM note_stage_text WHERE operation_key=? AND text_id=?",
+    )
+    .bind(operation)
+    .bind(&reference.text_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db)?
+    .ok_or_else(invalid)?;
+    if extent(row.get("length"))? != reference.length
+        || extent(row.get("utf8_bytes"))? != reference.utf8_bytes
+        || row.get::<Option<String>, _>("sha256").as_deref() != Some(reference.sha256.as_str())
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+// Primary-key keyset continuation, one <=64KiB encoded record at a time. Semantic
+// ordinals may reset per history group; chunk-local ordinals never do.
+async fn next_record(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    stream: &str,
+    after: &mut (i64, i64),
+) -> Result<Option<NoteStageRecord>> {
+    let row=sqlx::query("SELECT chunk_sequence,ordinal,value FROM note_stage_record WHERE operation_key=? AND stream=? AND (chunk_sequence,ordinal)>(?,?) ORDER BY chunk_sequence,ordinal LIMIT 1")
+        .bind(operation).bind(stream).bind(after.0).bind(after.1).fetch_optional(&mut *conn).await.map_err(db)?;
+    let Some(row) = row else { return Ok(None) };
+    *after = (row.get("chunk_sequence"), row.get("ordinal"));
+    let raw: &str = row.get("value");
+    if raw.len() > 65536 {
+        return Err(invalid());
+    }
+    Ok(Some(serde_json::from_str(raw).map_err(db)?))
+}
+
+struct ViewPiece {
+    start: u64,
+    end: u64,
+    origin_kind: String,
+    origin_id: String,
+    origin_start: u64,
+}
+async fn view_piece(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    generation: u64,
+    offset: u64,
+) -> Result<ViewPiece> {
+    let row=sqlx::query("SELECT start,end,origin_kind,origin_id,origin_start FROM note_stage_view_piece WHERE operation_key=? AND generation=? AND start<=? ORDER BY start DESC LIMIT 1")
+        .bind(operation).bind(integer(generation)?).bind(integer(offset)?).fetch_optional(&mut *conn).await.map_err(db)?.ok_or_else(invalid)?;
+    let piece = ViewPiece {
+        start: extent(row.get("start"))?,
+        end: extent(row.get("end"))?,
+        origin_kind: row.get("origin_kind"),
+        origin_id: row.get("origin_id"),
+        origin_start: extent(row.get("origin_start"))?,
+    };
+    if piece.start > offset || piece.end <= offset {
+        return Err(invalid());
+    }
+    Ok(piece)
+}
+
+fn scalar_boundary(text: &str, offset: u64) -> bool {
+    let mut units = 0;
+    for c in text.chars() {
+        if units == offset {
+            return true;
+        }
+        units += u64::try_from(c.len_utf16()).expect("scalar UTF16 length fits");
+        if units > offset {
+            return false;
+        }
+    }
+    units == offset
+}
+
+async fn view_boundary(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    generation: u64,
+    length: u64,
+    offset: u64,
+) -> Result<()> {
+    if offset > length {
+        return Err(invalid());
+    }
+    if offset == 0 || offset == length {
+        return Ok(());
+    }
+    let piece = view_piece(conn, operation, generation, offset).await?;
+    if offset == piece.start {
+        return Ok(());
+    }
+    let origin = sum(piece.origin_start, offset - piece.start)?;
+    let (start,end,text)=match piece.origin_kind.as_str() {
+        "root"=>super::source::source_piece(conn,&piece.origin_id,integer(origin)?).await?,
+        "text"=>sqlx::query_as::<_,(i64,i64,String)>("SELECT start,end,text FROM note_stage_text_piece WHERE operation_key=? AND text_id=? AND start<=? ORDER BY start DESC LIMIT 1")
+            .bind(operation).bind(&piece.origin_id).bind(integer(origin)?).fetch_optional(&mut *conn).await.map_err(db)?.ok_or_else(invalid)?,
+        _=>return Err(invalid()),
+    };
+    let start = extent(start)?;
+    let end = extent(end)?;
+    if start > origin
+        || end <= origin
+        || text.len() > 4096
+        || end - start != u64::try_from(text.encode_utf16().count()).map_err(db)?
+        || !scalar_boundary(&text, origin - start)
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+async fn insert_piece(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    generation: u64,
+    output: &mut u64,
+    length: u64,
+    origin: (&str, &str, u64),
+) -> Result<()> {
+    if length == 0 {
+        return Ok(());
+    }
+    let (kind, id, origin_start) = origin;
+    let end = sum(*output, length)?;
+    sqlx::query("INSERT INTO note_stage_view_piece(operation_key,generation,start,end,origin_kind,origin_id,origin_start) VALUES(?,?,?,?,?,?,?)")
+        .bind(operation).bind(integer(generation)?).bind(integer(*output)?).bind(integer(end)?).bind(kind).bind(id).bind(integer(origin_start)?).execute(&mut *conn).await.map_err(db)?;
+    *output = end;
+    Ok(())
+}
+
+async fn copy_range(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    input: u64,
+    output_generation: u64,
+    start: u64,
+    end: u64,
+    output: &mut u64,
+) -> Result<()> {
+    let mut position = start;
+    while position < end {
+        let piece = view_piece(conn, operation, input, position).await?;
+        let next = end.min(piece.end);
+        insert_piece(
+            conn,
+            operation,
+            output_generation,
+            output,
+            next - position,
+            (
+                &piece.origin_kind,
+                &piece.origin_id,
+                sum(piece.origin_start, position - piece.start)?,
+            ),
+        )
+        .await?;
+        position = next;
+    }
+    Ok(())
+}
+
+struct DirtyGroup {
+    local_sequence: u64,
+    generation: u64,
+    input_generation: u64,
+    input_length: u64,
+    consumed: u64,
+    output: u64,
+}
+async fn finish_group(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    mut group: DirtyGroup,
+) -> Result<(u64, u64)> {
+    copy_range(
+        conn,
+        operation,
+        group.input_generation,
+        group.generation,
+        group.consumed,
+        group.input_length,
+        &mut group.output,
+    )
+    .await?;
+    sqlx::query("UPDATE note_stage_view SET length=? WHERE operation_key=? AND generation=?")
+        .bind(integer(group.output)?)
+        .bind(operation)
+        .bind(integer(group.generation)?)
+        .execute(&mut *conn)
+        .await
+        .map_err(db)?;
+    Ok((group.generation, group.output))
+}
+
+/// Prepare chronological external piece views in the caller's write transaction.
+/// Every error requires rollback, including cached hashes and partial generations.
+/// Does NOT publish a sealed phase: live metadata/provenance validation is still
+/// required. Work is O(upload bytes + records + copied descriptors per group),
+/// and retained descriptor storage may grow with every history group. No complete
+/// source string or operation-sized collection enters Rust. Mutation records are
+/// checked against the final DIRTY view but are not applied during this phase.
+pub(super) async fn prepare_frozen_view(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    header: &NoteStageHeader,
+    request: &NoteStageSeal,
+    root_key: &str,
+) -> Result<PreparedView> {
+    verify_manifest(conn, operation, header, request).await?;
+    cache_text_digests(conn, operation).await?;
+    let base: i64 =
+        sqlx::query_scalar("SELECT source_length FROM note_stage_root WHERE root_key=?")
+            .bind(root_key)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(db)?
+            .ok_or_else(invalid)?;
+    let mut length = extent(base)?;
+    let mut generation = 0;
+    sqlx::query("INSERT INTO note_stage_view(operation_key,generation,input_generation,history_group,length) VALUES(?,0,NULL,NULL,?)")
+        .bind(operation).bind(base).execute(&mut *conn).await.map_err(db)?;
+    let mut output = 0;
+    insert_piece(
+        conn,
+        operation,
+        0,
+        &mut output,
+        length,
+        ("root", root_key, 0),
+    )
+    .await?;
+    let mut group: Option<DirtyGroup> = None;
+    let mut after = (-1, -1);
+    while let Some(record) = next_record(conn, operation, "dirty", &mut after).await? {
+        let NoteStageRecord::Splice {
+            local_sequence: Some(local_sequence),
+            start,
+            end,
+            replacement,
+            ..
+        } = record
+        else {
+            return Err(invalid());
+        };
+        verify_reference(conn, operation, &replacement).await?;
+        if group
+            .as_ref()
+            .is_none_or(|group| group.local_sequence != local_sequence)
+        {
+            if let Some(prior) = group.take() {
+                (generation, length) = finish_group(conn, operation, prior).await?;
+            }
+            let next = sum(generation, 1)?;
+            sqlx::query("INSERT INTO note_stage_view(operation_key,generation,input_generation,history_group,length) VALUES(?,?,?,?,0)")
+                .bind(operation).bind(integer(next)?).bind(integer(generation)?).bind(local_sequence.to_string()).execute(&mut *conn).await.map_err(db)?;
+            group = Some(DirtyGroup {
+                local_sequence,
+                generation: next,
+                input_generation: generation,
+                input_length: length,
+                consumed: 0,
+                output: 0,
+            });
+        }
+        let current = group.as_mut().ok_or_else(invalid)?;
+        if start < current.consumed || end < start || end > current.input_length {
+            return Err(invalid());
+        }
+        view_boundary(
+            conn,
+            operation,
+            current.input_generation,
+            current.input_length,
+            start,
+        )
+        .await?;
+        view_boundary(
+            conn,
+            operation,
+            current.input_generation,
+            current.input_length,
+            end,
+        )
+        .await?;
+        copy_range(
+            conn,
+            operation,
+            current.input_generation,
+            current.generation,
+            current.consumed,
+            start,
+            &mut current.output,
+        )
+        .await?;
+        insert_piece(
+            conn,
+            operation,
+            current.generation,
+            &mut current.output,
+            replacement.length,
+            ("text", &replacement.text_id, 0),
+        )
+        .await?;
+        current.consumed = end;
+    }
+    if let Some(group) = group {
+        (generation, length) = finish_group(conn, operation, group).await?;
+    }
+    for stream in ["selection", "mutation", "live"] {
+        let mut after = (-1, -1);
+        while let Some(record) = next_record(conn, operation, stream, &mut after).await? {
+            let (start, end) = match record {
+                NoteStageRecord::Range { start, end, .. } => (start, end),
+                NoteStageRecord::Splice {
+                    start,
+                    end,
+                    replacement,
+                    ..
+                } => {
+                    verify_reference(conn, operation, &replacement).await?;
+                    (start, end)
+                }
+                NoteStageRecord::Projection {
+                    source_range,
+                    detail,
+                    ..
+                } => {
+                    verify_reference(conn, operation, &detail).await?;
+                    (source_range.start, source_range.end)
+                }
+                NoteStageRecord::Text { .. } => return Err(invalid()),
+            };
+            if end < start {
+                return Err(invalid());
+            }
+            view_boundary(conn, operation, generation, length, start).await?;
+            view_boundary(conn, operation, generation, length, end).await?;
+        }
+    }
+    Ok(PreparedView {
+        view_id: uuid::Uuid::new_v4().to_string(),
+        length,
+        generation,
     })
 }
 
