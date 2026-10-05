@@ -1,5 +1,6 @@
 //! Change-aware catalog delivery for persistent first-turn-prepend providers.
 
+use base64::Engine;
 use sha2::{Digest, Sha256};
 
 use super::*;
@@ -37,7 +38,8 @@ impl AgentManager {
         digest.update(acp_session_id.as_bytes());
         digest.update(b"\0");
         digest.update(catalog.as_bytes());
-        let fingerprint = format!("{:x}", digest.finalize());
+        let fingerprint =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize());
         if session
             .metadata
             .as_ref()
