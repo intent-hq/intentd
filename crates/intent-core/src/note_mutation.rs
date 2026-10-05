@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 mod provenance;
+mod status;
 pub use provenance::NoteSourceHistory;
+pub use status::NoteOperationStatusQuery;
 
 const SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 /// Maximum number of inline replacements, all addressed to the same base.

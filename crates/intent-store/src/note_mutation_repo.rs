@@ -130,6 +130,9 @@ impl Store {
         let receipt_expires_at = intent_core::iso_from_unix_secs(retain_until);
         let pending = json!({"kind":"noteOperationStatus","outcome":"pending", "scope":request.scope(),
             "operationId":request.operation_id,"payloadDigest":request.payload_digest});
+        if pending.to_string().len() > 4096 {
+            return Err(fail(NoteMutationError::Budget));
+        }
         sqlx::query("INSERT INTO note_operation(operation_key,principal,backend_id,workspace_id,note_id,instance_id,operation_id,payload_digest,admission_expires,retain_until,outcome) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&operation_key).bind(principal).bind(&request.backend_id).bind(&request.workspace_id)
             .bind(&request.note_id).bind(&request.note_instance_id).bind(&request.operation_id)
@@ -150,6 +153,54 @@ impl Store {
             persisted_phases: 0,
             conversion: None,
         })))
+    }
+
+    /// Read an inline receipt after the service's current workspace authorization.
+    /// The original principal/incarnation remains part of the lookup after deletion.
+    ///
+    /// # Errors
+    /// Rejects malformed identities, a different backend and unsupported staged lookup.
+    pub async fn read_note_operation_status(
+        &self,
+        principal: &str,
+        request: &intent_core::note_mutation::NoteOperationStatusQuery,
+    ) -> Result<Value> {
+        request.validate().map_err(fail)?;
+        if principal.is_empty() || principal.len() > 256 || principal.contains('\0') {
+            return Err(fail(NoteMutationError::Invalid));
+        }
+        let backend: String =
+            sqlx::query_scalar("SELECT backend_id FROM note_page_backend WHERE singleton=1")
+                .fetch_one(self.read_pool())
+                .await
+                .map_err(db)?;
+        if backend != request.backend_id {
+            return Err(fail(NoteMutationError::Conflict));
+        }
+        // Staged persistence is a separate integration slice. Never claim an
+        // authoritative 'unknown' result for a ledger this implementation lacks.
+        if request.header_digest.is_some() {
+            return Err(Error::Unsupported("staged note operation status".into()));
+        }
+        let workspace_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace WHERE id=?)")
+                .bind(&request.workspace_id)
+                .fetch_one(self.read_pool())
+                .await
+                .map_err(db)?;
+        if !workspace_exists {
+            return Err(Error::NotFound("Workspace not found".into()));
+        }
+        self.note_mutation_status(
+            principal,
+            &request.scope(),
+            &request.operation_id,
+            request
+                .payload_digest
+                .as_deref()
+                .ok_or_else(|| fail(NoteMutationError::Invalid))?,
+        )
+        .await
     }
 
     /// Read the exact retained outcome without loading source or a current note.

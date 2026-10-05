@@ -2439,3 +2439,92 @@ async fn shared_specialist_reads_fence_guest_project_paths() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn note_operation_status_rechecks_membership_and_requires_a_caller() {
+    use intent_core::note_mutation::NoteOperationStatusQuery;
+    let tmp = TempDb::new();
+    let (svc, _primary, member) = fixture(&tmp).await;
+    let scope = WorkspaceId::new();
+    svc.store
+        .insert_workspace(&workspace(&scope))
+        .await
+        .unwrap();
+    let mut guest = svc.store.get_principal(&member).await.unwrap();
+    guest.id = PrincipalId::new();
+    svc.store.upsert_principal(&guest).await.unwrap();
+    svc.store
+        .add_workspace_member(&scope, &guest.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let backend: String =
+        sqlx::query_scalar("SELECT backend_id FROM note_page_backend WHERE singleton=1")
+            .fetch_one(svc.store.read_pool())
+            .await
+            .unwrap();
+    let query = NoteOperationStatusQuery {
+        backend_id: backend,
+        workspace_id: scope.0.clone(),
+        note_id: "deleted-note".into(),
+        note_instance_id: "original-incarnation".into(),
+        operation_id: uuid::Uuid::new_v4().to_string(),
+        payload_digest: Some("a".repeat(64)),
+        header_digest: None,
+    };
+    assert!(matches!(
+        svc.note_operation_status(query.clone()).await,
+        Err(Error::Forbidden(_))
+    ));
+    let caller = Caller::Wire {
+        principal_id: guest.id.clone(),
+        host_role: HostRole::Guest,
+    };
+    with_caller(caller.clone(), async {
+        let outcome = svc.note_operation_status(query.clone()).await.unwrap();
+        assert_eq!(outcome["outcome"], "unknown");
+        assert_eq!(
+            outcome["scope"],
+            serde_json::to_value(query.scope()).unwrap()
+        );
+        assert_eq!(
+            outcome["payloadDigest"],
+            query.payload_digest.as_deref().unwrap()
+        );
+    })
+    .await;
+    // Preserve the existing owner-authority semantics of trusted daemon and
+    // agent callers; neither identity can see another principal's receipts.
+    for caller in [
+        Caller::Daemon,
+        Caller::Agent {
+            agent_id: AgentId::new(),
+        },
+    ] {
+        with_caller(caller, async {
+            assert_eq!(
+                svc.note_operation_status(query.clone()).await.unwrap()["outcome"],
+                "unknown"
+            );
+        })
+        .await;
+    }
+    svc.store
+        .remove_workspace_member(&scope, &guest.id)
+        .await
+        .unwrap();
+    with_caller(caller, async {
+        assert!(matches!(
+            svc.note_operation_status(query.clone()).await,
+            Err(Error::NotFound(_))
+        ));
+    })
+    .await;
+    svc.store.delete_workspace(&scope).await.unwrap();
+    with_caller(Caller::Daemon, async {
+        assert!(matches!(
+            svc.note_operation_status(query).await,
+            Err(Error::NotFound(_))
+        ));
+    })
+    .await;
+}

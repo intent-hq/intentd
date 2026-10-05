@@ -24997,6 +24997,28 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn note_operation_status(
+        &self,
+        request: intent_core::note_mutation::NoteOperationStatusQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            request.validate().map_err(Error::NoteMutation)?;
+            self.require_member(&WorkspaceId(request.workspace_id.clone()))
+                .await?;
+            let principal = match intent_core::current_caller() {
+                Some(intent_core::Caller::Wire { principal_id, .. }) => {
+                    format!("principal:{}", principal_id.0)
+                }
+                Some(intent_core::Caller::Agent { agent_id }) => format!("agent:{}", agent_id.0),
+                Some(intent_core::Caller::Daemon) => "daemon".into(),
+                None => return Err(Error::Forbidden("Caller required".into())),
+            };
+            self.store
+                .read_note_operation_status(&principal, &request)
+                .await
+        })
+    }
+
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
         let store = self.store.clone();
         Box::pin(async move {

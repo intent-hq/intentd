@@ -1049,6 +1049,15 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { Err(crate::Error::Unsupported("note pages".into())) })
     }
 
+    /// Resolve a retained operation under current authorization, without live text.
+    fn note_operation_status(
+        &self,
+        request: crate::note_mutation::NoteOperationStatusQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = request;
+        Box::pin(async { Err(crate::Error::Unsupported("note operation status".into())) })
+    }
+
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
         let _ = (workspace_id, note_id);
         Box::pin(async {

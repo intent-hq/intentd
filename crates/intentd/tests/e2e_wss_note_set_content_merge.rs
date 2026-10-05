@@ -1396,3 +1396,112 @@ async fn bounded_note_markdown_paragraph_maps_and_breaks_over_wss() {
     let stale=wss_rpc_raw(&mut rpc,12,"note.get",json!({"workspaceId":ws,"noteId":note,"page":{"kind":"context","contextRef":owner["sourceMapRef"]}})).await;
     assert_eq!(stale["error"]["data"]["code"], "note-page-stale");
 }
+
+#[tokio::test]
+async fn bounded_note_operation_status_reads_committed_receipt_after_wss_reconnect_and_deletion() {
+    use intent_core::note_mutation::{NoteApplySplices, NoteSplice};
+    use intent_store::NoteMutationAdmission;
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let hello = wss_rpc(&mut rpc, 0, "client.hello", json!({})).await;
+    assert_eq!(hello["protocolVersion"], "13.7");
+    assert!(hello["server"]["capabilities"].get("notePaging").is_none());
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"title":"receipt status","path":"."}),
+    )
+    .await;
+    let ws = workspace["workspace"]["id"].as_str().unwrap();
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({"workspaceId":ws,"title":"receipt","content":"base😀\r\n"}),
+    )
+    .await;
+    let note = created["note"]["id"].as_str().unwrap();
+    let source = wss_rpc(
+        &mut rpc,
+        3,
+        "note.get",
+        json!({"workspaceId":ws,"noteId":note,"page":{"kind":"source"}}),
+    )
+    .await;
+    let mut request = NoteApplySplices {
+        backend_id: source["scope"]["backendId"].as_str().unwrap().into(),
+        workspace_id: ws.into(),
+        note_id: note.into(),
+        note_instance_id: source["scope"]["noteInstanceId"].as_str().unwrap().into(),
+        base_revision: source["sourceRevision"].as_str().unwrap().into(),
+        operation_id: uuid::Uuid::new_v4().to_string(),
+        expires_at: format!("{}.000Z", &intent_core::iso_ms_from_now(60_000)[..19]),
+        payload_digest: String::new(),
+        splices: vec![NoteSplice {
+            start: 0,
+            end: 4,
+            text: "saved".into(),
+        }],
+    };
+    request.payload_digest = request.computed_digest().unwrap();
+    let params = json!({"backendId":request.backend_id,"workspaceId":ws,"noteId":note,
+        "noteInstanceId":request.note_instance_id,"operationId":request.operation_id,
+        "payloadDigest":request.payload_digest});
+    let unknown = wss_rpc(&mut rpc, 4, "note.operationStatus", params.clone()).await;
+    assert_eq!(unknown["outcome"], "unknown");
+    let principal = fx.store.get_primary_principal().await.unwrap();
+    // Seed the receipt through the real atomic Store seam. This test proves
+    // status transport/reconnect behavior, not the unfinished public write route.
+    let NoteMutationAdmission::Write(mut write) = fx
+        .store
+        .begin_note_mutation(
+            &format!("principal:{}", principal.id.0),
+            request,
+            &intent_core::now_iso(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("new operation must reserve a writer")
+    };
+    write
+        .persist_source(
+            &intent_core::NoteVersionAuthor {
+                id: principal.id.0,
+                name: "User".into(),
+                author_type: "user".into(),
+            },
+            &intent_core::now_iso(),
+        )
+        .await
+        .unwrap();
+    let receipt = write.commit().await.unwrap();
+    rpc.close(None).await.unwrap();
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let response = wss_rpc_raw(&mut rpc, 5, "note.operationStatus", params.clone()).await;
+    assert!(response.to_string().len() <= 4096);
+    assert_eq!(response["result"], receipt);
+    wss_rpc(
+        &mut rpc,
+        6,
+        "note.delete",
+        json!({"workspaceId":ws,"noteId":note}),
+    )
+    .await;
+    assert_eq!(
+        wss_rpc(&mut rpc, 7, "note.operationStatus", params.clone()).await,
+        receipt
+    );
+    let mut mismatch = params.clone();
+    mismatch["payloadDigest"] = json!("f".repeat(64));
+    let response = wss_rpc_raw(&mut rpc, 8, "note.operationStatus", mismatch).await;
+    assert_eq!(response["error"]["data"]["code"], "note-operation-mismatch");
+    let mut oversized = params;
+    oversized["extra"] = json!("x".repeat(65536));
+    let response = wss_rpc_raw(&mut rpc, 9, "note.operationStatus", oversized).await;
+    assert!(response.to_string().len() <= 4096);
+    assert_eq!(response["error"]["data"]["code"], "note-page-budget");
+    rpc.close(None).await.unwrap();
+    fx.ws.stop().await;
+}

@@ -444,6 +444,24 @@ pub(crate) async fn prepare_message(
         }
     };
 
+    // Receipt lookup has a stricter envelope budget, including malformed
+    // requests. Validate before cloning params or echoing a caller-controlled ID.
+    if value.get("method").and_then(Value::as_str) == Some("note.operationStatus") {
+        if value.get("id").is_some_and(|id| !valid_note_page_id(id)) {
+            return Some(invalid_note_page_id());
+        }
+        if message.len() > 65_536 {
+            return value.get("id").map(|id| {
+                prepared_error(
+                    id,
+                    INVALID_PARAMS,
+                    "Note operation unavailable",
+                    Some(json!({"code":"note-page-budget"})),
+                )
+            });
+        }
+    }
+
     // Envelope validation (-32600). Answered even for notification-shaped
     // frames: notification status is not trusted until the envelope is valid.
     let (echo_id, method, is_notification) = match check_envelope(&value) {
@@ -543,7 +561,11 @@ pub(crate) async fn prepare_message(
             method,
             is_notification,
             result,
-            crate::MAX_OUTBOUND_MESSAGE_BYTES,
+            if method == "note.operationStatus" {
+                4096
+            } else {
+                crate::MAX_OUTBOUND_MESSAGE_BYTES
+            },
         );
         let encode_elapsed_ms = if is_notification {
             0
@@ -610,7 +632,16 @@ fn encode_dispatch_result(
     };
     let response_bytes = encoded.frame.len();
     if response_bytes > max_response_bytes {
-        let replacement = oversized_response_frame(id, method, response_bytes, max_response_bytes);
+        let replacement = if method == "note.operationStatus" {
+            error_frame(
+                id,
+                INVALID_PARAMS,
+                "Note operation unavailable",
+                Some(json!({"code":"note-page-budget"})),
+            )
+        } else {
+            oversized_response_frame(id, method, response_bytes, max_response_bytes)
+        };
         ResponseEncoding {
             frame: Some(replacement.frame),
             response_bytes,
@@ -644,6 +675,23 @@ fn invalid_note_page_id() -> PreparedReply {
         "Invalid note page request",
         Some(json!({"code":"invalid-params"})),
     )
+}
+
+// Receipt errors never echo database errors, source content or unbounded IDs.
+fn bounded_note_operation_error(error: Error) -> RpcErr {
+    match error {
+        Error::NoteMutation(_) => domain_to_rpc(error),
+        Error::NotFound(_) => not_found("Note operation not found"),
+        Error::Forbidden(_) => domain_to_rpc(Error::Forbidden("Note operation unavailable".into())),
+        Error::Unsupported(_) => {
+            domain_to_rpc(Error::Unsupported("Note operation unavailable".into()))
+        }
+        _ => RpcErr {
+            code: -32603,
+            message: "Note operation unavailable".into(),
+            data: Some(json!({"code":"internal-error"})),
+        },
+    }
 }
 
 /// Dispatch a validated request to the injected [`WorkspaceApi`].
@@ -1291,6 +1339,20 @@ async fn dispatch_other(
                 }
                 None => Ok(json!({ "notes": notes })),
             }
+        }
+        "note.operationStatus" => {
+            if params.values().any(Value::is_null) {
+                return Err(invalid_params("Invalid note operation identity"));
+            }
+            let request: intent_core::note_mutation::NoteOperationStatusQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid note operation identity"))?;
+            request
+                .validate()
+                .map_err(|e| domain_to_rpc(Error::NoteMutation(e)))?;
+            api.note_operation_status(request)
+                .await
+                .map_err(bounded_note_operation_error)
         }
         "note.get" => {
             let ws = require_ws_note(params)?;

@@ -512,3 +512,90 @@ async fn note_mutation_deleted_incarnation_receipt_does_not_mutate_replacement()
         "unknown"
     );
 }
+
+#[tokio::test]
+async fn note_operation_status_preserves_receipt_scope_without_reading_recreated_text() {
+    use intent_core::note_mutation::NoteOperationStatusQuery;
+    let (store, _tmp, _) = setup("original").await;
+    let request = request(&store, vec![edit(0, 8, "saved")]).await;
+    let receipt = commit(&store, request.clone()).await;
+    let mut status = NoteOperationStatusQuery {
+        backend_id: request.backend_id.clone(),
+        workspace_id: request.workspace_id.clone(),
+        note_id: request.note_id.clone(),
+        note_instance_id: request.note_instance_id.clone(),
+        operation_id: request.operation_id.clone(),
+        payload_digest: Some(request.payload_digest.clone()),
+        header_digest: None,
+    };
+    assert_eq!(
+        store
+            .read_note_operation_status("alice", &status)
+            .await
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        store
+            .read_note_operation_status("bob", &status)
+            .await
+            .unwrap()["outcome"],
+        "unknown"
+    );
+    let mut replacement = store
+        .get_note(&WorkspaceId("pages".into()), &NoteId("spec".into()))
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM note WHERE workspace_id='pages' AND id='spec'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .read_note_operation_status("alice", &status)
+            .await
+            .unwrap(),
+        receipt
+    );
+    replacement.content = "new incarnation private text".repeat(1000);
+    store.insert_note(&replacement).await.unwrap();
+    assert_eq!(
+        store
+            .read_note_operation_status("alice", &status)
+            .await
+            .unwrap(),
+        receipt
+    );
+    let replacement_scope = page(&store, json!({"kind":"source","maxSourceBytes":32})).await;
+    status.note_instance_id = replacement_scope["scope"]["noteInstanceId"]
+        .as_str()
+        .unwrap()
+        .into();
+    assert_eq!(
+        store
+            .read_note_operation_status("alice", &status)
+            .await
+            .unwrap()["outcome"],
+        "unknown"
+    );
+    status
+        .note_instance_id
+        .clone_from(&request.note_instance_id);
+    status.payload_digest = Some("b".repeat(64));
+    assert!(matches!(
+        store.read_note_operation_status("alice", &status).await,
+        Err(Error::NoteMutation(NoteMutationError::Mismatch))
+    ));
+    status.payload_digest = Some(request.payload_digest);
+    status.backend_id = "foreign database".into();
+    assert!(matches!(
+        store.read_note_operation_status("alice", &status).await,
+        Err(Error::NoteMutation(NoteMutationError::Conflict))
+    ));
+    status.backend_id = request.backend_id;
+    status.header_digest = Some("c".repeat(64));
+    assert!(matches!(
+        store.read_note_operation_status("alice", &status).await,
+        Err(Error::Unsupported(_))
+    ));
+}

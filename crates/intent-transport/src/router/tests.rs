@@ -7888,3 +7888,89 @@ async fn invitation_account_search_routes_and_rejects_malformed_params() {
         assert_eq!(err_code(&frame), -32602, "{invalid}");
     }
 }
+
+#[tokio::test]
+async fn note_operation_status_bounds_admission_and_all_reply_shapes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct StatusApi {
+        calls: AtomicUsize,
+    }
+    impl WorkspaceApi for StatusApi {
+        fn note_operation_status(
+            &self,
+            request: intent_core::note_mutation::NoteOperationStatusQuery,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                match request.note_id.as_str() {
+                    "large" => Ok(serde_json::json!({"private":"x".repeat(8192)})),
+                    "error" => Err(Error::Internal("private source".repeat(8192))),
+                    _ => Ok(
+                        serde_json::json!({"kind":"noteOperationStatus","outcome":"unknown",
+                        "scope":request.scope(),"operationId":request.operation_id,
+                        "payloadDigest":request.payload_digest}),
+                    ),
+                }
+            })
+        }
+    }
+    let api = StatusApi {
+        calls: AtomicUsize::new(0),
+    };
+    let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"note.operationStatus",
+        "params":{"backendId":"backend","workspaceId":"workspace","noteId":"note",
+        "noteInstanceId":"instance","operationId":"11111111-1111-4111-8111-111111111111",
+        "payloadDigest":"a".repeat(64)}});
+    let response = handle_message(&api, &request.to_string()).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap()["result"]["outcome"],
+        "unknown"
+    );
+    assert_eq!(api.calls.load(Ordering::Relaxed), 1);
+    for id in [
+        serde_json::json!("x".repeat(65)),
+        serde_json::json!(9007199254740992u64),
+        Value::Null,
+    ] {
+        let mut bad = request.clone();
+        bad["id"] = id;
+        let response = handle_message(&api, &bad.to_string()).await.unwrap();
+        assert!(response.len() <= 4096);
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["id"],
+            Value::Null
+        );
+    }
+    for field in ["payloadDigest", "headerDigest", "noteId"] {
+        let mut bad = request.clone();
+        bad["params"][field] = Value::Null;
+        let response = handle_message(&api, &bad.to_string()).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["error"]["code"],
+            -32602
+        );
+    }
+    let padded = format!("{}{}", request, " ".repeat(65536));
+    let response = handle_message(&api, &padded).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap()["error"]["data"]["code"],
+        "note-page-budget"
+    );
+    assert_eq!(
+        api.calls.load(Ordering::Relaxed),
+        1,
+        "invalid frames never dispatch"
+    );
+    for note in ["large", "error"] {
+        let mut probe = request.clone();
+        probe["params"]["noteId"] = serde_json::json!(note);
+        probe["id"] = serde_json::json!("\u{1}".repeat(64));
+        let response = handle_message(&api, &probe.to_string()).await.unwrap();
+        assert!(response.len() <= 4096);
+        assert!(!response.contains("private"));
+        assert!(serde_json::from_str::<Value>(&response)
+            .unwrap()
+            .get("error")
+            .is_some());
+    }
+}
