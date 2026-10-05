@@ -4,7 +4,7 @@ use crate::{
     note_mutation::{NoteApplySplices, NoteMutationError, NoteOperationStatusQuery},
     note_page::NoteScope,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 
@@ -28,6 +28,17 @@ fn require(ok: bool) -> Result<()> {
     } else {
         Err(NoteMutationError::Invalid)
     }
+}
+
+fn present_option<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> std::result::Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+fn required_nullable<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(d)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,7 +100,11 @@ pub struct NoteStageHeader {
     pub action: NoteStageAction,
     pub output: NoteStageOutput,
     pub selection: NoteStageSelection,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub query: Option<NoteStageSearch>,
 }
 impl NoteStageHeader {
@@ -117,12 +132,12 @@ impl NoteStageHeader {
 }
 
 macro_rules! request {
-    ($name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
+    ($name:ident { $( $(#[$attr:meta])* $field:ident : $ty:ty),* $(,)? }) => {
         #[derive(Clone,Debug,Serialize,Deserialize)]
         #[serde(rename_all="camelCase",deny_unknown_fields)]
         pub struct $name {
             pub backend_id:String,pub workspace_id:String,pub note_id:String,pub note_instance_id:String,
-            pub operation_id:String,pub header_digest:String,$(pub $field:$ty),*
+            pub operation_id:String,pub header_digest:String,$( $(#[$attr])* pub $field:$ty),*
         }
         impl $name {
             #[must_use]
@@ -137,7 +152,7 @@ request!(NoteStageBegin {
     expires_at: String,
     header: NoteStageHeader
 });
-request!(NoteStageAppend {stream:NoteStageStream,sequence:u64,previous_digest:Option<String>,records:Vec<Value>,chunk_digest:String});
+request!(NoteStageAppend {stream:NoteStageStream,sequence:u64,#[serde(deserialize_with="required_nullable")] previous_digest:Option<String>,records:Vec<Value>,chunk_digest:String});
 request!(NoteStageSeal {manifest:Vec<NoteStageManifestEntry>,payload_digest:String});
 request!(NoteStageCommit {
     payload_digest: String
@@ -191,6 +206,7 @@ pub struct NoteStageManifestEntry {
     pub stream: NoteStageStream,
     pub chunks: u64,
     pub records: u64,
+    #[serde(deserialize_with = "required_nullable")]
     pub last_digest: Option<String>,
 }
 impl NoteStageSeal {
@@ -300,6 +316,7 @@ pub enum NoteStageRecord {
         ordinal: u64,
         source_range: NoteStageRange,
         role: NoteStageRole,
+        #[serde(default, deserialize_with = "present_option")]
         canonical_id: Option<String>,
         detail: NoteStageTextReference,
     },

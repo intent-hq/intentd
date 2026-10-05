@@ -35,6 +35,10 @@ fn splice(group: u64, ordinal: u64, start: u64, end: u64) -> Value {
 #[test]
 fn stage_begin_digest_is_method_bound_and_expiry_is_only_new_admission() {
     let b = begin();
+    assert_eq!(
+        b.header_digest,
+        "7860b69538ccc6ccf51476d363c6092c397b35efe6b469f478301b299581f441"
+    );
     assert!(b.validate().is_ok());
     let now = time::OffsetDateTime::parse(
         "2026-10-05T11:00:00Z",
@@ -262,4 +266,18 @@ fn stage_commit_and_cancel_keep_exact_identity_and_digest_shapes() {
         .unwrap()
         .validate()
         .is_err());
+}
+
+#[test]
+fn stage_required_null_chain_and_optional_omission_are_distinct() {
+    let a = append(NoteStageStream::Text, vec![]);
+    let mut raw = serde_json::to_value(a).unwrap();
+    assert!(serde_json::from_value::<NoteStageAppend>(raw.clone()).is_ok());
+    raw.as_object_mut().unwrap().remove("previousDigest");
+    assert!(serde_json::from_value::<NoteStageAppend>(raw).is_err());
+    let missing = json!({"stream":"text","chunks":0,"records":0});
+    assert!(serde_json::from_value::<NoteStageManifestEntry>(missing).is_err());
+    let mut b = serde_json::to_value(begin()).unwrap();
+    b["header"]["query"] = Value::Null;
+    assert!(serde_json::from_value::<NoteStageBegin>(b).is_err());
 }
