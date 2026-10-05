@@ -16,6 +16,9 @@ mod common;
 #[path = "e2e_wss_agent_lifecycle/creation_preferences.rs"]
 mod creation_preferences;
 
+#[path = "e2e_wss_agent_lifecycle/provider_policy.rs"]
+mod provider_policy;
+
 #[path = "e2e_wss_agent_lifecycle/structured_notices.rs"]
 mod structured_notices;
 
@@ -17074,15 +17077,29 @@ async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
             1,
             "each launch must use the selected adapter exactly once: {argv:?}"
         );
+        let policy = &session["codexPolicy"];
+        assert_eq!(policy["pathPresent"], true);
+        assert_eq!(policy["codexPath"], json!(selected_cli));
+        assert_eq!(policy["config"]["agents"]["enabled"], false);
+        assert_eq!(policy["config"]["features"]["multi_agent_v2"], false);
+        assert!(policy["config"]["mcp_servers"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|s| s["enabled"] == true));
         assert_eq!(
-            session["codexPolicy"],
-            json!({
-                "config": {"agents": {"enabled": false}, "features": {"multi_agent_v2": false}},
-                "pathPresent": true,
-                "codexPath": selected_cli,
-            }),
-            "each launch must replace hostile runtime overrides with the selected installed CLI and enforce daemon policy: {session}"
+            session["mcpNames"],
+            json!([]),
+            "Codex receives MCP only via owned CODEX_CONFIG"
         );
+        assert_eq!(
+            policy["home"], entries[0]["codexPolicy"]["home"],
+            "restart keeps stable owned home"
+        );
+        assert!(policy["home"]
+            .as_str()
+            .unwrap()
+            .contains("provider-profiles-v1/session-"));
         let pid = session["pid"].as_u64().expect("mock child pid");
         if turn == 0 {
             first_pid = Some(pid);
@@ -19130,11 +19147,18 @@ async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
     let ws_id = seed_workspace_only(&data_dir).await;
     let prompt_log = data_dir.join("prompt-log.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().to_string();
+    let prompt_entered = data_dir.join("prompt-entered");
+    let prompt_release = data_dir.join("prompt-release");
     // 30 chunks × 100ms = 3s of stragglers — comfortably past the 500ms
     // post-interrupt drain cap, so a kept-alive child provably leaks them
     // into the follow-up turn (the pre-fix failure this test regresses).
     let behavior = json!({
         "parkIfPromptEndsWith": PARK_MARKER,
+        "promptReceiptGate": {
+            "suffix": PARK_MARKER,
+            "enteredFile": prompt_entered,
+            "releaseFile": prompt_release,
+        },
         "zombieAfterCancel": { "marker": ZOMBIE_MARKER, "count": 30, "intervalMs": 100 },
         "response": "resumed after respawn",
     })
@@ -19195,10 +19219,13 @@ async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // The parked turn streams nothing; poll turn-liveness until the prompt is
-    // provably in flight before interrupting it.
+    // A live daemon turn is NOT a provider receipt: the child is deliberately
+    // held before recording the prompt. Keep the original five-second budget
+    // for both turn-liveness and the provider receipt below (intent#6689).
+    let receipt_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut in_flight = false;
-    for i in 0..100 {
+    let mut i = 0;
+    while tokio::time::Instant::now() < receipt_deadline {
         let got = wss_rpc(
             &mut rpc,
             100 + i,
@@ -19210,9 +19237,53 @@ async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
             in_flight = true;
             break;
         }
+        i += 1;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(in_flight, "first turn is in flight before the stop");
+    while !prompt_entered.exists() {
+        assert!(
+            tokio::time::Instant::now() < receipt_deadline,
+            "mock did not enter the prompt receipt gate"
+        );
+        // timing-guard: wait for the child to enter its test-owned receipt gate.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !prompt_log.exists(),
+        "turnInFlight precedes the held child's prompt receipt"
+    );
+
+    // Release the test-owned gate only after observing the early liveness
+    // signal, then require the exact current prompt, not a replayed marker.
+    // Removing this receipt wait leaves the first child unrecorded and the
+    // final two-record assertion fails even though the follow-up succeeds.
+    std::fs::write(&prompt_release, "release").expect("release prompt receipt gate");
+    loop {
+        let log = std::fs::read_to_string(&prompt_log).unwrap_or_default();
+        if log.ends_with('\n') {
+            let entries: Vec<Value> = log
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("complete prompt record"))
+                .collect();
+            assert_eq!(entries.len(), 1, "one prompt before interrupt: {entries:?}");
+            assert_eq!(entries[0]["turn"], 1, "first child's first prompt");
+            assert!(
+                entries[0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.trim_end().ends_with(PARK_MARKER)),
+                "recorded the current parked prompt: {entries:?}"
+            );
+            assert!(prompt_entered.exists(), "the mock entered the receipt gate");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < receipt_deadline,
+            "first prompt was not recorded before interrupt; log: {log:?}"
+        );
+        // timing-guard: poll the child's complete prompt receipt within the shared deadline.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     // Interrupt mid-turn. The mock resolves the cancel politely, then keeps
     // streaming zombie chunks; the quirk tears the child down underneath them.

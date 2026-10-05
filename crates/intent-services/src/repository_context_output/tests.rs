@@ -350,7 +350,11 @@ async fn context_output_actual_settings_publication_order_and_origin_only_revisi
                     }
                     "reload" => {
                         let text = std::fs::read_to_string(registry.config_path()).unwrap();
-                        registry.reload(&text).unwrap();
+                        // Exercise real publication without changing effective settings.
+                        // An identical startup catch-up deliberately does not publish.
+                        registry
+                            .reload(&format!("{text}\n# publication-order reload\n"))
+                            .unwrap();
                     }
                     "pin" => {
                         let value = registry.get("git.autoCommit").unwrap();

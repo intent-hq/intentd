@@ -1,15 +1,12 @@
-//! Skills discovery module - ports skills-loader.ts faithfully.
+//! Intent-owned skill discovery for personal and project catalogs.
 //!
-//! Scans user and project directories for SKILL.md files following the
-//! precedence order (higher p wins name collisions):
-//! 1. `~/.agents/skills` (p1)
-//! 2. `~/.claude/skills` (p2)
-//! 3. `~/.augment/skills` (p3, auggie convention for back-compat)
-//! 4. `~/.intent/skills` (p4, app-owned)
-//! 5. `<workspace>/.agents/skills` (p5)
-//! 6. `<workspace>/.claude/skills` (p6)
-//! 7. `<workspace>/.augment/skills` (p7, auggie convention for back-compat)
-//! 8. `<workspace>/.intent/skills` (p8, app-owned)
+//! Only `~/.intent/skills` is an implicit personal source. Third-party home
+//! roots and config environment overrides belong to native suppression
+//! inventories, never this catalog. All project roots outrank personal skills;
+//! the ordered roots below preserve `.intent` as the highest project tier.
+//! Explicit links inside these roots may refer outside the workspace (shared
+//! skill libraries); canonical deduplication and global scan budgets still
+//! apply. Discovery never walks ancestor projects or fetches remote/plugin roots.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
@@ -38,12 +35,19 @@ static NOISE_DIRECTORIES: &[&str] = &[
 ];
 
 /// Resolve the user's home directory from the environment (cross-platform).
-#[cfg(not(test))]
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+pub(crate) fn skill_home_dir() -> Option<PathBuf> {
+    // Test processes must not watch or import the developer's ambient skills.
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -73,8 +77,8 @@ struct DiscoveredSkill {
 }
 
 #[derive(Debug, Clone)]
-struct ScanTarget {
-    root: PathBuf,
+pub(crate) struct SkillRoot {
+    pub root: PathBuf,
     precedence: u8,
     scope: String, // "project" or "user"
 }
@@ -137,13 +141,6 @@ pub(crate) fn invalidate_skills_cache(workspace_path: &Path) {
     }
 }
 
-/// Empty `CLAUDE_CONFIG_DIR` has the same meaning as an unset variable.
-pub(crate) fn claude_config_dir(home: &Path) -> PathBuf {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|path| !path.is_empty())
-        .map_or_else(|| home.join(".claude"), PathBuf::from)
-}
-
 /// Public API: format skills catalog for prompt injection
 pub(crate) async fn format_skills_catalog_for_prompt(workspace_path: &str) -> String {
     let payload = load_skills_payload(workspace_path).await;
@@ -186,72 +183,46 @@ fn normalize_workspace_path(workspace_path: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Get scan targets in precedence order
-/// If `home_override` is provided, use it instead of reading from env (for tests)
-fn get_scan_targets(
-    workspace_path: Option<&str>,
-    home_override: Option<PathBuf>,
-) -> Vec<ScanTarget> {
-    let mut targets = Vec::new();
-
-    // Unit tests ignore ambient configuration. Production callers may supply
-    // their resolved home while still honoring the daemon's Claude config.
-    let use_config_env = !cfg!(test);
-    #[cfg(test)]
-    let home = home_override;
-    #[cfg(not(test))]
-    let home = home_override.or_else(home_dir);
-    let claude = if use_config_env {
-        std::env::var_os("CLAUDE_CONFIG_DIR")
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| home.as_ref().map(|home| home.join(".claude")))
-    } else {
-        home.as_ref().map(|home| home.join(".claude"))
-    };
-    for (root, precedence) in [
-        (home.as_ref().map(|home| home.join(".agents/skills")), 1),
-        (claude.map(|root| root.join("skills")), 2),
-        (home.as_ref().map(|home| home.join(".augment/skills")), 3),
-        (home.as_ref().map(|home| home.join(".intent/skills")), 4),
-    ] {
-        if let Some(root) = root {
-            targets.push(ScanTarget {
-                root,
-                precedence,
-                scope: "user".to_string(),
+/// Ordered roots, lowest to highest precedence. This is the single source for
+/// synchronous discovery, cached discovery and filesystem watch registration.
+/// `home` is the actual user home; only its Intent-owned skill directory is used.
+/// Missing roots stay in the list so their later creation invalidates the cache.
+pub(crate) fn skill_roots(workspace: Option<&Path>, home: Option<&Path>) -> Vec<SkillRoot> {
+    const PROJECT_ROOTS: &[&str] = &[
+        ".agent/skills",
+        ".agents/skills",
+        ".codex/skills",
+        ".factory/skills",
+        ".grok/skills",
+        ".opencode/skill",
+        ".opencode/skills",
+        ".pi/skills",
+        ".cortex/skills",
+        ".claude/skills",
+        ".augment/skills",
+        ".intent/skills",
+    ];
+    let mut roots = Vec::new();
+    if let Some(home) = home {
+        roots.push(SkillRoot {
+            root: home.join(".intent/skills"),
+            precedence: 0,
+            scope: "user".to_string(),
+        });
+    }
+    if let Some(workspace) = workspace {
+        for (index, relative) in PROJECT_ROOTS.iter().enumerate() {
+            roots.push(SkillRoot {
+                root: workspace.join(relative),
+                precedence: u8::try_from(index + 1).expect("bounded project skill roots"),
+                scope: "project".to_string(),
             });
         }
     }
-
-    if let Some(ws) = workspace_path {
-        let ws_path = PathBuf::from(ws);
-        targets.push(ScanTarget {
-            root: ws_path.join(".agents").join("skills"),
-            precedence: 5,
-            scope: "project".to_string(),
-        });
-        targets.push(ScanTarget {
-            root: ws_path.join(".claude").join("skills"),
-            precedence: 6,
-            scope: "project".to_string(),
-        });
-        targets.push(ScanTarget {
-            root: ws_path.join(".augment").join("skills"),
-            precedence: 7,
-            scope: "project".to_string(),
-        });
-        targets.push(ScanTarget {
-            root: ws_path.join(".intent").join("skills"),
-            precedence: 8,
-            scope: "project".to_string(),
-        });
-    }
-
-    targets
+    roots
 }
 
-/// Load skills payload with caching and concurrent-load coalescing
+/// Internal: load cached skills for the process home.
 async fn load_skills_payload(workspace_path: &str) -> CachePayload {
     load_skills_payload_with_home(workspace_path, None).await
 }
@@ -381,7 +352,8 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
     let mut project_watch_directories = HashSet::new();
 
     // Visit the winning tier first so canonical deduplication cannot erase it.
-    for target in get_scan_targets(workspace_path, home_override)
+    let home = home_override.or_else(skill_home_dir);
+    for target in skill_roots(workspace_path.map(Path::new), home.as_deref())
         .into_iter()
         .rev()
     {
@@ -988,6 +960,143 @@ fn fingerprints_current_sync(fingerprints: &[PathFingerprint]) -> bool {
 mod tests {
     use super::*;
 
+    const AUDITED_PROJECT_ROOTS: &[&str] = &[
+        ".agent/skills",
+        ".agents/skills",
+        ".codex/skills",
+        ".factory/skills",
+        ".grok/skills",
+        ".opencode/skill",
+        ".opencode/skills",
+        ".pi/skills",
+        ".cortex/skills",
+        ".claude/skills",
+        ".augment/skills",
+        ".intent/skills",
+    ];
+
+    #[tokio::test]
+    async fn catalog_ownership_excludes_native_home_skills_from_both_consumers() {
+        let dir = crate::test_support::test_tempdir("skills-ownership-");
+        let home = dir.path().join("home");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        for (index, root) in AUDITED_PROJECT_ROOTS.iter().enumerate() {
+            let name = format!("personal-{index}");
+            write_skill(
+                &home.join(root),
+                &name,
+                &build_skill_content(&format!("name: {name}\ndescription: personal"), "Body"),
+            )
+            .await;
+        }
+        let expected = vec![format!("personal-{}", AUDITED_PROJECT_ROOTS.len() - 1)];
+        let asynchronous = discover_skills_test(&project.to_string_lossy(), home.clone()).await;
+        let synchronous = discover_skills_sync(Some(&project), Some(home));
+        assert_eq!(asynchronous, synchronous);
+        assert_eq!(
+            asynchronous
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(asynchronous[0].scope, "user");
+    }
+
+    #[tokio::test]
+    async fn catalog_ownership_discovers_new_roots_and_preserves_order() {
+        let dir = crate::test_support::test_tempdir("skills-project-roots-");
+        let project = dir.path().join("project");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(
+            discover_skills_test(&project.to_string_lossy(), home.clone())
+                .await
+                .is_empty()
+        );
+        for (index, root) in AUDITED_PROJECT_ROOTS.iter().enumerate() {
+            let name = format!("project-{index:02}");
+            write_skill(
+                &project.join(root),
+                &name,
+                &build_skill_content(&format!("name: {name}\ndescription: {root}"), "Body"),
+            )
+            .await;
+            write_skill(
+                &project.join(root),
+                "duplicate",
+                &build_skill_content(&format!("name: duplicate\ndescription: {root}"), "Body"),
+            )
+            .await;
+            let skills = discover_skills_test(&project.to_string_lossy(), home.clone()).await;
+            assert_eq!(
+                skills.len(),
+                index + 2,
+                "new root {root} must invalidate the cache"
+            );
+            assert_eq!(
+                skills
+                    .iter()
+                    .find(|s| s.name == "duplicate")
+                    .unwrap()
+                    .description,
+                *root
+            );
+            assert_eq!(
+                skills,
+                discover_skills_sync(Some(&project), Some(home.clone()))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn catalog_ownership_new_roots_keep_link_dedup_and_bounds() {
+        use std::os::unix::fs::symlink;
+        let dir = crate::test_support::test_tempdir("skills-root-links-");
+        let project = dir.path().join("project");
+        let external = dir.path().join("explicitly-linked");
+        let home = dir.path().join("home");
+        let file = write_skill(
+            &external,
+            "shared",
+            &build_skill_content("name: shared\ndescription: external", "Body"),
+        )
+        .await;
+        for root in [".codex/skills", ".factory/skills"] {
+            let link = project.join(root);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(&external, link).unwrap();
+        }
+        symlink(&external, external.join("cycle")).unwrap();
+        write_skill(&external, "malformed", "no frontmatter").await;
+        write_skill(
+            &external.join("a/b/c/d"),
+            "too-deep",
+            &build_skill_content("name: too-deep\ndescription: excluded", "Body"),
+        )
+        .await;
+        let oversized = write_skill(&external, "oversized", "oversized").await;
+        std::fs::File::options()
+            .write(true)
+            .open(oversized)
+            .unwrap()
+            .set_len(MAX_SKILL_BYTES + 1)
+            .unwrap();
+        let skills = discover_skills_test(&project.to_string_lossy(), home.clone()).await;
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "shared");
+        assert!(skills[0].location.contains(".factory/skills"));
+        std::fs::write(
+            file,
+            build_skill_content("name: shared\ndescription: updated", "Body"),
+        )
+        .unwrap();
+        let updated = discover_skills_test(&project.to_string_lossy(), home).await;
+        assert_eq!(updated[0].description, "updated");
+    }
+
     fn build_skill_content(frontmatter: &str, body: &str) -> String {
         format!("---\n{frontmatter}\n---\n\n{body}\n")
     }
@@ -1024,13 +1133,13 @@ mod tests {
     /// skills installed there) stays out of test-assembled prompts.
     #[test]
     fn test_scan_targets_without_home_override_skip_user_scope() {
-        let targets = get_scan_targets(Some("/tmp/ws"), None);
+        let targets = skill_roots(Some(Path::new("/tmp/ws")), skill_home_dir().as_deref());
         assert!(
             targets.iter().all(|t| t.scope == "project"),
             "no user-scope scan targets without an explicit home override"
         );
 
-        let with_home = get_scan_targets(Some("/tmp/ws"), Some(PathBuf::from("/tmp/home")));
+        let with_home = skill_roots(Some(Path::new("/tmp/ws")), Some(Path::new("/tmp/home")));
         assert!(with_home.iter().any(|t| t.scope == "user"));
     }
 

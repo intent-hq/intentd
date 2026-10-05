@@ -248,6 +248,11 @@ pub trait SystemControl: Send + Sync {
     fn metadata_status(&self) -> Pin<Box<dyn Future<Output = SystemStatus> + Send + '_>> {
         Box::pin(async { self.status() })
     }
+    /// Current owner-chosen collaboration label, read from the settings snapshot.
+    /// Separate from OS identity and personal pairing aliases.
+    fn collaboration_name(&self) -> Option<String> {
+        None
+    }
     /// Cached host identity, refreshed by the composition root off the RPC path.
     fn host_environment(&self) -> crate::host_env::HostEnvironment;
     /// Request a graceful shutdown (idempotent). Returns immediately; the daemon
@@ -575,6 +580,7 @@ pub(crate) async fn handle(
     is_uds: bool,
     is_administrator: bool,
 ) -> Option<String> {
+    let is_status = matches!(req.method, SystemMethod::Status);
     let result: Result<Value, (i32, String)> = match req.method {
         SystemMethod::Status if control.services() == SystemServices::StatusOnly => {
             let snapshot = control.metadata_status().await;
@@ -673,7 +679,12 @@ pub(crate) async fn handle(
         return None;
     }
     Some(match result {
-        Ok(value) => success_frame(&req.id_echo, &value),
+        Ok(mut value) => {
+            if is_status {
+                value["collaborationName"] = json!(control.collaboration_name());
+            }
+            success_frame(&req.id_echo, &value)
+        }
         Err((code, message)) => error_frame(&req.id_echo, code, &message),
     })
 }

@@ -18,7 +18,6 @@ use std::time::Duration;
 
 use intent_core::{Error, Result, WorkspaceId};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
 
 use crate::file_ops;
 use crate::Services;
@@ -201,9 +200,7 @@ pub(crate) async fn run_auggie_print(
     timeout_op: &str,
 ) -> Result<String> {
     let mut cmd = tokio::process::Command::new(bin);
-    cmd.arg("--print")
-        .arg("--mcp-config")
-        .arg(r#"{"mcpServers":{}}"#);
+    cmd.arg("--print");
     if let Some(m) = model {
         cmd.arg("--model").arg(m);
     }
@@ -220,51 +217,35 @@ pub(crate) async fn run_auggie_print(
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| Error::Internal(format!("failed to spawn auggie CLI: {e}")))?;
-    let pid = child.id();
-    let stdin = child.stdin.take();
-    // The stdin write sits inside the timed region: a prompt larger than the
-    // pipe capacity blocks until the child reads it, and a hung child never
-    // does (intent-hq/intent#5454).
-    let run = async move {
-        if let Some(mut stdin) = stdin {
-            // A failed write is non-fatal — the child may have already exited.
-            let _ = stdin.write_all(prompt.as_bytes()).await;
-            // Dropping stdin closes it so the read-to-EOF `--print` exits cleanly.
-        }
-        child.wait_with_output().await
-    };
-
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), run).await {
-        Ok(Ok(output)) => {
-            if !output.status.success() {
-                let code = output.status.code().unwrap_or(-1);
-                return Err(Error::Internal(format!(
-                    "auggie process exited with code {code}"
-                )));
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        }
-        Ok(Err(e)) => Err(Error::Internal(format!("auggie wait failed: {e}"))),
-        Err(_) => {
-            // Reap the whole process group (pgid == pid via `process_group`);
-            // the dropped `wait_with_output` future's `kill_on_drop` covers the
-            // direct child on non-unix.
-            #[cfg(unix)]
-            if let Some(pid) = pid {
-                use nix::sys::signal::{killpg, Signal};
-                use nix::unistd::Pid;
-                let _ = killpg(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL);
-            }
-            #[cfg(not(unix))]
-            let _ = pid;
-            Err(Error::Internal(format!(
-                "{timeout_op} timed out after {timeout_ms}ms"
-            )))
-        }
+    let launch_cwd = cwd.map_or_else(std::env::temp_dir, Path::to_owned);
+    cmd.current_dir(&launch_cwd);
+    let profile = crate::provider_launch::ephemeral_command_profile(
+        "auggie",
+        crate::provider_profiles::LaunchPurpose::Completion,
+        &cmd,
+        &launch_cwd,
+    )?;
+    let output = crate::provider_launch::run_utility(
+        cmd,
+        profile,
+        prompt.as_bytes().to_vec(),
+        Duration::from_millis(timeout_ms),
+    )
+    .await
+    .map_err(|e| {
+        Error::Internal(if e == "timed out" {
+            format!("{timeout_op} timed out after {timeout_ms}ms")
+        } else {
+            format!("auggie wait failed: {e}")
+        })
+    })?;
+    if !output.status.success() {
+        return Err(Error::Internal(format!(
+            "auggie process exited with code {}",
+            output.status.code().unwrap_or(-1)
+        )));
     }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 impl Services {
@@ -299,6 +280,8 @@ impl Services {
                 "reason": "enhance-prompt requires auggie as the effective default provider"
             }));
         }
+
+        self.validate_provider_configuration("auggie")?;
 
         // Optional cwd pin: unknown workspace surfaces as -32602 (NotFound);
         // a workspace without a filesystem root just runs without a cwd

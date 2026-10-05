@@ -1,6 +1,6 @@
 [package]
 name = "intent-services"
-version = "0.10.16"
+version = "0.10.18"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -12,19 +12,19 @@ description = "Shared business-logic surface invoked by every transport and the 
 repository-test-fixtures = []
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.10.16" }
-intent-store = { path = "../intent-store", version = "0.10.16" }
-intent-git = { path = "../intent-git", version = "0.10.16" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.10.16" }
-intent-linear = { path = "../intent-linear", version = "0.10.16" }
-intent-sentry = { path = "../intent-sentry", version = "0.10.16" }
+intent-core = { path = "../intent-core", version = "0.10.18" }
+intent-store = { path = "../intent-store", version = "0.10.18" }
+intent-git = { path = "../intent-git", version = "0.10.18" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.10.18" }
+intent-linear = { path = "../intent-linear", version = "0.10.18" }
+intent-sentry = { path = "../intent-sentry", version = "0.10.18" }
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
-intent-acp = { path = "../intent-acp", version = "0.10.16" }
-intent-js = { path = "../intent-js", version = "0.10.16" }
-intent-context = { path = "../intent-context", version = "0.10.16" }
-intent-providers = { path = "../intent-providers", version = "0.10.16" }
-intent-pty = { path = "../intent-pty", version = "0.10.16" }
-intent-search = { path = "../intent-search", version = "0.10.16" }
+intent-acp = { path = "../intent-acp", version = "0.10.18" }
+intent-js = { path = "../intent-js", version = "0.10.18" }
+intent-context = { path = "../intent-context", version = "0.10.18" }
+intent-providers = { path = "../intent-providers", version = "0.10.18" }
+intent-pty = { path = "../intent-pty", version = "0.10.18" }
+intent-search = { path = "../intent-search", version = "0.10.18" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 ignore = { workspace = true }
@@ -39,7 +39,9 @@ time = { workspace = true, features = ["formatting", "local-offset"] }
 similar = { version = "3.1.1", default-features = false }
 serde_yaml = "0.9"
 toml_edit = "0.25.5"
+toml.workspace = true
 tempfile = "3"
+fs2 = "0.4"
 reqwest.workspace = true
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 sha2 = "0.11"
