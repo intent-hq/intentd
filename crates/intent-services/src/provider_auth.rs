@@ -1424,12 +1424,16 @@ while IFS= read -r unexpected; do exit 95; done
             "auth fallback must never send a paid prompt"
         );
         assert_eq!(requests[0]["method"], "initialize");
-        // Catalog preparation observes the selected CLI, then the adapter
-        // launch revalidates it before spawning the pinned package.
-        assert_eq!(
-            std::fs::read_to_string(root.join("cli-calls")).unwrap(),
-            "auth\nauth\nauth\nversion\nversion\n"
-        );
+        // Catalog preparation and launch revalidation observe the selected
+        // CLI. Managed-profile acquisition can also inspect its version before
+        // deferring this unverified 2.1.0 runtime to the same pinned adapter.
+        // Preserve the auth sequence and reject any non-observation work,
+        // without tying auth fallback to a platform-specific probe count.
+        let calls = std::fs::read_to_string(root.join("cli-calls")).unwrap();
+        let observations = calls.strip_prefix("auth\nauth\nauth\n").unwrap();
+        let observations: Vec<_> = observations.lines().collect();
+        assert!(observations.len() >= 2);
+        assert!(observations.iter().all(|call| *call == "version"));
         assert!(
             !root.join("legacy-ran").exists(),
             "legacy override must never execute"
