@@ -112,7 +112,7 @@ fn fixture_command(data_dir: &Path, env: &[(&str, &str)]) -> std::process::Comma
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -121,8 +121,7 @@ fn fixture_command(data_dir: &Path, env: &[(&str, &str)]) -> std::process::Comma
     for (k, v) in env {
         cmd.env(k, v);
     }
-    common::hermetic_github_identity(&mut cmd, data_dir);
-    cmd.env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"));
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
     cmd
 }
 

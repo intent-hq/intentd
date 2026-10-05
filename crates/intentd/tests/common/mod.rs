@@ -634,6 +634,72 @@ pub fn serve_command_fixed_port() -> std::process::Command {
     cmd
 }
 
+/// Build an ordinary daemon fixture with its complete GitHub identity boundary.
+/// The caller owns `data_dir` for the command and child's entire lifetime.
+/// Workspaces, stdio, authentication, and mock-provider settings remain caller-owned.
+/// Like [`serve_command`], this selects an OS-assigned WSS port.
+pub fn hermetic_serve_command(data_dir: &Path) -> std::process::Command {
+    let mut cmd = serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir);
+    hermetic_fixture_identity(&mut cmd, data_dir);
+    cmd
+}
+
+/// Complete fixture constructor for tests that must bind the settings-file port.
+/// Retains [`serve_command_fixed_port`]'s behavior: no TCP-port env override.
+pub fn hermetic_serve_command_fixed_port(data_dir: &Path) -> std::process::Command {
+    let mut cmd = serve_command_fixed_port();
+    cmd.env("INTENTD_DATA_DIR", data_dir);
+    hermetic_fixture_identity(&mut cmd, data_dir);
+    cmd
+}
+
+/// Apply all four identity settings, including after caller env overrides.
+/// Reuse an existing `gh-config` only when it is a real, empty directory;
+/// reject populated directories and symlinks without deleting fixture state.
+/// The private secrets file may contain deliberately seeded state and is never
+/// truncated (restarts must retain it); symlinks and non-files are rejected.
+/// Intentional identity tests can layer private mock configuration afterwards.
+pub fn hermetic_fixture_identity(cmd: &mut std::process::Command, data_dir: &Path) {
+    let gh_config_dir = data_dir.join("gh-config");
+    match std::fs::create_dir(&gh_config_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => panic!(
+            "create private gh config {}: {error}",
+            gh_config_dir.display()
+        ),
+    }
+    assert!(
+        std::fs::symlink_metadata(&gh_config_dir)
+            .expect("inspect private gh config")
+            .file_type()
+            .is_dir(),
+        "private gh config must be a real directory: {}",
+        gh_config_dir.display()
+    );
+    assert!(
+        std::fs::read_dir(&gh_config_dir)
+            .expect("read private gh config")
+            .next()
+            .is_none(),
+        "private gh config must be empty: {}",
+        gh_config_dir.display()
+    );
+    let secrets = data_dir.join("secrets.json");
+    match std::fs::symlink_metadata(&secrets) {
+        Ok(metadata) => assert!(
+            metadata.file_type().is_file(),
+            "private secrets must be a regular file: {}",
+            secrets.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("inspect private secrets {}: {error}", secrets.display()),
+    }
+    hermetic_github_identity(cmd, data_dir);
+    cmd.env("INTENTD_SECRETS_FILE", secrets);
+}
+
 /// Cut a spawned daemon off from the HOST's GitHub identity so its boot-time
 /// primary-identity refresh resolves no token and hydrates no `login` /
 /// `displayName` / `avatarUrl` onto the primary principal (intent-hq/intent#5645).
