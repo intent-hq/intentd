@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.19] - 2026-10-05
+
+### 🐛 Bug Fixes
+
+- Keep deliberately emptied workspace scripts empty ([#2309](https://github.com/intent-hq/intentd/pull/2309))
+- Make provider MCP and skill configuration daemon-owned ([#2306](https://github.com/intent-hq/intentd/pull/2306))
+
+### 🧪 Testing
+
+- Await provider prompt receipt before WSS interrupt ([#2305](https://github.com/intent-hq/intentd/pull/2305))
+
+
 ## [0.10.18] - 2026-10-05
 
 ### 🚀 Features
