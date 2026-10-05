@@ -348,7 +348,7 @@ fn private_profile_command_reapplies_paths_after_clearing_environment() {
     for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
         assert!(environment
             .get(OsStr::new(key))
-            .is_none_or(|value| value.is_none()));
+            .is_none_or(Option::is_none));
     }
     for (key, path) in [
         ("GH_CONFIG_DIR", dir.path().join("gh-config")),
