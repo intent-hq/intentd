@@ -390,3 +390,42 @@ CREATE TRIGGER note_comment_anchor_cover_update AFTER UPDATE ON note_comment_anc
     )
     SELECT new.head_id,p.level,c.position/c.size,new.thread_id,new.id,new.start,new.end FROM cells c JOIN powers p ON p.size=c.size;
 END;
+
+-- A committed partial workspace sweep must remain unavailable after caller
+-- cancellation and process restart. Only actual workspace deletion removes
+-- this backend-local fence; it is never exported or imported.
+CREATE TABLE note_annotation_workspace_retirement (
+    workspace_id TEXT PRIMARY KEY REFERENCES workspace(id) ON DELETE CASCADE
+);
+CREATE TRIGGER note_annotation_retirement_note_insert BEFORE INSERT ON note
+WHEN EXISTS (SELECT 1 FROM note_annotation_workspace_retirement WHERE workspace_id=new.workspace_id)
+BEGIN
+    SELECT RAISE(ABORT,'workspace note retirement in progress');
+END;
+CREATE TRIGGER note_annotation_retirement_note_update BEFORE UPDATE ON note
+WHEN EXISTS (SELECT 1 FROM note_annotation_workspace_retirement WHERE workspace_id IN (old.workspace_id,new.workspace_id))
+BEGIN
+    SELECT RAISE(ABORT,'workspace note retirement in progress');
+END;
+CREATE TRIGGER note_annotation_retirement_comment_insert BEFORE INSERT ON comment
+WHEN new.note_id IS NOT NULL AND EXISTS (SELECT 1 FROM note_annotation_workspace_retirement WHERE workspace_id=new.workspace_id)
+BEGIN
+    SELECT RAISE(ABORT,'workspace note retirement in progress');
+END;
+CREATE TRIGGER note_annotation_retirement_comment_update BEFORE UPDATE ON comment
+WHEN EXISTS (SELECT 1 FROM note_annotation_workspace_retirement
+    WHERE (workspace_id=old.workspace_id AND old.note_id IS NOT NULL)
+       OR (workspace_id=new.workspace_id AND new.note_id IS NOT NULL))
+BEGIN
+    SELECT RAISE(ABORT,'workspace note retirement in progress');
+END;
+CREATE TRIGGER note_annotation_retirement_attribution_insert BEFORE INSERT ON note_line_attribution
+WHEN EXISTS (SELECT 1 FROM note_annotation_workspace_retirement WHERE workspace_id=new.workspace_id)
+BEGIN
+    SELECT RAISE(ABORT,'workspace note retirement in progress');
+END;
+CREATE TRIGGER note_annotation_retirement_attribution_update BEFORE UPDATE ON note_line_attribution
+WHEN EXISTS (SELECT 1 FROM note_annotation_workspace_retirement WHERE workspace_id IN (old.workspace_id,new.workspace_id))
+BEGIN
+    SELECT RAISE(ABORT,'workspace note retirement in progress');
+END;

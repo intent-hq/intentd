@@ -69,6 +69,7 @@ mod transfer_authorship;
 mod transfer_repo;
 mod usage_rate_repo;
 mod usage_stats_repo;
+mod workspace_annotation_cleanup;
 mod workspace_context_repo;
 mod workspace_git_root_repo;
 mod workspace_mcp_repo;

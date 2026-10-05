@@ -1373,6 +1373,9 @@ async fn annotation_cleanup_seeks_comment_anchors_and_preserves_other_workspaces
         .read_note_page_state(&keeper, &kept_note.id, None)
         .await
         .unwrap();
+    crate::workspace_annotation_cleanup::begin_retirement(&store, ws.as_str())
+        .await
+        .unwrap();
     let mut conn = store.write_pool().acquire().await.unwrap();
     let work = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&work);
@@ -1383,14 +1386,21 @@ async fn annotation_cleanup_seeks_comment_anchors_and_preserves_other_workspaces
             counter.fetch_add(100, Ordering::Relaxed);
             true
         });
-    let deleted = sqlx::query(crate::workspace_repo::DELETE_NOTE_COMMENT_BATCH_SQL)
-        .bind(ws.as_str())
-        .bind(50)
-        .execute(&mut *conn)
-        .await;
+    drop(conn);
+    let mut deleted = 0;
+    loop {
+        let batch = crate::workspace_annotation_cleanup::delete_comment_batch(&store, ws.as_str())
+            .await
+            .unwrap();
+        deleted += batch;
+        if batch == 0 {
+            break;
+        }
+    }
+    let mut conn = store.write_pool().acquire().await.unwrap();
     conn.lock_handle().await.unwrap().remove_progress_handler();
     let steps = work.load(Ordering::Relaxed);
-    assert_eq!(deleted.unwrap().rows_affected(), 50);
+    assert_eq!(deleted, 50);
     assert!(
         steps < 80_000,
         "50 small comments must not scan 10k unrelated anchors: {steps} VM steps"

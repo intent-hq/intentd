@@ -93,7 +93,9 @@ pub(crate) async fn head(
         "SELECT id, source_rev, attribution_generation, comment_revision, \
          attribution_rev = source_rev AS attribution_ready, \
          anchors_rev = source_rev AS anchors_ready FROM note_annotation_head \
-         WHERE workspace_id = ? AND note_id = ?",
+         WHERE workspace_id = ? AND note_id = ? \
+         AND NOT EXISTS (SELECT 1 FROM note_annotation_workspace_retirement r \
+                         WHERE r.workspace_id=note_annotation_head.workspace_id)",
     )
     .bind(workspace_id.as_str())
     .bind(note_id.as_str())

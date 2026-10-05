@@ -110,6 +110,7 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
     ("note_operation_item", "receipt-owned mappings, effects and inverse references are local to excluded note_operation identities"),
     ("note_operation_source", "retained receipt source belongs to excluded backend-local operations; live note source transfers through note"),
     ("note_annotation_head", "destination note triggers create fresh annotation epochs; legacy source and comments transfer separately"),
+    ("note_annotation_workspace_retirement", "backend-local partial deletion admission never transfers to a fresh destination workspace"),
     ("note_annotation_state", "backend-local incarnation state generations and deletion tombstones do not transfer"),
     ("note_attribution_line", "derived attribution projection is republished against the destination source revision"),
     ("note_attribution_author", "derived attribution author projection is republished against destination epochs"),
