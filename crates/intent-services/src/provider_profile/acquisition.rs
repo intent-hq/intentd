@@ -15,6 +15,8 @@ use super::{
 use crate::installed_cli::InstalledContext;
 use staged::DeferredReason;
 
+mod local_sources;
+
 pub enum NativeAcquisition {
     Ready(Box<AcquiredNativeProfile>),
     Deferred(DeferredReason),
@@ -349,6 +351,12 @@ fn inspect_sources(
             |s| Path::new(s.trim()).join("anthropic"),
         );
     absent(&anthropic)?;
+    let local = local_sources::resolve(workspace, Path::new(home))?;
+    let local_documents = local
+        .paths
+        .iter()
+        .map(|path| read_json(path))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut documents = Vec::new();
     let user = read_json(&config.join("settings.json"))?.unwrap_or_else(|| json!({}));
     let mut auth = AuthModelContext::default();
@@ -358,11 +366,11 @@ fn inspect_sources(
                 .insert(key.clone(), value.clone());
         }
     }
-    for document in [
-        user.clone(),
-        read_json(&workspace.join(".claude/settings.json"))?.unwrap_or_else(|| json!({})),
-        read_json(&workspace.join(".claude/settings.local.json"))?.unwrap_or_else(|| json!({})),
-    ] {
+    for document in std::iter::once(user.clone()).chain(
+        local_documents
+            .iter()
+            .map(|value| value.clone().unwrap_or_else(|| json!({}))),
+    ) {
         if [
             "policyHelper",
             "policyHelpers",
@@ -440,8 +448,9 @@ fn inspect_sources(
         return Err(DeferredReason::PolicyAcquisition);
     }
     documents.push(native);
-    let sources =
-        ConfigurationIdentity::from_value(&json!({"documents":documents,"environment":env}));
+    let sources = ConfigurationIdentity::from_value(
+        &json!({"documents":documents,"environment":env,"localSources":{"paths":local.paths,"provenance":local.provenance,"documents":local_documents}}),
+    );
     Ok((auth, sources))
 }
 

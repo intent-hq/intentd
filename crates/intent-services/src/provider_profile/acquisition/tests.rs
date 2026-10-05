@@ -445,3 +445,119 @@ fn f8_unreadable_and_unresolved_git_sources_defer() {
         ));
     }
 }
+
+#[test]
+fn f8_home_root_and_submodule_sources_remain_usable() {
+    let (mut f, local) = git_layout("nested");
+    // AK does not canonicalize the local store to HOME.
+    f.env.insert(
+        "HOME".into(),
+        local
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into(),
+    );
+    f.env.insert(
+        "CLAUDE_CONFIG_DIR".into(),
+        f.config.to_str().unwrap().into(),
+    );
+    std::fs::write(local, r#"{"model":"unrelated-home-local"}"#).unwrap();
+    assert!(f.inspect().is_ok());
+    let f = Fixture::new();
+    let store = f.root.path().join("submodule-store");
+    std::fs::create_dir(&store).unwrap();
+    std::fs::write(
+        f.workspace.join(".git"),
+        format!("gitdir: {}\n", store.display()),
+    )
+    .unwrap();
+    assert!(f.inspect().is_ok());
+}
+
+#[test]
+fn f8_symlink_and_broken_worktree_backlinks_defer() {
+    let (f, _) = git_layout("linked");
+    let gitdir = f.root.path().join("repo/.git/worktrees/linked");
+    std::fs::write(gitdir.join("gitdir"), "/wrong/.git\n").unwrap();
+    assert!(matches!(
+        f.inspect(),
+        Err(DeferredReason::PolicyAcquisition)
+    ));
+    let (f, local) = git_layout("nested");
+    std::os::unix::fs::symlink(f.config.join("settings.json"), local).unwrap();
+    assert!(matches!(
+        f.inspect(),
+        Err(DeferredReason::PolicyAcquisition)
+    ));
+}
+
+#[tokio::test]
+async fn f8_git_topology_change_invalidates_equal_settings() {
+    let (f, _) = git_layout("nested");
+    let acquired = ready(f.acquire(None).await);
+    // Same empty documents but a new nearer root must not reuse the old identity.
+    std::fs::create_dir(f.workspace.join(".git")).unwrap();
+    assert!(acquired
+        .build(
+            inputs(&BTreeMap::new()),
+            ProfileDirectory::ephemeral(f.root.path()).unwrap()
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires pinned Claude SDK/native runtime, node and Linux bwrap"]
+async fn f8_native_sources_match_public_acquisition() {
+    if std::env::var_os("INTENT_ACQUISITION_SOURCE_CHILD").is_some() {
+        let workspace = std::env::current_dir().unwrap();
+        let acquired = match acquire_native("claude-code", &workspace).await {
+            NativeAcquisition::Deferred(reason) => {
+                println!("DEFERRED:{reason:?}");
+                return;
+            }
+            NativeAcquisition::Ready(acquired) => acquired,
+        };
+        println!("READY");
+        if let Some(path) = std::env::var_os("INTENT_ACQUISITION_MUTATION") {
+            std::fs::write(path, r#"{"model":"claude-opus-4-6"}"#).unwrap();
+        }
+        let parent = std::env::var("INTENT_ACQUISITION_STATE").unwrap();
+        match acquired
+            .build(
+                inputs(&BTreeMap::new()),
+                ProfileDirectory::ephemeral(Path::new(&parent)).unwrap(),
+            )
+            .await
+        {
+            Ok(profile) => println!("BUILT:{}", profile.model.as_deref().unwrap_or("none")),
+            Err(_) => println!("BUILD_FAILED"),
+        }
+        return;
+    }
+    let modules =
+        std::env::var("INTENT_CLAUDE_FIXTURE_MODULES").expect("set pinned Claude modules");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = tokio::process::Command::new("node")
+        .env_remove("NODE_OPTIONS")
+        .arg(manifest.join("src/provider_profile/fixtures/claude-sources.mjs"))
+        .arg(modules)
+        .arg(std::env::current_exe().unwrap())
+        .arg(manifest.join("../..").canonicalize().unwrap())
+        .arg("provider_profile::acquisition::tests::f8_native_sources_match_public_acquisition")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "synthetic public/native source fixture: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("PASS Claude native/public canonical source parity"));
+}
