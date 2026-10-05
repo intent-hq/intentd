@@ -652,3 +652,216 @@ fn every_registered_provider_has_an_explicit_profile_strategy() {
     }
     assert!(capability_evidence("unregistered").is_err());
 }
+
+#[test]
+fn revision_url_denials_cover_http_and_sse() {
+    use policy::{PolicyFormat, PolicyScope, PolicySource};
+    let url = "https://denied.invalid/mcp";
+    for (provider, format, documents) in [
+        (
+            "pi",
+            PolicyFormat::Intent,
+            vec![
+                json!({"denyMcp":[{"identity":{"url":url}}]}),
+                json!({"allowMcp":[{"name":"remote"}],"denyMcp":[{"identity":{"url":url}}]}),
+            ],
+        ),
+        (
+            "claude-code",
+            PolicyFormat::ClaudeManagedMcp,
+            vec![
+                json!({"deniedMcpServers":[{"serverUrl":url}]}),
+                json!({"allowedMcpServers":[{"serverName":"remote"}],"deniedMcpServers":[{"serverUrl":url}]}),
+            ],
+        ),
+    ] {
+        for document in documents {
+            let source =
+                PolicySource::inline(PolicyScope::Host, "fixture", format, &document.to_string());
+            let policy = policy::read_host_policy(provider, &[source]).unwrap();
+            for server in [
+                NormalizedMcpServer::Http {
+                    url: url.into(),
+                    headers: None,
+                },
+                NormalizedMcpServer::Sse {
+                    url: url.into(),
+                    headers: None,
+                },
+            ] {
+                assert!(
+                    policy.validate_server("remote", &server).is_err(),
+                    "URL denial must cover every remote transport"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn revision_reopened_profile_cannot_delete_live_identity() {
+    let root = scratch();
+    let identity = ProfileIdentity {
+        workspace: "fixture",
+        agent: "one",
+        provider: "pi",
+    };
+    let first = ProfileDirectory::persistent(root.path(), &identity).unwrap();
+    let second = ProfileDirectory::persistent(&root.path().join("."), &identity).unwrap();
+    assert!(matches!(
+        second.remove_persistent(),
+        Err(ProfileError::InUse)
+    ));
+    assert!(first.path().exists());
+    let second = ProfileDirectory::persistent(root.path(), &identity).unwrap();
+    assert!(matches!(
+        first.remove_persistent(),
+        Err(ProfileError::InUse)
+    ));
+    let path = second.path().to_owned();
+    second.remove_persistent().unwrap();
+    assert!(!path.exists());
+}
+
+fn fixture_endpoint(key: &str) -> ModelEndpoint {
+    ModelEndpoint {
+        provider_id: "fixture".into(),
+        model_id: "fixture-model".into(),
+        base_url: "http://127.0.0.1:1/v1".into(),
+        api_key: key.into(),
+        context_window: Some(32000),
+        max_output_tokens: Some(1024),
+        compaction_reserved: None,
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn revision_withdrawn_route_preserves_history_and_retained_credentials() {
+    let root = scratch();
+    let identity = ProfileIdentity {
+        workspace: "fixture",
+        agent: "one",
+        provider: "pi",
+    };
+    let directory = ProfileDirectory::persistent(root.path(), &identity).unwrap();
+    let profile = prepare_profile_candidate(
+        "pi",
+        ProfilePurpose::Interactive,
+        directory,
+        &BTreeMap::new(),
+        &AuthModelContext {
+            endpoint: Some(fixture_endpoint("fixture-only")),
+            credentials: vec![auth::CredentialFile::PiAuth(
+                json!({"fixture":{"type":"api_key","key":"fixture-only"}}),
+            )],
+            ..Default::default()
+        },
+        &policy::HostPolicySnapshot::default(),
+    )
+    .unwrap();
+    profile
+        .directory
+        .write_private("history.jsonl", b"fixture history")
+        .unwrap();
+    let path = profile.directory.path().to_owned();
+    drop(profile);
+    let profile = prepare_profile_candidate(
+        "pi",
+        ProfilePurpose::Interactive,
+        ProfileDirectory::persistent(root.path(), &identity).unwrap(),
+        &BTreeMap::new(),
+        &AuthModelContext::default(),
+        &policy::HostPolicySnapshot::default(),
+    )
+    .unwrap();
+    assert!(
+        !path.join("models.json").exists(),
+        "withdrawn generated model route must be removed"
+    );
+    assert!(
+        path.join("auth.json").exists(),
+        "omitted credential update means retain native refresh state"
+    );
+    assert_eq!(
+        std::fs::read(path.join("history.jsonl")).unwrap(),
+        b"fixture history"
+    );
+    drop(profile);
+}
+
+#[test]
+#[cfg(unix)]
+fn revision_failed_rebuild_does_not_publish_partial_configuration() {
+    let root = scratch();
+    let directory = ProfileDirectory::ephemeral(root.path()).unwrap();
+    directory
+        .write_private("settings.json", b"original")
+        .unwrap();
+    let result = prepare_profile_candidate(
+        "pi",
+        ProfilePurpose::Interactive,
+        directory.clone(),
+        &BTreeMap::new(),
+        &AuthModelContext {
+            endpoint: Some(fixture_endpoint("fixture-only")),
+            credentials: vec![auth::CredentialFile::CodexAuth(json!({}))],
+            ..Default::default()
+        },
+        &policy::HostPolicySnapshot::default(),
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read(directory.path().join("settings.json")).unwrap(),
+        b"original"
+    );
+    assert!(!directory.path().join("models.json").exists());
+}
+
+#[test]
+#[cfg(unix)]
+#[ignore = "requires official Pi 0.81.0 at INTENT_PI_FIXTURE_RUNTIME"]
+fn revision_pi_native_auth_preserves_literal_values() {
+    let runtime = std::env::var("INTENT_PI_FIXTURE_RUNTIME").unwrap();
+    let root = scratch();
+    for key in [
+        "fixture-only",
+        "fixture$PROFILE_REVIEW_MISSING",
+        "${MISSING}$$!tail",
+        "!fixture-literal",
+    ] {
+        let profile = prepare_profile_candidate(
+            "pi",
+            ProfilePurpose::Ephemeral,
+            ProfileDirectory::ephemeral(root.path()).unwrap(),
+            &BTreeMap::new(),
+            &AuthModelContext {
+                endpoint: Some(fixture_endpoint(key)),
+                ..Default::default()
+            },
+            &policy::HostPolicySnapshot::default(),
+        )
+        .unwrap();
+        let input = root.path().join("expected.json");
+        std::fs::write(&input, json!({"apiKey":key}).to_string()).unwrap();
+        let output = std::process::Command::new("node")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", root.path())
+            .env("PI_OFFLINE", "1")
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/provider_profile/fixtures/pi-auth.mjs"),
+            )
+            .arg(&runtime)
+            .arg(profile.directory.path())
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "native fixture must resolve exact synthetic credential; no credential values logged"
+        );
+    }
+}
