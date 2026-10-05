@@ -1,6 +1,7 @@
 use super::*;
 use crate::desktop::tests::Harness;
 use intent_core::desktop::DesktopState;
+use intent_core::Caller;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::test]
