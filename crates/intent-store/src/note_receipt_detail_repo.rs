@@ -313,10 +313,24 @@ impl Store {
                 .bind(&operation_key).bind(if query.kind==ReceiptDetailKind::Detail {query.reference.as_str()}else{query.kind.storage_kind()})
                 .bind(after).bind(i64::try_from(query.max_items+1).map_err(db)?).fetch_all(&mut *tx).await.map_err(db)?;
             let mut items = Vec::new();
+            let mut fragment_bytes = 0;
             for (index, row) in rows.iter().take(query.max_items).enumerate() {
                 let value: String = row.get("value");
                 let item: Value = serde_json::from_str(&value).map_err(db)?;
                 validate_item(query.kind, &item)?;
+                let source_bytes = if item["kind"] == "fragment" {
+                    item["text"].as_str().ok_or_else(invalid)?.len()
+                } else {
+                    0
+                };
+                if fragment_bytes + source_bytes > query.max_source_bytes {
+                    if index == 0 {
+                        return Err(budget());
+                    }
+                    break;
+                }
+                fragment_bytes += source_bytes;
+
                 let seq: i64 = row.get("sequence");
                 let next = u64::try_from(seq)
                     .map_err(db)?

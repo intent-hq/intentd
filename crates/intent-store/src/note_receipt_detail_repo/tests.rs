@@ -335,3 +335,37 @@ async fn receipt_detail_pages_only_existing_scoped_metadata_or_fragments() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn receipt_detail_fragment_source_budget_applies_to_whole_page() {
+    let (_dir, store, mut query) = fixture().await;
+    let reference = format!("{KEY}:detail:fragments");
+    for sequence in 0..40 {
+        let value = json!({"kind":"fragment","id":format!("field{sequence}"),"field":"text","offset":0,"text":"x".repeat(1024),"nextRef":null});
+        sqlx::query("INSERT INTO note_operation_detail(operation_key,reference,sequence,value) VALUES(?,?,?,?)")
+            .bind(KEY).bind(&reference).bind(sequence).bind(value.to_string()).execute(store.write_pool()).await.unwrap();
+    }
+    query.kind = ReceiptDetailKind::Detail;
+    query.reference = reference;
+    query.max_items = 128;
+    query.max_wire_bytes = 65536;
+    query.max_source_bytes = 4096;
+    let mut seen = 0;
+    loop {
+        let page = read(&store, &query).await;
+        let items = page["items"].as_array().unwrap();
+        assert!(
+            items
+                .iter()
+                .map(|v| v["text"].as_str().unwrap().len())
+                .sum::<usize>()
+                <= 4096
+        );
+        seen += items.len();
+        let Some(next) = page["nextCursor"].as_str() else {
+            break;
+        };
+        query.cursor = Some(next.into());
+    }
+    assert_eq!(seen, 40);
+}
