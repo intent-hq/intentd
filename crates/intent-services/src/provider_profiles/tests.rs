@@ -191,6 +191,35 @@ fn codex_mixed_transport_layers_and_sse_are_explicit_errors() {
 }
 
 #[test]
+fn codex_resume_preserves_bundled_skills_without_exempting_native_roots() {
+    let dir = fixture();
+    let empty = NormalizedMcpServers::new();
+    let profile = prepare_provider_profile(request(dir.path(), "codex", &empty)).unwrap();
+    let bundled = profile.path().join("skills/.system/skill-creator/SKILL.md");
+    let personal = dir.path().join(".agents/skills/find-skills/SKILL.md");
+    let native_system = dir.path().join(".codex/skills/.system/native/SKILL.md");
+    let profile_user = profile.path().join("skills/custom/SKILL.md");
+    for path in [&bundled, &personal, &native_system, &profile_user] {
+        write(path, "---\nname: fixture\ndescription: fixture\n---\n");
+    }
+    drop(profile);
+    let mut req = request(dir.path(), "codex", &empty);
+    req.resume = true;
+    let resumed = prepare_provider_profile(req).unwrap();
+    let config: Value = serde_json::from_str(&resumed.env["CODEX_CONFIG"]).unwrap();
+    let disabled = config["skills"]["config"].as_array().unwrap();
+    assert!(!disabled
+        .iter()
+        .any(|entry| entry["path"] == bundled.to_string_lossy().as_ref()));
+    for path in [&personal, &native_system, &profile_user] {
+        assert!(disabled
+            .iter()
+            .any(|entry| entry["path"] == path.to_string_lossy().as_ref()
+                && entry["enabled"] == false));
+    }
+}
+
+#[test]
 fn claude_preserves_tool_free_metadata_and_refuses_exclusive_policy() {
     let dir = fixture();
     let empty = NormalizedMcpServers::new();

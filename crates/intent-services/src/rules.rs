@@ -522,22 +522,14 @@ pub(crate) async fn assemble_system_prompt(
         if let Some(rtk_instruction) = build_rtk_instruction(harness, rtk_enabled).await {
             parts.push(rtk_instruction);
         }
-        // Skills catalog layer (reference layer 4.7: after specialization rules, user
-        // rules, and skills — before isolation hint / specialist role). When a
-        // workspace path is available, discover and inject the skills catalog. Empty
-        // catalog ⇒ no layer appended. Discovery failures degrade gracefully (log
-        // warn, omit layer) — never fail prompt assembly.
-        if let Some(ws) = workspace {
-            if let Some(repo_path) = crate::git_ops::worktree_path(ws) {
-                match crate::skills::format_skills_catalog_for_prompt(&repo_path.to_string_lossy())
-                    .await
-                {
-                    catalog if !catalog.trim().is_empty() => {
-                        parts.push(catalog);
-                    }
-                    _ => {}
-                }
-            }
+    }
+    // Persistent workspaces, including repository-free Assistant, get the
+    // shared catalog. Session-less utility calls without a workspace keep
+    // their existing policy. Empty catalogs add no initial prompt layer.
+    if let Some(ws) = workspace {
+        let catalog = skill_catalog_for_workspace(ws).await;
+        if !catalog.is_empty() {
+            parts.push(catalog);
         }
     }
     // Workspace API reference layer (truncating providers only): the
@@ -621,6 +613,34 @@ pub(crate) async fn assemble_system_prompt(
     } else {
         Some(harness.join_prompt_layers(&parts))
     }
+}
+
+/// Use the same cached, bounded discovery for initial prompts and later turns.
+/// An empty path selects personal-only discovery, without provisioning a repo.
+pub(crate) async fn skill_catalog_for_workspace(workspace: &intent_core::Workspace) -> String {
+    let path = crate::git_ops::worktree_path(workspace);
+    crate::skills::format_skills_catalog_for_prompt(
+        path.as_deref()
+            .map_or(std::borrow::Cow::Borrowed(""), Path::to_string_lossy)
+            .as_ref(),
+    )
+    .await
+}
+
+/// Replace only Intent's catalog in a retained conversation. Explicitly send an
+/// empty catalog when the last skill disappears; native bundled skills remain.
+pub(crate) fn skill_catalog_update(catalog: &str) -> String {
+    let catalog = if catalog.is_empty() {
+        "<available_skills>\n</available_skills>"
+    } else {
+        catalog
+    };
+    format!(
+        "<system>\nIntent skill catalog update: this replaces the previous Intent-provided \
+         available_skills catalog. Skills omitted here are no longer available from that \
+         catalog. Keep provider-bundled system skills and all other conversation instructions.\n\n\
+         {catalog}\n</system>"
+    )
 }
 
 /// Stateless executor for the `rules.*` namespace over the settings [`Store`].
@@ -926,12 +946,20 @@ This is a test skill.
 
     #[tokio::test]
     async fn test_assemble_system_prompt_no_workspace() {
+        let repo = TempDir::new().unwrap();
+        let skill_dir = repo.path().join(".agents/skills/utility-excluded");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: utility-excluded\ndescription: Do not inject into a utility probe\n---\n",
+        )
+        .unwrap();
         let tmp_db = TempDb::new();
         let store = Store::open(&tmp_db.path).await.unwrap();
 
         let prompt = assemble_system_prompt(
             &store,
-            None,
+            Some(repo.path()),
             "workspace",
             None,
             false,
@@ -952,6 +980,17 @@ This is a test skill.
             !prompt_text.contains("<available_skills>"),
             "Skills catalog block should be absent when no workspace provided"
         );
+    }
+
+    #[test]
+    fn skill_catalog_update_clears_removed_skills_and_preserves_other_instructions() {
+        let empty = skill_catalog_update("");
+        assert!(empty.contains("<available_skills>\n</available_skills>"));
+        assert!(empty.contains("replaces the previous Intent-provided"));
+        assert!(empty.contains("Keep provider-bundled system skills"));
+        assert!(empty.contains("all other conversation instructions"));
+        let catalog = "<available_skills>\n<skill>current</skill>\n</available_skills>";
+        assert_eq!(skill_catalog_update(catalog).matches(catalog).count(), 1);
     }
 
     #[tokio::test]
