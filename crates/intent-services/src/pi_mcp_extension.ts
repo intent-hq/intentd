@@ -16,7 +16,7 @@
 
 import net from "node:net";
 import fs from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 
 const CONNECT_TIMEOUT_MS = 5_000;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
@@ -346,6 +346,66 @@ export default async function piMcpExtension(pi) {
 }
 
 
+// Keep descendant identities before terminating the leader: a detached helper
+// cannot be rediscovered from Pi's tree after it has been orphaned. Synchronous,
+// bounded cleanup also works in Node's exit event, which cannot await promises.
+function ownMcpProcessTree(child) {
+  const known = new Map();
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  const processes = () => {
+    const rows = execFileSync("/bin/ps", ["-A", "-o", "pid=,ppid=,stat=,lstart="],
+      { encoding: "utf8", timeout: 1000, maxBuffer: 8 * 1024 * 1024 });
+    return new Map(rows.trim().split("\n").flatMap(line => {
+      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
+      return match ? [[Number(match[1]), { parent: Number(match[2]), state: match[3], start: match[4] }]] : [];
+    }));
+  };
+  const snapshot = () => {
+    const rows = processes();
+    if (!known.has(child.pid) && rows.has(child.pid)) known.set(child.pid, rows.get(child.pid).start);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const [pid, row] of rows) {
+        if (!known.has(pid) && known.get(row.parent) === rows.get(row.parent)?.start && known.has(row.parent)) {
+          known.set(pid, row.start);
+          changed = true;
+        }
+      }
+    }
+    return rows;
+  };
+  const live = rows => [...known].filter(([pid, start]) => {
+    const row = rows.get(pid);
+    return row?.start === start && !row.state.startsWith("Z");
+  }).map(([pid]) => pid);
+  const signal = (pids, sig) => {
+    // Descendants first; the snapshot, not process group membership, owns them.
+    for (const pid of pids.sort((a,b) => Number(a === child.pid) - Number(b === child.pid))) {
+      try { process.kill(pid, sig); } catch (error) { if (error.code !== "ESRCH") throw error; }
+    }
+  };
+  return {
+    snapshot,
+    close() {
+      let rows = snapshot();
+      for (const sig of ["SIGTERM", "SIGKILL"]) {
+        signal(live(rows), sig);
+        const until = Date.now() + 500;
+        while (live(rows).length && Date.now() < until) {
+          Atomics.wait(pause, 0, 0, 20);
+          rows = snapshot();
+          // Include helpers created during shutdown, while their parent identity
+          // is still known; keep the escalation target even after parent exit.
+          if (sig === "SIGKILL") signal(live(rows), sig);
+        }
+        if (!live(rows).length) return true;
+      }
+      return false;
+    },
+  };
+}
+
 // Only the daemon-owned, policy-filtered file is consumed here. Never discover
 // native config or merge ambient definitions inside the extension.
 export async function registerOwnedStdioServers(pi) {
@@ -354,9 +414,10 @@ export async function registerOwnedStdioServers(pi) {
   const servers = JSON.parse(fs.readFileSync(path, "utf8")).mcpServers ?? {};
   const children = new Set();
   const closeAll = () => {
-    for (const close of children) close();
-    children.clear();
-    process.removeListener("exit", closeAll);
+    for (const close of children) {
+      if (close()) children.delete(close);
+    }
+    if (!children.size) process.removeListener("exit", closeAll);
   };
   if (typeof pi.on === "function") pi.on("session_shutdown", closeAll);
   process.once("exit", closeAll);
@@ -369,18 +430,34 @@ export async function registerOwnedStdioServers(pi) {
     child.stderr.resume();
     const client = new McpLineClient(child.stdout, child.stdin);
     child.on("error", (err) => client.markClosed(err));
-    const close = () => { client.close(); child.kill(); };
+    const tree = ownMcpProcessTree(child);
+    const close = () => {
+      try {
+        const reaped = tree.close();
+        client.close();
+        if (!reaped) console.error("[pi-mcp-extension] MCP tree cleanup unconfirmed; retaining exit backstop");
+        return reaped;
+      } catch {
+        console.error("[pi-mcp-extension] MCP tree inspection unavailable; retaining exit backstop");
+        return false;
+      }
+    };
     children.add(close);
-    child.once("exit", () => children.delete(close));
+    child.once("exit", () => { if (close()) children.delete(close); });
     try {
       await client.initialize({ name: "intentd-pi-owned-mcp", version: "1" });
+      tree.snapshot();
       for (const tool of await client.listTools()) {
         const qualified = `mcp_${Buffer.from(name).toString("hex")}__${tool.name}`;
         pi.registerTool({
           name: qualified, label: `${name}: ${tool.name}`, description: tool.description ?? "",
           parameters: tool.inputSchema ?? { type: "object", properties: {} },
           async execute(_id, args, signal) {
-            return mapToolResult(await client.callTool(tool.name, args ?? {}, { signal }));
+            try {
+              return mapToolResult(await client.callTool(tool.name, args ?? {}, { signal }));
+            } finally {
+              tree.snapshot();
+            }
           },
         });
       }

@@ -8,7 +8,7 @@
 //! never persisted. Ports `mcp-hub.ts`/`server-manager.ts`/`health-monitor.ts`/
 //! `user-mcp-settings.ts`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,6 +28,56 @@ use crate::provider_profiles::McpPolicy;
 use crate::settings::{AsyncSecretStore, REDACTED_PLACEHOLDER};
 use crate::settings_registry::SettingsRegistry;
 use crate::{system_actor, EventBus};
+
+/// Per-request disables preserve both saved and running aliases. Expansion is
+/// repeated across both catalogs, including aliases that cross server IDs.
+#[derive(Clone, Default)]
+struct AgentServerDisables {
+    aliases: Vec<(String, String)>,
+    global: BTreeSet<String>,
+    workspace: BTreeSet<String>,
+}
+
+impl AgentServerDisables {
+    fn add_config(&mut self, id: &str, config: &Value) {
+        self.aliases.push((id.to_owned(), config_id(config)));
+        if let Some(name) = config.get("name").and_then(Value::as_str) {
+            self.aliases.push((id.to_owned(), name.to_owned()));
+        }
+        if config.get("enabled").and_then(Value::as_bool) != Some(true) {
+            self.global.insert(id.to_owned());
+        }
+    }
+
+    fn expand(&mut self) {
+        for denied in [&mut self.global, &mut self.workspace] {
+            loop {
+                let before = denied.len();
+                for (id, name) in &self.aliases {
+                    if denied.contains(id) || denied.contains(name) {
+                        denied.insert(id.clone());
+                        denied.insert(name.clone());
+                    }
+                }
+                if before == denied.len() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn check(&self, id: &str) -> Result<()> {
+        if self.global.contains(id) {
+            return Err(Error::InvalidParams(format!("mcp server {id} is disabled")));
+        }
+        if self.workspace.contains(id) {
+            return Err(Error::InvalidParams(format!(
+                "mcp server {id} is disabled for this workspace"
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// Keychain account for the sensitive `mcp.servers` setting (§9.8). Mirrors the
 /// `SettingsService` redaction seam — the config (with secrets) lives here.
@@ -727,7 +777,7 @@ impl McpHub {
     /// of which flips a recovered server back to `running`.
     #[cfg(test)]
     fn tool_target(&self, server_id: &str) -> Result<ToolTarget> {
-        self.authorized_target(server_id, None, None)
+        self.authorized_target(server_id, None, None, None)
     }
 
     fn permits_running_config(&self, id: &str, policy: &McpPolicy) -> bool {
@@ -739,13 +789,31 @@ impl McpHub {
             .is_none_or(|running| policy_allows(policy, &running.config, None))
     }
 
+    fn running_disables(&self, saved: &AgentServerDisables) -> AgentServerDisables {
+        let mut combined = saved.clone();
+        for (id, running) in self.inner.servers.lock().unwrap().iter() {
+            combined.add_config(id, &running.config);
+        }
+        combined.expand();
+        combined
+    }
+
     fn authorized_target(
         &self,
         server_id: &str,
         policy: Option<&McpPolicy>,
         tool: Option<&str>,
+        disables: Option<&AgentServerDisables>,
     ) -> Result<ToolTarget> {
         let map = self.inner.servers.lock().unwrap();
+        if let Some(saved) = disables {
+            let mut combined = saved.clone();
+            for (id, running) in map.iter() {
+                combined.add_config(id, &running.config);
+            }
+            combined.expand();
+            combined.check(server_id)?;
+        }
         let rs = map
             .get(server_id)
             .ok_or_else(|| Error::NotFound(format!("mcp server {server_id} is not running")))?;
@@ -827,7 +895,7 @@ impl McpHub {
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
-        self.forward_authorized(server_id, method, params, timeout, None)
+        self.forward_authorized(server_id, method, params, timeout, None, None)
             .await
     }
 
@@ -838,11 +906,13 @@ impl McpHub {
         params: Value,
         timeout: Duration,
         policy: Option<&McpPolicy>,
+        disables: Option<&AgentServerDisables>,
     ) -> Result<Value> {
         match self.authorized_target(
             server_id,
             policy,
             params.get("name").and_then(Value::as_str),
+            disables,
         )? {
             ToolTarget::Stdio(conn) => {
                 let cancel = |id: i64| {
@@ -1890,41 +1960,24 @@ impl<'a> McpServersService<'a> {
         &self,
         workspace_id: Option<&str>,
         server_id: &str,
-    ) -> Result<()> {
+    ) -> Result<AgentServerDisables> {
         let settings = self.require_agent_mcp()?;
         let config = self.require_config(server_id).await?;
-        let enabled = config
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
         let configs = read_configs_for_policy(self.secrets).await?;
-        let global = disabled_servers(&settings).into_iter().collect();
-        let workspace = self
-            .workspace_disabled_ids(workspace_id)
-            .await?
-            .into_iter()
-            .collect();
-        let configs = Value::Object(configs);
-        let global_disabled = crate::project_mcp::intent_mcp_disabled_names(
-            &configs,
-            &global,
-            &std::collections::BTreeSet::new(),
-        );
-        if !enabled || global_disabled.contains(server_id) {
-            return Err(Error::InvalidParams(format!(
-                "mcp server {server_id} is disabled"
-            )));
+        let mut disables = AgentServerDisables {
+            global: disabled_servers(&settings).into_iter().collect(),
+            workspace: self
+                .workspace_disabled_ids(workspace_id)
+                .await?
+                .into_iter()
+                .collect(),
+            ..AgentServerDisables::default()
+        };
+        for (id, saved) in &configs {
+            disables.add_config(id, saved);
         }
-        let workspace_disabled = crate::project_mcp::intent_mcp_disabled_names(
-            &configs,
-            &std::collections::BTreeSet::new(),
-            &workspace,
-        );
-        if workspace_disabled.contains(server_id) {
-            return Err(Error::InvalidParams(format!(
-                "mcp server {server_id} is disabled for this workspace"
-            )));
-        }
+        disables.expand();
+        disables.check(server_id)?;
         if self
             .agent_policy
             .as_ref()
@@ -1934,7 +1987,7 @@ impl<'a> McpServersService<'a> {
                 "MCP server denied by provider policy".into(),
             ));
         }
-        Ok(())
+        Ok(disables)
     }
 
     /// `ws.mcp.listServers`: every configured server projected to a
@@ -1946,13 +1999,20 @@ impl<'a> McpServersService<'a> {
     /// disabled servers, which surface with `enabled: false`).
     pub(crate) async fn agent_list_servers(&self, workspace_id: Option<&str>) -> Result<Value> {
         let settings = self.require_agent_mcp()?;
-        let ws_disabled = self.workspace_disabled_ids(workspace_id).await?;
         let configs = read_configs_for_policy(self.secrets).await?;
-        let disabled = crate::project_mcp::intent_mcp_disabled_names(
-            &Value::Object(configs.clone()),
-            &disabled_servers(&settings).into_iter().collect(),
-            &std::collections::BTreeSet::new(),
-        );
+        let mut disables = AgentServerDisables {
+            global: disabled_servers(&settings).into_iter().collect(),
+            workspace: self
+                .workspace_disabled_ids(workspace_id)
+                .await?
+                .into_iter()
+                .collect(),
+            ..AgentServerDisables::default()
+        };
+        for (id, config) in &configs {
+            disables.add_config(id, config);
+        }
+        let disables = self.hub.running_disables(&disables);
         let mut servers: Vec<Value> = configs
             .values()
             .filter(|config| {
@@ -1980,7 +2040,7 @@ impl<'a> McpServersService<'a> {
                 m.insert(
                     "enabled".into(),
                     json!(
-                        !disabled.contains(&id)
+                        !disables.global.contains(&id)
                             && config
                                 .get("enabled")
                                 .and_then(Value::as_bool)
@@ -1994,12 +2054,7 @@ impl<'a> McpServersService<'a> {
                 if let Some(tc) = status.get("toolCount") {
                     m.insert("toolCount".into(), tc.clone());
                 }
-                if ws_disabled.contains(&id)
-                    || config
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|n| ws_disabled.iter().any(|d| d == n))
-                {
+                if disables.workspace.contains(&id) {
                     m.insert("workspaceDisabled".into(), json!(true));
                 }
                 Value::Object(m)
@@ -2016,7 +2071,7 @@ impl<'a> McpServersService<'a> {
         workspace_id: Option<&str>,
         server_id: &str,
     ) -> Result<Value> {
-        self.require_agent_server(workspace_id, server_id).await?;
+        let disables = self.require_agent_server(workspace_id, server_id).await?;
         let mut result = self
             .hub
             .forward_authorized(
@@ -2025,6 +2080,7 @@ impl<'a> McpServersService<'a> {
                 json!({}),
                 TOOL_TIMEOUT,
                 self.agent_policy.as_ref(),
+                Some(&disables),
             )
             .await?;
         if let Some(policy) = &self.agent_policy {
@@ -2051,7 +2107,7 @@ impl<'a> McpServersService<'a> {
         args: Value,
         timeout_ms: Option<u64>,
     ) -> Result<Value> {
-        self.require_agent_server(workspace_id, server_id).await?;
+        let disables = self.require_agent_server(workspace_id, server_id).await?;
         self.hub
             .forward_authorized(
                 server_id,
@@ -2061,6 +2117,7 @@ impl<'a> McpServersService<'a> {
                     .map_or(TOOL_TIMEOUT, Duration::from_millis)
                     .min(TOOL_TIMEOUT_CAP),
                 self.agent_policy.as_ref(),
+                Some(&disables),
             )
             .await
     }
@@ -4750,6 +4807,99 @@ for line in sys.stdin:
             .await
             .is_ok());
         assert_eq!(h.status("id")["state"], "running");
+    }
+
+    #[tokio::test]
+    async fn provider_policy_stale_runtime_names_obey_live_disables() {
+        for workspace_only in [false, true] {
+            let (reg, _cfg) = temp_registry();
+            let (url, _guard) = http_tool_stub().await;
+            let hub = remote_hub("policy", "http", &url, json!({}));
+            hub.inner
+                .servers
+                .lock()
+                .unwrap()
+                .get_mut("policy")
+                .unwrap()
+                .config["name"] = json!("blocked");
+            let mut saved = hub.inner.servers.lock().unwrap()["policy"].config.clone();
+            saved["name"] = json!("allowed");
+            let secrets = mem_async();
+            secrets
+                .store(SETTING_KEY, &json!({"policy":saved}).to_string())
+                .await
+                .unwrap();
+            let (_tmp, store, ws) = store_with_workspace().await;
+            let service = svc_with_store(Some(&reg), &secrets, &hub, &store)
+                .with_agent_policy(McpPolicy::default());
+            if workspace_only {
+                store
+                    .set_workspace_mcp_server_disabled(&WorkspaceId(ws.clone()), "blocked", true)
+                    .await
+                    .unwrap();
+            } else {
+                reg.apply(&[("mcp.disabledServers".into(), json!(["blocked"]))])
+                    .unwrap();
+            }
+            let listed = service.agent_list_tools(Some(&ws), "policy").await;
+            let called = service
+                .agent_call_tool(Some(&ws), "policy", "t1", json!({}), None)
+                .await;
+            assert!(listed.is_err() && called.is_err(), "stale runtime name must be denied (workspace={workspace_only}): list={listed:?}, call={called:?}");
+            let projection = service.agent_list_servers(Some(&ws)).await.unwrap();
+            if workspace_only {
+                assert_eq!(projection["servers"][0]["workspaceDisabled"], true);
+                assert!(service
+                    .agent_call_tool(None, "policy", "t1", json!({}), None)
+                    .await
+                    .is_ok());
+            } else {
+                assert_eq!(projection["servers"][0]["enabled"], false);
+            }
+            assert_eq!(hub.status("policy")["state"], "running");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_policy_workspace_projection_expands_alias_chains() {
+        let (reg, _cfg) = temp_registry();
+        let hub = McpHub::new();
+        let secrets = mem_async();
+        secrets
+            .store(
+                SETTING_KEY,
+                &json!({
+                    "first":{"id":"first","name":"second","command":"echo","enabled":true},
+                    "second":{"id":"second","name":"third","command":"echo","enabled":true}
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let (_tmp, store, ws) = store_with_workspace().await;
+        store
+            .set_workspace_mcp_server_disabled(&WorkspaceId(ws.clone()), "third", true)
+            .await
+            .unwrap();
+        let service = svc_with_store(Some(&reg), &secrets, &hub, &store)
+            .with_agent_policy(McpPolicy::default());
+        let listing = service.agent_list_servers(Some(&ws)).await.unwrap();
+        for server in listing["servers"].as_array().unwrap() {
+            assert_eq!(server["workspaceDisabled"], true);
+            assert_eq!(server["enabled"], true);
+        }
+        assert!(service
+            .agent_list_tools(Some(&ws), "first")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("disabled for this workspace"));
+        let other = service.agent_list_servers(None).await.unwrap();
+        assert!(other["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|server| server.get("workspaceDisabled").is_none()));
     }
 
     #[tokio::test]
