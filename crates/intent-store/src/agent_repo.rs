@@ -4244,7 +4244,7 @@ const DELETE_MESSAGE_BATCH_SQL: &str = "DELETE FROM agent_message WHERE rowid IN
 /// writers queued on the pool interleave. Returns the number of non-empty
 /// batches executed.
 pub(crate) async fn delete_in_bounded_batches(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::StorePool,
     sql: &str,
     scope_id: &str,
     batch: i64,

@@ -19,11 +19,14 @@ tracing = { workspace = true }
 base64 = { workspace = true }
 image = { version = "0.25.6", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 flate2 = "1.1.9"
+futures-util = "0.3"
+async-stream = "0.3"
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+trybuild = "1"
 tempfile = "3"
 tokio = { workspace = true }
 uuid = { workspace = true }

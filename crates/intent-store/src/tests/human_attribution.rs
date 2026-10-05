@@ -236,8 +236,8 @@ async fn transfer_human_trust_migration_cleans_legacy_keys_once_and_fences_downg
     previous_migrator().run(&write_pool).await.unwrap();
     let store = Store {
         _daemon_owner: None,
-        write_pool,
-        read_pool: crate::connect_read(&tmp.path).await.unwrap(),
+        write_pool: write_pool.into(),
+        read_pool: crate::connect_read(&tmp.path).await.unwrap().into(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
         export_author_barrier: Arc::default(),
         repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),

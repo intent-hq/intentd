@@ -761,11 +761,6 @@ async fn cancelled_query_ownership(renewed_read_pool: Option<bool>) {
         owner.write_pool().clone()
     };
     if renewed_read_pool.is_some() {
-        pool.set_connect_options(
-            sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(&db)
-                .create_if_missing(false),
-        );
         retire_pool_connections(&pool).await;
     }
     let mut connection = pool.acquire().await.unwrap().detach();
@@ -902,7 +897,7 @@ async fn cancelled_startup_keeps_ownership_during_initialization() {
     assert_released(&db).await;
 }
 
-async fn retire_pool_connections(pool: &sqlx::SqlitePool) {
+async fn retire_pool_connections(pool: &intent_store::StorePool) {
     // Reads can have opened multiple connections; wait for returns and retire
     // every original connection, not just the first available idle one.
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -922,7 +917,7 @@ async fn retire_pool_connections(pool: &sqlx::SqlitePool) {
     assert_eq!(pool.size(), 0);
 }
 
-async fn replaced_options_retain_ownership(read_pool: bool, handle: &str) {
+async fn renewed_facade_retains_ownership(read_pool: bool, handle: &str) {
     use sqlx::Connection;
     let fixture = Fixture::new();
     let db = fixture.data_dir().join("intentd.db");
@@ -936,20 +931,19 @@ async fn replaced_options_retain_ownership(read_pool: bool, handle: &str) {
         owner.read_pool().close().await;
         owner.write_pool().clone()
     };
-    let fresh = sqlx::sqlite::SqliteConnectOptions::new()
-        .filename(&db)
-        .create_if_missing(false)
-        .busy_timeout(Duration::from_secs(7));
-    pool.set_connect_options(fresh.clone());
-    // Retire the connection whose original options carried ownership. The next
-    // one must still be protected despite completely fresh connection options.
+    // The facade disallows mutable/exported connection options at compile time.
+    // Keep runtime renewal/detachment and original-body preservation coverage.
     retire_pool_connections(&pool).await;
     drop(owner);
-    let pool = if handle == "pool-options" {
-        let options = pool.options().clone();
-        pool.close().await;
+    let pool = if handle == "facade-clone" {
+        let retained = pool.clone();
+        let settings = pool.options();
+        assert_eq!(
+            settings.get_max_connections(),
+            if read_pool { 32 } else { 1 }
+        );
         drop(pool);
-        options.connect_with(fresh).await.unwrap()
+        retained
     } else {
         pool
     };
@@ -983,28 +977,28 @@ async fn replaced_options_retain_ownership(read_pool: bool, handle: &str) {
 }
 
 #[tokio::test]
-async fn replaced_write_pool_options_retain_ownership() {
-    replaced_options_retain_ownership(false, "pool").await;
+async fn renewed_write_facade_retains_ownership() {
+    renewed_facade_retains_ownership(false, "pool").await;
 }
 #[tokio::test]
-async fn replaced_read_pool_options_retain_ownership() {
-    replaced_options_retain_ownership(true, "pool").await;
+async fn renewed_read_facade_retains_ownership() {
+    renewed_facade_retains_ownership(true, "pool").await;
 }
 #[tokio::test]
 async fn renewed_write_detached_connection_retains_ownership() {
-    replaced_options_retain_ownership(false, "detached").await;
+    renewed_facade_retains_ownership(false, "detached").await;
 }
 #[tokio::test]
 async fn renewed_read_detached_connection_retains_ownership() {
-    replaced_options_retain_ownership(true, "detached").await;
+    renewed_facade_retains_ownership(true, "detached").await;
 }
 #[tokio::test]
-async fn exported_write_pool_options_retain_ownership() {
-    replaced_options_retain_ownership(false, "pool-options").await;
+async fn cloned_write_facade_retains_ownership() {
+    renewed_facade_retains_ownership(false, "facade-clone").await;
 }
 #[tokio::test]
-async fn exported_read_pool_options_retain_ownership() {
-    replaced_options_retain_ownership(true, "pool-options").await;
+async fn cloned_read_facade_retains_ownership() {
+    renewed_facade_retains_ownership(true, "facade-clone").await;
 }
 
 #[tokio::test]
@@ -1018,4 +1012,106 @@ async fn cancelled_renewed_write_query_retains_ownership() {
 #[tokio::test]
 async fn cancelled_renewed_read_query_retains_ownership() {
     cancelled_query_ownership(Some(true)).await;
+}
+
+#[cfg(target_os = "linux")]
+fn sqlite_workers() -> Vec<(PathBuf, String)> {
+    fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            let name = fs::read_to_string(path.join("comm")).unwrap_or_default();
+            name.starts_with("sqlx-sqlite").then(|| {
+                let wait = fs::read_to_string(path.join("wchan")).unwrap_or_default();
+                (path, wait)
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn database_lock_available(db: &Path) -> bool {
+    let mut lock = db.as_os_str().to_os_string();
+    lock.push(".daemon.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(PathBuf::from(lock))
+        .unwrap();
+    Flock::lock(file, FlockArg::LockExclusiveNonblock).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+async fn renewal_initialization_ownership(read: bool) {
+    use sqlx::Connection;
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let owner = Store::open_for_daemon(&db).await.unwrap();
+    let slim = seed(&owner).await;
+    let before = payloads(&owner, STAGED).await;
+    let pool = if read {
+        owner.write_pool().close().await;
+        owner.read_pool().clone()
+    } else {
+        owner.read_pool().close().await;
+        owner.write_pool().clone()
+    };
+    retire_pool_connections(&pool).await;
+    drop(owner);
+    let mut blocker = sqlx::SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new().filename(&db),
+    )
+    .await
+    .unwrap();
+    sqlx::query("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE")
+        .execute(&mut blocker)
+        .await
+        .unwrap();
+    let prior: Vec<_> = sqlite_workers().into_iter().map(|(path, _)| path).collect();
+    let acquisition = tokio::spawn(async move { pool.acquire().await });
+    let worker = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some((path, _)) = sqlite_workers()
+                .into_iter()
+                .find(|(path, wait)| !prior.contains(path) && wait.contains("hrtimer_nanosleep"))
+            {
+                break path;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("renewal must reach SQLite initialization busy wait");
+    assert!(!database_lock_available(&db));
+    acquisition.abort();
+    assert!(acquisition.await.unwrap_err().is_cancelled());
+    let worker_running = worker.exists();
+    let exclusive = !database_lock_available(&db);
+    println!(
+        "read={read}, initialization worker alive={worker_running}, ownership retained={exclusive}"
+    );
+    // Always release the synthetic blocker before asserting, including fail-before.
+    sqlx::query("COMMIT").execute(&mut blocker).await.unwrap();
+    blocker.close().await.unwrap();
+    assert!(
+        worker_running && exclusive,
+        "cancelled initialization must retain exclusive ownership, read={read}"
+    );
+    let observer = Store::open(&db).await.unwrap();
+    assert_eq!(payloads(&observer, STAGED).await, before);
+    finalize(&observer, STAGED, slim).await;
+    assert!(full_body_matches(&observer, STAGED).await);
+    observer.close().await;
+    assert_released(&db).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn write_renewal_initialization_retains_ownership_after_cancellation() {
+    renewal_initialization_ownership(false).await;
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn read_renewal_initialization_retains_ownership_after_cancellation() {
+    renewal_initialization_ownership(true).await;
 }

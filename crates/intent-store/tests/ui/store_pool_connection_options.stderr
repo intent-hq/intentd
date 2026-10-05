@@ -1,0 +1,5 @@
+error[E0599]: no method named `connect_options` found for reference `&StorePool` in the current scope
+ --> tests/ui/store_pool_connection_options.rs:2:18
+  |
+2 |     let _ = pool.connect_options();
+  |                  ^^^^^^^^^^^^^^^ method not found in `&StorePool`

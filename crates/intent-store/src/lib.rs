@@ -25,6 +25,8 @@ mod completion_watch_repo;
 mod daemon_ownership;
 mod delegation_group_repo;
 mod diagnostics;
+mod store_pool;
+pub use store_pool::{StorePool, StorePoolOptions};
 mod diffs_repo;
 mod draft_repo;
 mod event_repo;
@@ -363,8 +365,8 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 pub struct Store {
     // Also retained by connection options and SQLite handles; see retain_owner.
     _daemon_owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
-    write_pool: SqlitePool,
-    read_pool: SqlitePool,
+    write_pool: StorePool,
+    read_pool: StorePool,
     repository_lifecycle: std::sync::Arc<repository_lifecycle::LifecycleDomain>,
     /// Process-local `displayed` overlay of the browser tab registry; see
     /// `browser_tab_repo::DisplayedOverlay`.
@@ -413,9 +415,9 @@ impl Store {
         lifecycle.settle();
         Ok(Self {
             repository_lifecycle,
+            write_pool: StorePool::new(write_pool, owner.is_some()),
+            read_pool: StorePool::new(read_pool, owner.is_some()),
             _daemon_owner: owner,
-            write_pool,
-            read_pool,
             browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
             #[cfg(test)]
             export_author_barrier: std::sync::Arc::default(),
@@ -496,22 +498,17 @@ impl Store {
 
     /// Borrow the write pool (single connection, for INSERT/UPDATE/DELETE/BEGIN).
     ///
-    /// For owned stores, pool acquisition, same-database option replacement and
-    /// detached connections retain the startup lease. Unmodified clones of
-    /// `pool.options()` also retain it when used for the same database. Do not
-    /// retarget owned pools or replace their connection hooks.
-    /// `pool.connect_options()` exports configuration, not an ownership token:
-    /// standalone connections created from it bypass the pool and are not
-    /// supported as owned handles. Acquire through the pool instead.
+    /// Acquisition and queries retain ownership throughout initialization.
+    /// The facade exposes read-only settings, not a raw pool or mutable options.
     #[must_use]
-    pub fn write_pool(&self) -> &SqlitePool {
+    pub fn write_pool(&self) -> &StorePool {
         &self.write_pool
     }
 
     /// Borrow the read pool (32 connections, intended for read/SELECT queries).
     /// The ownership and exported-options boundary is the same as [`Self::write_pool`].
     #[must_use]
-    pub fn read_pool(&self) -> &SqlitePool {
+    pub fn read_pool(&self) -> &StorePool {
         &self.read_pool
     }
 
@@ -519,7 +516,7 @@ impl Store {
     /// explicit `read_pool()` / `write_pool()` usage.
     #[deprecated(since = "0.1.0", note = "use read_pool() or write_pool() explicitly")]
     #[must_use]
-    pub fn pool(&self) -> &SqlitePool {
+    pub fn pool(&self) -> &StorePool {
         &self.read_pool
     }
 
@@ -815,13 +812,17 @@ async fn connect_write_owned(
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
-        .auto_vacuum(SqliteAutoVacuum::Incremental)
-        .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_secs(5))
-        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+        .busy_timeout(Duration::from_secs(5));
+    let opts = if owner.is_none() {
+        opts.auto_vacuum(SqliteAutoVacuum::Incremental)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+    } else {
+        opts
+    };
 
-    retain_pool_owner(SqlitePoolOptions::new(), owner.clone())
+    retain_pool_owner(SqlitePoolOptions::new(), owner.clone(), true)
         .max_connections(1)
         .acquire_timeout(acquire_timeout)
         .connect_with(retain_owner(opts, owner))
@@ -870,17 +871,29 @@ async fn connect_read_owned(
     db_path: &Path,
     owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
 ) -> Result<SqlitePool> {
+    connect_read_owned_timeout(db_path, owner, Duration::from_secs(10)).await
+}
+
+async fn connect_read_owned_timeout(
+    db_path: &Path,
+    owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+    acquire_timeout: Duration,
+) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(false)
-        .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_secs(5))
-        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+        .busy_timeout(Duration::from_secs(5));
+    let opts = if owner.is_none() {
+        opts.journal_mode(SqliteJournalMode::Wal)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+    } else {
+        opts
+    };
 
-    retain_pool_owner(SqlitePoolOptions::new(), owner.clone())
+    retain_pool_owner(SqlitePoolOptions::new(), owner.clone(), false)
         .max_connections(32)
-        .acquire_timeout(Duration::from_secs(10))
+        .acquire_timeout(acquire_timeout)
         .connect_with(retain_owner(opts, owner))
         .await
         .map_err(|e| match e {
@@ -891,14 +904,14 @@ async fn connect_read_owned(
         })
 }
 
-/// Unlike connection options, the live pool's hooks cannot be replaced by
-/// `set_connect_options`. Keep ownership in that hook and install a separate
-/// `SQLite`-owned capture on every new connection before handing it to a caller.
-/// The hook capture retains the lease for the pool; the installed callback also covers
-/// detached handles and work still executing after async task cancellation.
+/// Install ownership before any database PRAGMA can block. `SQLx` runs connection
+/// option PRAGMAs before this hook, so owned options contain only local settings.
+/// Internal acquisition timeouts may cancel this future; the `SQLite` destructor
+/// then retains the lease until the actual busy worker finishes and closes.
 fn retain_pool_owner(
     options: SqlitePoolOptions,
     owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+    write: bool,
 ) -> SqlitePoolOptions {
     match owner {
         Some(owner) => options.after_connect(move |connection, _metadata| {
@@ -910,7 +923,14 @@ fn retain_pool_owner(
                         let _keep_alive = &owner;
                         left.cmp(right)
                     },
-                )
+                )?;
+                let pragmas = if write {
+                    "PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL"
+                } else {
+                    "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL"
+                };
+                sqlx::query(pragmas).execute(connection).await?;
+                Ok(())
             })
         }),
         None => options,
