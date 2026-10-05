@@ -55,6 +55,16 @@ impl Fixture {
         Self { root }
     }
 
+    fn database_files(&self) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(self.data_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("intentd.db"))
+            .collect();
+        names.sort();
+        names
+    }
+
     fn data_dir(&self) -> PathBuf {
         self.root.path().join("data")
     }
@@ -106,7 +116,11 @@ impl Fixture {
         command
     }
 
-    fn run(&self, mut command: Command, label: &str) -> String {
+    fn run(&self, command: Command, label: &str) -> String {
+        self.run_expected(command, label, true)
+    }
+
+    fn run_expected(&self, mut command: Command, label: &str, success: bool) -> String {
         let stdout_path = self.root.path().join(format!("{label}.stdout"));
         let stderr_path = self.root.path().join(format!("{label}.stderr"));
         command
@@ -120,20 +134,32 @@ impl Fixture {
             .expect("isolated diagnostic exceeded deadline");
         let stdout = fs::read_to_string(stdout_path).unwrap();
         let stderr = fs::read_to_string(stderr_path).unwrap();
-        assert!(status.success(), "{label}: {status}\n{stdout}\n{stderr}");
+        assert_eq!(
+            status.success(),
+            success,
+            "{label}: {status}\n{stdout}\n{stderr}"
+        );
         println!("{label}: {status}\n{stdout}\n{stderr}");
         stdout
     }
 
-    fn doctor(&self) {
+    fn preflight(&self) {
         let mut probe = self.command(&std::env::current_exe().unwrap());
         probe
             .args(["--exact", "diagnostic_fixture_is_isolated", "--nocapture"])
             .env(ISOLATION_PROBE, self.root.path());
         self.run(probe, "isolation");
+    }
+
+    fn doctor_output(&self, success: bool) -> String {
+        self.preflight();
         let mut command = self.command(Path::new(env!("CARGO_BIN_EXE_intentd")));
         command.arg("doctor");
-        let stdout = self.run(command, "doctor");
+        self.run_expected(command, "doctor", success)
+    }
+
+    fn doctor(&self) {
+        let stdout = self.doctor_output(true);
         assert!(stdout.contains("migrations current"), "{stdout}");
         assert!(stdout.contains("integrity_check: ok"), "{stdout}");
     }
@@ -255,7 +281,7 @@ async fn full_body_matches(store: &Store, id: &str) -> bool {
 async fn doctor_preserves_live_staged_and_finalized_full_bodies() {
     let fixture = Fixture::new();
     let _owner = fixture.lock();
-    let writer = Store::open(&fixture.data_dir().join("intentd.db"))
+    let writer = Store::open_for_daemon(&fixture.data_dir().join("intentd.db"))
         .await
         .unwrap();
     let slim = seed(&writer).await;
@@ -288,7 +314,7 @@ async fn owned_startup_reaps_dead_turn_and_preserves_finalized_full_body() {
     let finalized_before;
     {
         let _owner = fixture.lock();
-        let writer = Store::open(&db).await.unwrap();
+        let writer = Store::open_for_daemon(&db).await.unwrap();
         seed(&writer).await;
         finalized_before = payloads(&writer, FINALIZED).await;
         // The turn dies: close both pools and relinquish ownership before restart.
@@ -296,7 +322,7 @@ async fn owned_startup_reaps_dead_turn_and_preserves_finalized_full_body() {
     }
     let _new_owner = fixture.lock();
     fixture.assert_owned();
-    let restarted = Store::open(&db).await.unwrap();
+    let restarted = Store::open_for_daemon(&db).await.unwrap();
     assert!(
         payloads(&restarted, STAGED).await.is_empty(),
         "dead-turn payload should be reaped at owned startup"
@@ -310,4 +336,212 @@ async fn owned_startup_reaps_dead_turn_and_preserves_finalized_full_body() {
         "dead-turn cleanup must rebalance stored byte accounting"
     );
     restarted.close().await;
+}
+
+#[tokio::test]
+async fn ordinary_open_and_competing_startup_preserve_live_payloads() {
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let owner = Store::open_for_daemon(&db).await.unwrap();
+    let slim = seed(&owner).await;
+    let before = payloads(&owner, STAGED).await;
+    let other = Store::open(&db).await.unwrap();
+    assert_eq!(payloads(&other, STAGED).await, before);
+    assert!(Store::open_for_daemon(&db).await.is_err());
+    // A symlink alias cannot obtain a second startup lease either.
+    let alias = fixture.data_dir().join("alias.db");
+    std::os::unix::fs::symlink(&db, &alias).unwrap();
+    assert!(Store::open_for_daemon(&alias).await.is_err());
+    let retained = owner.clone();
+    drop(owner);
+    assert!(
+        Store::open_for_daemon(&db).await.is_err(),
+        "clones retain ownership"
+    );
+    assert_eq!(payloads(&retained, STAGED).await, before);
+    finalize(&retained, STAGED, slim).await;
+    assert!(full_body_matches(&retained, STAGED).await);
+    other.close().await;
+    retained.close().await;
+    drop(retained);
+    let restarted = Store::open_for_daemon(&db).await.unwrap();
+    assert!(full_body_matches(&restarted, STAGED).await);
+    restarted.close().await;
+}
+
+#[tokio::test]
+async fn competing_serve_exits_before_touching_live_payloads() {
+    let fixture = Fixture::new();
+    let _owner = fixture.lock();
+    let writer = Store::open_for_daemon(&fixture.data_dir().join("intentd.db"))
+        .await
+        .unwrap();
+    let slim = seed(&writer).await;
+    let before = payloads(&writer, STAGED).await;
+    fixture.preflight();
+    let mut command = common::serve_command();
+    // Keep the standard serve builder while replacing its environment with the
+    // same fail-closed synthetic routing verified by preflight.
+    let isolated = fixture.command(Path::new(env!("CARGO_BIN_EXE_intentd")));
+    command
+        .env_clear()
+        .envs(isolated.get_envs().filter_map(|(k, v)| v.map(|v| (k, v))));
+    command.current_dir(fixture.root.path());
+    fixture.run_expected(command, "competing-serve", false);
+    fixture.assert_owned();
+    assert_eq!(payloads(&writer, STAGED).await, before);
+    finalize(&writer, STAGED, slim).await;
+    assert!(full_body_matches(&writer, STAGED).await);
+    writer.close().await;
+}
+
+#[test]
+fn doctor_missing_database_does_not_create_database_or_schema() {
+    let fixture = Fixture::new();
+    let output = fixture.doctor_output(false);
+    assert!(
+        output.contains("read-only database open failed"),
+        "{output}"
+    );
+    assert!(!fixture.data_dir().join("intentd.db").exists());
+    assert!(
+        fixture.database_files().is_empty(),
+        "no database or SQLite sidecars created"
+    );
+}
+
+#[tokio::test]
+async fn doctor_old_schema_reports_without_migrating() {
+    use sqlx::Connection;
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db)
+        .create_if_missing(true);
+    let mut connection = sqlx::SqliteConnection::connect_with(&options)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY); INSERT INTO _sqlx_migrations VALUES (1); CREATE TABLE synthetic_old (value TEXT); INSERT INTO synthetic_old VALUES ('preserve')")
+        .execute(&mut connection).await.unwrap();
+    connection.close().await.unwrap();
+    let before = fs::read(&db).unwrap();
+    let output = fixture.doctor_output(false);
+    assert!(output.contains("migrations not current"), "{output}");
+    assert_eq!(
+        fs::read(&db).unwrap(),
+        before,
+        "old schema and data must be byte-identical"
+    );
+    assert_eq!(
+        fixture.database_files(),
+        vec!["intentd.db"],
+        "no journal or WAL created"
+    );
+}
+
+#[tokio::test]
+async fn doctor_does_not_checkpoint_pending_wal_frames() {
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let writer = Store::open_for_daemon(&db).await.unwrap();
+    sqlx::query("PRAGMA wal_autocheckpoint=0")
+        .execute(writer.write_pool())
+        .await
+        .unwrap();
+    // Establish a known base, then create committed frames that a PASSIVE
+    // checkpoint could copy. No reader holds a snapshot that would block it.
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(writer.write_pool())
+        .await
+        .unwrap();
+    seed(&writer).await;
+    let wal = db.with_file_name("intentd.db-wal");
+    let shm = db.with_file_name("intentd.db-shm");
+    let database_before = fs::read(&db).unwrap();
+    let wal_before = fs::read(&wal).unwrap();
+    assert!(
+        wal_before.len() > 32,
+        "fixture must have committed WAL frames"
+    );
+    // SQLite's native-endian WAL-index nBackfill counter sits at byte 96.
+    let backfill_before = fs::read(&shm).unwrap()[96..100].to_vec();
+    assert_eq!(backfill_before, 0_u32.to_ne_bytes());
+    fixture.doctor();
+    assert_eq!(
+        fs::read(&db).unwrap(),
+        database_before,
+        "doctor checkpointed the DB"
+    );
+    assert_eq!(
+        fs::read(&wal).unwrap(),
+        wal_before,
+        "doctor changed the WAL"
+    );
+    assert_eq!(
+        &fs::read(&shm).unwrap()[96..100],
+        backfill_before,
+        "doctor advanced checkpoint progress"
+    );
+    writer.close().await;
+}
+
+#[tokio::test]
+async fn diagnostic_handle_rejects_writes_and_checkpoint() {
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let writer = Store::open(&db).await.unwrap();
+    seed(&writer).await;
+    let diagnostic = intent_store::DiagnosticStore::open(&db).await.unwrap();
+    assert!(sqlx::query("DELETE FROM agent_message_payload")
+        .execute(diagnostic.read_pool())
+        .await
+        .is_err());
+    assert!(sqlx::query("CREATE TABLE forbidden (id INTEGER)")
+        .execute(diagnostic.read_pool())
+        .await
+        .is_err());
+    assert!(sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(diagnostic.read_pool())
+        .await
+        .is_err());
+    assert!(diagnostic.migration_status().await.unwrap().is_current());
+    diagnostic.close().await;
+    assert_eq!(payloads(&writer, STAGED).await.len(), 1);
+    writer.close().await;
+}
+
+#[tokio::test]
+async fn startup_lock_precedes_database_creation() {
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(fixture.data_dir().join("intentd.db.daemon.lock"))
+        .unwrap();
+    let lock = Flock::lock(lock, FlockArg::LockExclusiveNonblock).unwrap();
+    assert!(Store::open_for_daemon(&db).await.is_err());
+    assert!(
+        !db.exists(),
+        "a rejected startup cannot create or migrate the DB"
+    );
+    drop(lock);
+    let owner = Store::open_for_daemon(&db).await.unwrap();
+    assert!(owner.migration_status().await.unwrap().is_current());
+    owner.close().await;
+}
+
+#[tokio::test]
+async fn doctor_newer_schema_reports_without_modifying_database() {
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let writer = Store::open(&db).await.unwrap();
+    sqlx::query("INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (999999, 'synthetic future', 1, X'00', 0)")
+        .execute(writer.write_pool()).await.unwrap();
+    writer.close().await;
+    let before = fs::read(&db).unwrap();
+    let output = fixture.doctor_output(false);
+    assert!(output.contains("migrations not current"), "{output}");
+    assert_eq!(fs::read(&db).unwrap(), before);
 }

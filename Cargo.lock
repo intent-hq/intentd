@@ -2409,6 +2409,7 @@ dependencies = [
  "flate2",
  "image",
  "intent-core",
+ "nix 0.31.3",
  "rand 0.10.3",
  "serde",
  "serde_json",

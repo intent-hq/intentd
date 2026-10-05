@@ -7298,6 +7298,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
         }
     };
     let store = Store {
+        _daemon_owner: None,
         write_pool,
         read_pool: crate::connect_read(&tmp.path)
             .await

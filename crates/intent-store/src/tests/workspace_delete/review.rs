@@ -450,6 +450,7 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
     };
     legacy.run(&pool).await.unwrap();
     let store = Store {
+        _daemon_owner: None,
         write_pool: pool,
         read_pool: crate::connect_read(&tmp.path).await.unwrap(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),

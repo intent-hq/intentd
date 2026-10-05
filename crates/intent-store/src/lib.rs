@@ -22,7 +22,9 @@ mod client_repo;
 mod comment_repo;
 mod completion_wake_delivery_repo;
 mod completion_watch_repo;
+mod daemon_ownership;
 mod delegation_group_repo;
+mod diagnostics;
 mod diffs_repo;
 mod draft_repo;
 mod event_repo;
@@ -86,6 +88,7 @@ pub use agent_repo::{
 pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
 pub use completion_watch_repo::PersistedCompletionWatch;
 pub use delegation_group_repo::PersistedDelegationGroup;
+pub use diagnostics::DiagnosticStore;
 pub use diffs_repo::NewDiff;
 pub use event_repo::{EventQuery, NewEvent};
 pub use event_subscription_repo::PersistedEventSubscription;
@@ -358,6 +361,8 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// constraint. See `connect_write` / `connect_read` for the pool configurations.
 #[derive(Clone)]
 pub struct Store {
+    // Retained by every clone; only owned startup can run the global sweep.
+    _daemon_owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
     write_pool: SqlitePool,
     read_pool: SqlitePool,
     repository_lifecycle: std::sync::Arc<repository_lifecycle::LifecycleDomain>,
@@ -392,16 +397,53 @@ impl Store {
             )),
             _ => Error::Internal(format!("migrations failed: {e}")),
         })?;
-        // Reap `agent_message_payload` rows pre-staged (0109,
-        // intent-hq/intent#3884 part 2) by a turn that died with the daemon
-        // before appending its envelope. Only valid at open, before any turn
-        // runs — a live turn's staged rows are envelope-less by design. The
-        // 0109 stats delete trigger rebalances `conversation_bytes`.
+        lifecycle.settle();
+        Ok(Self {
+            repository_lifecycle,
+            _daemon_owner: None,
+            write_pool,
+            read_pool,
+            browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
+            #[cfg(test)]
+            export_author_barrier: std::sync::Arc::default(),
+        })
+    }
+
+    /// Open for exclusive daemon startup, sweeping dead-turn payloads before
+    /// returning a usable Store. Every clone retains ownership until dropped.
+    /// Ordinary opens never perform this sweep. The lock file must not be removed.
+    ///
+    /// # Errors
+    /// Returns an error if another daemon owns this database, locking is unsupported,
+    /// or opening/migrating/sweeping the database fails.
+    pub async fn open_for_daemon(db_path: &Path) -> Result<Self> {
+        // Resolve symlinks (including parent aliases for a new DB) before deriving
+        // the lock path, so different config paths cannot acquire different locks.
+        let physical = if db_path.exists() {
+            std::fs::canonicalize(db_path)
+        } else {
+            db_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .canonicalize()
+                .map(|parent| parent.join(db_path.file_name().unwrap_or_default()))
+        }
+        .map_err(|e| Error::Internal(format!("resolve daemon database path: {e}")))?;
+        let mut lock_path = physical.as_os_str().to_os_string();
+        lock_path.push(".daemon.lock");
+        let owner = daemon_ownership::DaemonOwnership::acquire(Path::new(&lock_path))?;
+        let store = Self {
+            _daemon_owner: Some(std::sync::Arc::new(owner)),
+            ..Self::open(&physical).await?
+        };
+        // No Store has escaped this constructor yet, and the OS lock excludes
+        // competing daemon startups. The delete trigger rebalances byte counts.
         let reaped = sqlx::query(
             "DELETE FROM agent_message_payload WHERE NOT EXISTS \
              (SELECT 1 FROM agent_message m WHERE m.id = agent_message_payload.message_id)",
         )
-        .execute(&write_pool)
+        .execute(store.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("orphaned payload sweep failed: {e}")))?
         .rows_affected();
@@ -411,15 +453,7 @@ impl Store {
                 "reaped orphaned pre-staged agent_message_payload rows"
             );
         }
-        lifecycle.settle();
-        Ok(Self {
-            repository_lifecycle,
-            write_pool,
-            read_pool,
-            browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
-            #[cfg(test)]
-            export_author_barrier: std::sync::Arc::default(),
-        })
+        Ok(store)
     }
 
     /// Borrow the write pool (single connection, for INSERT/UPDATE/DELETE/BEGIN).
@@ -660,10 +694,10 @@ pub struct MigrationStatus {
 }
 
 impl MigrationStatus {
-    /// True when every embedded migration version has been applied.
+    /// True when the applied versions exactly match this build, including no newer versions.
     #[must_use]
     pub fn is_current(&self) -> bool {
-        self.expected.iter().all(|v| self.applied.contains(v))
+        self.expected == self.applied
     }
 }
 
