@@ -390,3 +390,86 @@ async fn final_marker_witness_failure_rolls_back_entire_seal_and_retry_uses_same
     assert_eq!(witnesses, 1);
     assert_eq!(store.seal_note_stage("alice", &seal).await.unwrap(), sealed);
 }
+
+#[tokio::test]
+async fn dropping_seal_after_witness_writes_rolls_back_before_writer_retry() {
+    use crate::note_stage_repo::{MARKER_SEAL_PAUSE, MarkerSealPause};
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::Notify;
+
+    let (store, _tmp, note) = setup(&format!("😀{LITERAL}tail")).await;
+    store
+        .insert_comment(&note.workspace_id, &sample_comment(&note.id, ID, ID))
+        .await
+        .unwrap();
+    let begin = stage(&store, Edit::Shift).await;
+    let seal = seal_request(&store, &begin).await;
+    let uploaded: Vec<String> = sqlx::query_scalar(
+        "SELECT value FROM note_stage_record ORDER BY stream,chunk_sequence,ordinal",
+    )
+    .fetch_all(store.read_pool())
+    .await
+    .unwrap();
+    let pause = Arc::new(MarkerSealPause {
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    let mut pending = Box::pin(
+        MARKER_SEAL_PAUSE.scope(Arc::clone(&pause), store.seal_note_stage("alice", &seal)),
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            () = pause.entered.notified() => (),
+            result = &mut pending => panic!("seal settled before final witness barrier: {result:?}"),
+        }
+    })
+    .await
+    .expect("actual seal reached post-witness barrier");
+    // Drop the owning scoped future, not merely a borrowed Pin<&mut Future>.
+    drop(pending);
+    let mut tx = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.write_pool().begin_with("BEGIN IMMEDIATE"),
+    )
+    .await
+    .expect("cancelled seal released writer")
+    .unwrap();
+    let state: (String, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT phase,payload_digest,view_id FROM note_stage")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(state, ("staging".into(), None, None));
+    for table in [
+        "note_stage_view",
+        "note_stage_view_piece",
+        "note_stage_validation",
+    ] {
+        let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "{table}");
+    }
+    let cached: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_text WHERE sha256 IS NOT NULL")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(cached, 0);
+    let after: Vec<String> = sqlx::query_scalar(
+        "SELECT value FROM note_stage_record ORDER BY stream,chunk_sequence,ordinal",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(after, uploaded);
+    tx.commit().await.unwrap();
+    // Task-local pause belonged solely to the cancelled future; retry is real.
+    let sealed = store.seal_note_stage("alice", &seal).await.unwrap();
+    assert_eq!(sealed["phase"], "sealed");
+    assert_eq!(sealed["payloadDigest"], seal.payload_digest);
+    let witnesses: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation WHERE kind='live' AND json_type(value,'$.markerWitness')='object'")
+        .fetch_one(store.read_pool()).await.unwrap();
+    assert_eq!(witnesses, 1);
+}
