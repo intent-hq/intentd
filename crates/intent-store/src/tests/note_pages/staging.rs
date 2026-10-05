@@ -7,6 +7,8 @@ use intent_core::{
 };
 use serde_json::json;
 
+mod marker_admission;
+
 async fn request(store: &Store) -> NoteStageBegin {
     let first = page(store, json!({"kind":"source","maxSourceBytes":128})).await;
     let mut value = first["scope"].clone();

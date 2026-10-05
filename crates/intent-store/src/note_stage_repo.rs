@@ -148,8 +148,17 @@ impl Store {
         sqlx::query("INSERT INTO note_operation(operation_key,principal,backend_id,workspace_id,note_id,instance_id,operation_id,payload_digest,admission_expires,retain_until,outcome,method_kind) VALUES(?,?,?,?,?,?,?,?,?,?,?,'staged')")
             .bind(&operation_key).bind(principal).bind(&request.backend_id).bind(&request.workspace_id).bind(&request.note_id).bind(&request.note_instance_id).bind(&request.operation_id)
             .bind(&request.header_digest).bind(deadline.unix_timestamp()).bind(deadline.unix_timestamp()+7*86400+1).bind(state.to_string()).execute(&mut *tx).await.map_err(db)?;
-        sqlx::query("INSERT INTO note_stage(operation_key,root_key,header_digest,header,base_revision,phase) VALUES(?,?,?,?,?,'staging')")
-            .bind(&operation_key).bind(&root.key).bind(&request.header_digest).bind(serde_json::to_string(&request.header).map_err(db)?).bind(&request.header.base_revision).execute(&mut *tx).await.map_err(db)?;
+        // Capture one current ownership epoch while the same writer pins the
+        // source. Source generations can be shared across comment-only changes.
+        // Missing or inconsistent annotation state leaves marker support absent;
+        // it does not invalidate an otherwise valid source-only admission.
+        // This tuple alone confers no marker authority: seal must also prove
+        // inherited occurrence provenance before retaining a validated witness.
+        let marker_admission: Option<String> = sqlx::query_scalar("SELECT json_object('headId',a.id,'sourceRev',a.source_rev,'commentRevision',a.comment_revision,'stateGeneration',s.state_generation,'sourceRevision',s.source_revision) FROM note_annotation_head a JOIN note_page_head p ON p.workspace_id=a.workspace_id AND p.note_id=a.note_id JOIN note_annotation_state s ON s.workspace_id=a.workspace_id AND s.note_id=a.note_id WHERE a.workspace_id=? AND a.note_id=? AND p.instance_id=? AND a.source_rev=p.current_rev AND a.anchors_rev=a.source_rev AND s.instance_id=p.instance_id AND s.deleted=0 AND s.source_revision=? AND s.comment_revision=a.comment_revision AND length(a.comment_revision)=32 AND a.comment_revision NOT GLOB '*[^0-9a-f]*'")
+            .bind(&request.workspace_id).bind(&request.note_id).bind(&request.note_instance_id).bind(&request.header.base_revision)
+            .fetch_optional(&mut *tx).await.map_err(db)?;
+        sqlx::query("INSERT INTO note_stage(operation_key,root_key,header_digest,header,base_revision,phase,marker_admission) VALUES(?,?,?,?,?,'staging',?)")
+            .bind(&operation_key).bind(&root.key).bind(&request.header_digest).bind(serde_json::to_string(&request.header).map_err(db)?).bind(&request.header.base_revision).bind(marker_admission).execute(&mut *tx).await.map_err(db)?;
         let tail = serde_json::to_string(&NoteStageTail::default()).map_err(db)?;
         for stream in NOTE_STAGE_STREAMS {
             sqlx::query("INSERT INTO note_stage_stream(operation_key,stream,tail) VALUES(?,?,?)")
