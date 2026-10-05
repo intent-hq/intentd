@@ -126,7 +126,12 @@ impl NoteStageHeader {
                 && (self.output == NoteStageOutput::Search) == self.query.is_some(),
         )?;
         if let Some(q) = &self.query {
-            require(!q.case_sensitive && q.text.len() <= 1024 && !q.text.contains('\0'))?;
+            require(
+                !q.case_sensitive
+                    && q.text.len() <= 1024
+                    && !q.text.contains('\0')
+                    && (q.mode != NoteStageSearchMode::Source || !q.text.is_empty()),
+            )?;
         }
         Ok(())
     }
