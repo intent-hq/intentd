@@ -39,7 +39,9 @@ fn reference(id: &str, text: &str) -> Value {
     json!({"textId":id,"length":units(text),"utf8Bytes":text.len(),"sha256":digest})
 }
 async fn upload(store: &Store, begin: &NoteStageBegin, stream: &str, records: Vec<Value>) {
-    let mut chunk:NoteStageAppend=serde_json::from_value(json!({"backendId":begin.backend_id,"workspaceId":begin.workspace_id,"noteId":begin.note_id,"noteInstanceId":begin.note_instance_id,"operationId":begin.operation_id,"headerDigest":begin.header_digest,"stream":stream,"sequence":0,"previousDigest":null,"records":records,"chunkDigest":"0".repeat(64)})).unwrap();
+    let (sequence, previous): (i64, Option<String>) = sqlx::query_as("SELECT s.next_sequence,s.last_digest FROM note_stage_stream s JOIN note_operation o USING(operation_key) WHERE o.operation_id=? AND s.stream=?")
+        .bind(&begin.operation_id).bind(stream).fetch_one(store.read_pool()).await.unwrap();
+    let mut chunk:NoteStageAppend=serde_json::from_value(json!({"backendId":begin.backend_id,"workspaceId":begin.workspace_id,"noteId":begin.note_id,"noteInstanceId":begin.note_instance_id,"operationId":begin.operation_id,"headerDigest":begin.header_digest,"stream":stream,"sequence":sequence,"previousDigest":previous,"records":records,"chunkDigest":"0".repeat(64)})).unwrap();
     chunk.chunk_digest = chunk.computed_digest().unwrap();
     store.append_note_stage("alice", &chunk).await.unwrap();
 }
@@ -332,12 +334,24 @@ async fn before_seal_ownership_epoch_change_refuses_without_refreshing_begin_pin
 
 #[tokio::test]
 async fn final_marker_witness_failure_rolls_back_entire_seal_and_retry_uses_same_upload() {
-    let (store, _tmp, note) = setup(&format!("😀{LITERAL}tail")).await;
+    let (store, _tmp, note) = setup(&format!("😀{LITERAL}{LITERAL}tail")).await;
     store
         .insert_comment(&note.workspace_id, &sample_comment(&note.id, ID, ID))
         .await
         .unwrap();
     let begin = stage(&store, Edit::Shift).await;
+    let second = canonical(
+        &json!({"version":1,"nodeType":"commentAnchor","parentOrdinal":null,"nativeRange":{"from":4,"to":5},"attributesRef":"attrs"}),
+    );
+    upload(
+        &store,
+        &begin,
+        "text",
+        vec![json!({"kind":"text","id":"second-descriptor","offset":0,"text":second})],
+    )
+    .await;
+    let start = START + 3 + units(LITERAL);
+    upload(&store, &begin, "live", vec![json!({"kind":"projection","ordinal":1,"sourceRange":{"start":start,"end":start+units(LITERAL)},"role":"marker-occurrence","canonicalId":ID,"detail":reference("second-descriptor",&second)})]).await;
     let seal = seal_request(&store, &begin).await;
     let uploaded: Vec<String> = sqlx::query_scalar(
         "SELECT value FROM note_stage_record ORDER BY stream,chunk_sequence,ordinal",
@@ -345,7 +359,7 @@ async fn final_marker_witness_failure_rolls_back_entire_seal_and_retry_uses_same
     .fetch_all(store.read_pool())
     .await
     .unwrap();
-    sqlx::query("CREATE TRIGGER reject_marker_witness BEFORE UPDATE OF value ON note_stage_validation WHEN new.kind='live' AND json_type(new.value,'$.markerWitness')='object' BEGIN SELECT RAISE(ABORT,'injected final marker witness'); END")
+    sqlx::query("CREATE TRIGGER reject_marker_witness BEFORE UPDATE OF value ON note_stage_validation WHEN new.kind='live' AND new.id='1' AND json_type(new.value,'$.markerWitness')='object' BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM note_stage_validation WHERE operation_key=new.operation_key AND kind='live' AND id='0' AND json_type(value,'$.markerWitness')='object') THEN RAISE(ABORT,'first witness was not written') END; SELECT RAISE(ABORT,'injected final marker witness'); END")
         .execute(store.write_pool()).await.unwrap();
     let error = store.seal_note_stage("alice", &seal).await.unwrap_err();
     assert!(
@@ -387,7 +401,7 @@ async fn final_marker_witness_failure_rolls_back_entire_seal_and_retry_uses_same
     assert_eq!(sealed["payloadDigest"], seal.payload_digest);
     let witnesses:i64=sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation WHERE kind='live' AND json_type(value,'$.markerWitness')='object'")
         .fetch_one(store.read_pool()).await.unwrap();
-    assert_eq!(witnesses, 1);
+    assert_eq!(witnesses, 2);
     assert_eq!(store.seal_note_stage("alice", &seal).await.unwrap(), sealed);
 }
 
