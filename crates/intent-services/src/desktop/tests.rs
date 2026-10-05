@@ -769,9 +769,14 @@ async fn permission_nonfailure_wakes_keep_distinct_outcomes() {
         let payload: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(payload["outcome"], outcome);
         assert!(payload.get("error").is_none());
+        let suffix = match outcome {
+            "expired" => " Reason: expired.",
+            "invalidated" => " Reason: primary_changed.",
+            _ => "",
+        };
         assert_eq!(
             payload["message"],
-            format!("Desktop permission {outcome}; control is not active.")
+            format!("Desktop permission {outcome}; control is not active.{suffix}")
         );
         assert!(!h
             .executor

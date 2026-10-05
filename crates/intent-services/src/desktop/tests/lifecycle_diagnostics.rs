@@ -218,3 +218,18 @@ async fn desktop_lifecycle_startup_revocation_keeps_one_terminal_reason_without_
     assert!(!visible_text(&message).contains("rescinded by the user"));
     assert!(message["metadata"].get("reportId").is_none());
 }
+
+#[test]
+fn desktop_lifecycle_reason_projection_is_safe_and_idempotent() {
+    let mut payload = json!({"message":"Desktop control ended."});
+    annotate_wake_reason(&mut payload, "private-token-value");
+    assert_eq!(payload, json!({"message":"Desktop control ended."}));
+    annotate_wake_reason(&mut payload, "executor_failed");
+    let once = payload.clone();
+    annotate_wake_reason(&mut payload, "executor_failed");
+    assert_eq!(payload, once);
+    let mut stopped = json!({"message":STOP_HINT});
+    annotate_wake_reason(&mut stopped, "user_stop");
+    assert_eq!(stopped["message"], STOP_HINT);
+    assert_eq!(stopped["reason"], "user_stop");
+}

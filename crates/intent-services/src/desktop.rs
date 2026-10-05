@@ -742,7 +742,7 @@ impl Services {
         }
         self.desktop_event(&binding,DESKTOP_SESSION_CHANGED,json!({"workspaceId":binding.workspace_id,"agentId":binding.agent_id,"sessionId":session_id,"computerId":binding.computer_id,"computerName":binding.computer_name,"status":"active"})).await?;
         if let Some(request) = request {
-            self.desktop_outcome(&live, request, "granted", None)
+            self.desktop_outcome(&live, request, "granted", None, None)
                 .await?;
         } else {
             self.desktop_watch(binding.agent_id.clone());
@@ -875,6 +875,7 @@ impl Services {
         request: &str,
         outcome: &str,
         failure: Option<&DesktopError>,
+        reason: Option<&str>,
     ) -> DesktopResult<()> {
         let state = if outcome == "granted" {
             live.state()
@@ -889,6 +890,9 @@ impl Services {
             _ => format!("Desktop permission {outcome}; control is not active."),
         };
         let mut payload = json!({"type":"desktop_control","requestId":request,"outcome":outcome,"state":state,"message":message});
+        if let Some(reason) = reason {
+            annotate_wake_reason(&mut payload, reason);
+        }
         if let Phase::Active { session_id, .. } = &live.phase {
             payload["sessionId"] = session_id.clone().into();
         }
@@ -972,12 +976,21 @@ impl Services {
                         "invalidated"
                     },
                     None,
+                    Some(reason),
                 )
                 .await?;
                 Ok(json!({"ended":false,"withdrawn":true}))
             }
             Phase::Active { session_id, .. } => {
-                let payload = wake.then(|| json!({"type":"desktop_control","sessionId":session_id,"outcome":"revoked","state":{"status":"inactive"},"message":"Desktop control ended; control is not active. Do not automatically restart."}));
+                let mut payload = wake.then(|| json!({"type":"desktop_control","sessionId":session_id,"outcome":"revoked","state":{"status":"inactive"},"message":"Desktop control ended; control is not active. Do not automatically restart."}));
+                if let Some(payload) = &mut payload {
+                    annotate_wake_reason(payload, reason);
+                    if let Ok(Some(record)) = self.store.desktop_terminal(session_id).await {
+                        if let Some(request) = record["requestId"].as_str() {
+                            payload["requestId"] = request.into();
+                        }
+                    }
+                }
                 self.store
                     .desktop_record_end(session_id, reason, None, payload.as_ref())
                     .await?;
@@ -1173,7 +1186,7 @@ impl Services {
                 let result: DesktopResult<()> = async {
                     if decision == "deny" {
                         services
-                            .desktop_outcome(&live, &request, "denied", None)
+                            .desktop_outcome(&live, &request, "denied", None, None)
                             .await?;
                     } else {
                         if decision == "allow_future" && !claims_primary {
@@ -1200,7 +1213,7 @@ impl Services {
                         services.desktop.remove(&live.binding.agent_id);
                     }
                     let _ = services
-                        .desktop_outcome(&live, &request, "failed", Some(&e))
+                        .desktop_outcome(&live, &request, "failed", Some(&e), None)
                         .await;
                 }
                 services.desktop_flush_outbox().await;
@@ -1374,6 +1387,7 @@ impl Services {
             "Desktop control ended; control is not active. Do not automatically restart.".into()
         };
         let mut payload = json!({"type":"desktop_control","sessionId":session,"outcome":"revoked","state":{"status":"inactive"},"message":message});
+        annotate_wake_reason(&mut payload, reason);
         if let Some(request) = record["requestId"].as_str() {
             payload["requestId"] = request.into();
         }
@@ -1467,7 +1481,7 @@ impl Services {
                         let _guard = gate.lock().await;
                         if services.desktop.get(&agent).is_some_and(|l| matches!(l.phase,Phase::Pending { request_id:ref r,.. } if r==request_id)) {
                             services.desktop.remove(&agent);
-                            let _ = services.desktop_outcome(&live,request_id,"expired",None).await;
+                            let _ = services.desktop_outcome(&live,request_id,"expired",None,Some("expired")).await;
                         }
                     }
                     Phase::Active { session_id, .. } => {
@@ -1561,6 +1575,13 @@ impl Services {
                 payload["state"] = json!({"status":"inactive"});
                 payload["message"] =
                     "Desktop control is no longer active. Do not automatically restart.".into();
+                if let Some(session) = payload["sessionId"].as_str() {
+                    if let Ok(Some(record)) = self.store.desktop_terminal(session).await {
+                        if let Some(reason) = record["reason"].as_str() {
+                            annotate_wake_reason(&mut payload, reason);
+                        }
+                    }
+                }
             }
             let message = payload["message"]
                 .as_str()
@@ -1664,7 +1685,13 @@ impl Services {
                 "Desktop control is no longer active. Do not automatically restart.".into();
         }
         if let Ok(Some(record)) = self.store.desktop_terminal(&session).await {
+            if payload["outcome"] == "invalidated" || payload["outcome"] == "revoked" {
+                if let Some(reason) = record["reason"].as_str() {
+                    annotate_wake_reason(payload, reason);
+                }
+            }
             if record["reason"] == "user_stop" {
+                payload["reason"] = "user_stop".into();
                 payload["outcome"] = "revoked".into();
                 payload["state"] = json!({"status":"inactive"});
                 payload["reportId"] = record["reportId"].clone();
@@ -1802,4 +1829,37 @@ fn validate_result(result: &Value, action: &Value, workspace: &WorkspaceId) -> D
         }
     }
     Ok(())
+}
+
+// Only stable public reason codes belong in model-visible diagnostics. Journal
+// contents never authorize a new session, and unknown values stay private.
+fn annotate_wake_reason(payload: &mut Value, reason: &str) {
+    if ![
+        "user_stop",
+        "screen_locked",
+        "os_permission_lost",
+        "lease_expired",
+        "executor_failed",
+        "unsupported_environment",
+        "owner_changed",
+        "agent_terminated",
+        "disconnected",
+        "primary_changed",
+        "agent_end",
+        "expired",
+    ]
+    .contains(&reason)
+    {
+        return;
+    }
+    payload["reason"] = reason.into();
+    if reason != "user_stop" {
+        let suffix = format!(" Reason: {reason}.");
+        let message = payload["message"]
+            .as_str()
+            .unwrap_or("Desktop control is not active.");
+        if !message.ends_with(&suffix) {
+            payload["message"] = format!("{message}{suffix}").into();
+        }
+    }
 }
