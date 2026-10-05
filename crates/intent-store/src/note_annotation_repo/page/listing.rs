@@ -133,7 +133,7 @@ impl Store {
             (id, lease, None)
         };
         let epochs = self
-            .validate_annotation_lease(&lease, scope, principal)
+            .validate_annotation_lease(id, &lease, scope, principal)
             .await?;
         let (mut out, rows, more) = self
             .annotation_summary_rows(&lease, id, &epochs, cursor.as_ref(), &key)
@@ -181,7 +181,7 @@ impl Store {
         if wire_len(&out, rpc_id) > lease.query.wire {
             return Err(budget());
         }
-        self.validate_annotation_lease(&lease, scope, principal)
+        self.validate_annotation_lease(id, &lease, scope, principal)
             .await?;
         Ok(out)
     }
@@ -304,7 +304,7 @@ impl Store {
                     };
                     let detail:i64=sqlx::query_scalar("SELECT rowid FROM note_comment_projection WHERE head_id=? AND comment_id=?").bind(head).bind(root).fetch_one(self.read_pool()).await.map_err(db_error)?;
                     let preview = trim(&row.latest_comment_preview, 512);
-                    items.push((json!({"threadId":row.thread_id,"status":row.status,"totalComments":row.total_comments,"latestCommentId":row.latest_comment_id,"latestCommentPreview":preview,"truncated":row.truncated||preview.len()<row.latest_comment_preview.len(),"anchorRef":if row.root_present{Some(reference(id,30,number(detail)?,key)?)}else{None},"detailRef":reference(id,31,number(detail)?,key)?}),number(owner)?,number(row.position)?));
+                    items.push((json!({"threadId":row.thread_id,"rootCommentId":row.root_comment_id,"rootState":if row.root_present{"present"}else{"deleted"},"status":row.status,"totalComments":row.total_comments,"latestCommentId":row.latest_comment_id,"latestCommentPreview":preview,"truncated":row.truncated||preview.len()<row.latest_comment_preview.len(),"anchorRef":if row.root_present{Some(reference(id,30,number(detail)?,key)?)}else{None},"detailRef":reference(id,31,number(detail)?,key)?}),number(owner)?,number(row.position)?));
                 }
                 Ok((out, items, rows.page.has_more))
             }
@@ -329,6 +329,7 @@ impl Store {
                     )
                     .await?;
                 let mut out = envelope(lease, id, "noteReplyPage");
+                out["threadId"] = json!(lease.query.thread_id);
                 out["totalComments"] = json!(rows.total_comments);
                 out["rootCommentId"] = json!(rows.root_comment_id);
                 out["rootState"] = json!(if rows.root_present {

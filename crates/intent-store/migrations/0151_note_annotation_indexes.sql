@@ -338,22 +338,52 @@ END;
 CREATE TABLE note_annotation_snapshot (id TEXT PRIMARY KEY,expires_ms INTEGER NOT NULL,payload TEXT NOT NULL);
 CREATE INDEX note_annotation_snapshot_expiry ON note_annotation_snapshot(expires_ms,id);
 
--- At most four live prepared range queries are admitted by the store. Their
--- narrow rows retain at most one entry per current scoped thread per lease.
--- Storage grows at most four times the source index; no result-cardinality cap.
+-- Each admitted range query retains scalar totals only. Lease admission bounds
+-- the cache to 256 entries; expiry is reclaimed on admission or expired reads.
 CREATE TABLE note_annotation_match_head (
     snapshot_id TEXT PRIMARY KEY REFERENCES note_annotation_snapshot(id) ON DELETE CASCADE,
     total_threads INTEGER NOT NULL,total_comments INTEGER NOT NULL,prepare_steps INTEGER NOT NULL,
     head_id INTEGER NOT NULL REFERENCES note_annotation_head(id) ON DELETE CASCADE
 );
-CREATE TABLE note_annotation_match (
-    snapshot_id TEXT NOT NULL REFERENCES note_annotation_match_head(snapshot_id) ON DELETE CASCADE,
-    thread_id TEXT NOT NULL CHECK(length(CAST(thread_id AS BLOB))<=256),position INTEGER NOT NULL,
-    PRIMARY KEY(snapshot_id,position,thread_id)
-);
-
 CREATE TRIGGER note_annotation_match_invalidate AFTER UPDATE OF source_rev,comment_revision ON note_annotation_head
 WHEN new.source_rev<>old.source_rev OR new.comment_revision<>old.comment_revision BEGIN
     DELETE FROM note_annotation_match_head WHERE head_id=new.id;
 END;
 CREATE INDEX note_annotation_match_owner ON note_annotation_match_head(head_id);
+
+-- Source-owned ordered interval coverage. A dyadic decomposition contains at
+-- most 106 cells per nonempty 53-bit interval; a point query probes 54 buckets.
+-- This avoids sorting all long overlaps on every page. It is not a query cache.
+CREATE INDEX note_comment_anchor_start_order ON note_comment_anchor(head_id,start,thread_id,id);
+CREATE INDEX note_comment_anchor_thread_order ON note_comment_anchor(head_id,thread_id,start,end,id);
+CREATE TABLE note_comment_anchor_cover (
+    head_id INTEGER NOT NULL REFERENCES note_annotation_head(id) ON DELETE CASCADE,
+    level INTEGER NOT NULL, bucket INTEGER NOT NULL, thread_id TEXT NOT NULL,
+    anchor_id INTEGER NOT NULL REFERENCES note_comment_anchor(id) ON DELETE CASCADE,
+    start INTEGER NOT NULL,end INTEGER NOT NULL,
+    PRIMARY KEY(head_id,level,bucket,thread_id,anchor_id)
+) WITHOUT ROWID;
+CREATE INDEX note_comment_anchor_cover_owner ON note_comment_anchor_cover(anchor_id);
+CREATE TRIGGER note_comment_anchor_cover_insert AFTER INSERT ON note_comment_anchor BEGIN
+    INSERT INTO note_comment_anchor_cover
+    WITH RECURSIVE powers(level,size) AS (VALUES(0,1) UNION ALL SELECT level+1,size*2 FROM powers WHERE level<53),
+    cells(position,size) AS (
+        SELECT new.start,(SELECT MAX(size) FROM powers WHERE size<=new.end-new.start AND new.start%size=0) WHERE new.end>new.start
+        UNION ALL
+        SELECT position+size,(SELECT MAX(p.size) FROM powers p WHERE p.size<=new.end-(c.position+c.size) AND (c.position+c.size)%p.size=0)
+            FROM cells c WHERE position+size<new.end
+    )
+    SELECT new.head_id,p.level,c.position/c.size,new.thread_id,new.id,new.start,new.end FROM cells c JOIN powers p ON p.size=c.size;
+END;
+CREATE TRIGGER note_comment_anchor_cover_update AFTER UPDATE ON note_comment_anchor BEGIN
+    DELETE FROM note_comment_anchor_cover WHERE anchor_id=old.id;
+    INSERT INTO note_comment_anchor_cover
+    WITH RECURSIVE powers(level,size) AS (VALUES(0,1) UNION ALL SELECT level+1,size*2 FROM powers WHERE level<53),
+    cells(position,size) AS (
+        SELECT new.start,(SELECT MAX(size) FROM powers WHERE size<=new.end-new.start AND new.start%size=0) WHERE new.end>new.start
+        UNION ALL
+        SELECT position+size,(SELECT MAX(p.size) FROM powers p WHERE p.size<=new.end-(c.position+c.size) AND (c.position+c.size)%p.size=0)
+            FROM cells c WHERE position+size<new.end
+    )
+    SELECT new.head_id,p.level,c.position/c.size,new.thread_id,new.id,new.start,new.end FROM cells c JOIN powers p ON p.size=c.size;
+END;

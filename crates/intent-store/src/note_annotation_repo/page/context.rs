@@ -87,7 +87,7 @@ impl Store {
             return Err(bad_cursor());
         }
         let epochs = self
-            .validate_annotation_lease(&lease, scope, principal)
+            .validate_annotation_lease(origin.snapshot, &lease, scope, principal)
             .await?;
         if origin.kind == 30 && !epochs.anchors_ready {
             return Err(crate::note_annotation_repo::stale());
@@ -253,7 +253,7 @@ impl Store {
         if wire_len(&out, rpc_id) > wire {
             return Err(budget());
         }
-        self.validate_annotation_lease(&lease, scope, principal)
+        self.validate_annotation_lease(origin.snapshot, &lease, scope, principal)
             .await?;
         Ok(out)
     }

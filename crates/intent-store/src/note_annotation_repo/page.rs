@@ -61,7 +61,7 @@ struct Query {
     wire: usize,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Lease {
     scope: NoteScope,
     principal: String,
@@ -205,6 +205,14 @@ impl Store {
         tx.commit().await.map_err(db_error)?;
         Ok(id)
     }
+    async fn retire_annotation_lease(&self, id: Uuid) -> Result<()> {
+        sqlx::query("DELETE FROM note_annotation_snapshot WHERE id=?")
+            .bind(id.simple().to_string())
+            .execute(self.write_pool())
+            .await
+            .map_err(db_error)?;
+        Ok(())
+    }
     async fn annotation_lease(&self, id: Uuid) -> Result<Lease> {
         let row = sqlx::query("SELECT expires_ms,payload FROM note_annotation_snapshot WHERE id=?")
             .bind(id.simple().to_string())
@@ -212,22 +220,31 @@ impl Store {
             .await
             .map_err(db_error)?
             .ok_or_else(|| failure(NotePageError::Expired))?;
-        if row.get::<i64, _>("expires_ms")
-            <= i64::try_from(intent_core::now_epoch_ms()).map_err(|_| invalid())?
+        let lease: Lease = serde_json::from_str(&row.get::<String, _>("payload"))
+            .map_err(|_| Error::Internal("invalid annotation snapshot".into()))?;
+        if row.get::<i64, _>("expires_ms") != lease.expires_ms
+            || lease.expires_ms
+                <= i64::try_from(intent_core::now_epoch_ms()).map_err(|_| invalid())?
         {
+            self.retire_annotation_lease(id).await?;
             return Err(failure(NotePageError::Expired));
         }
-        serde_json::from_str(&row.get::<String, _>("payload"))
-            .map_err(|_| Error::Internal("invalid annotation snapshot".into()))
+        Ok(lease)
     }
     async fn validate_annotation_lease(
         &self,
+        id: Uuid,
         lease: &Lease,
         scope: &NoteScope,
         principal: &str,
     ) -> Result<AnnotationEpochs> {
         if &lease.scope != scope || lease.principal != principal {
             return Err(bad_cursor());
+        }
+        let retained = self.annotation_lease(id).await?;
+        if &retained != lease {
+            self.retire_annotation_lease(id).await?;
+            return Err(failure(NotePageError::Expired));
         }
         let ws = WorkspaceId::from(scope.workspace_id.as_str());
         let note = NoteId::from(scope.note_id.as_str());
@@ -256,6 +273,10 @@ impl Store {
         };
         if actual != &lease.epoch {
             return Err(stale());
+        }
+        if self.annotation_lease(id).await? != *lease {
+            self.retire_annotation_lease(id).await?;
+            return Err(failure(NotePageError::Expired));
         }
         Ok(epochs)
     }

@@ -1238,6 +1238,9 @@ async fn annotation_maintained_all_orphan_counts_follow_reply_updates_anchor_reb
 async fn annotation_dense_range_preparation_is_once_per_lease_bounded_and_invalidated() {
     use serde_json::json;
     use sqlx::Row;
+    let _serial = crate::note_annotation_repo::ANNOTATION_PREPARATION_TEST
+        .lock()
+        .await;
     let (_db, store, ws, note) = fixture().await;
     let mut tx = store.write_pool().begin().await.unwrap();
     sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000) INSERT INTO comment(id,workspace_id,note_id,thread_id,kind,content,author,author_type,status,anchor_json,created_at,updated_at) SELECT printf('dense%04d',x),?,?,printf('dense%04d',x),'comment','body','author','user','open','null','date','date' FROM n")
@@ -1309,7 +1312,12 @@ async fn annotation_dense_range_preparation_is_once_per_lease_bounded_and_invali
         .fetch_one(store.read_pool())
         .await
         .unwrap();
-    assert_eq!(count, 4);
+    assert_eq!(count, 5);
+    sqlx::query("DELETE FROM note_annotation_snapshot WHERE id=?")
+        .bind(sid)
+        .execute(store.write_pool())
+        .await
+        .unwrap();
     request.cursor = Some(first["nextCursor"].as_str().unwrap().into());
     assert!(store
         .read_note_annotation_page(
@@ -1327,7 +1335,7 @@ async fn annotation_dense_range_preparation_is_once_per_lease_bounded_and_invali
         .execute(store.write_pool())
         .await
         .unwrap();
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_annotation_match")
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_annotation_match_head")
         .fetch_one(store.read_pool())
         .await
         .unwrap();

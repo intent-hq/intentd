@@ -138,8 +138,13 @@ async fn annotation_full_summary_queries_seek_all_and_orphan_pages_in_dense_100k
         INSERT INTO note_comment_thread SELECT 1,printf('%06d',x),1,x%2 FROM n;
         INSERT INTO note_comment_root SELECT head_id,thread_id,thread_id,1 FROM note_comment_thread;
         INSERT INTO note_comment_projection SELECT thread_id,head_id,thread_id,NULL,'open','date','bounded',0 FROM note_comment_thread;
-        CREATE TABLE note_annotation_match(snapshot_id TEXT,thread_id TEXT,position INTEGER,PRIMARY KEY(snapshot_id,position,thread_id));
-        INSERT INTO note_annotation_match SELECT 'snapshot',thread_id,0 FROM note_comment_thread;")
+        CREATE TABLE note_comment_anchor(id INTEGER PRIMARY KEY,head_id INTEGER,thread_id TEXT,start INTEGER,end INTEGER);
+        CREATE INDEX note_comment_anchor_start_order ON note_comment_anchor(head_id,start,thread_id,id);
+        CREATE INDEX note_comment_anchor_thread_order ON note_comment_anchor(head_id,thread_id,start,end,id);
+        CREATE TABLE note_comment_anchor_cover(head_id INTEGER,level INTEGER,bucket INTEGER,thread_id TEXT,anchor_id INTEGER,start INTEGER,end INTEGER,PRIMARY KEY(head_id,level,bucket,thread_id,anchor_id)) WITHOUT ROWID;
+        INSERT INTO note_comment_anchor SELECT CAST(thread_id AS INTEGER),head_id,thread_id,0,10 FROM note_comment_thread;
+        INSERT INTO note_comment_anchor_cover SELECT head_id,3,0,thread_id,id,start,end FROM note_comment_anchor;
+        INSERT INTO note_comment_anchor_cover SELECT head_id,1,4,thread_id,id,start,end FROM note_comment_anchor;")
         .execute(&mut conn).await.unwrap();
     for filter in [
         CommentFilter::All,
@@ -148,7 +153,13 @@ async fn annotation_full_summary_queries_seek_all_and_orphan_pages_in_dense_100k
     ] {
         let make_query = || {
             if filter == CommentFilter::Anchored {
-                super::page::matches::match_summary_query(1, "snapshot", Some((0, "090000")), 3)
+                super::page::matches::match_summary_query(
+                    1,
+                    &[SourceRange { start: 1, end: 2 }],
+                    0,
+                    Some((1, "090000")),
+                    3,
+                )
             } else {
                 super::comments::thread_summary_query(1, &[], filter, Some((0, "090000")), 3)
             }
@@ -188,7 +199,7 @@ async fn annotation_full_summary_queries_seek_all_and_orphan_pages_in_dense_100k
         conn.lock_handle().await.unwrap().remove_progress_handler();
         assert_eq!(rows.len(), 3);
         assert!(
-            steps < 3000,
+            steps < 10000,
             "{filter:?} used {steps} VM instructions\n{plan}"
         );
         assert_eq!(

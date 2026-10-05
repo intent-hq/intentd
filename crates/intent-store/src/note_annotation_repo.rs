@@ -165,3 +165,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) static ANNOTATION_PREPARATION_TEST: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
