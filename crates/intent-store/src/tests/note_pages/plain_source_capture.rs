@@ -4,6 +4,59 @@ use super::{record_source_window_closure, setup};
 use serde_json::json;
 
 #[tokio::test]
+async fn indexed_selection_paragraph_capture_preserves_nonzero_unicode_source() {
+    let paragraph = "a".repeat(2050);
+    let source = format!("prefix😀\n\n{paragraph}");
+    assert_eq!(source.encode_utf16().count(), 2060);
+    let (store, _temporary, _) = setup(&source).await;
+    let captured_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let mut calls = Vec::new();
+    let first = record_source_window_closure(
+        &store,
+        json!({"kind":"source","at":10,"maxSourceBytes":4096,"maxWireBytes":8192,"maxItems":64}),
+        &mut calls,
+    )
+    .await;
+    assert_eq!(first["text"], paragraph);
+    assert_eq!(first["range"], json!({"start":10,"end":2060}));
+    assert_eq!(first["sourceLength"], 2060);
+    assert!(first["nextCursor"].is_null());
+    assert!(calls.iter().any(|call| call["response"]["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|item| item["construct"] == "paragraph"
+            && item["sourceRange"] == json!({"start":10,"end":2060})
+            && item["entryPath"] == "markdown"
+            && item["detailRef"].is_string())));
+    if let Ok(directory) = std::env::var("NOTE_PAGE_TRANSCRIPT_DIR") {
+        // Retain the same backend/note incarnation for a later frontend-upload
+        // replay; copying just response identities into a new Store is not proof.
+        let database = std::path::Path::new(&directory).join("selection-source.db");
+        sqlx::query("VACUUM INTO ?")
+            .bind(database.to_str().unwrap())
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        std::fs::write(
+            std::path::Path::new(&directory).join("plain-paragraph-selection-2050.json"),
+            serde_json::to_vec_pretty(&json!({
+                "backendHead":std::env::var("NOTE_PAGE_CAPTURE_HEAD").unwrap(),
+                "capturedAtMs":captured_at_ms,"source":source,"at":10,
+                "workspaceId":"pages","noteId":"spec","principal":"alice",
+                "rpcId":1,"calls":calls,"retainedDatabase":database,
+                "claim":"actual lexical Store source/context closure; native selection is captured separately by the frontend"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn indexed_plain_paragraph_capture_preserves_actual_lexical_resources() {
     for (name, source, expected_paragraphs, entry_path) in [
         ("one", "abc", 1, "markdown"),
