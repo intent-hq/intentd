@@ -41,6 +41,7 @@ mod message_payload;
 mod message_thumbnails;
 mod metrics_repo;
 mod node_repo;
+pub mod note_annotation_repo;
 mod note_line_attribution_repo;
 mod note_mutation_repo;
 mod note_page_html;

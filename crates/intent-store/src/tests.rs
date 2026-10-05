@@ -26,6 +26,7 @@ mod workspace_delete;
 mod metadata_key_json;
 mod note_artifacts;
 mod note_line_attribution;
+mod note_annotations;
 mod note_pages;
 mod note_search;
 
