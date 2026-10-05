@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.14] - 2026-10-05
+
+### 🐛 Bug Fixes
+
+- Resume suspend-interrupted turns that fail with provider timeout/terminated errors ([#2288](https://github.com/intent-hq/intentd/pull/2288))
+
+
 ## [0.10.13] - 2026-10-04
 
 ### 🐛 Bug Fixes
