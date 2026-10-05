@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.15] - 2026-10-05
+
+### 🚀 Features
+
+- Add host-bound GitLab checkout ([#2281](https://github.com/intent-hq/intentd/pull/2281))
+
+### 🐛 Bug Fixes
+
+- Preserve useful adapter failure diagnostics ([#2290](https://github.com/intent-hq/intentd/pull/2290))
+
+
 ## [0.10.14] - 2026-10-05
 
 ### 🐛 Bug Fixes
