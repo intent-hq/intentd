@@ -1126,10 +1126,21 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     // Now trigger graceful shutdown via system.shutdown RPC over UDS (system.*
     // is UDS-only; see PROTOCOL §5.7).
     let shutdown_result = uds_rpc(&socket, 13, "system.shutdown", json!({})).await;
-    assert_eq!(shutdown_result["result"].get("ok"), Some(&json!(true)));
+    let reply_shape = format!(
+        "shutdown reply: numeric_id={:?}, result_object={}, error_object={}",
+        shutdown_result.get("id").and_then(Value::as_i64),
+        shutdown_result["result"].is_object(),
+        shutdown_result["error"].is_object(),
+    );
+    assert_eq!(
+        shutdown_result["result"].get("ok"),
+        Some(&json!(true)),
+        "{reply_shape}"
+    );
     assert_eq!(
         shutdown_result["result"].get("stopping"),
-        Some(&json!(true))
+        Some(&json!(true)),
+        "{reply_shape}"
     );
 
     // Wait for daemon to exit gracefully (up to 10 seconds).
