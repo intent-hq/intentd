@@ -3505,12 +3505,24 @@ async fn context_recovery_groups_over_wss(
         .await
         .unwrap();
     let initial_rows = store.load_all_agent_queues().await.unwrap();
-    let initial_private = initial_rows
-        .iter()
-        .find(|r| r.agent_id.0 == agent)
-        .unwrap()
-        .payload
-        .clone();
+    let initial_row = initial_rows.iter().find(|r| r.agent_id.0 == agent).unwrap();
+    let initial_private = initial_row.payload.clone();
+    // Seed an independent completed exchange after the saved sources. The
+    // provider redrive below must preserve both rows in recreated history.
+    for (role, text) in [
+        ("user", "unrelated user after grouped source"),
+        ("assistant", "unrelated assistant after grouped source"),
+    ] {
+        store
+            .append_agent_message(
+                &initial_row.agent_id,
+                role,
+                &json!([{"type":"text","text":text}]),
+                &intent_core::now_iso(),
+            )
+            .await
+            .unwrap();
+    }
     drop(store);
     let error = json!({"code":-32603,"message":"HTTP 413 context too large"});
     let rules = if explicit {
@@ -3641,6 +3653,21 @@ async fn context_recovery_groups_over_wss(
             .is_some_and(|text| text.contains(KICKOFF_MSG))),
         "unrelated prior history survives"
     );
+    for text in [
+        "unrelated user after grouped source",
+        "unrelated assistant after grouped source",
+    ] {
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| block["text"]
+                    .as_str()
+                    .is_some_and(|body| body.contains(text)))
+                .count(),
+            1,
+            "later unrelated history survives"
+        );
+    }
     if oversized_prepend || explicit {
         assert!(!blocks
             .iter()
@@ -3796,6 +3823,21 @@ async fn fresh_direct_context_recovery_over_wss(oversized_current: bool) {
     assert_ne!(first["messageId"], second["messageId"]);
     assert_eq!(saved["deliveryGroups"][0]["isPrepend"], true);
     assert_eq!(saved["deliveryGroups"][1]["isPrepend"], false);
+    let row = rows.iter().find(|row| row.agent_id.0 == agent).unwrap();
+    for (role, text) in [
+        ("user", "unrelated user after direct source"),
+        ("assistant", "unrelated assistant after direct source"),
+    ] {
+        store
+            .append_agent_message(
+                &row.agent_id,
+                role,
+                &json!([{"type":"text","text":text}]),
+                &intent_core::now_iso(),
+            )
+            .await
+            .unwrap();
+    }
     drop(store);
     // Empty contains marker would not select a rule. A space matches every
     // assembled prompt, forcing a second context failure of the recovered turn.
@@ -3851,6 +3893,21 @@ async fn fresh_direct_context_recovery_over_wss(oversized_current: bool) {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     let blocks = records.last().unwrap()["blocks"].as_array().unwrap();
+    for text in [
+        "unrelated user after direct source",
+        "unrelated assistant after direct source",
+    ] {
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| block["text"]
+                    .as_str()
+                    .is_some_and(|body| body.contains(text)))
+                .count(),
+            1,
+            "later unrelated history survives"
+        );
+    }
     assert!(!blocks.iter().any(|block| block["text"]
         .as_str()
         .is_some_and(|text| text.contains(&source))));

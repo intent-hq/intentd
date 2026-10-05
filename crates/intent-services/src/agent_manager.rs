@@ -5357,6 +5357,11 @@ impl AgentManager {
         // agents; absent for non-specialist agents. Because it fires every turn
         // it also covers the session-recreated case handled by `build_turn_body`.
         let reminder = self.services.agent_role_reminder(agent_id).await;
+        let authoritative_saved_groups = options.delivery_groups.is_some()
+            || options.prepend_delivery_groups.is_some()
+            || options.flushed_entries.iter().flatten().any(|entry| {
+                entry.delivery_groups.is_some() || entry.prepend_delivery_groups.is_some()
+            });
         let replay_ids: Vec<String> = options
             .flushed_entries
             .iter()
@@ -5376,16 +5381,38 @@ impl AgentManager {
                     .map(|source| source.message_id.clone()),
             )
             .collect();
-        let group_source_ids: Vec<String> = groups
+        let mut group_source_ids: Vec<String> = groups
             .iter()
             .flatten()
             .filter_map(|group| group.source_id.clone())
             .collect();
+        if authoritative_saved_groups {
+            // Current wrapper rows are also represented by the saved groups.
+            // Historical recoverySources are identities to filter, never a
+            // prefix boundary that can erase a later independent exchange.
+            group_source_ids.extend(
+                options
+                    .flushed_entries
+                    .iter()
+                    .flatten()
+                    .map(|entry| entry.id.clone()),
+            );
+            if let Some(id) = options
+                .message_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("queueInfo"))
+                .and_then(|info| info.get("queuedMessageId"))
+                .and_then(Value::as_str)
+            {
+                group_source_ids.push(id.to_string());
+            }
+        }
         let (body, excluded_group_sources) = self
             .build_turn_body_with_group_replay(
                 agent_id,
                 &combined,
-                (!replay_ids.is_empty()).then_some(replay_ids.as_slice()),
+                (!authoritative_saved_groups && !replay_ids.is_empty())
+                    .then_some(replay_ids.as_slice()),
                 &group_source_ids,
             )
             .await;
@@ -5633,11 +5660,19 @@ impl AgentManager {
                 .iter()
                 .position(|message| queue_source(message).is_some_and(|id| ids.contains(&id)))
         });
-        let prior: &[_] =
-            match first_flushed.or_else(|| messages.iter().rposition(|m| m.role == "user")) {
-                Some(idx) => &messages[..idx],
+        let prior: &[_] = if let Some(index) = first_flushed {
+            // Preserve the existing boundary for an ordinary live flush.
+            &messages[..index]
+        } else if !excluded_group_sources.is_empty() {
+            // Saved source identities can precede later independent rows.
+            // Filter those sources below instead of truncating the history.
+            &messages
+        } else {
+            match messages.iter().rposition(|message| message.role == "user") {
+                Some(index) => &messages[..index],
                 None => messages.split_last().map_or(&[], |(_, rest)| rest),
-            };
+            }
+        };
         if prior.is_empty() {
             return (content.to_string(), excluded_group_sources);
         }
