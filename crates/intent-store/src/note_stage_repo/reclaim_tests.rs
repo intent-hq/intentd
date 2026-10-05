@@ -395,6 +395,18 @@ pub(super) async fn snapshot(conn: &mut SqliteConnection) -> serde_json::Value {
     ] {
         value[table] = serde_json::json!(count(conn, table).await);
     }
+    let root_due: Option<i64> =
+        sqlx::query_scalar("SELECT due_ms FROM note_stage_root_reclaim WHERE root_key='root'")
+            .fetch_optional(&mut *conn)
+            .await
+            .unwrap();
+    let pin_until: Option<i64> =
+        sqlx::query_scalar("SELECT until_ms FROM note_stage_root_pin WHERE operation_key='op'")
+            .fetch_optional(&mut *conn)
+            .await
+            .unwrap();
+    value["rootDueMs"] = serde_json::json!(root_due);
+    value["pinUntilMs"] = serde_json::json!(pin_until);
     value
 }
 
