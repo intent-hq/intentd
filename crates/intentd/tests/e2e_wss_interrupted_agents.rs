@@ -54,7 +54,7 @@ async fn await_uds(socket: &Path) -> bool {
 }
 
 async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::BufReader;
     let stream = UnixStream::connect(socket).await.expect("connect uds");
     let (read_half, mut write_half) = stream.into_split();
     let mut line = serde_json::to_string(
@@ -64,13 +64,107 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     line.push('\n');
     write_half.write_all(line.as_bytes()).await.unwrap();
     write_half.flush().await.unwrap();
-    let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
-        .await
-        .expect("uds rpc timed out")
-        .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
+    read_uds_response(BufReader::new(read_half), id).await
+}
+
+async fn read_uds_response(mut reader: impl tokio::io::AsyncBufRead + Unpin, id: i64) -> Value {
+    use tokio::io::AsyncBufReadExt;
+
+    timeout(common::rpc_read_timeout(), async {
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            reader.read_line(&mut buf).await.expect("read uds response");
+            let frame: Value = serde_json::from_str(buf.trim_end()).expect("invalid JSON frame");
+            if frame.get("id") == Some(&json!(id)) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("uds rpc timed out")
+}
+
+mod uds_reply_tests {
+    use super::*;
+
+    async fn read_frames(frames: &str) -> Value {
+        let (reader, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(frames.as_bytes()).await.unwrap();
+        drop(peer);
+        read_uds_response(tokio::io::BufReader::new(reader), 13).await
+    }
+
+    #[tokio::test]
+    async fn notification_before_reply() {
+        let reply = read_frames(concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"workspace.repositoryContext.retired\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":13,\"result\":{\"ok\":true,\"stopping\":true}}\n",
+        ))
+        .await;
+        assert_eq!(
+            reply,
+            json!({"jsonrpc":"2.0","id":13,"result":{"ok":true,"stopping":true}})
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_ids_before_reply() {
+        let reply = read_frames(concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":14,\"result\":{\"wrong\":true}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":\"13\",\"result\":{\"wrong\":true}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":13,\"result\":{\"ok\":true}}\n",
+        ))
+        .await;
+        assert_eq!(reply, json!({"jsonrpc":"2.0","id":13,"result":{"ok":true}}));
+    }
+
+    #[tokio::test]
+    async fn notification_before_matching_error() {
+        let reply = read_frames(concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"workspace.repositoryContext.retired\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":13,\"error\":{\"code\":-32603,\"message\":\"failed\"}}\n",
+        ))
+        .await;
+        assert_eq!(
+            reply,
+            json!({"jsonrpc":"2.0","id":13,"error":{"code":-32603,"message":"failed"}})
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "invalid JSON frame")]
+    async fn notification_then_eof_is_not_a_reply() {
+        read_frames("{\"jsonrpc\":\"2.0\",\"method\":\"workspace.repositoryContext.retired\",\"params\":{}}\n").await;
+    }
+
+    #[tokio::test]
+    async fn direct_reply() {
+        assert_eq!(
+            read_frames("{\"jsonrpc\":\"2.0\",\"id\":13,\"result\":{\"ok\":true}}\n").await,
+            json!({"jsonrpc":"2.0","id":13,"result":{"ok":true}}),
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_matching_error() {
+        assert_eq!(
+            read_frames("{\"jsonrpc\":\"2.0\",\"id\":13,\"error\":{\"code\":-32603,\"message\":\"failed\"}}\n").await,
+            json!({"jsonrpc":"2.0","id":13,"error":{"code":-32603,"message":"failed"}}),
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "invalid JSON frame")]
+    async fn eof_is_not_a_reply() {
+        read_frames("").await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "invalid JSON frame")]
+    async fn malformed_frame_is_not_skipped() {
+        read_frames("not JSON\n{\"jsonrpc\":\"2.0\",\"id\":13,\"result\":{\"ok\":true}}\n").await;
+    }
 }
 
 #[derive(Debug)]
