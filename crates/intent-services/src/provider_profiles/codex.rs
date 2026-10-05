@@ -156,7 +156,7 @@ pub(super) fn prepare(
     for ancestor in request.launch_cwd.ancestors().take(128) {
         roots.push(ancestor.join(".agents/skills"));
     }
-    let (paths, bounded) = inventory_skills(&roots)?;
+    let (paths, bounded) = inventory_skills(&roots, &profile.path().join("skills/.system"))?;
     config["skills"]["config"] = Value::Array(
         paths
             .iter()
@@ -179,7 +179,11 @@ pub(super) fn prepare(
 
 /// Bounded local metadata inventory; no skill content is injected and links are
 /// never followed. Native symlink/custom/plugin sources remain diagnosed.
-fn inventory_skills(roots: &[PathBuf]) -> Result<(BTreeSet<PathBuf>, bool), ProviderProfileError> {
+fn inventory_skills(
+    roots: &[PathBuf],
+    bundled_root: &Path,
+) -> Result<(BTreeSet<PathBuf>, bool), ProviderProfileError> {
+    let bundled_root = bundled_root.canonicalize().ok();
     let mut pending: Vec<_> = roots.iter().map(|root| (root.clone(), 0)).collect();
     let mut seen = BTreeSet::new();
     let mut paths = BTreeSet::new();
@@ -199,6 +203,10 @@ fn inventory_skills(roots: &[PathBuf]) -> Result<(BTreeSet<PathBuf>, bool), Prov
             continue;
         }
         let canonical = path.canonicalize().map_err(io_error)?;
+        // Native Codex installs its bundled skills inside the owned profile.
+        if bundled_root.as_deref() == Some(canonical.as_path()) {
+            continue;
+        }
         if !seen.insert(canonical.clone()) {
             continue;
         }
