@@ -14858,7 +14858,7 @@ async fn publish_error_status_and_requeue(
             )
         };
         let id = new_message_id();
-        let delivery_groups = ordered_prompt_groups(content, options);
+        let delivery_groups = ordered_prompt_groups(&content, options);
         // Some(empty) records that the legacy aggregate prepend is already
         // represented in delivery_groups. A future new carry-over can still
         // add earlier groups without duplicating that aggregate on retry.
