@@ -123,15 +123,28 @@ async fn acquire_context(
 }
 
 impl AcquiredNativeProfile {
+    pub(crate) fn same_configuration(&self, other: &Self) -> bool {
+        self.runtime_identity == other.runtime_identity
+            && self.workspace == other.workspace
+            && self.sources == other.sources
+            && self.environment == other.environment
+    }
+
+    #[must_use]
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
     /// The selected native executable; never substitute an ACP adapter or a new
-    /// discovery result. ACP acquisition is intentionally not certified here.
+    /// discovery result. Only `acp::acquire_acp` extends this boundary to the
+    /// verified pinned adapter and its exact native executable channel.
     #[must_use]
     pub fn executable(&self) -> &Path {
         self.context.runtime.path()
     }
 
     /// Freeze the acquired environment before applying profile.environment last.
-    /// Use only for this native launch; the caller owns args, cwd and child reap.
+    /// Use for the native launch or the sealed `acp` binding; callers own child reap.
     pub fn apply_environment(&self, command: &mut tokio::process::Command) {
         // InstalledContext normally retains trusted per-command overrides. This
         // sealed acquisition must instead retain the exact proven authority route.
@@ -193,31 +206,41 @@ impl AcquiredNativeProfile {
         if let Some(model) = inputs.model {
             auth_model.model = Some(model.to_owned());
         }
-        let selected = staged::select(staged::SelectionRequest {
-            provider: "claude-code",
-            runtime: RuntimeIdentity {
-                native_version: "2.1.280",
-                adapter_version: None,
-                os: "linux",
-                arch: "x86_64",
-            },
-            sdk_version: None,
-            purpose: inputs.purpose,
-            approved_servers: inputs.approved_servers,
-            auth_model: &auth_model,
-            instructions: inputs.instructions,
-            has_skill_instructions: inputs.has_skill_instructions,
-            policy: staged::PolicyAcquisition {
-                etc_root: &self.etc_root,
-                #[cfg(test)]
-                authority: staged::PolicyAuthority::LocalFilesOnly,
-                additional: inputs.intent_policy,
-            },
-        });
-        match selected {
-            staged::ProfileSelection::Managed(plan) => plan.build(directory),
-            staged::ProfileSelection::Deferred(_) => Err(changed()),
-        }
+        let servers = inputs.approved_servers.clone();
+        let instructions = inputs.instructions.to_owned();
+        let policy = inputs.intent_policy.to_vec();
+        let purpose = inputs.purpose;
+        let has_skill_instructions = inputs.has_skill_instructions;
+        let etc_root = self.etc_root.clone();
+        tokio::task::spawn_blocking(move || {
+            let selected = staged::select(staged::SelectionRequest {
+                provider: "claude-code",
+                runtime: RuntimeIdentity {
+                    native_version: "2.1.280",
+                    adapter_version: None,
+                    os: "linux",
+                    arch: "x86_64",
+                },
+                sdk_version: None,
+                purpose,
+                approved_servers: &servers,
+                auth_model: &auth_model,
+                instructions: &instructions,
+                has_skill_instructions,
+                policy: staged::PolicyAcquisition {
+                    etc_root: &etc_root,
+                    #[cfg(test)]
+                    authority: staged::PolicyAuthority::LocalFilesOnly,
+                    additional: &policy,
+                },
+            });
+            match selected {
+                staged::ProfileSelection::Managed(plan) => plan.build(directory),
+                staged::ProfileSelection::Deferred(_) => Err(changed()),
+            }
+        })
+        .await
+        .map_err(|_| ProfileError::Io)?
     }
 }
 

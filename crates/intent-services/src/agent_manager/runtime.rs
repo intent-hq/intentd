@@ -103,6 +103,7 @@ pub(super) struct LocalResources {
     pub(super) _rules_config: Option<TempConfigFile>,
     pub(super) _pi_extension: Option<PiExtensionDelivery>,
     pub(super) npx_launch_dir: Option<NpxLaunchDir>,
+    pub(super) managed_profile: Option<Arc<super::managed_profiles::SessionProfile>>,
     pub(super) cleanup_lease: Option<tokio::sync::oneshot::Sender<()>>,
     #[cfg(test)]
     pub(super) cleanup_services: Option<crate::Services>,
@@ -333,6 +334,7 @@ pub(super) struct DetachedChild {
     pub(super) spawn_pid: Option<u32>,
     /// `None` once moved into the owned cleanup task.
     pub(super) npx_launch_dir: Option<NpxLaunchDir>,
+    pub(super) managed_profile: Option<Arc<super::managed_profiles::SessionProfile>>,
     pub(super) cleanup_lease: Option<tokio::sync::oneshot::Sender<()>>,
     #[cfg(test)]
     pub(super) cleanup_services: Option<crate::Services>,
@@ -352,6 +354,7 @@ impl DetachedChild {
             child: Some(child),
             spawn_pid: resources.child_pid,
             npx_launch_dir: resources.npx_launch_dir.take(),
+            managed_profile: resources.managed_profile.take(),
             cleanup_lease: resources.cleanup_lease.take(),
             #[cfg(test)]
             cleanup_services: resources.cleanup_services.take(),
@@ -375,7 +378,7 @@ impl DetachedChild {
         let lease = self.cleanup_lease.take();
         #[cfg(test)]
         let services = self.cleanup_services.take();
-        let launch_dir = RetainUnlessSwept(self.npx_launch_dir.take());
+        let launch_dir = RetainUnlessSwept(self.npx_launch_dir.take(), self.managed_profile.take());
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             drop(launch_dir);
             drop(child);
@@ -397,15 +400,25 @@ impl DetachedChild {
     /// launch dir only after the shared sweep completes; a cancelled await
     /// leaves the batch sweep running.
     pub(super) async fn kill_trees(children: Vec<Self>) {
+        let mut managed_cleanups = Vec::new();
         let mut trees = Vec::with_capacity(children.len());
         let mut leases = Vec::with_capacity(children.len());
         let mut launch_dirs = Vec::with_capacity(children.len());
         for mut detached in children {
+            if detached.managed_profile.is_some() {
+                if let Some(cleanup) = detached.start_cleanup() {
+                    managed_cleanups.push(cleanup);
+                }
+                continue;
+            }
             leases.push(detached.cleanup_lease.take());
             if let Some(child) = detached.child.take() {
                 trees.push((child, detached.spawn_pid));
             }
-            launch_dirs.push(RetainUnlessSwept(detached.npx_launch_dir.take()));
+            launch_dirs.push(RetainUnlessSwept(
+                detached.npx_launch_dir.take(),
+                detached.managed_profile.take(),
+            ));
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
@@ -413,6 +426,9 @@ impl DetachedChild {
         let _ = spawn_owned_cleanup(&runtime, async move {
             let _leases = leases;
             kill_child_trees(trees).await;
+            for cleanup in managed_cleanups {
+                let _ = cleanup.await;
+            }
             for dir in launch_dirs {
                 dir.remove();
             }

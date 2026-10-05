@@ -449,6 +449,7 @@ async fn build_rtk_instruction(
 /// the prompt under [`intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING`] (the
 /// section the compact header points at). `None` — every non-flagged
 /// provider — leaves the prompt byte-identical to before.
+#[cfg(test)]
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn assemble_system_prompt(
     store: &Store,
@@ -462,6 +463,39 @@ pub(crate) async fn assemble_system_prompt(
     workspace: Option<&intent_core::Workspace>,
     agent_session: Option<&intent_core::AgentSession>,
     workspace_api_docs: Option<&str>,
+) -> Option<String> {
+    assemble_system_prompt_with_skills(
+        store,
+        workspace_path,
+        agent_type,
+        specialist,
+        is_sub_agent,
+        auto_commit_enabled,
+        rtk_enabled,
+        agent_features,
+        workspace,
+        agent_session,
+        workspace_api_docs,
+        None,
+    )
+    .await
+}
+
+/// A supplied catalog (including an empty string) replaces ambient discovery.
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn assemble_system_prompt_with_skills(
+    store: &Store,
+    workspace_path: Option<&Path>,
+    agent_type: &str,
+    specialist: Option<&SpecialistPromptInjection>,
+    is_sub_agent: bool,
+    auto_commit_enabled: bool,
+    rtk_enabled: bool,
+    agent_features: &intent_core::settings_file::AgentFeaturesSettings,
+    workspace: Option<&intent_core::Workspace>,
+    agent_session: Option<&intent_core::AgentSession>,
+    workspace_api_docs: Option<&str>,
+    owned_skill_catalog: Option<&str>,
 ) -> Option<String> {
     // The session's pinned harness + doctrine (H2): a stamped session keeps
     // assembling the exact version it was created with; session-less calls
@@ -519,7 +553,11 @@ pub(crate) async fn assemble_system_prompt(
     // workspace path is available, discover and inject the skills catalog. Empty
     // catalog ⇒ no layer appended. Discovery failures degrade gracefully (log
     // warn, omit layer) — never fail prompt assembly.
-    if let Some(ws) = workspace {
+    if let Some(catalog) = owned_skill_catalog {
+        if !catalog.trim().is_empty() {
+            parts.push(catalog.to_owned());
+        }
+    } else if let Some(ws) = workspace {
         if let Some(repo_path) = crate::git_ops::worktree_path(ws) {
             match crate::skills::format_skills_catalog_for_prompt(&repo_path.to_string_lossy())
                 .await
@@ -801,6 +839,41 @@ mod tests {
             disk_usage: None,
             pending_delete_at: None,
             membership: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_skill_catalog_replaces_ambient_discovery() {
+        let root = TempDir::new().unwrap();
+        let skill = root.path().join(".augment/skills/ambient");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: ambient\ndescription: UNSELECTED-SKILL\n---\nbody",
+        )
+        .unwrap();
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        let workspace = make_test_workspace(root.path());
+        for selected in ["", "OWNED-SKILL-CATALOG"] {
+            let prompt = assemble_system_prompt_with_skills(
+                &store,
+                Some(root.path()),
+                "workspace",
+                None,
+                false,
+                false,
+                false,
+                &AgentFeaturesSettings::default(),
+                Some(&workspace),
+                None,
+                None,
+                Some(selected),
+            )
+            .await
+            .unwrap();
+            assert!(!prompt.contains("UNSELECTED-SKILL"));
+            assert!(prompt.contains(selected));
         }
     }
 

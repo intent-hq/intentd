@@ -2705,6 +2705,7 @@ fn mock_handle() -> AgentHandle {
             _rules_config: None,
             _pi_extension: None,
             npx_launch_dir: None,
+            managed_profile: None,
             cleanup_lease: None,
             cleanup_services: None,
         }),
@@ -5022,6 +5023,7 @@ fn track_mock_agent_inner(
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                managed_profile: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
@@ -5179,6 +5181,7 @@ fn track_mock_agent_prompt_rpc_error_inner(
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                managed_profile: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
@@ -9003,6 +9006,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                managed_profile: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
@@ -20955,6 +20959,7 @@ mod harness_wake_tests {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir: None,
+                managed_profile: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
@@ -26395,4 +26400,257 @@ async fn submission_correlation_partial_flush_retains_persisted_head_and_tail() 
             1
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "requires the synthetic acquired-claude-acp fixture environment"]
+async fn managed_interactive_native_lifecycle() {
+    assert!(std::env::var_os("INTENT_MANAGED_SESSION_FIXTURE").is_some());
+    let cwd = std::env::current_dir().unwrap();
+    let state = PathBuf::from(std::env::var_os("INTENT_ACP_FIXTURE_STATE").unwrap());
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(
+        mgr.with_agent_config_root(state.join("agent-configs"))
+            .with_mcp_bridge_exe(std::env::var_os("INTENT_MANAGED_BRIDGE").unwrap())
+            .with_agent_log_root(state.join("logs")),
+    );
+    mgr.services.attach_agent_manager(&mgr);
+    let (ws, id) = (
+        WorkspaceId::from("managed-native"),
+        AgentId::from("managed-agent"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "claude-code").await;
+    let mut workspace = mgr.services.store.get_workspace(&ws).await.unwrap();
+    workspace.worktree_path = Some(cwd.to_string_lossy().into_owned());
+    mgr.services
+        .store
+        .update_workspace(&workspace)
+        .await
+        .unwrap();
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.model = Some("claude-sonnet-4-6".into());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .unwrap();
+    // Disabled stable-ID entries shadow project names without starting them.
+    mgr.services
+        .secrets
+        .store(
+            "mcp.servers",
+            &json!({"disabled-id": {
+                "name":"ambient", "enabled":false
+            }})
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let provider = intent_providers::find_provider("claude-code").unwrap();
+    let mut opts = intent_acp::spawn::SpawnOptions::new(provider);
+    opts.cwd = Some(&cwd);
+    opts.model = Some("claude-sonnet-4-6");
+    opts.npx_fallback_binary = Some(std::path::Path::new("/usr/bin/npx"));
+    opts.npx_fallback_package = Some(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE);
+    let mut first_id = None;
+    for text in ["MANAGED-FIRST-TURN", "MANAGED-RESUMED-TURN"] {
+        mgr.create_agent(
+            id.clone(),
+            ws.clone(),
+            "Builder",
+            "interactive",
+            cwd.clone(),
+            &opts,
+        )
+        .await
+        .unwrap();
+        let profile = mgr
+            .managed_profile(&id)
+            .expect("actual manager must activate verified path");
+        assert!(
+            profile.profile.session_meta["systemPrompt"]
+                .as_str()
+                .unwrap()
+                .contains("AMBIENT-SKILL-MARKER"),
+            "project skills are deliberately selected"
+        );
+        assert!(!profile.profile.session_meta["systemPrompt"]
+            .as_str()
+            .unwrap()
+            .contains("HOST-SKILL-MARKER"));
+        let sid = mgr.start_session(&id, cwd.clone(), provider).await.unwrap();
+        if let Some(first) = &first_id {
+            assert_eq!(&sid, first, "must load persistent history");
+        } else {
+            first_id = Some(sid.clone());
+        }
+        assert!(!mgr.take_recreated(&id));
+        let conn = mgr
+            .handles
+            .lock()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .execution
+            .connection()
+            .unwrap();
+        conn.request_timeout(
+            "session/prompt",
+            json!({"sessionId":sid,"prompt":[{"type":"text","text":text}]}),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        let path = profile.profile.directory.path().to_owned();
+        assert!(
+            profile
+                .profile
+                .directory
+                .clone()
+                .remove_persistent()
+                .is_err(),
+            "live child must retain its profile lease"
+        );
+        drop(profile);
+        if text == "MANAGED-FIRST-TURN" {
+            mgr.kill_child_only(&id).await;
+        } else {
+            drop(mgr.stop_many(std::slice::from_ref(&id)).await);
+        }
+        assert!(path.exists(), "native history must survive process cleanup");
+    }
+    // A previously managed session may not drop to native ambient discovery.
+    mgr.services
+        .secrets
+        .store(
+            "mcp.servers",
+            &json!({"enabled-id": {
+                "name":"unverified", "enabled":true, "command":"/bin/false"
+            }})
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(mgr
+        .create_agent(
+            id.clone(),
+            ws.clone(),
+            "Builder",
+            "interactive",
+            cwd.clone(),
+            &opts
+        )
+        .await
+        .is_err());
+    assert!(!mgr.contains(&id));
+    mgr.shutdown().await;
+    println!("PASS actual AgentManager new/load/respawn, owned skills, tombstone and hard changed-configuration failure");
+}
+
+#[tokio::test]
+async fn managed_catalog_preserves_stable_id_disables_and_tombstones() {
+    let root = test_tempdir("managed-catalog");
+    std::fs::write(
+        root.path().join(".mcp.json"),
+        json!({"mcpServers": {
+            "shared-name":{"command":"/bin/false"}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let (_tmp, mut mgr) = manager().await;
+    let registry =
+        Arc::new(crate::SettingsRegistry::load(root.path().join("config.toml")).unwrap());
+    mgr.services = mgr
+        .services
+        .clone()
+        .with_settings_registry(registry.clone());
+    let (ws, id) = (
+        WorkspaceId::from("catalog-disable"),
+        AgentId::from("catalog-agent"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let mut workspace = mgr.services.store.get_workspace(&ws).await.unwrap();
+    workspace.worktree_path = Some(root.path().to_string_lossy().into_owned());
+    mgr.services
+        .store
+        .update_workspace(&workspace)
+        .await
+        .unwrap();
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    for (enabled, global, local) in [
+        (false, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        mgr.services
+            .secrets
+            .store(
+                "mcp.servers",
+                &json!({"stable-id": {
+                    "name":"shared-name", "enabled":enabled,"command":"/bin/false"
+                }})
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        registry
+            .apply(&[(
+                "mcp.disabledServers".into(),
+                if global {
+                    json!(["stable-id"])
+                } else {
+                    json!([])
+                },
+            )])
+            .unwrap();
+        mgr.services
+            .store
+            .set_workspace_mcp_server_disabled(&ws, "stable-id", local)
+            .await
+            .unwrap();
+        let catalog = mgr.managed_catalog(&session, root.path()).await.unwrap();
+        assert!(catalog.servers.is_empty());
+        assert!(!catalog.entries["shared-name"].enabled);
+        assert!(matches!(&catalog.entries["shared-name"].identity,
+            crate::spawned_provider_catalog::ServerIdentity::Intent{id} if id=="stable-id"));
+    }
+    mgr.services
+        .secrets
+        .store("mcp.servers", "malformed")
+        .await
+        .unwrap();
+    assert!(mgr.managed_catalog(&session, root.path()).await.is_err());
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn managed_selection_never_falls_back_after_profile_loss() {
+    let root = test_tempdir("managed-lost-profile");
+    let (_tmp, mgr) = manager().await;
+    let mgr = mgr.with_agent_config_root(root.path().join("agent-configs"));
+    let (ws, id) = (
+        WorkspaceId::from("lost-profile"),
+        AgentId::from("lost-agent"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.acp_session_id = Some("native-history-id".into());
+    session.metadata = Some(json!({super::managed_profiles::SELECTION_KEY:"claude-acp-v1"}));
+    let provider = intent_providers::find_provider("claude-code").unwrap();
+    let opts = intent_acp::spawn::SpawnOptions::new(provider);
+    assert!(mgr
+        .select_managed_profile(&session, root.path(), &opts)
+        .await
+        .is_err());
+    session.metadata = None;
+    assert!(
+        mgr.select_managed_profile(&session, root.path(), &opts)
+            .await
+            .unwrap()
+            .is_none(),
+        "unmanaged imported history must retain legacy behavior"
+    );
+    mgr.shutdown().await;
 }

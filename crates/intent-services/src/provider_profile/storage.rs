@@ -29,18 +29,10 @@ impl ProfileDirectory {
     /// Returns a sanitized error for unsafe paths or filesystem failures.
     pub fn persistent(parent: &Path, identity: &ProfileIdentity<'_>) -> ProfileResult<Self> {
         private_dir(parent)?;
-        let mut hash = Sha256::new();
-        for part in [identity.provider, identity.workspace, identity.agent] {
-            hash.update(part.len().to_le_bytes());
-            hash.update(part.as_bytes());
-        }
-        let mut name = String::from("session-");
-        for byte in hash.finalize() {
-            let _ = write!(name, "{byte:02x}");
-        }
-        let path = std::fs::canonicalize(parent)
-            .map_err(|_| ProfileError::Io)?
-            .join(name);
+        let path = Self::persistent_path(
+            &std::fs::canonicalize(parent).map_err(|_| ProfileError::Io)?,
+            identity,
+        );
         let mut leases = persistent_leases().lock().map_err(|_| ProfileError::Io)?;
         leases.retain(|_, lease| lease.strong_count() > 0);
         if let Some(storage) = leases.get(&path).and_then(Weak::upgrade) {
@@ -55,6 +47,21 @@ impl ProfileDirectory {
         });
         leases.insert(path, Arc::downgrade(&storage));
         Ok(Self(storage))
+    }
+
+    /// Locate existing state without creating a profile or changing native history.
+    #[must_use]
+    pub fn persistent_path(parent: &Path, identity: &ProfileIdentity<'_>) -> PathBuf {
+        let mut hash = Sha256::new();
+        for part in [identity.provider, identity.workspace, identity.agent] {
+            hash.update(part.len().to_le_bytes());
+            hash.update(part.as_bytes());
+        }
+        let mut name = String::from("session-");
+        for byte in hash.finalize() {
+            let _ = write!(name, "{byte:02x}");
+        }
+        parent.join(name)
     }
 
     /// # Errors

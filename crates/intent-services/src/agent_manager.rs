@@ -114,6 +114,7 @@ use repository_origin::RepositoryOrigin;
 #[cfg(test)]
 pub(crate) mod tests;
 
+mod managed_profiles;
 pub(crate) mod runtime;
 #[cfg(all(test, unix))]
 use runtime::DetachedChild;
@@ -3197,6 +3198,23 @@ impl AgentManager {
         // error rather than silently defaulting to top-level (which would
         // mis-scope both surfaces and hide DB failures).
         let session = self.services.store.get_agent_session(&agent_id).await?;
+        let managed_plan = self.select_managed_profile(&session, &cwd, opts).await?;
+        let owned_skills = managed_plan
+            .as_ref()
+            .map(managed_profiles::Plan::skill_catalog);
+        if managed_plan.is_some() {
+            self.services
+                .store
+                .set_agent_session_metadata_key(
+                    &workspace_id,
+                    &agent_id,
+                    managed_profiles::SELECTION_KEY,
+                    "claude-acp-v1",
+                    None,
+                    None,
+                )
+                .await?;
+        }
         // Sub-agent gating: delegated children (`parent_agent_id` set) and
         // background workers (`is_background`) — the same derivation the
         // prompt assembly uses. Captured once here, at bridge creation:
@@ -3353,8 +3371,15 @@ impl AgentManager {
         // `start_session` (which runs after `create_agent`) can pass it into
         // every session-open branch.
         let mut session_mcp_servers: Vec<McpServer> = Vec::new();
+        let mut managed_servers = NormalizedMcpServers::new();
         if opts.provider.supports_session_mcp_servers {
-            let servers = self.normalized_mcp_servers(bridge.connect_addr()).await?;
+            let mut servers = self
+                .normalized_session_servers(bridge.connect_addr(), managed_plan.is_none())
+                .await?;
+            if managed_plan.is_some() {
+                servers.retain(|name, _| name == "workspace-mcp");
+                managed_servers = servers.clone();
+            }
             if let Some(blueprint) = servers.get("workspace-mcp").and_then(|original| {
                 EndpointBlueprint::from_original(server_blueprint, original, &bridge.connect_addr())
             }) {
@@ -3370,6 +3395,7 @@ impl AgentManager {
         // SP-1 `## Suggested Next Steps` directive) into a temp `--rules` file
         // when the caller supplies none. The handle owns the temp file so it
         // outlives the child that reads it.
+        let mut resolved_instructions = String::new();
         let mut rules_config: Option<TempConfigFile> = None;
         let mut rules_file_path: Option<String> = None;
         if opts.rules_file.is_none() {
@@ -3405,7 +3431,7 @@ impl AgentManager {
                 .provider
                 .truncates_tool_descriptions
                 .then(|| server.condensed_workspace_api_description());
-            if let Some(prompt) = crate::rules::assemble_system_prompt(
+            if let Some(prompt) = crate::rules::assemble_system_prompt_with_skills(
                 &self.services.store,
                 Some(&cwd),
                 agent_type,
@@ -3417,9 +3443,11 @@ impl AgentManager {
                 workspace.as_ref(),
                 Some(&session),
                 workspace_api_docs.as_deref(),
+                owned_skills.as_deref(),
             )
             .await
             {
+                resolved_instructions.clone_from(&prompt);
                 let path = config_dir.join(format!("intentd-rules-{}.md", Uuid::new_v4()));
                 std::fs::write(&path, prompt.as_bytes())
                     .map_err(|e| Error::Internal(format!("write rules file failed: {e}")))?;
@@ -3519,7 +3547,14 @@ impl AgentManager {
                 "info",
             )
             .await;
-        let spawned = if let Some(cli) =
+        let mut managed_profile = None;
+        let spawned = if let Some(plan) = managed_plan {
+            let (prepared, profile) = plan
+                .prepare(&spawn_opts, &resolved_instructions, &managed_servers)
+                .await?;
+            managed_profile = Some(profile);
+            intent_acp::spawn::spawn_prepared_provider(&spawn_opts, prepared, hooks)
+        } else if let Some(cli) =
             intent_providers::installed_cli::InstalledCli::for_provider(spawn_opts.provider.id)
         {
             let context = crate::installed_cli::InstalledContext::discover(cli)
@@ -3595,6 +3630,7 @@ impl AgentManager {
                 _rules_config: rules_config,
                 _pi_extension: pi_extension,
                 npx_launch_dir,
+                managed_profile,
                 cleanup_lease: Some(cleanup_lease),
                 #[cfg(test)]
                 cleanup_services: Some(self.services.clone()),
@@ -3716,6 +3752,14 @@ impl AgentManager {
     /// token bag when the catalog entry does not already set one.
     /// `workspace-mcp` is reserved and never overridden.
     async fn normalized_mcp_servers(&self, connect_addr: String) -> Result<NormalizedMcpServers> {
+        self.normalized_session_servers(connect_addr, true).await
+    }
+
+    async fn normalized_session_servers(
+        &self,
+        connect_addr: String,
+        include_user_servers: bool,
+    ) -> Result<NormalizedMcpServers> {
         let mut servers = NormalizedMcpServers::new();
         // A whitespace-containing bridge path breaks provider launchers that
         // shell-split the stdio command (monorepo#1049): emit the basename and
@@ -3740,7 +3784,9 @@ impl AgentManager {
                 env,
             },
         );
-        self.merge_user_mcp_servers(&mut servers).await?;
+        if include_user_servers {
+            self.merge_user_mcp_servers(&mut servers).await?;
+        }
         let baseline = build_baseline_mcp_env_from_process();
         Ok(apply_baseline_env_to_stdio_servers(&servers, &baseline))
     }
@@ -4031,6 +4077,17 @@ impl AgentManager {
         // flag still armed instead of resuming the stale session.
         let forced = self.force_recreate.lock().unwrap().contains(agent_id);
 
+        let managed_resume_required = if self.managed_profile(agent_id).is_some() {
+            let (_, owner) = self
+                .services
+                .store
+                .get_agent_session_last_turn_model(&session_record.workspace_id, agent_id)
+                .await?;
+            owner.is_none_or(|owner| intent_providers::provider_config(&owner).id == provider.id)
+        } else {
+            false
+        };
+
         // 1) Try to resume the persisted session (gated on stored id + capability).
         match if forced {
             Ok(None)
@@ -4120,7 +4177,13 @@ impl AgentManager {
                     },
                 });
             }
+            Ok(None) if !forced && stored_id.is_some() && managed_resume_required => {
+                return Err(Error::InvalidInput(
+                    "Managed session could not resume its existing history".into(),
+                ));
+            }
             Ok(None) => {}
+            Err(e) if self.managed_profile(agent_id).is_some() => return Err(e),
             // Auth-required resume failure (intent-hq/intent#3941): the
             // provider said it is not logged in — propagate the actionable
             // login error instead of recreating. For claude-code the
@@ -10006,11 +10069,30 @@ impl AgentManager {
             // the live-child reuse branch below would return the stale session
             // with the armed flag sitting unconsumed.
             let forced = self.force_recreate.lock().unwrap().contains(agent_id);
+            let profile_changed = if !needs_respawn && !forced && !rehomed {
+                if let Some(previous) = self.managed_profile(agent_id) {
+                    let mut opts = SpawnOptions::new(&resolved.provider);
+                    opts.cwd = Some(&resolved.cwd);
+                    opts.model = resolved.model.as_deref();
+                    opts.provider_binary = resolved.provider_binary.as_deref();
+                    opts.npx_fallback_binary = resolved.npx_fallback_binary.as_deref();
+                    opts.npx_fallback_package = resolved.npx_fallback_package;
+                    opts.extra_env = resolved.extra_env.clone();
+                    let next = self
+                        .select_managed_profile(&session, &resolved.cwd, &opts)
+                        .await?;
+                    next.is_none_or(|plan| !plan.matches(&previous))
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             // A re-home off a disabled provider always tears the live child
             // down: the identity comparison above keys on the provider
             // `command`, which `opencode` and `unsloth` share, so it alone
             // could reuse the disabled provider's child.
-            if needs_respawn || forced || rehomed {
+            if needs_respawn || forced || rehomed || profile_changed {
                 // Tear down the existing child (preserving the acpSessionId so
                 // start_session can try session/load for providers that support it).
                 // This is narrower than stop() — only kills the child/handle, no
@@ -10944,23 +11026,32 @@ where
     ))
 }
 
-/// A launch dir travelling through the owned cleanup: [`Self::remove`]
-/// deletes it once the tree has been swept; dropping the wrapper any other
+/// A launch directory and managed profile lease travelling through owned cleanup.
+/// [`Self::remove`] releases both only after confirmed process-group exit; it
+/// deletes the launch directory. Dropping the wrapper any other
 /// way (the cleanup future dropped unpolled on a shutting-down runtime, or
 /// never scheduled at all) retains the directory instead of deleting it. A
 /// retained dir survives the next daemon start too: the agent-configs
 /// startup sweep skips `intent_core::NPX_LAUNCH_DIR_PREFIX` entries, since a
 /// restart cannot tell a still-live orphan tree from a dead one.
-struct RetainUnlessSwept(Option<NpxLaunchDir>);
+struct RetainUnlessSwept(
+    Option<NpxLaunchDir>,
+    Option<Arc<managed_profiles::SessionProfile>>,
+);
 
 impl RetainUnlessSwept {
     fn remove(mut self) {
         drop(self.0.take());
+        drop(self.1.take());
     }
 }
 
 impl Drop for RetainUnlessSwept {
     fn drop(&mut self) {
+        if let Some(profile) = self.1.take() {
+            // Keep its deletion lease when process-group death was not proven.
+            std::mem::forget(profile);
+        }
         if let Some(dir) = self.0.take() {
             tracing::debug!(
                 path = %dir.path().display(),
@@ -17895,6 +17986,7 @@ mod dead_child_respawn_tests {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir,
+                managed_profile: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),

@@ -34,6 +34,7 @@ pub enum PolicyFormat {
     ClaudeManagedMcp,
 }
 
+#[derive(Clone)]
 pub struct PolicySource {
     pub scope: PolicyScope,
     pub label: String,
@@ -43,6 +44,7 @@ pub struct PolicySource {
 
 /// Native defaults are not requirements. Acquisition adapters may supply an
 /// already-resolved effective native requirement document, never raw defaults.
+#[derive(Clone)]
 pub enum PolicyInput {
     Inline(String),
     File { path: PathBuf, optional: bool },

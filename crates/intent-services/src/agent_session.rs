@@ -2765,6 +2765,11 @@ impl Services {
             Some(&stored.name),
             is_orchestrator,
         );
+        let meta = if let Some(manager) = self.agent_manager() {
+            manager.managed_session_meta(agent_id, conn, &provider_id, meta)?
+        } else {
+            meta
+        };
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -3096,6 +3101,11 @@ impl Services {
             None,
             is_orchestrator,
         );
+        let meta = if let Some(manager) = self.agent_manager() {
+            manager.managed_session_meta(agent_id, conn, &provider_id, meta)?
+        } else {
+            meta
+        };
         self.publish_status_event(
             &workspace_id,
             agent_id,
