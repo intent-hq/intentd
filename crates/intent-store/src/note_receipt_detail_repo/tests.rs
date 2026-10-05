@@ -325,6 +325,7 @@ async fn receipt_detail_pages_only_existing_scoped_metadata_or_fragments() {
     query.reference = reference;
     query.max_items = 1;
     let first = read(&store, &query).await;
+    assert_eq!(first["sourceLength"], 10); // Captured base; final receipt length is 12.
     assert_eq!(first["items"][0], records[0]);
     query.cursor = Some(first["nextCursor"].as_str().unwrap().into());
     let last = read(&store, &query).await;

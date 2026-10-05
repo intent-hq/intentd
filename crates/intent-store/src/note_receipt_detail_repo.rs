@@ -263,9 +263,7 @@ impl Store {
         if query.operation_envelope {
             let length = if matches!(
                 query.kind,
-                ReceiptDetailKind::Inverse
-                    | ReceiptDetailKind::InverseText
-                    | ReceiptDetailKind::Detail
+                ReceiptDetailKind::Inverse | ReceiptDetailKind::InverseText
             ) {
                 receipt["sourceLength"].clone()
             } else {
