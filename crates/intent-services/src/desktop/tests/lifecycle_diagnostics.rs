@@ -75,7 +75,7 @@ async fn desktop_lifecycle_pending_invalidation_reports_cause_and_request() {
     let pending = h.agent("startControl", json!({})).await.unwrap();
     h.executor.connection.lock().unwrap().connection_epoch = "new-executor-incarnation".into();
     assert_eq!(
-        h.services.desktop_current_state(&h.agent).await,
+        intent_core::with_caller(Caller::Daemon, h.services.desktop_current_state(&h.agent)).await,
         DesktopState::Inactive
     );
     let message = outcome(&h, "requestId", pending["requestId"].as_str().unwrap()).await;
