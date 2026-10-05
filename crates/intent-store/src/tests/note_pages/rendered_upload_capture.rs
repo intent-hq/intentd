@@ -3,8 +3,11 @@
 //! native authority. Original deadlines are never rewritten to rescue a replay.
 use crate::Store;
 use intent_core::{
-    note_page::NotePageError, note_receipt_detail::NoteOperationReceiptRead,
-    note_stage_read::NoteStageRead, Error,
+    note_page::NotePageError,
+    note_receipt_detail::NoteOperationReceiptRead,
+    note_stage::{NoteStageBegin, NoteStageSeal},
+    note_stage_read::NoteStageRead,
+    Error,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,7 +63,12 @@ async fn resolve_entry(
     identity: &Value,
     calls: &mut Vec<Value>,
     seen: &mut BTreeSet<String>,
+    path: &str,
 ) -> Value {
+    let whole_leaf = path == "root.leaf.renderedText";
+    if whole_leaf {
+        assert_eq!(entry["type"], "string");
+    }
     let id = entry["id"].as_str().unwrap();
     assert!(seen.insert(id.into()), "duplicate/cyclic metadata node");
     assert!(seen.len() <= 128, "fixed rendered tree grew unexpectedly");
@@ -80,8 +88,16 @@ async fn resolve_entry(
                         assert!(prior < key);
                     }
                     previous = Some(key.into());
-                    let value =
-                        Box::pin(resolve_entry(store, base, child, identity, calls, seen)).await;
+                    let value = Box::pin(resolve_entry(
+                        store,
+                        base,
+                        child,
+                        identity,
+                        calls,
+                        seen,
+                        &format!("{path}.{key}"),
+                    ))
+                    .await;
                     assert!(object.insert(key.into(), value).is_none());
                 }
                 if let Some(cursor) = page["nextCursor"].as_str() {
@@ -95,15 +111,19 @@ async fn resolve_entry(
             Value::Object(object)
         }
         "string" => {
-            if let Some(value) = entry.get("value") {
+            if !whole_leaf {
+                let value = entry
+                    .get("value")
+                    .expect("ordinary fixed-context strings are inline");
                 assert!(entry.get("valueRef").is_none());
                 assert!(value.as_str().unwrap().len() <= 1024);
                 return value.clone();
             }
-            assert_eq!(
-                entry["key"], "renderedText",
-                "only wholeleaf strings are external in this fixture"
+            assert!(
+                entry.get("value").is_none(),
+                "whole native leaf must use valueRef even when small"
             );
+            assert!(entry["valueRef"].is_string());
             let mut request = base.clone();
             request["ref"] = entry["valueRef"].clone();
             let mut text = String::new();
@@ -188,6 +208,8 @@ async fn replay_actual_frontend_rendered_upload_and_capture_search_details() {
     let mut initial = None;
     let mut cancel = None;
     let mut deadline = None;
+    let mut begin = None;
+    let mut payload_digest = None;
     for call in captured["requests"].as_array().unwrap() {
         let params = call["params"].clone();
         let response = match call["method"].as_str().unwrap() {
@@ -197,6 +219,9 @@ async fn replay_actual_frontend_rendered_upload_and_capture_search_details() {
                     params["header"]["query"],
                     json!({"text":"STRASSE","caseSensitive":false,"mode":"renderedText"})
                 );
+                let typed: NoteStageBegin = serde_json::from_value(params.clone()).unwrap();
+                assert_eq!(typed.computed_digest().unwrap(), typed.header_digest);
+                assert!(begin.replace(typed).is_none());
                 store
                     .begin_note_stage("alice", &serde_json::from_value(params.clone()).unwrap())
                     .await
@@ -206,10 +231,14 @@ async fn replay_actual_frontend_rendered_upload_and_capture_search_details() {
                 .append_note_stage("alice", &serde_json::from_value(params.clone()).unwrap())
                 .await
                 .unwrap(),
-            "note.operation.seal" => store
-                .seal_note_stage("alice", &serde_json::from_value(params.clone()).unwrap())
-                .await
-                .unwrap(),
+            "note.operation.seal" => {
+                let typed: NoteStageSeal = serde_json::from_value(params.clone()).unwrap();
+                assert_eq!(typed.computed_digest().unwrap(), typed.payload_digest);
+                assert!(payload_digest
+                    .replace(typed.payload_digest.clone())
+                    .is_none());
+                store.seal_note_stage("alice", &typed).await.unwrap()
+            }
             "note.operation.read" => {
                 // Preserve the exact initial FE read. Controlled response refs and
                 // cursors are never replayed as if they were backend-issued tokens.
@@ -231,6 +260,15 @@ async fn replay_actual_frontend_rendered_upload_and_capture_search_details() {
     assert_eq!(initial["maxItems"], 16);
     assert_eq!(initial["maxSourceBytes"], 1024);
     assert_eq!(initial["maxWireBytes"], 8192);
+    let (parent, leaf) = uploaded_descriptors(&captured);
+    let whole_leaf = format!("{}😀", "Straße ".repeat(18));
+    let mut base = initial.clone();
+    base["kind"] = json!("detail");
+    let begin = begin.unwrap();
+    let initial_typed: NoteStageRead = serde_json::from_value(initial.clone()).unwrap();
+    assert_eq!(initial_typed.scope(), begin.scope());
+    assert_eq!(initial_typed.operation_id, begin.operation_id);
+    assert_eq!(initial_typed.header_digest, begin.header_digest);
     let mut request = initial.clone();
     let mut hits = Vec::new();
     let mut cursors = BTreeSet::new();
@@ -244,6 +282,15 @@ async fn replay_actual_frontend_rendered_upload_and_capture_search_details() {
             .await
             .unwrap();
         if identity.is_none() {
+            assert_eq!(response["scope"], json!(begin.scope()));
+            assert_eq!(response["operationId"], begin.operation_id);
+            assert_eq!(response["headerDigest"], begin.header_digest);
+            assert_eq!(
+                response["payloadDigest"],
+                payload_digest.as_ref().unwrap().as_str()
+            );
+            assert_eq!(response["expiresAt"], begin.expires_at);
+            assert!(response["viewId"].as_str().is_some_and(|id| !id.is_empty()));
             identity = Some(response.clone());
         }
         checked_page(&response, identity.as_ref().unwrap());
@@ -255,6 +302,34 @@ async fn replay_actual_frontend_rendered_upload_and_capture_search_details() {
         hits.extend(response["items"].as_array().unwrap().iter().cloned());
         assert_eq!(response["count"]["value"], hits.len());
         calls.push(json!({"method":"note.operation.read","params":request,"normalizedRequest":normalized,"cursor":normalized.cursor,"rpcId":1,"response":response}));
+        // Match the actual FE consumer: resolve every hit and its metadata now,
+        // before requesting the next search cursor. Empty pages remain recorded.
+        for hit in response["items"].as_array().unwrap() {
+            let mut request = base.clone();
+            request["ref"] = hit["detailRef"].clone();
+            let root = detail_page(&store, &request, identity.as_ref().unwrap(), &mut calls).await;
+            assert!(root["nextCursor"].is_null());
+            assert_eq!(root["items"].as_array().unwrap().len(), 1);
+            assert!(root["items"][0]["parentId"].is_null());
+            let logical = resolve_entry(
+                &store,
+                &base,
+                &root["items"][0],
+                identity.as_ref().unwrap(),
+                &mut calls,
+                &mut BTreeSet::new(),
+                "root",
+            )
+            .await;
+            let start = hit["sourceRange"]["start"].as_u64().unwrap();
+            let end = hit["sourceRange"]["end"].as_u64().unwrap();
+            assert_eq!(
+                logical,
+                json!({"kind":"stagedRenderedHit","mapping":"identity","sourceRange":{"start":start,"end":end},"renderedRange":{"start":start-10,"end":end-10},
+            "parent":{"ordinal":0,"sourceRange":{"start":10,"end":138},"descriptor":parent,"attributes":{}},
+            "leaf":{"ordinal":1,"sourceRange":{"start":10,"end":138},"descriptor":leaf,"attributes":{},"renderedText":whole_leaf}})
+            );
+        }
         if response["nextCursor"].is_null() {
             assert_eq!(response["count"]["exact"], true);
             break;
@@ -272,36 +347,6 @@ async fn replay_actual_frontend_rendered_upload_and_capture_search_details() {
         assert_eq!(
             hit["sourceRange"],
             json!({"start":10+index*7,"end":16+index*7})
-        );
-    }
-    let identity = identity.unwrap();
-    let (parent, leaf) = uploaded_descriptors(&captured);
-    let whole_leaf = format!("{}😀", "Straße ".repeat(18));
-    let mut base = initial.clone();
-    base["kind"] = json!("detail");
-    for hit in &hits {
-        let mut request = base.clone();
-        request["ref"] = hit["detailRef"].clone();
-        let root = detail_page(&store, &request, &identity, &mut calls).await;
-        assert!(root["nextCursor"].is_null());
-        assert_eq!(root["items"].as_array().unwrap().len(), 1);
-        assert!(root["items"][0]["parentId"].is_null());
-        let logical = resolve_entry(
-            &store,
-            &base,
-            &root["items"][0],
-            &identity,
-            &mut calls,
-            &mut BTreeSet::new(),
-        )
-        .await;
-        let start = hit["sourceRange"]["start"].as_u64().unwrap();
-        let end = hit["sourceRange"]["end"].as_u64().unwrap();
-        assert_eq!(
-            logical,
-            json!({"kind":"stagedRenderedHit","mapping":"identity","sourceRange":{"start":start,"end":end},"renderedRange":{"start":start-10,"end":end-10},
-            "parent":{"ordinal":0,"sourceRange":{"start":10,"end":138},"descriptor":parent,"attributes":{}},
-            "leaf":{"ordinal":1,"sourceRange":{"start":10,"end":138},"descriptor":leaf,"attributes":{},"renderedText":whole_leaf}})
         );
     }
     let mut wrong = initial.clone();
