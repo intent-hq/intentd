@@ -12,6 +12,7 @@ use intent_core::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+mod detail;
 
 const RECORD_PAGE_SQL: &str = "SELECT sequence,value FROM note_operation_item WHERE operation_key=? AND kind=? AND sequence>=? ORDER BY sequence LIMIT ?";
 
@@ -122,6 +123,8 @@ fn position(text: &str, key: &[u8], binding: &[u8; 32]) -> Result<i64> {
 
 fn validate_item(kind: ReceiptDetailKind, item: &Value) -> Result<()> {
     let valid = match kind {
+        ReceiptDetailKind::Detail => detail::valid_record(item),
+        ReceiptDetailKind::InverseText => false,
         ReceiptDetailKind::Mapping => {
             item.as_object().is_some_and(|o| o.len() == 3)
                 && safe(&item["start"])
@@ -132,7 +135,7 @@ fn validate_item(kind: ReceiptDetailKind, item: &Value) -> Result<()> {
         ReceiptDetailKind::Effects => effect(item),
         ReceiptDetailKind::Inverse => {
             item.as_object().is_some_and(|o| o.len() == 8)
-                && safe(&item["historyGroup"])
+                && token(&item["historyGroup"])
                 && safe(&item["ordinal"])
                 && safe(&item["start"])
                 && safe(&item["end"])
@@ -211,7 +214,6 @@ impl Store {
         let receipt: Value = serde_json::from_str(&raw).map_err(db)?;
         if receipt["kind"] != "noteCommitReceipt"
             || receipt["outcome"] != "committed"
-            || receipt[query.kind.reference_field()] != query.reference
             || receipt["scope"] != serde_json::to_value(&query.scope).map_err(db)?
             || !token(&receipt["beforeRevision"])
             || !token(&receipt["afterRevision"])
@@ -229,6 +231,15 @@ impl Store {
             return Err(invalid());
         }
         let operation_key: String = row.get("operation_key");
+        let owns_reference = if query.kind == ReceiptDetailKind::Detail {
+            sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM note_operation_detail WHERE operation_key=? AND reference=?)")
+                .bind(&operation_key).bind(&query.reference).fetch_one(&mut *tx).await.map_err(db)?
+        } else {
+            receipt[query.kind.reference_field()] == query.reference
+        };
+        if !owns_reference {
+            return Err(invalid());
+        }
         let key: Vec<u8> = backend.get("token_key");
         let binding: [u8; 32] = Sha256::digest(
             serde_json::to_vec(&json!([
@@ -246,18 +257,15 @@ impl Store {
             .as_ref()
             .map(|c| position(c, &key, &binding))
             .transpose()?
-            .unwrap_or(0);
-        let rows = sqlx::query(RECORD_PAGE_SQL)
-            .bind(&operation_key)
-            .bind(query.kind.storage_kind())
-            .bind(after)
-            .bind(i64::try_from(query.max_items + 1).map_err(db)?)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db)?;
+            .unwrap_or(i64::try_from(query.offset.unwrap_or(0)).map_err(|_| invalid())?);
         let mut out = json!({"scope":query.scope,"operationId":query.operation_id,"beforeRevision":receipt["beforeRevision"],"afterRevision":receipt["afterRevision"],"items":[],"nextCursor":null});
         if query.operation_envelope {
-            let length = if query.kind == ReceiptDetailKind::Inverse {
+            let length = if matches!(
+                query.kind,
+                ReceiptDetailKind::Inverse
+                    | ReceiptDetailKind::InverseText
+                    | ReceiptDetailKind::Detail
+            ) {
                 receipt["sourceLength"].clone()
             } else {
                 let length:Option<i64>=sqlx::query_scalar("SELECT end FROM note_operation_source WHERE operation_key=? AND phase='base' ORDER BY start DESC LIMIT 1")
@@ -283,30 +291,52 @@ impl Store {
             }
             out["convertedCount"] = json!(converted);
         }
-        let mut items = Vec::new();
-        for (index, row) in rows.iter().take(query.max_items).enumerate() {
-            let value: String = row.get("value");
-            let item: Value = serde_json::from_str(&value).map_err(db)?;
-            validate_item(query.kind, &item)?;
-            let seq: i64 = row.get("sequence");
-            let next = u64::try_from(seq)
-                .map_err(db)?
-                .checked_add(1)
-                .ok_or_else(invalid)?;
-            let previous = out.clone();
-            items.push(item);
-            out["items"] = json!(items);
-            out["nextCursor"] = if index + 1 < rows.len() {
-                json!(cursor(&key, &binding, next)?)
-            } else {
-                Value::Null
-            };
-            if frame_len(&out, rpc_id) > query.max_wire_bytes {
-                if index == 0 {
-                    return Err(budget());
+        if query.kind == ReceiptDetailKind::InverseText {
+            detail::inverse_text(
+                &mut tx,
+                &operation_key,
+                query,
+                after,
+                &mut out,
+                &key,
+                &binding,
+                rpc_id,
+            )
+            .await?;
+        } else {
+            if query.offset.is_some() {
+                return Err(invalid());
+            }
+            let rows=sqlx::query(if query.kind==ReceiptDetailKind::Detail {
+                "SELECT sequence,value FROM note_operation_detail WHERE operation_key=? AND reference=? AND sequence>=? ORDER BY sequence LIMIT ?"
+            } else { RECORD_PAGE_SQL })
+                .bind(&operation_key).bind(if query.kind==ReceiptDetailKind::Detail {query.reference.as_str()}else{query.kind.storage_kind()})
+                .bind(after).bind(i64::try_from(query.max_items+1).map_err(db)?).fetch_all(&mut *tx).await.map_err(db)?;
+            let mut items = Vec::new();
+            for (index, row) in rows.iter().take(query.max_items).enumerate() {
+                let value: String = row.get("value");
+                let item: Value = serde_json::from_str(&value).map_err(db)?;
+                validate_item(query.kind, &item)?;
+                let seq: i64 = row.get("sequence");
+                let next = u64::try_from(seq)
+                    .map_err(db)?
+                    .checked_add(1)
+                    .ok_or_else(invalid)?;
+                let previous = out.clone();
+                items.push(item);
+                out["items"] = json!(items);
+                out["nextCursor"] = if index + 1 < rows.len() {
+                    json!(cursor(&key, &binding, next)?)
+                } else {
+                    Value::Null
+                };
+                if frame_len(&out, rpc_id) > query.max_wire_bytes {
+                    if index == 0 {
+                        return Err(budget());
+                    }
+                    out = previous;
+                    break;
                 }
-                out = previous;
-                break;
             }
         }
         if frame_len(&out, rpc_id) > query.max_wire_bytes {

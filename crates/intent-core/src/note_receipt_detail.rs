@@ -11,6 +11,8 @@ pub enum ReceiptDetailKind {
     Mapping,
     Effects,
     Inverse,
+    InverseText,
+    Detail,
 }
 
 impl ReceiptDetailKind {
@@ -19,7 +21,8 @@ impl ReceiptDetailKind {
         match self {
             Self::Mapping => "mapping",
             Self::Effects => "effects",
-            Self::Inverse => "inverse",
+            Self::Inverse | Self::InverseText => "inverse",
+            Self::Detail => "detail",
         }
     }
     #[must_use]
@@ -27,7 +30,8 @@ impl ReceiptDetailKind {
         match self {
             Self::Mapping => "mappingRef",
             Self::Effects => "effectsRef",
-            Self::Inverse => "inverseRef",
+            Self::Inverse | Self::InverseText => "inverseRef",
+            Self::Detail => "",
         }
     }
 }
@@ -70,6 +74,8 @@ pub struct NoteOperationReceiptRead {
     pub max_items: Option<usize>,
     pub max_wire_bytes: Option<usize>,
     pub max_source_bytes: Option<usize>,
+    pub text_id: Option<String>,
+    pub offset: Option<u64>,
 }
 
 /// Internal normalized request. Services authorize current visibility before
@@ -88,6 +94,9 @@ pub struct ReceiptDetailQuery {
     pub max_wire_bytes: usize,
     pub max_source_bytes: usize,
     pub operation_envelope: bool,
+    pub text_id: Option<String>,
+    #[serde(skip)]
+    pub offset: Option<u64>,
 }
 
 impl ReceiptDetailQuery {
@@ -111,11 +120,27 @@ impl ReceiptDetailQuery {
         identity.validate()?;
         if (self.operation_envelope && self.payload_digest.is_none())
             || (!self.operation_envelope
-                && (self.payload_digest.is_some() || self.kind == ReceiptDetailKind::Inverse))
+                && (self.payload_digest.is_some()
+                    || !matches!(
+                        self.kind,
+                        ReceiptDetailKind::Mapping | ReceiptDetailKind::Effects
+                    )))
             || [&self.reference]
                 .into_iter()
                 .chain(self.cursor.iter())
+                .chain(self.text_id.iter())
                 .any(|s| s.is_empty() || s.len() > 256 || s.contains('\0'))
+        {
+            return Err(NoteMutationError::Invalid);
+        }
+        if (self.kind == ReceiptDetailKind::InverseText) != self.text_id.is_some()
+            || (self.offset.is_some()
+                && (self.cursor.is_some()
+                    || !matches!(
+                        self.kind,
+                        ReceiptDetailKind::InverseText | ReceiptDetailKind::Detail
+                    )))
+            || self.offset.is_some_and(|n| n > 9_007_199_254_740_991)
         {
             return Err(NoteMutationError::Invalid);
         }
@@ -150,6 +175,8 @@ impl NoteGetReceiptRequest {
             max_wire_bytes: self.page.max_wire_bytes.unwrap_or(65536),
             max_source_bytes: 16384,
             operation_envelope: false,
+            text_id: None,
+            offset: None,
         };
         q.validate()?;
         Ok(q)
@@ -176,6 +203,8 @@ impl NoteOperationReceiptRead {
             max_wire_bytes: self.max_wire_bytes.unwrap_or(65536),
             max_source_bytes: self.max_source_bytes.unwrap_or(16384),
             operation_envelope: true,
+            text_id: self.text_id,
+            offset: self.offset,
         };
         q.validate()?;
         Ok(q)

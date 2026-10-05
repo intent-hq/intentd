@@ -29,6 +29,8 @@ async fn fixture() -> (tempfile::TempDir, Store, ReceiptDetailQuery) {
         max_wire_bytes: 4096,
         max_source_bytes: 16384,
         operation_envelope: true,
+        text_id: None,
+        offset: None,
     };
     let deadline = i64::try_from(intent_core::now_epoch_ms() / 1000).unwrap() + 3600;
     let receipt = json!({"kind":"noteCommitReceipt","outcome":"committed","scope":query.scope,"operationId":OP,"payloadDigest":"a".repeat(64),
@@ -191,7 +193,7 @@ async fn receipt_detail_never_exposes_internal_legacy_inverse_shape() {
         .execute(store.write_pool())
         .await
         .unwrap();
-    item(&store,"inverse",0,json!({"historyGroup":0,"inputState":"after","outputState":"before","ordinal":0,"start":0,"end":1,
+    item(&store,"inverse",0,json!({"historyGroup":"0","inputState":"after","outputState":"before","ordinal":0,"start":0,"end":1,
         "replacement":{"textId":"text:0","length":1,"utf8Bytes":1,"sha256":"a".repeat(64)},"provenanceRef":"provenance:0"})).await;
     let page = read(&store, &query).await;
     assert_eq!(page["sourceLength"], 12);
@@ -235,4 +237,101 @@ async fn receipt_detail_production_query_seeks_past_large_prefix() {
             .collect::<Vec<_>>(),
         [9999, 10000]
     );
+}
+
+#[tokio::test]
+async fn receipt_inverse_text_reconstructs_scalar_safe_bytes_and_enforces_reachability() {
+    let (_dir, store, mut query) = fixture().await;
+    let text = "a😀\r\n\\\"é".repeat(2000);
+    let length = i64::try_from(text.encode_utf16().count()).unwrap();
+    let sha = format!("{:x}", Sha256::digest(text.as_bytes()));
+    sqlx::query("DELETE FROM note_operation_source")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let mut piece = String::new();
+    let mut start = 0_i64;
+    for ch in text.chars().chain(std::iter::once('\0')) {
+        if ch == '\0' || piece.len() + ch.len_utf8() > 4096 {
+            let end = start + i64::try_from(piece.encode_utf16().count()).unwrap();
+            sqlx::query("INSERT INTO note_operation_source(operation_key,phase,start,end,text) VALUES(?,'base',?,?,?)")
+                .bind(KEY).bind(start).bind(end).bind(&piece).execute(store.write_pool()).await.unwrap();
+            start = end;
+            piece.clear();
+        }
+        if ch != '\0' {
+            piece.push(ch);
+        }
+    }
+    let text_id = format!("{KEY}:text:0");
+    sqlx::query("INSERT INTO note_operation_text(operation_key,text_id,phase,start,end,length,utf8_bytes,sha256) VALUES(?,?,'base',0,?,?,?,?)")
+        .bind(KEY).bind(&text_id).bind(length).bind(length).bind(i64::try_from(text.len()).unwrap()).bind(&sha).execute(store.write_pool()).await.unwrap();
+    item(&store,"inverse",0,json!({"historyGroup":"0","inputState":"after","outputState":"before","ordinal":0,"start":0,"end":1,
+        "replacement":{"textId":text_id,"length":length,"utf8Bytes":text.len(),"sha256":sha},"provenanceRef":format!("{KEY}:inverse-detail:0")})).await;
+    query.kind = ReceiptDetailKind::InverseText;
+    query.reference = format!("{KEY}:inverse");
+    query.text_id = Some(text_id);
+    query.max_source_bytes = 128;
+    let mut restored = String::new();
+    let mut units = 0;
+    loop {
+        let page = read(&store, &query).await;
+        let fragment = &page["items"][0];
+        assert_eq!(fragment["offset"], units);
+        let part = fragment["text"].as_str().unwrap();
+        assert!(part.len() <= 128);
+        units += part.encode_utf16().count();
+        restored.push_str(part);
+        let Some(next) = page["nextCursor"].as_str() else {
+            break;
+        };
+        query.cursor = Some(next.into());
+    }
+    assert_eq!(restored, text);
+    assert_eq!(format!("{:x}", Sha256::digest(restored.as_bytes())), sha);
+    query.cursor = None;
+    query.offset = Some(2);
+    assert!(matches!(
+        store
+            .read_note_receipt_detail("alice", &query, &json!(1))
+            .await,
+        Err(Error::NotePage(NotePageError::CursorInvalid))
+    ));
+    query.offset = Some(1);
+    query.max_source_bytes = 4;
+    assert_eq!(read(&store, &query).await["items"][0]["text"], "😀");
+    query.offset = None;
+    sqlx::query("UPDATE note_operation_item SET value=json_set(value,'$.replacement.textId','unreachable') WHERE kind='inverse'").execute(store.write_pool()).await.unwrap();
+    assert!(store
+        .read_note_receipt_detail("alice", &query, &json!(1))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn receipt_detail_pages_only_existing_scoped_metadata_or_fragments() {
+    let (_dir, store, mut query) = fixture().await;
+    let reference = format!("{KEY}:inverse-detail:0");
+    let records = [
+        json!({"id":"root","parentId":null,"type":"string","value":"original marker metadata"}),
+        json!({"kind":"fragment","id":"field","field":"text","offset":0,"text":"escaped\\\"😀","nextRef":null}),
+    ];
+    for (sequence, value) in records.iter().enumerate() {
+        sqlx::query("INSERT INTO note_operation_detail(operation_key,reference,sequence,value) VALUES(?,?,?,?)")
+            .bind(KEY).bind(&reference).bind(i64::try_from(sequence).unwrap()).bind(value.to_string()).execute(store.write_pool()).await.unwrap();
+    }
+    query.kind = ReceiptDetailKind::Detail;
+    query.reference = reference;
+    query.max_items = 1;
+    let first = read(&store, &query).await;
+    assert_eq!(first["items"][0], records[0]);
+    query.cursor = Some(first["nextCursor"].as_str().unwrap().into());
+    let last = read(&store, &query).await;
+    assert_eq!(last["items"][0], records[1]);
+    assert!(last["nextCursor"].is_null());
+    query.reference = format!("{KEY}:inverse-detail:other");
+    assert!(store
+        .read_note_receipt_detail("alice", &query, &json!(1))
+        .await
+        .is_err());
 }

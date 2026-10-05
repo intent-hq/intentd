@@ -41,3 +41,27 @@ fn receipt_detail_operation_requires_digest_and_binds_budgets() {
     bad["headerDigest"] = json!("b".repeat(64));
     assert!(serde_json::from_value::<NoteOperationReceiptRead>(bad).is_err());
 }
+
+#[test]
+fn receipt_inverse_text_requires_named_text_and_omits_offset_on_continuation() {
+    let value = json!({"backendId":"b","workspaceId":"w","noteId":"n","noteInstanceId":"i",
+        "operationId":"11111111-1111-4111-8111-111111111111","kind":"inverseText","ref":"r","textId":"text:0","offset":1,"payloadDigest":"a".repeat(64)});
+    assert!(
+        serde_json::from_value::<NoteOperationReceiptRead>(value.clone())
+            .unwrap()
+            .query()
+            .is_ok()
+    );
+    let mut bad = value.clone();
+    bad.as_object_mut().unwrap().remove("textId");
+    assert!(serde_json::from_value::<NoteOperationReceiptRead>(bad)
+        .unwrap()
+        .query()
+        .is_err());
+    let mut bad = value;
+    bad["cursor"] = json!("cursor");
+    assert!(serde_json::from_value::<NoteOperationReceiptRead>(bad)
+        .unwrap()
+        .query()
+        .is_err());
+}
