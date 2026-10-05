@@ -986,6 +986,46 @@ async fn native_first_push_creates_tracking_ref() {
     run("native_first_push_creates_tracking_ref", "push_first").await;
 }
 
+#[test]
+fn expected_absence_tracking_update_creates_only_missing_ref() {
+    let scratch = tempfile::Builder::new()
+        .prefix("native-tracking-absence-")
+        .tempdir()
+        .unwrap();
+    let next = git2::Oid::from_str(&repository(scratch.path())).unwrap();
+    let repo = git2::Repository::open_bare(scratch.path().join("forge/team/project.git")).unwrap();
+    let first = repo.refname_to_id("refs/heads/main").unwrap();
+    let name = "refs/remotes/origin/new/first-push";
+
+    // A zero expected OID checks absence under the ref lock. Force deliberately
+    // bypasses the separate existence precheck; this is an API contract test,
+    // not an execution of the internal check-to-lock race window.
+    repo.reference_matching(name, first, true, git2::Oid::ZERO_SHA1, "first publication")
+        .unwrap();
+    assert_eq!(repo.refname_to_id(name).unwrap(), first);
+    let error = repo
+        .reference_matching(name, next, true, git2::Oid::ZERO_SHA1, "stale absence")
+        .err()
+        .expect("a present direct ref must refuse expected absence");
+    assert_eq!(error.code(), git2::ErrorCode::Modified);
+    assert_eq!(repo.refname_to_id(name).unwrap(), first);
+
+    repo.reference_symbolic(name, "refs/heads/main", true, "competing symbolic ref")
+        .unwrap();
+    let error = repo
+        .reference_matching(name, next, true, git2::Oid::ZERO_SHA1, "stale absence")
+        .err()
+        .expect("a present symbolic ref must refuse expected absence");
+    assert_eq!(error.code(), git2::ErrorCode::Modified);
+    assert_eq!(
+        repo.find_reference(name)
+            .unwrap()
+            .symbolic_target()
+            .unwrap(),
+        Some("refs/heads/main")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn confirmed_native_push_survives_retired_ref_and_delivery_admission() {
     run(

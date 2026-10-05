@@ -458,7 +458,15 @@ pub(super) fn push(
                     );
                 }
                 Some(None) => {
-                    let _ = repo.reference(&tracking_ref, new, false, "confirmed native push");
+                    // Expected absence must be compared under the ref lock,
+                    // not only by the earlier force=false existence precheck.
+                    let _ = repo.reference_matching(
+                        &tracking_ref,
+                        new,
+                        true,
+                        git2::Oid::ZERO_SHA1,
+                        "confirmed native push",
+                    );
                 }
                 None => (),
             }
