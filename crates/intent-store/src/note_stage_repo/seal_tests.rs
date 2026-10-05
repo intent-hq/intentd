@@ -531,3 +531,179 @@ async fn stage_seal_one_group_across_chunks_uses_original_input_coordinates() {
         assert!(plan.contains("SEARCH"),"{plan}");assert!(!plan.contains("SCAN"),"{plan}");assert!(!plan.contains("TEMP B-TREE"),"{plan}");
     }
 }
+
+// Actual Store migrations/admission/append/COW source integration. View DDL is
+// deliberately test-local until the migration owner registers the agreed schema.
+#[tokio::test]
+async fn stage_seal_current_store_migrations_keep_pinned_source_and_cascade_views() {
+    use intent_core::{
+        note_stage::NoteStageBegin, ContentType, Note, NoteId, NoteMetadata, NoteVisibility,
+        WorkspaceId,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("seal.db");
+    let store = crate::Store::open(&path).await.unwrap();
+    let now = intent_core::now_iso();
+    sqlx::query("INSERT INTO workspace(id,title,branch,status,created_at,updated_at) VALUES('ws','Seal','test','Active',?,?)")
+        .bind(&now).bind(&now).execute(store.write_pool()).await.unwrap();
+    let mut note = Note {
+        id: NoteId::from("note"),
+        workspace_id: WorkspaceId::from("ws"),
+        title: "Seal".into(),
+        content: "a😀bc".into(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        metadata: NoteMetadata::default(),
+        created_at: now.clone(),
+        updated_at: now,
+        rev: 0,
+    };
+    store.insert_note(&note).await.unwrap();
+    let page = store
+        .read_note_page(
+            "ws",
+            "note",
+            "alice",
+            serde_json::from_value(json!({"kind":"source"})).unwrap(),
+            &json!(1),
+        )
+        .await
+        .unwrap();
+    let mut begin = page["scope"].clone();
+    begin["operationId"] = json!(uuid::Uuid::new_v4().to_string());
+    begin["expiresAt"] = json!(format!(
+        "{}.000Z",
+        &intent_core::iso_ms_from_now(60_000)[..19]
+    ));
+    begin["headerDigest"] = json!("0".repeat(64));
+    begin["header"] = serde_json::to_value(header()).unwrap();
+    begin["header"]["baseRevision"] = page["sourceRevision"].clone();
+    let mut begin: NoteStageBegin = serde_json::from_value(begin).unwrap();
+    begin.header_digest = begin.computed_digest().unwrap();
+    store.begin_note_stage("alice", &begin).await.unwrap();
+    for (stream, records) in [
+        (
+            NoteStageStream::Text,
+            vec![json!({"kind":"text","id":"replacement","offset":0,"text":"XY"})],
+        ),
+        (
+            NoteStageStream::Dirty,
+            vec![
+                json!({"kind":"splice","localSequence":9,"ordinal":0,"start":1,"end":3,"replacement":text_reference("replacement","XY")}),
+            ],
+        ),
+    ] {
+        let mut request = NoteStageAppend {
+            backend_id: begin.backend_id.clone(),
+            workspace_id: begin.workspace_id.clone(),
+            note_id: begin.note_id.clone(),
+            note_instance_id: begin.note_instance_id.clone(),
+            operation_id: begin.operation_id.clone(),
+            header_digest: begin.header_digest.clone(),
+            stream,
+            sequence: 0,
+            previous_digest: None,
+            records,
+            chunk_digest: String::new(),
+        };
+        request.chunk_digest = request.computed_digest().unwrap();
+        store.append_note_stage("alice", &request).await.unwrap();
+    }
+    note.content = "remote replacement".into();
+    store.update_note(&note).await.unwrap();
+    let mut tx = store
+        .write_pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .unwrap();
+    // Same schema agreed with the migration owner; only new view/cache objects.
+    for ddl in [
+        "ALTER TABLE note_stage_text ADD COLUMN sha256 TEXT CHECK(sha256 IS NULL OR length(sha256)=64)",
+        "CREATE TABLE note_stage_view(operation_key TEXT NOT NULL REFERENCES note_stage(operation_key) ON DELETE CASCADE,generation INTEGER NOT NULL,input_generation INTEGER,history_group TEXT,length INTEGER NOT NULL,PRIMARY KEY(operation_key,generation))",
+        "CREATE TABLE note_stage_view_piece(operation_key TEXT NOT NULL,generation INTEGER NOT NULL,start INTEGER NOT NULL,end INTEGER NOT NULL,origin_kind TEXT NOT NULL,origin_id TEXT NOT NULL,origin_start INTEGER NOT NULL,PRIMARY KEY(operation_key,generation,start),FOREIGN KEY(operation_key,generation) REFERENCES note_stage_view(operation_key,generation) ON DELETE CASCADE)",
+    ] {sqlx::query(ddl).execute(&mut *tx).await.unwrap();}
+    let (operation,root):(String,String)=sqlx::query_as("SELECT s.operation_key,s.root_key FROM note_stage s JOIN note_operation o USING(operation_key) WHERE o.operation_id=?")
+        .bind(&begin.operation_id).fetch_one(&mut *tx).await.unwrap();
+    let mut entries = vec![];
+    for stream in NOTE_STAGE_STREAMS {
+        let row=sqlx::query("SELECT next_sequence,last_digest,records FROM note_stage_stream WHERE operation_key=? AND stream=?").bind(&operation).bind(stream_name(stream)).fetch_one(&mut *tx).await.unwrap();
+        entries.push(NoteStageManifestEntry {
+            stream,
+            chunks: extent(row.get("next_sequence")).unwrap(),
+            records: extent(row.get("records")).unwrap(),
+            last_digest: row.get("last_digest"),
+        });
+    }
+    let mut request = NoteStageSeal {
+        backend_id: begin.backend_id,
+        workspace_id: begin.workspace_id,
+        note_id: begin.note_id,
+        note_instance_id: begin.note_instance_id,
+        operation_id: begin.operation_id,
+        header_digest: begin.header_digest,
+        manifest: entries,
+        payload_digest: String::new(),
+    };
+    request.payload_digest = request.computed_digest().unwrap();
+    let prepared = prepare_frozen_view(&mut tx, &operation, &begin.header, &request, &root)
+        .await
+        .unwrap();
+    assert_eq!((prepared.generation, prepared.length), (1, 5));
+    let old = super::super::source::source_piece(&mut tx, &root, 1)
+        .await
+        .unwrap();
+    assert_eq!(old.2, "a😀bc");
+    let parts:Vec<(i64,i64,String,i64)>=sqlx::query_as("SELECT start,end,origin_kind,origin_start FROM note_stage_view_piece WHERE operation_key=? AND generation=1 ORDER BY start")
+        .bind(&operation).fetch_all(&mut *tx).await.unwrap();
+    assert_eq!(
+        parts,
+        vec![
+            (0, 1, "root".into(), 0),
+            (1, 3, "text".into(), 0),
+            (3, 5, "root".into(), 3)
+        ]
+    );
+    let phase: String = sqlx::query_scalar("SELECT phase FROM note_stage WHERE operation_key=?")
+        .bind(&operation)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        phase, "staging",
+        "preparation must not publish a sealed operation"
+    );
+    let content: String =
+        sqlx::query_scalar("SELECT content FROM note WHERE workspace_id='ws' AND id='note'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(content, "remote replacement");
+    let fk = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+    assert!(fk.is_empty());
+    tx.commit().await.unwrap();
+    drop(store);
+    let reopened = crate::Store::open(&path).await.unwrap();
+    let views: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_view")
+        .fetch_one(reopened.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(views, 2);
+    sqlx::query("DELETE FROM note_operation WHERE operation_key=?")
+        .bind(&operation)
+        .execute(reopened.write_pool())
+        .await
+        .unwrap();
+    let pieces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_view_piece")
+        .fetch_one(reopened.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(pieces, 0);
+}
