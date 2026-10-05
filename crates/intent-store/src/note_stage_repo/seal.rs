@@ -33,7 +33,8 @@ fn stream_name(stream: NoteStageStream) -> &'static str {
 }
 
 /// Verify the five persisted stream summaries and every bounded chunk hash.
-/// Work is O(uploaded record bytes + chunks); memory holds at most one chunk of <=64KiB encoded records.
+/// Work is O(uploaded record bytes + chunks); resident values are bounded by a
+/// constant multiple of one chunk of <=64KiB encoded records.
 /// No source string, full stream, or operation-wide text-ID map is reconstructed.
 /// Caller owns the writer transaction, original operation binding and expiry.
 /// # Errors
@@ -188,6 +189,11 @@ pub(super) async fn verify_text(
     if length > 9_007_199_254_740_991 || utf8_bytes > 9_007_199_254_740_991 {
         return Err(invalid());
     }
+    let negative: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM note_stage_text_piece WHERE operation_key=? AND text_id=? AND start<0)")
+        .bind(operation).bind(text_id).fetch_one(&mut *conn).await.map_err(db)?;
+    if negative {
+        return Err(invalid());
+    }
     let mut last_start = -1_i64;
     let mut position = 0_u64;
     let mut bytes = 0_u64;
@@ -231,6 +237,91 @@ pub(super) async fn verify_text(
         length,
         utf8_bytes,
         sha256,
+    })
+}
+
+/// Structural fields only. This is not editor-schema or role-semantic admission.
+/// The caller must validate operation-owned attributes and actual earlier parent
+/// existence, frozen source coordinates, and current output-adapter support.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ProjectionDescriptor<'a> {
+    pub(super) node_type: &'a str,
+    pub(super) parent_ordinal: Option<u64>,
+    pub(super) native_from: u64,
+    pub(super) native_to: u64,
+    pub(super) attributes_ref: Option<&'a str>,
+}
+
+/// Check the resolved version-1 shape without inventing a native node allowlist.
+/// `value` must come from the operation-owned, digest-verified detail text. The
+/// caller supplies a bounded/streaming JSON reader; this does not load text IDs.
+pub(super) fn projection_descriptor(
+    value: &Value,
+    ordinal: u64,
+) -> Result<ProjectionDescriptor<'_>> {
+    const SAFE: u64 = 9_007_199_254_740_991;
+    let object = value.as_object().ok_or_else(invalid)?;
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "version" | "nodeType" | "parentOrdinal" | "nativeRange" | "attributesRef"
+        )
+    }) || ordinal > SAFE
+        || object.get("version").and_then(Value::as_u64) != Some(1)
+    {
+        return Err(invalid());
+    }
+    let node_type = object
+        .get("nodeType")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    if node_type.is_empty() || node_type.len() > 1024 || node_type.contains('\0') {
+        return Err(invalid());
+    }
+    let parent_ordinal = match object.get("parentOrdinal") {
+        Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .filter(|parent| *parent < ordinal)
+                .ok_or_else(invalid)?,
+        ),
+        None => return Err(invalid()),
+    };
+    let range = object
+        .get("nativeRange")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    if range.len() != 2 {
+        return Err(invalid());
+    }
+    let native_from = range
+        .get("from")
+        .and_then(Value::as_u64)
+        .ok_or_else(invalid)?;
+    let native_to = range
+        .get("to")
+        .and_then(Value::as_u64)
+        .ok_or_else(invalid)?;
+    if native_from > native_to || native_to > SAFE {
+        return Err(invalid());
+    }
+    let attributes_ref = match object.get("attributesRef") {
+        None => None,
+        Some(value) => {
+            let reference = value.as_str().ok_or_else(invalid)?;
+            if reference.is_empty() || reference.len() > 256 || reference.contains('\0') {
+                return Err(invalid());
+            }
+            Some(reference)
+        }
+    };
+    Ok(ProjectionDescriptor {
+        node_type,
+        parent_ordinal,
+        native_from,
+        native_to,
+        attributes_ref,
     })
 }
 

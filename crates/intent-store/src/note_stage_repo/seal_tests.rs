@@ -225,6 +225,7 @@ async fn stage_seal_text_accepts_owned_empty_and_rejects_gaps_overlaps_and_wrong
     .unwrap();
     verify_text(&mut conn, "op", "value").await.unwrap();
     for mutation in [
+        "INSERT INTO note_stage_text_piece VALUES('op','value',-1,0,'x')",
         "DELETE FROM note_stage_text_piece WHERE text_id='value' AND start=0",
         "UPDATE note_stage_text_piece SET start=1 WHERE text_id='value' AND start=2",
         "UPDATE note_stage_text_piece SET end=1 WHERE text_id='value' AND start=0",
@@ -237,4 +238,50 @@ async fn stage_seal_text_accepts_owned_empty_and_rejects_gaps_overlaps_and_wrong
         tx.rollback().await.unwrap();
         verify_text(&mut conn,"op","value").await.unwrap();
     }
+}
+
+#[test]
+fn stage_seal_projection_checks_shape_and_native_coordinates_without_source_unit_substitution() {
+    let value = json!({"version":1,"nodeType":"paragraph","parentOrdinal":null,"nativeRange":{"from":7,"to":9007199254740991_u64}});
+    assert_eq!(
+        projection_descriptor(&value, 0).unwrap(),
+        ProjectionDescriptor {
+            node_type: "paragraph",
+            parent_ordinal: None,
+            native_from: 7,
+            native_to: 9007199254740991,
+            attributes_ref: None
+        }
+    );
+    let mut child = value.clone();
+    child["parentOrdinal"] = json!(0);
+    child["attributesRef"] = json!("owned-attributes");
+    assert_eq!(
+        projection_descriptor(&child, 1).unwrap().attributes_ref,
+        Some("owned-attributes")
+    );
+    for (key, bad) in [
+        ("version", json!(2)),
+        ("nodeType", json!("")),
+        ("nodeType", json!("é".repeat(513))),
+        ("parentOrdinal", json!(1)),
+        ("parentOrdinal", json!(-1)),
+        ("attributesRef", Value::Null),
+        ("attributesRef", json!("")),
+        ("attributesRef", json!("x".repeat(257))),
+        ("nativeRange", json!({"from":2,"to":1})),
+        ("nativeRange", json!({"from":0,"to":9007199254740992_u64})),
+        ("nativeRange", json!({"from":0,"to":1,"sourceStart":0})),
+        ("extra", json!(true)),
+    ] {
+        let mut malformed = child.clone();
+        malformed[key] = bad;
+        assert!(projection_descriptor(&malformed, 1).is_err(), "{key}");
+    }
+    for key in ["version", "nodeType", "parentOrdinal", "nativeRange"] {
+        let mut malformed = value.clone();
+        malformed.as_object_mut().unwrap().remove(key);
+        assert!(projection_descriptor(&malformed, 0).is_err(), "{key}");
+    }
+    assert!(projection_descriptor(&child, 0).is_err());
 }
