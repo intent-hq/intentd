@@ -4,20 +4,74 @@ use intent_core::{
     AgentId, AuthorType, BoxFuture, Comment, CommentAddResult, CommentLocation,
     CommentResolveThreadResult, CommentRespondResult, CommentRespondThread, CommentStatus,
     CommentType, CommentWire, ContentType, Error, Event, EventQueryParams, FileStatus,
-    GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
-    GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteId, NoteMetadata, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, RepoConfig, Result,
-    ScriptCreateParams, ScriptMode, TaskUpdateResult, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
-    WorkspaceUpdate,
+    GitAgentCommitResult, GitBranchStatus, GitBranches, GitFileStatus, GitMergeConflicts,
+    GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult,
+    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility,
+    ReadAssetResult, RepoConfig, Result, ScriptCreateParams, ScriptMode, TaskUpdateResult,
+    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceCreate,
+    WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use serde_json::Value;
 
 use super::handle_message;
 
 struct FakeApi;
+
+#[test]
+fn execution_authorization_errors_preserve_typed_codes_and_drop_provider_bodies() {
+    use intent_core::execution::{
+        ExecutionAuthorizationFailure, ExecutionAuthorizationReason, ExecutionResource,
+    };
+    for (source, code, data_code) in [
+        (
+            Error::CloneFailed {
+                category: intent_core::CloneErrorCategory::AuthRequired,
+                detail: "https://secret@forge/private response".into(),
+            },
+            -32603,
+            "auth-required",
+        ),
+        (
+            Error::SourceControlUnauthorized {
+                provider: "github".into(),
+                host: "github.com".into(),
+            },
+            -32603,
+            "source-control-unauthorized",
+        ),
+        (
+            Error::Internal("private provider body".into()),
+            -32603,
+            "host-execution-authorization",
+        ),
+    ] {
+        let authorization = ExecutionAuthorizationFailure::new(
+            ExecutionResource::Git,
+            ExecutionAuthorizationReason::Rejected,
+            Some("github".into()),
+            Some("github.com".into()),
+        );
+        let rpc = super::domain_to_rpc(Error::ExecutionAuthorization {
+            source: Box::new(source),
+            authorization: Box::new(authorization),
+        });
+        assert_eq!(rpc.code, code);
+        let data = rpc.data.unwrap();
+        assert_eq!(data["code"], data_code);
+        assert_eq!(
+            data["executionAuthorization"]["recovery"]["actor"],
+            "host-owner"
+        );
+        assert!(!data.to_string().contains("private"));
+        assert!(!data.to_string().contains("secret@"));
+        assert!(!rpc.message.contains("private"));
+    }
+    let legacy = super::domain_to_rpc(Error::Internal("original".into()));
+    assert_eq!(legacy.data, Some(Value::String("original".into())));
+    let legacy = super::domain_to_rpc(Error::GitAuthorization("original".into()));
+    assert_eq!(legacy.data, Some(Value::String("original".into())));
+}
 
 fn sample_ws() -> Workspace {
     Workspace {
@@ -34,6 +88,7 @@ fn sample_ws() -> Workspace {
         created_at: "t0".to_string(),
         updated_at: "t0".to_string(),
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -605,6 +660,7 @@ impl WorkspaceApi for FakeApi {
                 updated_at: Some("t1".to_string()),
                 skipped: None,
                 reason: None,
+                rev: Some(1),
             })
         })
     }
@@ -746,6 +802,8 @@ impl WorkspaceApi for FakeApi {
                 content: "please change".to_string(),
                 author: "Agent".to_string(),
                 author_type: AuthorType::Agent,
+                author_principal_id: None,
+                author_identity: None,
                 status: CommentStatus::Open,
                 parent_id: Some("c1".to_string()),
                 // Replies carry no anchor of their own (monorepo#729).
@@ -1274,6 +1332,7 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async {
             Ok(serde_json::json!({
                 "ok": true,
+                "flowId": "7",
                 "userCode": "ABCD-1234",
                 "verificationUri": "https://github.com/login/device",
                 "expiresIn": 900,
@@ -1282,8 +1341,13 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn github_cancel_auth(&self) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async { Ok(serde_json::json!({ "ok": true, "cancelled": true })) })
+    fn github_cancel_auth(&self, flow_id: Option<String>) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true,
+                "cancelled": flow_id.as_deref().is_none_or(|id| id == "7"),
+            }))
+        })
     }
 
     fn github_revoke(&self) -> BoxFuture<'_, Result<Value>> {
@@ -1295,6 +1359,20 @@ impl WorkspaceApi for FakeApi {
             Ok(serde_json::json!({
                 "user": { "login": "octocat", "avatarUrl": "a", "htmlUrl": "h" }
             }))
+        })
+    }
+
+    fn host_invite_search_accounts(
+        &self,
+        provider: String,
+        host: Option<String>,
+        query: String,
+        limit: Option<u8>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(
+                serde_json::json!({"provider":provider,"host":host,"query":query,"limit":limit,"users":[]}),
+            )
         })
     }
 
@@ -1338,20 +1416,52 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async move { Ok(serde_json::json!({ "ok": true, "echoGistId": gist_id })) })
     }
 
-    fn git_commit(
+    fn source_control_identity_proof_create(
         &self,
-        _workspace_id: WorkspaceId,
-        message: String,
-        _idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<GitCommitResult>> {
+        provider: String,
+        host: Option<String>,
+        nonce: String,
+        host_label: String,
+        _purpose: Option<String>,
+        _expected_identity: Option<intent_core::PrincipalIdentity>,
+    ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
-            if message == "boom" {
-                return Err(Error::Internal("nothing to commit".to_string()));
+            // Sentinel nonces exercise the two typed refusals' wire shapes.
+            if nonce == "no-scope" {
+                return Err(Error::IdentityProof(
+                    intent_core::IdentityProofErrorKind::GitlabScopeMissing,
+                ));
             }
-            Ok(GitCommitResult {
-                hash: "abc123".to_string(),
-                files: vec!["src/a.ts".to_string()],
-            })
+            if nonce == "unverifiable" {
+                return Err(Error::IdentityUnverifiable {
+                    host: "gitlab.example".to_string(),
+                });
+            }
+            Ok(serde_json::json!({
+                "proofId": "77",
+                "login": "glab-octocat",
+                "echoProvider": provider,
+                "echoHost": host,
+                "echoNonce": nonce,
+                "echoHostLabel": host_label,
+            }))
+        })
+    }
+
+    fn source_control_identity_proof_delete(
+        &self,
+        provider: String,
+        host: Option<String>,
+        proof_id: String,
+        _purpose: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "ok": true,
+                "echoProvider": provider,
+                "echoHost": host,
+                "echoProofId": proof_id,
+            }))
         })
     }
 
@@ -1479,11 +1589,17 @@ impl WorkspaceApi for FakeApi {
     fn search_notes(
         &self,
         _query: String,
+        workspace_id: Option<WorkspaceId>,
+        prefer_workspace_id: Option<WorkspaceId>,
+        limit: Option<i64>,
+        include_archived: bool,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
-            Ok(serde_json::json!({ "requestId": request_id, "matches": [] }))
+            Ok(
+                serde_json::json!({ "requestId": request_id, "matches": [], "workspaceId":workspace_id, "preferWorkspaceId":prefer_workspace_id, "limit":limit, "includeArchived":include_archived, "indexed":true }),
+            )
         })
     }
 
@@ -1580,10 +1696,17 @@ impl WorkspaceApi for FakeApi {
         workspace_id: WorkspaceId,
         path: String,
         _caller_agent_id: Option<AgentId>,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<Value>> {
         // Echo a bare string so the wire test can assert file.read is NOT
         // wrapped in an object.
-        Box::pin(async move { Ok(Value::String(format!("{}:{path}", workspace_id.as_str()))) })
+        Box::pin(async move {
+            let scope = git_root_id.map(|id| format!("{id}:")).unwrap_or_default();
+            Ok(Value::String(format!(
+                "{}:{scope}{path}",
+                workspace_id.as_str()
+            )))
+        })
     }
 
     fn file_read_chunk(
@@ -1593,10 +1716,12 @@ impl WorkspaceApi for FakeApi {
         offset: u64,
         length: u64,
         _caller_agent_id: Option<AgentId>,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<Value>> {
         // Echo the window so the wire test can assert offset/length reach the
         // service, alongside the documented result shape.
         Box::pin(async move {
+            let path = git_root_id.map(|id| format!("{id}:{path}")).unwrap_or(path);
             Ok(serde_json::json!({
                 "content": format!("b64:{path}:{offset}:{length}"),
                 "bytesRead": length,
@@ -1956,6 +2081,7 @@ impl WorkspaceApi for FakeApi {
             Ok(serde_json::json!({
                 "agent": { "id": "agent-fake", "name": name, "workspaceId": workspace_id.as_str() },
                 "nameExplicitlySet": extra.name_explicitly_set,
+                "rememberSpecialist": extra.remember_specialist,
             }))
         })
     }
@@ -2039,6 +2165,17 @@ impl WorkspaceApi for FakeApi {
                 return Err(Error::NotFound("workspace".to_string()));
             }
             Ok(())
+        })
+    }
+
+    fn pr_refresh_automatic(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".into()));
+            }
+            Ok(
+                serde_json::json!({"outcome": "skipped", "prNumber": 300, "prUrl": null, "prStatus": "Open", "pullRequests": [{"number": 300}]}),
+            )
         })
     }
 
@@ -2567,6 +2704,27 @@ fn voice_not_configured_maps_to_structured_error_data() {
 }
 
 #[test]
+fn rate_limited_maps_to_structured_error_data() {
+    // Forge rate limiting (intent-hq/intent#5627) — any cause the
+    // source-control layer classifies as `RateLimited` — keeps the -32603
+    // code and the exact `source control rate limited: <detail>` message,
+    // and carries `error.data = { code: "rate-limited" }` so the invite flow
+    // routes "wait for the limit to reset" instead of a sign-in prompt.
+    let rpc = super::domain_to_rpc(intent_core::Error::RateLimited(
+        "API rate limit exceeded for user ID 1.".to_string(),
+    ));
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(
+        rpc.message,
+        "source control rate limited: API rate limit exceeded for user ID 1."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({ "code": "rate-limited" })
+    );
+}
+
+#[test]
 fn adapter_busy_maps_to_structured_error_data() {
     // An `agent.completeOnce` that queued past its own timeout at the
     // daemon-wide ephemeral-adapter bound (PROTOCOL §5.32, monorepo#2062)
@@ -2792,7 +2950,7 @@ async fn workspace_transfer_plan_returns_plan_envelope() {
     .await
     .unwrap();
     let plan = &v["result"]["plan"];
-    assert_eq!(plan["manifest"]["formatVersion"], serde_json::json!(1));
+    assert_eq!(plan["manifest"]["formatVersion"], serde_json::json!(2));
     assert_eq!(plan["manifest"]["workspaceId"], serde_json::json!("ws-1"));
     assert_eq!(
         plan["manifest"]["tables"][0]["rowCount"],
@@ -2962,6 +3120,25 @@ async fn workspace_create_with_initial_agent_sans_agent_id_is_accepted() {
         v["result"]["workspace"].is_object(),
         "create without agentId succeeds: {v}"
     );
+}
+
+#[tokio::test]
+async fn workspace_create_rejects_non_string_initial_agent_effort() {
+    for effort in [
+        serde_json::json!(3),
+        serde_json::json!(false),
+        serde_json::json!([]),
+    ] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 17, "method": "workspace.create",
+            "params": { "title": "WS", "initialAgent": { "reasoningEffort": effort } }
+        });
+        let response = call(&request.to_string()).await.unwrap();
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 17);
+        assert!(response.get("result").is_none(), "{response}");
+        assert_eq!(err_code(&response), -32602, "{response}");
+    }
 }
 
 #[tokio::test]
@@ -3801,8 +3978,10 @@ async fn singular_event_subscribe_aliases_are_not_routable() {
 
 /// `agent.list` row-scope params (§5.5): an unknown or non-string `scope` is
 /// `-32602` (never coerced, unlike the lenient retired flags), a bin scope
-/// cannot ride with either retired flag, and `parentAgentId` must be a
-/// canonical `agent-{uuid}` paired with `scope: "delegated"`.
+/// cannot ride with either retired flag, `parentAgentId` must be a
+/// canonical `agent-{uuid}` paired with `scope: "delegated"`, and
+/// `orphanedOnly` must be a boolean paired with `scope: "delegated"` and
+/// never with `parentAgentId`.
 #[tokio::test]
 async fn agent_list_scope_params_are_validated() {
     let scope_msg = "scope must be \"all\", \"topLevel\", \"delegated\" or \"background\"";
@@ -3843,10 +4022,50 @@ async fn agent_list_scope_params_are_validated() {
             r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
             "parentAgentId requires scope \"delegated\"",
         ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":"yes"}}"#,
+            "orphanedOnly must be a boolean",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":1}}"#,
+            "orphanedOnly must be a boolean",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","orphanedOnly":true}}"#,
+            "orphanedOnly requires scope \"delegated\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"topLevel","orphanedOnly":true}}"#,
+            "orphanedOnly requires scope \"delegated\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"background","orphanedOnly":true}}"#,
+            "orphanedOnly requires scope \"delegated\"",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":true,"parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
+            "orphanedOnly cannot be combined with parentAgentId: an orphan's direct children are pulled by parent",
+        ),
     ] {
         let v = call(frame).await.unwrap();
         assert_eq!(err_code(&v), -32602, "{frame}: {v}");
-        assert_eq!(v["error"]["message"], serde_json::json!(expected), "{frame}");
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!(expected),
+            "{frame}"
+        );
+    }
+    // `orphanedOnly: false` reads as absent on any scope: the frame passes
+    // param validation into the trait default (`Internal` → `-32603`),
+    // like a valid `orphanedOnly: true` delegated read.
+    for frame in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","orphanedOnly":false}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"topLevel","orphanedOnly":false}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":false,"parentAgentId":"agent-00000000-0000-4000-8000-000000000001"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.list","params":{"workspaceId":"ws-1","scope":"delegated","orphanedOnly":true}}"#,
+    ] {
+        let v = call(frame).await.unwrap();
+        assert_eq!(err_code(&v), -32603, "{frame}: {v}");
     }
     // The retired-flag contradiction still wins over a scope combination.
     let v = call(
@@ -4766,6 +4985,95 @@ async fn github_identity_proof_delete_routes_gist_id_and_requires_it() {
 }
 
 #[tokio::test]
+async fn source_control_identity_proof_create_routes_provider_host_nonce_and_host_label() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{"provider":"gitlab","host":"gitlab.example","nonce":"n1","hostLabel":"Studio"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["proofId"], serde_json::json!("77"));
+    assert_eq!(v["result"]["echoProvider"], serde_json::json!("gitlab"));
+    assert_eq!(v["result"]["echoHost"], serde_json::json!("gitlab.example"));
+    assert_eq!(v["result"]["echoNonce"], serde_json::json!("n1"));
+    assert_eq!(v["result"]["echoHostLabel"], serde_json::json!("Studio"));
+    // `host` is optional (absent / null ⇒ omitted) but strictly typed.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{"provider":"github","host":null,"nonce":"n1","hostLabel":"h"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["echoHost"], Value::Null, "{v}");
+    for params in [
+        "{}",
+        r#"{"nonce":"n1","hostLabel":"h"}"#,
+        r#"{"provider":"gitlab","hostLabel":"h"}"#,
+        r#"{"provider":"gitlab","nonce":"n1"}"#,
+        r#"{"provider":"gitlab","host":123,"nonce":"n1","hostLabel":"h"}"#,
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{params}");
+    }
+}
+
+#[tokio::test]
+async fn source_control_identity_proof_refusals_carry_bounded_data() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{"provider":"gitlab","nonce":"no-scope","hostLabel":"h"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+    assert_eq!(
+        v["error"]["data"],
+        serde_json::json!({ "code": "gitlab-scope-missing" })
+    );
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.create","params":{"provider":"gitlab","nonce":"unverifiable","hostLabel":"h"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+    assert_eq!(
+        v["error"]["data"],
+        serde_json::json!({ "code": "identity-unverifiable", "host": "gitlab.example" })
+    );
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("cannot verify identity on gitlab.example")
+    );
+}
+
+#[tokio::test]
+async fn source_control_identity_proof_delete_routes_proof_id_and_requires_it() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.delete","params":{"provider":"gitlab","host":"gitlab.example","proofId":"77"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["ok"], serde_json::json!(true));
+    assert_eq!(v["result"]["echoProvider"], serde_json::json!("gitlab"));
+    assert_eq!(v["result"]["echoHost"], serde_json::json!("gitlab.example"));
+    assert_eq!(v["result"]["echoProofId"], serde_json::json!("77"));
+    for params in [
+        "{}",
+        r#"{"proofId":"77"}"#,
+        r#"{"provider":"gitlab"}"#,
+        r#"{"provider":"gitlab","gistId":"77"}"#,
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"sourceControl.identityProof.delete","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{params}");
+    }
+}
+
+#[tokio::test]
 async fn github_users_search_routes_query_and_optional_limit() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"github.users.search","params":{"query":"octo","limit":3}}"#,
@@ -4904,6 +5212,8 @@ async fn github_auth_status_connect_revoke_get_user_route_without_params() {
         serde_json::json!("https://github.com/login/device")
     );
 
+    assert_eq!(connect["result"]["flowId"], serde_json::json!("7"));
+
     let cancel = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{}}"#)
         .await
         .unwrap();
@@ -4925,29 +5235,61 @@ async fn github_auth_status_connect_revoke_get_user_route_without_params() {
     assert!(user["result"]["user"].get("id").is_none());
 }
 
+/// `github.cancelAuth` takes an optional string `flowId`: the connect-issued
+/// id is forwarded verbatim (the stub cancels only its own "7"); only an
+/// OMITTED key is the unscoped cancel, and any present non-string — an
+/// explicit `null` included — is `-32602` rather than silently widening it.
 #[tokio::test]
-async fn git_commit_returns_ok_hash_and_files() {
-    let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"git.commit","params":{"workspaceId":"ws-1","message":"msg"}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(v["result"]["ok"], serde_json::json!(true));
-    assert_eq!(v["result"]["hash"], serde_json::json!("abc123"));
-    assert_eq!(v["result"]["files"], serde_json::json!(["src/a.ts"]));
+async fn github_cancel_auth_forwards_flow_id_and_rejects_non_string() {
+    let own =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{"flowId":"7"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(own["result"]["cancelled"], serde_json::json!(true));
+
+    let other =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{"flowId":"6"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(other["result"]["ok"], serde_json::json!(true));
+    assert_eq!(other["result"]["cancelled"], serde_json::json!(false));
+
+    let omitted = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(omitted["result"]["cancelled"], serde_json::json!(true));
+
+    for bad in ["null", "7", "true", "{}", r#"["7"]"#] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{{"flowId":{bad}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "flowId {bad}: {v}");
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!("flowId must be a string")
+        );
+    }
 }
 
 #[tokio::test]
-async fn git_commit_missing_message_is_minus_32602() {
-    let v =
-        call(r#"{"jsonrpc":"2.0","id":1,"method":"git.commit","params":{"workspaceId":"ws-1"}}"#)
-            .await
-            .unwrap();
-    assert_eq!(err_code(&v), -32602);
-    assert_eq!(
-        v["error"]["message"],
-        serde_json::json!("Missing required parameter: message")
-    );
+async fn removed_git_commit_is_method_not_found() {
+    for params in [
+        serde_json::json!({"workspaceId":"ws-1","message":"msg","idempotencyKey":"key"}),
+        serde_json::json!({"workspaceId":"ws-1"}),
+        serde_json::Value::Null,
+    ] {
+        let response = call(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "git.commit", "params": params
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32601, "{response}");
+    }
 }
 
 #[tokio::test]
@@ -5059,7 +5401,6 @@ async fn file_tracking_methods_are_routed_not_method_not_found() {
     for method in [
         "file-tracking.getChanges",
         "file-tracking.loadCommits",
-        "file-tracking.getLineStats",
         "file-tracking.getAgentLocks",
     ] {
         let msg = format!(
@@ -5072,11 +5413,7 @@ async fn file_tracking_methods_are_routed_not_method_not_found() {
 
 #[tokio::test]
 async fn file_tracking_reads_require_workspace_id() {
-    for method in [
-        "file-tracking.getChanges",
-        "file-tracking.getLineStats",
-        "file-tracking.getAgentLocks",
-    ] {
+    for method in ["file-tracking.getChanges", "file-tracking.getAgentLocks"] {
         let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#);
         let v = call(&msg).await.unwrap();
         assert_eq!(err_code(&v), -32602);
@@ -5102,43 +5439,23 @@ async fn file_tracking_stage_requires_paths() {
 }
 
 #[tokio::test]
-async fn metrics_methods_are_routed_not_method_not_found() {
-    // `getAllWorkspaceStats` takes no params; the rest carry their required id.
-    for (method, params) in [
-        ("metrics.getWorkspaceStats", r#"{"workspaceId":"ws-1"}"#),
-        ("metrics.getAgentStats", r#"{"agentId":"agent-1"}"#),
-        ("metrics.getAllWorkspaceStats", r"{}"),
-        ("metrics.clearAgentStats", r#"{"agentId":"agent-1"}"#),
-    ] {
-        let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
-        let v = call(&msg).await.unwrap();
-        assert_ne!(err_code(&v), -32601, "{method} should be routed");
-    }
+async fn metrics_agent_stats_is_routed() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"metrics.getAgentStats","params":{"agentId":"agent-1"}}"#)
+        .await
+        .unwrap();
+    assert_ne!(err_code(&v), -32601);
 }
 
 #[tokio::test]
-async fn metrics_workspace_stats_requires_workspace_id() {
-    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"metrics.getWorkspaceStats","params":{}}"#)
+async fn metrics_agent_stats_requires_agent_id() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"metrics.getAgentStats","params":{}}"#)
         .await
         .unwrap();
     assert_eq!(err_code(&v), -32602);
     assert_eq!(
         v["error"]["message"],
-        serde_json::json!("workspaceId is required")
+        serde_json::json!("Missing required parameter: agentId")
     );
-}
-
-#[tokio::test]
-async fn metrics_agent_methods_require_agent_id() {
-    for method in ["metrics.getAgentStats", "metrics.clearAgentStats"] {
-        let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#);
-        let v = call(&msg).await.unwrap();
-        assert_eq!(err_code(&v), -32602);
-        assert_eq!(
-            v["error"]["message"],
-            serde_json::json!("Missing required parameter: agentId")
-        );
-    }
 }
 
 #[tokio::test]
@@ -5281,6 +5598,62 @@ async fn search_notes_requires_query_and_is_global() {
 }
 
 #[tokio::test]
+async fn search_notes_routes_filters_and_null_defaults() {
+    for (params, expected) in [
+        (
+            serde_json::json!({"query":"body", "workspaceId":"hard", "preferWorkspaceId":"soft",
+            "limit":0,"includeArchived":false,"requestId":"notes"}),
+            serde_json::json!({"workspaceId":"hard","preferWorkspaceId":"soft","limit":0,"includeArchived":false}),
+        ),
+        (
+            serde_json::json!({"query":"body","workspaceId":null,"preferWorkspaceId":null,
+            "limit":null,"includeArchived":null,"requestId":null}),
+            serde_json::json!({"workspaceId":null,"preferWorkspaceId":null,"limit":null,"includeArchived":true}),
+        ),
+        (
+            serde_json::json!({"query":"body"}),
+            serde_json::json!({"workspaceId":null,"preferWorkspaceId":null,"limit":null,"includeArchived":true}),
+        ),
+    ] {
+        let reply = call(
+            &serde_json::json!({"jsonrpc":"2.0","id":1,
+            "method":"search.notes","params":params})
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        for (key, value) in expected.as_object().unwrap() {
+            assert_eq!(&reply["result"][key], value, "{key}: {reply}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn search_notes_rejects_invalid_optional_params() {
+    for (key, value) in [
+        ("workspaceId", serde_json::json!("")),
+        ("preferWorkspaceId", serde_json::json!(false)),
+        ("requestId", serde_json::json!([])),
+        ("includeArchived", serde_json::json!("false")),
+        ("limit", serde_json::json!(-1)),
+        ("limit", serde_json::json!(1.5)),
+        ("limit", serde_json::json!(9_223_372_036_854_775_808_u64)),
+    ] {
+        let mut params = serde_json::json!({"query":""});
+        params[key] = value;
+        let reply = call(
+            &serde_json::json!({"jsonrpc":"2.0","id":1,
+            "method":"search.notes","params":params})
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(err_code(&reply), -32602, "{reply}");
+        assert_eq!(reply["error"]["data"]["code"], "invalid-params");
+    }
+}
+
+#[tokio::test]
 async fn search_codebase_requires_workspace_and_query_and_maps_regex() {
     let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"search.codebase","params":{"query":"x"}}"#)
         .await
@@ -5404,6 +5777,46 @@ async fn terminal_kill_and_list_dispatch() {
         v["result"]["terminals"][0]["alive"],
         serde_json::json!(true)
     );
+}
+
+#[tokio::test]
+async fn file_read_routes_registered_root_selector() {
+    for (selector, expected) in [
+        (serde_json::json!("root-1"), "ws-1:root-1:a.txt"),
+        (serde_json::json!(""), "ws-1:a.txt"),
+        (serde_json::json!("   "), "ws-1:a.txt"),
+        (Value::Null, "ws-1:a.txt"),
+    ] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "file.read",
+            "params": { "workspaceId": "ws-1", "path": "a.txt", "gitRootId": selector }
+        });
+        let response = call(&request.to_string()).await.unwrap();
+        assert_eq!(response["result"], expected, "{response}");
+    }
+}
+
+#[tokio::test]
+async fn file_read_chunk_routes_registered_root_selector() {
+    for (selector, scope) in [
+        (serde_json::json!("root-1"), "root-1:"),
+        (serde_json::json!(""), ""),
+        (serde_json::json!("   "), ""),
+        (Value::Null, ""),
+    ] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "file.readChunk",
+            "params": { "workspaceId": "ws-1", "path": "a.bin", "gitRootId": selector, "offset": 64, "length": 32 }
+        });
+        let response = call(&request.to_string()).await.unwrap();
+        assert_eq!(
+            response["result"],
+            serde_json::json!({
+                "content": format!("b64:{scope}a.bin:64:32"), "bytesRead": 32, "size": 1000
+            }),
+            "{response}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -6468,6 +6881,266 @@ mod mark_seen_dispatch {
     }
 }
 
+/// `sourceControl.*` (PROTOCOL §5.27) optional-field parsing is strict: an
+/// absent or `null` `host` / `method` / `token` is forwarded as `None`, but a
+/// present non-string is `-32602` before the API is called. Regression for the
+/// lax `opt_str` path where `{"provider":"gitlab","host":123}` was routed as
+/// host-omitted — on `revoke`, acting on the bound credential instead of failing.
+mod source_control_optional_fields_strict {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{BoxFuture, Result, WorkspaceApi};
+    use serde_json::{json, Value};
+
+    use super::super::handle_message;
+
+    type HostCall = (&'static str, String, Option<String>);
+    type Connect = (String, Option<String>, Option<String>, Option<String>);
+
+    #[derive(Default)]
+    struct RecordingApi {
+        calls: Arc<Mutex<Vec<HostCall>>>,
+        connects: Arc<Mutex<Vec<Connect>>>,
+    }
+
+    impl RecordingApi {
+        fn record(
+            &self,
+            method: &'static str,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                calls.lock().unwrap().push((method, provider, host));
+                Ok(json!({ "ok": true }))
+            })
+        }
+    }
+
+    impl WorkspaceApi for RecordingApi {
+        fn source_control_auth_status(
+            &self,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("authStatus", provider, host)
+        }
+        fn source_control_connect(
+            &self,
+            provider: String,
+            host: Option<String>,
+            method: Option<String>,
+            token: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let connects = self.connects.clone();
+            Box::pin(async move {
+                connects
+                    .lock()
+                    .unwrap()
+                    .push((provider, host, method, token));
+                Ok(json!({ "status": "pending" }))
+            })
+        }
+        fn source_control_cancel_auth(
+            &self,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("cancelAuth", provider, host)
+        }
+        fn source_control_revoke(
+            &self,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("revoke", provider, host)
+        }
+        fn source_control_get_user(
+            &self,
+            provider: String,
+            host: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.record("getUser", provider, host)
+        }
+    }
+
+    async fn rpc(api: &RecordingApi, method: &str, params: Value) -> Value {
+        let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+        let out = handle_message(api, &msg.to_string())
+            .await
+            .expect("response");
+        serde_json::from_str(&out).unwrap()
+    }
+
+    const HOST_METHODS: [&str; 4] = [
+        "sourceControl.authStatus",
+        "sourceControl.cancelAuth",
+        "sourceControl.revoke",
+        "sourceControl.getUser",
+    ];
+
+    fn wrong_types() -> Vec<Value> {
+        vec![json!(123), json!(1.5), json!(true), json!([]), json!({})]
+    }
+
+    #[tokio::test]
+    async fn revoke_with_numeric_host_is_invalid_params_and_binding_untouched() {
+        let api = RecordingApi::default();
+        let v = rpc(
+            &api,
+            "sourceControl.revoke",
+            json!({ "provider": "gitlab", "host": 123 }),
+        )
+        .await;
+        assert_eq!(v["error"]["code"], json!(-32602), "{v}");
+        assert_eq!(v["error"]["data"]["code"], json!("invalid-params"));
+        assert_eq!(v["error"]["message"], json!("host must be a string"));
+        assert!(v.get("result").is_none());
+        assert!(
+            api.calls.lock().unwrap().is_empty(),
+            "revoke must not reach the service on a non-string host"
+        );
+    }
+
+    #[tokio::test]
+    async fn present_non_string_host_is_invalid_params_on_every_host_method() {
+        let api = RecordingApi::default();
+        for method in HOST_METHODS {
+            for bad in wrong_types() {
+                let v = rpc(&api, method, json!({ "provider": "gitlab", "host": bad })).await;
+                assert_eq!(v["error"]["code"], json!(-32602), "{method} host={bad}");
+                assert_eq!(v["error"]["message"], json!("host must be a string"));
+            }
+        }
+        for bad in wrong_types() {
+            let v = rpc(
+                &api,
+                "sourceControl.connect",
+                json!({ "provider": "gitlab", "host": bad.clone() }),
+            )
+            .await;
+            assert_eq!(v["error"]["code"], json!(-32602), "connect host={bad}");
+        }
+        assert!(api.calls.lock().unwrap().is_empty());
+        assert!(api.connects.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn connect_with_non_string_method_or_token_is_invalid_params_no_flow_started() {
+        let api = RecordingApi::default();
+        for (params, expected) in [
+            (
+                json!({ "provider": "gitlab", "method": 1 }),
+                "method must be a string",
+            ),
+            (
+                json!({ "provider": "gitlab", "method": ["pat"] }),
+                "method must be a string",
+            ),
+            (
+                json!({ "provider": "gitlab", "method": "pat", "token": 42 }),
+                "token must be a string",
+            ),
+            (
+                json!({ "provider": "gitlab", "method": "pat", "token": { "v": "x" } }),
+                "token must be a string",
+            ),
+            (
+                json!({ "provider": "github", "method": true }),
+                "method must be a string",
+            ),
+        ] {
+            let v = rpc(&api, "sourceControl.connect", params.clone()).await;
+            assert_eq!(v["error"]["code"], json!(-32602), "params: {params}");
+            assert_eq!(v["error"]["data"]["code"], json!("invalid-params"));
+            assert_eq!(v["error"]["message"], json!(expected), "params: {params}");
+        }
+        assert!(
+            api.connects.lock().unwrap().is_empty(),
+            "no device flow / PAT exchange may start on malformed params"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_and_null_optional_fields_are_forwarded_as_none() {
+        let api = RecordingApi::default();
+        for method in HOST_METHODS {
+            let v = rpc(&api, method, json!({ "provider": "gitlab" })).await;
+            assert_eq!(v["result"]["ok"], json!(true), "{method} absent");
+            let v = rpc(&api, method, json!({ "provider": "gitlab", "host": null })).await;
+            assert_eq!(v["result"]["ok"], json!(true), "{method} null");
+        }
+        let calls = api.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), HOST_METHODS.len() * 2);
+        assert!(calls.iter().all(|(_, p, h)| p == "gitlab" && h.is_none()));
+
+        let v = rpc(
+            &api,
+            "sourceControl.connect",
+            json!({ "provider": "gitlab", "host": null, "method": null, "token": null }),
+        )
+        .await;
+        assert_eq!(v["result"]["status"], json!("pending"));
+        let v = rpc(
+            &api,
+            "sourceControl.connect",
+            json!({ "provider": "gitlab" }),
+        )
+        .await;
+        assert_eq!(v["result"]["status"], json!("pending"));
+        let connects = api.connects.lock().unwrap().clone();
+        assert_eq!(
+            connects,
+            vec![
+                ("gitlab".to_string(), None, None, None),
+                ("gitlab".to_string(), None, None, None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn string_optional_fields_are_forwarded_verbatim() {
+        let api = RecordingApi::default();
+        let v = rpc(
+            &api,
+            "sourceControl.revoke",
+            json!({ "provider": "gitlab", "host": "gitlab.example.com" }),
+        )
+        .await;
+        assert_eq!(v["result"]["ok"], json!(true));
+        let v = rpc(
+            &api,
+            "sourceControl.connect",
+            json!({
+                "provider": "gitlab",
+                "host": "gitlab.example.com",
+                "method": "pat",
+                "token": "glpat-x"
+            }),
+        )
+        .await;
+        assert_eq!(v["result"]["status"], json!("pending"));
+        assert_eq!(
+            api.calls.lock().unwrap().clone(),
+            vec![(
+                "revoke",
+                "gitlab".to_string(),
+                Some("gitlab.example.com".to_string())
+            )]
+        );
+        assert_eq!(
+            api.connects.lock().unwrap().clone(),
+            vec![(
+                "gitlab".to_string(),
+                Some("gitlab.example.com".to_string()),
+                Some("pat".to_string()),
+                Some("glpat-x".to_string()),
+            )]
+        );
+    }
+}
+
 /// `repoConfig.*` namespace tests (additive intentd-only surface, FE parity
 /// with `packages/cloudlands-fe/src/features/workspace/main/repo-config.ipc.ts`).
 #[tokio::test]
@@ -6652,6 +7325,20 @@ async fn pr_refresh_dispatches_and_returns_service_result() {
     assert_eq!(v["result"]["prUrl"], "https://github.com/o/r/pull/300");
     assert_eq!(v["result"]["prStatus"], "Open");
     assert_eq!(v["result"]["pullRequests"][0]["number"], 300);
+}
+
+#[tokio::test]
+async fn pr_refresh_routes_automatic_and_validates_provenance() {
+    for (value, expected) in [("true", "skipped"), ("false", "linked")] {
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"pr.refresh","params":{{"workspaceId":"ws-1","automatic":{value}}}}}"#
+        );
+        let result = call(&request).await.unwrap();
+        assert_eq!(result["result"]["outcome"], expected);
+        assert_eq!(result["result"]["prNumber"], 300);
+    }
+    let result = call(r#"{"jsonrpc":"2.0","id":1,"method":"pr.refresh","params":{"workspaceId":"ws-1","automatic":"true"}}"#).await.unwrap();
+    assert_eq!(result["error"]["code"], -32602);
 }
 
 #[tokio::test]
@@ -7143,5 +7830,61 @@ mod oversized_response {
                 > crate::MAX_OUTBOUND_MESSAGE_BYTES as u64,
             "data.responseBytes must be the oversized serialized size"
         );
+    }
+}
+
+#[path = "tests/discovery_context.rs"]
+mod discovery_context;
+
+mod integration_context;
+
+#[tokio::test]
+async fn agent_create_validates_and_forwards_remember_specialist() {
+    for (value, expected) in [
+        (serde_json::json!(true), true),
+        (serde_json::json!(false), false),
+        (Value::Null, false),
+    ] {
+        let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"workspaceId":"ws-1","rememberSpecialist":value}});
+        let response = call(&request.to_string()).await.unwrap();
+        assert_eq!(response["result"]["rememberSpecialist"], expected);
+    }
+    for value in [
+        serde_json::json!("true"),
+        serde_json::json!(1),
+        serde_json::json!({}),
+    ] {
+        let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"workspaceId":"ws-1","rememberSpecialist":value}});
+        let response = call(&request.to_string()).await.unwrap();
+        assert_eq!(err_code(&response), -32602);
+    }
+}
+
+#[tokio::test]
+async fn invitation_account_search_routes_and_rejects_malformed_params() {
+    let params =
+        serde_json::json!({"provider":"gitlab","host":"custom.example","query":"al","limit":3});
+    let frame=call(&serde_json::json!({"jsonrpc":"2.0","id":71,"method":"host.invite.searchAccounts","params":params}).to_string()).await.unwrap();
+    assert_eq!(
+        frame["result"],
+        serde_json::json!({"provider":"gitlab","host":"custom.example","query":"al","limit":3,"users":[]})
+    );
+    for patch in [
+        serde_json::json!({"provider":null}),
+        serde_json::json!({"query":3}),
+        serde_json::json!({"host":4}),
+        serde_json::json!({"limit":null}),
+        serde_json::json!({"limit":0}),
+        serde_json::json!({"limit":11}),
+        serde_json::json!({"limit":-1}),
+        serde_json::json!({"limit":1.5}),
+        serde_json::json!({"limit":"3"}),
+    ] {
+        let mut invalid = params.clone();
+        for (k, v) in patch.as_object().unwrap() {
+            invalid[k] = v.clone();
+        }
+        let frame=call(&serde_json::json!({"jsonrpc":"2.0","id":71,"method":"host.invite.searchAccounts","params":invalid}).to_string()).await.unwrap();
+        assert_eq!(err_code(&frame), -32602, "{invalid}");
     }
 }

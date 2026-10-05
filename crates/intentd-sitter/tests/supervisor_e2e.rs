@@ -286,15 +286,30 @@ fn args_dump_script() -> String {
     format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"${FAKE_DAEMON_LOG}\"\nexit 0\n")
 }
 
+// The signal handlers exit the fake daemon while its wait is interrupted.
+// Reap only the background sleep owned by this shell before preserving that exit.
+const PARKED_CHILD_CLEANUP: &str = r#"sleep_pid=
+stop_sleep() {
+    if [ -n "$sleep_pid" ]; then
+        kill "$sleep_pid" 2>/dev/null || :
+        wait "$sleep_pid" 2>/dev/null || :
+        sleep_pid=
+    fi
+}
+trap stop_sleep EXIT
+"#;
+
 /// Fake daemon: log a start line, then run until SIGTERM/SIGINT (both exit
 /// 0 — a graceful daemon shutdown).
 fn long_running_script(version: &str) -> String {
     format!(
-        "#!/bin/sh\n\
+        "#!/bin/sh\n{PARKED_CHILD_CLEANUP}\
          printf 'start {version} :: %s\\n' \"$*\" >> \"${FAKE_DAEMON_LOG}\"\n\
          trap 'exit 0' TERM INT\n\
          sleep 60 &\n\
-         wait $!\n\
+         sleep_pid=$!\n\
+         wait \"$sleep_pid\"\n\
+         sleep_pid=\n\
          exit 0\n"
     )
 }
@@ -308,12 +323,14 @@ fn crash_script(code: i32) -> String {
 /// sitter injected the update-restart marker into the environment.
 fn long_running_env_script(version: &str) -> String {
     format!(
-        "#!/bin/sh\n\
+        "#!/bin/sh\n{PARKED_CHILD_CLEANUP}\
          printf 'start {version} update_restart=%s\\n' \
          \"${{{UPDATE_RESTART_ENV}:-unset}}\" >> \"${FAKE_DAEMON_LOG}\"\n\
          trap 'exit 0' TERM INT\n\
          sleep 60 &\n\
-         wait $!\n\
+         sleep_pid=$!\n\
+         wait \"$sleep_pid\"\n\
+         sleep_pid=\n\
          exit 0\n"
     )
 }
@@ -336,7 +353,7 @@ fn crash_env_script(code: i32) -> String {
 /// once the test releases it exits with [`RESTART_FOR_UPDATE_EXIT_CODE`].
 fn idle_restart_script(version: &str, release: &Barrier) -> String {
     format!(
-        "#!/bin/sh\n\
+        "#!/bin/sh\n{PARKED_CHILD_CLEANUP}\
          printf 'start {version} update_restart=%s idle_restart=%s\\n' \
          \"${{{UPDATE_RESTART_ENV}:-unset}}\" \"${{{IDLE_RESTART_ENV}:-unset}}\" \
          >> \"${FAKE_DAEMON_LOG}\"\n\
@@ -344,7 +361,9 @@ fn idle_restart_script(version: &str, release: &Barrier) -> String {
          trap 'echo \"usr2 {version}\" >> \"${FAKE_DAEMON_LOG}\"; {wait}; \
          exit {RESTART_FOR_UPDATE_EXIT_CODE}' USR2\n\
          sleep 60 &\n\
-         wait $!\n\
+         sleep_pid=$!\n\
+         wait \"$sleep_pid\"\n\
+         sleep_pid=\n\
          exit 0\n",
         wait = release.sh_wait(),
     )
@@ -354,13 +373,14 @@ fn idle_restart_script(version: &str, release: &Barrier) -> String {
 /// a daemon that never gets idle.
 fn never_idle_script(version: &str) -> String {
     format!(
-        "#!/bin/sh\n\
+        "#!/bin/sh\n{PARKED_CHILD_CLEANUP}\
          printf 'start {version} update_restart=%s idle_restart=%s\\n' \
          \"${{{UPDATE_RESTART_ENV}:-unset}}\" \"${{{IDLE_RESTART_ENV}:-unset}}\" \
          >> \"${FAKE_DAEMON_LOG}\"\n\
          trap 'echo \"term {version}\" >> \"${FAKE_DAEMON_LOG}\"; exit 0' TERM INT\n\
          trap 'echo \"usr2 {version}\" >> \"${FAKE_DAEMON_LOG}\"' USR2\n\
-         while :; do sleep 60 & wait $!; done\n"
+         while :; do sleep 60 & sleep_pid=$!; \
+         if wait \"$sleep_pid\"; then sleep_pid=; else stop_sleep; fi; done\n"
     )
 }
 
@@ -370,7 +390,7 @@ fn never_idle_script(version: &str) -> String {
 /// [`long_running_script`]. The one-shot marker lives next to the log.
 fn restart_once_script(version: &str, release: &Barrier) -> String {
     format!(
-        "#!/bin/sh\n\
+        "#!/bin/sh\n{PARKED_CHILD_CLEANUP}\
          printf 'start {version} update_restart=%s idle_restart=%s\\n' \
          \"${{{UPDATE_RESTART_ENV}:-unset}}\" \"${{{IDLE_RESTART_ENV}:-unset}}\" \
          >> \"${FAKE_DAEMON_LOG}\"\n\
@@ -382,7 +402,9 @@ fn restart_once_script(version: &str, release: &Barrier) -> String {
          fi\n\
          trap 'exit 0' TERM INT\n\
          sleep 60 &\n\
-         wait $!\n\
+         sleep_pid=$!\n\
+         wait \"$sleep_pid\"\n\
+         sleep_pid=\n\
          exit 0\n",
         arrive = release.sh_arrive(),
         wait = release.sh_wait(),
@@ -414,6 +436,68 @@ fn long_lived_crash_script(secs: &str, code: i32) -> String {
          {stay_up}\n\
          exit {code}\n"
     )
+}
+
+/// A graceful fake-daemon exit must also close its parked child's stdout.
+#[test]
+fn fake_daemon_graceful_exit_stops_its_parked_child() {
+    use nix::sys::signal::Signal;
+    use std::io::Read as _;
+    use std::os::fd::OwnedFd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let release = Barrier::new(dir.path(), "restart");
+    fs::write(release.path(), b"").unwrap();
+    let scripts = [
+        long_running_script("test"),
+        long_running_env_script("test"),
+        idle_restart_script("test", &release),
+        never_idle_script("test"),
+        restart_once_script("test", &release),
+    ];
+    for (index, script) in scripts.into_iter().enumerate() {
+        let log = dir.path().join(format!("daemon-{index}.log"));
+        // Exercise restart_once's long-running second invocation.
+        fs::write(format!("{}.restarted", log.display()), b"").unwrap();
+        // Add only a readiness marker immediately before the real wait.
+        let script = script
+            .replace("wait $!", "printf ready; wait $!")
+            .replace(
+                "wait \"$sleep_pid\"\n",
+                "printf ready; wait \"$sleep_pid\"\n",
+            )
+            .replace(
+                "if wait \"$sleep_pid\";",
+                "printf ready; if wait \"$sleep_pid\";",
+            );
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .env(FAKE_DAEMON_LOG, &log)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(OwnedFd::from(writer)))
+            .stderr(Stdio::null());
+        let mut child = spawn_guarded(&mut command);
+        drop(command);
+        let mut ready = [0; 5];
+        reader.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+        child.signal(Signal::SIGTERM).unwrap();
+        assert_eq!(
+            wait_exit(&mut child, Duration::from_secs(3)).code(),
+            Some(0)
+        );
+        let mut remaining = Vec::new();
+        reader.read_to_end(&mut remaining).unwrap_or_else(|error| {
+            panic!("script {index} left its child holding stdout: {error}")
+        });
+        assert!(remaining.is_empty(), "unexpected script {index} output");
+    }
 }
 
 /// Sitter command wired to a temp data dir, a manifest base URL, and the
@@ -2807,6 +2891,118 @@ fn restart_command_respawns_state_version_without_exiting_sitter() {
         !paths.pid_path.exists(),
         "the pidfile must be removed on exit"
     );
+}
+
+#[test]
+fn shutdown_during_startup_check_releases_ownership_without_spawning() {
+    use std::sync::atomic::Ordering;
+
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (signal, code) in [("TERM", 143), ("INT", 130)] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
+        let state_before = fs::read(&paths.state_path).unwrap();
+        let (base_url, hold, parked) = serve_holdable(Arc::new(Mutex::new(HashMap::new())));
+        hold.store(true, Ordering::SeqCst);
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut sitter = spawn_guarded(sitter_command(dir.path(), &base_url).arg("serve"));
+            wait_until("startup check to stall", Duration::from_secs(10), || {
+                parked.load(Ordering::SeqCst) > 0
+            });
+            assert_eq!(
+                read_or_empty(&paths.pid_path).trim(),
+                sitter.id().to_string()
+            );
+            send_signal(&sitter, signal);
+            assert_eq!(
+                wait_exit(&mut sitter, Duration::from_secs(3)).code(),
+                Some(code)
+            );
+            assert!(
+                !paths.pid_path.exists(),
+                "shutdown must remove the PID record"
+            );
+            let lock = fs::OpenOptions::new()
+                .write(true)
+                .open(paths.pid_path.with_extension("lock"))
+                .unwrap();
+            assert!(
+                nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock).is_ok()
+            );
+            assert!(read_or_empty(&daemon_log_path(dir.path())).is_empty());
+            assert_eq!(fs::read(&paths.state_path).unwrap(), state_before);
+        }));
+        // Release the fixture on both pass and panic, after checking that
+        // shutdown completed without waiting for its network response.
+        hold.store(false, Ordering::SeqCst);
+        if let Err(error) = outcome {
+            panic::resume_unwind(error);
+        }
+    }
+}
+
+#[test]
+fn duplicate_serve_preserves_live_sitter_discovery() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    // Model the daemon's exclusive data-directory claim. A duplicate child
+    // exits unsuccessfully while the original remains alive.
+    let script = long_running_script("0.1.0").replacen(
+        "#!/bin/sh\n",
+        "#!/bin/sh\nmkdir \"$INTENTD_DATA_DIR/daemon-owner\" 2>/dev/null || exit 1\n",
+        1,
+    );
+    preinstall(&paths, "0.1.0", &script);
+    let base_url = dead_url();
+    let mut owner = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .arg("serve"),
+    );
+    wait_until("original daemon to start", Duration::from_secs(15), || {
+        read_or_empty(&daemon_log_path(dir.path())).contains("start 0.1.0")
+    });
+    assert_eq!(
+        read_or_empty(&paths.pid_path).trim(),
+        owner.id().to_string()
+    );
+    let state_before = fs::read(&paths.state_path).unwrap();
+    let mut duplicate = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(GIVE_UP_AFTER_ENV, "1")
+            .arg("serve"),
+    );
+    let status = wait_exit(&mut duplicate, Duration::from_secs(15));
+    assert!(owner.try_wait().unwrap().is_none());
+    assert_eq!(
+        read_or_empty(&paths.pid_path).trim(),
+        owner.id().to_string(),
+        "a failed duplicate start must preserve discovery of the live owner"
+    );
+    assert_eq!(status.code(), Some(1), "duplicate must fail immediately");
+    assert!(read_or_empty(&stderr_path(dir.path())).contains("cannot claim serve ownership"));
+    assert_eq!(
+        fs::read(&paths.state_path).unwrap(),
+        state_before,
+        "duplicate must not perform a startup update check"
+    );
+    assert_eq!(
+        intentd_sitter::supervisor::read_live_pid(&paths.pid_path),
+        Some(Pid::from_raw(owner.id().cast_signed()))
+    );
+    send_signal(&owner, "TERM");
+    assert_eq!(
+        wait_exit(&mut owner, Duration::from_secs(10)).code(),
+        Some(0)
+    );
+    assert!(!paths.pid_path.exists());
 }
 
 #[test]

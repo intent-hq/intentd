@@ -17,7 +17,10 @@ use tokio::sync::broadcast;
 
 use intent_core::{Error, Result};
 
-use crate::scrollback::{LineSnapshot, Scrollback, DEFAULT_SCROLLBACK_BYTES};
+use crate::scrollback::{LineSnapshot, OutputChunk, Scrollback, DEFAULT_SCROLLBACK_BYTES};
+
+#[cfg(unix)]
+mod unix_io;
 
 /// Broadcast backlog of output chunks buffered per subscriber before lagging.
 const FANOUT_CAPACITY: usize = 2048;
@@ -191,17 +194,20 @@ impl SpawnSpec {
 /// receiver tailing every subsequent output chunk (§12.1 back-fill-then-tail).
 pub struct Attachment {
     /// Recent scrollback captured at attach time, to be written before tailing.
-    pub backlog: Vec<u8>,
+    pub backlog: OutputChunk,
     /// Live output stream; each item is a shared output chunk.
-    pub live: broadcast::Receiver<Arc<Vec<u8>>>,
+    pub live: broadcast::Receiver<Arc<OutputChunk>>,
 }
 
 /// Scrollback + broadcast guarded together so attach (snapshot + subscribe) and
 /// the reader (append + send) are atomic relative to each other — guaranteeing a
 /// late subscriber sees each chunk exactly once (history XOR live, never both).
 struct Fanout {
+    eof: bool,
+    eof_notify: Arc<tokio::sync::Notify>,
+    framing: intent_core::script_output::LineDecoder,
     scrollback: Scrollback,
-    tx: broadcast::Sender<Arc<Vec<u8>>>,
+    tx: broadcast::Sender<Arc<OutputChunk>>,
 }
 
 /// A point-in-time view of a tracked PTY's metadata (`terminal.list` /
@@ -242,6 +248,9 @@ struct PtySession {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     fanout: Arc<Mutex<Fanout>>,
     reader: Mutex<Option<JoinHandle<()>>>,
+    /// Ask the Unix reader to drain queued output and stop without waiting for EOF.
+    #[cfg(unix)]
+    stop_reader: Arc<AtomicBool>,
     /// Exit watcher thread: reaps the child, then releases `slave` once the
     /// reader has drained the queue (see `exit_watch_loop`).
     watcher: Mutex<Option<JoinHandle<()>>>,
@@ -310,8 +319,8 @@ fn retry_transient<T, E: std::fmt::Display>(
 }
 
 /// The unified host owning every spawned PTY (terminals and scripts).
-#[derive(Default)]
 pub struct PtyHost {
+    daemon_boot_id: String,
     sessions: Mutex<HashMap<PtyId, Arc<PtySession>>>,
     next_id: AtomicU64,
     /// Latched by [`kill_all`](Self::kill_all) (clean daemon shutdown): once
@@ -321,11 +330,28 @@ pub struct PtyHost {
     closed: AtomicBool,
 }
 
+impl Default for PtyHost {
+    fn default() -> Self {
+        Self {
+            daemon_boot_id: uuid::Uuid::new_v4().to_string(),
+            sessions: Mutex::default(),
+            next_id: AtomicU64::default(),
+            closed: AtomicBool::default(),
+        }
+    }
+}
+
 impl PtyHost {
     /// Create an empty host.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Identity of this host lifetime, shared by terminal lists, snapshots and events.
+    #[must_use]
+    pub fn daemon_boot_id(&self) -> &str {
+        &self.daemon_boot_id
     }
 
     /// Spawn a process attached to a fresh PTY and start fanning out its output.
@@ -358,6 +384,20 @@ impl PtyHost {
             cmd.env_remove(k);
         }
 
+        // Prepare I/O before spawning: an fd/configuration failure must not
+        // leave a child behind without a session to own its cleanup.
+        #[cfg(unix)]
+        let stop_reader = Arc::new(AtomicBool::new(false));
+        #[cfg(unix)]
+        let (reader, writer) =
+            unix_io::open(pair.master.as_ref(), &stop_reader).map_err(internal)?;
+        #[cfg(unix)]
+        let (reader, writer): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+            (Box::new(reader), Box::new(writer));
+        #[cfg(not(unix))]
+        let writer = pair.master.take_writer().map_err(internal)?;
+        #[cfg(not(unix))]
+        let reader = pair.master.try_clone_reader().map_err(internal)?;
         let child = pair.slave.spawn_command(cmd).map_err(internal)?;
         // Keep the parent-side slave open (monorepo#587): if we dropped it
         // here, a fast-exiting child would close the *last* slave fd before
@@ -369,11 +409,12 @@ impl PtyHost {
 
         let pid = child.process_id();
         let killer = child.clone_killer();
-        let writer = pair.master.take_writer().map_err(internal)?;
-        let reader = pair.master.try_clone_reader().map_err(internal)?;
 
         let (tx, _rx) = broadcast::channel(FANOUT_CAPACITY);
         let fanout = Arc::new(Mutex::new(Fanout {
+            eof: false,
+            eof_notify: Arc::default(),
+            framing: intent_core::script_output::LineDecoder::new(false),
             scrollback: Scrollback::new(spec.scrollback_bytes),
             tx,
         }));
@@ -404,6 +445,8 @@ impl PtyHost {
             killer: Mutex::new(killer),
             fanout,
             reader: Mutex::new(Some(handle)),
+            #[cfg(unix)]
+            stop_reader,
             watcher: Mutex::new(None),
             exit: Mutex::new(None),
         });
@@ -443,10 +486,50 @@ impl PtyHost {
     pub fn attach(&self, id: PtyId) -> Result<Attachment> {
         let session = self.get(id)?;
         let guard = session.fanout.lock().unwrap();
-        let backlog = guard.scrollback.snapshot();
+        let backlog = guard.scrollback.positioned_snapshot(usize::MAX);
         let live = guard.tx.subscribe();
         drop(guard);
         Ok(Attachment { backlog, live })
+    }
+
+    /// Whether the process output reader has observed EOF.
+    /// # Errors
+    /// Returns `NotFound` if the session was removed.
+    /// # Panics
+    /// Panics if the output lock is poisoned.
+    pub fn output_eof(&self, id: PtyId) -> Result<bool> {
+        Ok(self.get(id)?.fanout.lock().unwrap().eof)
+    }
+
+    /// Wait for the output reader to finish; callers decide their teardown deadline.
+    /// # Errors
+    /// Returns `NotFound` for a removed attempt.
+    /// # Panics
+    /// Panics if the output lock is poisoned.
+    pub async fn wait_output_eof(&self, id: PtyId) -> Result<()> {
+        let session = self.get(id)?;
+        let notify = session.fanout.lock().unwrap().eof_notify.clone();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !session.fanout.lock().unwrap().eof {
+            notified.await;
+        }
+        Ok(())
+    }
+
+    /// Atomically capture the output cursor and constant-sized framing state.
+    /// # Errors
+    /// Returns `NotFound` if the attempt no longer exists.
+    /// # Panics
+    /// Panics if the fanout lock was poisoned.
+    pub fn observation_cursor(
+        &self,
+        id: PtyId,
+    ) -> Result<(u64, intent_core::script_output::LineDecoder)> {
+        let session = self.get(id)?;
+        let guard = session.fanout.lock().unwrap();
+        Ok((guard.scrollback.end_offset(), guard.framing.window()))
     }
 
     /// Snapshot the PTY's current scrollback for replay (`terminal.getBuffer` /
@@ -479,6 +562,19 @@ impl PtyHost {
         let session = self.get(id)?;
         let guard = session.fanout.lock().unwrap();
         Ok(guard.scrollback.snapshot_tail(max_bytes))
+    }
+
+    /// Atomically capture retained output and its byte positions.
+    ///
+    /// # Errors
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    /// Panics if the session fanout mutex is poisoned.
+    pub fn positioned_scrollback(&self, id: PtyId, max_bytes: usize) -> Result<OutputChunk> {
+        let session = self.get(id)?;
+        let guard = session.fanout.lock().unwrap();
+        Ok(guard.scrollback.positioned_snapshot(max_bytes))
     }
 
     /// Snapshot an oldest-indexed line window from retained scrollback. The
@@ -912,7 +1008,10 @@ fn exit_watch_loop(session: &PtySession) {
     // against a wedged reader; a grandchild that inherited the slave keeps
     // the stream open regardless of when we release ours.
     let deadline = std::time::Instant::now() + DRAIN_GRACE;
-    while master_pending(session) && std::time::Instant::now() < deadline {
+    while session.slave.lock().unwrap().is_some()
+        && master_pending(session)
+        && std::time::Instant::now() < deadline
+    {
         std::thread::sleep(DRAIN_POLL);
     }
     session.slave.lock().unwrap().take();
@@ -926,28 +1025,32 @@ fn read_loop(mut reader: Box<dyn Read + Send>, fanout: &Arc<Mutex<Fanout>>) {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let chunk = Arc::new(buf[..n].to_vec());
                 let mut guard = fanout.lock().unwrap();
-                guard.scrollback.push(&chunk);
+                let start_offset = guard.scrollback.end_offset();
+                guard.scrollback.push(&buf[..n]);
+                for byte in &buf[..n] {
+                    guard.framing.push(*byte);
+                }
+                let chunk = Arc::new(OutputChunk {
+                    bytes: buf[..n].to_vec(),
+                    start_offset,
+                    end_offset: guard.scrollback.end_offset(),
+                });
                 let _ = guard.tx.send(chunk);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
+    let mut fanout = fanout.lock().unwrap();
+    fanout.eof = true;
+    fanout.eof_notify.notify_waiters();
 }
 
-/// Terminate a session's whole process group (SIGTERM→grace→SIGKILL), then drop
-/// the master and join the reader thread. The PTY child is a `setsid` session
-/// leader so `killpg` reaps grandchildren too (no orphans, mirroring M5).
-#[cfg_attr(
-    not(unix),
-    expect(
-        clippy::unused_async,
-        reason = "async on every platform; the group escalation awaits only on unix"
-    )
-)]
-async fn teardown(session: &PtySession) {
+/// Terminate a session's whole process group (SIGTERM→grace→SIGKILL), then
+/// cancel and join its I/O threads. The PTY child is a setsid session leader,
+/// so killpg also reaches descendants that remain in its process group.
+async fn teardown(session: &Arc<PtySession>) {
     #[cfg(unix)]
     {
         if let Some(pid) = session.pid {
@@ -960,16 +1063,11 @@ async fn teardown(session: &PtySession) {
     {
         let _ = session.killer.lock().unwrap().kill();
     }
-    // Release the held slave and the master fd so the reader observes EOF,
-    // then join the reader and exit-watcher threads (the watcher exits on its
-    // own once it sees the slave released).
-    session.slave.lock().unwrap().take();
-    session.master.lock().unwrap().take();
-    if let Some(handle) = session.reader.lock().unwrap().take() {
-        let _ = handle.join();
-    }
-    if let Some(handle) = session.watcher.lock().unwrap().take() {
-        let _ = handle.join();
+    // Joining may wait for a bounded output drain; do not stall a runtime
+    // worker (and other sessions' concurrent teardown) while that happens.
+    let session = Arc::clone(session);
+    if let Err(e) = tokio::task::spawn_blocking(move || finish_io(&session)).await {
+        tracing::warn!(error = %e, "pty I/O cleanup task failed");
     }
 }
 
@@ -994,11 +1092,24 @@ fn reap_refused_spawn(session: &PtySession) {
     // Blocking reap is fine: the child was just SIGKILLed, so `wait` returns
     // promptly, and this path only runs during daemon shutdown.
     let _ = session.child.lock().unwrap().wait();
-    session.slave.lock().unwrap().take();
-    session.master.lock().unwrap().take();
+    finish_io(session);
+}
+
+/// Join owned I/O threads without relying on every slave holder exiting. Keep
+/// our slave open until queued output has drained (macOS discards it on close).
+fn finish_io(session: &PtySession) {
+    #[cfg(unix)]
+    session.stop_reader.store(true, Ordering::Release);
+    #[cfg(not(unix))]
+    {
+        session.slave.lock().unwrap().take();
+        session.master.lock().unwrap().take();
+    }
     if let Some(handle) = session.reader.lock().unwrap().take() {
         let _ = handle.join();
     }
+    session.slave.lock().unwrap().take();
+    session.master.lock().unwrap().take();
     if let Some(handle) = session.watcher.lock().unwrap().take() {
         let _ = handle.join();
     }
@@ -1081,7 +1192,7 @@ mod tests {
 
     /// Drain a live receiver until `needle` is seen or the deadline passes.
     async fn collect_until(
-        rx: &mut broadcast::Receiver<Arc<Vec<u8>>>,
+        rx: &mut broadcast::Receiver<Arc<OutputChunk>>,
         needle: &[u8],
         timeout: Duration,
     ) -> Vec<u8> {
@@ -1104,7 +1215,7 @@ mod tests {
     /// deadline passes. Used when output arrives in an arbitrary order and no
     /// single chunk can serve as a completion sentinel.
     async fn collect_until_all(
-        rx: &mut broadcast::Receiver<Arc<Vec<u8>>>,
+        rx: &mut broadcast::Receiver<Arc<OutputChunk>>,
         needles: &[Vec<u8>],
         timeout: Duration,
     ) -> Vec<u8> {
@@ -1626,6 +1737,131 @@ mod tests {
         );
     }
 
+    /// A slave retained outside the child's process group has the same EOF
+    /// behavior as a descendant that escaped with `setsid()`. The watchdog owns
+    /// that fd and releases it on failure, so even the unfixed blocking join
+    /// cannot strand the test process. The outer test runner is bounded too.
+    struct RetainedSlave {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        holder: Option<JoinHandle<bool>>,
+    }
+
+    impl RetainedSlave {
+        fn new(session: &PtySession) -> Self {
+            use std::os::unix::fs::OpenOptionsExt;
+            let path = session
+                .master
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .tty_name()
+                .unwrap();
+            let slave = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(nix::libc::O_NOCTTY)
+                .open(path)
+                .unwrap();
+            let (release, rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let completed = rx
+                    .recv_timeout(Duration::from_secs(10).mul_f64(timeout_multiplier()))
+                    .is_ok();
+                drop(slave);
+                completed
+            });
+            Self {
+                release: Some(release),
+                holder: Some(holder),
+            }
+        }
+
+        fn release(&mut self) -> bool {
+            let _ = self.release.take().unwrap().send(());
+            self.holder.take().unwrap().join().unwrap()
+        }
+    }
+
+    impl Drop for RetainedSlave {
+        fn drop(&mut self) {
+            if self.holder.is_some() {
+                let _ = self.release();
+            }
+        }
+    }
+
+    async fn teardown_with_retained_slave(mode: &str) {
+        struct Cleanup(Arc<PtySession>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                reap_refused_spawn(&self.0);
+            }
+        }
+        let host = PtyHost::new();
+        let id = host.spawn(cat_spec("retained-slave")).unwrap();
+        let session = host.get(id).unwrap();
+        // Declared before the holder so panic unwinding releases the external
+        // slave before cleanup joins threads, including on unfixed code.
+        let _cleanup = Cleanup(Arc::clone(&session));
+        let mut holder = RetainedSlave::new(&session);
+        let mut rx = host.attach(id).unwrap().live;
+        host.write(id, b"reader-ready\n").unwrap();
+        let output = collect_until(&mut rx, b"reader-ready", Duration::from_secs(5)).await;
+        assert!(
+            contains(&output, b"reader-ready"),
+            "reader is running before teardown"
+        );
+
+        match mode {
+            "all" => assert_eq!(host.kill_all().await, 1),
+            "single" => assert!(host.kill(id).await),
+            "refused" => {
+                host.sessions.lock().unwrap().remove(&id);
+                reap_refused_spawn(&session);
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            Arc::strong_count(&session.fanout),
+            1,
+            "reader released its fanout owner"
+        );
+        assert_eq!(
+            Arc::strong_count(&session),
+            2,
+            "only the test and cleanup guard retain the joined session"
+        );
+        assert!(session.reader.lock().unwrap().is_none(), "reader joined");
+        assert!(session.watcher.lock().unwrap().is_none(), "watcher joined");
+        assert!(session.slave.lock().unwrap().is_none());
+        assert!(session.master.lock().unwrap().is_none());
+        assert!(observe_exit(&session).is_some(), "direct child reaped");
+        assert_eq!(host.count(), 0);
+        // Assert thread ownership above while the external slave is still
+        // held: dropping a blocked JoinHandle is not a successful teardown.
+        let completed_while_held = holder.release();
+        assert!(
+            completed_while_held,
+            "{mode} teardown waited for the external slave holder to release its fd"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_all_finishes_with_retained_slave() {
+        teardown_with_retained_slave("all").await;
+    }
+
+    #[tokio::test]
+    async fn kill_finishes_with_retained_slave() {
+        teardown_with_retained_slave("single").await;
+    }
+
+    #[tokio::test]
+    async fn refused_spawn_cleanup_finishes_with_retained_slave() {
+        teardown_with_retained_slave("refused").await;
+    }
+
     /// Clean daemon shutdown (monorepo#1526): `kill_all` reaps every tracked
     /// session across all scopes — including a TERM+HUP-trapping descendant —
     /// leaving an empty host and no process-group orphans.
@@ -1849,3 +2085,7 @@ mod tests {
         assert!(host.kill(id).await);
     }
 }
+
+#[cfg(test)]
+#[path = "replay_tests.rs"]
+mod replay_tests;

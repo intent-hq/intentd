@@ -62,12 +62,12 @@ const OWNER_TOKEN: &str = "gho_e2e_owner_token";
 const OWNER_ID: u64 = 100;
 
 /// `GET /user` requests ONE identity refresh makes. `refresh_primary_identity`
-/// probes `check_auth` (a `GET /user` in `GitHubSourceControl`) and then
-/// `get_user` (another), so one refresh is two requests — pre-existing
-/// behaviour of the `principal.me` refresher, not introduced here. The
-/// exact-total assertions below are pinned to this so a second refresh
-/// inside the window (or a third request per refresh) fails loudly.
-const GET_USER_PER_REFRESH: usize = 2;
+/// resolves the account with a single `get_user` (`github_link`; the
+/// `check_auth` probe folds an outage into "not authenticated" and is not
+/// consulted), so one refresh is one request. The exact-total assertions
+/// below are pinned to this so a second refresh inside the window (or a
+/// second request per refresh) fails loudly.
+const GET_USER_PER_REFRESH: usize = 1;
 
 /// Absolute bound on one `wss_rpc` round-trip — send plus the whole receive
 /// loop, however many pings or unrelated notifications arrive in between.
@@ -329,8 +329,9 @@ fn owner_row(result: &Value) -> &Value {
         .unwrap_or_else(|| panic!("owner row in {result}"))
 }
 
-/// The documented `workspace.members.list` row keys — the shape this change
-/// leaves untouched.
+/// The documented owner row keys, including the additive `hostRole`.
+/// The `identity` triple is present exactly when the owner is linked
+/// (`login` is a string) and absent otherwise.
 fn assert_member_row_shape(row: &Value) {
     let mut keys: Vec<&str> = row
         .as_object()
@@ -339,18 +340,40 @@ fn assert_member_row_shape(row: &Value) {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(
-        keys,
-        [
+    let linked = row["login"].is_string();
+    let expected: &[&str] = if linked {
+        &[
             "addedAt",
             "avatarUrl",
             "displayName",
+            "hostRole",
+            "identity",
             "login",
             "principalId",
-            "role"
-        ],
-        "{row}"
-    );
+            "role",
+        ]
+    } else {
+        &[
+            "addedAt",
+            "avatarUrl",
+            "displayName",
+            "hostRole",
+            "login",
+            "principalId",
+            "role",
+        ]
+    };
+    assert_eq!(keys, expected, "{row}");
+    assert_eq!(row["hostRole"], json!("owner"), "{row}");
+    if linked {
+        assert_eq!(
+            row["identity"],
+            json!({ "provider": "github", "host": "github.com", "externalUserId": OWNER_ID.to_string() }),
+            "{row}"
+        );
+    } else {
+        assert!(row.get("identity").is_none(), "{row}");
+    }
 }
 
 // ---------------------------------------------------------------------------

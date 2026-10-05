@@ -163,6 +163,76 @@ async fn handshake_completes() {
 }
 
 #[tokio::test]
+async fn structured_notices_are_negotiated_with_and_without_callbacks() {
+    use crate::callback_registration::CallbackOffer;
+    for offer in [CallbackOffer::Disabled, CallbackOffer::V1] {
+        let (conn, responder, _stderr) = connect_mock(ConnectionHooks::default());
+        crate::handshake::handshake_with_callbacks(
+            std::sync::Arc::new(conn),
+            intent_providers::find_provider("codex").unwrap(),
+            offer,
+        )
+        .await
+        .unwrap();
+        let seen = responder.await.unwrap();
+        assert_eq!(
+            seen[0]["params"]["clientCapabilities"]["session"]["notices"],
+            json!({})
+        );
+        assert_eq!(seen[0]["params"]["clientCapabilities"]["terminal"], true);
+        assert_eq!(
+            seen[0]["params"]["clientCapabilities"]["fs"]["readTextFile"],
+            true
+        );
+    }
+}
+
+#[test]
+fn structured_notices_are_consumed_without_becoming_chunks() {
+    for severity in ["info", "warning", "error", "_custom"] {
+        let note = crate::IncomingNotification {
+            method: "session/update".into(),
+            params: json!({"sessionId": "notice-session", "update": {
+                "sessionUpdate": "notice", "severity": severity,
+                "title": "Diagnostic title", "description": "Exact detail\n第二行"
+            }}),
+        };
+        let mapped = crate::session::map_notification(&note).expect("notice must be consumed");
+        let crate::session::MappedUpdate::Notice(notice) = mapped else {
+            panic!("notice must remain a diagnostic");
+        };
+        assert_eq!(serde_json::to_value(notice.severity).unwrap(), severity);
+        assert_eq!(notice.title, "Diagnostic title");
+        assert_eq!(notice.description.as_deref(), Some("Exact detail\n第二行"));
+    }
+}
+
+#[test]
+fn structured_notices_without_description_and_legacy_text_remain_distinct() {
+    let mut note = crate::IncomingNotification {
+        method: "session/update".into(),
+        params: json!({"sessionId": "s", "update": {
+            "sessionUpdate": "notice", "severity": "warning", "title": "Warning: exact text\n\n"
+        }}),
+    };
+    let Some(crate::session::MappedUpdate::Notice(notice)) =
+        crate::session::map_notification(&note)
+    else {
+        panic!("notice without optional description must map");
+    };
+    assert_eq!(notice.description, None);
+    note.params["update"] = json!({"sessionUpdate": "agent_message_chunk",
+        "content": {"type": "text", "text": notice.title}});
+    let Some(crate::session::MappedUpdate::Chunk { text, thought, .. }) =
+        crate::session::map_notification(&note)
+    else {
+        panic!("legacy assistant content must stay text");
+    };
+    assert_eq!(text.as_deref(), Some("Warning: exact text\n\n"));
+    assert!(!thought);
+}
+
+#[tokio::test]
 async fn antigravity_auth_marker_fails_pending_and_future_requests_without_url() {
     let (client_write, mut agent_read) = tokio::io::duplex(4096);
     let (mut agent_write, client_read) = tokio::io::duplex(4096);
@@ -631,6 +701,526 @@ async fn spawn_provider_relative_bare_command_present_in_cwd_is_not_provider_not
     }
 }
 
+/// A workspace fixture that reproduces the intent-hq/intent#5738 failure
+/// mode: a pnpm/Bun workspace whose `package.json` uses `catalog:`
+/// specifiers. npm run from inside it rejects the manifest
+/// (`EUNSUPPORTEDPROTOCOL`) before any `npx -y <adapter>` install can start.
+/// The directory name carries a space so the ACP cwd path shape is exercised.
+#[cfg(unix)]
+fn catalog_workspace(tmp: &std::path::Path) -> std::path::PathBuf {
+    let workspace = tmp.join("bun workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("package.json"),
+        r#"{"name":"catalog-workspace","private":true,"dependencies":{"zod":"catalog:"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\ncatalog:\n  zod: ^3.23.0\n",
+    )
+    .unwrap();
+    workspace
+}
+
+/// The fake `npx` script body; `__REPORT__` is the report path. It behaves
+/// like npm's project-root discovery (`@npmcli/config` `loadLocalPrefix`):
+/// writes its cwd and the cwd's entries to the report (atomically, via
+/// rename), walks up from the cwd to the nearest `package.json`, and — unless
+/// `--workspaces=false` / `--no-workspaces` is on the command line — keeps
+/// walking and adopts an ancestor manifest declaring `workspaces` as the
+/// project root instead (real npm adopts it only when a glob matches the cwd;
+/// the fake treats any `workspaces` field as matching). It then fails like npm
+/// when that root's manifest uses `catalog:` (`EUNSUPPORTEDPROTOCOL`) or its
+/// `.npmrc` names a `script-shell` that does not exist (`ENOENT`, exit 254).
+/// Exits 0 otherwise; never downloads anything. The duplicate-workspace-name
+/// rejection is left to the real-npx regression.
+#[cfg(unix)]
+const FAKE_NPX_SCRIPT: &str = r#"#!/bin/sh
+{ printf '%s\n' "$PWD"; ls -A; } > '__REPORT__.tmp' && mv '__REPORT__.tmp' '__REPORT__'
+no_ws=0
+for a in "$@"; do
+  case "$a" in
+    --) break ;;
+    --workspaces=false|--no-workspaces) no_ws=1 ;;
+    -*) ;;
+    *) break ;;
+  esac
+done
+root=""
+d="$PWD"
+while :; do
+  if [ -e "$d/package.json" ]; then
+    if [ -z "$root" ]; then
+      root="$d"
+      [ "$no_ws" = 1 ] && break
+    elif grep -q '"workspaces"' "$d/package.json"; then
+      root="$d"
+      break
+    fi
+  fi
+  [ "$d" = / ] && break
+  d=$(dirname "$d")
+done
+if [ -n "$root" ]; then
+  if grep -q 'catalog:' "$root/package.json"; then
+    echo 'npm error code EUNSUPPORTEDPROTOCOL' >&2
+    echo 'npm error Unsupported URL Type "catalog:": catalog:' >&2
+    exit 1
+  fi
+  shell=$(sed -n 's/^script-shell=//p' "$root/.npmrc" 2>/dev/null)
+  if [ -n "$shell" ] && [ ! -x "$shell" ]; then
+    echo 'npm error code ENOENT' >&2
+    echo "npm error enoent spawn $shell ENOENT" >&2
+    exit 254
+  fi
+fi
+exit 0
+"#;
+
+/// Write [`FAKE_NPX_SCRIPT`] as an executable `npx` into `dir`.
+#[cfg(unix)]
+fn write_fake_npx(dir: &std::path::Path, report: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let npx = dir.join("npx");
+    std::fs::write(
+        &npx,
+        FAKE_NPX_SCRIPT.replace("__REPORT__", &report.display().to_string()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o755)).unwrap();
+    npx
+}
+
+/// Poll `report` until the fake npx has renamed it into place: the cwd it
+/// ran in and the names of that directory's entries.
+#[cfg(unix)]
+async fn read_npx_report(report: &std::path::Path) -> (std::path::PathBuf, Vec<String>) {
+    for _ in 0..200 {
+        if let Ok(s) = tokio::fs::read_to_string(report).await {
+            let mut lines = s.lines();
+            if let Some(cwd) = lines.next() {
+                let entries = lines.map(str::to_owned).collect();
+                return (std::path::PathBuf::from(cwd), entries);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("fake npx never reported its cwd to {}", report.display());
+}
+
+/// The launch dir holds exactly the private sentinel `package.json` that makes
+/// it npm's nearest project root and nothing else. (The sentinel alone does
+/// not stop npm consulting an ancestor: `--workspaces=false` on the argv does
+/// — see `spawn_provider_real_npx_*`.)
+#[cfg(unix)]
+fn assert_neutral_launch_dir(npx_cwd: &std::path::Path, entries: &[String]) {
+    assert_eq!(
+        entries,
+        ["package.json"],
+        "npx launch dir {} must hold only the sentinel manifest",
+        npx_cwd.display()
+    );
+    let sentinel: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(npx_cwd.join("package.json")).unwrap())
+            .expect("sentinel package.json is JSON");
+    assert_eq!(sentinel["private"], serde_json::json!(true), "{sentinel}");
+    assert!(
+        sentinel.get("dependencies").is_none() && sentinel.get("workspaces").is_none(),
+        "sentinel must not declare dependencies or workspaces: {sentinel}"
+    );
+}
+
+/// intent-hq/intent#5738: an npx launch runs npx in a neutral directory —
+/// never the workspace — so a `catalog:` workspace cannot break adapter
+/// startup. `opts.cwd` (the ACP session cwd the agent manager passes to
+/// `session/new` separately) is left untouched.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_runs_npx_launch_in_a_neutral_dir() {
+    use crate::spawn::{spawn_provider, LaunchMode, SpawnOptions};
+
+    let tmp = test_temp_dir("intent-acp-npx-isolation-");
+    let workspace = catalog_workspace(tmp.path());
+    let report = tmp.path().join("npx-report");
+    let npx = write_fake_npx(tmp.path(), &report);
+
+    let provider = *intent_providers::find_provider("claude-code").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&workspace);
+    opts.npx_fallback_binary = Some(&npx);
+    opts.npx_fallback_package = provider.npx_only_package;
+    assert_eq!(opts.launch_target().0, LaunchMode::NpxFallback);
+
+    let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn fake npx");
+    let (npx_cwd, entries) = read_npx_report(&report).await;
+    let status = agent.child_mut().wait().await.expect("wait fake npx");
+    assert!(
+        status.success(),
+        "npx must not see the workspace package.json (exit {status:?})"
+    );
+    assert_ne!(npx_cwd, workspace, "npx ran inside the workspace");
+    assert!(
+        !npx_cwd.starts_with(&workspace),
+        "npx cwd {} is under the workspace",
+        npx_cwd.display()
+    );
+    assert_neutral_launch_dir(&npx_cwd, &entries);
+    assert_eq!(
+        opts.cwd,
+        Some(workspace.as_path()),
+        "ACP session cwd untouched"
+    );
+    agent.kill().await.ok();
+}
+
+/// Seed `ancestor` (an ancestor of the npx launch root at
+/// `ancestor/.intent/agent-configs`) with the verifier's intent-hq/intent#5738
+/// fixture: a `catalog:` manifest whose `workspaces` glob matches every launch
+/// dir, plus a `.npmrc` whose `script-shell` does not exist. npm that adopts
+/// this root dies with `ENOENT` before the adapter starts; two live launch
+/// dirs under it are rejected as duplicate workspace names.
+#[cfg(unix)]
+fn seed_matching_workspace_ancestor(ancestor: &std::path::Path) -> std::path::PathBuf {
+    let launch_root = ancestor.join(".intent").join("agent-configs");
+    std::fs::create_dir_all(&launch_root).unwrap();
+    std::fs::write(
+        ancestor.join("package.json"),
+        r#"{"name":"catalog-parent","private":true,"workspaces":[".intent/agent-configs/*"],"dependencies":{"zod":"catalog:"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ancestor.join(".npmrc"),
+        "script-shell=/intentd-test-nonexistent-shell\nregistry=http://127.0.0.1:9/\n",
+    )
+    .unwrap();
+    launch_root
+}
+
+/// intent-hq/intent#5738: npm picks its project root by walking UP from the
+/// cwd; the nearest `package.json` is only its first candidate — it keeps
+/// walking and adopts an ancestor whose `workspaces` glob matches the cwd
+/// (`@npmcli/config` `loadLocalPrefix`) unless workspaces are disabled on the
+/// command line. An ancestor of `npx_launch_root` (here a `$HOME` above
+/// `.intent/agent-configs`) carrying such a manifest and a broken `.npmrc`
+/// must not reach the launch, sentinel or not.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_npx_launch_is_isolated_from_the_launch_roots_ancestors() {
+    use crate::spawn::{spawn_provider, SpawnOptions};
+
+    let tmp = test_temp_dir("intent-acp-npx-ancestor-");
+    let workspace = tmp.path().join("plain workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let linked_home = tmp.path().join("linked-home");
+    // Exercise the macOS /var -> /private/var path mismatch on Linux too.
+    std::os::unix::fs::symlink(&home, &linked_home).unwrap();
+    let launch_root = seed_matching_workspace_ancestor(&linked_home);
+    let report = tmp.path().join("npx-report");
+    let npx = write_fake_npx(tmp.path(), &report);
+
+    let provider = *intent_providers::find_provider("claude-code").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&workspace);
+    opts.npx_launch_root = Some(&launch_root);
+    opts.npx_fallback_binary = Some(&npx);
+    opts.npx_fallback_package = provider.npx_only_package;
+    assert!(opts.via_npx());
+
+    let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn fake npx");
+    let (npx_cwd, entries) = read_npx_report(&report).await;
+    let status = agent.child_mut().wait().await.expect("wait fake npx");
+    assert!(
+        npx_cwd.starts_with(launch_root.canonicalize().unwrap()),
+        "npx cwd {} is not under the launch root {}",
+        npx_cwd.display(),
+        launch_root.display()
+    );
+    assert!(
+        status.success(),
+        "npx must not adopt the launch root's ancestor workspace manifest (exit {status:?})"
+    );
+    assert_neutral_launch_dir(&npx_cwd, &entries);
+    agent.kill().await.ok();
+}
+
+/// The installed real `npx`, or `None` (the test skips) when there is none.
+#[cfg(unix)]
+fn real_npx(test: &str) -> Option<std::path::PathBuf> {
+    let npx = intent_providers::resolve_on_path("npx");
+    if npx.is_none() {
+        eprintln!("skipping {test}: npx not on PATH");
+    }
+    npx
+}
+
+/// A local, dependency-less npm package whose `bin` records `process.cwd()`
+/// into the file named by `$ADAPTER_REPORT` — what `npx -y <this path>`
+/// resolves offline, standing in for the pinned adapter.
+#[cfg(unix)]
+fn local_adapter_package(dir: &std::path::Path) -> std::path::PathBuf {
+    let adapter = dir.join("adapter");
+    std::fs::create_dir_all(&adapter).unwrap();
+    std::fs::write(
+        adapter.join("package.json"),
+        r#"{"name":"intentd-test-adapter","version":"1.0.0","bin":{"intentd-test-adapter":"cli.js"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        adapter.join("cli.js"),
+        "#!/usr/bin/env node\nrequire('fs').writeFileSync(process.env.ADAPTER_REPORT, 'ADAPTER_STARTED ' + process.cwd() + '\\n');\n",
+    )
+    .unwrap();
+    adapter
+}
+
+/// intent-hq/intent#5738 — the verifier's reproduction against the REAL npm
+/// CLI (fake npx scripts only approximate `@npmcli/config`): under an
+/// ancestor whose `workspaces` glob matches the launch dirs and whose `.npmrc`
+/// sets a nonexistent `script-shell`, `npx -y <adapter>` must still start the
+/// adapter (a) from one launch dir — without the workspaces flag npm adopts the
+/// ancestor, loads its `.npmrc` and dies with `ENOENT` (exit 254) — and (b)
+/// from a second launch dir while the first still exists — without the flag
+/// npm rejects the two same-named sentinels as duplicate workspaces (exit 1).
+/// Offline, with private user/global npmrc and cache; skips without `npx`.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_real_npx_ignores_matching_ancestor_workspaces_and_sibling_launch_dirs() {
+    use crate::spawn::{spawn_provider, SpawnOptions};
+
+    let Some(npx) = real_npx("real-npx ancestor workspaces regression") else {
+        return;
+    };
+    let tmp = test_temp_dir("intent-acp-npx-real-");
+    let workspace = tmp.path().join("plain workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let home = tmp.path().join("clean-home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("user.npmrc"), "").unwrap();
+    std::fs::write(home.join("global.npmrc"), "").unwrap();
+    let launch_root = seed_matching_workspace_ancestor(&tmp.path().join("parent"));
+    let adapter = local_adapter_package(tmp.path());
+    // `npx_fallback_package` is the `&'static` pinned package spec in production.
+    let adapter_spec: &'static str =
+        Box::leak(adapter.to_str().unwrap().to_owned().into_boxed_str());
+
+    let provider = *intent_providers::find_provider("claude-code").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&workspace);
+    opts.npx_launch_root = Some(&launch_root);
+    opts.npx_fallback_binary = Some(&npx);
+    opts.npx_fallback_package = Some(adapter_spec);
+    for (k, v) in [
+        ("HOME", home.to_str().unwrap()),
+        (
+            "npm_config_userconfig",
+            home.join("user.npmrc").to_str().unwrap(),
+        ),
+        (
+            "npm_config_globalconfig",
+            home.join("global.npmrc").to_str().unwrap(),
+        ),
+        (
+            "npm_config_cache",
+            tmp.path().join("npm-cache").to_str().unwrap(),
+        ),
+        ("npm_config_offline", "true"),
+        ("npm_config_update_notifier", "false"),
+        ("npm_config_loglevel", "error"),
+        ("DD_TRACE_ENABLED", "false"),
+    ] {
+        opts.extra_env.insert(k.to_string(), v.to_string());
+    }
+    assert!(opts.via_npx());
+
+    let mut launched = Vec::new();
+    let mut alive = Vec::new();
+    for label in ["first", "second"] {
+        let report = tmp.path().join(format!("adapter-report-{label}"));
+        opts.extra_env.insert(
+            "ADAPTER_REPORT".to_string(),
+            report.to_str().unwrap().to_string(),
+        );
+        // The previous launch dir is still alive (`alive`), so npm now sees two
+        // same-named sentinels under the matching glob.
+        let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn real npx");
+        let status = tokio::time::timeout(Duration::from_secs(120), agent.child_mut().wait())
+            .await
+            .unwrap_or_else(|_| panic!("{label} real npx launch did not exit"))
+            .expect("wait real npx");
+        assert!(
+            status.success(),
+            "{label} launch: real npx must start the adapter despite the matching ancestor \
+             workspaces glob / broken .npmrc (exit {status:?}; 254 = ancestor .npmrc \
+             script-shell adopted, 1 = duplicate workspace names)"
+        );
+        let started = std::fs::read_to_string(&report)
+            .unwrap_or_else(|e| panic!("{label} launch: adapter never started ({e})"));
+        let cwd = std::path::PathBuf::from(
+            started
+                .trim()
+                .strip_prefix("ADAPTER_STARTED ")
+                .unwrap_or_else(|| panic!("{label} launch: unexpected report {started:?}")),
+        );
+        assert!(
+            cwd.starts_with(launch_root.canonicalize().unwrap()),
+            "{label} launch: adapter cwd {} is not under the launch root {}",
+            cwd.display(),
+            launch_root.display()
+        );
+        launched.push(cwd);
+        alive.push(agent);
+    }
+    assert_ne!(launched[0], launched[1], "each launch gets its own dir");
+    for mut agent in alive {
+        agent.kill().await.ok();
+    }
+}
+
+/// Seed `root` as a VALID npm workspace root — `workspaces: ["packages/*"]`
+/// with a `packages/some-workspace` member — and return an npx launch root
+/// beneath it (`root/.intent/agent-configs`, outside the glob). This is where
+/// a daemon whose environment carries `npm_config_workspace=some-workspace`
+/// (a shell exported it, or an `npm run` script launched the daemon) would
+/// otherwise have bootstrapped npx successfully before intent-hq/intent#5738.
+#[cfg(unix)]
+fn seed_valid_workspace_root(root: &std::path::Path) -> std::path::PathBuf {
+    let member = root.join("packages").join("some-workspace");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        r#"{"name":"some-workspace","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let launch_root = root.join(".intent").join("agent-configs");
+    std::fs::create_dir_all(&launch_root).unwrap();
+    launch_root
+}
+
+/// intent-hq/intent#5738 (regression of the `--workspaces=false` fix against
+/// the REAL npm CLI): npm reads `npm_config_workspace` — in any letter case —
+/// from the environment, and a selector next to `--workspaces=false` is fatal
+/// (`Cannot use --no-workspaces and --workspace at the same time`, exit 1)
+/// before the adapter starts. The managed bootstrap must remove every
+/// inherited selector after all env merges (here they arrive through
+/// `extra_env`, the last merge) while passing unrelated npm settings — the
+/// private npmrc / cache / offline configuration this test itself relies on —
+/// through. Offline; skips without `npx`.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_real_npx_ignores_inherited_npm_workspace_selectors() {
+    use crate::spawn::{spawn_provider, SpawnOptions};
+
+    let Some(npx) = real_npx("real-npx inherited workspace selector regression") else {
+        return;
+    };
+    let tmp = test_temp_dir("intent-acp-npx-real-selector-");
+    let workspace = tmp.path().join("plain workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let home = tmp.path().join("clean-home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(home.join("user.npmrc"), "").unwrap();
+    std::fs::write(home.join("global.npmrc"), "").unwrap();
+    let launch_root = seed_valid_workspace_root(&tmp.path().join("valid-workspace"));
+    let adapter = local_adapter_package(tmp.path());
+    let adapter_spec: &'static str =
+        Box::leak(adapter.to_str().unwrap().to_owned().into_boxed_str());
+    let report = tmp.path().join("adapter-report");
+
+    let provider = *intent_providers::find_provider("claude-code").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&workspace);
+    opts.npx_launch_root = Some(&launch_root);
+    opts.npx_fallback_binary = Some(&npx);
+    opts.npx_fallback_package = Some(adapter_spec);
+    for (k, v) in [
+        ("HOME", home.to_str().unwrap()),
+        (
+            "npm_config_userconfig",
+            home.join("user.npmrc").to_str().unwrap(),
+        ),
+        (
+            "npm_config_globalconfig",
+            home.join("global.npmrc").to_str().unwrap(),
+        ),
+        (
+            "npm_config_cache",
+            tmp.path().join("npm-cache").to_str().unwrap(),
+        ),
+        ("npm_config_offline", "true"),
+        ("npm_config_update_notifier", "false"),
+        ("npm_config_loglevel", "error"),
+        ("DD_TRACE_ENABLED", "false"),
+        ("ADAPTER_REPORT", report.to_str().unwrap()),
+        // The inherited selectors under test, in both spellings npm accepts.
+        ("npm_config_workspace", "some-workspace"),
+        ("NPM_CONFIG_WORKSPACE", "some-workspace"),
+    ] {
+        opts.extra_env.insert(k.to_string(), v.to_string());
+    }
+    assert!(opts.via_npx());
+
+    let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn real npx");
+    let status = tokio::time::timeout(Duration::from_secs(120), agent.child_mut().wait())
+        .await
+        .expect("real npx launch did not exit")
+        .expect("wait real npx");
+    assert!(
+        status.success(),
+        "real npx must start the adapter despite an inherited npm_config_workspace selector \
+         (exit {status:?}; 1 = `Cannot use --no-workspaces and --workspace at the same time`)"
+    );
+    let started =
+        std::fs::read_to_string(&report).unwrap_or_else(|e| panic!("adapter never started ({e})"));
+    let cwd = std::path::PathBuf::from(
+        started
+            .trim()
+            .strip_prefix("ADAPTER_STARTED ")
+            .unwrap_or_else(|| panic!("unexpected report {started:?}")),
+    );
+    assert!(
+        cwd.starts_with(launch_root.canonicalize().unwrap()),
+        "adapter cwd {} is not under the launch root {}",
+        cwd.display(),
+        launch_root.display()
+    );
+    agent.kill().await.ok();
+}
+
+/// intent-hq/intent#5738 (spawn classification): the process cwd of an npx
+/// launch is the neutral dir, so a workspace directory that no longer exists
+/// neither fails the spawn nor is reported as the missing working directory.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_npx_launch_does_not_depend_on_the_workspace_existing() {
+    use crate::spawn::{spawn_provider, SpawnOptions};
+
+    let tmp = test_temp_dir("intent-acp-npx-gone-ws-");
+    let gone = tmp.path().join("deleted workspace");
+    let report = tmp.path().join("npx-report");
+    let npx = write_fake_npx(tmp.path(), &report);
+
+    let provider = *intent_providers::find_provider("codex").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&gone);
+    opts.npx_fallback_binary = Some(&npx);
+    opts.npx_fallback_package = provider.npx_only_package;
+    assert!(opts.via_npx());
+
+    let mut agent = spawn_provider(&opts, ConnectionHooks::default())
+        .expect("npx launch must not require the workspace directory");
+    let (npx_cwd, _) = read_npx_report(&report).await;
+    assert_ne!(npx_cwd, gone);
+    agent.kill().await.ok();
+}
+
 /// The bare-command `PATH` search of `classify_not_found` walks the child's
 /// enhanced `PATH`: a command present there (`sh`) is "program exists" and a
 /// name absent from every directory is `ProviderNotFound`.
@@ -650,7 +1240,7 @@ fn classify_not_found_searches_the_child_path_for_bare_commands() {
     let opts = SpawnOptions::new(&present);
     let (launch, target) = opts.launch_target();
     assert_eq!(launch, LaunchMode::BareCommand);
-    let err = classify_not_found(&opts, launch, target, "sh", &enoent);
+    let err = classify_not_found(&opts, launch, target, "sh", opts.cwd, &enoent);
     match &err {
         AcpError::Spawn(msg) => assert!(msg.contains("the program exists"), "{msg}"),
         other => panic!("expected Spawn for a bare command on PATH, got {other:?}"),
@@ -667,6 +1257,7 @@ fn classify_not_found_searches_the_child_path_for_bare_commands() {
         launch,
         target,
         "intentd-no-such-provider-command-4971",
+        opts.cwd,
         &enoent,
     );
     assert!(
@@ -713,10 +1304,10 @@ fn classify_not_found_resolves_relative_path_entries_against_child_cwd() {
     let (launch, target) = opts.launch_target();
     assert_eq!(launch, LaunchMode::BareCommand);
     let err = classify_not_found_with_path(
-        &opts,
         launch,
         target,
         "intentd-4971-child-local",
+        opts.cwd,
         &enoent,
         child_path,
     );
@@ -728,10 +1319,10 @@ fn classify_not_found_resolves_relative_path_entries_against_child_cwd() {
     let opts = SpawnOptions::new(&provider);
     let (launch, target) = opts.launch_target();
     let err = classify_not_found_with_path(
-        &opts,
         launch,
         target,
         "intentd-4971-child-local",
+        opts.cwd,
         &enoent,
         child_path,
     );
@@ -6128,6 +6719,7 @@ mod _dead_workspace_metadata_tool_tests {
                 created_at: now.clone(),
                 updated_at: now,
                 last_activity: None,
+                last_content_activity: None,
                 tags: vec!["demo".to_string()],
                 path: None,
                 repository_path: None,
@@ -6425,6 +7017,7 @@ mod workspace_api_tool_tests {
                 created_at: now.clone(),
                 updated_at: now,
                 last_activity: None,
+                last_content_activity: None,
                 tags: Vec::new(),
                 path: path.map(str::to_string),
                 repository_path: None,
@@ -7068,14 +7661,8 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // Byte-identity needs every gate open (the defaults plus the opt-in
-        // `peerAgents` toggle, the default-off gate).
-        let all_on_srv = server("amber-forest", None).with_agent_features(
-            intent_core::settings_file::AgentFeaturesSettings {
-                peer_agents: true,
-                ..Default::default()
-            },
-        );
+        // Every gate is open by default.
+        let all_on_srv = server("amber-forest", None);
         let resp = all_on_srv
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -7301,10 +7888,13 @@ mod workspace_api_tool_tests {
 
     #[tokio::test]
     async fn peer_agents_off_denies_retire() {
-        // `peerAgents` defaults OFF (the one opt-in toggle), so the default
-        // bridge prunes/denies `ws.agent.retire` on all three layers.
-        let srv = server("amber-forest", None)
-            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings::default());
+        // An explicit opt-out prunes/denies `ws.agent.retire` on all three layers.
+        let srv = server("amber-forest", None).with_agent_features(
+            intent_core::settings_file::AgentFeaturesSettings {
+                peer_agents: false,
+                ..Default::default()
+            },
+        );
         // Layer (a): the description does not advertise it.
         let resp = srv
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
@@ -7313,7 +7903,7 @@ mod workspace_api_tool_tests {
         let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
         assert!(
             !desc.contains("ws.agent.retire"),
-            "default description must not advertise ws.agent.retire"
+            "opted-out description must not advertise ws.agent.retire"
         );
         // Layer (b): the installer is not in the prelude; sibling ws.agent.*
         // methods survive.
@@ -7341,14 +7931,8 @@ mod workspace_api_tool_tests {
     }
 
     #[tokio::test]
-    async fn peer_agents_on_installs_and_advertises_retire() {
-        // Opting in installs the binding and advertises the doc line.
-        let srv = server("amber-forest", None).with_agent_features(
-            intent_core::settings_file::AgentFeaturesSettings {
-                peer_agents: true,
-                ..Default::default()
-            },
-        );
+    async fn peer_agents_default_installs_and_advertises_retire() {
+        let srv = server("amber-forest", None);
         let resp = srv
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -7382,15 +7966,8 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // A top-level bridge with every gate open (the defaults plus the
-        // opt-in `peerAgents` toggle) stays byte-identical to the static
-        // const.
-        let top = server("amber-forest", None)
-            .with_sub_agent(false)
-            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings {
-                peer_agents: true,
-                ..Default::default()
-            });
+        // A default top-level bridge stays byte-identical to the static const.
+        let top = server("amber-forest", None).with_sub_agent(false);
         let resp = top
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -7883,6 +8460,7 @@ mod wsapi3_bindings_tests {
                     updated_at: Some("2026-01-01T00:00:00Z".to_string()),
                     skipped: None,
                     reason: None,
+                    rev: Some(1),
                 })
             })
         }
@@ -8189,6 +8767,8 @@ mod wsapi3_bindings_tests {
                         content: "root".to_string(),
                         author: "Agent".to_string(),
                         author_type: intent_core::AuthorType::default(),
+                        author_principal_id: None,
+                        author_identity: None,
                         status: intent_core::CommentStatus::default(),
                         parent_id: None,
                         anchor: Option::default(),
@@ -8238,6 +8818,8 @@ mod wsapi3_bindings_tests {
                         content: comment,
                         author: "Agent".to_string(),
                         author_type: intent_core::AuthorType::default(),
+                        author_principal_id: None,
+                        author_identity: None,
                         status: intent_core::CommentStatus::default(),
                         parent_id: None,
                         anchor: Option::default(),
@@ -9813,6 +10395,7 @@ mod wsapi4_bindings_tests {
             waiting_for_agent_ids: vec![],
             waiting_on_hooks: vec![],
             waiting_on_pr_monitors: vec![],
+            waiting_on_script_monitors: vec![],
             turn_in_flight: false,
             last_stream_activity_at: None,
             context_usage: None,
@@ -9856,6 +10439,7 @@ mod wsapi4_bindings_tests {
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
+                chief_prompt_version: None,
             },
         }
     }
@@ -9909,6 +10493,7 @@ mod wsapi4_bindings_tests {
                 match &scope {
                     AgentListRowScope::Delegated {
                         parent_agent_id: Some(p),
+                        ..
                     } => Some(p.as_str().to_string()),
                     _ => None,
                 },
@@ -9923,7 +10508,14 @@ mod wsapi4_bindings_tests {
                         AgentListRowScope::TopLevel => {
                             r.parent_agent_id.is_none() && !r.metadata.is_background
                         }
-                        AgentListRowScope::Delegated { parent_agent_id } => {
+                        AgentListRowScope::Delegated {
+                            parent_agent_id,
+                            orphaned_only,
+                        } => {
+                            assert!(
+                                !orphaned_only,
+                                "the MCP binding never issues the orphanedOnly read"
+                            );
                             r.parent_agent_id.is_some()
                                 && parent_agent_id
                                     .as_ref()
@@ -10538,6 +11130,83 @@ mod wsapi4_bindings_tests {
             "{}",
             text(&resp)
         );
+    }
+
+    #[tokio::test]
+    async fn self_queue_reads_keep_counts_without_any_pending_payload() {
+        let (srv, api) = server_with_caller("self-agent");
+        for count in [3_usize, 0] {
+            let entries: Vec<Value> = (0..count).map(|i| json!({
+                "id": format!("entry-{i}"), "content": "PENDING_SECRET",
+                "images": [{"data": "IMAGE_SECRET"}],
+                "messageMetadata": {"fromAgentId": format!("sender-{i}"), "extra": "METADATA_SECRET"},
+                "position": i,
+            })).collect();
+            *api.queue_entries.lock().unwrap() = entries.clone();
+            for method in ["status", "getQueue"] {
+                let resp = call(
+                    &srv,
+                    &format!("return await ws.agent.{method}('self-agent');"),
+                )
+                .await;
+                assert_eq!(resp["result"]["isError"], false, "{resp}");
+                let v = body(&resp);
+                assert_eq!(v["queueLength"], count, "{v}");
+                assert_eq!(v["queue"], json!([]), "self queue payload: {v}");
+                assert!(!v.to_string().contains("SECRET"), "{v}");
+                if method == "status" {
+                    assert!(v["queueNotice"]
+                        .as_str()
+                        .unwrap()
+                        .contains("after the current turn"));
+                }
+                if method == "getQueue" {
+                    assert_eq!(v["refused"], true, "{v}");
+                    assert!(v["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("after the current turn"));
+                }
+            }
+            assert_eq!(
+                *api.queue_entries.lock().unwrap(),
+                entries,
+                "reads never consume"
+            );
+            let other = body(&call(&srv, "return await ws.agent.getQueue('other-agent');").await);
+            assert_eq!(other["queue"].as_array().unwrap().len(), count);
+        }
+    }
+
+    #[tokio::test]
+    async fn self_queue_event_history_hides_all_payload_copies() {
+        let (srv, api) = server_with_caller("self-agent");
+        let rows = json!([
+            {"type":"agent:queue:updated", "actor":{"id":"self-agent"},
+             "data":{"agentId":"self-agent", "queue":[{"content":"SELF_SECRET", "images":["SELF_SECRET"]}]},
+             "metadata":{"copy":"SELF_SECRET"}},
+            {"eventType":"agent:queue:processing", "sessionId":"self-agent",
+             "data":{"agentId":"self-agent", "messageId":"m", "content":"SELF_SECRET", "queuedMessages":[{"content":"SELF_SECRET"}]}},
+            {"eventType":"agent:queue:updated", "data":{"agentId":"other-agent", "queue":[{"content":"OTHER_VISIBLE"}]}}
+        ]);
+        for paginated in [false, true] {
+            *api.event_query_result.lock().unwrap() = Some(if paginated {
+                json!({"items": rows, "nextToken":"next-page"})
+            } else {
+                rows.clone()
+            });
+            for code in [
+                "return await ws.event.query();",
+                "return await ws.event.agentActivity('self-agent');",
+            ] {
+                let result = body(&call(&srv, code).await);
+                assert!(!result.to_string().contains("SELF_SECRET"), "{result}");
+                assert!(result.to_string().contains("OTHER_VISIBLE"), "{result}");
+                if paginated {
+                    assert_eq!(result["nextToken"], "next-page");
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -12100,13 +12769,10 @@ mod wsapi4_bindings_tests {
         assert!(api.request_attention_calls.lock().unwrap().is_empty());
     }
 
-    /// A bridge with `peerAgents` opted in (the toggle defaults off), so the
+    /// A bridge with `peerAgents` enabled by default, so the
     /// `retire` binding is installed and dispatchable.
     fn peer_agents_features() -> intent_core::settings_file::AgentFeaturesSettings {
-        intent_core::settings_file::AgentFeaturesSettings {
-            peer_agents: true,
-            ..Default::default()
-        }
+        intent_core::settings_file::AgentFeaturesSettings::default()
     }
 
     #[tokio::test]
@@ -12409,13 +13075,17 @@ mod wsapi4_bindings_tests {
         assert_eq!(api.agent_create_calls.lock().unwrap().len(), 1);
     }
 
-    /// Arg-conditional feature gate: with `peerAgents` OFF (the default),
+    /// Arg-conditional feature gate: with `peerAgents` explicitly OFF,
     /// `create({ topLevel: true })` is denied naming the toggle, while plain
     /// `create()` on the same bridge succeeds unchanged.
     #[tokio::test]
     async fn peer_agents_off_denies_top_level_but_not_plain_create() {
         let api = Arc::new(FakeApi::default());
         let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("amber-forest"))
+            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings {
+                peer_agents: false,
+                ..Default::default()
+            })
             .with_caller_agent_id(Some(AgentId::from("caller-1")));
         let resp = call(
             &srv,
@@ -12747,6 +13417,7 @@ mod workspace_api_output_limit_tests {
                     created_at: now.clone(),
                     updated_at: now,
                     last_activity: None,
+                    last_content_activity: None,
                     tags: Vec::new(),
                     path: None,
                     repository_path,
@@ -13073,6 +13744,7 @@ mod workspace_apply_proposal_tests {
             created_at: now.clone(),
             updated_at: now,
             last_activity: None,
+            last_content_activity: None,
             tags: Vec::new(),
             path: Some(format!("/checkouts/{id}")),
             repository_path: None,
@@ -13136,6 +13808,7 @@ mod workspace_apply_proposal_tests {
             waiting_for_agent_ids: vec![],
             waiting_on_hooks: vec![],
             waiting_on_pr_monitors: vec![],
+            waiting_on_script_monitors: vec![],
             turn_in_flight: true,
             last_stream_activity_at: None,
             context_usage: None,
@@ -13179,6 +13852,7 @@ mod workspace_apply_proposal_tests {
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
+                chief_prompt_version: None,
             },
         }
     }

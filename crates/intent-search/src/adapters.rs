@@ -36,7 +36,7 @@ pub struct EventMatch {
     pub score: Option<f64>,
 }
 
-/// `search.notes` hit: the note id, a preview snippet, and an optional score.
+/// Indexed `search.notes` hit with composite identity and persisted display context.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteMatch {
@@ -44,6 +44,11 @@ pub struct NoteMatch {
     pub preview: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
+    pub workspace_id: String,
+    pub title: String,
+    pub updated_at: String,
+    pub is_archived: bool,
+    pub workspace_archived: bool,
 }
 
 /// `search.codebase` hit: the workspace-relative file, an optional detected

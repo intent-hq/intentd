@@ -87,7 +87,7 @@ pub(crate) fn hit_repo(scope: &[RepoRef], html_url: &str) -> RepoRef {
 
 /// Parse `{owner}/{repo}` off a GitHub `html_url` (`https://<host>/{owner}/
 /// {repo}/...`); `None` when the path carries fewer than two segments.
-fn repo_from_html_url(html_url: &str) -> Option<RepoRef> {
+pub(crate) fn repo_from_html_url(html_url: &str) -> Option<RepoRef> {
     let rest = html_url.split_once("://").map_or(html_url, |(_, r)| r);
     let mut segments = rest.split('/').skip(1).filter(|s| !s.is_empty());
     let owner = segments.next()?;
@@ -238,6 +238,22 @@ pub(crate) fn pull_to_json(pr: &PullRequest) -> Value {
         "deletions": 0,
         "changedFiles": 0,
     })
+}
+
+/// [`pull_to_json`] plus the additive, presence-detected `isInMergeQueue`
+/// — the `github.pulls.get` shape served from the shared PR cache: the key
+/// is present exactly when the cached read reported the host's merge-queue
+/// state (`true` / `false`), and absent (never `null`) when it did not
+/// (REST-only fallback, older GHES).
+pub(crate) fn pull_to_json_with_merge_queue(
+    pr: &PullRequest,
+    is_in_merge_queue: Option<bool>,
+) -> Value {
+    let mut v = pull_to_json(pr);
+    if let (Value::Object(map), Some(queued)) = (&mut v, is_in_merge_queue) {
+        map.insert("isInMergeQueue".into(), json!(queued));
+    }
+    v
 }
 
 /// [`pull_to_json`] plus the `owner` / `repo` the PR belongs to — the

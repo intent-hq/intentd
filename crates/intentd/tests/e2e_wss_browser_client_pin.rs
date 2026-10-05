@@ -14,8 +14,11 @@
 
 mod common;
 
+#[path = "e2e_wss_browser_client_pin/identity_isolation.rs"]
+mod identity_isolation;
+
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,13 +57,16 @@ fn scratch_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-bcpin-")
 }
 
-fn spawn_serve(data_dir: &Path) -> Child {
+fn spawn_serve(data_dir: &Path, mut command: Command) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    common::serve_command()
+    common::hermetic_github_identity(&mut command, data_dir);
+    command
+        .env_remove("GITLAB_TOKEN")
         .env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -84,9 +90,13 @@ async fn await_uds(socket: &Path) -> bool {
 }
 
 async fn boot(root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
+    boot_with_command(root, common::serve_command()).await
+}
+
+async fn boot_with_command(root: &Path, command: Command) -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir).expect("mkdir data");
-    let child = spawn_serve(&data_dir);
+    let child = spawn_serve(&data_dir, command);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -379,17 +389,30 @@ async fn workspace_browser_client_pin_rpcs_over_secure_wss() {
     assert_eq!(
         keys,
         [
+            "avatarUrl",
             "capabilities",
             "clientId",
             "connectedAt",
             "connections",
             "deviceKind",
+            "displayName",
+            "hostRole",
             "hostname",
+            "login",
             "name",
             "prettyHostname",
+            "principalId",
             "transports"
         ]
     );
+    let me = wss_rpc(&mut a, 20, "principal.me", json!({})).await;
+    for row in clients {
+        assert_eq!(row["principalId"], me["result"]["id"]);
+        assert_eq!(row["hostRole"], "owner");
+        for key in ["login", "displayName", "avatarUrl"] {
+            assert_eq!(row.get(key), Some(&Value::Null));
+        }
+    }
 
     // A hello without host identification lists no host keys (presence-
     // detected, never null).

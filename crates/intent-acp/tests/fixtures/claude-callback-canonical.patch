@@ -1,0 +1,1417 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index a3d6b2d..8a5691f 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -41,5 +41,8 @@ jobs:
+       - name: Build
+         run: npm run build
+ 
++      - name: Test confirmed callback registration
++        run: npm run test:callback
++
+       - name: Run tests
+         run: npm run test:run
+diff --git a/package.json b/package.json
+index c01ea12..2fc76d9 100644
+--- a/package.json
++++ b/package.json
+@@ -40,7 +40,8 @@
+     "test:integration": "RUN_INTEGRATION_TESTS=true vitest run",
+     "test:run": "vitest run",
+     "test:coverage": "vitest run --coverage",
+-    "prepublishOnly": "npm run build"
++    "prepublishOnly": "npm run build",
++    "test:callback": "node tests/run-hermetic.mjs"
+   },
+   "keywords": [
+     "claude",
+diff --git a/src/acp-agent.ts b/src/acp-agent.ts
+index ceaaafc..068103a 100644
+--- a/src/acp-agent.ts
++++ b/src/acp-agent.ts
+@@ -53,6 +53,7 @@ import {
+   WriteTextFileRequest,
+   WriteTextFileResponse,
+   StopReason,
++  type Stream,
+ } from "@agentclientprotocol/sdk";
+ import {
+   AccountInfo,
+@@ -97,6 +98,15 @@ import {
+   toGoalSnapshot,
+ } from "./goal-extension.js";
+ import { sanitizeTitle, SessionTitles } from "./session-titles.js";
++import {
++  CALLBACK_METHOD,
++  CallbackRegistration,
++  type CallbackRegistrationRequest,
++  type CallbackRegistrationResponse,
++  callbackCapability,
++  callbackNegotiated,
++  parseCallbackRegistration,
++} from "./callback-registration.js";
+ import {
+   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
+   AcpSessionNotification,
+@@ -726,6 +736,7 @@ type Turn = {
+ 
+ export type Session = {
+   query: Query;
++  callbackRegistration?: CallbackRegistration;
+   input: Pushable<SDKUserMessage>;
+   cancelled: boolean;
+   /** FIFO of in-flight prompts. The head is the turn the SDK is currently
+@@ -2373,6 +2384,7 @@ export class ClaudeAcpAgent {
+       // steering extension contract: advertises the `_session/steering` request
+       // so clients know they may inject a follow-up into a running turn.
+       _meta: {
++        ...callbackCapability(request.clientCapabilities),
+         ...airSessionFailureCapabilityMeta(
+           AGENT_FILE_CHANGE_REPORT_CAPABILITY,
+           AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
+@@ -2405,6 +2417,32 @@ export class ClaudeAcpAgent {
+     return response;
+   }
+ 
++  registerMcpCallback(
++    params: unknown,
++    signal?: AbortSignal,
++  ): Promise<CallbackRegistrationResponse> {
++    if (!callbackNegotiated(this.clientCapabilities)) {
++      throw RequestError.invalidParams(undefined, "Callback registration v1 was not negotiated");
++    }
++    const request = parseCallbackRegistration(params);
++    // Capture the concrete session and Query synchronously, before queuing.
++    const session = this.sessions[request.sessionId];
++    const registration = session?.callbackRegistration;
++    const originalQuery = session?.query;
++    if (!session || !registration || !originalQuery) {
++      throw RequestError.invalidParams(undefined, "No original callback allocation");
++    }
++    return registration.register(
++      request,
++      originalQuery,
++      () =>
++        this.sessions[request.sessionId] === session &&
++        !session.queryClosed &&
++        session.query === originalQuery,
++      signal,
++    );
++  }
++
+   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+     if (this.providerUpdate) await this.providerUpdate;
+     return forkSession(params, {
+@@ -8114,6 +8152,9 @@ export class ClaudeAcpAgent {
+           sessionId: params.sessionId,
+           modes: existingSession.modes,
+           configOptions: existingSession.configOptions,
++          ...(existingSession.callbackRegistration && {
++            _meta: existingSession.callbackRegistration.metadata(),
++          }),
+         };
+       }
+ 
+@@ -8145,6 +8186,7 @@ export class ClaudeAcpAgent {
+       sessionId: response.sessionId,
+       modes: response.modes,
+       configOptions: response.configOptions,
++      ...(response._meta && { _meta: response._meta }),
+     };
+   }
+ 
+@@ -8605,6 +8647,9 @@ export class ClaudeAcpAgent {
+       options,
+     });
+     timing.phase("prepare-query");
++    const callbackRegistration = callbackNegotiated(this.clientCapabilities)
++      ? new CallbackRegistration(q, options.mcpServers)
++      : undefined;
+ 
+     // `query()` spawns the CLI at once. Any throw between here and the
+     // registration in `this.sessions` would leave that child process running
+@@ -8797,6 +8842,7 @@ export class ClaudeAcpAgent {
+ 
+       this.sessions[sessionId] = {
+         query: q,
++        callbackRegistration,
+         input: input,
+         cancelled: false,
+         cwd: params.cwd,
+@@ -8863,6 +8909,7 @@ export class ClaudeAcpAgent {
+         sessionId,
+         modes,
+         configOptions,
++        ...(callbackRegistration && { _meta: callbackRegistration.metadata() }),
+       };
+     } catch (error) {
+       this.discardUnregisteredQuery(q, input, settingsManager);
+@@ -10532,12 +10579,13 @@ export async function runPromptWithCancellation(
+   }
+ }
+ 
+-export function runAcp(logger?: Logger) {
+-  const input = nodeToWebWritable(process.stdout);
+-  const output = nodeToWebReadable(process.stdin);
+-
+-  const stream = ndJsonStream(input, output);
+-
++export function runAcp(
++  logger?: Logger,
++  stream: Stream = ndJsonStream(
++    nodeToWebWritable(process.stdout),
++    nodeToWebReadable(process.stdin),
++  ),
++) {
+   // `connect(...)` returns a connection-scoped peer handle (`connection.client`)
+   // that stays valid for the whole connection, so the agent captures it once.
+   // Handlers close over `agent`, which is assigned synchronously right after
+@@ -10548,6 +10596,11 @@ export function runAcp(logger?: Logger) {
+   let agent: ClaudeAcpAgent;
+   const connection = acpAgent({ name: "claude-code-acp" })
+     .onRequest(methods.agent.initialize, (ctx) => agent.initialize(ctx.params))
++    .onRequest<CallbackRegistrationRequest, CallbackRegistrationResponse>(
++      CALLBACK_METHOD,
++      { parse: parseCallbackRegistration },
++      (ctx) => agent.registerMcpCallback(ctx.params, ctx.signal),
++    )
+     .onRequest(methods.agent.session.new, (ctx) => agent.newSession(ctx.params))
+     .onRequest(methods.agent.session.load, (ctx) => agent.loadSession(ctx.params))
+     .onRequest(methods.agent.session.fork, (ctx) => agent.unstable_forkSession(ctx.params))
+diff --git a/src/callback-registration.ts b/src/callback-registration.ts
+new file mode 100644
+index 0000000..4b29a64
+--- /dev/null
++++ b/src/callback-registration.ts
+@@ -0,0 +1,291 @@
++import { randomUUID } from "node:crypto";
++import { type ClientCapabilities, RequestError } from "@agentclientprotocol/sdk";
++import type {
++  McpServerConfig,
++  McpSetServersResult,
++  McpStdioServerConfig,
++  Query,
++} from "@anthropic-ai/claude-agent-sdk";
++
++// Transport correlation only: none of these identifiers is repository authority.
++export const CALLBACK_META = "intentCallbackRegistration";
++export const CALLBACK_METHOD = "_intent/session/register_mcp_callback";
++export const CALLBACK_VERSION = 1;
++export const CALLBACK_TIMEOUT_MS = 5000;
++
++export type CallbackRegistrationRequest = Readonly<{
++  version: typeof CALLBACK_VERSION;
++  sessionId: string;
++  queryReceipt: string;
++  registrationId: string;
++  server: Readonly<{
++    type: "stdio";
++    command: string;
++    args: readonly string[];
++    env?: Readonly<Record<string, string>>;
++  }>;
++}>;
++
++type CallbackReason = string | { code: string; message: string };
++
++export type CallbackRegistrationResponse = {
++  version: typeof CALLBACK_VERSION;
++  sessionId: string;
++  queryReceipt: string;
++  registrationId: string;
++  serverName: string;
++  status: "not-dispatched" | "uncertain" | "stale" | "failed" | "acknowledged";
++  result: McpSetServersResult | null;
++  reason?: CallbackReason;
++};
++
++function record(value: unknown): value is Record<string, unknown> {
++  return value !== null && typeof value === "object" && !Array.isArray(value);
++}
++
++function keys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
++  return Object.keys(value).every((key) => allowed.includes(key));
++}
++
++function strings(value: unknown): value is string[] {
++  return Array.isArray(value) && value.every((item) => typeof item === "string");
++}
++
++function stringRecord(value: unknown): value is Record<string, string> {
++  return record(value) && Object.values(value).every((item) => typeof item === "string");
++}
++
++export function callbackNegotiated(capabilities: ClientCapabilities | undefined): boolean {
++  const offered = capabilities?._meta?.[CALLBACK_META];
++  return record(offered) && keys(offered, ["version"]) && offered.version === CALLBACK_VERSION;
++}
++
++export function callbackCapability(capabilities: ClientCapabilities | undefined) {
++  return callbackNegotiated(capabilities)
++    ? { [CALLBACK_META]: { version: CALLBACK_VERSION, method: CALLBACK_METHOD } }
++    : {};
++}
++
++export function parseCallbackRegistration(value: unknown): CallbackRegistrationRequest {
++  const invalid = (): never => {
++    throw RequestError.invalidParams(undefined, "Invalid callback registration v1");
++  };
++  if (
++    !record(value) ||
++    !keys(value, ["version", "sessionId", "queryReceipt", "registrationId", "server"]) ||
++    value.version !== CALLBACK_VERSION ||
++    typeof value.sessionId !== "string" ||
++    !value.sessionId ||
++    typeof value.queryReceipt !== "string" ||
++    !value.queryReceipt ||
++    typeof value.registrationId !== "string" ||
++    !/^[a-zA-Z0-9_-]{1,128}$/.test(value.registrationId)
++  ) {
++    return invalid();
++  }
++  const server = value.server;
++  if (
++    !record(server) ||
++    !keys(server, ["type", "command", "args", "env"]) ||
++    server.type !== "stdio" ||
++    typeof server.command !== "string" ||
++    !server.command ||
++    !strings(server.args) ||
++    (server.env !== undefined && !stringRecord(server.env))
++  ) {
++    return invalid();
++  }
++  // An ACP caller cannot alter a queued configuration after capture.
++  return Object.freeze({
++    version: CALLBACK_VERSION,
++    sessionId: value.sessionId,
++    queryReceipt: value.queryReceipt,
++    registrationId: value.registrationId,
++    server: Object.freeze({
++      type: "stdio",
++      command: server.command,
++      args: Object.freeze([...server.args]),
++      ...(server.env !== undefined && { env: Object.freeze({ ...server.env }) }),
++    }),
++  });
++}
++
++function sdkResult(value: unknown): McpSetServersResult | null {
++  if (
++    !record(value) ||
++    !strings(value.added) ||
++    !strings(value.removed) ||
++    !stringRecord(value.errors)
++  ) {
++    return null;
++  }
++  return { added: [...value.added], removed: [...value.removed], errors: { ...value.errors } };
++}
++
++function sdkServer(server: CallbackRegistrationRequest["server"]): McpStdioServerConfig {
++  // The SDK declares mutable containers. Give it its own frozen copy without
++  // casting away the readonly contract of the captured request.
++  const args = [...server.args];
++  Object.freeze(args);
++  const env = server.env === undefined ? undefined : { ...server.env };
++  if (env !== undefined) {
++    Object.freeze(env);
++  }
++  return Object.freeze({ type: "stdio", command: server.command, args, ...(env && { env }) });
++}
++
++/** One original Query allocation. It is never rebound or recovered by session ID. */
++export class CallbackRegistration {
++  #query: Query;
++  #servers: Map<string, McpServerConfig>;
++  #used = new Set<string>();
++  #tail: Promise<void> = Promise.resolve();
++  #blocked = false;
++  #receipt = randomUUID();
++
++  constructor(query: Query, servers: Record<string, McpServerConfig> | undefined) {
++    this.#query = query;
++    // Preserve every original SDK/user entry, including SDK server instances.
++    // Only this helper adds entries; it never removes or redirects an entry.
++    this.#servers = new Map(
++      Object.entries(servers ?? {}).map(([name, config]) => [
++        name,
++        config.type === "sdk" ? { ...config } : structuredClone(config),
++      ]),
++    );
++  }
++
++  metadata() {
++    return { [CALLBACK_META]: { version: CALLBACK_VERSION, queryReceipt: this.#receipt } };
++  }
++
++  register(
++    params: CallbackRegistrationRequest,
++    query: Query,
++    isCurrent: () => boolean,
++    signal?: AbortSignal,
++  ): Promise<CallbackRegistrationResponse> {
++    if (params.queryReceipt !== this.#receipt || query !== this.#query || !isCurrent()) {
++      throw RequestError.invalidParams(undefined, "Stale or closed callback allocation");
++    }
++    if (this.#used.has(params.registrationId)) {
++      throw RequestError.invalidParams(
++        undefined,
++        "Callback registration identity is immutable and cannot be reused",
++      );
++    }
++    this.#used.add(params.registrationId);
++    // The caller cannot choose an alias belonging to a pending/user/plugin server.
++    const serverName = `intent-callback-${randomUUID()}`;
++    let dispatched = false;
++    let abandoned = false;
++    const response = (
++      status: CallbackRegistrationResponse["status"],
++      reason?: CallbackReason,
++      result: McpSetServersResult | null = null,
++    ): CallbackRegistrationResponse => ({
++      version: CALLBACK_VERSION,
++      sessionId: params.sessionId,
++      queryReceipt: this.#receipt,
++      registrationId: params.registrationId,
++      serverName,
++      status,
++      result,
++      ...(reason && { reason }),
++    });
++    const work = this.#tail.then(async () => {
++      if (abandoned || signal?.aborted) {
++        return response("not-dispatched", "cancelled");
++      }
++      if (!isCurrent()) {
++        return response("not-dispatched", "stale");
++      }
++      if (this.#blocked) {
++        return response("not-dispatched", "previous-outcome-uncertain-or-failed");
++      }
++      try {
++        // Include settings/plugin names in collision detection. This reads
++        // the same Query; it is not a new initialization or config write.
++        const status = await this.#query.mcpServerStatus();
++        if (abandoned || signal?.aborted) {
++          return response("not-dispatched", "cancelled");
++        }
++        if (!isCurrent()) {
++          return response("not-dispatched", "stale");
++        }
++        if (
++          !Array.isArray(status) ||
++          !status.every((entry) => record(entry) && typeof entry.name === "string")
++        ) {
++          return response("not-dispatched", "invalid-server-status");
++        }
++        if (this.#servers.has(serverName) || status.some((entry) => entry.name === serverName)) {
++          return response("not-dispatched", "registration-name-collision");
++        }
++        this.#servers.set(serverName, sdkServer(params.server));
++        dispatched = true;
++        const raw = await this.#query.setMcpServers(Object.fromEntries(this.#servers));
++        const result = sdkResult(raw);
++        if (!result) {
++          this.#blocked = true;
++          return response("uncertain", "invalid-sdk-result");
++        }
++        // A timeout/cancellation response is final even if the SDK later
++        // finishes. Never use that late finish to resume registration work.
++        if (!isCurrent()) {
++          return response("stale", "allocation-replaced-or-closed", result);
++        }
++        if (result.removed.length || Object.keys(result.errors).length) {
++          this.#blocked = true;
++          return response("failed", "sdk-reported-errors-or-removals", result);
++        }
++        if (!result.added.includes(serverName)) {
++          this.#blocked = true;
++          return response("uncertain", "registration-not-acknowledged", result);
++        }
++        return response("acknowledged", undefined, result);
++      } catch (error) {
++        if (dispatched) {
++          this.#blocked = true;
++        }
++        return response(dispatched ? "uncertain" : "not-dispatched", {
++          code: "sdk-error",
++          message: error instanceof Error ? error.message : String(error),
++        });
++      }
++    });
++    // Serialization follows the REAL SDK completion, not the caller's timer.
++    this.#tail = work.then(
++      () => {},
++      () => {},
++    );
++    return new Promise((resolve) => {
++      let settled = false;
++      const finish = (value: CallbackRegistrationResponse) => {
++        if (settled) {
++          return;
++        }
++        settled = true;
++        clearTimeout(timer);
++        signal?.removeEventListener("abort", cancel);
++        resolve(value);
++      };
++      const abandon = (reason: string) => {
++        abandoned = true;
++        if (dispatched) {
++          this.#blocked = true;
++        }
++        finish(response(dispatched ? "uncertain" : "not-dispatched", reason));
++      };
++      const cancel = () => abandon("cancelled");
++      const timer = setTimeout(() => abandon("timeout"), CALLBACK_TIMEOUT_MS);
++      signal?.addEventListener("abort", cancel, { once: true });
++      if (signal?.aborted) {
++        cancel();
++      }
++      work.then(finish, (error) =>
++        finish(response("uncertain", { code: "internal", message: String(error) })),
++      );
++    });
++  }
++}
+diff --git a/tests/callback-registration.test.mjs b/tests/callback-registration.test.mjs
+new file mode 100644
+index 0000000..a755271
+--- /dev/null
++++ b/tests/callback-registration.test.mjs
+@@ -0,0 +1,469 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { bareAgent, adapterFixture } from "./scripted-query.mjs";
++import { mcpPeer, deferred } from "./mcp-peer.mjs";
++import { readFileSync } from "node:fs";
++import { spawnSync } from "node:child_process";
++import { homedir } from "node:os";
++
++const METHOD = "_intent/session/register_mcp_callback";
++function request(opened, peer, registrationId = "fresh") {
++  return {
++    version: 1,
++    sessionId: opened.sessionId,
++    queryReceipt: opened._meta.intentCallbackRegistration.queryReceipt,
++    registrationId,
++    server: peer.config,
++  };
++}
++
++async function peer(t, tag) {
++  const p = await mcpPeer(tag);
++  t.after(() => p.close());
++  return p;
++}
++
++test("original initialize explicitly negotiates callback registration v1", async () => {
++  const agent = await bareAgent();
++  const init = await agent.initialize({
++    protocolVersion: 1,
++    clientCapabilities: {
++      _meta: { intentCallbackRegistration: { version: 1 } },
++    },
++  });
++  assert.deepEqual(init._meta.intentCallbackRegistration, {
++    version: 1,
++    method: "_intent/session/register_mcp_callback",
++  });
++});
++
++test("real dispatcher and SDK control deliver initialize/list/call on the same original Query", async (t) => {
++  const pending = await peer(t, "pending ordinary route");
++  const user = await peer(t, "user ordinary route");
++  const fresh = await peer(t, "fresh callback route");
++  const f = await adapterFixture(t);
++  const opened = await f.newSession([
++    ["workspace-mcp", pending],
++    ["user", user],
++  ]);
++  const original = f.agent.sessions[opened.sessionId].query;
++  const outcome = await f.rpc.request(METHOD, request(opened, fresh));
++  assert.equal(outcome.status, "acknowledged");
++  assert.equal(outcome.queryReceipt, opened._meta.intentCallbackRegistration.queryReceipt);
++  assert.equal(f.processes.length, 1);
++  assert.equal(f.processes[0].initializations, 1);
++  assert.equal(f.agent.sessions[opened.sessionId].query, original);
++  assert.deepEqual(outcome.result, { added: [outcome.serverName], removed: [], errors: {} });
++  const delivered = await f.processes[0].clients
++    .get(outcome.serverName)
++    .rpc.request("tools/call", { name: "probe", arguments: {} });
++  assert.equal(delivered.content[0].text, fresh.tag);
++  assert.deepEqual(
++    fresh.frames.map((x) => x.method),
++    ["initialize", "tools/list", "tools/call"],
++  );
++  const mutation = f.processes[0].frames.find(
++    (frame) => frame.request?.subtype === "mcp_set_servers",
++  );
++  assert.deepEqual(mutation.request.servers["workspace-mcp"].args, pending.config.args);
++  assert.deepEqual(mutation.request.servers.user.args, user.config.args);
++});
++
++function mutations(process) {
++  return process.frames.filter((frame) => frame.request?.subtype === "mcp_set_servers");
++}
++
++test("fixture permissions deny credential reads and any native child launch", () => {
++  assert.equal(process.env.NODE_OPTIONS, "");
++  assert.throws(() => readFileSync(`${homedir()}/.claude/settings.json`), {
++    code: "ERR_ACCESS_DENIED",
++  });
++  assert.throws(() => spawnSync(process.execPath, ["--version"]), { code: "ERR_ACCESS_DENIED" });
++});
++
++test("absent unsupported and malformed negotiation leave ordinary sessions unchanged", async (t) => {
++  for (const offered of [
++    undefined,
++    null,
++    false,
++    [],
++    "1",
++    { version: 2 },
++    { version: "1" },
++    { version: 1, extra: true },
++  ]) {
++    const capabilities =
++      offered === undefined ? {} : { _meta: { intentCallbackRegistration: offered } };
++    const f = await adapterFixture(t, capabilities);
++    assert.equal(f.init._meta.intentCallbackRegistration, undefined);
++    const opened = await f.newSession();
++    assert.equal(opened._meta, undefined);
++    const fresh = await peer(t, "unsupported route");
++    await assert.rejects(
++      f.rpc.request(METHOD, {
++        version: 1,
++        sessionId: opened.sessionId,
++        queryReceipt: "invented",
++        registrationId: "x",
++        server: fresh.config,
++      }),
++      /not negotiated/,
++    );
++    assert.equal(mutations(f.processes[0]).length, 0);
++    assert.equal(f.processes[0].initializations, 1);
++  }
++});
++
++test("malformed requests and invented receipts do not issue SDK mutation", async (t) => {
++  const f = await adapterFixture(t);
++  const opened = await f.newSession();
++  const fresh = await peer(t, "unused");
++  const valid = request(opened, fresh);
++  const invalid = [
++    null,
++    {},
++    { ...valid, version: 2 },
++    { ...valid, registrationId: "" },
++    { ...valid, queryReceipt: "different" },
++    { ...valid, extra: true },
++    { ...valid, server: { ...valid.server, env: { TOKEN: 1 } } },
++    { ...valid, server: { ...valid.server, name: "workspace-mcp" } },
++  ];
++  for (const params of invalid) await assert.rejects(f.rpc.request(METHOD, params));
++  assert.equal(mutations(f.processes[0]).length, 0);
++  const ok = await f.rpc.request(METHOD, valid);
++  assert.equal(ok.status, "acknowledged");
++  await assert.rejects(
++    f.rpc.request(METHOD, { ...valid, server: { ...valid.server, args: ["different"] } }),
++    /immutable/,
++  );
++  assert.equal(mutations(f.processes[0]).length, 1);
++});
++
++test("existing SDK/user entries and held old ordinary results survive new registration", async (t) => {
++  const pending = await peer(t, "old result");
++  const user = await peer(t, "SDK option user");
++  const fresh = await peer(t, "new result");
++  const f = await adapterFixture(t);
++  const opened = await f.newSession([["workspace-mcp", pending]], {
++    mcpServers: { user: user.config },
++  });
++  const originalClient = f.processes[0].clients.get("workspace-mcp");
++  const held = originalClient.rpc.request("tools/call", {
++    name: "probe",
++    arguments: { hold: true },
++  });
++  const call = await pending.callStarted.promise;
++  const added = await f.rpc.request(METHOD, request(opened, fresh));
++  assert.equal(added.status, "acknowledged");
++  assert.equal(f.processes[0].clients.get("workspace-mcp"), originalClient);
++  assert.equal(f.processes[0].clients.get("user").config.args[0], user.config.args[0]);
++  call.release.resolve();
++  assert.equal((await held).content[0].text, "old result");
++  assert.equal(
++    (await originalClient.rpc.request("tools/call", { name: "probe", arguments: {} })).content[0]
++      .text,
++    "old result",
++  );
++});
++
++test("per Query serialization retains all additions and snapshots queued request input", async (t) => {
++  const f = await adapterFixture(t);
++  const opened = await f.newSession();
++  const first = await peer(t, "first");
++  const second = await peer(t, "second");
++  const p = f.processes[0];
++  p.hold = deferred();
++  const a = f.rpc.request(METHOD, request(opened, first, "a"));
++  await p.setEntered.promise;
++  const queued = request(opened, second, "b");
++  queued.server = { ...queued.server, args: [...queued.server.args] };
++  const b = f.agent.registerMcpCallback(queued);
++  queued.server.args[0] = "retarget attempt";
++  assert.equal(mutations(p).length, 1);
++  p.hold.resolve();
++  const ra = await a;
++  const rb = await b;
++  assert.equal(ra.status, "acknowledged");
++  assert.equal(rb.status, "acknowledged");
++  assert.notEqual(ra.serverName, rb.serverName);
++  assert.deepEqual(mutations(p)[1].request.servers[ra.serverName].args, first.config.args);
++  assert.deepEqual(mutations(p)[1].request.servers[rb.serverName].args, second.config.args);
++});
++
++async function replace(f, opened) {
++  return f.agent.createSession(
++    { cwd: process.env.CALLBACK_TEST_ROOT, mcpServers: [] },
++    { reuseSessionId: opened.sessionId },
++  );
++}
++
++test("replacement during dispatch keeps the old outcome and rejects old queued work", async (t) => {
++  const f = await adapterFixture(t);
++  const opened = await f.newSession();
++  const originalSession = f.agent.sessions[opened.sessionId];
++  const old = await peer(t, "old");
++  const queued = await peer(t, "queued");
++  const fresh = await peer(t, "replacement");
++  const p = f.processes[0];
++  p.hold = deferred();
++  const a = f.rpc.request(METHOD, request(opened, old, "a"));
++  await p.setEntered.promise;
++  const b = f.agent.registerMcpCallback(request(opened, queued, "b"));
++  const replacement = await replace(f, opened);
++  assert.notEqual(
++    replacement._meta.intentCallbackRegistration.queryReceipt,
++    opened._meta.intentCallbackRegistration.queryReceipt,
++  );
++  const currentSession = f.agent.sessions[opened.sessionId];
++  assert.notEqual(currentSession, originalSession);
++  const current = await f.rpc.request(METHOD, request(replacement, fresh));
++  p.hold.resolve();
++  const oldResponse = await a;
++  assert.equal(oldResponse.status, "stale");
++  assert.deepEqual(oldResponse.result.added, [oldResponse.serverName]);
++  assert.equal((await b).status, "not-dispatched");
++  assert.equal(mutations(p).length, 1);
++  assert.equal(mutations(f.processes[1]).length, 1);
++  assert.equal(f.agent.sessions[opened.sessionId], currentSession);
++  assert.equal(
++    (
++      await f.processes[1].clients
++        .get(current.serverName)
++        .rpc.request("tools/call", { name: "probe", arguments: {} })
++    ).content[0].text,
++    "replacement",
++  );
++  await assert.rejects(f.rpc.request(METHOD, request(opened, old, "late")), /Stale/);
++});
++
++test("completed update then replacement leaves each registration on its original Query", async (t) => {
++  const f = await adapterFixture(t);
++  const opened = await f.newSession();
++  const old = await peer(t, "completed old");
++  const added = await f.rpc.request(METHOD, request(opened, old));
++  assert.equal(added.status, "acknowledged");
++  const newer = await replace(f, opened);
++  const fresh = await peer(t, "new physical allocation");
++  const current = await f.rpc.request(METHOD, request(newer, fresh));
++  assert.equal(current.status, "acknowledged");
++  await assert.rejects(f.rpc.request(METHOD, request(opened, old, "old-again")), /Stale/);
++  assert.equal(
++    (
++      await f.processes[0].clients
++        .get(added.serverName)
++        .rpc.request("tools/call", { name: "probe", arguments: {} })
++    ).content[0].text,
++    "completed old",
++  );
++  assert.equal(f.processes.length, 2);
++  assert.equal(mutations(f.processes[0]).length, 1);
++  assert.equal(mutations(f.processes[1]).length, 1);
++});
++
++test("replacement while status is pending never mutates the replacement or original", async (t) => {
++  const f = await adapterFixture(t);
++  const opened = await f.newSession();
++  const fresh = await peer(t, "not delivered");
++  const p = f.processes[0];
++  p.statusEntered = deferred();
++  p.statusHold = deferred();
++  const update = f.rpc.request(METHOD, request(opened, fresh));
++  await p.statusEntered.promise;
++  const newer = await replace(f, opened);
++  p.statusHold.resolve();
++  assert.equal((await update).status, "not-dispatched");
++  assert.equal(mutations(p).length, 0);
++  assert.equal(mutations(f.processes[1]).length, 0);
++  assert.equal(
++    f.agent.sessions[newer.sessionId].callbackRegistration.metadata().intentCallbackRegistration
++      .queryReceipt,
++    newer._meta.intentCallbackRegistration.queryReceipt,
++  );
++});
++
++test("per-server failure stays explicit and cannot trigger an implicit retry", async (t) => {
++  const f = await adapterFixture(t);
++  const opened = await f.newSession();
++  const bad = { config: { type: "stdio", command: "not-a-fixture", args: [] } };
++  const result = await f.rpc.request(METHOD, request(opened, bad));
++  assert.equal(result.status, "failed");
++  assert.match(result.result.errors[result.serverName], /native executable prohibited/);
++  const next = await f.rpc.request(METHOD, request(opened, bad, "next"));
++  assert.equal(next.status, "not-dispatched");
++  assert.equal(mutations(f.processes[0]).length, 1);
++});
++
++test("SDK failure and malformed acknowledgment preserve uncertain outcome without replay", async (t) => {
++  for (const kind of ["error", "invalid", "missing-add", "removed"]) {
++    const f = await adapterFixture(t);
++    const opened = await f.newSession();
++    const fresh = await peer(t, kind);
++    const p = f.processes[0];
++    if (kind === "error") p.error = "original control connection failure";
++    if (kind === "invalid") p.resultOverride = { unexpected: true };
++    if (kind === "missing-add") p.resultOverride = { added: [], removed: [], errors: {} };
++    if (kind === "removed")
++      p.resultOverride = { added: [], removed: ["original-user"], errors: {} };
++    const result = await f.rpc.request(METHOD, request(opened, fresh));
++    assert.equal(result.status, kind === "removed" ? "failed" : "uncertain");
++    if (kind === "error")
++      assert.equal(result.reason.message, "original control connection failure");
++    if (kind === "removed") assert.deepEqual(result.result.removed, ["original-user"]);
++    assert.equal(
++      (await f.rpc.request(METHOD, request(opened, fresh, "again"))).status,
++      "not-dispatched",
++    );
++    assert.equal(mutations(p).length, 1);
++  }
++});
++
++test("ACP wire cancellation after dispatch stays uncertain even after late SDK completion", async (t) => {
++  const f = await adapterFixture(t);
++  const opened = await f.newSession();
++  const fresh = await peer(t, "cancelled delivery");
++  const p = f.processes[0];
++  p.hold = deferred();
++  const id = f.rpc.next;
++  const update = f.rpc.request(METHOD, request(opened, fresh));
++  await p.setEntered.promise;
++  f.rpc.notify("$/cancel_request", { requestId: id });
++  const result = await update;
++  assert.equal(result.status, "uncertain");
++  assert.equal(result.reason, "cancelled");
++  const next = f.rpc.request(METHOD, request(opened, fresh, "after-cancel"));
++  assert.equal(mutations(p).length, 1);
++  p.hold.resolve();
++  assert.equal((await next).status, "not-dispatched");
++  assert.equal(mutations(p).length, 1);
++});
++
++test("queued cancellation never mutates and does not cancel the earlier operation", async (t) => {
++  const f = await adapterFixture(t);
++  const opened = await f.newSession();
++  const fresh = await peer(t, "first preserved");
++  const p = f.processes[0];
++  p.hold = deferred();
++  const first = f.rpc.request(METHOD, request(opened, fresh));
++  await p.setEntered.promise;
++  const abort = new AbortController();
++  const queued = f.agent.registerMcpCallback(request(opened, fresh, "queued-cancel"), abort.signal);
++  abort.abort();
++  assert.equal((await queued).status, "not-dispatched");
++  p.hold.resolve();
++  assert.equal((await first).status, "acknowledged");
++  assert.equal(mutations(p).length, 1);
++});
++
++test("bounded timeout does not release the SDK serialization or adopt its late success", async (t) => {
++  const f = await adapterFixture(t);
++  const opened = await f.newSession();
++  const fresh = await peer(t, "late result");
++  const p = f.processes[0];
++  p.hold = deferred();
++  const update = f.rpc.request(METHOD, request(opened, fresh));
++  await p.setEntered.promise;
++  const result = await update;
++  assert.equal(result.status, "uncertain");
++  assert.equal(result.reason, "timeout");
++  const queued = f.rpc.request(METHOD, request(opened, fresh, "after-timeout"));
++  assert.equal(mutations(p).length, 1);
++  p.hold.resolve();
++  assert.equal((await queued).status, "not-dispatched");
++  assert.equal(mutations(p).length, 1);
++});
++
++test("closed original Query rejects new delivery and preserves pending SDK error", async (t) => {
++  const f = await adapterFixture(t);
++  const opened = await f.newSession();
++  const fresh = await peer(t, "closed");
++  const p = f.processes[0];
++  p.hold = deferred();
++  const update = f.rpc.request(METHOD, request(opened, fresh));
++  await p.setEntered.promise;
++  f.agent.closeQueryStream(f.agent.sessions[opened.sessionId]);
++  const result = await update;
++  assert.equal(result.status, "uncertain");
++  assert.equal(result.reason.code, "sdk-error");
++  await assert.rejects(f.rpc.request(METHOD, request(opened, fresh, "closed-next")), /closed/);
++  assert.equal(mutations(p).length, 1);
++});
++
++test("original load response retains receipt without recreating the Query", async (t) => {
++  const f = await adapterFixture(t);
++  const opened = await f.newSession();
++  const session = f.agent.sessions[opened.sessionId];
++  const loaded = await f.rpc.request("session/load", {
++    ...session.creationParams,
++    sessionId: opened.sessionId,
++  });
++  assert.deepEqual(loaded._meta, opened._meta);
++  assert.equal(f.agent.sessions[opened.sessionId], session);
++  assert.equal(f.processes.length, 1);
++  assert.equal(f.processes[0].initializations, 1);
++  assert.equal(mutations(f.processes[0]).length, 0);
++});
++
++test("receipt from another connection with identical session ID cannot adopt its Query", async (t) => {
++  const first = await adapterFixture(t);
++  const opened = await first.newSession();
++  const other = await adapterFixture(t);
++  const otherOpened = await replace(other, opened);
++  assert.equal(otherOpened.sessionId, opened.sessionId);
++  const fresh = await peer(t, "other original Query");
++  await assert.rejects(other.rpc.request(METHOD, request(opened, fresh)), /Stale/);
++  assert.equal(mutations(other.processes[0]).length, 0);
++  const own = await other.rpc.request(METHOD, request(otherOpened, fresh));
++  assert.equal(own.status, "acknowledged");
++  assert.equal(mutations(first.processes[0]).length, 0);
++});
++
++test("later capability negotiation never upgrades an already exposed ordinary session", async (t) => {
++  const f = await adapterFixture(t, {});
++  const opened = await f.newSession();
++  const original = f.agent.sessions[opened.sessionId];
++  const init = await f.rpc.request("initialize", {
++    protocolVersion: 1,
++    clientCapabilities: { _meta: { intentCallbackRegistration: { version: 1 } } },
++  });
++  assert.equal(init._meta.intentCallbackRegistration.version, 1);
++  const fresh = await peer(t, "unavailable old session");
++  await assert.rejects(
++    f.rpc.request(METHOD, {
++      version: 1,
++      sessionId: opened.sessionId,
++      queryReceipt: "invented",
++      registrationId: "late",
++      server: fresh.config,
++    }),
++    /No original callback allocation/,
++  );
++  assert.equal(f.agent.sessions[opened.sessionId], original);
++  assert.equal(original.callbackRegistration, undefined);
++  assert.equal(mutations(f.processes[0]).length, 0);
++});
++
++test("typed capture keeps the SDK input frozen while retaining the original Query control", async (t) => {
++  const p = await peer(t, "typed immutable config");
++  const f = await adapterFixture(t);
++  const opened = await f.newSession([]);
++  const original = f.agent.sessions[opened.sessionId].query;
++  const set = original.setMcpServers.bind(original);
++  let observed = 0;
++  original.setMcpServers = (servers) => {
++    const entry = Object.entries(servers).find(([name]) => name.startsWith("intent-callback-"));
++    assert.ok(entry);
++    const [, server] = entry;
++    assert.equal(Object.isFrozen(server), true);
++    assert.equal(Object.isFrozen(server.args), true);
++    if (server.env) assert.equal(Object.isFrozen(server.env), true);
++    observed++;
++    return set(servers);
++  };
++  const outcome = await f.rpc.request(METHOD, request(opened, p));
++  assert.equal(outcome.status, "acknowledged");
++  assert.equal(observed, 1);
++  assert.equal(f.agent.sessions[opened.sessionId].query, original);
++  assert.equal(f.processes.length, 1);
++  assert.equal(f.processes[0].initializations, 1);
++});
+diff --git a/tests/mcp-peer.mjs b/tests/mcp-peer.mjs
+new file mode 100644
+index 0000000..e6d164b
+--- /dev/null
++++ b/tests/mcp-peer.mjs
+@@ -0,0 +1,126 @@
++import { createServer, connect } from "node:net";
++import { createInterface } from "node:readline";
++
++export function deferred() {
++  let resolve;
++  const promise = new Promise((r) => {
++    resolve = r;
++  });
++  return { promise, resolve };
++}
++
++export class RpcLines {
++  constructor(input, output) {
++    this.output = output;
++    this.pending = new Map();
++    this.frames = [];
++    this.next = 1;
++    this.lines = createInterface({ input });
++    this.lines.on("line", (line) => {
++      const frame = JSON.parse(line);
++      this.frames.push(frame);
++      const pending = this.pending.get(frame.id);
++      if (pending) {
++        this.pending.delete(frame.id);
++        if (frame.error) pending.reject(Object.assign(new Error(frame.error.message), frame.error));
++        else pending.resolve(frame.result);
++      }
++    });
++    this.lines.on("close", () => {
++      for (const pending of this.pending.values()) pending.reject(new Error("fixture peer closed"));
++      this.pending.clear();
++    });
++  }
++  request(method, params = {}) {
++    const id = this.next++;
++    const response = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
++    this.output.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
++    return response;
++  }
++  notify(method, params) {
++    this.output.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
++  }
++  close() {
++    this.lines.close();
++    this.output.end();
++  }
++}
++
++// Real loopback MCP JSON-RPC exchange. No native provider, auth or repository grant.
++export async function mcpPeer(tag) {
++  const sockets = new Set();
++  const frames = [];
++  const calls = [];
++  const callStarted = deferred();
++  const server = createServer((socket) => {
++    sockets.add(socket);
++    socket.on("error", () => {});
++    socket.on("close", () => sockets.delete(socket));
++    const lines = createInterface({ input: socket });
++    lines.on("line", async (line) => {
++      const frame = JSON.parse(line);
++      frames.push(frame);
++      let result;
++      if (frame.method === "initialize")
++        result = {
++          protocolVersion: "2024-11-05",
++          capabilities: { tools: {} },
++          serverInfo: { name: tag, version: "1" },
++        };
++      else if (frame.method === "tools/list")
++        result = { tools: [{ name: "probe", description: tag, inputSchema: { type: "object" } }] };
++      else if (frame.method === "tools/call") {
++        const call = { params: frame.params, entered: deferred(), release: deferred() };
++        calls.push(call);
++        callStarted.resolve(call);
++        call.entered.resolve();
++        if (frame.params.arguments?.hold) await call.release.promise;
++        result = { content: [{ type: "text", text: tag }], isError: false };
++      } else return;
++      socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: frame.id, result })}\n`);
++    });
++  });
++  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
++  const address = server.address();
++  return {
++    tag,
++    frames,
++    calls,
++    callStarted,
++    config: { type: "stdio", command: "fixture-mcp", args: [`127.0.0.1:${address.port}`] },
++    async close() {
++      for (const call of calls) call.release.resolve();
++      for (const socket of sockets) socket.destroy();
++      await new Promise((resolve) => server.close(resolve));
++    },
++  };
++}
++
++export async function connectMcp(config) {
++  if (config.command !== "fixture-mcp" || config.type !== "stdio")
++    throw new Error("native executable prohibited in fixture");
++  const match = /^127\.0\.0\.1:(\d+)$/.exec(config.args[0]);
++  if (!match) throw new Error("non-loopback target prohibited in fixture");
++  const socket = connect(Number(match[1]), "127.0.0.1");
++  await new Promise((resolve, reject) => {
++    socket.once("connect", resolve);
++    socket.once("error", reject);
++  });
++  socket.on("error", () => {});
++  const rpc = new RpcLines(socket, socket);
++  await rpc.request("initialize", {
++    protocolVersion: "2024-11-05",
++    capabilities: {},
++    clientInfo: { name: "scripted-control-peer", version: "1" },
++  });
++  const tools = await rpc.request("tools/list");
++  return {
++    rpc,
++    tools,
++    config,
++    close() {
++      rpc.close();
++      socket.destroy();
++    },
++  };
++}
+diff --git a/tests/run-hermetic.mjs b/tests/run-hermetic.mjs
+new file mode 100644
+index 0000000..ed80270
+--- /dev/null
++++ b/tests/run-hermetic.mjs
+@@ -0,0 +1,109 @@
++import { spawn, spawnSync } from "node:child_process";
++import assert from "node:assert/strict";
++import { createInterface } from "node:readline";
++import { mkdtempSync, mkdirSync, realpathSync, rmSync } from "node:fs";
++import { resolve } from "node:path";
++
++const root = resolve(import.meta.dirname, "..");
++const dependencies = realpathSync(`${root}/node_modules`);
++if (!dependencies.startsWith(`${root}/`))
++  throw new Error("Fixture dependencies must be self-contained");
++mkdirSync(`${root}/.dev`, { recursive: true });
++const scratch = mkdtempSync(`${root}/.dev/hermetic-`);
++const env = {
++  PATH: process.env.PATH,
++  CALLBACK_TEST_ROOT: scratch,
++  CLAUDE_CONFIG_DIR: `${scratch}/claude-config`,
++  XDG_CONFIG_HOME: `${scratch}/xdg`,
++  TMPDIR: scratch,
++  NODE_OPTIONS: "",
++  DD_TRACE_ENABLED: "false",
++  DD_INJECTION_ENABLED: "false",
++  DD_INSTRUMENT_SERVICE_WITH_APM: "false",
++  DD_INJECT_NATIVE: "never",
++  DD_INSTRUMENTATION_TELEMETRY_ENABLED: "false",
++  DO_NOT_TRACK: "1",
++  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
++};
++
++async function checkDefaultStdio() {
++  // This separate permission-confined process exercises the unchanged default
++  // stream path. Only CLI auth probing is replaced, just as in the Query fixture.
++  const code = `
++        import { runAcp } from './dist/lib.js';
++        const { agent } = runAcp({ log() {}, warn() {}, error() {} });
++        agent.probeCliAuthStatus = async () => {};
++    `;
++  const child = spawn(
++    process.execPath,
++    [
++      "--permission",
++      `--allow-fs-read=${root}`,
++      `--allow-fs-read=${dependencies}`,
++      `--allow-fs-write=${scratch}`,
++      "--input-type=module",
++      "--eval",
++      code,
++    ],
++    { cwd: root, env, stdio: ["pipe", "pipe", "pipe"] },
++  );
++  const lines = createInterface({ input: child.stdout });
++  const closed = new Promise((resolve) => child.once("close", resolve));
++  const timer = setTimeout(() => child.kill(), 5000);
++  try {
++    const reply = new Promise((resolve, reject) => {
++      child.once("error", reject);
++      child.once("exit", () => reject(new Error("Default stdio exited before initialize")));
++      lines.on("line", (line) => {
++        try {
++          const frame = JSON.parse(line);
++          if (frame.id === "ordinary-stdio") resolve(frame);
++        } catch (error) {
++          reject(error);
++        }
++      });
++    });
++    child.stdin.write(
++      JSON.stringify({
++        jsonrpc: "2.0",
++        id: "ordinary-stdio",
++        method: "initialize",
++        params: { protocolVersion: 1, clientCapabilities: {} },
++      }) + "\n",
++    );
++    const frame = await reply;
++    assert.equal(frame.error, undefined);
++    assert.equal(frame.result.protocolVersion, 1);
++    assert.equal(frame.result.agentInfo.name, "@agentclientprotocol/claude-agent-acp");
++    assert.equal(frame.result._meta.intentCallbackRegistration, undefined);
++    console.log("Default runAcp(logger) stdio initialize: passed");
++  } finally {
++    clearTimeout(timer);
++    lines.close();
++    child.stdin.end();
++    child.kill();
++    await closed;
++  }
++}
++try {
++  await checkDefaultStdio();
++  const result = spawnSync(
++    process.execPath,
++    [
++      "--permission",
++      `--allow-fs-read=${root}`,
++      `--allow-fs-read=${dependencies}`,
++      `--allow-fs-write=${scratch}`,
++      "--test",
++      "--test-isolation=none",
++      "--test-concurrency=1",
++      "--test-timeout=20000",
++      ...process.argv.slice(2),
++      "tests/callback-registration.test.mjs",
++    ],
++    { cwd: root, env, stdio: "inherit" },
++  );
++  process.exitCode = result.status ?? 1;
++} finally {
++  rmSync(scratch, { recursive: true, force: true });
++}
+diff --git a/tests/scripted-query.mjs b/tests/scripted-query.mjs
+new file mode 100644
+index 0000000..d1abd03
+--- /dev/null
++++ b/tests/scripted-query.mjs
+@@ -0,0 +1,212 @@
++import { EventEmitter } from "node:events";
++import { PassThrough, Readable, Writable } from "node:stream";
++import { createInterface } from "node:readline";
++import { ndJsonStream } from "@agentclientprotocol/sdk";
++import { ClaudeAcpAgent, runAcp } from "../dist/acp-agent.js";
++import { SettingsManager } from "../dist/settings.js";
++import { RpcLines, connectMcp, deferred } from "./mcp-peer.mjs";
++
++// Replace configuration discovery only. The real adapter's createSession,
++// Query constructor, control serialization and explicit dispatcher still run.
++SettingsManager.prototype.initialize = async function () {
++  this.initialized = true;
++  this.effective = {};
++};
++SettingsManager.prototype.getSettings = function () {
++  return this.effective;
++};
++
++export class ScriptedQueryProcess extends EventEmitter {
++  constructor(options) {
++    super();
++    this.stdin = new PassThrough();
++    this.stdout = new PassThrough();
++    this.killed = false;
++    this.exitCode = null;
++    this.frames = [];
++    this.clients = new Map();
++    this.initializations = 0;
++    this.hold = null;
++    this.resultOverride = null;
++    this.error = null;
++    this.onSet = null;
++    this.setEntered = deferred();
++    this.statusEntered = deferred();
++    this.statusHold = null;
++    this.options = options;
++    const index = options.args.indexOf("--mcp-config");
++    this.initial = index === -1 ? {} : JSON.parse(options.args[index + 1]).mcpServers;
++    this.lines = createInterface({ input: this.stdin });
++    this.lines.on("line", (line) => {
++      const frame = JSON.parse(line);
++      this.frames.push(frame);
++      if (frame.type === "control_request") {
++        this.handle(frame).then(
++          (response) => this.respond(frame, response),
++          (error) => this.respond(frame, null, error.message),
++        );
++      }
++    });
++    this.stdin.on("end", () => this.kill());
++  }
++  respond(frame, response, error) {
++    if (this.killed) return;
++    this.stdout.write(
++      `${JSON.stringify({
++        type: "control_response",
++        response: {
++          subtype: error ? "error" : "success",
++          request_id: frame.request_id,
++          ...(error ? { error } : { response }),
++        },
++      })}\n`,
++    );
++  }
++  async add(name, config) {
++    if (this.clients.has(name)) {
++      if (JSON.stringify(this.clients.get(name).config) !== JSON.stringify(config))
++        throw new Error("fixture detected alias redirection");
++      return false;
++    }
++    this.clients.set(name, await connectMcp(config));
++    return true;
++  }
++  async handle(frame) {
++    const request = frame.request;
++    if (request.subtype === "initialize") {
++      this.initializations++;
++      for (const [name, config] of Object.entries(this.initial)) await this.add(name, config);
++      return {
++        commands: [],
++        models: [{ value: "fixture-model", displayName: "Fixture", description: "local fixture" }],
++        account: {},
++      };
++    }
++    if (request.subtype === "mcp_status") {
++      this.statusEntered.resolve();
++      if (this.statusHold) await this.statusHold.promise;
++      return {
++        mcpServers: [...this.clients.keys()].map((name) => ({ name, status: "connected" })),
++      };
++    }
++    if (request.subtype === "mcp_set_servers") {
++      this.setEntered.resolve(request);
++      this.onSet?.(request);
++      if (this.hold) await this.hold.promise;
++      if (this.error) throw new Error(this.error);
++      const added = [];
++      const errors = {};
++      const removed = [];
++      for (const name of this.clients.keys()) {
++        if (!(name in request.servers)) removed.push(name);
++      }
++      for (const [name, config] of Object.entries(request.servers)) {
++        try {
++          if (await this.add(name, config)) added.push(name);
++        } catch (error) {
++          errors[name] = error.message;
++        }
++      }
++      return this.resultOverride ?? { added, removed, errors };
++    }
++    if (["set_permission_mode", "set_model", "apply_flag_settings"].includes(request.subtype))
++      return {};
++    if (request.subtype === "interrupt") return {};
++    throw new Error(`unexpected control request: ${request.subtype}`);
++  }
++  kill() {
++    if (this.killed) return true;
++    this.killed = true;
++    this.exitCode = 0;
++    this.hold?.resolve();
++    this.statusHold?.resolve();
++    for (const client of this.clients.values()) client.close();
++    this.lines.close();
++    this.stdout.end();
++    this.emit("exit", 0, null);
++    return true;
++  }
++}
++
++const quiet = { log() {}, error() {}, warn() {}, debug() {} };
++
++export async function adapterFixture(
++  t,
++  capabilities = { _meta: { intentCallbackRegistration: { version: 1 } } },
++) {
++  const input = new PassThrough();
++  const output = new PassThrough();
++  const stream = ndJsonStream(Writable.toWeb(output), Readable.toWeb(input));
++  const { agent, connection } = runAcp(quiet, stream);
++  const processes = [];
++  const originalCreate = agent.createSession.bind(agent);
++  let authProbes = 0;
++  const allocated = [];
++  agent.probeCliAuthStatus = async () => {
++    authProbes++;
++    return null;
++  };
++  agent.claudeSubscriptionGuardActive = () => false;
++  agent.sendAvailableCommandsUpdate = async () => {};
++  agent.createSession = async (params, options) => {
++    const result = await originalCreate(
++      {
++        ...params,
++        _meta: {
++          ...params._meta,
++          claudeCode: {
++            options: {
++              ...params._meta?.claudeCode?.options,
++              settingSources: [],
++              spawnClaudeCodeProcess(spawnOptions) {
++                const process = new ScriptedQueryProcess(spawnOptions);
++                processes.push(process);
++                return process;
++              },
++            },
++          },
++        },
++      },
++      options,
++    );
++    allocated.push(agent.sessions[result.sessionId]);
++    return result;
++  };
++  const rpc = new RpcLines(output, input);
++  t.after(async () => {
++    for (const process of processes) process.kill();
++    for (const session of allocated) agent.closeQueryStream(session);
++    rpc.close();
++    output.end();
++    await connection.disconnect?.();
++  });
++  const init = await rpc.request("initialize", {
++    protocolVersion: 1,
++    clientCapabilities: capabilities,
++  });
++  return {
++    agent,
++    rpc,
++    init,
++    processes,
++    authProbes: () => authProbes,
++    async newSession(servers = [], options = {}) {
++      return rpc.request("session/new", {
++        cwd: process.env.CALLBACK_TEST_ROOT,
++        mcpServers: servers.map(([name, peer]) => ({
++          name,
++          command: peer.config.command,
++          args: peer.config.args,
++          env: [],
++        })),
++        _meta: { claudeCode: { options } },
++      });
++    },
++  };
++}
++
++export async function bareAgent() {
++  const agent = new ClaudeAcpAgent({}, quiet);
++  agent.probeCliAuthStatus = async () => null;
++  return agent;
++}

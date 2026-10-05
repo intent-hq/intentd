@@ -1,8 +1,10 @@
 //! Shared test support for the intentd / intentd-sitter integration suites.
 //!
 //! Workspace-internal and never published: pull it in as a `[dev-dependencies]`
-//! entry only. It owns the two helpers every e2e suite that spawns a daemon,
-//! sitter, or fake sidecar used to hand-roll privately:
+//! entry only. It owns the scaffolding the source-scanning lints share
+//! ([`source_lint`]: lexer, `#[cfg(test)]` blanking, statement splitting,
+//! opt-out markers, workspace walkers) and the two helpers every e2e suite
+//! that spawns a daemon, sitter, or fake sidecar used to hand-roll privately:
 //!
 //! - [`GuardedChild`] (unix only): a [`std::process::Child`] spawned as the
 //!   leader of its own process group and torn down — the whole group and
@@ -33,6 +35,7 @@
 mod barrier;
 #[cfg(unix)]
 mod guarded_child;
+pub mod source_lint;
 
 pub use barrier::Barrier;
 #[cfg(unix)]

@@ -40,6 +40,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>, title: &str) ->
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: path.as_ref().map(|p| p.to_string_lossy().to_string()),
         repository_path: None,
@@ -1350,7 +1351,7 @@ async fn non_chief_agent_ws_app_gating_error() {
         .as_str()
         .expect("error should be a string");
     assert!(
-        error_msg.contains("ws.app.* is only available in the Chief of Staff workspace"),
+        error_msg.contains("ws.app.* is only available in the Assistant workspace"),
         "Expected gating error message in tool output, got: {error_msg}"
     );
 

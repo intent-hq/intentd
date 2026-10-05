@@ -173,7 +173,7 @@ case "$1" in
     ;;
   serve)
     printf '{{"listenAddr":"tc-%s"}}\n' "$(cat "$key")"
-    sleep 600
+    exec sleep 600
     ;;
 esac
 "#
@@ -471,6 +471,7 @@ async fn seed_workspace(data_dir: &Path) -> String {
         created_at: timestamp.clone(),
         updated_at: timestamp,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,

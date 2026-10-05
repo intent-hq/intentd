@@ -1,4 +1,4 @@
-//! Commit creation (`git.commit` / `git.agentCommit`).
+//! Commit creation for agent commits and accept-changes.
 //!
 //! Ports `gitService.commit`: a commit is built from the current index
 //! (already-staged changes) using the repository's configured identity, mirroring
@@ -48,11 +48,25 @@ fn pending_merge_heads(repo: &mut Repository) -> Result<Vec<git2::Oid>> {
     Ok(heads)
 }
 
+/// Whether `MERGE_HEAD` names an incoming parent for a pending merge.
+/// Used by staged-only callers because a merge can have no changed paths.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the repository or its merge heads cannot be read.
+pub fn has_pending_merge(worktree_path: &Path) -> Result<bool> {
+    let mut repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    Ok(!pending_merge_heads(&mut repo)?.is_empty())
+}
+
 /// The outcome of creating a commit: the new commit SHA and the files it changed.
 #[derive(Debug, Clone)]
 pub struct CommitOutcome {
     pub hash: String,
     pub files: Vec<String>,
+    /// The commit exists, but its path-specific index refresh failed. Callers
+    /// must retain the receipt and report this separately, never retry the commit.
+    pub index_refresh_error: Option<String>,
 }
 
 /// Create a commit from the current index (already-staged changes), mirroring
@@ -69,6 +83,19 @@ pub struct CommitOutcome {
 ///
 /// Returns `Error::Internal` if there is nothing staged to commit or another libgit2 operation fails.
 pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
+    commit_observed(worktree_path, message, |_| {})
+}
+
+/// Commit with an original-operation observation immediately after the actual
+/// commit primitive, before fallible attribution and merge cleanup.
+/// The observer records completion only; it must not dispatch another stage.
+/// # Errors
+/// Preserves the ordinary commit errors, including failures after observation.
+pub fn commit_observed(
+    worktree_path: &Path,
+    message: &str,
+    observed: impl FnOnce(&str),
+) -> Result<CommitOutcome> {
     let mut repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let merge_heads = pending_merge_heads(&mut repo)?;
     let mut index = repo.index().map_err(map_git_err)?;
@@ -95,11 +122,15 @@ pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
         }
     }
 
+    // Calculate the receipt from the immutable trees before advancing HEAD.
+    // A metadata error must not hide the SHA of an already-created commit.
+    let files = changed_files(&repo, parent.as_ref(), &tree)?;
     let sig = repo.signature().map_err(map_git_err)?;
     let parents: Vec<&Commit> = parent.iter().chain(merge_parents.iter()).collect();
     let oid = repo
         .commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
         .map_err(map_git_err)?;
+    observed(&oid.to_string());
     if !merge_parents.is_empty() {
         // Drop MERGE_HEAD/MERGE_MSG etc. so the repo leaves the merging
         // state, exactly like `git commit` finishing a merge. The merge
@@ -111,17 +142,17 @@ pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
         }
     }
 
-    let files = changed_files(&repo, parent.as_ref(), &tree)?;
     Ok(CommitOutcome {
         hash: oid.to_string(),
         files,
+        index_refresh_error: None,
     })
 }
 
 /// Create a commit whose body carries attribution trailers, building the message
 /// via [`build_commit_message`] before committing the staged index. Mirrors
 /// [`commit`] except for the trailer-aware message; used by the agent commit path
-/// while bare [`commit`] backs `git.commit`.
+/// while bare [`commit`] also serves accept-changes.
 ///
 /// # Errors
 ///
@@ -143,6 +174,8 @@ pub fn commit_with_trailers(
 /// attribution-filtered `git.agentCommit` fallback so another actor's staged
 /// work cannot ride along. `paths` are worktree-relative; a path missing from
 /// the working tree is committed as a deletion.
+/// After commit creation, an index-refresh failure is returned in the outcome
+/// alongside the original SHA and files, rather than hiding the committed result.
 ///
 /// # Errors
 ///
@@ -217,6 +250,8 @@ pub fn commit_paths_with_trailers(
         }
     }
 
+    // Resolve fallible receipt metadata before creating the commit.
+    let files = changed_files(&repo, parent.as_ref(), &tree)?;
     let sig = repo.signature().map_err(map_git_err)?;
     let parents: Vec<&Commit> = parent.iter().collect();
     let oid = repo
@@ -228,21 +263,23 @@ pub fn commit_paths_with_trailers(
     // they read as clean against the new HEAD. `read(true)` drops the
     // in-memory tree built above and reloads the real index first, keeping
     // every other entry (including other actors' staged work) intact.
-    index.read(true).map_err(map_git_err)?;
-    for raw in paths {
-        let rel = Path::new(raw);
-        if workdir.join(rel).exists() {
-            index.add_path(rel).map_err(map_git_err)?;
-        } else {
-            index.remove_path(rel).map_err(map_git_err)?;
+    let refresh = (|| -> std::result::Result<(), git2::Error> {
+        index.read(true)?;
+        for raw in paths {
+            let rel = Path::new(raw);
+            if workdir.join(rel).exists() {
+                index.add_path(rel)?;
+            } else {
+                index.remove_path(rel)?;
+            }
         }
-    }
-    index.write().map_err(map_git_err)?;
+        index.write()
+    })();
 
-    let files = changed_files(&repo, parent.as_ref(), &tree)?;
     Ok(CommitOutcome {
         hash: oid.to_string(),
         files,
+        index_refresh_error: refresh.err().map(|e| map_git_err(e).to_string()),
     })
 }
 
@@ -386,6 +423,43 @@ mod tests {
     }
 
     #[test]
+    fn commit_metadata_failure_does_not_advance_head() {
+        let dir = init_repo("commit-metadata-failure");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        write_file(dir.path(), "a.txt", "hi\n");
+        stage(dir.path(), &["a.txt".to_string()]).unwrap();
+        let (head, tree_path) = {
+            let repo = Repository::open(dir.path()).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let tree = parent.tree_id().to_string();
+            (
+                parent.id(),
+                repo.path()
+                    .join("objects")
+                    .join(&tree[..2])
+                    .join(&tree[2..]),
+            )
+        };
+        // A missing parent tree makes changed-file reporting fail while the
+        // parent commit and newly staged tree remain valid commit inputs.
+        // Only this disposable repository is corrupted.
+        std::fs::remove_file(tree_path).unwrap();
+        let error = commit(dir.path(), "must not commit").unwrap_err();
+        assert!(error.to_string().contains("object not found"), "{error}");
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(
+            repo.head().unwrap().target(),
+            Some(head),
+            "a metadata failure must not hide a successful commit"
+        );
+        assert!(repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("a.txt"), 0)
+            .is_some());
+    }
+
+    #[test]
     fn build_commit_message_agent_id_only() {
         let msg = build_commit_message("Fix bug", Some("agent-123"), None);
         assert_eq!(msg, "Fix bug\n\nAgent-Id: agent-123");
@@ -427,6 +501,58 @@ mod tests {
     }
 
     #[test]
+    fn commit_paths_retains_receipt_when_index_is_locked() {
+        let dir = init_repo("commit-paths-index-locked");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        write_file(dir.path(), "staged.txt", "other actor\n");
+        stage(dir.path(), &["staged.txt".to_string()]).unwrap();
+        write_file(dir.path(), "mine.txt", "mine\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let parent = repo.head().unwrap().target().unwrap();
+        let index_before = std::fs::read(repo.path().join("index")).unwrap();
+        // This disposable lock allows commit creation but prevents the final
+        // index write. No timing, permissions, or production repository involved.
+        let lock = repo.path().join("index.lock");
+        std::fs::write(&lock, "held by test\n").unwrap();
+
+        let result = commit_paths_with_trailers(
+            dir.path(),
+            "scoped",
+            Some("agent-1"),
+            None,
+            &["mine.txt".to_string()],
+        );
+        let committed = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_ne!(committed.id(), parent);
+        assert_eq!(committed.parent_count(), 1);
+        assert_eq!(committed.parent_id(0).unwrap(), parent);
+        assert_eq!(
+            std::fs::read(repo.path().join("index")).unwrap(),
+            index_before
+        );
+        assert!(committed.tree().unwrap().get_name("staged.txt").is_none());
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), "held by test\n");
+        let outcome = result.expect("an index-refresh failure must retain the commit receipt");
+        assert!(
+            outcome
+                .index_refresh_error
+                .as_deref()
+                .unwrap()
+                .contains("locked"),
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.hash, committed.id().to_string());
+        assert_eq!(outcome.files, vec!["mine.txt".to_string()]);
+
+        std::fs::remove_file(lock).unwrap();
+        // A later HEAD must not replace the original operation's identity.
+        stage(dir.path(), &["mine.txt".to_string()]).unwrap();
+        let later = commit(dir.path(), "other actor's staged change").unwrap();
+        assert_ne!(outcome.hash, later.hash);
+        assert_eq!(outcome.hash, committed.id().to_string());
+    }
+
+    #[test]
     fn commit_paths_leaves_unrelated_staged_entries_out_of_the_commit() {
         // Another actor pre-staged `staged.txt`; committing only `mine.txt`
         // must not sweep it in, and it must stay staged afterwards.
@@ -445,6 +571,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.files, vec!["mine.txt".to_string()]);
+        assert!(out.index_refresh_error.is_none());
 
         let st = crate::status::status(dir.path()).unwrap();
         let staged_entry = st

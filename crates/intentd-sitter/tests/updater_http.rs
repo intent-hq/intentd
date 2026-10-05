@@ -66,6 +66,30 @@ fn make_tar_xz(bin_contents: &[u8]) -> Vec<u8> {
             bin_contents,
         )
         .unwrap();
+    // Modern release fixtures include the sidecar required before activation.
+    for (name, contents) in [
+        (
+            if cfg!(windows) {
+                "tailcat.exe"
+            } else {
+                "tailcat"
+            },
+            b"sidecar".as_slice(),
+        ),
+        ("tailcat.LICENSE", b"license".as_slice()),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                format!("intentd-{TARGET_TRIPLE}/libexec/{name}"),
+                contents,
+            )
+            .unwrap();
+    }
     builder.into_inner().unwrap().finish().unwrap()
 }
 

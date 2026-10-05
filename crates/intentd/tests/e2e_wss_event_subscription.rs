@@ -111,16 +111,23 @@ async fn create_agent(rpc: &mut PlainWs, id: i64, ws_id: &str, name: &str) -> St
         .to_string()
 }
 
-/// Serialized conversation text for an agent (empty string when no messages).
-async fn conversation_text(rpc: &mut PlainWs, id: i64, ws_id: &str, agent_id: &str) -> String {
-    let convo = wss_rpc(
+/// The `agent.getConversation` page for an agent.
+async fn conversation_page(rpc: &mut PlainWs, id: i64, ws_id: &str, agent_id: &str) -> Value {
+    wss_rpc(
         rpc,
         id,
         "agent.getConversation",
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
     )
-    .await;
-    convo.to_string()
+    .await
+}
+
+/// Serialized conversation text for an agent (substring assertions only —
+/// cross-time equality goes through `common::conversation_fingerprint`).
+async fn conversation_text(rpc: &mut PlainWs, id: i64, ws_id: &str, agent_id: &str) -> String {
+    conversation_page(rpc, id, ws_id, agent_id)
+        .await
+        .to_string()
 }
 
 /// Subscribe over the wire with a subscriber `agentId`, drive a matching
@@ -229,9 +236,13 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
 
     // … and a further matching event no longer delivers. Settle first so any
     // batch already in flight when the delivery task was aborted lands
-    // before the baseline read (review: flake window).
+    // before the baseline read (review: flake window). Compare row
+    // fingerprints, not raw payloads: the read-time `author` projection may
+    // hydrate between the two reads and must not count as a wake (#5603).
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let baseline = conversation_text(&mut rpc, 101, &ws_id, &subscriber).await;
+    let baseline = common::conversation_fingerprint(
+        &conversation_page(&mut rpc, 101, &ws_id, &subscriber).await,
+    );
     wss_rpc(
         &mut rpc,
         102,
@@ -240,10 +251,13 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let after = conversation_text(&mut rpc, 103, &ws_id, &subscriber).await;
-    assert_eq!(
-        baseline, after,
-        "no wake may be delivered after unsubscribe"
+    let after = common::conversation_fingerprint(
+        &conversation_page(&mut rpc, 103, &ws_id, &subscriber).await,
+    );
+    assert!(
+        baseline == after,
+        "no wake may be delivered after unsubscribe; changed rows:\n{}",
+        common::fingerprint_diff(&baseline, &after)
     );
 
     // Unknown id → error (kept response contract).

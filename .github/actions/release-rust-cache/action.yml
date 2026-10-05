@@ -1,0 +1,117 @@
+name: Restore release Rust cache
+description: Bounded sccache archives shared by main producers and tag consumers.
+inputs:
+  flavor:
+    description: daemon-dist or sitter-release (never shared across profiles)
+    required: true
+  target:
+    description: Single Rust target triple
+    required: true
+  runner:
+    description: Runner image label from the release matrix
+    required: true
+  generation:
+    description: Producer-only unique run ID and attempt; leave empty in restore-only consumers
+    default: ''
+  disable-annotations:
+    description: Producers capture statistics before stopping the server
+    default: 'false'
+outputs:
+  key:
+    description: Exact key for the producer save step
+    value: ${{ steps.key.outputs.key }}
+  cache-hit:
+    description: Whether the exact dependency generation was found
+    value: ${{ steps.restore.outputs.cache-hit }}
+  matched-key:
+    description: Restored archive identity, empty on a cold miss
+    value: ${{ steps.restore.outputs.cache-matched-key }}
+  directory:
+    description: Only directory permitted in the producer save
+    value: ${{ steps.key.outputs.directory }}
+runs:
+  using: composite
+  steps:
+    # Provision the pinned Rust toolchain BEFORE calling this action.
+    # No Cargo registry, target directory, binary, or release artifact is cached.
+    # sccache independently validates compiler, flags and source contents; a
+    # dependency-prefix restore is a seed, never evidence of a compiler hit.
+    - name: Set cache identity and compiler wrapper
+      id: key
+      shell: bash
+      env:
+        CACHE_FLAVOR: ${{ inputs.flavor }}
+        CACHE_TARGET: ${{ inputs.target }}
+        CACHE_RUNNER: ${{ inputs.runner }}
+        TOOLCHAIN: ${{ hashFiles('rust-toolchain.toml') }}
+        BUILD_INPUTS: ${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.cargo/config*', 'dist-workspace.toml', '**/build.rs', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h', '.github/dist-build-setup.yml', '.github/actions/release-rust-cache/**/*', '.github/workflows/release-cache.yml', '.github/workflows/release-sitter.yml', 'scripts/*release*cache*.py') }}
+        CACHE_GENERATION: ${{ inputs.generation }}
+      run: |
+        case "$CACHE_FLAVOR" in daemon-dist|sitter-release) ;; *) exit 1 ;; esac
+        case "$CACHE_TARGET" in aarch64-apple-darwin|x86_64-apple-darwin|aarch64-unknown-linux-musl|x86_64-unknown-linux-musl|x86_64-pc-windows-msvc) ;; *) exit 1 ;; esac
+        case "$CACHE_RUNNER" in macos-14|gh-linux-16x|windows-2022|gh-windows-16x) ;; *) exit 1 ;; esac
+        test -n "$TOOLCHAIN"
+        test -n "$BUILD_INPUTS"
+        generation=${CACHE_GENERATION:-}
+        if [[ -n "$generation" && ! "$generation" =~ ^[0-9]+-[0-9]+$ ]]; then
+          echo 'generation must be a numeric run ID and attempt' >&2
+          exit 1
+        fi
+        directory="$RUNNER_TEMP/intentd-release-sccache"
+        prefix="intentd-release-v1-$CACHE_FLAVOR-$CACHE_TARGET-$CACHE_RUNNER--$TOOLCHAIN-"
+        {
+          echo "directory=$directory"
+          echo "prefix=$prefix"
+          echo "input-prefix=$prefix$BUILD_INPUTS-"
+          # No producer saves the lookup sentinel. Consumers prefix-match the
+          # newest committed generation instead of pinning an old exact key.
+          echo "key=$prefix$BUILD_INPUTS-${generation:-lookup}"
+        } >> "$GITHUB_OUTPUT"
+        # The daemon graph exceeds the archive cap. Writing early misses into
+        # that small cache evicts restored late dependencies before their turn.
+        # Tags preserve the seed; main producers need bounded working room to
+        # refresh it. The producer still trims to 256 MiB BEFORE every upload.
+        size=256M
+        mode=READ_WRITE
+        if [[ "$CACHE_FLAVOR" == daemon-dist ]]; then
+          if [[ -n "$generation" ]]; then
+            size=2G
+          else
+            mode=READ_ONLY
+          fi
+        fi
+        {
+          echo "SCCACHE_DIR=$directory"
+          echo "SCCACHE_CACHE_SIZE=$size"
+          echo "SCCACHE_LOCAL_RW_MODE=$mode"
+          echo 'SCCACHE_GHA_ENABLED=false'
+          echo 'CARGO_INCREMENTAL=0'
+          echo 'RUSTC_WRAPPER=sccache'
+        } >> "$GITHUB_ENV"
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@d651010b8da762cde178750d8eda7b5febfe147a # v0.0.9
+      with:
+        version: v0.17.0
+        disable_annotations: ${{ inputs.disable-annotations }}
+    - name: Restore compiler entries
+      id: restore
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ steps.key.outputs.directory }}
+        key: ${{ steps.key.outputs.key }}
+        restore-keys: |
+          ${{ steps.key.outputs.input-prefix }}
+          ${{ steps.key.outputs.prefix }}
+    # Consumers use a lookup sentinel, so cache-hit (exact match) is false even
+    # when an archive was restored by prefix. Compiler hits are separate stats
+    # reported by sccache after the build; restore logs include bytes and time.
+    - name: Report restored archive
+      shell: bash
+      env:
+        CACHE_MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+      run: |
+        echo "Restored archive: ${CACHE_MATCHED_KEY:-none} (compiler hits are reported separately)" >> "$GITHUB_STEP_SUMMARY"
+        echo "Compiler cache mode: ${SCCACHE_LOCAL_RW_MODE:-READ_WRITE}; working limit: ${SCCACHE_CACHE_SIZE:-256M}; saved entry limit: 256 MiB." >> "$GITHUB_STEP_SUMMARY"
+        if [[ "${SCCACHE_LOCAL_RW_MODE:-}" == READ_ONLY ]]; then
+          echo 'Daemon seed is read-only to prevent eviction before reuse. sccache 0.17 reports intentionally rejected miss writes as cache-write errors; raw statistics are preserved.' >> "$GITHUB_STEP_SUMMARY"
+        fi

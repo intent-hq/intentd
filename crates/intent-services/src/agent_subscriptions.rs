@@ -33,6 +33,8 @@
 
 use std::sync::Arc;
 
+use std::collections::{HashMap, HashSet};
+
 use intent_store::{PersistedCompletionWatch, PersistedDelegationGroup, Store};
 
 use intent_core::{now_iso, AgentId, Error, Event, Result, WorkspaceId};
@@ -63,11 +65,50 @@ pub(crate) enum GroupPersistOp {
 type GroupPersistAck = oneshot::Sender<Result<()>>;
 
 /// Sender half of the group persistence lane (see [`GroupPersistOp`]).
-pub(crate) type GroupPersistSender =
-    mpsc::UnboundedSender<(GroupPersistOp, Option<GroupPersistAck>)>;
+type GroupPersistSender = mpsc::UnboundedSender<(GroupPersistOp, Option<GroupPersistAck>)>;
+
+/// The ordered lane has its own owner: its receiver must remain available while
+/// finite producers drain, including producers awaiting an acknowledgement.
+/// Close it only after those producers have settled.
+pub(crate) struct GroupPersistLane {
+    sender: std::sync::Mutex<Option<GroupPersistSender>>,
+    worker: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl GroupPersistLane {
+    fn new(store: Store) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self {
+            sender: std::sync::Mutex::new(Some(tx)),
+            worker: tokio::sync::Mutex::new(Some(intent_core::spawn_daemon(
+                run_group_persist_lane(store, rx),
+            ))),
+        }
+    }
+
+    fn send(&self, op: GroupPersistOp, ack: Option<GroupPersistAck>) {
+        let sender = self.sender.lock().unwrap();
+        if sender.as_ref().is_none_or(|tx| tx.send((op, ack)).is_err()) {
+            tracing::warn!("delegation_group persistence lane closed; write refused");
+        }
+    }
+
+    async fn shutdown(&self) {
+        self.sender.lock().unwrap().take();
+        // Serialize drainers and retain the handle if an awaiting caller is
+        // cancelled. No cloned sender may outlive the admission mutex above.
+        let mut worker = self.worker.lock().await;
+        if let Some(handle) = worker.as_mut() {
+            if let Err(error) = handle.await {
+                tracing::error!(%error, "delegation_group persistence worker failed");
+            }
+        }
+        worker.take();
+    }
+}
 
 /// The lane worker: drains ops strictly in enqueue order, one at a time.
-/// Exits when the last [`Services`] clone drops its sender.
+/// Shutdown closes admission, drains all accepted ops and joins this worker.
 async fn run_group_persist_lane(
     store: Store,
     mut rx: mpsc::UnboundedReceiver<(GroupPersistOp, Option<GroupPersistAck>)>,
@@ -242,6 +283,15 @@ pub(crate) fn check_watch_scope(
     Ok(())
 }
 
+/// Restored startup bookkeeping awaiting reconciliation after listener readiness.
+/// Contains identifiers only; durable rows remain the recovery record on shutdown.
+#[derive(Default)]
+pub struct StartupCompletionRecovery {
+    groups: Vec<String>,
+    children: Vec<(AgentId, WorkspaceId)>,
+    watch_ids: HashSet<String>,
+}
+
 impl Services {
     /// Register a parent→child completion watch and return its subscription id.
     ///
@@ -262,6 +312,8 @@ impl Services {
         child_agent_id: AgentId,
         group_id: Option<String>,
     ) -> Result<String> {
+        let parent = self.workspace_mutations.enter(parent_workspace_id)?;
+        let child = self.workspace_mutations.enter(child_workspace_id)?;
         let watch = self.insert_watch_in_memory(
             parent_workspace_id,
             child_workspace_id,
@@ -276,7 +328,7 @@ impl Services {
         // adopt path this upserts the existing row's mutable columns
         // (group_id) so the strengthened mode is restart-durable.
         let id = watch.id.clone();
-        self.persist_completion_watch(&watch);
+        self.persist_completion_watch(&watch, (parent, child));
         Ok(id)
     }
 
@@ -298,6 +350,8 @@ impl Services {
         child_agent_id: AgentId,
         group_id: Option<String>,
     ) -> Result<String> {
+        let _parent = self.workspace_mutations.enter(parent_workspace_id)?;
+        let _child = self.workspace_mutations.enter(child_workspace_id)?;
         let watch = self.insert_watch_in_memory(
             parent_workspace_id,
             child_workspace_id,
@@ -329,6 +383,8 @@ impl Services {
         parent_agent_name: String,
         child_agent_id: AgentId,
     ) -> Result<String> {
+        let _parent = self.workspace_mutations.enter(parent_workspace_id)?;
+        let _child = self.workspace_mutations.enter(child_workspace_id)?;
         check_watch_scope(parent_workspace_id, child_workspace_id)?;
         let _registration = self.completion_watch_registration_gate.lock().await;
         if let Some(existing) = self
@@ -387,6 +443,8 @@ impl Services {
         parent_agent_name: String,
         child_agent_id: AgentId,
     ) -> Result<String> {
+        let _parent = self.workspace_mutations.enter(parent_workspace_id)?;
+        let _child = self.workspace_mutations.enter(child_workspace_id)?;
         let watch = self.insert_watch_in_memory(
             parent_workspace_id,
             child_workspace_id,
@@ -648,7 +706,7 @@ impl Services {
         if changed || rearmed {
             let store = self.store.clone();
             let watch_id = id.clone();
-            intent_core::spawn_daemon(async move {
+            self.store_tasks.spawn_draining(async move {
                 if changed {
                     if let Err(e) = store
                         .update_completion_watch_parent(&watch_id, &name, &home_ws)
@@ -849,7 +907,7 @@ impl Services {
             // duplicate agent:idle wake after a restart.
             let store = self.store.clone();
             let watch_id = subscription_id.to_string();
-            intent_core::spawn_daemon(async move {
+            self.store_tasks.spawn_draining(async move {
                 if let Err(e) = store
                     .mark_completion_watch_report_delivered(&watch_id)
                     .await
@@ -908,7 +966,7 @@ impl Services {
             // Best-effort DB sweep of every persisted watch for this parent.
             let store = self.store.clone();
             let parent = parent_agent_id.clone();
-            intent_core::spawn_daemon(async move {
+            self.store_tasks.spawn_draining(async move {
                 if let Err(e) = store.delete_completion_watches_for_parent(&parent).await {
                     tracing::warn!("completion_watch parent sweep failed {}: {e}", parent.0);
                 }
@@ -953,10 +1011,12 @@ impl Services {
             event_summaries: Vec::new(),
             raw_events: Vec::new(),
         };
-        guard.delegation_groups.push(group.clone());
-        // Write-through persist (best-effort), enqueued under the lock so the
-        // lane order matches the registry order.
-        self.persist_delegation_group(group);
+        // Do not persist an empty recovery record. If it lands before the
+        // first enrollment snapshot and the daemon stops between the writes,
+        // rehydration seals a group with no expected children and loses the
+        // eventual parent wake. Enrollment persists the first meaningful
+        // snapshot through the same ordered lane.
+        guard.delegation_groups.push(group);
         drop(guard);
         group_id
     }
@@ -1334,7 +1394,7 @@ impl Services {
         };
         if !watch_ids.is_empty() {
             let store = self.store.clone();
-            intent_core::spawn_daemon(async move {
+            self.store_tasks.spawn_draining(async move {
                 for id in watch_ids {
                     if let Err(e) = store.delete_completion_watch(&id).await {
                         tracing::warn!("completion_watch delete failed {id}: {e}");
@@ -1420,19 +1480,19 @@ impl Services {
 
     /// The group persistence lane sender, spawning the single worker on first
     /// use (see [`GroupPersistOp`]).
-    fn group_persist_sender(&self) -> &GroupPersistSender {
-        self.group_persist_lane.get_or_init(|| {
-            let (tx, rx) = mpsc::unbounded_channel();
-            intent_core::spawn_daemon(run_group_persist_lane(self.store.clone(), rx));
-            tx
-        })
+    fn group_persist_lane(&self) -> &GroupPersistLane {
+        self.group_persist_lane
+            .get_or_init(|| GroupPersistLane::new(self.store.clone()))
     }
 
-    /// Fire-and-forget lane enqueue; a closed lane (worker gone) is logged.
+    pub(crate) async fn shutdown_group_persistence(&self) {
+        // Initialize even an unused lane so later calls cannot reopen admission.
+        self.group_persist_lane().shutdown().await;
+    }
+
+    /// Fire-and-forget lane enqueue; a closed lane is logged.
     fn enqueue_group_persist(&self, op: GroupPersistOp) {
-        if self.group_persist_sender().send((op, None)).is_err() {
-            tracing::warn!("delegation_group persistence lane closed; write dropped");
-        }
+        self.group_persist_lane().send(op, None);
     }
 
     /// Lane enqueue whose outcome the caller awaits via
@@ -1442,9 +1502,7 @@ impl Services {
         op: GroupPersistOp,
     ) -> oneshot::Receiver<Result<()>> {
         let (tx, rx) = oneshot::channel();
-        if self.group_persist_sender().send((op, Some(tx))).is_err() {
-            tracing::warn!("delegation_group persistence lane closed; write dropped");
-        }
+        self.group_persist_lane().send(op, Some(tx));
         rx
     }
 
@@ -1483,10 +1541,20 @@ impl Services {
     /// async persist task, not durable-before-observable — the crash window
     /// between in-memory registration and commit is milliseconds and the
     /// parent can re-register.
-    fn persist_completion_watch(&self, watch: &CompletionWatch) {
+    fn persist_completion_watch(
+        &self,
+        watch: &CompletionWatch,
+        mutations: (
+            crate::workspace_mutations::Mutation,
+            crate::workspace_mutations::Mutation,
+        ),
+    ) {
         let store = self.store.clone();
         let persisted = completion_watch_to_persisted(watch);
-        intent_core::spawn_daemon(async move {
+        self.store_tasks.spawn_draining(async move {
+            // Keep registration admitted through the write. Otherwise a
+            // delayed upsert could resurrect a watch after deletion swept it.
+            let _mutations = mutations;
             let id = persisted.id.clone();
             if let Err(e) = store.upsert_completion_watch(&persisted).await {
                 tracing::warn!("completion_watch upsert failed {id}: {e}");
@@ -1499,7 +1567,7 @@ impl Services {
     fn delete_persisted_watch(&self, subscription_id: &str) {
         let store = self.store.clone();
         let id = subscription_id.to_string();
-        intent_core::spawn_daemon(async move {
+        self.store_tasks.spawn_draining(async move {
             if let Err(e) = store.delete_completion_watch(&id).await {
                 tracing::warn!("completion_watch delete failed {id}: {e}");
             }
@@ -1535,13 +1603,25 @@ impl Services {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn heal_completion_watches_on_startup(&self) -> Result<usize> {
+        let recovery = self.restore_completion_watches(&mut HashMap::new()).await?;
+        let loaded = recovery.watch_ids.len();
+        let (_stop, stopping) = tokio::sync::watch::channel(false);
+        self.reconcile_startup_completions(recovery, &stopping)
+            .await;
+        Ok(loaded)
+    }
+
+    async fn restore_completion_watches(
+        &self,
+        parents: &mut HashMap<AgentId, bool>,
+    ) -> Result<StartupCompletionRecovery> {
         let mut persisted = self.store.list_completion_watches().await?;
         // Strongest-first: grouped (0) < ungrouped (1), with the store's
         // created_at ASC ordering as the tiebreaker (stable sort).
         let rank =
             |p: &intent_store::PersistedCompletionWatch| -> u8 { u8::from(p.group_id.is_none()) };
         persisted.sort_by_key(rank);
-        let mut loaded = 0usize;
+        let mut watch_ids = HashSet::new();
         let mut to_reconcile: Vec<(AgentId, WorkspaceId)> = Vec::new();
         for p in persisted {
             enum LoadOutcome {
@@ -1556,13 +1636,9 @@ impl Services {
             // soft-retire inertness gate rejects every wake, so rehydrating
             // its watch only feeds the delivery-retry loop; `agent.restore`
             // does not resurrect watches, matching the retire sweep.
-            let parent_alive = self.agent_is_live(&p.parent_agent_id).await
-                && !matches!(
-                    self.store
-                        .get_agent_session_retired_at(&p.parent_agent_id)
-                        .await,
-                    Ok(Some(_))
-                );
+            let parent_alive = self
+                .completion_parent_is_live(&p.parent_agent_id, parents)
+                .await;
             if !parent_alive {
                 tracing::info!(
                     watch = %p.id,
@@ -1632,7 +1708,7 @@ impl Services {
                     continue;
                 }
             };
-            loaded += 1;
+            watch_ids.insert(p.id);
             to_reconcile.push((child_agent, child_ws));
         }
         // Reconcile: a child that completed (or was deleted) while the daemon
@@ -1640,23 +1716,109 @@ impl Services {
         // event covers every watch on the same child.
         to_reconcile.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
         to_reconcile.dedup_by(|a, b| a.0 == b.0);
-        for (child_id, child_ws) in to_reconcile {
-            self.reconcile_watch_child_on_rehydration(
-                &child_id,
-                &child_ws,
+        Ok(StartupCompletionRecovery {
+            groups: Vec::new(),
+            children: to_reconcile,
+            watch_ids,
+        })
+    }
+
+    /// Restore startup groups and watches without delivering any completion.
+    /// Call before listeners open; reconciliation belongs to an owned worker
+    /// after readiness. Parent metadata is read once across the entire pass.
+    pub async fn prepare_startup_completion_recovery(&self) -> StartupCompletionRecovery {
+        let mut recovery = StartupCompletionRecovery::default();
+        let mut parents = HashMap::new();
+        match self.store.list_workspaces_with_undelivered_groups().await {
+            Ok(workspaces) => {
+                for workspace in workspaces {
+                    match self
+                        .restore_delegation_groups(&workspace, &mut parents)
+                        .await
+                    {
+                        Ok(groups) => recovery.groups.extend(groups),
+                        Err(error) => {
+                            tracing::warn!(%error, %workspace, "delegation group startup restoration failed");
+                        }
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "delegation group startup listing failed"),
+        }
+        match self.restore_completion_watches(&mut parents).await {
+            Ok(watches) => {
+                recovery.children = watches.children;
+                recovery.watch_ids = watches.watch_ids;
+            }
+            Err(error) => tracing::warn!(%error, "completion watch startup restoration failed"),
+        }
+        tracing::info!(
+            groups = recovery.groups.len(),
+            watches = recovery.watch_ids.len(),
+            "restored startup completion bookkeeping"
+        );
+        recovery
+    }
+
+    /// Reconcile restored groups first, then individual watched children.
+    /// Stop between operations, draining an admitted wake so its durable
+    /// delivery claim is never stranded. The caller must join this worker
+    /// before shutting down the agent manager or store.
+    pub async fn reconcile_startup_completions(
+        &self,
+        recovery: StartupCompletionRecovery,
+        stopping: &tokio::sync::watch::Receiver<bool>,
+    ) {
+        for group in recovery.groups {
+            if *stopping.borrow() {
+                return;
+            }
+            self.reconcile_group_on_rehydration(&group).await;
+            self.try_fire_group(&group).await;
+        }
+        for (child, workspace) in recovery.children {
+            if *stopping.borrow() {
+                return;
+            }
+            self.reconcile_watch_child_for_watches(
+                &child,
+                &workspace,
                 WatchReconcileCallSite::Rehydration,
+                Some(&recovery.watch_ids),
             )
             .await;
         }
-        Ok(loaded)
+        tracing::info!("startup completion reconciliation complete");
+    }
+
+    async fn completion_parent_is_live(
+        &self,
+        parent: &AgentId,
+        parents: &mut HashMap<AgentId, bool>,
+    ) -> bool {
+        if let Some(live) = parents.get(parent) {
+            return *live;
+        }
+        let live = match self.store.get_agent_session_summary(parent).await {
+            Ok(session) => {
+                session.status != intent_core::AgentStatus::Deleted && session.retired_at.is_none()
+            }
+            Err(intent_store::Error::NotFound(_)) => false,
+            Err(error) => {
+                tracing::warn!(%parent, %error, "completion parent lookup failed; retaining bookkeeping");
+                true
+            }
+        };
+        parents.insert(parent.clone(), live);
+        live
     }
 
     /// Whether an agent session row exists and is not `Deleted`. Store errors
     /// other than `NotFound` are treated as live (conservative: never prune a
     /// watch on a transient store error).
     pub(crate) async fn agent_is_live(&self, agent_id: &AgentId) -> bool {
-        match self.store.get_agent_session(agent_id).await {
-            Ok(session) => !matches!(session.status, intent_core::AgentStatus::Deleted),
+        match self.store.get_agent_session_status(agent_id).await {
+            Ok(status) => !matches!(status, intent_core::AgentStatus::Deleted),
             Err(intent_store::Error::NotFound(_)) => false,
             Err(e) => {
                 tracing::warn!(
@@ -1685,9 +1847,31 @@ impl Services {
         fallback_ws: &WorkspaceId,
         call_site: WatchReconcileCallSite,
     ) {
+        self.reconcile_watch_child_for_watches(child_id, fallback_ws, call_site, None)
+            .await;
+    }
+
+    async fn reconcile_watch_child_for_watches(
+        &self,
+        child_id: &AgentId,
+        fallback_ws: &WorkspaceId,
+        call_site: WatchReconcileCallSite,
+        watch_ids: Option<&HashSet<String>>,
+    ) {
         use intent_core::AgentStatus;
+
+        // A live request or earlier group settlement may have retired every
+        // restored watch for this child while the worker was deferred.
+        if watch_ids.is_some_and(|ids| {
+            !self
+                .find_watches_for_child(child_id)
+                .iter()
+                .any(|watch| ids.contains(&watch.id))
+        }) {
+            return;
+        }
         let (event_type, event_ws, status_value, completion_report, stop_reason, agent_name) =
-            match self.store.get_agent_session(child_id).await {
+            match self.store.get_agent_session_summary(child_id).await {
                 Ok(session) => {
                     let is_deleted = matches!(session.status, AgentStatus::Deleted);
                     // A retired session (`retired_at` set) is inert — no
@@ -1730,7 +1914,11 @@ impl Services {
                         // completion if the last outgoing watch disappears
                         // without a wake, then leave the watch armed.
                         if settled && self.agent_is_waiting_on_agents(child_id) {
-                            self.mark_interim_skipped_idle(child_id);
+                            if watch_ids.is_some() {
+                                self.mark_interim_skipped_idle_preserving_provenance(child_id);
+                            } else {
+                                self.mark_interim_skipped_idle(child_id);
+                            }
                             return;
                         }
                         // Registration-time hook/PR-monitor/event-subscription
@@ -1757,7 +1945,11 @@ impl Services {
                         if settled
                             && matches!(call_site, WatchReconcileCallSite::Registration)
                             && (!self.active_hooks_for_agent(child_id).await.is_empty()
-                                || !self.active_pr_monitors_for_agent(child_id).await.is_empty()
+                                || (!self.active_pr_monitors_for_agent(child_id).await.is_empty()
+                                    || !self
+                                        .active_script_monitors_for_agent(child_id)
+                                        .await
+                                        .is_empty())
                                 || !self.list_event_subscriptions_for_agent(child_id).is_empty())
                         {
                             self.mark_interim_skipped_idle_stale_report(child_id);
@@ -1871,7 +2063,7 @@ impl Services {
         // No-advisory variant: registration-time / boot reconciliation must
         // never fire the monitoring-idle advisory — a deferred idle here
         // leaves the watch armed, exactly as before the advisory existed.
-        self.deliver_completion_to_watches_no_advisory(child_id, &event)
+        self.deliver_completion_to_watches_inner(child_id, &event, false, true, watch_ids)
             .await;
     }
 
@@ -1899,6 +2091,22 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<usize> {
+        let groups = self
+            .restore_delegation_groups(workspace_id, &mut HashMap::new())
+            .await?;
+        let loaded = groups.len();
+        for group in groups {
+            self.reconcile_group_on_rehydration(&group).await;
+            self.try_fire_group(&group).await;
+        }
+        Ok(loaded)
+    }
+
+    async fn restore_delegation_groups(
+        &self,
+        workspace_id: &WorkspaceId,
+        parents: &mut HashMap<AgentId, bool>,
+    ) -> Result<Vec<String>> {
         let persisted = self.store.list_undelivered_groups(workspace_id).await?;
         // Prune groups whose parent is permanently gone (deleted/missing or
         // retired) BEFORE loading them (monorepo#4183): an aggregated wake
@@ -1911,13 +2119,9 @@ impl Services {
         // group (the delivery-path backstop catches it later).
         let mut survivors = Vec::with_capacity(persisted.len());
         for p in persisted {
-            let parent_gone = !self.agent_is_live(&p.parent_agent_id).await
-                || matches!(
-                    self.store
-                        .get_agent_session_retired_at(&p.parent_agent_id)
-                        .await,
-                    Ok(Some(_)) | Err(intent_store::Error::NotFound(_))
-                );
+            let parent_gone = !self
+                .completion_parent_is_live(&p.parent_agent_id, parents)
+                .await;
             if parent_gone {
                 tracing::info!(
                     group = %p.group_id,
@@ -1932,12 +2136,11 @@ impl Services {
             survivors.push(p);
         }
         let persisted = survivors;
-        let (loaded, groups_to_reconcile) = {
+        let groups_to_reconcile = {
             let mut guard = self
                 .agent_subscriptions
                 .lock()
                 .expect("agent subscription registry poisoned");
-            let mut loaded = 0;
             let mut groups_to_reconcile = Vec::new();
             for p in persisted {
                 // Skip if this group is already in memory (idempotent rehydration).
@@ -1953,18 +2156,11 @@ impl Services {
                 group.sealed = true;
                 groups_to_reconcile.push(group.group_id.clone());
                 guard.delegation_groups.push(group);
-                loaded += 1;
             }
-            (loaded, groups_to_reconcile)
+            groups_to_reconcile
         }; // guard dropped here
 
-        // STAB-108 reconciliation: check each rehydrated group for already-completed children
-        for group_id in groups_to_reconcile {
-            self.reconcile_group_on_rehydration(&group_id).await;
-            // Fire the group if it's now ready (all children completed/deleted)
-            self.try_fire_group(&group_id).await;
-        }
-        Ok(loaded)
+        Ok(groups_to_reconcile)
     }
 
     /// STAB-108: Reconcile a delegation group against current agent state after rehydration.
@@ -2003,7 +2199,7 @@ impl Services {
         // For each unrecorded child, check its status and record if complete/deleted
         for child_id in agents_to_check {
             // Check agent status
-            let agent_result = self.store.get_agent_session(&child_id).await;
+            let agent_result = self.store.get_agent_session_summary(&child_id).await;
 
             match agent_result {
                 Ok(session) => {
@@ -2153,7 +2349,7 @@ impl Services {
                         if event_type == intent_core::events::AGENT_IDLE
                             && self.agent_is_waiting_on_agents_durable(&child_id).await
                         {
-                            self.mark_interim_skipped_idle(&child_id);
+                            self.mark_interim_skipped_idle_preserving_provenance(&child_id);
                             continue;
                         }
                         // Same emit-time `isWaitingForOtherAgents` stamp as
@@ -2316,7 +2512,21 @@ impl Services {
         // settled — its group completion must not be recorded yet. Not
         // stamped onto `event_data` (internal classification only), so
         // probed live here, matching the agent-waiting check below.
-        if !completion_reported && !self.active_pr_monitors_for_agent(agent_id).await.is_empty() {
+        if !completion_reported
+            && (!self.active_pr_monitors_for_agent(agent_id).await.is_empty()
+                || !self
+                    .active_script_monitors_for_agent(agent_id)
+                    .await
+                    .is_empty())
+        {
+            return;
+        }
+        if self
+            .store
+            .script_monitor_pending_for_agent(agent_id)
+            .await
+            .unwrap_or(true)
+        {
             return;
         }
         // Agent-waiting deferral (issue intent-hq/monorepo#1468): an idle
@@ -2607,6 +2817,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -2711,6 +2922,110 @@ mod tests {
         let root = tempfile::tempdir().expect("temp workspaces root");
         let services = Services::new(store).with_workspaces_root(root.path().to_path_buf());
         (tmp, root, services, ws)
+    }
+
+    async fn held_subscription_shutdown(
+        svc: &Services,
+        held: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    ) {
+        let drain = svc.shutdown_store_writers();
+        tokio::pin!(drain);
+        let returned_early = tokio::select! {
+            biased;
+            () = &mut drain => true,
+            () = std::future::ready(()) => false,
+        };
+        drop(held);
+        if !returned_early {
+            tokio::time::timeout(std::time::Duration::from_secs(10), drain)
+                .await
+                .unwrap();
+        }
+        assert!(
+            !returned_early,
+            "shutdown passed an admitted subscription write held at the Store"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_retains_completion_watch_upsert() {
+        let (tmp, _root, svc, ws) = setup().await;
+        let held = svc.store.write_pool().acquire().await.unwrap();
+        let id = svc
+            .register_completion_watch(
+                &ws,
+                &ws,
+                AgentId::from("agent-parent"),
+                "parent".into(),
+                AgentId::from("agent-child"),
+                None,
+            )
+            .unwrap();
+        held_subscription_shutdown(&svc, held).await;
+        svc.store.close().await;
+        let reopened = Store::open(&tmp.path).await.unwrap();
+        assert!(reopened
+            .list_completion_watches()
+            .await
+            .unwrap()
+            .iter()
+            .any(|watch| watch.id == id));
+        reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_retains_completion_watch_delete() {
+        let (tmp, _root, svc, ws) = setup().await;
+        let id = svc
+            .register_completion_watch_durable(
+                &ws,
+                &ws,
+                AgentId::from("agent-parent"),
+                "parent".into(),
+                AgentId::from("agent-child"),
+                None,
+            )
+            .await
+            .unwrap();
+        let held = svc.store.write_pool().acquire().await.unwrap();
+        svc.delete_persisted_watch(&id);
+        held_subscription_shutdown(&svc, held).await;
+        svc.store.close().await;
+        let reopened = Store::open(&tmp.path).await.unwrap();
+        assert!(reopened
+            .list_completion_watches()
+            .await
+            .unwrap()
+            .iter()
+            .all(|watch| watch.id != id));
+        reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_retains_ordered_group_lane() {
+        let (tmp, _root, svc, ws) = setup().await;
+        let parent = AgentId::from("agent-parent");
+        let id = svc.get_or_create_delegation_group(&ws, &parent);
+        let mut group = svc.delegation_group_for_parent(&parent).unwrap();
+        group.expected_agent_ids.push(AgentId::from("agent-child"));
+        let held = svc.store.write_pool().acquire().await.unwrap();
+        svc.persist_delegation_group(group);
+        let ack = svc.enqueue_group_persist_acked(GroupPersistOp::Delete(id));
+        held_subscription_shutdown(&svc, held).await;
+        Services::await_group_persist(ack).await.unwrap();
+        let refused = svc.enqueue_group_persist_acked(GroupPersistOp::Delete("late".into()));
+        assert!(Services::await_group_persist(refused).await.is_err());
+        svc.store.close().await;
+        let reopened = Store::open(&tmp.path).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM delegation_group")
+            .fetch_one(reopened.read_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "ordered delete must not be resurrected by the earlier upsert"
+        );
+        reopened.close().await;
     }
 
     async fn enriched(svc: &Services, ws: &WorkspaceId) -> (WorkspaceDisplayStatus, bool) {

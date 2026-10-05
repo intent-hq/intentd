@@ -1,6 +1,6 @@
 //! Skills directory watcher → `skills:changed` events.
 //!
-//! Watches the 7-tier skills scan roots (4 user-tier + 3 project-tier per workspace)
+//! Watches the same Intent personal and project roots used by skill discovery
 //! and emits `skills:changed` events when SKILL.md files are created, modified, or
 //! deleted — or when a tier directory itself appears or disappears (#612).
 //! User-tier changes affect all workspaces; project-tier changes are scoped
@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
+use super::linked_watch::ScopedLinkedWatches;
 use super::root_watch::{watch_root, RootWatch};
 use super::shared_watch::{watch_tiers, SharedWatchHub, TierWatch};
 
@@ -30,9 +31,8 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// Holds watchers for all skills directories (user-tier + project-tier).
 /// Dropping this tears down all watchers.
 ///
-/// The four user tiers keep a [`RootWatch`] each — they are shared once per
-/// daemon, so they do not scale with the workspace count. The three project
-/// tiers per workspace no longer own streams at all: they ride the shared
+/// The Intent personal tier keeps one [`RootWatch`] shared per daemon, so it
+/// does not scale with the workspace count. Project tiers ride the shared
 /// workspace-root stream via [`watch_tiers`].
 pub(crate) struct SkillsWatcher {
     hub: Arc<SharedWatchHub>,
@@ -49,6 +49,11 @@ impl Drop for SkillsWatcher {
 }
 
 impl SkillsWatcher {
+    pub(super) async fn shutdown(mut self) {
+        let _ = self.raw_tx.send(SkillsMsg::Stop);
+        let _ = (&mut self.task).await;
+    }
+
     /// Start watching skills directories for all workspaces.
     /// `workspaces` is a list of (`workspace_id`, `workspace_path`) pairs.
     pub(super) fn start(
@@ -60,9 +65,9 @@ impl SkillsWatcher {
 
         // Start user-tier watchers (affect all workspaces)
         let mut user_watchers = Vec::new();
-        let user_roots = get_user_skill_roots();
-        for root in user_roots {
-            user_watchers.push(watch_directory(hub, root, None, raw_tx.clone()));
+        let home = crate::skills::skill_home_dir();
+        for root in crate::skills::skill_roots(None, home.as_deref()) {
+            user_watchers.push(watch_directory(hub, root.root, None, raw_tx.clone()));
         }
 
         // Start project-tier watchers (per-workspace)
@@ -74,7 +79,13 @@ impl SkillsWatcher {
             );
         }
 
-        let task = intent_core::spawn_daemon(debounce_loop(bus, workspaces, raw_rx));
+        let task = intent_core::spawn_daemon(debounce_loop(
+            bus,
+            workspaces,
+            raw_rx,
+            Arc::clone(hub),
+            raw_tx.clone(),
+        ));
 
         Self {
             hub: Arc::clone(hub),
@@ -167,9 +178,8 @@ impl SkillsWatcher {
     }
 }
 
-/// Watch all three project-tier skill roots of one workspace over the shared
-/// workspace-root stream — one subscription, no streams of its own (previously
-/// three [`RootWatch`]es, each its own stream even when the tier was missing).
+/// Watch all project skill roots over one shared workspace-root subscription.
+/// Derive relative tiers from discovery so newly added roots cannot drift.
 fn start_project_watch(
     hub: &Arc<SharedWatchHub>,
     workspace_id: &WorkspaceId,
@@ -178,21 +188,40 @@ fn start_project_watch(
 ) -> TierWatch {
     let ws_id = workspace_id.clone();
     let tx = raw_tx.clone();
-    watch_tiers(
-        hub,
-        workspace_path,
-        PROJECT_SKILL_TIERS,
-        is_skill_md,
-        move || {
-            let _ = tx.send(SkillsMsg::Change(Some(ws_id.clone())));
-        },
-    )
+    let roots = crate::skills::skill_roots(Some(Path::new("")), None);
+    let subpaths: Vec<_> = roots
+        .iter()
+        .map(|root| root.root.to_string_lossy())
+        .collect();
+    let subpaths: Vec<_> = subpaths.iter().map(AsRef::as_ref).collect();
+    watch_tiers(hub, workspace_path, &subpaths, is_skill_md, move || {
+        let _ = tx.send(SkillsMsg::Change(Some(ws_id.clone())));
+    })
+}
+
+/// Linked targets are scoped to workspace lifetime, like the ordinary tiers.
+struct LinkedSkillWatches {
+    watches: ScopedLinkedWatches,
+}
+
+impl LinkedSkillWatches {
+    async fn refresh_user(&mut self) {
+        let directories = crate::skills::linked_skill_watch_directories("").await;
+        self.watches.sync_user(directories);
+    }
+
+    async fn refresh(&mut self, id: &WorkspaceId, path: &Path) {
+        let directories =
+            crate::skills::linked_skill_watch_directories(&path.to_string_lossy()).await;
+        self.watches.sync_project(id.clone(), directories);
+    }
 }
 
 /// Message into the debounce loop: a raw filesystem change, or a runtime
 /// (de)registration of a workspace (#611).
 #[derive(Debug, Clone)]
 enum SkillsMsg {
+    Stop,
     /// Raw change from a root watch; `None` = user tier (all workspaces).
     Change(Option<WorkspaceId>),
     /// Workspace registered after start.
@@ -212,9 +241,8 @@ enum SkillsMsg {
 }
 
 /// Fingerprint the resolved skill set for a workspace: a hash of the
-/// serialized [`crate::skills::SkillMetadata`] list, so a body-only or
-/// description-only edit during a suspension is still detected (the shared
-/// `check_skills_changed` compares names and count only).
+/// serialized [`crate::skills::SkillMetadata`] list, including descriptions
+/// and locations. Body-only edits do not change the discovery catalog.
 async fn skills_fingerprint(workspace_path: &Path) -> u64 {
     let skills = crate::skills::discover_skills(&workspace_path.to_string_lossy()).await;
     let rendered = serde_json::to_string(&skills).unwrap_or_default();
@@ -240,27 +268,9 @@ fn watch_directory(
 
 fn is_skill_md(path: &Path) -> bool {
     path.file_name().and_then(|n| n.to_str()) == Some("SKILL.md")
-}
-
-fn get_user_skill_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(home) = home_dir() {
-        roots.push(home.join(".agents").join("skills"));
-        roots.push(home.join(".claude").join("skills"));
-        roots.push(home.join(".intent").join("skills"));
-        roots.push(home.join(".augment").join("skills"));
-    }
-    roots
-}
-
-/// Project-tier skill roots, relative to the workspace root.
-const PROJECT_SKILL_TIERS: &[&str] = &[".agents/skills", ".intent/skills", ".augment/skills"];
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+        || path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_symlink())
 }
 
 /// Debounce loop that coalesces rapid skill file changes per workspace.
@@ -270,44 +280,65 @@ async fn debounce_loop(
     bus: EventBus,
     workspaces: Vec<(WorkspaceId, PathBuf)>,
     mut raw_rx: mpsc::UnboundedReceiver<SkillsMsg>,
+    hub: Arc<SharedWatchHub>,
+    tx: mpsc::UnboundedSender<SkillsMsg>,
 ) {
     let mut pending: HashMap<WorkspaceId, tokio::time::Instant> = HashMap::new();
     let mut workspace_paths: HashMap<WorkspaceId, PathBuf> = workspaces.into_iter().collect();
-    // Baselines snapshotted at `Pause`, consumed by the first flush after the
-    // matching `Resume`. Only suspended workspaces have an entry — the normal
-    // watch path keeps using the shared discovery cache.
+    // Private metadata baselines survive ordinary RPC cache refreshes and
+    // archive/resume. A reader must not swallow the next change notification.
     let mut suspend_baselines: HashMap<WorkspaceId, u64> = HashMap::new();
+    let mut linked = LinkedSkillWatches {
+        watches: ScopedLinkedWatches::new(hub, move |scope| {
+            let _ = tx.send(SkillsMsg::Change(scope));
+        }),
+    };
+    linked.refresh_user().await;
+    let mut user_deadline: Option<tokio::time::Instant> = None;
+    for (id, path) in &workspace_paths {
+        linked.refresh(id, path).await;
+    }
 
     loop {
-        let next_deadline = pending.values().copied().min();
+        let next_deadline = pending.values().copied().chain(user_deadline).min();
 
         tokio::select! {
             maybe = raw_rx.recv() => match maybe {
+                Some(SkillsMsg::Stop) => raw_rx.close(),
                 Some(SkillsMsg::Change(workspace_id)) => {
                     let deadline = tokio::time::Instant::now() + DEBOUNCE;
                     match workspace_id {
                         // User-tier change: affects all workspaces
                         None => {
-                            for ws_id in workspace_paths.keys() {
-                                pending.insert(ws_id.clone(), deadline);
+                            crate::skills::invalidate_skills_cache(Path::new(""));
+                            user_deadline.get_or_insert(deadline);
+                            for (ws_id, path) in &workspace_paths {
+                                crate::skills::invalidate_skills_cache(path);
+                                pending.entry(ws_id.clone()).or_insert(deadline);
                             }
                         }
                         // Project-tier change: affects specific workspace
                         Some(ws_id) => {
-                            pending.insert(ws_id, deadline);
+                            if let Some(path) = workspace_paths.get(&ws_id) {
+                                crate::skills::invalidate_skills_cache(path);
+                                pending.entry(ws_id).or_insert(deadline);
+                            }
                         }
                     }
                 }
                 Some(SkillsMsg::Add(ws_id, path)) => {
                     suspend_baselines.remove(&ws_id);
+                    linked.refresh(&ws_id, &path).await;
                     workspace_paths.insert(ws_id, path);
                 }
                 Some(SkillsMsg::Remove(ws_id)) => {
+                    linked.watches.remove(&ws_id);
                     workspace_paths.remove(&ws_id);
                     suspend_baselines.remove(&ws_id);
                     pending.remove(&ws_id);
                 }
                 Some(SkillsMsg::Pause(ws_id)) => {
+                    linked.watches.remove(&ws_id);
                     if let Some(path) = workspace_paths.get(&ws_id) {
                         suspend_baselines.insert(ws_id.clone(), skills_fingerprint(path).await);
                     }
@@ -315,6 +346,7 @@ async fn debounce_loop(
                     pending.remove(&ws_id);
                 }
                 Some(SkillsMsg::Resume(ws_id, path)) => {
+                    linked.refresh(&ws_id, &path).await;
                     workspace_paths.insert(ws_id.clone(), path);
                     // Catch-up: flush after the normal debounce so the
                     // re-registered watches' own events coalesce into it.
@@ -326,12 +358,16 @@ async fn debounce_loop(
                 }
                 None => {
                     // All senders dropped: flush and exit
-                    flush_all(&bus, &workspace_paths, &mut suspend_baselines, &mut pending).await;
+                    flush_all(&bus, &workspace_paths, &mut suspend_baselines, &mut pending, &mut linked).await;
                     return;
                 }
             },
             () = sleep_until(next_deadline), if next_deadline.is_some() => {
-                flush_due(&bus, &workspace_paths, &mut suspend_baselines, &mut pending).await;
+                if user_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+                    user_deadline = None;
+                    linked.refresh_user().await;
+                }
+                flush_due(&bus, &workspace_paths, &mut suspend_baselines, &mut pending, &mut linked).await;
             }
         }
     }
@@ -342,6 +378,7 @@ async fn flush_due(
     workspace_paths: &HashMap<WorkspaceId, PathBuf>,
     suspend_baselines: &mut HashMap<WorkspaceId, u64>,
     pending: &mut HashMap<WorkspaceId, tokio::time::Instant>,
+    linked: &mut LinkedSkillWatches,
 ) {
     let now = tokio::time::Instant::now();
     let due: Vec<WorkspaceId> = pending
@@ -353,8 +390,10 @@ async fn flush_due(
     for ws_id in due {
         pending.remove(&ws_id);
         if let Some(path) = workspace_paths.get(&ws_id) {
-            let baseline = suspend_baselines.remove(&ws_id);
-            emit_skills_changed(bus, &ws_id, path, baseline).await;
+            linked.refresh(&ws_id, path).await;
+            let baseline = suspend_baselines.get(&ws_id).copied();
+            let fingerprint = emit_skills_changed(bus, &ws_id, path, baseline).await;
+            suspend_baselines.insert(ws_id, fingerprint);
         }
     }
 }
@@ -364,33 +403,32 @@ async fn flush_all(
     workspace_paths: &HashMap<WorkspaceId, PathBuf>,
     suspend_baselines: &mut HashMap<WorkspaceId, u64>,
     pending: &mut HashMap<WorkspaceId, tokio::time::Instant>,
+    linked: &mut LinkedSkillWatches,
 ) {
     for (ws_id, _) in pending.drain() {
         if let Some(path) = workspace_paths.get(&ws_id) {
-            let baseline = suspend_baselines.remove(&ws_id);
-            emit_skills_changed(bus, &ws_id, path, baseline).await;
+            linked.refresh(&ws_id, path).await;
+            let baseline = suspend_baselines.get(&ws_id).copied();
+            let fingerprint = emit_skills_changed(bus, &ws_id, path, baseline).await;
+            suspend_baselines.insert(ws_id, fingerprint);
         }
     }
 }
 
-/// Emit `skills:changed` if the set actually changed. `suspend_baseline` is
-/// `Some` only for the first flush after an unarchive: the shared discovery
-/// cache is unusable as a baseline across that window (any `skills.*` reader
-/// can refresh it mid-suspension), so the retained fingerprint is compared
-/// instead. Without one — e.g. a workspace archived before daemon start — the
-/// normal cache comparison applies and may emit one benign extra event.
+/// Compare against the watcher's private metadata baseline, including across
+/// archive/resume, so an intervening skill.list cannot consume a notification.
 async fn emit_skills_changed(
     bus: &EventBus,
     workspace_id: &WorkspaceId,
     workspace_path: &Path,
     suspend_baseline: Option<u64>,
-) {
+) -> u64 {
     // Re-run discovery to check if the skill set actually changed
-    let (_, cache_changed) =
-        crate::skills::check_skills_changed(&workspace_path.to_string_lossy()).await;
+    let (skills, _) = crate::skills::check_skills_changed(&workspace_path.to_string_lossy()).await;
+    let fingerprint = skills_fingerprint(workspace_path).await;
     let changed = match suspend_baseline {
-        Some(baseline) => skills_fingerprint(workspace_path).await != baseline,
-        None => cache_changed,
+        Some(baseline) => fingerprint != baseline,
+        None => !skills.is_empty(),
     };
 
     if changed {
@@ -414,6 +452,7 @@ async fn emit_skills_changed(
         };
         let _ = bus.publish(&event).await;
     }
+    fingerprint
 }
 
 async fn sleep_until(deadline: Option<tokio::time::Instant>) {
@@ -524,6 +563,52 @@ mod tests {
 
     fn skill_md(name: &str) -> String {
         format!("---\nname: {name}\ndescription: d\n---\n\nbody")
+    }
+
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn newly_created_provider_roots_emit_and_refresh_catalog() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let ws = crate::test_support::test_tempdir("skills-new-provider-roots-");
+        let id = WorkspaceId::from("skills-new-provider-roots");
+        let watcher = SkillsWatcher::start(
+            &SharedWatchHub::new(),
+            bus,
+            vec![(id.clone(), ws.path().to_path_buf())],
+        );
+        watcher.wait_established(LIVENESS).await;
+        watcher.barrier().await;
+        for (index, root) in [
+            ".agent/skills",
+            ".codex/skills",
+            ".factory/skills",
+            ".grok/skills",
+            ".opencode/skill",
+            ".opencode/skills",
+            ".pi/skills",
+            ".cortex/skills",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let name = format!("new-provider-root-{index}");
+            let skill = ws.path().join(root).join(&name);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("SKILL.md"), skill_md(&name)).unwrap();
+            let events = drain_skills_events(&mut sub, Duration::from_millis(100), LIVENESS).await;
+            assert!(
+                events.iter().any(|event| event.workspace_id == id),
+                "missing event for {root}"
+            );
+            let skills = crate::skills::discover_skills(&ws.path().to_string_lossy()).await;
+            assert!(
+                skills.iter().any(|skill| skill.name == name),
+                "missing skill from {root}"
+            );
+        }
     }
 
     #[tokio::test]

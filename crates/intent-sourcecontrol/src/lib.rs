@@ -10,29 +10,55 @@
 //! No `pr.*` wire methods or routing live here — those map onto this trait in a
 //! later milestone (§7.5).
 
+pub mod account_search;
+pub mod branch_rules_cache;
+pub mod cache_scope;
 pub mod device_flow;
 pub mod error;
 pub mod gh_sync;
 pub mod github;
+mod github_transport;
+pub mod gitlab;
+pub mod gitlab_auth;
+pub mod gitlab_token;
 pub mod identity_proof;
+pub mod instance;
 pub mod model;
 pub mod registry;
+pub mod remote_project;
+pub mod request_budget;
 pub mod token;
+pub mod traffic;
 
 use async_trait::async_trait;
 
 pub use device_flow::{DeviceFlow, PollStatus};
 pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
+pub use gitlab::{GitLabSourceControl, GitlabRequestCredentials};
+pub use gitlab_auth::{
+    GitlabDeviceAuthorization, GitlabDeviceFlow, GitlabExchange, GitlabGrant, GitlabHost,
+    GitlabPollStatus, GitlabUser, StoredCredential,
+};
+pub use gitlab_token::GitlabTokenSource;
+pub use instance::{GitlabDescriptor, GitlabInstance};
 pub use model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
-    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
-    PrObservation, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review,
-    ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
+    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrAncestry,
+    PrAncestryIdentity, PrInvolvement, PrObservation, PrPatch, PrQuery, PrState, PullRequest,
+    PullRequestFile, PullRequestFilesPage, PullRequestReview, RateLimitStatus, Repo, RepoRef,
+    Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
     ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
 };
-pub use registry::{GithubSettings, SourceControlRegistry, SourceControlSettings};
+pub use model::{
+    ConfirmedReviewState, ProviderAvailability, ReviewAvailability, ReviewBranchIdentity,
+    ReviewCreateOutcome, ReviewCreateResult, ReviewDetails, ReviewObservation,
+};
+pub use registry::{GithubSettings, GitlabSettings, SourceControlRegistry, SourceControlSettings};
+/// Re-exported so callers can hand [`gitlab_auth::persist_gitlab_token`] a
+/// redacted token without depending on `secrecy` themselves.
+pub use secrecy::{ExposeSecret, SecretString};
 pub use token::TokenSource;
 
 /// The provider-agnostic forge API (§7.2).
@@ -47,22 +73,36 @@ pub trait SourceControl: Send + Sync {
     /// Stable id of the provider, e.g. `"github"`.
     fn provider_id(&self) -> &'static str;
 
+    /// Authorization-scoped identity for shared reads. Providers without this
+    /// contract keep the legacy uncached path.
+    fn cache_scope(&self) -> Option<cache_scope::CacheScope> {
+        None
+    }
+
     /// Capabilities the active host supports (FE can gate UI on these).
     fn capabilities(&self) -> ScCapabilities;
 
     /// Auth / connectivity probe (used by `settings`/`doctor`).
     async fn check_auth(&self) -> Result<AuthStatus>;
 
-    /// The host's REST core quota — when it resets (unix seconds), how many
+    /// The host's PR-read quota — when it resets (unix seconds), how many
     /// requests remain, and the window's limit — queried after a call
     /// failed with [`Error::RateLimited`] so background sweeps can pause
     /// until the window turns over, and re-probed while paused so the pause
-    /// lifts early once the quota has recovered (monorepo#2961). GitHub's
-    /// `GET /rate_limit` is free (does not count against the quota). Hosts
+    /// lifts early once the quota has recovered (monorepo#2961). GitHub uses
+    /// authoritative headers from small REST/GraphQL reads, costing at most
+    /// one point per resource; its `/rate_limit` overview can disagree with
+    /// enforced counters and must not establish recovery (intent#5837). Hosts
     /// without the signal return the all-`None` default and callers fall
     /// back to a fixed pause that runs its full window.
     async fn rate_limit_status(&self) -> Result<RateLimitStatus> {
         Ok(RateLimitStatus::default())
+    }
+
+    /// Minimum spacing between quota probes shared by the service's sweeps.
+    /// Metered probes must opt in; the default preserves hosts with free probes.
+    fn rate_limit_probe_interval(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
     }
 
     /// Authenticated user identity (`GET /user`). Backs `github.getUser`.
@@ -142,9 +182,54 @@ pub trait SourceControl: Send + Sync {
     /// Fetch a single pull request by number.
     async fn get_pr(&self, repo: &RepoRef, number: u64) -> Result<PullRequest>;
 
+    /// Additive detail with provider-confirmed metadata where available.
+    /// This legacy wrapper leaves confirmation unknown; normalized fields are not raw evidence.
+    async fn review_details(&self, repo: &RepoRef, number: u64) -> Result<ReviewDetails> {
+        Ok(ReviewDetails {
+            review: self.get_pr(repo, number).await?,
+            source: None,
+            target: None,
+            confirmed_draft: None,
+            confirmed_state: None,
+        })
+    }
+
+    /// Qualified observation whose optional-field failures remain explicit.
+    async fn review_observation(&self, _repo: &RepoRef, _number: u64) -> Result<ReviewObservation> {
+        Err(Error::Unsupported("qualified review observation".into()))
+    }
+
     /// List pull requests matching `query`, one §5.5 page at a time (the page
     /// cursor / size travel in `query`). Backs `github.pulls.list/search`.
     async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> Result<Page<PullRequest>>;
+
+    /// Search PRs across token-visible repositories owned by an organization or user.
+    /// Providers must opt in; never silently substitute a repository listing.
+    async fn list_org_prs(&self, _org: &str, _query: PrQuery) -> Result<Page<PullRequest>> {
+        Err(Error::Unsupported(
+            "organization pull request search".into(),
+        ))
+    }
+
+    /// Read one bounded page of changed files including available patches.
+    async fn pull_files(
+        &self,
+        _repo: &RepoRef,
+        _number: u64,
+        _page: PageParams,
+    ) -> Result<PullRequestFilesPage> {
+        Err(Error::Unsupported("pull request files".into()))
+    }
+
+    /// Read one bounded page of reviews without collapsing dismissed states.
+    async fn pull_reviews(
+        &self,
+        _repo: &RepoRef,
+        _number: u64,
+        _page: PageParams,
+    ) -> Result<Page<PullRequestReview>> {
+        Err(Error::Unsupported("pull request review details".into()))
+    }
 
     /// Apply a partial update to a pull request.
     async fn update_pr(&self, repo: &RepoRef, number: u64, patch: PrPatch) -> Result<PullRequest>;
@@ -235,6 +320,18 @@ pub trait SourceControl: Send + Sync {
     /// would, [`Error::RateLimited`] included.
     async fn pr_observation(&self, _repo: &RepoRef, _number: u64) -> Result<Option<PrObservation>> {
         Ok(None)
+    }
+
+    /// Compare the observed immutable revisions in the base repository. One
+    /// bounded attempt; ordinary failures degrade to unknown at the service
+    /// boundary, while quota exhaustion must propagate. Unsupported hosts add
+    /// no requests and cannot establish current ancestry.
+    async fn pr_ancestry(
+        &self,
+        _repo: &RepoRef,
+        _identity: &PrAncestryIdentity,
+    ) -> Result<PrAncestry> {
+        Ok(PrAncestry::Unknown)
     }
 
     /// List issue/PR (conversation) comments.

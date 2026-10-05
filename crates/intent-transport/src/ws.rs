@@ -45,7 +45,6 @@ use crate::auth::{
 };
 use crate::conn::{self, ConnSubs};
 use crate::context::Caller;
-use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
 use crate::reverse::{PrimaryReverseRegistry, ReverseChannel, ReverseTransport};
 use crate::rpc_limit::RpcLimiter;
@@ -396,6 +395,7 @@ pub(crate) struct WsInner {
     pub next_client_id: AtomicU64,
     pub external_stop_generation: AtomicU64,
     pub state: tokio::sync::Mutex<StartState>,
+    pub stop_gate: tokio::sync::Mutex<()>,
     /// REV-1 first-client-sticky reverse-dispatch target set. Every accepted
     /// connection registers its per-connection [`ReverseChannel`] here so
     /// agent-initiated reverse RPCs (`browser.exec`) can be routed to the
@@ -478,6 +478,7 @@ impl WsApiServer {
             next_client_id: AtomicU64::new(0),
             external_stop_generation: AtomicU64::new(0),
             state: tokio::sync::Mutex::new(StartState::default()),
+            stop_gate: tokio::sync::Mutex::new(()),
             reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
             server_pairing_info: None,
             control,
@@ -521,6 +522,7 @@ impl WsApiServer {
             next_client_id: AtomicU64::new(0),
             external_stop_generation: AtomicU64::new(0),
             state: tokio::sync::Mutex::new(StartState::default()),
+            stop_gate: tokio::sync::Mutex::new(()),
             reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
             server_pairing_info: None,
             control,
@@ -607,7 +609,41 @@ impl WsApiServer {
     ///
     /// Returns the underlying I/O error if binding the listener fails.
     pub async fn start(&self) -> std::io::Result<u16> {
-        self.inner.start().await
+        self.inner.start(None).await
+    }
+
+    /// Select consecutively from `base_port` through 65535, retaining every
+    /// socket while `persist` commits the assignment before serving. A successful
+    /// assignment is reused on subsequent starts of this server.
+    ///
+    /// # Errors
+    /// Returns bind, cancellation, or persistence errors without serving.
+    pub async fn start_with_port_assignment(
+        &self,
+        persist: impl Fn(u16) -> std::io::Result<()> + Send + Sync + 'static,
+    ) -> std::io::Result<u16> {
+        self.start_with_cancellable_port_assignment(persist, || false)
+            .await
+    }
+
+    /// Like `start_with_port_assignment`, with caller cancellation checked before
+    /// every bind attempt and before persistence/readiness. The predicate must
+    /// retain the caller's original cancellation state even if transport stop
+    /// completes before this start future is first polled.
+    ///
+    /// # Errors
+    /// Returns bind, cancellation, or persistence errors without serving.
+    pub async fn start_with_cancellable_port_assignment(
+        &self,
+        persist: impl Fn(u16) -> std::io::Result<()> + Send + Sync + 'static,
+        cancelled: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> std::io::Result<u16> {
+        self.inner
+            .start(Some(crate::lifecycle::PortAssignment {
+                persist: Arc::new(persist),
+                cancelled: Arc::new(cancelled),
+            }))
+            .await
     }
 
     /// Gracefully stop the listener (idempotent).
@@ -830,7 +866,9 @@ impl WsInner {
         // the primary user, a hashed per-principal credential its principal.
         // Identity is never taken from `client.hello`. The insecure dev seat
         // (auth off) is the local user, exactly like UDS.
-        let credential = if self.auth_enabled {
+        // Subscribe before admission so an upgrade racing revocation cannot miss it.
+        let revocations = self.api.subscribe_principal_revocations();
+        let admitted = if self.auth_enabled {
             // Keychain-backed token reads can stall on a locked/prompting OS
             // keychain; [`AsyncTokenStore`] offloads to the blocking pool with
             // a bounded per-call timeout + single-flight cache so a hung
@@ -839,21 +877,40 @@ impl WsInner {
                 self.token_store.as_ref(),
                 extract_token(authorization.as_deref(), target),
             ) {
-                (Some(store), Some(t)) => validate_token(store, self.api.as_ref(), &t).await,
+                (Some(store), Some(t)) => {
+                    let rotation = crate::auth::LegacyRotation::new(store, &t);
+                    validate_token(store, self.api.as_ref(), &t)
+                        .await
+                        .map(|resolved| crate::auth::AdmittedCredential::new(resolved, t, rotation))
+                }
                 _ => None,
             };
             let Some(resolved) = resolved else {
                 return reject(&mut stream, 401, "Unauthorized").await;
             };
-            resolved
+            Some(resolved)
         } else {
-            ResolvedCredential::Legacy
+            None
         };
-        // Port forwarding is owner-only (multiplayer w3): the `/tunnel` mux
-        // reaches host loopback, so a per-principal (collaborator) credential
-        // is refused at the upgrade — the fe renders "Only the workspace
-        // owner can open forwarded ports" instead of a connection failure.
-        if path == "/tunnel" && matches!(credential, ResolvedCredential::Principal(_)) {
+        let credential = admitted
+            .as_ref()
+            .map_or(ResolvedCredential::Legacy, |c| c.resolved.clone());
+        let principal_credential = matches!(credential, ResolvedCredential::Principal(_));
+        let caller = credential.into_caller(self.api.as_ref()).await;
+        if principal_credential && caller.is_none() {
+            return reject(&mut stream, 401, "Unauthorized").await;
+        }
+        // Members have the owner's loopback preview reach. Workspace guests
+        // remain refused; hello fields cannot alter credential-derived authority.
+        if path == "/tunnel"
+            && matches!(
+                caller.as_ref(),
+                Some(Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            )
+        {
             return reject(&mut stream, 403, "Forbidden").await;
         }
         // Guest connection caps: a per-principal credential takes a
@@ -862,16 +919,18 @@ impl WsInner {
         // both are refused with 503. The seats ride with the connection task
         // so an aborted (heartbeat-reaped) task returns them like a clean
         // exit does. The legacy token — the primary — is never counted.
-        let guest = match &credential {
-            ResolvedCredential::Principal(principal_id) => {
+        let guest = match &caller {
+            Some(Caller::Wire {
+                principal_id,
+                host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
+            }) => {
                 let Some(admission) = self.guests.admit(principal_id) else {
                     return reject_guest_cap_spent(&mut stream).await;
                 };
                 Some(admission)
             }
-            ResolvedCredential::Legacy => None,
+            _ => None,
         };
-        let caller = credential.into_caller(self.api.as_ref()).await;
         let Some(key) = ws_key else {
             return reject(&mut stream, 400, "Bad Request").await;
         };
@@ -920,9 +979,15 @@ impl WsInner {
             WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await
         };
         if path == "/tunnel" {
-            self.spawn_tunnel_connection(ws);
+            self.spawn_tunnel_connection(
+                ws,
+                caller,
+                guest,
+                revocations,
+                admitted.and_then(|c| c.rotation),
+            );
         } else {
-            self.spawn_connection(ws, caller, guest);
+            self.spawn_connection(ws, caller, guest, revocations, admitted);
         }
         Ok(())
     }
@@ -956,6 +1021,8 @@ impl WsInner {
         ws: WebSocketStream<S>,
         caller: Option<Caller>,
         guest: Option<GuestAdmission>,
+        revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>>,
+        admitted: Option<crate::auth::AdmittedCredential>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -967,7 +1034,7 @@ impl WsInner {
             let last_pong = last_pong.clone();
             async move {
                 let _guest = guest;
-                this.connection_loop(id, ws, cmd_rx, last_pong, caller)
+                this.connection_loop(id, ws, cmd_rx, last_pong, caller, revocations, admitted)
                     .await;
             }
         });
@@ -986,8 +1053,14 @@ impl WsInner {
     /// connections live in the same registry as `/ws` clients, so the
     /// heartbeat reaper, `stop()` shutdown close, and the `/health` count all
     /// cover them identically.
-    fn spawn_tunnel_connection<S>(self: &Arc<Self>, ws: WebSocketStream<S>)
-    where
+    fn spawn_tunnel_connection<S>(
+        self: &Arc<Self>,
+        ws: WebSocketStream<S>,
+        caller: Option<Caller>,
+        guest: Option<GuestAdmission>,
+        revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>>,
+        rotation: Option<crate::auth::LegacyRotation>,
+    ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
@@ -998,7 +1071,19 @@ impl WsInner {
         let handle = tokio::spawn({
             let last_pong = last_pong.clone();
             async move {
-                crate::tunnel::run_tunnel_connection(ws, cmd_rx, last_pong, limits).await;
+                let _guest = guest;
+                let authority = caller
+                    .filter(|c| !c.is_administrator())
+                    .and_then(|c| c.principal_id().cloned())
+                    .map(|principal_id| crate::tunnel::MemberAuthority {
+                        api: this.api.clone(),
+                        principal_id,
+                        revocations,
+                    });
+                crate::tunnel::run_tunnel_connection(
+                    ws, cmd_rx, last_pong, limits, authority, rotation,
+                )
+                .await;
                 this.deregister(id);
             }
         });
@@ -1186,6 +1271,10 @@ impl WsInner {
     /// Drive one WebSocket connection: dispatch incoming text via the shared
     /// router, push outbound frames, answer pings, and honour control commands.
     /// On exit, subscriptions are dropped and the socket is closed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keep the private admitted credential scoped to this connection"
+    )]
     async fn connection_loop<S>(
         self: Arc<Self>,
         id: u64,
@@ -1193,22 +1282,52 @@ impl WsInner {
         mut cmd_rx: mpsc::Receiver<ConnCmd>,
         last_pong: Arc<AtomicI64>,
         caller: Option<Caller>,
+        mut revocations: Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>>,
+        mut admitted: Option<crate::auth::AdmittedCredential>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        enum Input {
+            Revoked(std::result::Result<intent_core::PrincipalRevocation, ()>),
+            RoleChanged(bool),
+            Incoming(Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>),
+            Outbound(String),
+            Command(Option<ConnCmd>),
+        }
+
         let (mut sink, mut stream) = ws.split();
         // Two-lane outbound queue: RPC responses on the priority lane, event/
         // subscription pushes on the bulk lane; `recv()` drains priority first
         // so responses overtake queued bulk traffic on a saturated link.
         let (app_tx, mut app_rx) = conn::outbound_channel();
         let mut subs = ConnSubs::default();
-        let mut forwards = ForwardRegistry::default();
-        // A connection bound to a non-administrator principal never serves
-        // reverse RPCs and is never an eligible reverse target (multiplayer
-        // w3); an unbound legacy-token connection keeps the administrator
-        // default (see `context::is_non_administrator_caller`).
+        let credential_binding = admitted
+            .as_ref()
+            .and_then(|admitted| admitted.binding(self.token_store.as_ref()?, caller.as_ref()?));
+        let read_connection = crate::context::with_credential_context(
+            true,
+            caller.clone(),
+            credential_binding.clone(),
+            async {
+                if credential_binding.is_some() {
+                    crate::context::ReadConnectionGuard::bind(
+                        self.api.as_ref(),
+                        intent_core::repository_request::RepositoryWireEntry::Bearer,
+                    )
+                } else {
+                    crate::context::ReadConnectionGuard::absent()
+                }
+            },
+        )
+        .await;
+        let mut rotation = admitted.as_mut().and_then(|c| c.rotation.take());
+        subs.pairing.admitted = admitted;
+        // Bind reverse authority independently of hello metadata. Members may
+        // serve ordinary workspace browsers, while guests remain ineligible.
+        let _retirements = read_connection.forward_retirements(app_tx.priority_sender());
         let reverse = ReverseChannel::new(app_tx.priority_sender())
-            .with_administrator(caller.as_ref().is_none_or(Caller::is_administrator));
+            .with_administrator(caller.as_ref().is_none_or(Caller::is_administrator))
+            .with_member_authority(self.api.clone(), caller.as_ref());
         // REV-2: register this connection's reverse channel with the shared
         // target registry; it becomes an eligible `browser.exec` target once
         // `client.hello` binds an identity advertising `browserExec`. The
@@ -1219,6 +1338,13 @@ impl WsInner {
         let reverse_guard = self
             .reverse_registry
             .register(reverse.clone(), ReverseTransport::Wss);
+        let mut role_changes = caller.as_ref().filter(|c| !c.is_administrator()).map(|_| {
+            self.bus.subscribe(intent_services::SubscriptionFilter {
+                event_types: vec![intent_core::events::HOST_MEMBERS_CHANGED.to_string()],
+                batch_window: None,
+                ..Default::default()
+            })
+        });
         // Per-connection logical-client binding (§16): `None` until `client.hello`.
         let mut client_id: Option<intent_core::ClientId> = None;
         // Credential revocation (multiplayer w4): a connection bound to a
@@ -1229,18 +1355,49 @@ impl WsInner {
         let revoked_principal = match &caller {
             Some(Caller::Wire {
                 principal_id,
-                is_administrator: false,
+                host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
             }) => Some(principal_id.clone()),
             _ => None,
         };
-        let mut revocations = revoked_principal
-            .as_ref()
-            .and_then(|_| self.api.subscribe_principal_revocations());
+        if revoked_principal.is_none() {
+            revocations = None;
+        }
         loop {
-            tokio::select! {
-                revoked = recv_revocation(&mut revocations) => {
+            // Only revocation has priority; keep ordinary traffic fair so
+            // a queued request burst cannot starve replies or heartbeats.
+            let input = if subs.pairing.revoked {
+                Input::Revoked(Err(()))
+            } else {
+                tokio::select! {
+                    biased;
+                    () = crate::auth::await_rotation(&mut rotation) => Input::Revoked(Err(())),
+                    revoked = recv_revocation(&mut revocations) => Input::Revoked(revoked),
+                    input = async {
+                        tokio::select! {
+                            change = async { role_changes.as_mut().expect("guarded").recv().await }, if role_changes.is_some() => Input::RoleChanged(change.is_some()),
+                            incoming = stream.next() => Input::Incoming(incoming),
+                            Some(frame) = app_rx.recv() => Input::Outbound(frame),
+                            cmd = cmd_rx.recv() => Input::Command(cmd),
+                        }
+                    } => input,
+                }
+            };
+            match input {
+                Input::Revoked(revoked) => {
                     match revoked {
-                        Some(id) if Some(&id) == revoked_principal.as_ref() => {
+                        Ok(ref revocation)
+                            if Some(&revocation.principal_id) != revoked_principal.as_ref() => {}
+                        _ => {
+                            read_connection.retire();
+                            // Stop streams and event producers before the bounded
+                            // response drain; only already-admitted replies may leave.
+                            let control = revoked
+                                .ok()
+                                .and_then(|r| r.final_event)
+                                .map(|event| subs.removal_control(&event))
+                                .unwrap_or_default();
+                            subs = ConnSubs::default();
+                            reverse.close();
                             // Deliver in-flight RPC responses before the
                             // close: when the revocation is the caller's own
                             // `principal.revokeSelf`, the broadcast fires
@@ -1250,13 +1407,38 @@ impl WsInner {
                             // bounded so a stuck handler cannot keep a revoked
                             // connection open.
                             let deadline = tokio::time::Instant::now() + REVOKE_FLUSH_GRACE;
+                            for frame in control {
+                                if !matches!(
+                                    tokio::time::timeout_at(
+                                        deadline,
+                                        sink.send(Message::Text(frame.into()))
+                                    )
+                                    .await,
+                                    Ok(Ok(()))
+                                ) {
+                                    break;
+                                }
+                            }
                             while !app_tx.priority_idle() {
-                                let next = tokio::time::timeout_at(deadline, app_rx.recv()).await;
+                                let next =
+                                    tokio::time::timeout_at(deadline, app_rx.recv_priority()).await;
                                 let Ok(Some(frame)) = next else { break };
                                 if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
                                     continue;
                                 }
-                                if sink.send(Message::Text(frame.into())).await.is_err() {
+                                if serde_json::from_str::<serde_json::Value>(&frame)
+                                    .is_ok_and(|value| value.get("method").is_some())
+                                {
+                                    continue;
+                                }
+                                if !matches!(
+                                    tokio::time::timeout_at(
+                                        deadline,
+                                        sink.send(Message::Text(frame.into()))
+                                    )
+                                    .await,
+                                    Ok(Ok(()))
+                                ) {
                                     break;
                                 }
                             }
@@ -1268,11 +1450,32 @@ impl WsInner {
                                 .await;
                             break;
                         }
-                        Some(_) => {}
-                        None => revocations = None,
                     }
                 }
-                incoming = stream.next() => match incoming {
+                Input::RoleChanged(change) => {
+                    if !change {
+                        role_changes = None;
+                        continue;
+                    }
+                    // Notifications run outside the incoming-frame caller scope.
+                    // Reuse this connection's authenticated caller for the role check.
+                    let allowed = crate::context::with_request_context(
+                        true,
+                        caller.clone(),
+                        crate::context::may_manage_workspaces(self.api.as_ref()),
+                    )
+                    .await;
+                    reverse.set_browser_member(allowed);
+                    if allowed {
+                        if let Some(identity) = subs.hello_identity.clone() {
+                            reverse_guard.bind(identity);
+                        }
+                    } else {
+                        reverse_guard.unbind();
+                    }
+                    reverse_guard.refresh_devices();
+                }
+                Input::Incoming(incoming) => match incoming {
                     Some(Err(e)) => {
                         // Over-limit inbound message or frame (monorepo#495):
                         // tell the client why with a 1009 (Message Too Big)
@@ -1298,9 +1501,33 @@ impl WsInner {
                         // Wrap in connection context (is_tcp=true for WSS) so server.*
                         // RPCs gate on real origin, not the locality flag (§5.2), and
                         // bind the caller resolved at upgrade (multiplayer w1).
-                        let frame_ok = crate::context::with_request_context(true, caller.clone(), async {
-                            conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, &reverse_guard, self.control.as_ref(), self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local, &self.rpc_limiter).await
-                        }).await;
+                        let frame_ok = intent_core::caller::with_wire_credential(
+                            credential_binding.clone(),
+                            crate::context::with_request_context(
+                                true,
+                                caller.clone(),
+                                read_connection.run(async {
+                                    crate::context::with_repository_frame(&text, || {
+                                        conn::process_frame(
+                                            &text,
+                                            &self.api,
+                                            &self.bus,
+                                            &app_tx,
+                                            &mut subs,
+                                            &reverse,
+                                            &reverse_guard,
+                                            self.control.as_ref(),
+                                            self.server_pairing_info.as_ref(),
+                                            &mut client_id,
+                                            self.locality_is_local,
+                                            &self.rpc_limiter,
+                                        )
+                                    })
+                                    .await
+                                }),
+                            ),
+                        )
+                        .await;
                         if !frame_ok {
                             break;
                         }
@@ -1314,7 +1541,7 @@ impl WsInner {
                     None | Some(Ok(Message::Close(_))) => break,
                     Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
                 },
-                Some(frame) = app_rx.recv() => {
+                Input::Outbound(frame) => {
                     // Last-resort backstop for non-response frames
                     // (subscription pushes/events): oversized router
                     // responses are already replaced with a `-32010` error
@@ -1331,7 +1558,7 @@ impl WsInner {
                         break;
                     }
                 }
-                cmd = cmd_rx.recv() => match cmd {
+                Input::Command(cmd) => match cmd {
                     None => break,
                     Some(ConnCmd::Ping) => {
                         if sink.send(Message::Ping(Bytes::new())).await.is_err() {
@@ -1339,6 +1566,7 @@ impl WsInner {
                         }
                     }
                     Some(ConnCmd::Close) => {
+                        read_connection.retire();
                         let _ = sink
                             .send(Message::Close(Some(CloseFrame {
                                 code: CloseCode::Away,
@@ -1347,11 +1575,11 @@ impl WsInner {
                             .await;
                         break;
                     }
-                }
+                },
             }
         }
+        read_connection.retire();
         drop(subs);
-        drop(forwards);
         reverse.close();
         drop(reverse_guard);
         if let Some(mut gate) = self.cleanup_gate.clone() {
@@ -1362,24 +1590,16 @@ impl WsInner {
     }
 }
 
-/// Await the next principal revocation on an optional feed: `Some(id)` per
-/// revoked principal (a lagged receiver skips ahead — a missed close only
-/// means that connection fails on its next RPC instead), `None` once the
-/// feed is closed, and pending forever when there is no feed so the
-/// `select!` branch never fires for administrator/unbound connections.
-async fn recv_revocation(
-    rx: &mut Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalId>>,
-) -> Option<intent_core::PrincipalId> {
+/// Await a revocation; lag or feed closure fails closed because an affected
+/// principal may have been missed. Without a feed this remains pending, so
+/// administrator/unbound connections never enter the revocation branch.
+pub(crate) async fn recv_revocation(
+    rx: &mut Option<tokio::sync::broadcast::Receiver<intent_core::PrincipalRevocation>>,
+) -> std::result::Result<intent_core::PrincipalRevocation, ()> {
     let Some(rx) = rx.as_mut() else {
         return std::future::pending().await;
     };
-    loop {
-        match rx.recv().await {
-            Ok(id) => return Some(id),
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-        }
-    }
+    rx.recv().await.map_err(|_| ())
 }
 
 /// Build a rustls `TlsAcceptor` from the self-signed cert/key, pinning the ring
@@ -1540,6 +1760,23 @@ mod tests {
         mono_ms, negotiate_extensions, GuestConnectionLimits, GuestRegistry, SharedGuestLimits,
     };
     use intent_core::PrincipalId;
+
+    #[tokio::test]
+    async fn member_transport_revocation_feed_fails_closed_on_lag_or_close() {
+        use futures_util::FutureExt as _;
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        let mut rx = Some(rx);
+        let first = intent_core::PrincipalRevocation::from(PrincipalId::new());
+        tx.send(first.clone()).unwrap();
+        assert_eq!(super::recv_revocation(&mut rx).await, Ok(first));
+        tx.send(PrincipalId::new().into()).unwrap();
+        tx.send(PrincipalId::new().into()).unwrap();
+        assert_eq!(super::recv_revocation(&mut rx).await, Err(()));
+        let mut closed = Some(tx.subscribe());
+        drop(tx);
+        assert_eq!(super::recv_revocation(&mut closed).await, Err(()));
+        assert!(super::recv_revocation(&mut None).now_or_never().is_none());
+    }
 
     fn caps(listener: u32, per_guest: u32) -> GuestConnectionLimits {
         GuestConnectionLimits {

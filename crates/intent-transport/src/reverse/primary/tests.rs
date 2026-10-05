@@ -592,7 +592,7 @@ fn transitions_queued_before_the_claim_are_retained() {
     );
     assert!(transitions
         .iter()
-        .all(|t| t.identity() == &identity("x", true)));
+        .all(|t| t.identity() == Some(&identity("x", true))));
 }
 
 #[test]
@@ -1012,4 +1012,89 @@ async fn dispatch_reports_transport_error_when_channel_is_closed() {
         matches!(err, ReverseDispatchError::Transport { .. }),
         "unexpected error: {err:?}"
     );
+}
+
+/// Fail closed for stale raw/scoped targets even with an eligible connected
+/// desktop sharing the suffix; no implicit pin or tab-host authority transfer.
+#[tokio::test]
+async fn identity_drift_never_resolves_stale_targets_by_suffix() {
+    let reg = PrimaryReverseRegistry::new();
+    let (desktop, mut rx) = idle_channel();
+    let guard = reg.register(desktop.clone(), ReverseTransport::Wss);
+    guard.bind(identity("desktop", true));
+    assert_eq!(
+        dispatch_and_reply(
+            &reg,
+            pinned("desktop"),
+            &desktop,
+            &mut rx,
+            json!({"host": "before-rehello"})
+        )
+        .await
+        .unwrap(),
+        json!({"host": "before-rehello"})
+    );
+    // The same healthy physical connection re-hellos with a changed logical ID.
+    guard.bind(identity("alice:bob:desktop", true));
+    for id in ["desktop", "bob:desktop", "alice:desktop"] {
+        for target in [client(id), pinned(id)] {
+            let err = reg
+                .dispatch("browser.exec", json!({"actions": []}), target)
+                .await;
+            assert!(
+                matches!(err, Err(ReverseDispatchError::ClientOffline { client_id, .. })
+                if client_id.as_str() == id)
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "suffix collision must send no action"
+            );
+        }
+    }
+    assert_eq!(
+        dispatch_and_reply(
+            &reg,
+            pinned("alice:bob:desktop"),
+            &desktop,
+            &mut rx,
+            json!({"host": "intended"})
+        )
+        .await
+        .unwrap(),
+        json!({"host": "intended"})
+    );
+}
+
+#[tokio::test]
+async fn identity_drift_unauthorized_exact_collision_cannot_capture_reverse_authority() {
+    let reg = PrimaryReverseRegistry::new();
+    let (owner, mut owner_rx) = idle_channel();
+    let owner_guard = reg.register(owner.clone(), ReverseTransport::Wss);
+    owner_guard.bind(identity("alice:desktop", true));
+    let (foreign, mut foreign_rx) = idle_channel();
+    let foreign_guard = reg.register(foreign.with_administrator(false), ReverseTransport::Wss);
+    // Deliberately bypass hello's namespace protection: reverse routing must
+    // independently reject an unauthorized newest connection with an exact ID.
+    foreign_guard.bind(identity("alice:desktop", true));
+    for target in [client("alice:desktop"), pinned("alice:desktop")] {
+        assert_eq!(
+            dispatch_and_reply(
+                &reg,
+                target,
+                &owner,
+                &mut owner_rx,
+                json!({"host": "owner"})
+            )
+            .await
+            .unwrap(),
+            json!({"host": "owner"})
+        );
+        assert!(foreign_rx.try_recv().is_err());
+    }
+    drop(owner_guard);
+    assert!(matches!(
+        reg.resolve(&pinned("alice:desktop")),
+        Err(ReverseDispatchError::ClientOffline { .. })
+    ));
+    assert!(foreign_rx.try_recv().is_err());
 }

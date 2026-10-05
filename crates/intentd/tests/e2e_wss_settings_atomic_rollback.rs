@@ -4,7 +4,7 @@
 //!   to their pre-batch values and returns the failing key in the error
 //!   response;
 //! - retired `model.workspaceOverrides`: `settings.update` over WSS
-//!   tolerates-and-ignores the retired path while `settings.get` rejects it;
+//!   rejects the retired path atomically, as do `settings.get`/`settings.reset`;
 //! - default-provider switch (monorepo#3177): a `settings.update` batch
 //!   switching `model.defaultProvider` re-resolves `model.default` for the new
 //!   provider (cached catalog default, else cleared);
@@ -37,6 +37,135 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+
+#[tokio::test]
+async fn fast_mode_settings_contract_over_wss() {
+    let dir = temp_data_dir();
+    let data_dir = dir.path().to_path_buf();
+    let env = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let mut daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    let ack = wss_rpc(
+        &mut sub,
+        100,
+        "events.subscribe",
+        json!({"eventTypes":["settings:changed"]}),
+    )
+    .await;
+    assert_success_envelope(&ack, 100);
+    let list = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    assert_success_envelope(&list, 1);
+    let entry = list["result"]["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "providers.fastMode")
+        .unwrap();
+    assert_eq!(entry["type"], "object");
+    assert_eq!(entry["defaultValue"], json!({}));
+    assert_eq!(entry["value"], json!({}));
+    assert_eq!(entry["origin"], "default");
+    let catalog = wss_rpc(&mut ws, 2, "providers.catalog", json!({})).await;
+    assert_success_envelope(&catalog, 2);
+    for row in catalog["result"]["providers"].as_array().unwrap() {
+        assert_eq!(
+            row["supportsFastMode"],
+            matches!(row["id"].as_str(), Some("claude-code" | "codex"))
+        );
+    }
+    let prefs = json!({"claude-code":true,"codex":false});
+    let response = wss_rpc(
+        &mut ws,
+        3,
+        "settings.update",
+        json!({"changes":[{"path":"providers.fastMode","value":prefs}]}),
+    )
+    .await;
+    assert_success_envelope(&response, 3);
+    let changed = next_settings_changed(&mut sub).await;
+    assert_eq!(
+        changed
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["path"] == "providers.fastMode")
+            .count(),
+        1
+    );
+    assert_eq!(changed[0]["value"], prefs);
+    let before = std::fs::read_to_string(data_dir.join("config.toml")).unwrap();
+    for invalid in [
+        Value::Null,
+        json!([]),
+        json!({"codex":1}),
+        json!({"claude":true}),
+        json!({"auggie":false}),
+        json!({"unknown":true}),
+    ] {
+        let response = wss_rpc(&mut ws, 4, "settings.update", json!({"changes":[{"path":"git.autoCommit","value":false},{"path":"providers.fastMode","value":invalid}]})).await;
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("config.toml")).unwrap(),
+            before
+        );
+    }
+    let response = wss_rpc(
+        &mut ws,
+        5,
+        "settings.update",
+        json!({"changes":[{"path":"providers.fastMode.codex","value":true}]}),
+    )
+    .await;
+    assert_eq!(response["error"]["code"], -32602);
+    // A real daemon restart proves both independent values survive process state.
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    daemon.child = spawn_serve(&data_dir, "both", &env);
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut ws = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let got = wss_rpc(
+        &mut ws,
+        6,
+        "settings.get",
+        json!({"path":"providers.fastMode"}),
+    )
+    .await;
+    assert_success_envelope(&got, 6);
+    assert_eq!(got["result"]["value"], prefs);
+    assert_eq!(got["result"]["origin"], "file");
+    let reset = wss_rpc(
+        &mut ws,
+        7,
+        "settings.reset",
+        json!({"path":"providers.fastMode"}),
+    )
+    .await;
+    assert_success_envelope(&reset, 7);
+    assert_eq!(reset["result"]["value"], json!({}));
+    let got = wss_rpc(
+        &mut ws,
+        8,
+        "settings.get",
+        json!({"path":"providers.fastMode"}),
+    )
+    .await;
+    assert_eq!(got["result"]["origin"], "default");
+}
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -334,10 +463,8 @@ async fn mixed_batch_rollback_over_wss() {
     );
 }
 
-/// Retired `model.workspaceOverrides` over WSS: `settings.update` writes to the
-/// retired path are tolerated-and-ignored (no `-32602`, `applied: []`, mixed
-/// batches still apply their live entries) and `settings.get` rejects the path
-/// as unknown — same wire contract as UDS (`legacy_workspace_overrides_discards_and_strips_on_boot`).
+/// Retired writes fail as unknown settings over WSS, including mixed batches.
+/// Legacy config import/strip remains covered by the UDS boot regression.
 #[tokio::test]
 async fn retired_workspace_overrides_over_wss() {
     let data_dir_guard = temp_data_dir();
@@ -365,65 +492,46 @@ async fn retired_workspace_overrides_over_wss() {
     let cfg = client_config(&fingerprint);
     let mut ws = connect_ws(port, cfg).await;
 
-    // Old-client write of the retired path alone: tolerated, nothing applied.
-    let resp = wss_rpc(
-        &mut ws,
-        1,
-        "settings.update",
-        json!({
-            "changes": [
-                {"path": "model.workspaceOverrides", "value": {"ws-1": "gpt-5"}}
-            ]
-        }),
-    )
-    .await;
-    assert!(
-        resp.get("error").is_none(),
-        "retired-path update must not error: {resp}"
-    );
+    let before = wss_rpc(&mut ws, 1, "settings.get", json!({"path": "model.default"})).await;
+    let retired = json!({"path": "model.workspaceOverrides", "value": {"ws-1": "gpt-5"}});
+    let live = json!({"path": "model.default", "value": "claude-sonnet-4"});
+    for (i, changes) in [
+        json!([retired.clone()]),
+        json!([retired.clone(), live.clone()]),
+        json!([live, retired]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = 2 + i64::try_from(i).expect("request index fits i64");
+        let resp = wss_rpc(&mut ws, id, "settings.update", json!({"changes": changes})).await;
+        assert_eq!(resp["jsonrpc"], json!("2.0"));
+        assert_eq!(resp["id"], json!(id));
+        assert_eq!(resp["error"]["code"], json!(-32602), "{resp}");
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("unknown setting: model.workspaceOverrides"),
+            "{resp}"
+        );
+        assert!(resp.get("result").is_none(), "{resp}");
+    }
+    let after = wss_rpc(&mut ws, 5, "settings.get", json!({"path": "model.default"})).await;
     assert_eq!(
-        resp["result"]["applied"],
-        json!([]),
-        "retired path must not be echoed in applied"
+        after["result"], before["result"],
+        "mixed batches must not apply live entries"
     );
-
-    // Mixed batch: the live entry applies, the retired one is skipped.
-    let resp = wss_rpc(
-        &mut ws,
-        2,
-        "settings.update",
-        json!({
-            "changes": [
-                {"path": "model.workspaceOverrides", "value": {"ws-1": "gpt-5"}},
-                {"path": "model.default", "value": "claude-sonnet-4"}
-            ]
-        }),
-    )
-    .await;
-    assert!(
-        resp.get("error").is_none(),
-        "mixed batch with retired path must not error: {resp}"
-    );
-    let applied = resp["result"]["applied"].as_array().expect("applied array");
-    assert_eq!(applied.len(), 1, "only the live entry applies: {resp}");
-    assert_eq!(applied[0]["path"], json!("model.default"));
-
-    let resp = wss_rpc(&mut ws, 3, "settings.get", json!({"path": "model.default"})).await;
-    assert_eq!(resp["result"]["value"], json!("claude-sonnet-4"));
-
-    // The retired path is gone from the catalog: settings.get rejects it.
-    let resp = wss_rpc(
-        &mut ws,
-        4,
-        "settings.get",
-        json!({"path": "model.workspaceOverrides"}),
-    )
-    .await;
-    assert_eq!(
-        resp["error"]["code"],
-        json!(-32602),
-        "settings.get on the retired path must reject as unknown: {resp}"
-    );
+    for (id, method) in [(6, "settings.get"), (7, "settings.reset")] {
+        let resp = wss_rpc(
+            &mut ws,
+            id,
+            method,
+            json!({"path": "model.workspaceOverrides"}),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], json!(-32602), "{resp}");
+    }
 }
 
 /// `tokenImpact` over WSS (§5.12): every `agentFeatures.*` definition in
@@ -509,6 +617,13 @@ async fn next_settings_changed<S>(ws: &mut WebSocketStream<S>) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    next_settings_changed_data(ws).await["changes"].clone()
+}
+
+async fn next_settings_changed_data<S>(ws: &mut WebSocketStream<S>) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -521,7 +636,7 @@ where
                 if v["method"] == json!("events.event")
                     && v["params"]["event"]["type"] == json!("settings:changed")
                 {
-                    return v["params"]["event"]["data"]["changes"].clone();
+                    return v["params"]["event"]["data"].clone();
                 }
             }
             Some(Ok(Message::Ping(p))) => {
@@ -1414,15 +1529,39 @@ async fn redaction_placeholder_round_trip_keeps_secret_over_wss() {
         "echoing the placeholder must not clobber the stored secret"
     );
 
-    // A literal value still replaces.
+    // A literal secret and an ordinary setting still commit as one revision
+    // after secret persistence moves outside the global gate (#5554 part 2).
     let resp = wss_rpc(
         &mut ws,
         4,
         "settings.update",
-        json!({ "changes": [{ "path": "linear.token", "value": "lin_api_rotated" }] }),
+        json!({ "changes": [
+            { "path": "notifications.volume", "value": 0.75 },
+            { "path": "linear.token", "value": "lin_api_rotated" }
+        ] }),
     )
     .await;
     assert_success_envelope(&resp, 4);
+    let applied = json!([
+        { "path": "notifications.volume", "value": 0.75, "origin": "file" },
+        { "path": "linear.token", "value": PLACEHOLDER }
+    ]);
+    assert_eq!(resp["result"]["applied"], applied);
+    let event = next_settings_changed_data(&mut sub).await;
+    assert_eq!(event["changes"], applied);
+    assert_eq!(event["revision"], resp["result"]["revision"]);
+    let snapshot = wss_rpc(&mut ws, 5, "settings.list", json!({})).await;
+    assert_success_envelope(&snapshot, 5);
+    assert_eq!(snapshot["result"]["revision"], event["revision"]);
+    for expected in applied.as_array().unwrap() {
+        let entry = snapshot["result"]["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"] == expected["path"])
+            .unwrap();
+        assert_eq!(entry["value"], expected["value"]);
+    }
     assert_eq!(
         stored_secret(&secrets_file, "linear.token").as_deref(),
         Some("lin_api_rotated")

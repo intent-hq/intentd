@@ -21,10 +21,11 @@ use futures_util::{SinkExt, StreamExt};
 use intent_core::{Result as CoreResult, WorkspaceApi};
 use intent_services::{EventBus, Services};
 use intent_sourcecontrol::{
-    AuthStatus, Branch, CheckRun, Comment, CommentAnchor, Issue, IssueQuery, MergeMethod,
-    MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
-    PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review,
-    ReviewComment, ReviewThread, ReviewVerdict, ScCapabilities, SourceControl, UserIdentity,
+    AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor, Issue, IssueQuery,
+    MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page, PageParams,
+    PrInvolvement, PrPatch, PrQuery, PrState, PullRequest, PullRequestFile, PullRequestFilesPage,
+    PullRequestReview, Repo, RepoRef, Result as ScResult, Review, ReviewComment, ReviewThread,
+    ReviewVerdict, ScCapabilities, SourceControl, UserIdentity,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -180,10 +181,23 @@ struct RecordingForge {
     issue_gets: Mutex<Vec<(RepoRef, u64)>>,
     branch_queries: Mutex<Vec<(Option<String>, Option<String>)>>,
     user_searches: Mutex<Vec<(String, u8)>>,
+    calls: Mutex<Vec<Value>>,
 }
 
 #[async_trait]
 impl SourceControl for RecordingForge {
+    async fn list_org_prs(&self, org: &str, query: PrQuery) -> ScResult<Page<PullRequest>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["org-prs", org, query]));
+        let mut pr = sample_pr();
+        pr.url = format!("https://github.com/{org}/outside-home/pull/42");
+        Ok(Page {
+            items: vec![pr],
+            next_cursor: Some("2".into()),
+        })
+    }
     fn provider_id(&self) -> &'static str {
         "stub"
     }
@@ -198,10 +212,14 @@ impl SourceControl for RecordingForge {
         }
     }
     async fn check_auth(&self) -> ScResult<AuthStatus> {
-        unimplemented!()
+        Ok(AuthStatus {
+            authenticated: true,
+            login: Some("fixture".into()),
+            scopes: vec![],
+        })
     }
     async fn get_user(&self) -> ScResult<UserIdentity> {
-        unimplemented!()
+        Ok(serde_json::from_value(json!({"login":"fixture","id":42})).unwrap())
     }
     async fn search_users(&self, query: &str, limit: u8) -> ScResult<Vec<UserIdentity>> {
         self.user_searches
@@ -225,14 +243,32 @@ impl SourceControl for RecordingForge {
             },
         ])
     }
-    async fn list_repos(&self, _: PageParams) -> ScResult<Page<Repo>> {
-        unimplemented!()
+    async fn list_repos(&self, page: PageParams) -> ScResult<Page<Repo>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["repos", page.limit, page.cursor]));
+        Ok(Page {
+            items: vec![sample_repo()],
+            next_cursor: Some("2".into()),
+        })
     }
-    async fn search_repos(&self, _: &str, _: PageParams) -> ScResult<Page<Repo>> {
-        unimplemented!()
+    async fn search_repos(&self, query: &str, page: PageParams) -> ScResult<Page<Repo>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["search", query, page.limit, page.cursor]));
+        Ok(Page {
+            items: vec![sample_repo()],
+            next_cursor: Some("2".into()),
+        })
     }
-    async fn get_repo(&self, _: &str, _: &str) -> ScResult<Repo> {
-        unimplemented!()
+    async fn get_repo(&self, owner: &str, repo: &str) -> ScResult<Repo> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["repo", owner, repo]));
+        Ok(sample_repo())
     }
     async fn list_remote_branches(
         &self,
@@ -268,11 +304,102 @@ impl SourceControl for RecordingForge {
     ) -> ScResult<Option<String>> {
         unimplemented!()
     }
-    async fn create_pr(&self, _: &RepoRef, _: NewPullRequest) -> ScResult<PullRequest> {
-        unimplemented!()
+    async fn create_pr(&self, repo: &RepoRef, request: NewPullRequest) -> ScResult<PullRequest> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["create", repo, request]));
+        Ok(sample_pr())
     }
-    async fn get_pr(&self, _: &RepoRef, _: u64) -> ScResult<PullRequest> {
-        unimplemented!()
+    async fn get_pr(&self, repo: &RepoRef, number: u64) -> ScResult<PullRequest> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["get-pr", repo.owner, repo.name, number]));
+        if number == 404 {
+            return Err(intent_sourcecontrol::Error::NotFound("PR missing".into()));
+        }
+        let mut pr = sample_pr();
+        if number == 43
+            && self
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call[0] == "get-pr" && call[3] == 43)
+                .count()
+                > 1
+        {
+            pr.head_sha = Some("new-head".into());
+        }
+        Ok(pr)
+    }
+    async fn pull_files(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        page: PageParams,
+    ) -> ScResult<PullRequestFilesPage> {
+        self.calls.lock().unwrap().push(json!([
+            "files",
+            repo.owner,
+            repo.name,
+            number,
+            page.limit,
+            page.cursor
+        ]));
+        Ok(PullRequestFilesPage {
+            items: vec![
+                PullRequestFile {
+                    filename: "src/new.rs".into(),
+                    previous_filename: Some("src/old.rs".into()),
+                    status: "renamed".into(),
+                    additions: 2,
+                    deletions: 1,
+                    changes: 3,
+                    patch: Some("@@ -1 +1,2 @@\n-old\n+new\n+line".into()),
+                    url: Some("https://github.com/o/r/blob/deadbeef/src/new.rs".into()),
+                },
+                PullRequestFile {
+                    filename: "image.png".into(),
+                    previous_filename: None,
+                    status: "added".into(),
+                    additions: 0,
+                    deletions: 0,
+                    changes: 0,
+                    patch: None,
+                    url: None,
+                },
+            ],
+            next_cursor: Some("2".into()),
+            truncated: false,
+        })
+    }
+    async fn pull_reviews(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        page: PageParams,
+    ) -> ScResult<Page<PullRequestReview>> {
+        self.calls.lock().unwrap().push(json!([
+            "reviews",
+            repo.owner,
+            repo.name,
+            number,
+            page.limit,
+            page.cursor
+        ]));
+        Ok(Page {
+            items: vec![PullRequestReview {
+                id: 7,
+                author: "reviewer".into(),
+                state: "DISMISSED".into(),
+                body: Some("Former review".into()),
+                submitted_at: Some("2026-09-29T00:00:00Z".into()),
+                url: Some("https://github.com/o/r/pull/42#pullrequestreview-7".into()),
+            }],
+            next_cursor: None,
+        })
     }
     async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> ScResult<Page<PullRequest>> {
         let items = if query.extra_repos.is_empty() {
@@ -301,18 +428,30 @@ impl SourceControl for RecordingForge {
     }
     async fn merge_pr(
         &self,
-        _: &RepoRef,
-        _: u64,
-        _: MergeMethod,
-        _: MergeOptions,
+        repo: &RepoRef,
+        number: u64,
+        method: MergeMethod,
+        options: MergeOptions,
     ) -> ScResult<MergeOutcome> {
-        unimplemented!()
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["merge", repo, number, method, options]));
+        Ok(MergeOutcome {
+            merged: true,
+            message: "fixture merged".into(),
+            sha: Some("deadbeef".into()),
+        })
     }
     async fn mergeability(&self, _: &RepoRef, _: u64) -> ScResult<Mergeability> {
         unimplemented!()
     }
-    async fn update_branch(&self, _: &RepoRef, _: u64) -> ScResult<()> {
-        unimplemented!()
+    async fn update_branch(&self, repo: &RepoRef, number: u64) -> ScResult<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["updateBranch", repo, number]));
+        Ok(())
     }
     async fn submit_review(
         &self,
@@ -340,37 +479,70 @@ impl SourceControl for RecordingForge {
     }
     async fn list_review_comments(
         &self,
-        _: &RepoRef,
-        _: u64,
-        _: PageParams,
+        repo: &RepoRef,
+        number: u64,
+        page: PageParams,
     ) -> ScResult<Page<ReviewComment>> {
-        unimplemented!()
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["comments", repo, number, page.limit, page.cursor]));
+        Ok(Page {
+            items: vec![sample_comment()],
+            next_cursor: Some("2".into()),
+        })
     }
     async fn reply_to_review_comment(
         &self,
-        _: &RepoRef,
-        _: u64,
-        _: u64,
-        _: &str,
+        repo: &RepoRef,
+        number: u64,
+        comment: u64,
+        body: &str,
     ) -> ScResult<ReviewComment> {
-        unimplemented!()
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["reply", repo, number, comment, body]));
+        Ok(sample_comment())
     }
     async fn get_review_threads(
         &self,
-        _: &RepoRef,
-        _: u64,
-        _: PageParams,
+        repo: &RepoRef,
+        number: u64,
+        page: PageParams,
     ) -> ScResult<Page<ReviewThread>> {
-        unimplemented!()
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["threads", repo, number, page.limit, page.cursor]));
+        Ok(Page {
+            items: vec![ReviewThread {
+                id: "thread".into(),
+                is_resolved: false,
+                comments: vec![],
+            }],
+            next_cursor: Some("2".into()),
+        })
     }
-    async fn resolve_thread(&self, _: &str) -> ScResult<bool> {
-        unimplemented!()
+    async fn resolve_thread(&self, id: &str) -> ScResult<bool> {
+        self.calls.lock().unwrap().push(json!(["resolve", id]));
+        Ok(true)
     }
-    async fn unresolve_thread(&self, _: &str) -> ScResult<bool> {
-        unimplemented!()
+    async fn unresolve_thread(&self, id: &str) -> ScResult<bool> {
+        self.calls.lock().unwrap().push(json!(["unresolve", id]));
+        Ok(false)
     }
-    async fn check_runs(&self, _: &RepoRef, _: &str) -> ScResult<Vec<CheckRun>> {
-        unimplemented!()
+    async fn check_runs(&self, repo: &RepoRef, git_ref: &str) -> ScResult<Vec<CheckRun>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["checks", repo.owner, repo.name, git_ref]));
+        Ok(vec![CheckRun {
+            name: "CI".into(),
+            state: CheckState::Pending,
+            url: None,
+            started_at: None,
+        }])
     }
     async fn create_issue(&self, _: &RepoRef, _: &str, _: Option<&str>) -> ScResult<Issue> {
         unimplemented!()
@@ -415,7 +587,7 @@ struct Fixture {
     port: u16,
     cfg: Arc<ClientConfig>,
     forge: Arc<RecordingForge>,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services carry the recording
@@ -453,7 +625,7 @@ async fn boot() -> Fixture {
         port,
         cfg,
         forge,
-        _dir: dir_guard,
+        dir: dir_guard,
     }
 }
 
@@ -506,37 +678,132 @@ fn wire_next_token(cursor: &str) -> String {
         .encode(serde_json::to_vec(&json!({ "c": cursor })).unwrap())
 }
 
+#[intent_test_macros::daemon_test]
+async fn org_pulls_search_spans_repos_outside_home_and_preserves_cursor() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    let response = wss_rpc(
+        &mut ws,
+        1,
+        "github.pulls.search",
+        json!({
+            "org":"intent-hq", "query":"  fix login  ", "filter":"review-requested",
+            "state":"closed", "limit":25, "nextToken":wire_next_token("3")
+        }),
+    )
+    .await;
+    assert_eq!(response["pulls"][0]["owner"], "intent-hq");
+    assert_eq!(response["pulls"][0]["repo"], "outside-home");
+    assert_eq!(response["nextToken"], wire_next_token("2"));
+    let calls = fx.forge.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "no sidebar repository lookup or per-repo fan-out"
+    );
+    assert_eq!(calls[0][0], "org-prs");
+    assert_eq!(calls[0][1], "intent-hq");
+    assert_eq!(calls[0][2]["search"], "fix login");
+    assert_eq!(calls[0][2]["cursor"], "3");
+    assert_eq!(calls[0][2]["limit"], 25);
+    assert_eq!(calls[0][2]["state"], "closed");
+    assert_eq!(calls[0][2]["involvement"], "review-requested");
+    let blank = wss_rpc(
+        &mut ws,
+        2,
+        "github.pulls.search",
+        json!({"org":"intent-hq", "query":"  "}),
+    )
+    .await;
+    assert_eq!(blank["pulls"][0]["repo"], "outside-home");
+    assert!(
+        fx.forge.pr_queries.lock().unwrap().is_empty(),
+        "org listing never degrades to one repo"
+    );
+    let personal = wss_rpc(
+        &mut ws,
+        3,
+        "github.pulls.search",
+        json!({"org":"Wattenberger", "filter":"created"}),
+    )
+    .await;
+    assert_eq!(personal["pulls"][0]["owner"], "Wattenberger");
+    assert_eq!(personal["pulls"][0]["repo"], "outside-home");
+    let artifact = fx.dir.path().join("org-pulls-search-wire.json");
+    std::fs::write(
+        &artifact,
+        serde_json::to_vec_pretty(&json!({"filtered":response,"blank":blank,"personal":personal,"engineCalls":fx.forge.calls.lock().unwrap().clone()}))
+            .unwrap(),
+    )
+    .unwrap();
+    println!("org PR search wire artifact: {}", artifact.display());
+}
+
+#[intent_test_macros::daemon_test]
+async fn org_pulls_search_rejects_invalid_or_mixed_scopes_before_forge() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for (index, params) in [
+        json!({"org":""}),
+        json!({"org":"intent-hq OR org:elsewhere"}),
+        json!({"org":true}),
+        json!({"org":null}),
+        json!({"org":"x".repeat(40)}),
+        json!({"org":"with/slash"}),
+        json!({"org":"intent-hq","owner":"intent-hq","repo":"intent"}),
+        json!({"org":"intent-hq","repos":[]}),
+        json!({"org":"intent-hq","repo":null}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = wss_rpc_envelope(
+            &mut ws,
+            i64::try_from(index).unwrap(),
+            "github.pulls.search",
+            params,
+        )
+        .await;
+        assert_eq!(result["error"]["code"], -32602, "{result}");
+    }
+    assert!(fx.forge.calls.lock().unwrap().is_empty());
+    assert!(fx.forge.pr_queries.lock().unwrap().is_empty());
+}
+
 /// `github.pulls.search` with a free-text `query`: the trimmed text reaches
 /// the engine as `PrQuery.search`, the involvement filter still parses, the
 /// `nextToken` decodes onto the engine cursor, and the response carries the
 /// PR page plus an encoded `nextToken` for the engine's `next_cursor`.
 #[intent_test_macros::daemon_test]
 async fn pulls_search_forwards_query_and_cursor() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "github.pulls.search",
-        json!({
-            "owner": "o", "repo": "r", "filter": "created", "state": "open",
-            "query": "  panic on save  ", "limit": 10,
-            "nextToken": wire_next_token("3"),
-        }),
-    )
-    .await;
-    assert_eq!(r["pulls"][0]["number"], 42);
-    assert_eq!(r["nextToken"], json!(wire_next_token("2")));
+        let r = context_rpc(
+            context,
+            &mut ws,
+            1,
+            "github.pulls.search",
+            json!({
+                "owner": "o", "repo": "r", "filter": "created", "state": "open",
+                "query": "  panic on save  ", "limit": 10,
+                "nextToken": wire_next_token("3"),
+            }),
+        )
+        .await;
+        assert_eq!(r["pulls"][0]["number"], 42);
+        assert_eq!(r["nextToken"], json!(wire_next_token("2")));
 
-    let queries = fx.forge.pr_queries.lock().unwrap();
-    assert_eq!(queries.len(), 1);
-    let q = &queries[0];
-    assert_eq!(q.search.as_deref(), Some("panic on save"));
-    assert_eq!(q.state, Some(PrState::Open));
-    assert!(q.involvement.is_some());
-    assert_eq!(q.limit, Some(10));
-    assert_eq!(q.cursor.as_deref(), Some("3"));
+        let queries = fx.forge.pr_queries.lock().unwrap();
+        assert_eq!(queries.len(), 1);
+        let q = &queries[0];
+        assert_eq!(q.search.as_deref(), Some("panic on save"));
+        assert_eq!(q.state, Some(PrState::Open));
+        assert!(q.involvement.is_some());
+        assert_eq!(q.limit, Some(10));
+        assert_eq!(q.cursor.as_deref(), Some("3"));
+    }
 }
 
 /// `github.issues.search` with a free-text `query`: the trimmed text reaches
@@ -544,70 +811,77 @@ async fn pulls_search_forwards_query_and_cursor() {
 /// cursor round-trips both ways.
 #[intent_test_macros::daemon_test]
 async fn issues_search_forwards_query_and_cursor() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "github.issues.search",
-        json!({
-            "owner": "o", "repo": "r", "state": "closed",
-            "query": "  login bug  ",
-            "nextToken": wire_next_token("5"),
-        }),
-    )
-    .await;
-    assert_eq!(r["issues"][0]["number"], 11);
-    assert_eq!(r["issues"][0]["owner"], "o");
-    assert_eq!(r["issues"][0]["repo"], "r");
-    // The response token encodes the engine's returned next_cursor ("2"),
-    // not an echo of the request token (cursor "5").
-    assert_eq!(r["nextToken"], json!(wire_next_token("2")));
+        let r = context_rpc(
+            context,
+            &mut ws,
+            1,
+            "github.issues.search",
+            json!({
+                "owner": "o", "repo": "r", "state": "closed",
+                "query": "  login bug  ",
+                "nextToken": wire_next_token("5"),
+            }),
+        )
+        .await;
+        assert_eq!(r["issues"][0]["number"], 11);
+        assert_eq!(r["issues"][0]["owner"], "o");
+        assert_eq!(r["issues"][0]["repo"], "r");
+        // The response token encodes the engine's returned next_cursor ("2"),
+        // not an echo of the request token (cursor "5").
+        assert_eq!(r["nextToken"], json!(wire_next_token("2")));
 
-    let queries = fx.forge.issue_queries.lock().unwrap();
-    assert_eq!(queries.len(), 1);
-    let q = &queries[0];
-    assert_eq!(q.search.as_deref(), Some("login bug"));
-    assert_eq!(q.state.as_deref(), Some("closed"));
-    assert_eq!(q.cursor.as_deref(), Some("5"));
+        let queries = fx.forge.issue_queries.lock().unwrap();
+        assert_eq!(queries.len(), 1);
+        let q = &queries[0];
+        assert_eq!(q.search.as_deref(), Some("login bug"));
+        assert_eq!(q.state.as_deref(), Some("closed"));
+        assert_eq!(q.cursor.as_deref(), Some("5"));
+    }
 }
 
 /// Without a `query` (or with a blank one) the engine sees `search: None` —
 /// the pre-existing listing behavior is unchanged.
 #[intent_test_macros::daemon_test]
 async fn search_without_query_leaves_listing_unchanged() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "github.issues.search",
-        json!({ "owner": "o", "repo": "r" }),
-    )
-    .await;
-    assert_eq!(r["issues"][0]["number"], 11);
+        let r = context_rpc(
+            context,
+            &mut ws,
+            1,
+            "github.issues.search",
+            json!({ "owner": "o", "repo": "r" }),
+        )
+        .await;
+        assert_eq!(r["issues"][0]["number"], 11);
 
-    let r2 = wss_rpc(
-        &mut ws,
-        2,
-        "github.pulls.search",
-        json!({ "owner": "o", "repo": "r", "query": "   " }),
-    )
-    .await;
-    assert_eq!(r2["pulls"][0]["number"], 42);
+        let r2 = context_rpc(
+            context,
+            &mut ws,
+            2,
+            "github.pulls.search",
+            json!({ "owner": "o", "repo": "r", "query": "   " }),
+        )
+        .await;
+        assert_eq!(r2["pulls"][0]["number"], 42);
 
-    let issue_queries = fx.forge.issue_queries.lock().unwrap();
-    assert_eq!(issue_queries.len(), 1);
-    assert_eq!(issue_queries[0].search, None);
-    assert_eq!(issue_queries[0].state.as_deref(), Some("open"));
+        let issue_queries = fx.forge.issue_queries.lock().unwrap();
+        assert_eq!(issue_queries.len(), 1);
+        assert_eq!(issue_queries[0].search, None);
+        assert_eq!(issue_queries[0].state.as_deref(), Some("open"));
 
-    let pr_queries = fx.forge.pr_queries.lock().unwrap();
-    assert_eq!(pr_queries.len(), 1);
-    assert_eq!(pr_queries[0].search, None);
-    assert_eq!(pr_queries[0].involvement, None);
-    assert!(pr_queries[0].extra_repos.is_empty());
+        let pr_queries = fx.forge.pr_queries.lock().unwrap();
+        assert_eq!(pr_queries.len(), 1);
+        assert_eq!(pr_queries[0].search, None);
+        assert_eq!(pr_queries[0].involvement, None);
+        assert!(pr_queries[0].extra_repos.is_empty());
+    }
 }
 
 /// `github.pulls.search` / `github.issues.search` with `repos` extras
@@ -618,96 +892,100 @@ async fn search_without_query_leaves_listing_unchanged() {
 /// updated-desc order, and `nextToken` round-trips.
 #[tokio::test]
 async fn search_with_repos_spans_repos_and_attributes_hits() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "github.pulls.search",
-        json!({
-            "owner": "intent-hq", "repo": "intent", "filter": "involves",
-            "repos": [
-                { "owner": "intent-hq", "repo": "intentd" },
-                { "owner": "Intent-HQ", "repo": "Intent" },
-                { "owner": "intent-hq", "repo": "cloudlands-fe" },
-                { "owner": "INTENT-HQ", "repo": "INTENTD" },
+        let r = context_rpc(
+            context,
+            &mut ws,
+            1,
+            "github.pulls.search",
+            json!({
+                "owner": "intent-hq", "repo": "intent", "filter": "involves",
+                "repos": [
+                    { "owner": "intent-hq", "repo": "intentd" },
+                    { "owner": "Intent-HQ", "repo": "Intent" },
+                    { "owner": "intent-hq", "repo": "cloudlands-fe" },
+                    { "owner": "INTENT-HQ", "repo": "INTENTD" },
+                ],
+            }),
+        )
+        .await;
+        let pulls = r["pulls"].as_array().unwrap();
+        let attributed: Vec<(&str, &str, u64)> = pulls
+            .iter()
+            .map(|p| {
+                (
+                    p["owner"].as_str().unwrap(),
+                    p["repo"].as_str().unwrap(),
+                    p["number"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            attributed,
+            vec![
+                ("intent-hq", "intent", 100),
+                ("intent-hq", "intentd", 101),
+                ("intent-hq", "cloudlands-fe", 102),
             ],
-        }),
-    )
-    .await;
-    let pulls = r["pulls"].as_array().unwrap();
-    let attributed: Vec<(&str, &str, u64)> = pulls
-        .iter()
-        .map(|p| {
-            (
-                p["owner"].as_str().unwrap(),
-                p["repo"].as_str().unwrap(),
-                p["number"].as_u64().unwrap(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        attributed,
-        vec![
-            ("intent-hq", "intent", 100),
-            ("intent-hq", "intentd", 101),
-            ("intent-hq", "cloudlands-fe", 102),
-        ],
-        "{r}"
-    );
-    assert_eq!(
-        pulls[1]["htmlUrl"],
-        "https://github.com/intent-hq/intentd/pull/101"
-    );
-    let updated: Vec<&str> = pulls
-        .iter()
-        .map(|p| p["updatedAt"].as_str().unwrap())
-        .collect();
-    let mut sorted = updated.clone();
-    sorted.sort_unstable_by(|a, b| b.cmp(a));
-    assert_eq!(updated, sorted, "blended page is updated-desc");
-    assert_eq!(r["nextToken"], json!(wire_next_token("2")));
+            "{r}"
+        );
+        assert_eq!(
+            pulls[1]["htmlUrl"],
+            "https://github.com/intent-hq/intentd/pull/101"
+        );
+        let updated: Vec<&str> = pulls
+            .iter()
+            .map(|p| p["updatedAt"].as_str().unwrap())
+            .collect();
+        let mut sorted = updated.clone();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(updated, sorted, "blended page is updated-desc");
+        assert_eq!(r["nextToken"], json!(wire_next_token("2")));
 
-    let r2 = wss_rpc(
-        &mut ws,
-        2,
-        "github.issues.search",
-        json!({
-            "owner": "intent-hq", "repo": "intent", "query": "crash",
-            "repos": [{ "owner": "intent-hq", "repo": "intentd" }],
-        }),
-    )
-    .await;
-    let issues = r2["issues"].as_array().unwrap();
-    assert_eq!(issues.len(), 2, "{r2}");
-    assert_eq!(issues[0]["owner"], "intent-hq");
-    assert_eq!(issues[0]["repo"], "intent");
-    assert_eq!(issues[1]["owner"], "intent-hq");
-    assert_eq!(issues[1]["repo"], "intentd");
-    assert_eq!(
-        issues[1]["htmlUrl"],
-        "https://github.com/intent-hq/intentd/issues/101"
-    );
-    assert_eq!(r2["nextToken"], json!(wire_next_token("2")));
+        let r2 = context_rpc(
+            context,
+            &mut ws,
+            2,
+            "github.issues.search",
+            json!({
+                "owner": "intent-hq", "repo": "intent", "query": "crash",
+                "repos": [{ "owner": "intent-hq", "repo": "intentd" }],
+            }),
+        )
+        .await;
+        let issues = r2["issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 2, "{r2}");
+        assert_eq!(issues[0]["owner"], "intent-hq");
+        assert_eq!(issues[0]["repo"], "intent");
+        assert_eq!(issues[1]["owner"], "intent-hq");
+        assert_eq!(issues[1]["repo"], "intentd");
+        assert_eq!(
+            issues[1]["htmlUrl"],
+            "https://github.com/intent-hq/intentd/issues/101"
+        );
+        assert_eq!(r2["nextToken"], json!(wire_next_token("2")));
 
-    let pr_queries = fx.forge.pr_queries.lock().unwrap();
-    assert_eq!(pr_queries.len(), 1, "ONE engine call, no per-repo fan-out");
-    assert_eq!(
-        pr_queries[0].extra_repos,
-        vec![
-            RepoRef::new("intent-hq", "intentd"),
-            RepoRef::new("intent-hq", "cloudlands-fe"),
-        ]
-    );
-    assert_eq!(pr_queries[0].involvement, Some(PrInvolvement::Involves));
-    let issue_queries = fx.forge.issue_queries.lock().unwrap();
-    assert_eq!(issue_queries.len(), 1);
-    assert_eq!(
-        issue_queries[0].extra_repos,
-        vec![RepoRef::new("intent-hq", "intentd")]
-    );
-    assert_eq!(issue_queries[0].search.as_deref(), Some("crash"));
+        let pr_queries = fx.forge.pr_queries.lock().unwrap();
+        assert_eq!(pr_queries.len(), 1, "ONE engine call, no per-repo fan-out");
+        assert_eq!(
+            pr_queries[0].extra_repos,
+            vec![
+                RepoRef::new("intent-hq", "intentd"),
+                RepoRef::new("intent-hq", "cloudlands-fe"),
+            ]
+        );
+        assert_eq!(pr_queries[0].involvement, Some(PrInvolvement::Involves));
+        let issue_queries = fx.forge.issue_queries.lock().unwrap();
+        assert_eq!(issue_queries.len(), 1);
+        assert_eq!(
+            issue_queries[0].extra_repos,
+            vec![RepoRef::new("intent-hq", "intentd")]
+        );
+        assert_eq!(issue_queries[0].search.as_deref(), Some("crash"));
+    }
 }
 
 /// `repos` validation on the wire: a malformed entry is `-32602` naming its
@@ -715,153 +993,183 @@ async fn search_with_repos_spans_repos_and_attributes_hits() {
 /// is `-32602` — in both cases the engine is never called.
 #[tokio::test]
 async fn search_repos_rejects_malformed_and_over_cap() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    let env = wss_rpc_envelope(
-        &mut ws,
-        1,
-        "github.pulls.search",
-        json!({
-            "owner": "o", "repo": "r",
-            "repos": [{ "owner": "a", "repo": "b" }, { "owner": "c" }],
-        }),
-    )
-    .await;
-    assert_eq!(env["error"]["code"], json!(-32602), "{env}");
-    let msg = env["error"]["message"].as_str().unwrap();
-    assert!(msg.contains("repos[1].repo"), "{msg}");
-    assert_eq!(env["error"]["data"], json!({ "code": "invalid-params" }));
-
-    let env = wss_rpc_envelope(
-        &mut ws,
-        2,
-        "github.issues.search",
-        json!({ "owner": "o", "repo": "r", "repos": "intent-hq/intentd" }),
-    )
-    .await;
-    assert_eq!(env["error"]["code"], json!(-32602), "{env}");
-
-    // A slug carrying whitespace / `:` / `/` would smuggle a second `repo:`
-    // qualifier into the search `q` and bypass the cap → `-32602` naming it.
-    for (id, repos, needle) in [
-        (
-            5,
-            json!([{ "owner": "a", "repo": "b repo:other/private" }]),
-            "repos[0].repo",
-        ),
-        (
-            6,
-            json!([{ "owner": "a:x", "repo": "b" }]),
-            "repos[0].owner",
-        ),
-        (
-            7,
-            json!([{ "owner": "a", "repo": "b" }, { "owner": "c/d", "repo": "e" }]),
-            "repos[1].owner",
-        ),
-    ] {
-        let env = wss_rpc_envelope(
+        let env = context_envelope(
+            context,
             &mut ws,
-            id,
-            "github.issues.search",
-            json!({ "owner": "o", "repo": "r", "repos": repos }),
+            1,
+            "github.pulls.search",
+            json!({
+                "owner": "o", "repo": "r",
+                "repos": [{ "owner": "a", "repo": "b" }, { "owner": "c" }],
+            }),
         )
         .await;
         assert_eq!(env["error"]["code"], json!(-32602), "{env}");
         let msg = env["error"]["message"].as_str().unwrap();
-        assert!(msg.contains(needle), "{msg}");
+        assert!(msg.contains("repos[1].repo"), "{msg}");
+        assert_eq!(env["error"]["data"], json!({ "code": "invalid-params" }));
+
+        let env = context_envelope(
+            context,
+            &mut ws,
+            2,
+            "github.issues.search",
+            json!({ "owner": "o", "repo": "r", "repos": "intent-hq/intentd" }),
+        )
+        .await;
+        assert_eq!(env["error"]["code"], json!(-32602), "{env}");
+
+        // A slug carrying whitespace / `:` / `/` would smuggle a second `repo:`
+        // qualifier into the search `q` and bypass the cap → `-32602` naming it.
+        for (id, repos, needle) in [
+            (
+                5,
+                json!([{ "owner": "a", "repo": "b repo:other/private" }]),
+                "repos[0].repo",
+            ),
+            (
+                6,
+                json!([{ "owner": "a:x", "repo": "b" }]),
+                "repos[0].owner",
+            ),
+            (
+                7,
+                json!([{ "owner": "a", "repo": "b" }, { "owner": "c/d", "repo": "e" }]),
+                "repos[1].owner",
+            ),
+        ] {
+            let env = context_envelope(
+                context,
+                &mut ws,
+                id,
+                "github.issues.search",
+                json!({ "owner": "o", "repo": "r", "repos": repos }),
+            )
+            .await;
+            assert_eq!(env["error"]["code"], json!(-32602), "{env}");
+            let msg = env["error"]["message"].as_str().unwrap();
+            assert!(msg.contains(needle), "{msg}");
+        }
+
+        let seven: Vec<Value> = (1..=6)
+            .map(|i| json!({ "owner": "o", "repo": format!("r{i}") }))
+            .collect();
+        let env = context_envelope(
+            context,
+            &mut ws,
+            3,
+            "github.pulls.search",
+            json!({ "owner": "o", "repo": "r", "repos": seven }),
+        )
+        .await;
+        assert_eq!(env["error"]["code"], json!(-32602), "{env}");
+        let msg = env["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("at most 6"), "{msg}");
+
+        assert!(fx.forge.pr_queries.lock().unwrap().is_empty());
+        assert!(fx.forge.issue_queries.lock().unwrap().is_empty());
+
+        // Exactly six in total passes.
+        let six: Vec<Value> = (1..=5)
+            .map(|i| json!({ "owner": "o", "repo": format!("r{i}") }))
+            .collect();
+        let r = context_rpc(
+            context,
+            &mut ws,
+            4,
+            "github.pulls.search",
+            json!({ "owner": "o", "repo": "r", "repos": six }),
+        )
+        .await;
+        assert_eq!(r["pulls"].as_array().unwrap().len(), 6);
+        assert_eq!(fx.forge.pr_queries.lock().unwrap()[0].extra_repos.len(), 5);
     }
-
-    let seven: Vec<Value> = (1..=6)
-        .map(|i| json!({ "owner": "o", "repo": format!("r{i}") }))
-        .collect();
-    let env = wss_rpc_envelope(
-        &mut ws,
-        3,
-        "github.pulls.search",
-        json!({ "owner": "o", "repo": "r", "repos": seven }),
-    )
-    .await;
-    assert_eq!(env["error"]["code"], json!(-32602), "{env}");
-    let msg = env["error"]["message"].as_str().unwrap();
-    assert!(msg.contains("at most 6"), "{msg}");
-
-    assert!(fx.forge.pr_queries.lock().unwrap().is_empty());
-    assert!(fx.forge.issue_queries.lock().unwrap().is_empty());
-
-    // Exactly six in total passes.
-    let six: Vec<Value> = (1..=5)
-        .map(|i| json!({ "owner": "o", "repo": format!("r{i}") }))
-        .collect();
-    let r = wss_rpc(
-        &mut ws,
-        4,
-        "github.pulls.search",
-        json!({ "owner": "o", "repo": "r", "repos": six }),
-    )
-    .await;
-    assert_eq!(r["pulls"].as_array().unwrap().len(), 6);
-    assert_eq!(fx.forge.pr_queries.lock().unwrap()[0].extra_repos.len(), 5);
 }
 
 /// `github.issues.get` resolves a single issue by `{owner, repo, number}`:
 /// the addressing reaches the engine verbatim and the `{ issue }` result is
 /// the `GithubIssue` DTO with `user.login` / `createdAt` / `updatedAt`
 /// populated from the engine model, while a missing `number` is rejected in
-/// the router with `-32602` before the engine is touched.
+/// the router with `-32602` before the engine is touched. A repeat read
+/// within `prCache.maxAgeSeconds` is served from the daemon's issue cache:
+/// the same `{ issue }`, no second `get_issue` on the engine.
 #[intent_test_macros::daemon_test]
 async fn issues_get_returns_issue_with_author_and_timestamps() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "github.issues.get",
-        json!({ "owner": "o", "repo": "r", "number": 7 }),
-    )
-    .await;
-    let issue = &r["issue"];
-    assert_eq!(issue["number"], 7);
-    assert_eq!(issue["title"], "Login bug");
-    assert_eq!(issue["state"], "open");
-    assert_eq!(issue["htmlUrl"], "https://github.com/o/r/issues/11");
-    assert_eq!(issue["user"]["login"], "reporter");
-    assert_eq!(issue["createdAt"], "2026-01-01T00:00:00Z");
-    assert_eq!(issue["updatedAt"], "2026-01-02T00:00:00Z");
-    assert_eq!(issue["owner"], "o");
-    assert_eq!(issue["repo"], "r");
-    assert_eq!(issue["labels"], json!([]));
-    assert_eq!(issue["comments"], 0);
+        let r = context_rpc(
+            context,
+            &mut ws,
+            1,
+            "github.issues.get",
+            json!({ "owner": "o", "repo": "r", "number": 7 }),
+        )
+        .await;
+        let issue = &r["issue"];
+        assert_eq!(issue["number"], 7);
+        assert_eq!(issue["title"], "Login bug");
+        assert_eq!(issue["state"], "open");
+        assert_eq!(issue["htmlUrl"], "https://github.com/o/r/issues/11");
+        assert_eq!(issue["user"]["login"], "reporter");
+        assert_eq!(issue["createdAt"], "2026-01-01T00:00:00Z");
+        assert_eq!(issue["updatedAt"], "2026-01-02T00:00:00Z");
+        assert_eq!(issue["owner"], "o");
+        assert_eq!(issue["repo"], "r");
+        assert_eq!(issue["labels"], json!([]));
+        assert_eq!(issue["comments"], 0);
 
-    let env = wss_rpc_envelope(
-        &mut ws,
-        2,
-        "github.issues.get",
-        json!({ "owner": "o", "repo": "r" }),
-    )
-    .await;
-    assert_eq!(env["error"]["code"], json!(-32602), "envelope: {env}");
+        let env = context_envelope(
+            context,
+            &mut ws,
+            2,
+            "github.issues.get",
+            json!({ "owner": "o", "repo": "r" }),
+        )
+        .await;
+        assert_eq!(env["error"]["code"], json!(-32602), "envelope: {env}");
 
-    // Mixed-case addressing reaches the engine with its casing intact.
-    let r3 = wss_rpc(
-        &mut ws,
-        3,
-        "github.issues.get",
-        json!({ "owner": "Intent-HQ", "repo": "IntentD", "number": 9 }),
-    )
-    .await;
-    assert_eq!(r3["issue"]["number"], 9);
+        // Mixed-case addressing reaches the engine with its casing intact.
+        let r3 = context_rpc(
+            context,
+            &mut ws,
+            3,
+            "github.issues.get",
+            json!({ "owner": "Intent-HQ", "repo": "IntentD", "number": 9 }),
+        )
+        .await;
+        assert_eq!(r3["issue"]["number"], 9);
 
-    // `RepoRef` equality is case-insensitive, so compare the recorded fields
-    // directly to prove the addressing was forwarded verbatim.
-    let gets = fx.forge.issue_gets.lock().unwrap();
-    let recorded: Vec<(&str, &str, u64)> = gets
-        .iter()
-        .map(|(repo, number)| (repo.owner.as_str(), repo.name.as_str(), *number))
-        .collect();
-    assert_eq!(recorded, vec![("o", "r", 7), ("Intent-HQ", "IntentD", 9)]);
+        // A repeat hover within `prCache.maxAgeSeconds` is a cache hit: the
+        // identical `{ issue }` with no further engine read.
+        let again = context_rpc(
+            context,
+            &mut ws,
+            4,
+            "github.issues.get",
+            json!({ "owner": "o", "repo": "r", "number": 7 }),
+        )
+        .await;
+        assert_eq!(again["issue"], r["issue"], "a hit answers the cached issue");
+
+        // `RepoRef` equality is case-insensitive, so compare the recorded fields
+        // directly to prove the addressing was forwarded verbatim.
+        let gets = fx.forge.issue_gets.lock().unwrap();
+        let recorded: Vec<(&str, &str, u64)> = gets
+            .iter()
+            .map(|(repo, number)| (repo.owner.as_str(), repo.name.as_str(), *number))
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![("o", "r", 7), ("Intent-HQ", "IntentD", 9)],
+            "a hit within max_age costs no engine request"
+        );
+    }
 }
 
 /// `github.issues.search` rejects the PR-only `review-requested` filter with
@@ -871,54 +1179,59 @@ async fn issues_get_returns_issue_with_author_and_timestamps() {
 /// `review-requested` (monorepo#551).
 #[intent_test_macros::daemon_test]
 async fn issues_search_rejects_pr_only_review_requested_filter() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    let env = wss_rpc_envelope(
-        &mut ws,
-        1,
-        "github.issues.search",
-        json!({ "owner": "o", "repo": "r", "filter": "review-requested" }),
-    )
-    .await;
-    assert!(
-        env.get("result").is_none(),
-        "expected error envelope: {env}"
-    );
-    assert_eq!(env["error"]["code"], json!(-32603));
-    assert_eq!(env["error"]["message"], json!("Internal error"));
-    let data = env["error"]["data"].as_str().unwrap();
-    assert!(
-        data.contains("all, assigned, created, involves"),
-        "error data must list the issues filter set: {data}"
-    );
-    assert!(fx.forge.issue_queries.lock().unwrap().is_empty());
+        let env = context_envelope(
+            context,
+            &mut ws,
+            1,
+            "github.issues.search",
+            json!({ "owner": "o", "repo": "r", "filter": "review-requested" }),
+        )
+        .await;
+        assert!(
+            env.get("result").is_none(),
+            "expected error envelope: {env}"
+        );
+        assert_eq!(env["error"]["code"], json!(-32603));
+        assert_eq!(env["error"]["message"], json!("Internal error"));
+        let data = env["error"]["data"].as_str().unwrap();
+        assert!(
+            data.contains("all, assigned, created, involves"),
+            "error data must list the issues filter set: {data}"
+        );
+        assert!(fx.forge.issue_queries.lock().unwrap().is_empty());
 
-    // Valid issue filters still pass through unchanged.
-    let r = wss_rpc(
-        &mut ws,
-        2,
-        "github.issues.search",
-        json!({ "owner": "o", "repo": "r", "filter": "involves" }),
-    )
-    .await;
-    assert_eq!(r["issues"][0]["number"], 11);
+        // Valid issue filters still pass through unchanged.
+        let r = context_rpc(
+            context,
+            &mut ws,
+            2,
+            "github.issues.search",
+            json!({ "owner": "o", "repo": "r", "filter": "involves" }),
+        )
+        .await;
+        assert_eq!(r["issues"][0]["number"], 11);
 
-    // The PR search keeps its wider filter set.
-    let r2 = wss_rpc(
-        &mut ws,
-        3,
-        "github.pulls.search",
-        json!({ "owner": "o", "repo": "r", "filter": "review-requested" }),
-    )
-    .await;
-    assert_eq!(r2["pulls"][0]["number"], 42);
-    let pr_queries = fx.forge.pr_queries.lock().unwrap();
-    assert_eq!(pr_queries.len(), 1);
-    assert_eq!(
-        pr_queries[0].involvement,
-        Some(PrInvolvement::ReviewRequested)
-    );
+        // The PR search keeps its wider filter set.
+        let r2 = context_rpc(
+            context,
+            &mut ws,
+            3,
+            "github.pulls.search",
+            json!({ "owner": "o", "repo": "r", "filter": "review-requested" }),
+        )
+        .await;
+        assert_eq!(r2["pulls"][0]["number"], 42);
+        let pr_queries = fx.forge.pr_queries.lock().unwrap();
+        assert_eq!(pr_queries.len(), 1);
+        assert_eq!(
+            pr_queries[0].involvement,
+            Some(PrInvolvement::ReviewRequested)
+        );
+    }
 }
 
 /// `github.branches.list` with an optional `prefix`: the wire `prefix`
@@ -927,56 +1240,61 @@ async fn issues_search_rejects_pr_only_review_requested_filter() {
 /// call keeps the pre-existing unfiltered listing (`prefix: None`).
 #[intent_test_macros::daemon_test]
 async fn branches_list_forwards_optional_prefix() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    // Prefixed: filtered names + the encoded engine next_cursor ("2").
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "github.branches.list",
-        json!({
-            "owner": "o", "repo": "r", "prefix": "feature/",
-            "nextToken": wire_next_token("3"),
-        }),
-    )
-    .await;
-    assert_eq!(r["branches"], json!(["feature/login", "feature/logout"]));
-    assert_eq!(r["nextToken"], json!(wire_next_token("2")));
+        // Prefixed: filtered names + the encoded engine next_cursor ("2").
+        let r = context_rpc(
+            context,
+            &mut ws,
+            1,
+            "github.branches.list",
+            json!({
+                "owner": "o", "repo": "r", "prefix": "feature/",
+                "nextToken": wire_next_token("3"),
+            }),
+        )
+        .await;
+        assert_eq!(r["branches"], json!(["feature/login", "feature/logout"]));
+        assert_eq!(r["nextToken"], json!(wire_next_token("2")));
 
-    // No prefix and a blank prefix both reach the engine as `None`.
-    let r2 = wss_rpc(
-        &mut ws,
-        2,
-        "github.branches.list",
-        json!({ "owner": "o", "repo": "r" }),
-    )
-    .await;
-    assert_eq!(
-        r2["branches"],
-        json!(["main", "feature/login", "feature/logout"])
-    );
-    let r3 = wss_rpc(
-        &mut ws,
-        3,
-        "github.branches.list",
-        json!({ "owner": "o", "repo": "r", "prefix": "   " }),
-    )
-    .await;
-    assert_eq!(
-        r3["branches"],
-        json!(["main", "feature/login", "feature/logout"])
-    );
+        // No prefix and a blank prefix both reach the engine as `None`.
+        let r2 = context_rpc(
+            context,
+            &mut ws,
+            2,
+            "github.branches.list",
+            json!({ "owner": "o", "repo": "r" }),
+        )
+        .await;
+        assert_eq!(
+            r2["branches"],
+            json!(["main", "feature/login", "feature/logout"])
+        );
+        let r3 = context_rpc(
+            context,
+            &mut ws,
+            3,
+            "github.branches.list",
+            json!({ "owner": "o", "repo": "r", "prefix": "   " }),
+        )
+        .await;
+        assert_eq!(
+            r3["branches"],
+            json!(["main", "feature/login", "feature/logout"])
+        );
 
-    let queries = fx.forge.branch_queries.lock().unwrap();
-    assert_eq!(
-        *queries,
-        vec![
-            (Some("feature/".to_string()), Some("3".to_string())),
-            (None, None),
-            (None, None),
-        ]
-    );
+        let queries = fx.forge.branch_queries.lock().unwrap();
+        assert_eq!(
+            *queries,
+            vec![
+                (Some("feature/".to_string()), Some("3".to_string())),
+                (None, None),
+                (None, None),
+            ]
+        );
+    }
 }
 
 /// `github.users.search` (PROTOCOL §5.27): `query` is required (`-32602`
@@ -987,73 +1305,384 @@ async fn branches_list_forwards_optional_prefix() {
 /// round trip.
 #[intent_test_macros::daemon_test]
 async fn users_search_forwards_query_and_clamps_limit() {
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+        let missing = context_envelope(context, &mut ws, 1, "github.users.search", json!({})).await;
+        assert_eq!(missing["jsonrpc"], "2.0");
+        assert_eq!(missing["id"], 1);
+        assert_eq!(missing["error"]["code"], -32602, "{missing}");
+        assert!(missing.get("result").is_none(), "{missing}");
+
+        let ok = context_envelope(
+            context,
+            &mut ws,
+            2,
+            "github.users.search",
+            json!({ "query": "  octo " }),
+        )
+        .await;
+        assert_eq!(ok["jsonrpc"], "2.0");
+        assert_eq!(ok["id"], 2);
+        assert!(ok.get("error").is_none(), "{ok}");
+        assert_eq!(
+            ok["result"],
+            json!({
+                "users": [
+                    {
+                        "id": 583_231,
+                        "login": "octocat",
+                        "avatarUrl": "https://avatars.example/u/1",
+                        "htmlUrl": "https://github.com/octocat",
+                    },
+                    { "id": 7, "login": "octodog", "avatarUrl": "", "htmlUrl": "" },
+                ]
+            })
+        );
+
+        context_rpc(
+            context,
+            &mut ws,
+            3,
+            "github.users.search",
+            json!({ "query": "octo", "limit": 0 }),
+        )
+        .await;
+        context_rpc(
+            context,
+            &mut ws,
+            4,
+            "github.users.search",
+            json!({ "query": "octo", "limit": 99 }),
+        )
+        .await;
+        context_rpc(
+            context,
+            &mut ws,
+            5,
+            "github.users.search",
+            json!({ "query": "octo", "limit": 3 }),
+        )
+        .await;
+
+        let blank = context_rpc(
+            context,
+            &mut ws,
+            6,
+            "github.users.search",
+            json!({ "query": "   " }),
+        )
+        .await;
+        assert_eq!(blank, json!({ "users": [] }));
+
+        let searches = fx.forge.user_searches.lock().unwrap();
+        assert_eq!(
+            *searches,
+            vec![
+                ("octo".to_string(), 8),
+                ("octo".to_string(), 1),
+                ("octo".to_string(), 10),
+                ("octo".to_string(), 3),
+            ]
+        );
+    }
+}
+
+fn sample_repo() -> Repo {
+    serde_json::from_value(json!({"owner":"o","name":"r","defaultBranch":"main"})).unwrap()
+}
+fn sample_comment() -> ReviewComment {
+    serde_json::from_value(json!({"id":9,"body":"Reply","path":"src/lib.rs","author":"fixture","createdAt":"2026-01-01","updatedAt":"2026-01-01","url":"https://github.com/o/r/pull/7#discussion_r9"})).unwrap()
+}
+
+#[intent_test_macros::daemon_test]
+async fn integration_context_github_preserves_exact_provider_arguments() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    let repo = json!({"owner":"o","name":"r"});
+    let token = wire_next_token("2");
+    for (method, params, expected) in [
+        ("github.authStatus", json!({}), None),
+        ("github.getUser", json!({}), None),
+        (
+            "sourceControl.authStatus",
+            json!({"provider":"github"}),
+            None,
+        ),
+        ("sourceControl.getUser", json!({"provider":"github"}), None),
+        (
+            "github.repos.list",
+            json!({"perPage":7,"nextToken":token}),
+            Some(json!(["repos", 7, "2"])),
+        ),
+        (
+            "github.repos.search",
+            json!({"query":"widget","limit":7,"nextToken":token}),
+            Some(json!(["search", "widget", 7, "2"])),
+        ),
+        (
+            "github.repos.get",
+            json!({"owner":"o","repo":"r"}),
+            Some(json!(["repo", "o", "r"])),
+        ),
+        (
+            "github.pulls.create",
+            json!({"owner":"o","repo":"r","title":"Title","body":"workspaceId","head":"feature","base":"main","draft":true}),
+            Some(
+                json!(["create",repo,{"title":"Title","body":"workspaceId","sourceBranch":"feature","targetBranch":"main","draft":true}]),
+            ),
+        ),
+        (
+            "github.pulls.merge",
+            json!({"owner":"o","repo":"r","number":7,"mergeMethod":"squash","commitTitle":"Title","commitMessage":"Body"}),
+            Some(json!(["merge",repo,7,"squash",{"commitTitle":"Title","commitMessage":"Body"}])),
+        ),
+        (
+            "github.pulls.updateBranch",
+            json!({"owner":"o","repo":"r","number":7,"expectedHeadSha":"expected"}),
+            Some(json!(["updateBranch", repo, 7])),
+        ),
+        (
+            "github.listReviewComments",
+            json!({"owner":"o","repo":"r","number":7,"limit":7,"nextToken":token}),
+            Some(json!(["comments", repo, 7, 7, "2"])),
+        ),
+        (
+            "github.replyReviewComment",
+            json!({"owner":"o","repo":"r","number":7,"commentId":9,"body":"Reply"}),
+            Some(json!(["reply", repo, 7, 9, "Reply"])),
+        ),
+        (
+            "github.getReviewThreads",
+            json!({"owner":"o","repo":"r","number":7,"perPage":7,"nextToken":token}),
+            Some(json!(["threads", repo, 7, 7, "2"])),
+        ),
+        (
+            "github.resolveThread",
+            json!({"threadId":"thread"}),
+            Some(json!(["resolve", "thread"])),
+        ),
+        (
+            "github.unresolveThread",
+            json!({"threadId":"thread"}),
+            Some(json!(["unresolve", "thread"])),
+        ),
+    ] {
+        let mut baseline = None;
+        for context in [None, Some("workspace-a"), Some("workspace-b")] {
+            let mut request = params.clone();
+            if let Some(context) = context {
+                request["workspaceId"] = json!(context);
+            }
+            fx.forge.calls.lock().unwrap().clear();
+            let result = wss_rpc(&mut ws, 1, method, request).await;
+            if let Some(baseline) = &baseline {
+                assert_eq!(&result, baseline, "{method}");
+            } else {
+                baseline = Some(result);
+            }
+            assert_eq!(
+                *fx.forge.calls.lock().unwrap(),
+                expected.clone().into_iter().collect::<Vec<_>>(),
+                "{method}: {context:?}"
+            );
+        }
+    }
+}
 
-    let missing = wss_rpc_envelope(&mut ws, 1, "github.users.search", json!({})).await;
-    assert_eq!(missing["jsonrpc"], "2.0");
-    assert_eq!(missing["id"], 1);
-    assert_eq!(missing["error"]["code"], -32602, "{missing}");
-    assert!(missing.get("result").is_none(), "{missing}");
+// Each existing fixture runs direct and workspace-originated calls with the same assertions.
+async fn context_rpc(
+    context: Option<&str>,
+    ws: &mut TlsWs,
+    id: i64,
+    method: &str,
+    mut params: Value,
+) -> Value {
+    if method.starts_with("github.") {
+        if let Some(context) = context {
+            params["workspaceId"] = json!(context);
+        }
+    }
+    wss_rpc(ws, id, method, params).await
+}
 
-    let ok = wss_rpc_envelope(
-        &mut ws,
-        2,
-        "github.users.search",
-        json!({ "query": "  octo " }),
-    )
-    .await;
-    assert_eq!(ok["jsonrpc"], "2.0");
-    assert_eq!(ok["id"], 2);
-    assert!(ok.get("error").is_none(), "{ok}");
-    assert_eq!(
-        ok["result"],
-        json!({
-            "users": [
-                {
-                    "id": 583_231,
-                    "login": "octocat",
-                    "avatarUrl": "https://avatars.example/u/1",
-                    "htmlUrl": "https://github.com/octocat",
-                },
-                { "id": 7, "login": "octodog", "avatarUrl": "", "htmlUrl": "" },
+async fn context_envelope(
+    context: Option<&str>,
+    ws: &mut TlsWs,
+    id: i64,
+    method: &str,
+    mut params: Value,
+) -> Value {
+    if let Some(context) = context {
+        params["workspaceId"] = json!(context);
+    }
+    wss_rpc_envelope(ws, id, method, params).await
+}
+
+#[intent_test_macros::daemon_test]
+async fn integration_context_github_lists_keep_filters_and_pagination() {
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
+        let token = wire_next_token("3");
+        let pulls=context_rpc(context,&mut ws,1,"github.pulls.list",json!({"owner":"o","repo":"r","state":"closed","head":"feature","base":"main","perPage":7,"nextToken":token})).await;
+        assert_eq!(pulls["pulls"][0]["number"], 42);
+        assert_eq!(pulls["nextToken"], wire_next_token("2"));
+        let expected = PrQuery {
+            state: Some(PrState::Closed),
+            head: Some("feature".into()),
+            base: Some("main".into()),
+            limit: Some(7),
+            cursor: Some("3".into()),
+            ..Default::default()
+        };
+        assert_eq!(*fx.forge.pr_queries.lock().unwrap(), vec![expected]);
+        let issues=context_rpc(context,&mut ws,2,"github.issues.list",json!({"owner":"o","repo":"r","state":"closed","labels":"bug,urgent","perPage":7,"nextToken":token})).await;
+        assert_eq!(issues["issues"][0]["number"], 11);
+        assert_eq!(issues["nextToken"], wire_next_token("2"));
+        let queries = fx.forge.issue_queries.lock().unwrap();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].state.as_deref(), Some("closed"));
+        assert_eq!(queries[0].labels.as_deref(), Some("bug,urgent"));
+        assert_eq!(queries[0].limit, Some(7));
+        assert_eq!(queries[0].cursor.as_deref(), Some("3"));
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn integration_context_github_provider_and_write_errors_are_unchanged() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for (method, params, code) in [
+        (
+            "sourceControl.authStatus",
+            json!({"provider":"github","host":"github.com"}),
+            -32602,
+        ),
+        (
+            "sourceControl.getUser",
+            json!({"provider":"unknown"}),
+            -32602,
+        ),
+        (
+            "sourceControl.getUser",
+            json!({"provider":"gitlab","host":42}),
+            -32602,
+        ),
+        (
+            "github.pulls.create",
+            json!({"owner":"o","repo":"r","title":"Title"}),
+            -32602,
+        ),
+        (
+            "github.pulls.merge",
+            json!({"owner":"o","repo":"r","number":7,"mergeMethod":"bogus"}),
+            -32603,
+        ),
+        (
+            "github.replyReviewComment",
+            json!({"owner":"o","repo":"r","number":7}),
+            -32602,
+        ),
+        ("github.resolveThread", json!({}), -32602),
+    ] {
+        let direct = wss_rpc_envelope(&mut ws, 1, method, params.clone()).await;
+        assert_eq!(direct["error"]["code"], code, "{method}: {direct}");
+        let mut routed = params;
+        routed["workspaceId"] = json!("workspace-route");
+        assert_eq!(
+            wss_rpc_envelope(&mut ws, 1, method, routed).await,
+            direct,
+            "{method}"
+        );
+    }
+    assert!(fx.forge.calls.lock().unwrap().is_empty());
+}
+
+// Failure modes: wrong repository/PR/head addressing; lost pagination; fabricated
+// binary patches; dismissed review coerced to approval; missing required params;
+// provider errors hidden as success; workspace context changing explicit addressing.
+#[intent_test_macros::daemon_test]
+async fn home_pull_details_wire_contract() {
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
+        let params =
+            json!({"owner":"o","repo":"r","number":42,"limit":2,"nextToken":wire_next_token("3")});
+        let checks =
+            context_envelope(context, &mut ws, 1, "github.pulls.checks", params.clone()).await;
+        assert_eq!(
+            checks,
+            json!({"jsonrpc":"2.0","id":1,"result":{"headSha":"deadbeef","checks":[{"name":"CI","state":"pending","url":null}]}})
+        );
+        let reviews =
+            context_envelope(context, &mut ws, 2, "github.pulls.reviews", params.clone()).await;
+        assert_eq!(
+            reviews,
+            json!({"jsonrpc":"2.0","id":2,"result":{"reviews":[{"id":7,"author":"reviewer","state":"DISMISSED","body":"Former review","submittedAt":"2026-09-29T00:00:00Z","url":"https://github.com/o/r/pull/42#pullrequestreview-7"}],"nextToken":null}})
+        );
+        let files = context_envelope(context, &mut ws, 3, "github.pulls.files", params).await;
+        assert_eq!(
+            files,
+            json!({"jsonrpc":"2.0","id":3,"result":{"headSha":"deadbeef","truncated":false,"files":[{"filename":"src/new.rs","previousFilename":"src/old.rs","status":"renamed","additions":2,"deletions":1,"changes":3,"patch":"@@ -1 +1,2 @@\n-old\n+new\n+line","url":"https://github.com/o/r/blob/deadbeef/src/new.rs"},{"filename":"image.png","previousFilename":null,"status":"added","additions":0,"deletions":0,"changes":0,"patch":null,"url":null}],"nextToken":wire_next_token("2")}})
+        );
+        assert_eq!(
+            *fx.forge.calls.lock().unwrap(),
+            vec![
+                json!(["get-pr", "o", "r", 42]),
+                json!(["checks", "o", "r", "deadbeef"]),
+                json!(["reviews", "o", "r", 42, 2, "3"]),
+                json!(["get-pr", "o", "r", 42]),
+                json!(["files", "o", "r", 42, 2, "3"]),
+                json!(["get-pr", "o", "r", 42])
             ]
-        })
-    );
+        );
+        let conflict = context_envelope(
+            context,
+            &mut ws,
+            8,
+            "github.pulls.files",
+            json!({"owner":"o","repo":"r","number":42,"expectedHeadSha":"old-head"}),
+        )
+        .await;
+        assert_eq!(conflict["error"]["code"], -32005, "{conflict}");
+        assert!(conflict.get("result").is_none());
+        let moved = context_envelope(
+            context,
+            &mut ws,
+            9,
+            "github.pulls.files",
+            json!({"owner":"o","repo":"r","number":43}),
+        )
+        .await;
+        assert_eq!(moved["error"]["code"], -32005, "{moved}");
+        assert!(moved.get("result").is_none());
 
-    wss_rpc(
-        &mut ws,
-        3,
-        "github.users.search",
-        json!({ "query": "octo", "limit": 0 }),
-    )
-    .await;
-    wss_rpc(
-        &mut ws,
-        4,
-        "github.users.search",
-        json!({ "query": "octo", "limit": 99 }),
-    )
-    .await;
-    wss_rpc(
-        &mut ws,
-        5,
-        "github.users.search",
-        json!({ "query": "octo", "limit": 3 }),
-    )
-    .await;
-
-    let blank = wss_rpc(&mut ws, 6, "github.users.search", json!({ "query": "   " })).await;
-    assert_eq!(blank, json!({ "users": [] }));
-
-    let searches = fx.forge.user_searches.lock().unwrap();
-    assert_eq!(
-        *searches,
-        vec![
-            ("octo".to_string(), 8),
-            ("octo".to_string(), 1),
-            ("octo".to_string(), 10),
-            ("octo".to_string(), 3),
-        ]
-    );
+        for (id, method) in [
+            (4, "github.pulls.checks"),
+            (5, "github.pulls.reviews"),
+            (6, "github.pulls.files"),
+        ] {
+            let response = context_envelope(
+                context,
+                &mut ws,
+                id,
+                method,
+                json!({"owner":"o","repo":"r"}),
+            )
+            .await;
+            assert_eq!(response["error"]["code"], -32602);
+        }
+        let error = context_envelope(
+            context,
+            &mut ws,
+            7,
+            "github.pulls.checks",
+            json!({"owner":"o","repo":"r","number":404}),
+        )
+        .await;
+        assert!(error.get("error").is_some(), "{error}");
+        assert!(error.get("result").is_none());
+    }
 }

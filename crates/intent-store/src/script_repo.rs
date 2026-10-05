@@ -1,22 +1,52 @@
 //! Script-definition registry (`script.*`, PROTOCOL §5.8). Parity with the
 //! FE's `.workspace/scripts.json` persistence: definitions survive a daemon
-//! restart and are hydrated into the runtime registry on boot. Runtime state
-//! is transient and never persisted — except the `was_running` marker
+//! restart and are hydrated into the runtime registry on boot. Archive state
+//! and the compact latest result are durable; PTY runtime/output remain transient.
+//! Recovery uses the `was_running` marker
 //! (stored-on-write), which records that a service-mode script was running
 //! when the daemon died so hydration can surface `previouslyRunning`.
 
 use std::collections::BTreeMap;
 
-use intent_core::{Error, Result, Script};
+use intent_core::{Error, Result, Script, ScriptLastRun, WorkspaceId};
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
 use crate::{enum_from_db, enum_to_db, Store};
 
 const SCRIPT_COLUMNS: &str = "id, workspace_id, name, command, cwd, env, mode, category, \
-    source, auto_start, created_at, updated_at";
+    source, auto_start, created_at, updated_at, purpose, archived_at, last_run";
 
 impl Store {
+    /// Whether this workspace has ever held a script definition. Unlike row
+    /// membership, this remains true after the final script is removed.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database read fails.
+    pub async fn workspace_scripts_initialized(&self, workspace_id: &WorkspaceId) -> Result<bool> {
+        sqlx::query_scalar::<_, bool>("SELECT scripts_initialized FROM workspace WHERE id = ?")
+            .bind(workspace_id.as_str())
+            .fetch_optional(self.read_pool())
+            .await
+            .map(|value| value.unwrap_or(false))
+            .map_err(|e| Error::Internal(format!("get scripts initialization failed: {e}")))
+    }
+
+    /// Resolve a script's durable scope without reading its command or environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database read fails.
+    pub async fn script_workspace(&self, id: &str) -> Result<Option<WorkspaceId>> {
+        let workspace =
+            sqlx::query_scalar::<_, String>("SELECT workspace_id FROM script WHERE id = ?")
+                .bind(id)
+                .fetch_optional(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("get script workspace failed: {e}")))?;
+        Ok(workspace.map(WorkspaceId::from))
+    }
+
     /// Insert or replace a script definition, keyed on `id` (mirrors the FE
     /// `upsertScript`: an existing id is fully replaced). The replace resets
     /// the `was_running` marker to its default (cleared) — an upserted
@@ -26,10 +56,26 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_script(&self, s: &Script) -> Result<()> {
+        self.upsert_script_with_scope(s, false).await
+    }
+
+    /// Upsert a definition only if its id is new or already belongs to this
+    /// workspace. The scope check and write use a single atomic statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` for an id in another workspace, or
+    /// `Error::Internal` if the database operation fails.
+    pub async fn upsert_script_in_workspace(&self, s: &Script) -> Result<()> {
+        self.upsert_script_with_scope(s, true).await
+    }
+
+    async fn upsert_script_with_scope(&self, s: &Script, scoped: bool) -> Result<()> {
         let sql = format!(
-            "INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+            "INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? \
+             WHERE ? = 0 OR NOT EXISTS (SELECT 1 FROM script WHERE id = ? AND workspace_id != ?)"
         );
-        sqlx::query(&sql)
+        let result = sqlx::query(&sql)
             .bind(&s.id)
             .bind(&s.workspace_id)
             .bind(&s.name)
@@ -42,9 +88,24 @@ impl Store {
             .bind(s.auto_start.map(i64::from))
             .bind(&s.created_at)
             .bind(&s.updated_at)
+            .bind(enum_to_db(&s.purpose)?)
+            .bind(&s.archived_at)
+            .bind(
+                s.last_run
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| Error::Internal(format!("encode script result failed: {e}")))?,
+            )
+            .bind(scoped)
+            .bind(&s.id)
+            .bind(&s.workspace_id)
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("upsert script failed: {e}")))?;
+        if result.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("script {}", s.id)));
+        }
         Ok(())
     }
 
@@ -60,6 +121,41 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_scripts(&self, scripts: &[Script]) -> Result<()> {
+        self.upsert_scripts_inner(scripts, None).await.map(|_| ())
+    }
+
+    /// Seed defaults only if no definition has ever been persisted in this
+    /// workspace. The initialization claim and inserts commit together, so a
+    /// stale first-use reader cannot undo a concurrent create followed by purge.
+    /// Empty defaults do not initialize the workspace. Returns whether seeded.
+    ///
+    /// # Errors
+    /// Returns `Error::InvalidParams` for a script in another workspace, or
+    /// `Error::Internal` if the transaction fails (the claim is rolled back).
+    pub async fn bootstrap_scripts(
+        &self,
+        workspace_id: &WorkspaceId,
+        scripts: &[Script],
+    ) -> Result<bool> {
+        if scripts.is_empty() {
+            return Ok(false);
+        }
+        if scripts
+            .iter()
+            .any(|s| s.workspace_id != workspace_id.as_str())
+        {
+            return Err(Error::InvalidParams(
+                "bootstrap scripts workspace mismatch".into(),
+            ));
+        }
+        self.upsert_scripts_inner(scripts, Some(workspace_id)).await
+    }
+
+    async fn upsert_scripts_inner(
+        &self,
+        scripts: &[Script],
+        initialize_workspace: Option<&WorkspaceId>,
+    ) -> Result<bool> {
         // Per-row bind count derived from SCRIPT_COLUMNS so the placeholder
         // row and chunk math cannot drift if the persisted set changes.
         // 2048 rows × 12 binds = 24576, well under the 32766 cap; one chunk
@@ -72,6 +168,21 @@ impl Store {
             .begin()
             .await
             .map_err(|e| Error::Internal(format!("bulk upsert scripts begin failed: {e}")))?;
+        if let Some(workspace_id) = initialize_workspace {
+            let claimed = sqlx::query(
+                "UPDATE workspace SET scripts_initialized = 1 WHERE id = ? AND scripts_initialized = 0",
+            )
+            .bind(workspace_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("claim script initialization failed: {e}")))?;
+            if claimed.rows_affected() == 0 {
+                tx.rollback().await.map_err(|e| {
+                    Error::Internal(format!("script initialization rollback failed: {e}"))
+                })?;
+                return Ok(false);
+            }
+        }
         for chunk in scripts.chunks(ROWS_PER_STATEMENT) {
             let placeholders = vec![row.as_str(); chunk.len()].join(",");
             let sql =
@@ -90,7 +201,18 @@ impl Store {
                     .bind(&s.source)
                     .bind(s.auto_start.map(i64::from))
                     .bind(&s.created_at)
-                    .bind(&s.updated_at);
+                    .bind(&s.updated_at)
+                    .bind(enum_to_db(&s.purpose)?)
+                    .bind(&s.archived_at)
+                    .bind(
+                        s.last_run
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()
+                            .map_err(|e| {
+                                Error::Internal(format!("encode script result failed: {e}"))
+                            })?,
+                    );
             }
             query
                 .execute(&mut *tx)
@@ -100,7 +222,7 @@ impl Store {
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("bulk upsert scripts commit failed: {e}")))?;
-        Ok(())
+        Ok(true)
     }
 
     /// Delete a script definition by `id` (FE `removeScript`). Returns whether
@@ -118,6 +240,31 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Delete only the definition in the admitted workspace. Scope validation
+    /// and deletion are one statement, including when an id was moved after
+    /// a caller's earlier runtime lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` for an absent or foreign id, or
+    /// `Error::Internal` if the database operation fails.
+    pub async fn remove_script_in_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &str,
+    ) -> Result<()> {
+        let res = sqlx::query("DELETE FROM script WHERE id = ? AND workspace_id = ?")
+            .bind(id)
+            .bind(workspace_id.as_str())
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("remove script failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("script {id}")));
+        }
+        Ok(())
+    }
+
     /// List every persisted script definition (all workspaces), oldest first —
     /// the boot-time hydration read.
     ///
@@ -125,12 +272,141 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_scripts(&self) -> Result<Vec<Script>> {
-        let sql = format!("SELECT {SCRIPT_COLUMNS} FROM script ORDER BY created_at");
+        let sql = format!("SELECT {SCRIPT_COLUMNS} FROM script ORDER BY created_at, id");
         let rows = sqlx::query(&sql)
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list scripts failed: {e}")))?;
         rows.iter().map(map_script_row).collect()
+    }
+
+    /// Read one persisted definition only if it belongs to this workspace.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database read or decoding fails.
+    pub async fn get_script_in_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &str,
+    ) -> Result<Option<Script>> {
+        let sql = format!("SELECT {SCRIPT_COLUMNS} FROM script WHERE id = ? AND workspace_id = ?");
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .bind(&workspace_id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get script failed: {e}")))?;
+        row.as_ref().map(map_script_row).transpose()
+    }
+
+    /// Commit archive state without replacing the definition, result or recovery marker.
+    /// # Errors
+    /// Returns a database error or `NotFound` for a foreign/missing definition.
+    pub async fn set_script_archived_at(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &str,
+        archived_at: Option<&str>,
+    ) -> Result<()> {
+        let result =
+            sqlx::query("UPDATE script SET archived_at = ? WHERE workspace_id = ? AND id = ?")
+                .bind(archived_at)
+                .bind(workspace_id.as_str())
+                .bind(id)
+                .execute(self.write_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("archive script failed: {e}")))?;
+        if result.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("script {id}")));
+        }
+        Ok(())
+    }
+
+    /// Persist command admission before spawn; retain the preceding result.
+    /// # Errors
+    /// Returns a database error or `NotFound` for a missing/foreign definition.
+    pub async fn admit_script_run(&self, ws: &WorkspaceId, id: &str, token: &str) -> Result<()> {
+        let result = sqlx::query("UPDATE script SET pending_run_id = ?, latest_run_id = ?, latest_run_result = NULL, pending_started_at = NULL, was_running = CASE WHEN mode = 'command' THEN 1 ELSE was_running END WHERE workspace_id = ? AND id = ?")
+            .bind(token).bind(token).bind(ws.as_str()).bind(id).execute(self.write_pool()).await
+            .map_err(|e| Error::Internal(format!("admit script run failed: {e}")))?;
+        if result.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("script {id}")));
+        }
+        Ok(())
+    }
+
+    /// Persist the observed start only for the still-current admission.
+    /// # Errors
+    /// Returns a database error.
+    pub async fn start_script_run(
+        &self,
+        ws: &WorkspaceId,
+        id: &str,
+        token: &str,
+        started: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE script SET pending_started_at = ?, was_running = 1 WHERE workspace_id = ? AND id = ? AND pending_run_id = ?")
+            .bind(started).bind(ws.as_str()).bind(id).bind(token).execute(self.write_pool()).await
+            .map_err(|e| Error::Internal(format!("start script run failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Cancel an unspawned RPC reservation without inventing a result.
+    /// # Errors
+    /// Returns a database error.
+    pub async fn abandon_script_run(
+        &self,
+        ws: &WorkspaceId,
+        id: &str,
+        token: &str,
+        preserve_marker: bool,
+    ) -> Result<()> {
+        sqlx::query("UPDATE script SET pending_run_id = NULL, pending_started_at = NULL, was_running = ? WHERE workspace_id = ? AND id = ? AND pending_run_id = ?")
+            .bind(preserve_marker).bind(ws.as_str()).bind(id).bind(token).execute(self.write_pool()).await
+            .map_err(|e| Error::Internal(format!("abandon script run failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Atomically settle the matching admission and retire explicit one-offs.
+    /// A replaced, removed, already settled or newer run is an unchanged false.
+    /// Recovery keeps the command lost marker or existing service restore marker,
+    /// but never recreates a dismissed service marker; it consumes the token.
+    /// # Errors
+    /// Returns a database/encoding error; neither result nor archive is changed.
+    pub async fn settle_script_run(
+        &self,
+        ws: &WorkspaceId,
+        id: &str,
+        token: &str,
+        result: &ScriptLastRun,
+        recovery: bool,
+    ) -> Result<bool> {
+        let encoded = serde_json::to_string(result).map_err(|e| Error::Internal(e.to_string()))?;
+        let result = sqlx::query("UPDATE script SET last_run = CASE WHEN mode = 'command' THEN ? ELSE last_run END, latest_run_result = ?, archived_at = CASE WHEN purpose = 'oneOff' THEN coalesce(archived_at, ?) ELSE archived_at END, pending_run_id = NULL, pending_started_at = NULL, was_running = CASE WHEN ? THEN CASE WHEN mode = 'command' THEN 1 ELSE was_running END ELSE 0 END WHERE workspace_id = ? AND id = ? AND pending_run_id = ?")
+            .bind(&encoded).bind(&encoded).bind(&result.stopped_at).bind(recovery).bind(ws.as_str()).bind(id).bind(token)
+            .execute(self.write_pool()).await.map_err(|e| Error::Internal(format!("settle script run failed: {e}")))?;
+        Ok(result.rows_affected() != 0)
+    }
+
+    /// Outstanding durable command admissions, including pre-spawn/restart gaps.
+    /// # Errors
+    /// Returns a database error.
+    pub async fn pending_script_runs(
+        &self,
+    ) -> Result<Vec<(WorkspaceId, String, String, Option<String>)>> {
+        let rows = sqlx::query("SELECT workspace_id, id, pending_run_id, pending_started_at FROM script WHERE pending_run_id IS NOT NULL")
+            .fetch_all(self.read_pool()).await.map_err(|e| Error::Internal(format!("read pending script runs failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    WorkspaceId::from(r.get::<String, _>("workspace_id")),
+                    r.get("id"),
+                    r.get("pending_run_id"),
+                    r.get("pending_started_at"),
+                )
+            })
+            .collect())
     }
 
     /// Set or clear the service was-running marker (stored-on-write): set on a
@@ -205,6 +481,12 @@ fn map_script_row(r: &SqliteRow) -> Result<Script> {
             .map_err(|e| Error::Internal(format!("column {name}: {e}")))
     };
     Ok(Script {
+        purpose: enum_from_db(&r.get::<String, _>("purpose"))?,
+        archived_at: col("archived_at")?,
+        last_run: col("last_run")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|e| Error::Internal(format!("decode script result failed: {e}")))?,
         id: r.get("id"),
         workspace_id: r.get("workspace_id"),
         name: r.get("name"),

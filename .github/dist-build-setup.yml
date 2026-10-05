@@ -170,3 +170,11 @@
       *) echo "no tailcat mapping for target '${{ join(matrix.targets, ' ') }}'" >&2; exit 1 ;;
     esac
     ls -l "$dest"
+# Main builds populate these bounded compiler entries. Tags only restore;
+# an evicted or incompatible archive leaves the normal cold build intact.
+- name: Restore release compiler cache
+  uses: ./.github/actions/release-rust-cache
+  with:
+    flavor: daemon-dist
+    target: ${{ join(matrix.targets, ' ') }}
+    runner: ${{ matrix.runner }}

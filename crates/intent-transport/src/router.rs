@@ -5,6 +5,17 @@
 //! Envelope validation, the notification-vs-request distinction, and the
 //! `-32700/-32600/-32601/-32602/-32603` error matrix all live here so every
 //! transport (UDS today, WS/TLS later) shares one code path.
+//!
+//! Discovery/configuration requests may carry optional routing-only `workspaceId`
+//! (docs/protocol/workspace-routing.md). These handlers deliberately consume only
+//! their semantic selectors: catalogs/settings/capabilities/client registry remain
+//! daemon-wide, and specialist project writes still require explicit scope/path.
+//! No workspace lookup or extra service argument is needed for this metadata.
+//!
+//! Selected resource continuations likewise accept optional routing context:
+//! agent/terminal/upload/export/search IDs keep selecting the resource, and the
+//! service authorizes its actual owner. In particular, source export follow-ups
+//! retain their exportId/seq/archiveSource semantics without a workspace lookup.
 
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
@@ -86,7 +97,30 @@ fn not_found(message: impl Into<String>) -> RpcErr {
 /// surface as `-32603 "Internal error"` carrying the original cause in `data`.
 fn domain_to_rpc(e: Error) -> RpcErr {
     match e {
-        Error::Internal(msg) => RpcErr {
+        Error::ExecutionAuthorization {
+            source,
+            authorization,
+        } => {
+            let code = match source.as_ref() {
+                Error::CloneFailed { .. } | Error::SourceControlUnauthorized { .. } => {
+                    source.code()
+                }
+                _ => -32603,
+            };
+            let data_code = match source.as_ref() {
+                Error::CloneFailed { category, .. } => category.as_str(),
+                Error::SourceControlUnauthorized { .. } => "source-control-unauthorized",
+                _ => "host-execution-authorization",
+            };
+            RpcErr {
+                code,
+                message: authorization.message(),
+                data: Some(json!({
+                    "code": data_code, "executionAuthorization": authorization,
+                })),
+            }
+        }
+        Error::Internal(msg) | Error::GitAuthorization(msg) => RpcErr {
             code: -32603,
             message: "Internal error".to_string(),
             data: Some(Value::String(msg)),
@@ -167,6 +201,45 @@ fn domain_to_rpc(e: Error) -> RpcErr {
                 "limit": limit,
             })),
         },
+        // Provider-generic auth typed errors (§5.27): -32603 with the stable
+        // `data = { code, provider, host }` so the FE keys its PAT fallback
+        // and "credential rejected" presentation on `data.code`, not prose.
+        ref e @ Error::DeviceGrantUnsupported {
+            ref provider,
+            ref host,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "device-grant-unsupported",
+                "provider": provider,
+                "host": host,
+            })),
+        },
+        ref e @ Error::HostMembershipRequired => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "host-membership-required" })),
+        },
+        ref e @ (Error::IdentityMismatch | Error::IdentityInUse) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(
+                json!({ "code": if matches!(e, Error::IdentityMismatch) { "identity-mismatch" } else { "identity-in-use" } }),
+            ),
+        },
+        ref e @ Error::SourceControlUnauthorized {
+            ref provider,
+            ref host,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "source-control-unauthorized",
+                "provider": provider,
+                "host": host,
+            })),
+        },
         // -32602 discriminator (monorepo#1320): `data.code` distinguishes a
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
@@ -188,14 +261,33 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": kind.as_str() })),
         },
-        // Gist identity-proof refusal (guest half): `-32603` with the stable
-        // `data.code` (`github-not-connected` / `github-scope-missing` /
-        // `github-unreachable`) so the join flow can route "sign in" vs
-        // "retry" without matching on prose.
+        // Identity-proof refusal (guest half): `-32603` with the stable
+        // `data.code` (`<provider>-not-connected` / `-scope-missing` /
+        // `-unreachable`) so the join flow can route "sign in" vs "retry"
+        // without matching on prose.
         ref e @ Error::IdentityProof(kind) => RpcErr {
             code: e.code(),
             message: e.to_string(),
             data: Some(json!({ "code": kind.as_str() })),
+        },
+        // Identity-proof refusal (host half, protocol 10.8): the forge will
+        // not serve the proof to this host — `data.host` names the instance
+        // so the guest can be told which connection the host lacks.
+        ref e @ Error::IdentityUnverifiable { ref host } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "identity-unverifiable", "host": host })),
+        },
+        // Forge rate limiting — every cause the source-control layer
+        // classifies as `RateLimited` (REST primary 403/429, secondary-limit
+        // 403s, GraphQL RATE_LIMIT) on `github.getUser`, the identity-proof
+        // methods and PR reads: same `-32603` code and human message, plus
+        // the stable `data.code` so clients route "wait for the limit to
+        // reset" instead of prompting a sign-in (intent-hq/intent#5627).
+        ref e @ Error::RateLimited(_) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "rate-limited" })),
         },
         other => RpcErr {
             code: other.code(),
@@ -271,18 +363,73 @@ pub(crate) fn check_envelope(value: &Value) -> EnvelopeCheck<'_> {
 /// Handle one JSON-RPC frame. Returns `Some(response)` for requests and `None`
 /// for notifications (including unknown / failed ones, per §3.4).
 pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<String> {
+    prepare_message(api, message)
+        .await
+        .map(PreparedReply::into_frame)
+}
+
+/// Classification comes from dispatch/encoding, never from response JSON.
+pub(crate) struct PreparedReply {
+    pub(crate) frame: String,
+    pub(crate) service: Option<(
+        intent_core::repository_request::RepositoryReadReplyKind,
+        Value,
+    )>,
+}
+
+impl PreparedReply {
+    pub(crate) fn transport(frame: String) -> Self {
+        Self {
+            frame,
+            service: None,
+        }
+    }
+
+    pub(crate) fn into_frame(self) -> String {
+        self.frame
+    }
+}
+
+fn prepared_error(id: &Value, code: i32, message: &str, data: Option<Value>) -> PreparedReply {
+    PreparedReply::transport(error_string(id, code, message, data))
+}
+
+/// A final local refusal uses the existing domain-error encoder and size cap.
+pub(crate) fn delivery_error(id: &Value, error: Error) -> String {
+    encode_dispatch_result(
+        id,
+        "",
+        false,
+        Err(domain_to_rpc(error)),
+        crate::MAX_OUTBOUND_MESSAGE_BYTES,
+    )
+    .frame
+    .expect("a request error has a frame")
+}
+
+pub(crate) async fn prepare_message(
+    api: &dyn WorkspaceApi,
+    message: &str,
+) -> Option<PreparedReply> {
     let value: Value = match serde_json::from_str(message) {
         Ok(v) => v,
         // Parse errors are always answered with id null (§9), even for
         // would-be notifications — notification status is not yet known.
-        Err(_) => return Some(error_string(&Value::Null, PARSE_ERROR, "Parse error", None)),
+        Err(_) => {
+            return Some(prepared_error(
+                &Value::Null,
+                PARSE_ERROR,
+                "Parse error",
+                None,
+            ))
+        }
     };
 
     // Envelope validation (-32600). Answered even for notification-shaped
     // frames: notification status is not trusted until the envelope is valid.
     let (echo_id, method, is_notification) = match check_envelope(&value) {
         EnvelopeCheck::NotObject => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &Value::Null,
                 INVALID_REQUEST,
                 "Invalid Request: expected an object",
@@ -290,7 +437,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             ))
         }
         EnvelopeCheck::BadJsonRpc { echo_id } => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &echo_id,
                 INVALID_REQUEST,
                 "Invalid Request: jsonrpc must be \"2.0\"",
@@ -298,7 +445,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             ))
         }
         EnvelopeCheck::BadMethod { echo_id } => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &echo_id,
                 INVALID_REQUEST,
                 "Invalid Request: method must be a non-empty string",
@@ -306,7 +453,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             ))
         }
         EnvelopeCheck::BadId => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &Value::Null,
                 INVALID_REQUEST,
                 "Invalid Request: id must be a string, number, or null",
@@ -329,7 +476,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             if is_notification {
                 return None;
             }
-            return Some(error_string(
+            return Some(prepared_error(
                 &echo_id,
                 INVALID_PARAMS,
                 "Invalid params",
@@ -357,6 +504,11 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
     let profile_span = span.clone();
     async move {
         let result = dispatch(api, method, &params).await;
+        let kind = if result.is_ok() {
+            intent_core::repository_request::RepositoryReadReplyKind::Result
+        } else {
+            intent_core::repository_request::RepositoryReadReplyKind::ServiceError
+        };
         let encode_started = Instant::now();
         let encoded = encode_dispatch_result(
             &echo_id,
@@ -377,7 +529,16 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         profile_span.record("encode_elapsed_ms", encode_elapsed_ms);
         profile_span.record("oversized_replacement", encoded.oversized_replacement);
         profile_span.record("encode_failed", encoded.encode_failed);
-        encoded.frame
+        encoded.frame.map(|frame| {
+            if encoded.oversized_replacement || encoded.encode_failed {
+                PreparedReply::transport(frame)
+            } else {
+                PreparedReply {
+                    frame,
+                    service: Some((kind, echo_id)),
+                }
+            }
+        })
     }
     .instrument(span)
     .await
@@ -445,6 +606,104 @@ async fn dispatch(
     params: &Map<String, Value>,
 ) -> Result<Value, RpcErr> {
     match method {
+        "workspace.repositorySelection.capture" => {
+            let input: intent_core::repository_request::RepositorySelectionQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_capture(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.save" => {
+            let input: intent_core::repository_request::RepositorySelectionSaveQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_save(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.reset" => {
+            let input: intent_core::repository_request::RepositorySelectionBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_reset(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.reconcile" => {
+            let input: intent_core::repository_request::RepositorySelectionBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_reconcile(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.release" => {
+            let input: intent_core::repository_request::RepositorySelectionBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_release(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "sourceControl.read.capture" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_capture(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.detail" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_detail(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.release" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_release(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "workspace.repositoryContext.capture" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_context_capture(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "workspace.repositoryContext" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_context(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "workspace.repositoryContext.release" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_context_release(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
         "workspace.list" => {
             let include_archived = params
                 .get("includeArchived")
@@ -675,6 +934,38 @@ async fn dispatch(
         // `workspace.invite.create` is handled on the connection fast-path
         // (it wraps the secret into the `intent://invite` link with the
         // listener's own hosts/port); only list/revoke route here.
+        "host.members.list" => api.host_members_list().await.map_err(domain_to_rpc),
+        "host.members.remove" => api
+            .host_members_remove(intent_core::PrincipalId(require_str_param(
+                params,
+                "principalId",
+            )?))
+            .await
+            .map_err(domain_to_rpc),
+        "host.executionContext" => api.host_execution_context().await.map_err(domain_to_rpc),
+        "host.invite.searchAccounts" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let query = require_str_param(params, "query")?;
+            let limit = params
+                .get("limit")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .filter(|n| (1..=10).contains(n))
+                        .map(|n| u8::try_from(n).expect("bounded limit"))
+                        .ok_or_else(|| invalid_params("limit must be an integer from 1 to 10"))
+                })
+                .transpose()?;
+            api.host_invite_search_accounts(provider, host, query, limit)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
+        "host.invite.revoke" => api
+            .host_invite_revoke(require_str_param(params, "inviteId")?)
+            .await
+            .map_err(domain_to_rpc),
         "workspace.invite.list" => {
             let id = require_workspace_id(params)?;
             let r = api.workspace_invite_list(id).await.map_err(workspace_err)?;
@@ -1454,12 +1745,14 @@ async fn dispatch(
             // while absent / null / `"all"` keep today's read. Unlike the
             // lenient retired flags, an unknown or non-string `scope` is
             // `-32602`, never coerced, and a bin scope cannot be combined
-            // with either retired flag (retired is its own bin). Every
-            // variant additionally carries `scopeCounts` (one grouped SQL
-            // aggregate over the non-retired rows) and `delegatedCounts`
-            // (one grouped aggregate over the non-retired delegated rows,
-            // per direct parent) under the same no-snapshot-isolation
-            // tolerance as `retiredCount`.
+            // with either retired flag (retired is its own bin). A
+            // `delegated` read narrows by `parentAgentId` OR `orphanedOnly`
+            // (never both). Every variant additionally carries
+            // `scopeCounts` (one grouped SQL aggregate over the non-retired
+            // rows) and `delegatedCounts` (one grouped aggregate over the
+            // non-retired delegated rows, per direct parent, with its
+            // `orphaned` sub-aggregate) under the same
+            // no-snapshot-isolation tolerance as `retiredCount`.
             let scope = parse_agent_list_scope(params, include_retired || retired_only)?;
             // Attribute the dispatch to its read variant for the profiling
             // WARNs (flags only — see `RPC_REQUEST_SHAPE_FIELD`).
@@ -1665,6 +1958,10 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "agent.getCreationPreferences" => api
+            .agent_get_creation_preferences(require_ws_note(params)?)
+            .await
+            .map_err(domain_to_rpc),
         "agent.create" => {
             // Agent ids are server-assigned: reject stale clients that still
             // send `agentId` before the request reaches the service (checked
@@ -1704,6 +2001,8 @@ async fn dispatch(
             // default. The blank is dropped downstream, so the persisted
             // field is still `NULL` either way.
             let extra = AgentCreateExtra {
+                remember_specialist: opt_bool_strict(params, "rememberSpecialist")?
+                    .unwrap_or(false),
                 provider: opt_nonempty_str(params, "provider"),
                 reasoning_effort: opt_str(params, "reasoningEffort"),
                 agent_type: opt_nonempty_str(params, "agentType"),
@@ -1809,6 +2108,18 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.sendQueuedMessagesNow" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = require_ws_note(params)?;
+            let ids = params
+                .get("messageIds")
+                .ok_or_else(|| invalid_params("messageIds is required"))?;
+            let message_ids: Vec<String> =
+                serde_json::from_value(ids.clone()).map_err(|e| invalid_params(e.to_string()))?;
+            api.agent_send_queued_messages_now(ws, agent_id, message_ids)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "agent.sendQueuedMessageNow" => {
             let agent_id = require_agent_id(params)?;
             let message_id = require_str_param(params, "messageId")?;
@@ -1875,6 +2186,11 @@ async fn dispatch(
         }
         "agent.queueMessage" => {
             let agent_id = require_agent_id(params)?;
+            let message_id = match params.get("messageId") {
+                None => None,
+                Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+                Some(_) => return Err(invalid_params("messageId must be a nonempty string")),
+            };
             let content = require_str_param(params, "content")?;
             let image_blocks = opt_value(params, "imageBlocks");
             let file_blocks = opt_value(params, "fileBlocks");
@@ -1891,8 +2207,9 @@ async fn dispatch(
                 Some(_) => return Err(invalid_params("messageMetadata must be an object")),
             };
             let result = api
-                .agent_queue_message(
+                .agent_queue_submission(
                     agent_id,
+                    message_id,
                     content,
                     image_blocks,
                     file_blocks,
@@ -2053,6 +2370,11 @@ async fn dispatch(
             }
             let system_prompt = opt_str(params, "systemPrompt");
             let model = opt_str(params, "model");
+            let reasoning_effort = match params.get("reasoningEffort") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) => Some(value.clone()),
+                Some(_) => return Err(invalid_params("reasoningEffort must be a string or null")),
+            };
             // Optional quick-action `type` hint (`commit` / `pr` / `review` /
             // `fast`): keys `quickActions.typeOverrides` in the daemon-side
             // resolution the op applies when no explicit `model` is sent
@@ -2076,6 +2398,7 @@ async fn dispatch(
                     quick_action_type,
                     ws,
                     timeout_ms,
+                    reasoning_effort,
                 )
                 .await
                 .map_err(domain_to_rpc)?;
@@ -2155,6 +2478,14 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(json!({ "cancelled": cancelled }))
+        }
+        "agent.retire" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let reason = opt_str_strict(params, "reason")?;
+            api.agent_retire(agent_id, ws, reason)
+                .await
+                .map_err(domain_to_rpc)
         }
         "agent.restore" => {
             // Soft retire undo (§5.5): clear `retiredAt`, returning the
@@ -2517,6 +2848,8 @@ async fn dispatch(
                 "removed": r.get("removed").cloned().unwrap_or(Value::Bool(false)),
             }))
         }
+        // Path-based Git calls accept optional routing-only `workspaceId`.
+        // The explicit path still selects the filesystem target on this daemon.
         "git.getBranches" => {
             let repo_path = require_str_param(params, "repoPath")?;
             let include_remote = parse_bool(params, "includeRemote");
@@ -2611,16 +2944,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "git.commit" => {
-            let ws = require_ws_note(params)?;
-            let message = require_str_param(params, "message")?;
-            let idempotency_key = opt_str(params, "idempotencyKey");
-            let r = api
-                .git_commit(ws, message, idempotency_key)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!({ "ok": true, "hash": r.hash, "files": r.files }))
-        }
         "git.agentCommit" => {
             let ws = require_ws_note(params)?;
             let message = require_str_param(params, "message")?;
@@ -2664,8 +2987,7 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        // `git.diff` is accepted as an alias for the wire-canonical `git.diffs`.
-        "git.diffs" | "git.diff" => {
+        "git.diffs" => {
             let ws = require_ws_note(params)?;
             // §5.6 extension: `paths` narrows the diff to exactly those
             // workspace-relative files (literal matching). The legacy single
@@ -2703,8 +3025,7 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        // `git.log` is accepted as an alias for the wire-canonical `git.commits`.
-        "git.commits" | "git.log" => {
+        "git.commits" => {
             let ws = require_ws_note(params)?;
             // §5.5 page params arrive nested under `page` ({ continuationToken,
             // limit }); fall back to top-level `limit`/`nextToken` for parity
@@ -2783,19 +3104,22 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
-        "pr.status" => {
-            let ws = require_ws_note(params)?;
-            let r = api.pr_status(ws).await.map_err(domain_to_rpc)?;
-            Ok(r)
-        }
         "pr.refresh" => {
             let ws = require_ws_note(params)?;
-            let r = api.pr_refresh(ws).await.map_err(workspace_err)?;
+            let automatic = opt_bool_strict(params, "automatic")?.unwrap_or(false);
+            let r = if automatic {
+                api.pr_refresh_automatic(ws).await
+            } else {
+                api.pr_refresh(ws).await
+            }
+            .map_err(workspace_err)?;
             Ok(r)
         }
         // `github.*` explicit-addressing surface (PROTOCOL §5.27): every data
         // method takes `(owner, repo[, number])` rather than resolving from the
-        // workspace. `limit` falls back to the FE's `perPage` spelling.
+        // workspace. Optional `workspaceId` is routing metadata and must not
+        // change these selectors or leaf credential resolution. `limit` falls back
+        // to the FE's `perPage` spelling.
         "github.pulls.create" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
@@ -2862,6 +3186,38 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "github.pulls.checks" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let number = require_u64(params, "number")?;
+            api.github_pulls_checks(owner, repo, number)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "github.pulls.reviews" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let number = require_u64(params, "number")?;
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let next_token = opt_str(params, "nextToken");
+            api.github_pulls_reviews(owner, repo, number, limit, next_token)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "github.pulls.files" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let number = require_u64(params, "number")?;
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let next_token = opt_str(params, "nextToken");
+            api.github_pulls_files(
+                owner,
+                repo,
+                number,
+                limit,
+                next_token,
+                opt_str(params, "expectedHeadSha"),
+            )
+            .await
+            .map_err(domain_to_rpc)
+        }
         "github.pulls.get" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
@@ -2918,13 +3274,29 @@ async fn dispatch(
             Ok(r)
         }
         "github.pulls.search" => {
-            let (owner, repo) = require_repo_slug(params)?;
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
             let query = opt_str(params, "query");
-            let repos = opt_repo_refs(params, "repos")?;
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
+            if params.contains_key("org") {
+                let org = require_str_param(params, "org")?;
+                validate_repo_slug_part("org", &org, true)?;
+                if ["owner", "repo", "repos"]
+                    .iter()
+                    .any(|key| params.contains_key(*key))
+                {
+                    return Err(invalid_params(
+                        "org cannot be combined with owner, repo, or repos".to_string(),
+                    ));
+                }
+                return api
+                    .github_org_pulls_search(org, filter, state, query, limit, next_token)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
+            let (owner, repo) = require_repo_slug(params)?;
+            let repos = opt_repo_refs(params, "repos")?;
             let r = api
                 .github_pulls_search(owner, repo, filter, state, query, repos, limit, next_token)
                 .await
@@ -3050,7 +3422,19 @@ async fn dispatch(
             Ok(r)
         }
         "github.cancelAuth" => {
-            let r = api.github_cancel_auth().await.map_err(domain_to_rpc)?;
+            // Strict: only an OMITTED `flowId` is the unscoped cancel. Any
+            // present non-string — an explicit `null` included, unlike
+            // `opt_str_strict` — is rejected so it can never silently widen
+            // the cancel to "whichever flow is pending".
+            let flow_id = match params.get("flowId") {
+                None => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(invalid_params("flowId must be a string")),
+            };
+            let r = api
+                .github_cancel_auth(flow_id)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "github.revoke" => {
@@ -3091,15 +3475,227 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        // `sourceControl.identityProof.*` (protocol 10.8): the
+        // provider-generic form of the pair above — `provider` required
+        // (`github` | `gitlab`), `host` optional and gitlab-only, parsed
+        // strictly like the `sourceControl.*` auth methods; `proofId` is the
+        // gist id / snippet id `create` answered.
+        "sourceControl.identityProof.create" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let nonce = require_str_param(params, "nonce")?;
+            let host_label = require_str_param(params, "hostLabel")?;
+            let r = api
+                .source_control_identity_proof_create(
+                    provider,
+                    host,
+                    nonce,
+                    host_label,
+                    opt_str_strict(params, "purpose")?,
+                    params
+                        .get("expectedIdentity")
+                        .filter(|v| !v.is_null())
+                        .map(|v| {
+                            serde_json::from_value(v.clone())
+                                .map_err(|_| invalid_params("invalid expectedIdentity"))
+                        })
+                        .transpose()?,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.identityProof.delete" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let proof_id = require_str_param(params, "proofId")?;
+            let r = api
+                .source_control_identity_proof_delete(
+                    provider,
+                    host,
+                    proof_id,
+                    opt_str_strict(params, "purpose")?,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        // Provider-generic auth (§5.27 "Provider-generic auth —
+        // `sourceControl.*`", v10.5): `provider` is required on every method
+        // (`github` | `gitlab`), `host` is optional and gitlab-only; both are
+        // validated by the service so the `-32602` messages stay in one place.
+        // The optional fields are parsed strictly: absent / `null` ⇒ omitted,
+        // but a present non-string is `-32602` before the service runs — a
+        // lax `host` would otherwise route `{"host": 123}` as host-omitted
+        // and, on `revoke`, act on the bound credential instead of failing.
+        "identity.authStatus" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_auth_status(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.connect" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let method = opt_str_strict(params, "method")?;
+            let token = opt_str_strict(params, "token")?;
+            api.identity_connect(provider, host, method, token)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.cancelAuth" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let flow_id = require_str_param(params, "flowId")?;
+            api.identity_cancel_auth(provider, host, flow_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.revoke" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_revoke(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.getUser" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            api.identity_get_user(provider, host)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "identity.select" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let external_user_id = require_str_param(params, "externalUserId")?;
+            api.identity_select(provider, host, external_user_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        // `host` names the forge, never an intentd routing destination.
+        // Optional `workspaceId` leaves provider/host credential selection intact.
+        "sourceControl.checkout.capture" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_capture(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.projects" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_projects(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.project" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_project(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.branches" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_branches(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.warm" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_warm(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.release" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_release(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.authStatus" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
+            let r = api
+                .source_control_auth_status_for_instance(provider, host, instance_base_url)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.connect" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
+            let method = opt_str_strict(params, "method")?;
+            let token = opt_str_strict(params, "token")?;
+            let r = api
+                .source_control_connect_for_instance(
+                    provider,
+                    host,
+                    method,
+                    token,
+                    instance_base_url,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.cancelAuth" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
+            let r = api
+                .source_control_cancel_auth_for_instance(provider, host, instance_base_url)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.revoke" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
+            let r = api
+                .source_control_revoke_for_instance(provider, host, instance_base_url)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "sourceControl.getUser" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
+            let r = api
+                .source_control_get_user_for_instance(provider, host, instance_base_url)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         // `principal.me` (multiplayer w1): the principal this connection was
         // bound to at admission; no params. Fails when no caller is bound.
         "principal.me" => {
             let r = api.principal_me().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
-        // `principal.list` (direct member add): the host's credentialed
-        // guests for the owner's share dialog; no params. Owner-only in the
-        // service layer (`-32003` for a collaborator).
+        // Credentialed sharing directory for owner/member callers; no params.
+        // The service reads current durable authority; guests are refused.
         "principal.list" => {
             let r = api.principal_list().await.map_err(domain_to_rpc)?;
             Ok(r)
@@ -3120,7 +3716,8 @@ async fn dispatch(
             let r = api.presence_snapshot(id).await.map_err(workspace_err)?;
             Ok(r)
         }
-        // `linear.*` (§5.28) is daemon-owned and global: no `workspaceId`. A key
+        // `linear.*` (§5.28) uses leaf-configured credentials. Optional
+        // `workspaceId` is routing metadata only; it never selects credentials. A key
         // that is absent or fails the `viewer` probe ("not configured") and any
         // other Linear failure surface as `-32603`; an invalid `filter` is
         // `-32602` with the descriptive message verbatim.
@@ -3193,7 +3790,10 @@ async fn dispatch(
             // up front so we never call the engine with a bogus payload.
             let _title = require_non_empty_str(params, "title")?;
             let _team_id = require_non_empty_str(params, "teamId")?;
-            let request = Value::Object(params.clone());
+            let mut request = params.clone();
+            // Routing context belongs to the leaf transport, not the provider body.
+            request.remove("workspaceId");
+            let request = Value::Object(request);
             match api.linear_create_issue(request).await {
                 Ok(v) => Ok(v),
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
@@ -3204,14 +3804,18 @@ async fn dispatch(
             // `issueId` is required; every other field is optional and only
             // forwarded when present.
             let _issue_id = require_non_empty_str(params, "issueId")?;
-            let request = Value::Object(params.clone());
+            let mut request = params.clone();
+            // Routing context belongs to the leaf transport, not the provider body.
+            request.remove("workspaceId");
+            let request = Value::Object(request);
             match api.linear_update_issue(request).await {
                 Ok(v) => Ok(v),
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
-        // `sentry.*` (§5.29) is daemon-owned and global: no `workspaceId`. A
+        // `sentry.*` (§5.29) accepts optional routing-only `workspaceId`;
+        // explicit issue/project selectors and leaf credentials are unchanged. A
         // credential pair that is absent or fails the org probe ("not
         // configured") and any other Sentry failure surface as `-32603`; an
         // invalid `status` is `-32602` with the descriptive message verbatim.
@@ -3310,14 +3914,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "file-tracking.getLineStats" => {
-            let ws = require_ws_note(params)?;
-            let r = api
-                .file_tracking_get_line_stats(ws)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
         "file-tracking.stage" => {
             let ws = require_ws_note(params)?;
             require_present(params, "paths")?;
@@ -3338,14 +3934,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "metrics.getWorkspaceStats" => {
-            let ws = require_ws_note(params)?;
-            let r = api
-                .metrics_get_workspace_stats(ws)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
         "metrics.getAgentStats" => {
             let agent_id = require_str_param(params, "agentId")?;
             let r = api
@@ -3354,23 +3942,9 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "metrics.getAllWorkspaceStats" => {
-            let r = api
-                .metrics_get_all_workspace_stats()
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "metrics.clearAgentStats" => {
-            let agent_id = require_str_param(params, "agentId")?;
-            let r = api
-                .metrics_clear_agent_stats(agent_id)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
         "settings.list" => {
-            // Global namespace (no workspaceId); sensitive values are redacted.
+            // Daemon-wide storage; optional routing context does not scope settings.
+            // Sensitive values are redacted.
             let r = api.settings_list().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
@@ -3402,7 +3976,7 @@ async fn dispatch(
             }
         }
         "system.capabilities" => {
-            // Machine-level capabilities, no workspaceId (PROTOCOL §5.7).
+            // Machine-level capabilities; optional workspaceId is routing-only (§5.7).
             // Router method (unlike the system.* control fast-path): the
             // cowSupported probe lives in the service layer's aggregate cache.
             let r = api.system_capabilities().await.map_err(domain_to_rpc)?;
@@ -3487,6 +4061,15 @@ async fn dispatch(
             Ok(r)
         }
         "accept-changes.prepare" => {
+            if params.contains_key("review") {
+                let input: intent_core::repository_request::NativeReviewPrepareQuery =
+                    serde_json::from_value(Value::Object(params.clone()))
+                        .map_err(|_| invalid_params("Invalid native review parameters"))?;
+                return api
+                    .native_review_prepare(input)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
             let ws = require_ws_note(params)?;
             let action = require_str_param(params, "action")?;
             let files = opt_str_array(params, "files");
@@ -3497,6 +4080,15 @@ async fn dispatch(
             Ok(r)
         }
         "accept-changes.execute" => {
+            if params.contains_key("review") {
+                let input: intent_core::repository_request::NativeReviewExecuteQuery =
+                    serde_json::from_value(Value::Object(params.clone()))
+                        .map_err(|_| invalid_params("Invalid native review parameters"))?;
+                return api
+                    .native_review_execute(input)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
             let ws = require_ws_note(params)?;
             require_str_param(params, "action")?;
             let r = api
@@ -3504,6 +4096,22 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
+        }
+        "accept-changes.reconcile" => {
+            let input: intent_core::repository_request::NativeReviewBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid native review parameters"))?;
+            api.native_review_reconcile(input)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "accept-changes.release" => {
+            let input: intent_core::repository_request::NativeReviewBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid native review parameters"))?;
+            api.native_review_release(input)
+                .await
+                .map_err(domain_to_rpc)
         }
         "accept-changes.mergePR" => {
             let ws = require_ws_note(params)?;
@@ -3590,10 +4198,34 @@ async fn dispatch(
         }
         "search.notes" => {
             let query = require_str_param(params, "query")?;
-            let request_id = opt_str(params, "requestId");
-            api.search_notes(query, request_id)
-                .await
-                .map_err(domain_to_rpc)
+            let workspace_id = opt_str_strict(params, "workspaceId")?;
+            let prefer_workspace_id = opt_str_strict(params, "preferWorkspaceId")?;
+            for (name, id) in [
+                ("workspaceId", &workspace_id),
+                ("preferWorkspaceId", &prefer_workspace_id),
+            ] {
+                if id.as_ref().is_some_and(String::is_empty) {
+                    return Err(invalid_params(format!("{name} must not be empty")));
+                }
+            }
+            let limit = match params.get("limit") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(value.as_i64().filter(|n| *n >= 0).ok_or_else(|| {
+                    invalid_params("limit must be a nonnegative signed 64-bit integer")
+                })?),
+            };
+            let include_archived = opt_bool_strict(params, "includeArchived")?.unwrap_or(true);
+            let request_id = opt_str_strict(params, "requestId")?;
+            api.search_notes(
+                query,
+                workspace_id.map(WorkspaceId::from),
+                prefer_workspace_id.map(WorkspaceId::from),
+                limit,
+                include_archived,
+                request_id,
+            )
+            .await
+            .map_err(domain_to_rpc)
         }
         "search.codebase" => {
             let ws = require_ws_note(params)?;
@@ -3660,14 +4292,16 @@ async fn dispatch(
         "file.read" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
-            api.file_read(ws, path, None).await.map_err(domain_to_rpc)
+            api.file_read(ws, path, None, opt_git_root_id(params))
+                .await
+                .map_err(domain_to_rpc)
         }
         "file.readChunk" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
             let offset = require_u64(params, "offset")?;
             let length = require_u64(params, "length")?;
-            api.file_read_chunk(ws, path, offset, length, None)
+            api.file_read_chunk(ws, path, offset, length, None, opt_git_root_id(params))
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -3859,17 +4493,57 @@ async fn dispatch(
         }
         "script.list" => {
             let ws = require_ws_note(params)?;
-            api.script_list(ws).await.map_err(domain_to_rpc)
+            let archive = params
+                .get("archive")
+                .map(|value| {
+                    serde_json::from_value::<intent_core::ScriptArchiveFilter>(value.clone())
+                })
+                .transpose()
+                .map_err(|e| invalid_params(e.to_string()))?
+                .unwrap_or_default();
+            api.script_list_filtered(ws, archive)
+                .await
+                .map_err(domain_to_rpc)
         }
         "script.create" => {
             let ws = require_ws_note(params)?;
             let create = parse_script_create(params)?;
             api.script_create(ws, create).await.map_err(domain_to_rpc)
         }
+        "script.archive" | "script.restore" => {
+            let ws = require_workspace_id(params)?;
+            let ids = params
+                .get("scriptIds")
+                .ok_or_else(|| invalid_params("scriptIds is required"))?;
+            let ids: Vec<String> =
+                serde_json::from_value(ids.clone()).map_err(|e| invalid_params(e.to_string()))?;
+            if ids.is_empty() || ids.len() > 1000 || ids.iter().any(|id| id.trim().is_empty()) {
+                return Err(invalid_params("scriptIds must contain 1–1000 nonempty IDs"));
+            }
+            if method == "script.archive" {
+                api.script_archive(ws, ids).await.map_err(domain_to_rpc)
+            } else {
+                api.script_restore(ws, ids).await.map_err(domain_to_rpc)
+            }
+        }
         "script.remove" => {
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             api.script_remove(ws, script_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "scriptMonitor.list" => {
+            let ws = require_ws_note(params)?;
+            let agent = opt_str(params, "agentId").map(intent_core::AgentId::from);
+            api.script_monitor_list(ws, agent)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "scriptMonitor.cancel" | "scriptMonitor.cancelRun" => {
+            let ws = require_ws_note(params)?;
+            let id = require_str_param(params, "monitorId")?;
+            api.script_monitor_cancel(ws, id, None, method == "scriptMonitor.cancelRun")
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -3999,14 +4673,17 @@ async fn dispatch(
             }
         }
         "specialist.list" => {
-            // Matches the TS WSS `specialist.list` signature: no params; merges
-            // user > bundled tiers only (the project tier is not part of the live
-            // wire contract iOS calls). `specialist.get` still accepts an optional
-            // `workspacePath` for the project tier (PROTOCOL §5.11). The optional
-            // `provider` supplies the resolution context for the additive
-            // `resolvedModel`/`resolvedProvider` preview fields.
+            let workspace_path = if opt_bool_strict(params, "includeProject")?.unwrap_or(false) {
+                let workspace = api
+                    .get_workspace(require_workspace_id(params)?)
+                    .await
+                    .map_err(workspace_err)?;
+                workspace.effective_path().map(str::to_owned)
+            } else {
+                None
+            };
             let provider = opt_str(params, "provider");
-            match api.specialist_list(None, provider).await {
+            match api.specialist_list(workspace_path, provider).await {
                 Ok(v) => Ok(v),
                 // Unknown provider → -32602 with the raw message.
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
@@ -4571,6 +5248,11 @@ fn parse_script_create(params: &Map<String, Value>) -> Result<ScriptCreateParams
         }
     };
     Ok(ScriptCreateParams {
+        purpose: params
+            .get("purpose")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|e| invalid_params(format!("Invalid purpose: {e}")))?,
         name,
         command,
         mode,
@@ -4653,18 +5335,10 @@ fn parse_projection(
     }
 }
 
-/// Parse the optional `agent.list` `scope` + `parentAgentId` params (§5.5).
-/// Absent / `null` / `"all"` is `None` — today's read; `"topLevel"` /
-/// `"delegated"` / `"background"` select one bin of the non-retired rows.
-/// Any other value (unknown string OR non-string) is `-32602`, never
-/// coerced. `parentAgentId` (a canonical `agent-{uuid}`) narrows a
-/// `delegated` read to that parent's direct sub-agents and is `-32602` with
-/// any other scope, including the default. A bin scope combined with
-/// `includeRetired` / `retiredOnly` (`retired_flag`) is `-32602`: retired
-/// sessions are their own bin.
 /// The [`RPC_REQUEST_SHAPE_FIELD`] value for one `agent.list` read: which
 /// variant the parsed params selected. Flags only — a `parentAgentId`
-/// narrowing reads as the literal ` parentAgentId` suffix, never the id.
+/// narrowing reads as the literal ` parentAgentId` suffix, never the id;
+/// an `orphanedOnly` narrowing as ` orphanedOnly`.
 fn agent_list_request_shape(
     scope: Option<&intent_core::AgentListRowScope>,
     include_retired: bool,
@@ -4674,7 +5348,12 @@ fn agent_list_request_shape(
     match scope {
         Some(AgentListRowScope::Delegated {
             parent_agent_id: Some(_),
+            ..
         }) => "scope=delegated parentAgentId".to_string(),
+        Some(AgentListRowScope::Delegated {
+            orphaned_only: true,
+            ..
+        }) => "scope=delegated orphanedOnly".to_string(),
         Some(scope) => format!("scope={}", scope.wire_name()),
         None if retired_only => "retiredOnly".to_string(),
         None if include_retired => "includeRetired".to_string(),
@@ -4682,6 +5361,20 @@ fn agent_list_request_shape(
     }
 }
 
+/// Parse the optional `agent.list` `scope` + `parentAgentId` +
+/// `orphanedOnly` params (§5.5). Absent / `null` / `"all"` is `None` —
+/// today's read; `"topLevel"` / `"delegated"` / `"background"` select one
+/// bin of the non-retired rows. Any other value (unknown string OR
+/// non-string) is `-32602`, never coerced. `parentAgentId` (a canonical
+/// `agent-{uuid}`) narrows a `delegated` read to that parent's direct
+/// sub-agents and is `-32602` with any other scope, including the default.
+/// `orphanedOnly: true` (a boolean, else `-32602`) narrows a `delegated`
+/// read the other way, to the workspace's orphaned delegated rows; it is
+/// `-32602` with any other scope and `-32602` combined with `parentAgentId`
+/// (the two sub-filters are mutually exclusive); `false` reads as absent.
+/// A bin scope combined with `includeRetired` / `retiredOnly`
+/// (`retired_flag`) is `-32602`: retired sessions are their own bin. Every
+/// rejection lands before any read.
 fn parse_agent_list_scope(
     params: &Map<String, Value>,
     retired_flag: bool,
@@ -4704,12 +5397,18 @@ fn parse_agent_list_scope(
             ));
         }
     };
+    let orphaned_only = match params.get("orphanedOnly") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(invalid_params("orphanedOnly must be a boolean")),
+    };
     let scope = match params.get("scope") {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) if s == "all" => None,
         Some(Value::String(s)) if s == "topLevel" => Some(AgentListRowScope::TopLevel),
         Some(Value::String(s)) if s == "delegated" => Some(AgentListRowScope::Delegated {
             parent_agent_id: parent_agent_id.clone(),
+            orphaned_only,
         }),
         Some(Value::String(s)) if s == "background" => Some(AgentListRowScope::Background),
         Some(_) => {
@@ -4728,6 +5427,16 @@ fn parse_agent_list_scope(
     }
     if parent_agent_id.is_some() && !matches!(scope, Some(AgentListRowScope::Delegated { .. })) {
         return Err(invalid_params("parentAgentId requires scope \"delegated\""));
+    }
+    if orphaned_only {
+        if !matches!(scope, Some(AgentListRowScope::Delegated { .. })) {
+            return Err(invalid_params("orphanedOnly requires scope \"delegated\""));
+        }
+        if parent_agent_id.is_some() {
+            return Err(invalid_params(
+                "orphanedOnly cannot be combined with parentAgentId: an orphan's direct children are pulled by parent",
+            ));
+        }
     }
     Ok(scope)
 }

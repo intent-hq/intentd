@@ -8,7 +8,7 @@
 use intent_core::Error;
 
 pub use intent_core::{
-    FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
+    FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitFileStatus,
     GitMergeConflicts, GitPullResult, GitStatus, Result,
 };
 
@@ -17,6 +17,7 @@ pub use local_changes::{local_changes, LocalChanges, MAX_UNPUSHED_COUNT};
 
 pub mod auth;
 pub mod branches;
+pub mod checkpoint;
 pub mod commit;
 pub mod conflicts;
 pub mod cow;
@@ -25,9 +26,12 @@ pub mod diff;
 pub mod fetch;
 pub mod fs_remove;
 pub mod history;
+pub mod hub;
 pub mod identity;
 pub mod local_changes;
 pub mod ls_remote;
+pub mod native_checkout;
+pub mod native_push;
 pub mod pull;
 pub mod push;
 pub mod rebase;
@@ -55,7 +59,11 @@ pub(crate) const SLOW_GIT_WARN_THRESHOLD: std::time::Duration = std::time::Durat
 // By-value so it slots point-free into `map_err(map_git_err)` everywhere.
 #[expect(clippy::needless_pass_by_value)]
 pub(crate) fn map_git_err(e: git2::Error) -> Error {
-    Error::Internal(e.message().to_string())
+    if e.code() == git2::ErrorCode::Auth {
+        Error::GitAuthorization(e.message().to_string())
+    } else {
+        Error::Internal(e.message().to_string())
+    }
 }
 
 /// Whether `path` points at a git repository (a repo root or a linked

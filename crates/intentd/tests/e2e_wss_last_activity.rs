@@ -334,38 +334,27 @@ where
     }
 }
 
-/// Wait until `user_rows` user messages for `agent_id` have been persisted AND
-/// every turn carrying one of them has ended.
-///
-/// Burst messages do not map 1:1 onto turns: a message sent while the agent is
-/// still mid-turn is queued, and the default `agents.flushQueuedMessages`
-/// mode (`all`) drains two or more queued entries into ONE combined turn. On a
-/// loaded host a 3-message burst can therefore legitimately end with 3, 2, or
-/// 1 `agent:stream:end` events, so counting stream:ends is a flake
-/// (intent-hq/intent#4947). Correlate on turn identity instead: every
-/// persisted user row emits `agent:message { role: "user", turnId }` before
-/// its turn's worker spawns (the combined turn stamps the head entry's id on
-/// each row), and the terminal `agent:stream:end` names the same `turnId`.
-/// Both ride the same event bus, so the row echo always precedes its turn's
-/// stream:end on the wire.
-///
-/// Returns the distinct turn ids the `user_rows` rows were carried by, so a
-/// caller that forced a particular folding can assert it actually happened.
+/// Wait for every submitted contribution to appear in a persisted user preview
+/// and for all carrying turns to end. Human merging can put several contributions
+/// in one row, while a batch flush can put several rows in one turn. Neither row
+/// count nor stream-end count is therefore a submission count. The short fixture
+/// messages fit the preview; verify the full durable text separately below.
 async fn await_user_turns_ended<S>(
     ws: &mut WebSocketStream<S>,
     agent_id: &str,
-    user_rows: usize,
+    contributions: &[&str],
 ) -> HashSet<String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
-    let mut rows_seen = 0usize;
+    let mut seen = vec![0usize; contributions.len()];
+    let mut seen_order = Vec::new();
     let mut open_turns: HashSet<String> = HashSet::new();
     let mut ended_turns: HashSet<String> = HashSet::new();
-    while rows_seen < user_rows || open_turns.iter().any(|t| !ended_turns.contains(t)) {
+    while seen.contains(&0) || open_turns.iter().any(|t| !ended_turns.contains(t)) {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let evt = try_next_event(ws, &["agent:message", "agent:stream:end"], remaining)
+        let evt = try_next_event(ws, &["agent:last-message", "agent:stream:end"], remaining)
             .await
             .unwrap_or_else(|| {
                 let still_open = open_turns
@@ -373,8 +362,8 @@ where
                     .filter(|t| !ended_turns.contains(*t))
                     .count();
                 panic!(
-                    "{} waiting for {user_rows} user rows and their turns to end \
-                     (saw {rows_seen} user rows, {still_open} turns still open)",
+                    "{} waiting for contributions {contributions:?} and their turns to end \
+                     (seen {seen:?}, {still_open} turns still open)",
                     wait_failure_kind(deadline)
                 )
             });
@@ -383,9 +372,23 @@ where
         }
         let turn_id = evt["data"]["turnId"].as_str().map(str::to_string);
         match evt["type"].as_str() {
-            Some("agent:message") if evt["data"]["role"] == json!("user") => {
-                rows_seen += 1;
-                open_turns.insert(turn_id.expect("user agent:message carries turnId"));
+            Some("agent:last-message") if evt["data"]["role"] == json!("user") => {
+                let text = evt["data"]["lastUserMessage"]
+                    .as_str()
+                    .expect("user preview");
+                let mut positions = Vec::new();
+                for (i, contribution) in contributions.iter().enumerate() {
+                    for (offset, _) in text.match_indices(contribution) {
+                        seen[i] += 1;
+                        assert_eq!(seen[i], 1, "duplicate contribution: {evt}");
+                        positions.push((offset, i));
+                    }
+                }
+                if !positions.is_empty() {
+                    positions.sort_unstable();
+                    seen_order.extend(positions.into_iter().map(|(_, i)| i));
+                    open_turns.insert(turn_id.expect("user preview carries turnId"));
+                }
             }
             Some("agent:stream:end") => {
                 if let Some(tid) = turn_id {
@@ -395,6 +398,7 @@ where
             _ => {}
         }
     }
+    assert_eq!(seen_order, (0..contributions.len()).collect::<Vec<_>>());
     open_turns
 }
 
@@ -964,9 +968,10 @@ async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option
     }
 
     // Wait (bounded) until every turn carrying a burst message has completed.
-    // Not "three stream:ends": messages that queue behind an in-flight turn
-    // drain as one combined turn, so the burst may end in fewer turns.
-    let burst_turns = await_user_turns_ended(&mut agent_sub, agent_id, 3).await;
+    // Neither three rows nor three stream:ends: pending same-human inputs
+    // merge into one row, and queued rows can drain together in one turn.
+    let burst_turns =
+        await_user_turns_ended(&mut agent_sub, agent_id, &["msg 0", "msg 1", "msg 2"]).await;
     if release_file.is_some() {
         assert_eq!(
             burst_turns.len(),
@@ -974,6 +979,30 @@ async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option
             "held msg 0 turn + one combined flush turn for msgs 1 and 2: {burst_turns:?}"
         );
     }
+
+    let store = intent_store::Store::open(&daemon.data_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    let session = store
+        .get_agent_session(&intent_core::AgentId::from(agent_id))
+        .await
+        .unwrap();
+    let text = session
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .flat_map(|m| m.content.as_array().into_iter().flatten())
+        .filter_map(|block| block["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    for contribution in ["msg 0", "msg 1", "msg 2"] {
+        assert_eq!(text.matches(contribution).count(), 1, "transcript: {text}");
+    }
+    assert!(
+        text.find("msg 0") < text.find("msg 1") && text.find("msg 1") < text.find("msg 2"),
+        "transcript: {text}"
+    );
+    store.close().await;
 
     // Collect workspace:updated events until the subscription has been quiet
     // for well over one debounce window (covers the trailing debounce fire).

@@ -4,9 +4,10 @@
 //!
 //! - `workspace.invite.create` — served on every authenticated connection
 //!   (UDS and `/ws`). The service half mints the invite; this half wraps it
-//!   into the `intent://invite?…` link, which is the `intent://pair` envelope
-//!   (hosts / port / fingerprint / optional `tc`) **minus the bearer token**,
-//!   plus `inviteId` and `secret`. It needs the listener's own pairing
+//!   into the tunnel-only `intent://invite?…` link: port / fingerprint /
+//!   `tc` (no `host`, **never the bearer token**) plus `inviteId` and
+//!   `secret`; without a tunnel address the create is refused
+//!   (`tunnel-down`). It needs the listener's own pairing
 //!   snapshot ([`ServerPairingInfo`]), which the JSON-RPC router has no
 //!   access to — hence a fast path, like `pairing.getInfo`.
 //! - `invite.challenge` / `invite.prove` — served on the unauthenticated
@@ -24,7 +25,6 @@
 //!   that credential as proof of identity, answering the same `authorized`
 //!   shape. Nothing else is reachable through `/invite`.
 
-use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -36,10 +36,10 @@ use crate::control::SystemControl;
 use crate::events::{error_frame, error_frame_with_data, success_frame};
 use crate::host_env::HostEnvironment;
 use crate::pairing::encode_query_value;
-use crate::server::{pairing_hosts, ServerPairingInfo};
+use crate::server::ServerPairingInfo;
 use intent_core::{
-    Error, InviteErrorKind, InviteLinkBuilder, InviteLinkEnvelope, ResolvedInviteLinkEnvelope,
-    Result, WorkspaceApi, WorkspaceId,
+    Error, InviteErrorKind, InviteLinkBuilder, InviteLinkEnvelope, InvitePin, InviteProofClaim,
+    InviteScope, ResolvedInviteLinkEnvelope, Result, WorkspaceApi, WorkspaceId,
 };
 
 /// Version of the `intent://invite` payload format (`v` query parameter and
@@ -50,39 +50,32 @@ pub(crate) const INVITE_PAYLOAD_VERSION: u32 = 1;
 /// any method other than the invite methods.
 pub(crate) const INVITE_ENDPOINT_ONLY_MESSAGE: &str = "the /invite endpoint serves invite.inspect, invite.accept, invite.challenge and invite.prove only";
 
-/// Build the invite link:
-/// `intent://invite?v=1&host=<ip[,ip...]>&port=<p>&fp=<sha256>&inviteId=<id>&secret=<s>[&tc=<addr>]`.
-/// Same encoding rules as [`crate::pairing::build_pairing_uri`]; never
-/// carries the daemon bearer token.
+/// Build the tunnel-only invite link:
+/// `intent://invite?v=1&port=<p>&fp=<sha256>&inviteId=<id>&secret=<s>&tc=<addr>`.
+/// No `host` parameter (an invite is dialed through the tunnel only); same
+/// encoding rules as [`crate::pairing::build_pairing_uri`]; never carries the
+/// daemon bearer token.
 pub(crate) fn build_invite_uri(
-    hosts: &[String],
     port: u16,
     fingerprint: &str,
     invite_id: &str,
     secret: &str,
-    tc_address: Option<&str>,
+    tc_address: &str,
 ) -> String {
-    let hosts = hosts
-        .iter()
-        .map(|h| encode_query_value(h))
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut uri = format!(
-        "intent://invite?v={INVITE_PAYLOAD_VERSION}&host={hosts}&port={port}&fp={}&inviteId={}&secret={}",
+    format!(
+        "intent://invite?v={INVITE_PAYLOAD_VERSION}&port={port}&fp={}&inviteId={}&secret={}&tc={}",
         encode_query_value(fingerprint),
         encode_query_value(invite_id),
-        encode_query_value(secret)
-    );
-    if let Some(tc) = tc_address {
-        let _ = write!(uri, "&tc={}", encode_query_value(tc));
-    }
-    uri
+        encode_query_value(secret),
+        encode_query_value(tc_address)
+    )
 }
 
 /// Which invite fast path a frame names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InviteMethod {
     Create,
+    HostCreate,
     Inspect,
     Accept,
     Challenge,
@@ -93,7 +86,7 @@ impl InviteMethod {
     /// Served on the unauthenticated `/invite` endpoint (everything but
     /// `workspace.invite.create`, which needs an authenticated owner).
     pub(crate) fn on_invite_endpoint(self) -> bool {
-        !matches!(self, InviteMethod::Create)
+        !matches!(self, InviteMethod::Create | InviteMethod::HostCreate)
     }
 }
 
@@ -121,6 +114,7 @@ pub(crate) fn classify(value: &Value) -> Option<InviteRequest> {
     }
     let method = match method {
         "workspace.invite.create" => InviteMethod::Create,
+        "host.invite.create" => InviteMethod::HostCreate,
         "invite.inspect" => InviteMethod::Inspect,
         "invite.accept" => InviteMethod::Accept,
         "invite.challenge" => InviteMethod::Challenge,
@@ -155,6 +149,26 @@ fn respond(req: &InviteRequest, result: Result<Value>) -> Option<String> {
             e.code(),
             &e.to_string(),
             &json!({ "code": "listener-down" }),
+        ),
+        Err(e @ Error::TunnelDown) => error_frame_with_data(
+            &req.id_echo,
+            e.code(),
+            &e.to_string(),
+            &json!({ "code": "tunnel-down" }),
+        ),
+        // Identity-proof refusal (host half, protocol 10.8): `data.host`
+        // names the instance the host has no connection to.
+        Err(ref e @ Error::IdentityUnverifiable { ref host }) => error_frame_with_data(
+            &req.id_echo,
+            e.code(),
+            &e.to_string(),
+            &json!({ "code": "identity-unverifiable", "host": host }),
+        ),
+        Err(e @ Error::InvalidParams(_)) => error_frame_with_data(
+            &req.id_echo,
+            e.code(),
+            &e.to_string(),
+            &json!({"code":"invalid-params"}),
         ),
         Err(e) => error_frame(&req.id_echo, e.code(), &e.to_string()),
     })
@@ -237,7 +251,7 @@ pub(crate) fn hashes_secret(req: &InviteRequest) -> bool {
         | InviteMethod::Accept
         | InviteMethod::Challenge
         | InviteMethod::Prove => true,
-        InviteMethod::Create => false,
+        InviteMethod::Create | InviteMethod::HostCreate => false,
     }
 }
 
@@ -292,27 +306,26 @@ fn opt_u64_param(params: &Value, key: &str) -> Result<Option<u64>> {
     }
 }
 
-/// The link envelope of this listener: hosts, port, fingerprint and the
-/// optional tunnel address every `intent://invite?…` link of the daemon
-/// shares. [`link_envelope`] resolves it; [`InviteLinkEnvelope::invite_url`]
-/// formats one invite's link from it.
+/// The link envelope of this listener: port, fingerprint and the tunnel
+/// address every `intent://invite?…` link of the daemon shares. Invite links
+/// are tunnel-only, so the listener's bind addresses are never part of it.
+/// [`link_envelope`] resolves it; [`InviteLinkEnvelope::invite_url`] formats
+/// one invite's link from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LinkEnvelope {
-    pub hosts: Vec<String>,
     pub port: u16,
     pub fingerprint: String,
-    pub tc_address: Option<String>,
+    pub tc_address: String,
 }
 
 impl InviteLinkEnvelope for LinkEnvelope {
     fn invite_url(&self, invite_id: &str, secret: &str) -> String {
         build_invite_uri(
-            &self.hosts,
             self.port,
             &self.fingerprint,
             invite_id,
             secret,
-            self.tc_address.as_deref(),
+            &self.tc_address,
         )
     }
 }
@@ -321,36 +334,29 @@ impl InviteLinkEnvelope for LinkEnvelope {
 /// this runs BEFORE the invite is minted so a daemon nobody can dial never
 /// stores an invite that cannot be redeemed: no TCP listener is
 /// [`Error::ListenerDown`] (`error.data.code = "listener-down"`, like
-/// `pairing.getInfo`), and no dialable route at all (loopback-only bind and
-/// no tunnel) is `Unsupported`.
+/// `pairing.getInfo`), and no tunnel address is [`Error::TunnelDown`]
+/// (`error.data.code = "tunnel-down"`) — an invite link is tunnel-only, so a
+/// LAN bind address does not make it dialable.
 async fn link_envelope(provider: Option<&Arc<dyn ServerPairingInfo>>) -> Result<LinkEnvelope> {
     let provider = provider.ok_or_else(|| {
         Error::Unsupported("invite links are unavailable on this listener".to_string())
     })?;
     let snapshot = provider.pairing_snapshot().await;
     let port = snapshot.port.ok_or(Error::ListenerDown)?;
+    let tc_address = snapshot.tc_address.ok_or(Error::TunnelDown)?;
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
-    let hosts = pairing_hosts(&snapshot);
-    if hosts.is_empty() && snapshot.tc_address.is_none() {
-        return Err(Error::Unsupported(
-            "no dialable route for an invite link: set server.bindAddress to a LAN \
-             address or enable the tunnel (server.tunnel.enabled) before inviting"
-                .to_string(),
-        ));
-    }
     Ok(LinkEnvelope {
-        hosts,
         port,
         fingerprint: cert.fingerprint256,
-        tc_address: snapshot.tc_address,
+        tc_address,
     })
 }
 
 /// The services layer's [`InviteLinkBuilder`] over a listener's pairing
 /// provider: the same [`link_envelope`] `workspace.invite.create` resolves,
 /// so a link rebuilt for `workspace.invite.list` is byte-identical to the
-/// one minted. Resolution failures (listener down, no dialable route) are
-/// `None` here — a read never fails for them.
+/// one minted. Resolution failures (listener down, tunnel down) are `None`
+/// here — a read never fails for them.
 pub struct InviteLinkResolver {
     provider: Arc<dyn ServerPairingInfo>,
 }
@@ -377,9 +383,10 @@ impl InviteLinkBuilder for InviteLinkResolver {
 
 /// Handle a classified `workspace.invite.create`: params
 /// `{ workspaceId, pinLogin?, expiresInSecs? }` → the service result
-/// (`{ invite, secret }`) extended with `url`, `hosts`, `port`,
-/// `fingerprint`, `version` and the additive `tcAddress`. Owner-only in the
-/// service layer (`-32003` otherwise); the secret appears exactly once, here.
+/// (`{ invite, secret }`) extended with `url`, `hosts` (always `[]`: invite
+/// links are tunnel-only; kept for wire compatibility), `port`,
+/// `fingerprint`, `version` and `tcAddress`. Owner-only in the service layer
+/// (`-32003` otherwise); the secret appears exactly once, here.
 /// The envelope is resolved exactly once per create and the one link it
 /// formats is stamped as both the top-level `url` and `invite.url`, so the
 /// two are identical by construction.
@@ -388,22 +395,61 @@ pub(crate) async fn handle_create(
     api: &Arc<dyn WorkspaceApi>,
     provider: Option<&Arc<dyn ServerPairingInfo>>,
 ) -> Option<String> {
-    let result = create_json(&req.params, api, provider).await;
+    let result = create_scoped_json(
+        &req.params,
+        api,
+        provider,
+        if req.method == InviteMethod::HostCreate {
+            InviteScope::Host
+        } else {
+            InviteScope::Workspace
+        },
+    )
+    .await;
     respond(&req, result)
 }
 
-async fn create_json(
+async fn create_scoped_json(
     params: &Value,
     api: &Arc<dyn WorkspaceApi>,
     provider: Option<&Arc<dyn ServerPairingInfo>>,
+    scope: InviteScope,
 ) -> Result<Value> {
-    let workspace_id = WorkspaceId::from(str_param(params, "workspaceId")?.as_str());
-    let pin_login = opt_str_param(params, "pinLogin")?;
-    let expires_in_secs = opt_u64_param(params, "expiresInSecs")?;
+    let (workspace_id, pin, expires_in_secs) = if scope == InviteScope::Host {
+        if params.get("workspaceId").is_some() || params.get("expiresInSecs").is_some() {
+            return Err(Error::InvalidParams(
+                "host invitations do not accept workspaceId or expiresInSecs".into(),
+            ));
+        }
+        (
+            None,
+            Some(InvitePin {
+                login: str_param(params, "pinLogin")?,
+                provider: Some(str_param(params, "pinProvider")?),
+                host: opt_str_param(params, "pinHost")?,
+            }),
+            None,
+        )
+    } else {
+        (
+            Some(WorkspaceId::from(
+                str_param(params, "workspaceId")?.as_str(),
+            )),
+            workspace_pin(params)?,
+            opt_u64_param(params, "expiresInSecs")?,
+        )
+    };
     let envelope = link_envelope(provider).await?;
-    let mut result = api
-        .workspace_invite_create(workspace_id, pin_login, expires_in_secs)
-        .await?;
+    let mut result = match workspace_id {
+        Some(workspace_id) => {
+            api.workspace_invite_create(workspace_id, pin, expires_in_secs)
+                .await?
+        }
+        None => {
+            api.host_invite_create(pin.expect("host pin was validated"))
+                .await?
+        }
+    };
     let invite_id = result
         .pointer("/invite/id")
         .and_then(Value::as_str)
@@ -414,7 +460,7 @@ async fn create_json(
         .and_then(Value::as_str)
         .ok_or_else(|| Error::Internal("invite result carries no secret".to_string()))?
         .to_string();
-    let url = envelope.invite_url(&invite_id, &secret);
+    let url = envelope.scoped_invite_url(&invite_id, &secret, scope);
     result
         .pointer_mut("/invite")
         .and_then(Value::as_object_mut)
@@ -424,13 +470,11 @@ async fn create_json(
         .as_object_mut()
         .ok_or_else(|| Error::Internal("invite result is not an object".to_string()))?;
     obj.insert("url".into(), url.into());
-    obj.insert("hosts".into(), json!(envelope.hosts));
+    obj.insert("hosts".into(), json!([]));
     obj.insert("port".into(), envelope.port.into());
     obj.insert("fingerprint".into(), envelope.fingerprint.into());
     obj.insert("version".into(), INVITE_PAYLOAD_VERSION.into());
-    if let Some(tc) = envelope.tc_address {
-        obj.insert("tcAddress".into(), tc.into());
-    }
+    obj.insert("tcAddress".into(), envelope.tc_address.into());
     Ok(result)
 }
 
@@ -469,7 +513,7 @@ fn with_host_identity(mut result: Value, what: &str, host: HostEnvironment) -> R
 
 /// Handle a classified `invite.inspect` on the `/invite` endpoint: params
 /// `{ inviteId, secret }` → the service result `{ workspaceId,
-/// workspaceTitle }` extended with the host's `hostname` / `prettyHostname`
+/// workspaceTitle, pinIdentity }` extended with the host's `hostname` / `prettyHostname`
 /// exactly like an `invite.challenge`, without issuing a nonce.
 pub(crate) async fn handle_inspect(
     req: InviteRequest,
@@ -480,6 +524,34 @@ pub(crate) async fn handle_inspect(
     respond(&req, result)
 }
 
+fn workspace_pin(params: &Value) -> Result<Option<InvitePin>> {
+    let pin = if let Some(login) = opt_str_param(params, "pinLogin")? {
+        Some(InvitePin {
+            login,
+            provider: opt_str_param(params, "pinProvider")?,
+            host: opt_str_param(params, "pinHost")?,
+        })
+    } else {
+        if params.get("pinProvider").is_some_and(|v| !v.is_null())
+            || params.get("pinHost").is_some_and(|v| !v.is_null())
+        {
+            return Err(Error::InvalidParams(
+                "`pinProvider` / `pinHost` require `pinLogin`".to_string(),
+            ));
+        }
+        None
+    };
+    Ok(pin)
+}
+
+fn invite_scope(params: &Value) -> Result<InviteScope> {
+    match params.get("scope") {
+        None => Ok(InviteScope::Workspace),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|_| Error::InvalidParams("scope must be workspace or host".into())),
+    }
+}
+
 async fn inspect_json(
     params: &Value,
     api: &Arc<dyn WorkspaceApi>,
@@ -487,7 +559,9 @@ async fn inspect_json(
 ) -> Result<Value> {
     let invite_id = str_param(params, "inviteId")?;
     let secret = str_param(params, "secret")?;
-    let result = api.invite_inspect(invite_id, secret).await?;
+    let result = api
+        .invite_inspect(invite_id, secret, invite_scope(params)?)
+        .await?;
     with_host_identity(result, "invite.inspect", host)
 }
 
@@ -507,7 +581,8 @@ async fn accept_json(params: &Value, api: &Arc<dyn WorkspaceApi>) -> Result<Valu
     let invite_id = str_param(params, "inviteId")?;
     let secret = str_param(params, "secret")?;
     let credential = str_param(params, "credential")?;
-    api.invite_accept(invite_id, secret, credential).await
+    api.invite_accept(invite_id, secret, invite_scope(params)?, credential)
+        .await
 }
 
 /// Handle a classified `invite.challenge` on the `/invite` endpoint: params
@@ -530,15 +605,21 @@ async fn challenge_json(
 ) -> Result<Value> {
     let invite_id = str_param(params, "inviteId")?;
     let secret = str_param(params, "secret")?;
-    let result = api.invite_challenge(invite_id, secret).await?;
+    let result = api
+        .invite_challenge(invite_id, secret, invite_scope(params)?)
+        .await?;
     with_host_identity(result, "invite.challenge", host)
 }
 
 /// Handle a classified `invite.prove` on the `/invite` endpoint: params
-/// `{ inviteId, secret, nonce, gistId, login }` → the `authorized` shape
+/// `{ inviteId, secret, nonce, login, gistId? | proofId?, provider?, host? }`
+/// (`proofId` aliases `gistId`, exactly one of the two — never both, even
+/// spelling the same id; `provider` defaults in the service layer to
+/// github, `host` to the forge's default instance — protocol 10.8) → the
+/// `authorized` shape
 /// `{ status, token, principalId, login, workspaceId }` as the service
-/// answers it (no host identity: the client already
-/// saw it on the challenge).
+/// answers it (no host identity: the client already saw it on the
+/// challenge).
 pub(crate) async fn handle_prove(
     req: InviteRequest,
     api: &Arc<dyn WorkspaceApi>,
@@ -551,9 +632,30 @@ async fn prove_json(params: &Value, api: &Arc<dyn WorkspaceApi>) -> Result<Value
     let invite_id = str_param(params, "inviteId")?;
     let secret = str_param(params, "secret")?;
     let nonce = str_param(params, "nonce")?;
-    let gist_id = str_param(params, "gistId")?;
     let login = str_param(params, "login")?;
-    api.invite_prove(invite_id, secret, nonce, gist_id, login)
+    let proof_id = match (
+        opt_str_param(params, "proofId")?,
+        opt_str_param(params, "gistId")?,
+    ) {
+        (Some(proof_id), None) | (None, Some(proof_id)) => proof_id,
+        (Some(_), Some(_)) => {
+            return Err(Error::InvalidParams(
+                "`proofId` and `gistId` are aliases; pass exactly one".to_string(),
+            ));
+        }
+        (None, None) => {
+            return Err(Error::InvalidParams(
+                "`proofId` (or its alias `gistId`) is required".to_string(),
+            ));
+        }
+    };
+    let claim = InviteProofClaim {
+        proof_id,
+        login,
+        provider: opt_str_param(params, "provider")?,
+        host: opt_str_param(params, "host")?,
+    };
+    api.invite_prove(invite_id, secret, invite_scope(params)?, nonce, claim)
         .await
 }
 
@@ -570,7 +672,7 @@ pub(crate) async fn handle_invite_endpoint(
         InviteMethod::Accept => handle_accept(req, api).await,
         InviteMethod::Challenge => handle_challenge(req, api, host).await,
         InviteMethod::Prove => handle_prove(req, api).await,
-        InviteMethod::Create => req
+        InviteMethod::Create | InviteMethod::HostCreate => req
             .id_present
             .then(|| error_frame(&req.id_echo, -32001, INVITE_ENDPOINT_ONLY_MESSAGE)),
     }

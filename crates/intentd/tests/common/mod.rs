@@ -8,12 +8,57 @@
 // uses a subset of it, so unused items are expected.
 #![allow(dead_code)]
 
+#[cfg(unix)]
+pub mod claude_npx;
+#[cfg(unix)]
+pub mod codex_npx;
+
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::{Arc, Mutex, Once};
 use std::thread::ThreadId;
 use std::time::Duration;
+
+/// The four repository retirement feeds share the response connection. Their
+/// typed, nonsecret envelopes are notifications, never an RPC acknowledgment.
+pub fn is_repository_retirement_notification(value: &serde_json::Value) -> bool {
+    let Some(frame) = value.as_object() else {
+        return false;
+    };
+    if frame.len() != 3 || value["jsonrpc"] != "2.0" {
+        return false;
+    }
+    let ids = match value["method"].as_str() {
+        Some("workspace.repositoryContext.retired") => "lifetimeIds",
+        Some("workspace.repositorySelection.retired") => "selectionIds",
+        Some("accept-changes.retired") => "operationIds",
+        Some("sourceControl.read.retired") => "readLifetimeIds",
+        _ => return false,
+    };
+    let Some(params) = value["params"].as_object() else {
+        return false;
+    };
+    params.len() == 4
+        && params
+            .get(ids)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|ids| ids.iter().all(serde_json::Value::is_string))
+        && params
+            .get("sequence")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|sequence| {
+                sequence
+                    .parse::<u64>()
+                    .is_ok_and(|n| n.to_string() == sequence)
+            })
+        && params
+            .get("allRetired")
+            .is_some_and(serde_json::Value::is_boolean)
+        && params
+            .get("terminal")
+            .is_some_and(serde_json::Value::is_boolean)
+}
 
 /// Force the hermetic-root guard on for every integration-test binary that
 /// compiles this module. Runs before `main()` — and therefore before any test
@@ -589,6 +634,29 @@ pub fn serve_command_fixed_port() -> std::process::Command {
     cmd
 }
 
+/// Cut a spawned daemon off from the HOST's GitHub identity so its boot-time
+/// primary-identity refresh resolves no token and hydrates no `login` /
+/// `displayName` / `avatarUrl` onto the primary principal (intent-hq/intent#5645).
+/// The daemon's token resolution falls back from the secrets store to
+/// `GITHUB_TOKEN` / `GH_TOKEN` and then to `gh auth token`, so a test that
+/// asserts anonymous author shapes is otherwise a race against the developer's
+/// own `gh auth login` — green on CI and on a logged-out machine, red on a
+/// logged-in one. Removes both env tokens and points `GH_CONFIG_DIR` at an
+/// empty directory under `data_dir` (no `hosts.yml` → `gh auth token` fails
+/// without consulting the keyring). This covers only the env and `gh` rungs:
+/// the caller must ALSO isolate the secrets store (`INTENTD_SECRETS_FILE`
+/// under the test dir, as every spawn helper here already does) or a stored
+/// device-flow token on the host still wins. Callers that seed their own
+/// token / secrets file / API-base mock still layer those on top via later
+/// `.env(..)`.
+pub fn hermetic_github_identity(cmd: &mut std::process::Command, data_dir: &Path) {
+    let gh_config_dir = data_dir.join("gh-config");
+    std::fs::create_dir_all(&gh_config_dir).expect("mkdir empty gh config dir");
+    cmd.env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .env("GH_CONFIG_DIR", &gh_config_dir);
+}
+
 /// Enable the WSS/TCP listener for a daemon booted from `data_dir` by seeding
 /// `config.toml` with `[server.wsApi] enabled = true` plus an OS-assigned free
 /// port (the config-driven replacement for the retired `serve --listen both`
@@ -964,6 +1032,62 @@ impl Drop for DaemonGuard {
     }
 }
 
+/// Stable identity projection of an `agent.getConversation` page for
+/// cross-time equality assertions ("no wake was delivered between these two
+/// reads"): one entry per `messages[]` row keeping exactly the persisted
+/// fields that identify a delivered message — `id`, `seq`, `role`,
+/// `contentBlocks`, `timestamp` — and dropping every field the daemon
+/// attaches at read time. In particular `author` is excluded: it is resolved
+/// from the principal store on every read, and the daemon refreshes the
+/// primary principal's GitHub profile asynchronously, so two reads of an
+/// unchanged transcript can differ only in `author` (`login` /
+/// `displayName` / `avatarUrl` null → hydrated) — comparing the raw payload
+/// registered that hydration as a delivered wake (intent-hq/intent#5603).
+/// Page-level fields (`turnInFlight`, `lastStreamActivityAt`, cursors) are
+/// likewise outside the fingerprint. A genuinely new or edited message still
+/// changes it. Compare with `==`; on mismatch print [`fingerprint_diff`].
+pub fn conversation_fingerprint(convo: &serde_json::Value) -> Vec<serde_json::Value> {
+    convo["messages"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "id": row["id"],
+                        "seq": row["seq"],
+                        "role": row["role"],
+                        "contentBlocks": row["contentBlocks"],
+                        "timestamp": row["timestamp"],
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Row-by-row description of how two [`conversation_fingerprint`]s differ
+/// (changed / added / removed rows by index, each with its projected row),
+/// for assertion messages; empty when the fingerprints are equal.
+pub fn fingerprint_diff(before: &[serde_json::Value], after: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for i in 0..before.len().max(after.len()) {
+        match (before.get(i), after.get(i)) {
+            (Some(b), Some(a)) if b == a => {}
+            (Some(b), Some(a)) => {
+                let _ = writeln!(out, "row {i} changed:\n  before: {b}\n  after:  {a}");
+            }
+            (Some(b), None) => {
+                let _ = writeln!(out, "row {i} removed: {b}");
+            }
+            (None, Some(a)) => {
+                let _ = writeln!(out, "row {i} added: {a}");
+            }
+            (None, None) => unreachable!("index bounded by the longer fingerprint"),
+        }
+    }
+    out
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1008,51 +1132,166 @@ mod tests {
         let _ = std::panic::catch_unwind(|| panic!("intentional: exercise retention hook"));
     }
 
+    // Hold a unique parent until every original/retained-path assertion is done.
+    // A panic frees the original child name, so another test can reuse it while
+    // the failed-* sibling still belongs to the earlier test. The parent is
+    // registered on the assertion thread to retain diagnostics on a real failure.
+    fn with_retention_test_root(base: &Path, f: impl FnOnce(PathBuf)) {
+        let root = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-case-");
+        f(root.path().to_path_buf());
+    }
+
+    #[test]
+    fn retention_checks_isolate_reused_names() {
+        // Force the same candidate name, without depending on random collisions.
+        fn fixed_tempdir(base: &Path) -> tempfile::TempDir {
+            let mut dir = tempfile::Builder::new()
+                .prefix("itd-retain-reused")
+                .rand_bytes(0)
+                .tempdir_in(base)
+                .expect("create fixed-name test dir");
+            if keep_tmp_requested() {
+                dir.disable_cleanup(true);
+            }
+            register_for_failure_retention(dir.path());
+            dir
+        }
+
+        let namespace = test_tempdir("itd-retain-reuse-");
+        with_retention_test_root(namespace.path(), |failing_root| {
+            with_retention_test_root(namespace.path(), |passing_root| {
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let failing = std::thread::spawn(move || {
+                    let dir = fixed_tempdir(&failing_root);
+                    let original = dir.path().to_path_buf();
+                    let retained = retained_path_for(&original);
+                    let owner = format!(
+                        "pid={} tid={:?}",
+                        std::process::id(),
+                        std::thread::current().id()
+                    );
+                    std::fs::write(dir.path().join("daemon.log"), &owner).expect("write owner");
+                    caught_panic();
+                    ready_tx.send((original, retained, owner)).expect("ready");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release");
+                });
+                let (failed_original, failed_retained, failed_owner) = ready_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("retained");
+                // KEEP_TMP intentionally leaves the original occupied, so name
+                // reuse only applies to the ordinary rename-on-panic policy.
+                if keep_tmp_requested() {
+                    release_tx.send(()).expect("release");
+                    failing.join().expect("failing owner finished");
+                    assert_eq!(
+                        std::fs::read_to_string(failed_original.join("daemon.log")).unwrap(),
+                        failed_owner
+                    );
+                    std::fs::remove_dir_all(failed_original).expect("clean up kept dir");
+                    return;
+                }
+                let (original, retained, passing_owner, retained_exists) =
+                    on_fresh_thread(move || {
+                        let dir = fixed_tempdir(&passing_root);
+                        let original = dir.path().to_path_buf();
+                        let retained = retained_path_for(&original);
+                        let owner = std::thread::current().id();
+                        drop(dir);
+                        let exists = retained.exists();
+                        (original, retained, owner, exists)
+                    });
+                release_tx.send(()).expect("release");
+                failing.join().expect("failing owner finished");
+                let diagnostics = std::fs::read_to_string(failed_retained.join("daemon.log"))
+                    .expect("retained diagnostics");
+                assert_eq!(
+                    diagnostics, failed_owner,
+                    "failed diagnostics are preserved"
+                );
+                assert_eq!(original.file_name(), failed_original.file_name());
+                assert!(
+                    !original.exists(),
+                    "passing owner removed {}",
+                    original.display()
+                );
+                assert!(
+                    !retained_exists,
+                    "no failed-* sibling for passing pid={} tid={passing_owner:?}: original={} retained={}; failed owner {failed_owner}: original={} retained={}",
+                    std::process::id(), original.display(), retained.display(),
+                    failed_original.display(), failed_retained.display()
+                );
+            });
+        });
+    }
+
     #[test]
     fn tempdir_is_retained_when_creating_thread_panics() {
-        let (original, retained) = on_fresh_thread(|| {
-            let dir = test_tempdir("itd-retain-");
-            std::fs::write(dir.path().join("daemon.log"), "line\n".repeat(3)).expect("write log");
-            let original = dir.path().to_path_buf();
-            let retained = retained_path_for(&original);
-            assert_eq!(
-                retained.file_name().unwrap().to_string_lossy(),
-                format!("failed-{}", original.file_name().unwrap().to_string_lossy())
+        with_retention_test_root(&std::env::temp_dir(), |base| {
+            let (original, retained) = on_fresh_thread(move || {
+                let dir = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-");
+                std::fs::write(dir.path().join("daemon.log"), "line\n".repeat(3))
+                    .expect("write log");
+                let original = dir.path().to_path_buf();
+                let retained = retained_path_for(&original);
+                assert_eq!(
+                    retained.file_name().unwrap().to_string_lossy(),
+                    format!("failed-{}", original.file_name().unwrap().to_string_lossy())
+                );
+                caught_panic();
+                (original, retained)
+            });
+            if keep_tmp_requested() {
+                assert!(original.is_dir(), "KEEP_TMP keeps the dir in place");
+                let _ = std::fs::remove_dir_all(&original);
+                return;
+            }
+            assert!(!original.exists(), "original swept after retention");
+            assert!(
+                retained.is_dir(),
+                "retained dir exists at {}",
+                retained.display()
             );
-            caught_panic();
-            (original, retained)
+            assert!(
+                retained.join("daemon.log").is_file(),
+                "daemon.log travelled with the dir"
+            );
+            std::fs::remove_dir_all(&retained).expect("clean up retained dir");
         });
-        if keep_tmp_requested() {
-            assert!(original.is_dir(), "KEEP_TMP keeps the dir in place");
-            let _ = std::fs::remove_dir_all(&original);
-            return;
-        }
-        assert!(!original.exists(), "original swept after retention");
-        assert!(
-            retained.is_dir(),
-            "retained dir exists at {}",
-            retained.display()
-        );
-        assert!(
-            retained.join("daemon.log").is_file(),
-            "daemon.log travelled with the dir"
-        );
-        std::fs::remove_dir_all(&retained).expect("clean up retained dir");
     }
 
     #[test]
     fn tempdir_is_not_retained_on_success() {
-        let (original, retained) = on_fresh_thread(|| {
-            let dir = test_tempdir("itd-retain-");
-            let original = dir.path().to_path_buf();
-            (original.clone(), retained_path_for(&original))
+        with_retention_test_root(&std::env::temp_dir(), |base| {
+            let (original, retained, owner) = on_fresh_thread(move || {
+                let dir = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-");
+                let original = dir.path().to_path_buf();
+                (
+                    original.clone(),
+                    retained_path_for(&original),
+                    std::thread::current().id(),
+                )
+            });
+            if keep_tmp_requested() {
+                let _ = std::fs::remove_dir_all(&original);
+            } else {
+                assert!(
+                    !original.exists(),
+                    "passing thread {owner:?} sweeps {} (pid={})",
+                    original.display(),
+                    std::process::id()
+                );
+            }
+            assert!(
+                !retained.exists(),
+                "no failed-* sibling without a panic: pid={} tid={owner:?} original={} retained={}",
+                std::process::id(),
+                original.display(),
+                retained.display()
+            );
         });
-        if keep_tmp_requested() {
-            let _ = std::fs::remove_dir_all(&original);
-        } else {
-            assert!(!original.exists(), "passing thread sweeps its dir");
-        }
-        assert!(!retained.exists(), "no failed-* sibling without a panic");
     }
 
     #[test]
@@ -1097,77 +1336,275 @@ mod tests {
     }
 
     #[test]
-    fn suppressed_thread_keeps_normal_cleanup_on_caught_panic() {
-        let (original, retained) = on_fresh_thread(|| {
-            let dir = test_tempdir("itd-retain-");
-            let original = dir.path().to_path_buf();
-            {
-                let _suppress = suppress_failure_retention();
-                caught_panic();
-            }
-            assert!(original.is_dir(), "suppressed: dir untouched by the hook");
-            caught_panic();
+    fn suppressed_caught_panic_preserves_successful_drop_policy() {
+        with_retention_test_root(&std::env::temp_dir(), |base| {
+            let (original, retained) = on_fresh_thread(move || {
+                let dir = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-");
+                let original = dir.path().to_path_buf();
+                std::fs::write(original.join("daemon.log"), "successful-owner-evidence")
+                    .expect("write owned evidence");
+                {
+                    let _suppress = suppress_failure_retention();
+                    caught_panic();
+                }
+                assert!(original.is_dir(), "caught panic leaves original untouched");
+                let retained = retained_path_for(&original);
+                assert!(!retained.exists(), "suppression must not rename the dir");
+                drop(dir);
+                (original, retained)
+            });
             assert!(
-                !original.exists(),
-                "retention is back once the guard is dropped"
+                !retained.exists(),
+                "successful drop does not retain a failure"
             );
-            (original.clone(), retained_path_for(&original))
+            if keep_tmp_requested() {
+                assert!(original.is_dir(), "KEEP_TMP keeps successful dirs too");
+                assert_eq!(
+                    std::fs::read_to_string(original.join("daemon.log")).unwrap(),
+                    "successful-owner-evidence"
+                );
+                std::fs::remove_dir_all(&original).expect("clean up owned kept dir");
+            }
+            assert!(!original.exists(), "owned original removed after teardown");
         });
-        if keep_tmp_requested() {
-            let _ = std::fs::remove_dir_all(&original);
-            return;
-        }
-        assert!(retained.is_dir(), "renamed by the post-guard panic");
-        std::fs::remove_dir_all(&retained).expect("clean up retained dir");
+    }
+
+    #[test]
+    fn suppressed_thread_keeps_normal_cleanup_on_caught_panic() {
+        with_retention_test_root(&std::env::temp_dir(), |base| {
+            let (original, retained) = on_fresh_thread(move || {
+                let dir = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-");
+                std::fs::write(dir.path().join("daemon.log"), "suppression-owner-evidence")
+                    .expect("write owned evidence");
+                let original = dir.path().to_path_buf();
+                {
+                    let _suppress = suppress_failure_retention();
+                    caught_panic();
+                }
+                assert!(original.is_dir(), "suppressed: dir untouched by the hook");
+                caught_panic();
+                if keep_tmp_requested() {
+                    assert!(original.is_dir(), "KEEP_TMP keeps the dir in place");
+                    assert!(
+                        !retained_path_for(&original).exists(),
+                        "KEEP_TMP does not rename the dir after suppression"
+                    );
+                } else {
+                    assert!(
+                        !original.exists(),
+                        "retention is back once the guard is dropped"
+                    );
+                }
+                (original.clone(), retained_path_for(&original))
+            });
+            if keep_tmp_requested() {
+                assert!(original.is_dir(), "KEEP_TMP preserves the owned original");
+                assert!(!retained.exists(), "KEEP_TMP must not also rename the dir");
+                assert_eq!(
+                    std::fs::read_to_string(original.join("daemon.log")).unwrap(),
+                    "suppression-owner-evidence"
+                );
+                std::fs::remove_dir_all(&original).expect("clean up owned kept dir");
+                assert!(!original.exists(), "explicit owned teardown completed");
+                return;
+            }
+            assert!(retained.is_dir(), "renamed by the post-guard panic");
+            assert_eq!(
+                std::fs::read_to_string(retained.join("daemon.log")).unwrap(),
+                "suppression-owner-evidence"
+            );
+            std::fs::remove_dir_all(&retained).expect("clean up retained dir");
+            assert!(!retained.exists(), "explicit owned teardown completed");
+        });
     }
 
     #[test]
     fn real_failure_inside_suppression_window_still_retains() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let outcome = std::thread::spawn(move || {
-            let dir = test_tempdir("itd-retain-");
-            let original = dir.path().to_path_buf();
-            tx.send((original.clone(), retained_path_for(&original)))
-                .expect("send paths");
-            let _suppress = suppress_failure_retention();
-            caught_panic();
-            assert!(original.is_dir(), "caught panic under the guard: untouched");
-            panic!("intentional: uncaught failure while suppressed");
-        })
-        .join();
-        assert!(outcome.is_err(), "thread must have failed");
-        let (original, retained) = rx.recv().expect("paths");
-        if keep_tmp_requested() {
-            let _ = std::fs::remove_dir_all(&original);
-            return;
-        }
-        assert!(!original.exists(), "original swept after retention");
-        assert!(
-            retained.is_dir(),
-            "guard dropped during unwinding retained {}",
-            retained.display()
-        );
-        std::fs::remove_dir_all(&retained).expect("clean up retained dir");
+        with_retention_test_root(&std::env::temp_dir(), |base| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let outcome = std::thread::spawn(move || {
+                let dir = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-");
+                std::fs::write(dir.path().join("daemon.log"), "suppression-owner-evidence")
+                    .expect("write owned evidence");
+                let original = dir.path().to_path_buf();
+                tx.send((original.clone(), retained_path_for(&original)))
+                    .expect("send paths");
+                let _suppress = suppress_failure_retention();
+                caught_panic();
+                assert!(original.is_dir(), "caught panic under the guard: untouched");
+                panic!("intentional: uncaught failure while suppressed");
+            })
+            .join();
+            assert!(outcome.is_err(), "thread must have failed");
+            let (original, retained) = rx.recv().expect("paths");
+            if keep_tmp_requested() {
+                assert!(original.is_dir(), "KEEP_TMP preserves the owned original");
+                assert!(!retained.exists(), "KEEP_TMP must not also rename the dir");
+                assert_eq!(
+                    std::fs::read_to_string(original.join("daemon.log")).unwrap(),
+                    "suppression-owner-evidence"
+                );
+                std::fs::remove_dir_all(&original).expect("clean up owned kept dir");
+                assert!(!original.exists(), "explicit owned teardown completed");
+                return;
+            }
+            assert!(!original.exists(), "original swept after retention");
+            assert!(
+                retained.is_dir(),
+                "guard dropped during unwinding retained {}",
+                retained.display()
+            );
+            assert_eq!(
+                std::fs::read_to_string(retained.join("daemon.log")).unwrap(),
+                "suppression-owner-evidence"
+            );
+            std::fs::remove_dir_all(&retained).expect("clean up retained dir");
+            assert!(!retained.exists(), "explicit owned teardown completed");
+        });
     }
 
     #[test]
     fn sibling_thread_panic_does_not_retain_my_dir() {
-        let (original, retained) = on_fresh_thread(|| {
-            let dir = test_tempdir("itd-retain-");
-            let original = dir.path().to_path_buf();
-            on_fresh_thread(caught_panic);
+        with_retention_test_root(&std::env::temp_dir(), |base| {
+            let (original, retained) = on_fresh_thread(move || {
+                let dir = test_tempdir_in(base.to_str().expect("UTF-8 temp root"), "itd-retain-");
+                let original = dir.path().to_path_buf();
+                on_fresh_thread(caught_panic);
+                assert!(
+                    original.is_dir(),
+                    "another thread's panic leaves my dir alone"
+                );
+                (original.clone(), retained_path_for(&original))
+            });
+            if keep_tmp_requested() {
+                let _ = std::fs::remove_dir_all(&original);
+            }
             assert!(
-                original.is_dir(),
-                "another thread's panic leaves my dir alone"
+                !retained.exists(),
+                "retention is scoped to the panicking thread"
             );
-            (original.clone(), retained_path_for(&original))
         });
-        if keep_tmp_requested() {
-            let _ = std::fs::remove_dir_all(&original);
-        }
+    }
+
+    /// A synthetic `agent.getConversation` page whose `user` row carries the
+    /// given `author`; the assistant row has none (as served).
+    fn conversation_page(author: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "agentId": "agent-1",
+            "messages": [
+                {
+                    "id": "user-msg-1",
+                    "agentId": "agent-1",
+                    "seq": 1,
+                    "role": "user",
+                    "contentBlocks": [{ "id": "user-msg-1:0", "type": "text", "text": "hello" }],
+                    "author": author,
+                    "timestamp": "2026-09-22T00:00:00Z",
+                },
+                {
+                    "id": "asst-msg-1",
+                    "agentId": "agent-1",
+                    "seq": 2,
+                    "role": "assistant",
+                    "contentBlocks": [{ "id": "blk-1", "type": "text", "text": "hi" }],
+                    "timestamp": "2026-09-22T00:00:01Z",
+                },
+            ],
+            "truncated": false,
+            "totalMessages": 2,
+            "nextToken": null,
+            "turnInFlight": false,
+            "lastStreamActivityAt": null,
+        })
+    }
+
+    #[test]
+    fn conversation_fingerprint_ignores_author_hydration() {
+        let before = conversation_page(&serde_json::json!({
+            "principalId": "prin-1",
+            "login": null,
+            "displayName": null,
+            "avatarUrl": null,
+        }));
+        let after = conversation_page(&serde_json::json!({
+            "principalId": "prin-1",
+            "login": "octocat",
+            "displayName": "The Octocat",
+            "avatarUrl": "https://avatars.example/octocat",
+        }));
+        assert_ne!(before, after, "the raw payloads differ in author");
+        let (fp_before, fp_after) = (
+            conversation_fingerprint(&before),
+            conversation_fingerprint(&after),
+        );
+        assert_eq!(
+            fp_before,
+            fp_after,
+            "author hydration must not change the fingerprint:\n{}",
+            fingerprint_diff(&fp_before, &fp_after)
+        );
+        assert!(fingerprint_diff(&fp_before, &fp_after).is_empty());
         assert!(
-            !retained.exists(),
-            "retention is scoped to the panicking thread"
+            fp_before
+                .iter()
+                .all(|row| row.get("author").is_none() && row.get("agentId").is_none()),
+            "fingerprint rows carry only identity fields: {fp_before:?}"
+        );
+    }
+
+    #[test]
+    fn conversation_fingerprint_detects_appended_message() {
+        let before = conversation_page(&serde_json::Value::Null);
+        let mut after = before.clone();
+        after["messages"]
+            .as_array_mut()
+            .expect("messages")
+            .push(serde_json::json!({
+                "id": "user-msg-2",
+                "agentId": "agent-1",
+                "seq": 3,
+                "role": "user",
+                "contentBlocks": [{ "id": "user-msg-2:0", "type": "text", "text": "wake" }],
+                "timestamp": "2026-09-22T00:00:02Z",
+            }));
+        after["totalMessages"] = serde_json::json!(3);
+        let (fp_before, fp_after) = (
+            conversation_fingerprint(&before),
+            conversation_fingerprint(&after),
+        );
+        assert_ne!(
+            fp_before, fp_after,
+            "an appended row must change the fingerprint"
+        );
+        let diff = fingerprint_diff(&fp_before, &fp_after);
+        assert!(
+            diff.starts_with("row 2 added: ") && diff.contains("user-msg-2"),
+            "diff names the appended row: {diff}"
+        );
+    }
+
+    #[test]
+    fn conversation_fingerprint_detects_changed_content_blocks() {
+        let before = conversation_page(&serde_json::Value::Null);
+        let mut after = before.clone();
+        after["messages"][1]["contentBlocks"] =
+            serde_json::json!([{ "id": "blk-1", "type": "text", "text": "edited" }]);
+        let (fp_before, fp_after) = (
+            conversation_fingerprint(&before),
+            conversation_fingerprint(&after),
+        );
+        assert_ne!(
+            fp_before, fp_after,
+            "changed contentBlocks under the same ids must change the fingerprint"
+        );
+        let diff = fingerprint_diff(&fp_before, &fp_after);
+        assert!(
+            diff.starts_with("row 1 changed:") && diff.contains("edited"),
+            "diff names the changed row: {diff}"
+        );
+        assert!(
+            !diff.contains("row 0"),
+            "unchanged rows are not listed: {diff}"
         );
     }
 }

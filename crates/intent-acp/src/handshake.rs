@@ -2,22 +2,25 @@
 //! (§6.4).
 //!
 //! `initialize` negotiates protocol version 1 and advertises the client
-//! capabilities `{ fs: { readTextFile, writeTextFile }, terminal: true }`.
+//! filesystem, terminal, and structured session-notice capabilities.
 //! `authenticate` is sent only when the provider implements it; on failure the
 //! provider's auth-error patterns are matched against the error text and
 //! captured stderr, surfacing a provider-specific login hint. `set_session_mode`
 //! is session-scoped and exposed here for M3.4 (it is not part of the initial
 //! connection handshake, which runs before any session exists).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
-    AuthMethodId, AuthenticateRequest, ClientCapabilities, FileSystemCapabilities, Implementation,
-    InitializeRequest, InitializeResponse, SessionModeState, SetSessionModeRequest,
+    AuthMethodId, AuthenticateRequest, ClientCapabilities, ClientSessionCapabilities,
+    FileSystemCapabilities, Implementation, InitializeRequest, InitializeResponse,
+    NoticeCapabilities, SessionModeState, SetSessionModeRequest,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use intent_providers::{auth_error_message, is_provider_authentication_error, ProviderConfig};
 
+use crate::callback_registration::{CallbackClient, CallbackHandshake, CallbackOffer, META_KEY};
 use crate::error::{AcpError, AcpResult};
 use crate::transport::Connection;
 
@@ -89,23 +92,55 @@ pub async fn handshake(conn: &Connection, provider: &ProviderConfig) -> AcpResul
     })
 }
 
+/// Run the ordinary handshake with an explicit optional callback offer.
+///
+/// # Errors
+/// Propagates the unchanged initialization and authentication errors.
+pub async fn handshake_with_callbacks(
+    conn: Arc<Connection>,
+    provider: &ProviderConfig,
+    offer: CallbackOffer,
+) -> AcpResult<CallbackHandshake> {
+    let initialize = initialize_with_offer(&conn, offer).await?;
+    let authenticated = authenticate(&conn, provider).await?;
+    let callbacks = CallbackClient::negotiated(conn, offer, initialize.meta.as_ref());
+    Ok(CallbackHandshake {
+        ordinary: HandshakeResult {
+            initialize,
+            authenticated,
+        },
+        callbacks,
+    })
+}
+
 /// Send `initialize`, advertising client capabilities and client info (§6.4.1).
 ///
 /// # Errors
 ///
 /// Returns [`AcpError::Protocol`] if the response does not deserialize; otherwise propagates the transport/RPC error from the request.
 pub async fn initialize(conn: &Connection) -> AcpResult<InitializeResponse> {
+    initialize_with_offer(conn, CallbackOffer::Disabled).await
+}
+
+async fn initialize_with_offer(
+    conn: &Connection,
+    offer: CallbackOffer,
+) -> AcpResult<InitializeResponse> {
     let request = InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(
             ClientCapabilities::new()
                 .fs(FileSystemCapabilities::new()
                     .read_text_file(true)
                     .write_text_file(true))
-                .terminal(true),
+                .terminal(true)
+                .session(ClientSessionCapabilities::new().notices(NoticeCapabilities::new())),
         )
         .client_info(Implementation::new(CLIENT_NAME, env!("CARGO_PKG_VERSION")));
 
-    let params = serde_json::to_value(&request)?;
+    let mut params = serde_json::to_value(&request)?;
+    if offer == CallbackOffer::V1 {
+        params["clientCapabilities"]["_meta"] = serde_json::json!({META_KEY: {"version": 1}});
+    }
     let result = conn
         .request_timeout("initialize", params, initialize_timeout())
         .await?;

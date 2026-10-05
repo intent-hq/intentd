@@ -95,6 +95,16 @@ pub struct PullRequestInfo {
     pub mergeable_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_draft: Option<bool>,
+    /// The PR sits in the host's merge queue (GitHub GraphQL
+    /// `isInMergeQueue`). Presence-detected: `Some(true)` exactly when a
+    /// signal-bearing read (the `github.pulls.get` fold, §5.27) reported the
+    /// PR queued, `None` otherwise — a REST read carries no queue signal (a
+    /// queued PR reads `mergeable_state: "clean"`), so the REST-only refresh
+    /// paths inherit a persisted `Some(true)` instead of erasing it
+    /// (`pr_ops::carry_merge_queue_signal`). Rows persisted before the field
+    /// existed read `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_in_merge_queue: Option<bool>,
 }
 
 impl PullRequestInfo {
@@ -103,9 +113,10 @@ impl PullRequestInfo {
     /// [`Workspace::slim_for_list`]. The list-context readers (sidebar PR
     /// dropdown, card status, delete warning) need `number` / `url` /
     /// `title` / `status` / `isDraft` plus the timestamps used for ordering,
-    /// and `mergeable` / `mergeableState` — the FE derives the PR lifecycle
-    /// display status from them on list rows, so both stay. `headSha` and
-    /// `author` feed hover tooltips only, so they are `workspace.get`-only.
+    /// and `mergeable` / `mergeableState` / `isInMergeQueue` — the FE derives
+    /// the PR lifecycle display status from them on list rows, so all three
+    /// stay. `headSha` and `author` feed hover tooltips only, so they are
+    /// `workspace.get`-only.
     pub fn slim_for_list(&mut self) {
         self.head_sha = None;
         self.author = None;
@@ -143,7 +154,7 @@ pub enum ContextLinkKind {
     Pr,
 }
 
-/// A GitHub issue/PR context link persisted on a [`Workspace`] as
+/// A repository issue/PR context link persisted on a [`Workspace`] as
 /// `contextLinks` (§5.1). Supplied by clients on `workspace.create` from the
 /// initializer's issue/PR context mentions and returned on the `Workspace`
 /// wire shape so any client opening the workspace can seed its layout from
@@ -250,6 +261,11 @@ pub struct Workspace {
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
+    /// Persisted high-water mark of recorded user/assistant message timestamps
+    /// and note update timestamps. Excludes metadata/usage maintenance. Historical
+    /// backfill uses retained content only; absent when no valid content exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_content_activity: Option<String>,
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -398,6 +414,10 @@ pub struct Workspace {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceMembership {
+    /// Effective management authority for the current caller. Host members
+    /// inherit this on ordinary workspaces without becoming their owner.
+    #[serde(default)]
+    pub can_manage: bool,
     /// The workspace's owner; `None` only for a row whose principal columns
     /// were nulled by transfer import and not yet re-derived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -477,9 +497,9 @@ pub const WORKSPACE_LIST_PR_CAP: usize = 5;
 /// `diskUsage`) are deliberately absent; `pullRequestsTotal` is the one
 /// list-only key (set by the [`WORKSPACE_LIST_PR_CAP`] truncation, never on
 /// `workspace.get`). The flattened [`WorkspaceMembership`] keys
-/// (`ownerPrincipalId`, `myRole`, `memberCount`, `openInviteCount`) are
-/// list-relevant (role badge / member count in the sidebar), small, and
-/// rung 1: one bulk membership query per list, persisted counts. Adding a
+/// (`ownerPrincipalId`, `myRole`, `canManage`, `memberCount`, `openInviteCount`)
+/// are list-relevant (role badge, management actions and member count), small,
+/// and rung 1: persisted authority projected in one bulk membership query. Adding a
 /// key here is a
 /// wire-contract change — update `docs/protocol/methods/workspace.md` in
 /// the same commit and state which rung of the derived-field ladder the
@@ -527,6 +547,7 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "pendingDeleteAt",
     "ownerPrincipalId",
     "myRole",
+    "canManage",
     "memberCount",
     "openInviteCount",
 ];
@@ -727,7 +748,7 @@ pub const CHIEF_WORKSPACE_TIMESTAMP: &str = "2026-01-01T00:00:00.000Z";
 pub fn chief_workspace() -> Workspace {
     Workspace {
         id: WorkspaceId::chief(),
-        title: "Chief of Staff".to_string(),
+        title: "Assistant".to_string(),
         branch: String::new(),
         base_ref: None,
         base_commit_sha: None,
@@ -739,6 +760,7 @@ pub fn chief_workspace() -> Workspace {
         created_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
         updated_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
         last_activity: Some(CHIEF_WORKSPACE_TIMESTAMP.to_string()),
+        last_content_activity: None,
         tags: Vec::new(),
         path: None,
         repository_path: None,
@@ -913,7 +935,23 @@ pub struct TokenUsage {
     pub by_agent_id: BTreeMap<String, TokenUsageTotals>,
     pub totals: TokenUsageTotals,
     pub by_model: BTreeMap<String, TokenUsageTotals>,
+    /// Sparse, deterministic agent × model projection. `None` means the
+    /// persisted snapshot predates this additive field; new materializations
+    /// always write `Some`, including `Some([])` for an empty workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_agent_model: Option<Vec<TokenUsageCrossFilterRow>>,
     pub last_scan_at: Option<String>,
+}
+
+/// One sparse cell in [`TokenUsage::by_agent_model`] (PROTOCOL §5.23).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageCrossFilterRow {
+    pub agent_id: String,
+    pub model: String,
+    pub totals: TokenUsageTotals,
+    pub human_messages: u64,
+    pub agent_messages: u64,
 }
 
 /// Coarse project classification for worktree setup (PROTOCOL §5.25), detected
@@ -952,6 +990,65 @@ pub struct SetupScript {
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_by: Option<SetupScriptGeneratedBy>,
+}
+
+/// Lifecycle state of a workspace's setup stage (§6.5 `workspace:setup:*`),
+/// as tracked in the daemon's in-memory per-workspace map and surfaced to
+/// agents through `ws.workspace.details().setupStatus`. Never persisted: a
+/// workspace with no record (created before the daemon booted) reads
+/// [`Unknown`](Self::Unknown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceSetupState {
+    /// The worktree exists; the effective setup script is not yet resolved.
+    Pending,
+    /// A setup script was resolved and its terminal spawned.
+    Running,
+    /// The script exited `0`.
+    Completed,
+    /// The script exited non-zero, or failed before/at spawn (no exit code).
+    Failed,
+    /// No effective script (or no worktree): the stage never ran.
+    Skipped,
+    /// No record for this workspace in the current daemon lifetime.
+    Unknown,
+}
+
+/// Snapshot of a workspace's setup stage: the [`WorkspaceSetupState`] plus
+/// the details known at that point. Optional fields are omitted (never
+/// `null`) when not applicable to the state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSetupStatus {
+    pub state: WorkspaceSetupState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+}
+
+impl WorkspaceSetupStatus {
+    /// The bare status for `state` with every optional detail omitted.
+    #[must_use]
+    pub fn new(state: WorkspaceSetupState) -> Self {
+        Self {
+            state,
+            exit_code: None,
+            terminal_id: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    /// The status of a workspace with no record: `state: "unknown"`.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::new(WorkspaceSetupState::Unknown)
+    }
 }
 
 /// Script mode for repo scripts (service = long-running, command = run-once).
@@ -1209,6 +1306,9 @@ pub struct WorkspaceDiffSummary {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceCreate {
+    /// Original native pre-workspace checkout selection. Mutually exclusive
+    /// with caller-supplied repository/clone/worktree paths and legacy URLs.
+    pub repository_checkout: Option<crate::repository_checkout::CheckoutSelection>,
     pub title: Option<String>,
     pub status_message: Option<String>,
     pub branch: Option<String>,
@@ -1274,11 +1374,18 @@ pub struct WorkspaceCreate {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceCreateInitialAgent {
+    /// Opt in to remembering a successful manual initial-agent selection.
+    pub remember_specialist: Option<bool>,
+    /// False marks a client-supplied name as a generated placeholder.
+    pub name_explicitly_set: Option<bool>,
     pub prompt: Option<String>,
     pub name: Option<String>,
     /// Bare model id (no `provider:` prefix — compound ids are rejected
     /// `-32602` at the wire boundary, PROTOCOL §5.5); pair with `provider`.
     pub model: Option<String>,
+    /// Creation-time effort, with the same resolution as `agent.create`.
+    /// A present blank string clears effort instead of inheriting defaults.
+    pub reasoning_effort: Option<String>,
     pub specialist: Option<String>,
     pub provider: Option<String>,
     pub behavior_prompt: Option<String>,
@@ -1600,6 +1707,10 @@ pub struct Comment {
     pub content: String,
     pub author: String,
     pub author_type: AuthorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_principal_id: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_identity: Option<PrincipalIdentity>,
     pub status: CommentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
@@ -1875,6 +1986,11 @@ pub struct NoteUpdateMetadataResult {
     pub skipped: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The note's `rev` after the write: the base a follow-up conditional
+    /// write should send as `expectedVersion`. Absent on the `skipped` arm,
+    /// which writes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<i64>,
 }
 
 /// Result of `note.delete`.
@@ -2302,6 +2418,10 @@ pub struct CommentWire {
     pub content: String,
     pub author: String,
     pub author_type: AuthorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_principal_id: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_identity: Option<PrincipalIdentity>,
     pub status: CommentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
@@ -2350,6 +2470,8 @@ impl CommentWire {
             content: c.content.clone(),
             author: c.author.clone(),
             author_type: c.author_type,
+            author_principal_id: c.author_principal_id.clone(),
+            author_identity: c.author_identity.clone(),
             status: c.status,
             parent_id: c.parent_id.clone(),
             anchor: c.anchor.clone(),
@@ -2401,6 +2523,10 @@ pub struct CommentThreadSummary {
     pub last_activity: String,
     pub latest_comment_author: String,
     pub latest_comment_author_type: AuthorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_comment_author_principal_id: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_comment_author_identity: Option<PrincipalIdentity>,
     pub latest_comment_at: String,
     pub comment_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2644,6 +2770,44 @@ pub enum AgentStatus {
     Completed,
     #[serde(rename = "Processing")]
     Processing,
+}
+
+impl AgentStatus {
+    /// Every variant in declaration order — the enumeration behind the
+    /// running-turn golden and the store's SQL status lists. Completeness is
+    /// pinned against serde's derived variant inventory
+    /// (`agent_status_all_matches_serde_variant_inventory`), so a variant
+    /// added to the enum but not here fails the suite.
+    pub const ALL: [Self; 9] = [
+        Self::Pending,
+        Self::Active,
+        Self::RuntimeIdle,
+        Self::Error,
+        Self::Deleted,
+        Self::Idle,
+        Self::Waiting,
+        Self::Completed,
+        Self::Processing,
+    ];
+
+    /// Whether a session persisted in this status is running a turn: `pending`,
+    /// `active`, or the legacy capitalized `Processing`. The single definition
+    /// of the rule behind the §5.5 retire guard, the §5.19 agent-lock liveness
+    /// test, the transfer export "agents-running" warning, and the
+    /// `delegatedCounts.running` SQL aggregate on `agent.list`. Exhaustive so a
+    /// new variant fails to compile until it is classified.
+    #[must_use]
+    pub const fn is_running_turn(self) -> bool {
+        match self {
+            Self::Pending | Self::Active | Self::Processing => true,
+            Self::RuntimeIdle
+            | Self::Error
+            | Self::Deleted
+            | Self::Idle
+            | Self::Waiting
+            | Self::Completed => false,
+        }
+    }
 }
 
 /// Per-session credit/message/tool stats (§9.1 / §19.2). A derived snapshot
@@ -3007,8 +3171,14 @@ pub enum AgentListRowScope {
     /// lists by default.
     TopLevel,
     /// `parent_agent_id IS NOT NULL`, optionally narrowed to one parent's
-    /// direct sub-agents (`parent_agent_id = ?`).
-    Delegated { parent_agent_id: Option<AgentId> },
+    /// direct sub-agents (`parent_agent_id = ?`) OR — `orphaned_only` — to
+    /// the workspace's orphaned delegated rows (the rows
+    /// [`AgentDelegatedCounts::orphaned`] counts). The two sub-filters are
+    /// mutually exclusive; the router rejects the pair with `-32602`.
+    Delegated {
+        parent_agent_id: Option<AgentId>,
+        orphaned_only: bool,
+    },
     /// `parent_agent_id IS NULL AND is_background <> 0` — unparented
     /// background agents.
     Background,
@@ -3051,6 +3221,22 @@ pub struct AgentParentDelegatedCounts {
     pub running: u64,
 }
 
+/// The **orphaned** subset of [`AgentDelegatedCounts`] (§5.5, within 10.6):
+/// non-retired sessions with `parent_agent_id` set whose parent is NOT a
+/// non-retired `agent_session` row of the same workspace (parent deleted,
+/// soft-retired, or absent). Orphan-hood is decided by the DIRECT parent's
+/// liveness only — a child of a live standalone background parent is not
+/// an orphan, and neither is a child of an orphan. `running` follows the
+/// same `is_running_turn` rule as `byParent[*].running`. Always present:
+/// `{ total: 0, running: 0 }` when the workspace has no orphaned delegated
+/// session. Invariant: `total ≤ scopeCounts.delegated`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentOrphanedDelegatedCounts {
+    pub total: u64,
+    pub running: u64,
+}
+
 /// The always-present `delegatedCounts` field on every `agent.list`
 /// response variant (§5.5): the workspace's non-retired delegated sessions
 /// (the `delegated` bin, `parent_agent_id IS NOT NULL`) counted per DIRECT
@@ -3063,13 +3249,17 @@ pub struct AgentParentDelegatedCounts {
 /// delegated sessions), and its keys are the raw `parent_agent_id` values,
 /// so a key may name a parent outside this workspace (cross-workspace
 /// delegation). Invariant: `Σ byParent[*].total == scopeCounts.delegated`.
+/// `orphaned` is the always-present orphaned sub-aggregate of the same row
+/// set ([`AgentOrphanedDelegatedCounts`]), served from the same statement.
 /// Like [`AgentScopeCounts`], the counts stay workspace-wide even when the
-/// rows read was narrowed by `scope` or `parentAgentId`.
+/// rows read was narrowed by `scope`, `parentAgentId` or `orphanedOnly`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDelegatedCounts {
     pub running: u64,
     pub by_parent: BTreeMap<AgentId, AgentParentDelegatedCounts>,
+    #[serde(default)]
+    pub orphaned: AgentOrphanedDelegatedCounts,
 }
 
 /// Per-field byte budget for `agent.list` row previews (list-payload cost
@@ -3334,6 +3524,7 @@ pub const AGENT_LIST_ROW_METADATA_KEYS: &[&str] = &[
     "lastSeenMessageId",
     "isInitialAgent",
     "sponsorAgentId",
+    "chiefPromptVersion",
 ];
 
 /// Serialized-size attribution of one JSON object for list-row budget
@@ -3461,11 +3652,11 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// (`agent.create` and everything funneling through it — delegate,
 /// wakeOrCreate) stamps exactly this value, and a new session ALWAYS gets the
 /// current version — the stamp depends only on creation time, never on the
-/// creating parent's pinned version. Bump when doctrine text or feature
-/// defaults change materially; existing sessions keep their stamped version
+/// creating parent's pinned version. Bump when versioned guidance behavior,
+/// doctrine text or feature defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "2.6";
+pub const CURRENT_HARNESS_VERSION: &str = "3.0";
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
 /// exported before harness versioning existed deserialize as "1.0", matching
@@ -3560,6 +3751,19 @@ pub(crate) const IS_INITIAL_AGENT_KEY: &str = "isInitialAgent";
 /// [`AgentSession::sponsor_agent_id`].
 pub(crate) const SPONSOR_AGENT_ID_KEY: &str = "sponsorAgentId";
 
+/// Client-supplied version of the Assistant prompt frozen at creation.
+/// Never inferred from specialist identity or creation time.
+pub const CHIEF_PROMPT_VERSION_KEY: &str = "chiefPromptVersion";
+
+/// Read a positive JSON integer version; malformed legacy values fail closed.
+pub fn chief_prompt_version(metadata: &serde_json::Value) -> Option<u32> {
+    metadata
+        .get(CHIEF_PROMPT_VERSION_KEY)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
+}
+
 /// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5).
 /// `User` marks the explicit user-action front doors — the FE
 /// `agent.sendMessage` RPC, a user-typed `agent.queueMessage` entry (the
@@ -3575,7 +3779,8 @@ pub(crate) const SPONSOR_AGENT_ID_KEY: &str = "sponsorAgentId";
 /// an answer-tagged row, `agent.dismissQuestions`, or a newer question turn,
 /// never by delivery order. `Automatic` is the `Default` so unmarked internal
 /// paths fail closed (never mistaken for a user action).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MessageOrigin {
     /// FE-originated user action: `agent.sendMessage` (typed message or
     /// wizard answers), a drained `agent.queueMessage` entry,
@@ -4065,6 +4270,10 @@ pub struct AgentMetadata {
     /// [`IS_INITIAL_AGENT_KEY`]); omitted for non-peer agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sponsor_agent_id: Option<String>,
+    /// Explicit creation-time Assistant prompt version. Missing/invalid legacy
+    /// markers are omitted; prompt or specialist changes invalidate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chief_prompt_version: Option<u32>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -4158,6 +4367,8 @@ pub struct AgentLite {
     /// the service projection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting_on_pr_monitors: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_on_script_monitors: Vec<serde_json::Value>,
     /// Turn-liveness (STAB-125): `turnInFlight` is `true` while a
     /// `session/prompt` turn's live-turn slot is open for this agent, and
     /// `lastStreamActivityAt` is the RFC-3339 timestamp of the most recent
@@ -4304,6 +4515,7 @@ impl AgentLite {
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
         let is_initial_agent = session.is_initial_agent().then_some(true);
         let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
+        let chief_prompt_version = session.metadata.as_ref().and_then(chief_prompt_version);
         let metadata = AgentMetadata {
             is_background: session.is_background,
             specialist: session.specialist,
@@ -4325,6 +4537,7 @@ impl AgentLite {
             last_seen_message_id,
             is_initial_agent,
             sponsor_agent_id,
+            chief_prompt_version,
         };
         Self {
             id: session.id,
@@ -4348,6 +4561,7 @@ impl AgentLite {
             waiting_for_agent_ids: Vec::new(),
             waiting_on_hooks: Vec::new(),
             waiting_on_pr_monitors: Vec::new(),
+            waiting_on_script_monitors: Vec::new(),
             turn_in_flight: false,
             last_stream_activity_at: None,
             context_usage: None,
@@ -4539,6 +4753,8 @@ impl AgentLite {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentCreateExtra {
+    /// Opt in to remembering this successful manual creation’s specialist.
+    pub remember_specialist: bool,
     pub provider: Option<String>,
     /// Reasoning-effort level persisted on the created session (PROTOCOL
     /// §5.5, Option B). Stored as-is when a non-empty string; empty /
@@ -4864,16 +5080,6 @@ pub struct GitPullResult {
     pub error: Option<String>,
 }
 
-/// `git.commit` service result (the `ok` flag is added by the transport). Mirrors
-/// the TS `ws.git.commit` payload `{ hash?, files? }`; on success both are
-/// present (`hash` is the new commit SHA, `files` the files it changed).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GitCommitResult {
-    pub hash: String,
-    pub files: Vec<String>,
-}
-
 /// `git.agentCommit` service result (the `ok` flag is added by the transport).
 /// Mirrors the TS `ws.git.agentCommit` payload `{ hash, files, fileCount }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4910,6 +5116,51 @@ pub enum ScriptMode {
     Command,
 }
 
+/// Explicit retention choice; legacy definitions remain saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScriptPurpose {
+    #[default]
+    Saved,
+    OneOff,
+}
+
+/// Archive selection. Omitted wire filters preserve legacy lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptArchiveFilter {
+    Active,
+    Archived,
+    #[default]
+    All,
+}
+
+/// Latest settled command outcome, independent of transient runtime state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptRunOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+/// Compact durable result; full PTY output remains transient.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptLastRun {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub outcome: ScriptRunOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    pub stopped_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Runtime status of a script process (ported from the TS `ScriptStatus`,
 /// plus `restarting` — new in intentd, monorepo#1318 — and `starting` —
 /// intent-hq/intent#4858). `restarting` covers the restart-in-flight window
@@ -4937,6 +5188,8 @@ pub enum ScriptStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScriptRuntimeState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub status: ScriptStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
@@ -4964,6 +5217,7 @@ impl Default for ScriptRuntimeState {
     fn default() -> Self {
         Self {
             status: ScriptStatus::Idle,
+            run_id: None,
             pid: None,
             exit_code: None,
             started_at: None,
@@ -4981,6 +5235,12 @@ impl Default for ScriptRuntimeState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Script {
+    #[serde(default)]
+    pub purpose: ScriptPurpose,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<ScriptLastRun>,
     pub id: String,
     pub workspace_id: String,
     pub name: String,
@@ -5004,6 +5264,7 @@ pub struct Script {
 /// request params. `workspaceId` is passed separately.
 #[derive(Debug, Clone, Default)]
 pub struct ScriptCreateParams {
+    pub purpose: Option<ScriptPurpose>,
     pub name: String,
     pub command: String,
     pub mode: ScriptMode,
@@ -5281,16 +5542,121 @@ impl WorkspaceGitRoot {
     }
 }
 
-/// A person known to the daemon (multiplayer w1). Principals are GitHub
-/// identities: `github_user_id` is the stable GitHub account id once linked
-/// (`None` for the primary principal until the auth flow links it), and
-/// `login` / `display_name` / `avatar_url` are cached profile fields refreshed
-/// on each link. Exactly one principal per daemon is `is_primary` — the
-/// daemon's original single user, minted by migration `0125_principals`.
+/// The provider-neutral identity key of a principal (migration
+/// `0130_principal_identity`): which forge (`provider`, e.g. `github` /
+/// `gitlab`), which instance of it (`host`, e.g. `github.com` or a
+/// self-hosted GitLab host) and the account's stable id there
+/// (`external_user_id`, the provider's numeric id as text). Two accounts
+/// with the same numeric id on different providers or hosts are different
+/// principals. Stored and compared verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrincipalIdentity {
+    pub provider: String,
+    pub host: String,
+    pub external_user_id: String,
+}
+
+impl PrincipalIdentity {
+    /// The `provider` of every github.com account.
+    pub const GITHUB_PROVIDER: &'static str = "github";
+    /// The `host` of every github.com account.
+    pub const GITHUB_HOST: &'static str = "github.com";
+
+    /// The identity of a github.com account by its numeric user id — the
+    /// triple migration `0130` backfills from `github_user_id`.
+    #[must_use]
+    pub fn github(github_user_id: i64) -> Self {
+        Self {
+            provider: Self::GITHUB_PROVIDER.to_string(),
+            host: Self::GITHUB_HOST.to_string(),
+            external_user_id: github_user_id.to_string(),
+        }
+    }
+
+    /// The numeric GitHub user id when this is a github.com identity; `None`
+    /// for every other provider / host.
+    #[must_use]
+    pub fn github_user_id(&self) -> Option<i64> {
+        (self.provider == Self::GITHUB_PROVIDER && self.host == Self::GITHUB_HOST)
+            .then(|| self.external_user_id.parse().ok())
+            .flatten()
+    }
+
+    /// Whether this identity lives on the forge `(provider, host)` — the
+    /// account itself aside.
+    #[must_use]
+    pub fn is_on(&self, provider: &str, host: &str) -> bool {
+        self.provider == provider && self.host == host
+    }
+}
+
+/// The account a `workspace.invite.create` pins its invite to, as the wire
+/// names it (protocol 10.8): `login` on the forge `provider` / `host`, both
+/// optional and defaulting to the inviting principal's own identity forge
+/// (`provider` is `"github"` | `"gitlab"`; `host` is gitlab-only, the bound
+/// instance when omitted).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InvitePin {
+    pub login: String,
+    pub provider: Option<String>,
+    pub host: Option<String>,
+}
+
+impl InvitePin {
+    /// A pin by `login` alone: the forge defaults to the inviter's.
+    #[must_use]
+    pub fn login(login: impl Into<String>) -> Self {
+        Self {
+            login: login.into(),
+            provider: None,
+            host: None,
+        }
+    }
+}
+
+/// What a first-time guest names on `invite.prove` (protocol 10.8): the
+/// proof it published (`proof_id` — a gist id on GitHub, a snippet id on
+/// GitLab; the wire spells it `proofId`, or `gistId` for a GitHub proof),
+/// the `login` it claims, and the forge the proof lives on (an omitted
+/// `provider` is `"github"` — never inferred from the invite's pin; `host`
+/// is gitlab-only and defaults to the pin host only when the pin's provider
+/// equals the chosen provider, else the bound instance).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteProofClaim {
+    pub proof_id: String,
+    pub login: String,
+    pub provider: Option<String>,
+    pub host: Option<String>,
+}
+
+impl InviteProofClaim {
+    /// A pre-10.8 claim: a GitHub gist `gist_id` owned by `login`.
+    #[must_use]
+    pub fn github(gist_id: impl Into<String>, login: impl Into<String>) -> Self {
+        Self {
+            proof_id: gist_id.into(),
+            login: login.into(),
+            provider: Some(PrincipalIdentity::GITHUB_PROVIDER.to_string()),
+            host: None,
+        }
+    }
+}
+
+/// A person known to the daemon (multiplayer w1). A principal is keyed by
+/// its provider-neutral [`PrincipalIdentity`] once linked (`None` for the
+/// primary principal until the auth flow links it); `github_user_id` is the
+/// legacy github.com projection of that key, kept populated for github
+/// principals (dual-write) and `None` for every other provider. `login` /
+/// `display_name` / `avatar_url` are cached profile fields refreshed on each
+/// link. Exactly one principal per daemon is `is_primary` — the daemon's
+/// original single user, minted by migration `0125_principals`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Principal {
     pub id: PrincipalId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<PrincipalIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_user_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5302,6 +5668,34 @@ pub struct Principal {
     pub is_primary: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl Principal {
+    /// The identity key this row resolves by: the stored `identity`, or —
+    /// for a row written before the triple existed (or a caller that only
+    /// set the legacy field) — the github.com triple of `github_user_id`.
+    #[must_use]
+    pub fn identity_key(&self) -> Option<PrincipalIdentity> {
+        self.identity
+            .clone()
+            .or_else(|| self.github_user_id.map(PrincipalIdentity::github))
+    }
+
+    /// Link (or unlink, with `None`) a github.com account: sets the identity
+    /// triple and its legacy `github_user_id` projection together, so the two
+    /// never disagree.
+    pub fn set_github_user_id(&mut self, github_user_id: Option<i64>) {
+        self.github_user_id = github_user_id;
+        self.identity = github_user_id.map(PrincipalIdentity::github);
+    }
+
+    /// Link any forge account: sets the identity triple and derives the
+    /// legacy `github_user_id` projection from it (`None` for every
+    /// non-github.com identity), so the two never disagree.
+    pub fn set_identity(&mut self, identity: PrincipalIdentity) {
+        self.github_user_id = identity.github_user_id();
+        self.identity = Some(identity);
+    }
 }
 
 /// A principal's role within a workspace. Wire/DB words are the lowercase
@@ -5386,6 +5780,11 @@ pub struct WorkspaceInvite {
     #[serde(default, skip_serializing)]
     pub secret: Option<String>,
     pub created_by_principal_id: PrincipalId,
+    /// The account the invite is pinned to, as the provider-neutral triple
+    /// (migration `0130`); `pin_github_user_id` is its legacy github.com
+    /// projection, kept populated for a github pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_identity: Option<PrincipalIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_github_user_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5404,11 +5803,21 @@ pub struct WorkspaceInvite {
 }
 
 impl WorkspaceInvite {
+    /// The identity the invite is pinned to: the stored `pin_identity`, or
+    /// the github.com triple of a legacy `pin_github_user_id`; `None` when
+    /// unpinned.
+    #[must_use]
+    pub fn pin_identity_key(&self) -> Option<PrincipalIdentity> {
+        self.pin_identity
+            .clone()
+            .or_else(|| self.pin_github_user_id.map(PrincipalIdentity::github))
+    }
+
     /// Whether the invite stays open across redemptions: `true` when
-    /// unpinned, `false` when pinned to one GitHub account (single-use).
+    /// unpinned, `false` when pinned to one account (single-use).
     #[must_use]
     pub fn is_reusable(&self) -> bool {
-        self.pin_github_user_id.is_none()
+        self.pin_identity.is_none() && self.pin_github_user_id.is_none()
     }
 
     /// Whether the invite can still be redeemed at `now` (ISO-8601 UTC,
@@ -5933,6 +6342,7 @@ mod tests {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         }
     }
 
@@ -6597,6 +7007,8 @@ mod tests {
             content: "hello".to_string(),
             author: "Agent".to_string(),
             author_type: AuthorType::Agent,
+            author_principal_id: None,
+            author_identity: None,
             status: CommentStatus::Open,
             parent_id: None,
             anchor: Some(CommentAnchor {
@@ -6650,6 +7062,8 @@ mod tests {
             content: "try this".to_string(),
             author: "Agent".to_string(),
             author_type: AuthorType::Agent,
+            author_principal_id: None,
+            author_identity: None,
             status: CommentStatus::Open,
             parent_id: Some("c1".to_string()),
             anchor: None,
@@ -6751,6 +7165,80 @@ mod tests {
         }
     }
 
+    /// Golden for the running-turn rule (PROTOCOL §5.5 `agent.list`
+    /// `delegatedCounts` "running rule"): exactly `pending`, `active` and the
+    /// legacy capitalized `Processing` count as running, keyed by the persisted
+    /// wire name so the docs prose has one authoritative counterpart.
+    /// `AgentStatus::ALL` must enumerate every variant exactly once.
+    #[test]
+    fn agent_status_running_turn_golden() {
+        let expected = [
+            ("pending", true),
+            ("active", true),
+            ("idle", false),
+            ("error", false),
+            ("deleted", false),
+            ("Idle", false),
+            ("Waiting", false),
+            ("Completed", false),
+            ("Processing", true),
+        ];
+        assert_eq!(AgentStatus::ALL.len(), expected.len());
+        for (status, (wire, running)) in AgentStatus::ALL.into_iter().zip(expected) {
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{wire}\""),
+                "ALL order must match the golden"
+            );
+            assert_eq!(
+                status.is_running_turn(),
+                running,
+                "running-turn classification of {wire}"
+            );
+        }
+        assert_eq!(
+            AgentStatus::ALL
+                .iter()
+                .filter(|s| s.is_running_turn())
+                .map(|s| serde_json::to_value(s).unwrap())
+                .collect::<Vec<_>>(),
+            vec![json!("pending"), json!("active"), json!("Processing")]
+        );
+    }
+
+    /// `AgentStatus::ALL` is complete: serde's derive generates the variant
+    /// inventory from the enum itself and lists it in the unknown-variant
+    /// error ("expected one of `a`, `b`, …"), so a variant added to the
+    /// enum — and classified in the exhaustive `is_running_turn` match — but
+    /// left out of `ALL` fails here instead of silently dropping out of the
+    /// store's generated SQL status list.
+    #[test]
+    fn agent_status_all_matches_serde_variant_inventory() {
+        let err = serde_json::from_str::<AgentStatus>("\"__not_a_status__\"")
+            .unwrap_err()
+            .to_string();
+        let (_, listed) = err
+            .split_once("expected one of ")
+            .unwrap_or_else(|| panic!("serde unknown-variant error shape changed: {err}"));
+        let mut inventory: Vec<&str> = listed.split('`').skip(1).step_by(2).collect();
+        inventory.sort_unstable();
+        let mut all: Vec<String> = AgentStatus::ALL
+            .iter()
+            .map(|s| {
+                serde_json::to_value(s)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        all.sort_unstable();
+        assert_eq!(
+            all, inventory,
+            "AgentStatus::ALL must list every variant exactly once"
+        );
+    }
+
     /// `WorkspaceStatus` serializes to the `PascalCase` TS `WorkspaceStatus` string
     /// enum (`src/shared/types.ts`): `Active`/`Inactive`/`Archived`/`Deleted`.
     #[test]
@@ -6789,6 +7277,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -7041,6 +7530,7 @@ mod tests {
             by_agent_id,
             totals: by_model["opus-4.8"].clone(),
             by_model,
+            by_agent_model: None,
             last_scan_at: None,
         };
         let v = serde_json::to_value(&usage).unwrap();
@@ -7057,6 +7547,30 @@ mod tests {
         assert!(v["totals"].get("thoughtTokens").is_none());
         let back: TokenUsage = serde_json::from_value(v).unwrap();
         assert_eq!(back, usage);
+    }
+
+    #[test]
+    fn token_usage_cross_filter_wire_shape_is_additive() {
+        let row = TokenUsageCrossFilterRow {
+            agent_id: "agent-123".to_string(),
+            model: "opus-4.8".to_string(),
+            totals: TokenUsageTotals {
+                input_tokens: 7,
+                ..Default::default()
+            },
+            human_messages: 2,
+            agent_messages: 3,
+        };
+        let usage = TokenUsage {
+            by_agent_model: Some(vec![row]),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&usage).unwrap();
+        assert_eq!(value["byAgentModel"][0]["agentId"], "agent-123");
+        assert_eq!(value["byAgentModel"][0]["model"], "opus-4.8");
+        assert_eq!(value["byAgentModel"][0]["totals"]["inputTokens"], 7);
+        assert_eq!(value["byAgentModel"][0]["humanMessages"], 2);
+        assert_eq!(value["byAgentModel"][0]["agentMessages"], 3);
     }
 
     /// Reported reasoning tokens serialize as the additive camelCase
@@ -7078,6 +7592,7 @@ mod tests {
             by_agent_id,
             totals,
             by_model,
+            by_agent_model: None,
             last_scan_at: None,
         };
         let v = serde_json::to_value(&usage).unwrap();
@@ -7122,6 +7637,7 @@ mod tests {
             by_agent_id,
             totals,
             by_model,
+            by_agent_model: None,
             last_scan_at: None,
         };
         let v = serde_json::to_value(&usage).unwrap();
@@ -7983,6 +8499,62 @@ mod tests {
         // Only the JSON boolean `true` surfaces the flag.
         let v = project(Some(json!({ IS_INITIAL_AGENT_KEY: true })));
         assert_eq!(v["metadata"]["isInitialAgent"], true);
+
+        for version in [json!(1), json!(3), json!(u32::MAX)] {
+            let v = project(Some(json!({ CHIEF_PROMPT_VERSION_KEY: version })));
+            assert_eq!(v["metadata"][CHIEF_PROMPT_VERSION_KEY], version);
+        }
+        for version in [
+            json!(null),
+            json!(0),
+            json!(-1),
+            json!(3.0),
+            json!(1.5),
+            json!("3"),
+            json!(true),
+            json!({}),
+            json!([]),
+            json!(u64::MAX),
+        ] {
+            let v = project(Some(json!({ CHIEF_PROMPT_VERSION_KEY: version })));
+            assert!(v["metadata"].get(CHIEF_PROMPT_VERSION_KEY).is_none());
+        }
+        assert!(legacy["metadata"].get(CHIEF_PROMPT_VERSION_KEY).is_none());
+    }
+
+    #[test]
+    fn harness_stamps_preserve_missing_and_saved_versions() {
+        for stamp in [
+            None,
+            Some("1.0"),
+            Some("2.9"),
+            Some("future-unknown"),
+            Some("3.0"),
+        ] {
+            let mut payload = json!({
+                "id":"agent-legacy", "workspaceId":"ws-legacy", "name":"Saved",
+                "status":"idle", "createdAt":"t0", "updatedAt":"t0",
+                "harnessFeatures":{"peerAgents":false}
+            });
+            if let Some(stamp) = stamp {
+                payload["harnessVersion"] = json!(stamp);
+            }
+            let session: AgentSession = serde_json::from_value(payload).unwrap();
+            let expected = stamp.unwrap_or("1.0");
+            assert_eq!(session.harness_version, expected);
+            assert_eq!(session.harness_features, Some(json!({"peerAgents":false})));
+            let round_trip: AgentSession =
+                serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+            assert_eq!(round_trip, session);
+            let lite = AgentLite::from_session(session, 0, None, None, None, None, None);
+            let mut payload = serde_json::to_value(lite).unwrap();
+            if stamp.is_none() {
+                payload.as_object_mut().unwrap().remove("harnessVersion");
+            }
+            let lite: AgentLite = serde_json::from_value(payload).unwrap();
+            assert_eq!(lite.harness_version, expected);
+            assert_eq!(lite.harness_features, Some(json!({"peerAgents":false})));
+        }
     }
 
     /// `AgentSession` serializes to the camelCase `agent-session.ts` wire shape:
@@ -8174,6 +8746,7 @@ mod tests {
                 "prompt": "fix the auth flow",
                 "name": "Auth fixer",
                 "model": "opus",
+                "reasoningEffort": "high",
                 "specialist": "implementor",
                 "provider": "auggie",
                 "behaviorPrompt": "be terse",
@@ -8188,6 +8761,7 @@ mod tests {
         assert_eq!(agent.prompt.as_deref(), Some("fix the auth flow"));
         assert_eq!(agent.name.as_deref(), Some("Auth fixer"));
         assert_eq!(agent.model.as_deref(), Some("opus"));
+        assert_eq!(agent.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(agent.specialist.as_deref(), Some("implementor"));
         assert_eq!(agent.provider.as_deref(), Some("auggie"));
         assert_eq!(agent.behavior_prompt.as_deref(), Some("be terse"));
@@ -8211,7 +8785,29 @@ mod tests {
         let bare = bare.initial_agent.expect("initialAgent");
         assert_eq!(bare.prompt.as_deref(), Some("p"));
         assert!(bare.specialist.is_none());
+        assert!(bare.reasoning_effort.is_none());
         assert!(bare.metadata.is_none());
+    }
+
+    #[test]
+    fn workspace_create_initial_agent_effort_preserves_explicit_clear() {
+        for effort in [
+            None,
+            Some(json!(null)),
+            Some(json!("")),
+            Some(json!(" \t ")),
+        ] {
+            let mut initial_agent = json!({});
+            if let Some(value) = &effort {
+                initial_agent["reasoningEffort"] = value.clone();
+            }
+            let input: WorkspaceCreate =
+                serde_json::from_value(json!({ "initialAgent": initial_agent })).unwrap();
+            assert_eq!(
+                input.initial_agent.unwrap().reasoning_effort.as_deref(),
+                effort.as_ref().and_then(serde_json::Value::as_str)
+            );
+        }
     }
 
     #[test]

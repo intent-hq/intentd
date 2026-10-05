@@ -1,38 +1,135 @@
 //! Principal, workspace membership and bearer-credential repository
-//! (multiplayer w1, migration `0125_principals`). Principals are people
-//! (GitHub identities); the primary principal is minted by the migration and
-//! owns every pre-existing workspace. Credentials are keyed by the hex
-//! SHA-256 of the presented token — the service layer hashes, this module
-//! never sees plaintext.
+//! (multiplayer w1, migration `0125_principals`). Principals are people,
+//! keyed by the provider-neutral identity triple `(identity_provider,
+//! instance_host, external_user_id)` (migration `0130`; `github_user_id` is
+//! its github.com projection, dual-written); the primary principal is minted
+//! by the migration and owns every pre-existing workspace. Credentials are
+//! keyed by the hex SHA-256 of the presented token — the service layer
+//! hashes, this module never sees plaintext.
 
 use std::collections::HashMap;
 
 use intent_core::{
-    now_iso, Error, Principal, PrincipalCredential, PrincipalId, Result, WorkspaceId,
-    WorkspaceInvite, WorkspaceMember, WorkspaceMembership, WorkspaceRole,
+    now_iso, Error, Principal, PrincipalCredential, PrincipalId, PrincipalIdentity, Result,
+    WorkspaceId, WorkspaceInvite, WorkspaceMember, WorkspaceMembership, WorkspaceRole,
+    WorkspaceStatus,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
-use crate::{enum_from_db, Store};
+use crate::{enum_from_db, enum_to_db, HostJoinCredential, Store};
 
-const PRINCIPAL_COLUMNS: &str =
-    "id, github_user_id, login, display_name, avatar_url, is_primary, created_at, updated_at";
+pub(crate) const PRINCIPAL_COLUMNS: &str = "id, github_user_id, login, display_name, avatar_url, \
+     is_primary, created_at, updated_at, identity_provider, instance_host, external_user_id";
+
+/// The `ON CONFLICT(id)` clause shared by every principal upsert: identity
+/// (triple and github projection) and cached profile fields are overwritten
+/// and `updated_at` bumped; `is_primary` / `created_at` are never touched.
+pub(crate) const PRINCIPAL_UPSERT_SET: &str = "github_user_id = excluded.github_user_id, \
+     login = excluded.login, \
+     display_name = excluded.display_name, \
+     avatar_url = excluded.avatar_url, \
+     updated_at = excluded.updated_at, \
+     identity_provider = excluded.identity_provider, \
+     instance_host = excluded.instance_host, \
+     external_user_id = excluded.external_user_id";
 
 const MEMBER_COLUMNS: &str = "workspace_id, principal_id, role, added_at";
 
 const CREDENTIAL_COLUMNS: &str = "token_hash, principal_id, created_at, last_used_at, revoked_at";
 
-const INVITE_COLUMNS: &str = "id, workspace_id, secret_hash, secret, created_by_principal_id, \
+pub(crate) const INVITE_COLUMNS: &str =
+    "id, workspace_id, secret_hash, secret, created_by_principal_id, \
      pin_github_user_id, pin_login, created_at, expires_at, redeemed_at, \
-     redeemed_by_principal_id, revoked_at, redemption_count";
+     redeemed_by_principal_id, revoked_at, redemption_count, \
+     pin_identity_provider, pin_instance_host, pin_external_user_id";
 
 /// The SQL form of [`WorkspaceInvite::is_open_at`] on a `workspace_invite`
 /// row aliased `i`: not revoked, not expired (one `?` bound to now), and —
 /// for a pinned, single-use invite — not yet redeemed. An unpinned invite is
 /// reusable and stays open across redemptions (migration `0129`).
-const INVITE_OPEN: &str = "i.revoked_at IS NULL AND i.expires_at > ? \
-     AND (i.pin_github_user_id IS NULL OR i.redeemed_at IS NULL)";
+pub(crate) const INVITE_OPEN: &str = "i.revoked_at IS NULL AND i.expires_at > ? \
+     AND ((i.pin_identity_provider IS NULL AND i.pin_github_user_id IS NULL) \
+          OR i.redeemed_at IS NULL)";
+
+/// The identity columns a principal row is written with: the triple the row
+/// resolves by ([`Principal::identity_key`]) and its github.com projection —
+/// `github_user_id` as given, else parsed back out of a github triple — so a
+/// caller that set either field alone still dual-writes both.
+fn principal_identity_columns(p: &Principal) -> (Option<PrincipalIdentity>, Option<i64>) {
+    let identity = p.identity_key();
+    let github_user_id = p.github_user_id.or_else(|| {
+        identity
+            .as_ref()
+            .and_then(PrincipalIdentity::github_user_id)
+    });
+    (identity, github_user_id)
+}
+
+/// Compare the columns actually written by the shared upsert, under the
+/// original managed writer. Cached profile fields and the ignored incoming
+/// primary flag do not change authority. A missing row is a new incarnation.
+pub(crate) async fn principal_authority_changes(
+    conn: &mut sqlx::SqliteConnection,
+    principal: &Principal,
+) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT github_user_id, identity_provider, instance_host, external_user_id \
+         FROM principal WHERE id = ?",
+    )
+    .bind(&principal.id.0)
+    .fetch_optional(conn)
+    .await
+    .map_err(|e| Error::Internal(format!("read principal authority failed: {e}")))?;
+    let Some(row) = row else { return Ok(true) };
+    let (identity, github_user_id) = principal_identity_columns(principal);
+    Ok(
+        row.get::<Option<i64>, _>("github_user_id") != github_user_id
+            || row.get::<Option<String>, _>("identity_provider").as_deref()
+                != identity.as_ref().map(|i| i.provider.as_str())
+            || row.get::<Option<String>, _>("instance_host").as_deref()
+                != identity.as_ref().map(|i| i.host.as_str())
+            || row.get::<Option<String>, _>("external_user_id").as_deref()
+                != identity.as_ref().map(|i| i.external_user_id.as_str()),
+    )
+}
+
+async fn member_role_in_txn(
+    conn: &mut sqlx::SqliteConnection,
+    workspace_id: &WorkspaceId,
+    principal_id: &PrincipalId,
+) -> Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT role FROM workspace_member WHERE workspace_id = ? AND principal_id = ?",
+    )
+    .bind(&workspace_id.0)
+    .bind(&principal_id.0)
+    .fetch_optional(conn)
+    .await
+    .map_err(|e| Error::Internal(format!("read member authority failed: {e}")))
+}
+
+/// The same owner expression as `sync_workspace_owner`, before any mutation.
+/// Even an unchanged membership can repair a stale owner column.
+async fn workspace_owner_needs_sync(
+    conn: &mut sqlx::SqliteConnection,
+    workspace_id: &WorkspaceId,
+) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM workspace WHERE id = ? \
+         AND owner_principal_id IS NOT COALESCE(\
+            (SELECT m.principal_id FROM workspace_member m \
+             WHERE m.workspace_id = workspace.id AND m.role = 'owner' \
+               AND m.principal_id = workspace.owner_principal_id), \
+            (SELECT m.principal_id FROM workspace_member m \
+             WHERE m.workspace_id = workspace.id AND m.role = 'owner' \
+             ORDER BY m.added_at, m.principal_id LIMIT 1)))",
+    )
+    .bind(&workspace_id.0)
+    .fetch_one(conn)
+    .await
+    .map_err(|e| Error::Internal(format!("read owner synchronization failed: {e}")))
+}
 
 /// The workspace columns an unstamped user message's author is resolved
 /// from (see [`Store::get_workspace_author_fallback`]).
@@ -50,10 +147,20 @@ pub struct WorkspaceAuthorFallback {
 /// on (see [`Store::count_workspace_guests`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WorkspaceGuestCount {
-    /// `collaborator` memberships (the owner is never a guest).
+    /// Direct collaborators who are not active host members.
     pub collaborators: u64,
-    /// Invites not yet redeemed, revoked or expired.
+    /// Unexpired, unrevoked invitations (reusable links may be redeemed).
     pub open_invites: u64,
+}
+
+/// One person in the effective workspace roster. Profiles and role come
+/// from the same database snapshot; retained guest rows never duplicate a member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveWorkspaceMember {
+    pub principal: Principal,
+    pub role: WorkspaceRole,
+    pub host_role: intent_core::HostRole,
+    pub added_at: String,
 }
 
 impl WorkspaceGuestCount {
@@ -63,6 +170,18 @@ impl WorkspaceGuestCount {
     pub fn committed(self) -> u64 {
         self.collaborators.saturating_add(self.open_invites)
     }
+}
+
+/// What [`Store::archive_workspace_detaching_guests`] committed alongside
+/// the archive flip.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ArchivedGuestSweep {
+    /// The `collaborator` memberships deleted, in `added_at` order.
+    pub removed_collaborators: Vec<PrincipalId>,
+    /// Open invites flipped to revoked.
+    pub revoked_invites: u64,
+    /// Membership rows left after the sweep (the owner, when seated).
+    pub member_count: u64,
 }
 
 /// Result of [`Store::add_workspace_collaborator_within_cap`].
@@ -78,6 +197,23 @@ pub enum CollaboratorAddOutcome {
     /// The workspace's committed seats (collaborators plus open invites)
     /// already reach the cap; nothing was written.
     WorkspaceFull,
+    /// The workspace is archived (checked inside the write transaction, so
+    /// an archive that committed first is always seen); nothing was written.
+    WorkspaceArchived,
+}
+
+/// Result of [`Store::insert_workspace_invite`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteInsertOutcome {
+    /// The invite row was inserted.
+    Inserted,
+    /// The workspace is archived (checked inside the write transaction);
+    /// nothing was written.
+    WorkspaceArchived,
+    /// The issuer no longer has workspace management authority.
+    IssuerForbidden,
+    /// Committed guest seats already reach the requested cap.
+    WorkspaceFull,
 }
 
 /// Result of [`Store::join_workspace_by_invite`].
@@ -87,8 +223,8 @@ pub enum InviteJoinOutcome {
     /// joined one (existing row refreshed, or the minted one).
     Joined(Principal),
     /// The join committed for an account that was already a member of the
-    /// workspace: the principal row was refreshed, a fresh credential was
-    /// minted and the invite's last-redemption stamp moved, but no
+    /// workspace: the principal row was refreshed, the credential was reused
+    /// (or minted for a new proof) and the last-redemption stamp moved, but no
     /// membership was added and the redemption was not counted.
     Rejoined(Principal),
     /// The invite was no longer open at redemption; nothing was written.
@@ -96,15 +232,41 @@ pub enum InviteJoinOutcome {
     /// The workspace's collaborators already reach the guest cap; nothing
     /// was written and the invite stays open.
     WorkspaceFull,
-    /// `rotate_from_hash` was not an active credential of the joining
+    /// The presented bearer was not an active credential of the joining
     /// principal at the moment of the join (unknown, revoked, or another
     /// principal's); nothing was written and the invite stays open.
     CredentialInvalid,
-    /// `identity.github_user_id` is the primary principal's own account: the
+    /// The full identity triple is the primary principal's own account: the
     /// host owner cannot join its own host as a guest, and no per-principal
     /// credential is minted for the primary row. Nothing was written and the
     /// invite stays open.
     OwnerSelfJoin,
+    /// The workspace is archived (checked inside the write transaction, so
+    /// an archive that committed first is always seen — its sweep also
+    /// closed the invite, so this is the guard behind the open check);
+    /// nothing was written.
+    WorkspaceArchived,
+    /// The stable pin changed or does not identify the joining person.
+    PinMismatch,
+    /// Revocation happened after the proof challenge.
+    AccessRevoked,
+}
+
+/// Whether `workspace_id` is archived, read on the transaction's own
+/// connection so the answer is the one the surrounding write commits
+/// against. `None` when the workspace does not exist (the caller's FK or
+/// scoped write reports that as before).
+async fn workspace_archived_in_txn(
+    conn: &mut sqlx::SqliteConnection,
+    workspace_id: &WorkspaceId,
+    what: &str,
+) -> Result<Option<bool>> {
+    let archived: Option<i64> = sqlx::query_scalar("SELECT archived FROM workspace WHERE id = ?")
+        .bind(&workspace_id.0)
+        .fetch_optional(conn)
+        .await
+        .map_err(|e| Error::Internal(format!("{what} archived check failed: {e}")))?;
+    Ok(archived.map(|a| a != 0))
 }
 
 impl Store {
@@ -154,6 +316,49 @@ impl Store {
         Ok(out)
     }
 
+    /// Cached device profiles and effective roles from the same `SQLite` snapshot,
+    /// batched by returned principals rather than scanning the host directory.
+    ///
+    /// # Errors
+    /// Returns an internal error if the database read fails.
+    pub async fn get_device_principals(
+        &self,
+        ids: &[PrincipalId],
+        viewer: Option<&PrincipalId>,
+    ) -> Result<Vec<(Principal, intent_core::HostRole)>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(32_000) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut sql = format!("SELECT {PRINCIPAL_COLUMNS}, EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = principal.id) AS is_member FROM principal WHERE id IN ({placeholders})");
+            if viewer.is_some() {
+                sql.push_str(" AND (id = ? OR EXISTS(SELECT 1 FROM principal v WHERE v.id = ? AND (v.is_primary = 1 OR EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = v.id))))");
+            }
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(id.as_str());
+            }
+            if let Some(viewer) = viewer {
+                query = query.bind(viewer.as_str()).bind(viewer.as_str());
+            }
+            let rows = query
+                .fetch_all(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("read device principals: {e}")))?;
+            for row in rows {
+                let person = map_principal_row(&row);
+                let role = if person.is_primary {
+                    intent_core::HostRole::Owner
+                } else if row.get::<bool, _>("is_member") {
+                    intent_core::HostRole::Member
+                } else {
+                    intent_core::HostRole::Guest
+                };
+                out.push((person, role));
+            }
+        }
+        Ok(out)
+    }
+
     /// The daemon's primary principal (the original single user, minted by
     /// migration `0125_principals`).
     ///
@@ -172,8 +377,28 @@ impl Store {
             .ok_or_else(|| Error::Internal("primary principal missing".to_string()))
     }
 
-    /// Look up a principal by linked GitHub account id; `None` when no
-    /// principal has linked that account.
+    /// Look up a principal by its identity triple; `None` when no principal
+    /// has linked that account on that provider / host.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn find_principal_by_identity(
+        &self,
+        identity: &PrincipalIdentity,
+    ) -> Result<Option<Principal>> {
+        let sql =
+            format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE {PRINCIPAL_BY_IDENTITY}");
+        let row = bind_identity(sqlx::query(&sql), identity)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("find principal by identity failed: {e}")))?;
+        Ok(row.as_ref().map(map_principal_row))
+    }
+
+    /// Look up a principal by linked github.com account id — the
+    /// [`PrincipalIdentity::github`] case of
+    /// [`Self::find_principal_by_identity`].
     ///
     /// # Errors
     ///
@@ -182,13 +407,8 @@ impl Store {
         &self,
         github_user_id: i64,
     ) -> Result<Option<Principal>> {
-        let sql = format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE github_user_id = ?");
-        let row = sqlx::query(&sql)
-            .bind(github_user_id)
-            .fetch_optional(self.read_pool())
+        self.find_principal_by_identity(&PrincipalIdentity::github(github_user_id))
             .await
-            .map_err(|e| Error::Internal(format!("find principal by github id failed: {e}")))?;
-        Ok(row.as_ref().map(map_principal_row))
     }
 
     /// List every principal, primary first then by `created_at`.
@@ -230,37 +450,66 @@ impl Store {
         Ok(rows.iter().map(map_principal_row).collect())
     }
 
-    /// Insert or update a principal by id. On conflict the GitHub identity
-    /// and cached profile fields are overwritten and `updated_at` bumped;
-    /// `is_primary` and `created_at` are never changed by an upsert (the
-    /// primary flag is owned by the migration).
+    /// The safe sharing directory, excluding the primary and revoked people.
+    /// Role and profile are selected together without credential material.
+    ///
+    /// # Errors
+    /// Returns `Internal` on database failure.
+    pub async fn list_sharing_principals(&self) -> Result<Vec<(Principal, intent_core::HostRole)>> {
+        let rows = sqlx::query(
+            "SELECT p.*, h.principal_id IS NOT NULL AS is_host_member \
+             FROM principal p LEFT JOIN host_member h ON h.principal_id = p.id \
+             WHERE p.is_primary = 0 AND EXISTS (SELECT 1 FROM principal_credential c \
+                 WHERE c.principal_id = p.id AND c.revoked_at IS NULL) \
+             ORDER BY p.created_at, p.id",
+        )
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("sharing directory failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    map_principal_row(r),
+                    if r.get::<bool, _>("is_host_member") {
+                        intent_core::HostRole::Member
+                    } else {
+                        intent_core::HostRole::Guest
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Insert or update a principal by id. On conflict the identity (triple
+    /// and github projection, see [`principal_identity_columns`]) and cached
+    /// profile fields are overwritten and `updated_at` bumped; `is_primary`
+    /// and `created_at` are never changed by an upsert (the primary flag is
+    /// owned by the migration).
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails (including
-    /// a `github_user_id` already linked to another principal).
+    /// an identity already linked to another principal).
     pub async fn upsert_principal(&self, p: &Principal) -> Result<()> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("upsert principal acquire failed: {e}")))?;
+        if principal_authority_changes(&mut conn, p).await? {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+        }
         let sql = format!(
-            "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?) \
-             ON CONFLICT(id) DO UPDATE SET \
-                 github_user_id = excluded.github_user_id, \
-                 login = excluded.login, \
-                 display_name = excluded.display_name, \
-                 avatar_url = excluded.avatar_url, \
-                 updated_at = excluded.updated_at"
+            "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?) \
+             ON CONFLICT(id) DO UPDATE SET {PRINCIPAL_UPSERT_SET}"
         );
-        sqlx::query(&sql)
-            .bind(&p.id.0)
-            .bind(p.github_user_id)
-            .bind(&p.login)
-            .bind(&p.display_name)
-            .bind(&p.avatar_url)
-            .bind(i64::from(p.is_primary))
-            .bind(&p.created_at)
-            .bind(&p.updated_at)
-            .execute(self.write_pool())
+        bind_principal(sqlx::query(&sql), p)
+            .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("upsert principal failed: {e}")))?;
+        lifecycle.settle();
         Ok(())
     }
 
@@ -340,13 +589,14 @@ impl Store {
 
     /// Membership summaries for `workspace.get` / `workspace.list`
     /// (multiplayer w1): owner, member count and `viewer`'s role, computed
-    /// in SQL in ONE query scoped to exactly `workspace_ids` (the rows the
+    /// in one scalar projection scoped to exactly `workspace_ids` (the rows the
     /// caller is about to return — never the whole table, so archived or
     /// filtered-out workspaces cost nothing), keyed by workspace id. An empty
     /// `workspace_ids` short-circuits without touching the database.
     /// `viewer = None` yields no `my_role`. `open_invite_count` is `0` until
     /// invitations exist (a reusable invite counts as open while unexpired
-    /// and unrevoked, however often it was redeemed).
+    /// and unrevoked, however often it was redeemed). A separate indexed
+    /// deadline probe reconciles due reservations before that same snapshot.
     ///
     /// # Errors
     ///
@@ -359,26 +609,37 @@ impl Store {
         if workspace_ids.is_empty() {
             return Ok(HashMap::new());
         }
+        let mut tx = self.sharing_snapshot(workspace_ids, None).await?;
         let placeholders = vec!["?"; workspace_ids.len()].join(",");
         let sql = format!(
-            "SELECT w.id AS workspace_id, w.owner_principal_id, \
-                (SELECT COUNT(*) FROM workspace_member m WHERE m.workspace_id = w.id) AS member_count, \
-                (SELECT COUNT(*) FROM workspace_invite i WHERE i.workspace_id = w.id \
-                    AND {INVITE_OPEN}) AS open_invite_count, \
-                (SELECT m.role FROM workspace_member m \
-                    WHERE m.workspace_id = w.id AND m.principal_id = ?) AS my_role \
-             FROM workspace w WHERE w.id IN ({placeholders})"
+            "WITH viewer AS (SELECT p.id, p.is_primary, h.principal_id IS NOT NULL AS is_host_member \
+                FROM principal p LEFT JOIN host_member h ON h.principal_id = p.id WHERE p.id = ?) \
+             SELECT w.id AS workspace_id, w.owner_principal_id, \
+                COALESCE(v.is_primary OR CASE WHEN v.is_host_member THEN w.id <> ? \
+                    ELSE m.role = 'owner' END, 0) AS can_manage, \
+                CASE WHEN w.id = ? THEN s.direct_count ELSE s.non_host_count + h.member_count END AS member_count, \
+                s.open_invite_count, \
+                COALESCE(m.role, CASE WHEN v.is_host_member AND w.id <> ? THEN 'collaborator' END) AS my_role \
+             FROM workspace w JOIN workspace_sharing_summary s ON s.workspace_id = w.id \
+             CROSS JOIN host_membership_state h LEFT JOIN viewer v ON 1 = 1 \
+             LEFT JOIN workspace_member m ON m.workspace_id = w.id AND m.principal_id = v.id \
+             WHERE h.id = 1 AND w.id IN ({placeholders})"
         );
         let mut query = sqlx::query(&sql)
-            .bind(now_iso())
-            .bind(viewer.map(|p| p.0.as_str()));
+            .bind(viewer.map(|p| p.0.as_str()))
+            .bind(intent_core::CHIEF_WORKSPACE_ID)
+            .bind(intent_core::CHIEF_WORKSPACE_ID)
+            .bind(intent_core::CHIEF_WORKSPACE_ID);
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
         let rows = query
-            .fetch_all(self.read_pool())
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("workspace membership summaries failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("sharing snapshot commit failed: {e}")))?;
         rows.iter()
             .map(|r| {
                 let my_role = r
@@ -388,6 +649,7 @@ impl Store {
                 Ok((
                     WorkspaceId(r.get("workspace_id")),
                     WorkspaceMembership {
+                        can_manage: r.get("can_manage"),
                         owner_principal_id: r
                             .get::<Option<String>, _>("owner_principal_id")
                             .map(PrincipalId),
@@ -422,6 +684,84 @@ impl Store {
         rows.iter().map(map_member_row).collect()
     }
 
+    /// Effective members of an existing workspace, owner first. The union
+    /// deduplicates by principal, never by a forge handle or numeric account ID.
+    /// Chief retains only its direct membership. Explicit roster reads load
+    /// profiles in this one query, not all host principals or per-person reads.
+    ///
+    /// # Errors
+    /// Returns `Internal` on database failure.
+    pub async fn list_effective_workspace_members(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<EffectiveWorkspaceMember>> {
+        let rows = sqlx::query(
+            "WITH people AS (SELECT principal_id FROM workspace_member WHERE workspace_id = ? \
+                 UNION SELECT principal_id FROM host_member WHERE ? <> ?) \
+             SELECT p.*, h.principal_id IS NOT NULL AS is_host_member, \
+                 CASE WHEN h.principal_id IS NOT NULL AND w.id <> ? THEN h.added_at \
+                      ELSE m.added_at END AS member_added_at \
+             FROM people x JOIN principal p ON p.id = x.principal_id \
+             JOIN workspace w ON w.id = ? \
+             LEFT JOIN workspace_member m ON m.workspace_id = w.id AND m.principal_id = p.id \
+             LEFT JOIN host_member h ON h.principal_id = p.id \
+             ORDER BY p.is_primary DESC, member_added_at, p.id",
+        )
+        .bind(workspace_id.as_str())
+        .bind(workspace_id.as_str())
+        .bind(intent_core::CHIEF_WORKSPACE_ID)
+        .bind(intent_core::CHIEF_WORKSPACE_ID)
+        .bind(workspace_id.as_str())
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("effective workspace roster failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let principal = map_principal_row(r);
+                EffectiveWorkspaceMember {
+                    role: if principal.is_primary {
+                        WorkspaceRole::Owner
+                    } else {
+                        WorkspaceRole::Collaborator
+                    },
+                    host_role: if principal.is_primary {
+                        intent_core::HostRole::Owner
+                    } else if r.get::<bool, _>("is_host_member") {
+                        intent_core::HostRole::Member
+                    } else {
+                        intent_core::HostRole::Guest
+                    },
+                    principal,
+                    added_at: r.get("member_added_at"),
+                }
+            })
+            .collect())
+    }
+
+    /// IDs for presence fan-out. Members inherit ordinary workspaces; direct
+    /// guest grants remain scoped. This runs on presence changes, never lists.
+    ///
+    /// # Errors
+    /// Returns `Internal` on database failure.
+    pub async fn effective_principal_workspace_ids(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<Vec<WorkspaceId>> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT workspace_id FROM workspace_member WHERE principal_id = ? \
+             UNION SELECT w.id FROM workspace w WHERE w.id <> ? \
+             AND EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?)",
+        )
+        .bind(principal.as_str())
+        .bind(intent_core::CHIEF_WORKSPACE_ID)
+        .bind(principal.as_str())
+        .fetch_all(self.read_pool())
+        .await
+        .map(|ids| ids.into_iter().map(WorkspaceId).collect())
+        .map_err(|e| Error::Internal(format!("effective presence workspaces failed: {e}")))
+    }
+
     /// List every workspace id a principal is a member of, with the role.
     ///
     /// # Errors
@@ -441,6 +781,18 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("list principal memberships failed: {e}")))?;
         rows.iter().map(map_member_row).collect()
+    }
+
+    /// Whether a principal retains any workspace grant, without loading the roster.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn has_workspace_membership(&self, principal_id: &PrincipalId) -> Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_member WHERE principal_id = ?)")
+            .bind(&principal_id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("check principal membership failed: {e}")))
     }
 
     /// A principal's role in a workspace; `None` when not a member.
@@ -485,10 +837,20 @@ impl Store {
     ) -> Result<bool> {
         let pool = self.write_pool();
         crate::with_write_txn_retry(|| async {
+            // Each attempt owns its own ticket. A later retry never confirms
+            // an earlier failed/indeterminate transaction's barrier.
+            let mut lifecycle = self.repository_lifecycle_write().await?;
             let mut tx = pool
                 .begin()
                 .await
                 .map_err(|e| Error::Internal(format!("add workspace member begin failed: {e}")))?;
+            if member_role_in_txn(&mut tx, workspace_id, principal_id)
+                .await?
+                .is_none()
+                || workspace_owner_needs_sync(&mut tx, workspace_id).await?
+            {
+                lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+            }
             let sql = format!(
                 "INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?) \
                  ON CONFLICT(workspace_id, principal_id) DO NOTHING"
@@ -505,6 +867,7 @@ impl Store {
             tx.commit()
                 .await
                 .map_err(|e| Error::Internal(format!("add workspace member commit failed: {e}")))?;
+            lifecycle.settle();
             Ok(res.rows_affected() > 0)
         })
         .await
@@ -520,11 +883,14 @@ impl Store {
     /// is inside its own write transaction — cannot both take the last
     /// seat, and a `revoke_all_principal_credentials` that committed
     /// before the transaction began is always observed (no seat for a
-    /// principal that can no longer authenticate). The credential predicate
-    /// is evaluated first, so a seated principal whose credentials are all
+    /// principal that can no longer authenticate). Active host members are
+    /// already effective members and bypass guest admission. For guests the
+    /// credential predicate is evaluated first, so a seated principal whose credentials are all
     /// revoked is `NoActiveCredential`, not `AlreadyMember`; an already
     /// seated credentialed principal takes no new seat and is reported
-    /// without a write.
+    /// without a write. An archived workspace is `WorkspaceArchived` (read
+    /// under the same lock, so an archive whose sweep committed first is
+    /// never followed by a fresh seat).
     ///
     /// # Errors
     ///
@@ -536,6 +902,7 @@ impl Store {
         principal_id: &PrincipalId,
         max_guests: u32,
     ) -> Result<CollaboratorAddOutcome> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         let mut conn = self
             .write_pool()
             .acquire()
@@ -547,6 +914,17 @@ impl Store {
             .map_err(|e| Error::Internal(format!("capped member add begin failed: {e}")))?;
 
         let body_result: Result<CollaboratorAddOutcome> = async {
+            let inherited: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?) AND ? <> ?",
+            ).bind(principal_id.as_str()).bind(workspace_id.as_str()).bind(intent_core::CHIEF_WORKSPACE_ID)
+                .fetch_one(&mut *conn).await
+                .map_err(|e|Error::Internal(format!("capped member add host role failed: {e}")))?;
+            if inherited { return Ok(CollaboratorAddOutcome::AlreadyMember); }
+            if workspace_archived_in_txn(&mut conn, workspace_id, "capped member add").await?
+                == Some(true)
+            {
+                return Ok(CollaboratorAddOutcome::WorkspaceArchived);
+            }
             let active_credential: Option<i64> = sqlx::query_scalar(
                 "SELECT 1 FROM principal_credential \
                     WHERE principal_id = ? AND revoked_at IS NULL LIMIT 1",
@@ -571,27 +949,16 @@ impl Store {
             if already_member.is_some() {
                 return Ok(CollaboratorAddOutcome::AlreadyMember);
             }
-            let sql = format!(
-                "SELECT \
-                    (SELECT COUNT(*) FROM workspace_member m \
-                        WHERE m.workspace_id = ? AND m.role = 'collaborator') + \
-                    (SELECT COUNT(*) FROM workspace_invite i WHERE i.workspace_id = ? \
-                        AND {INVITE_OPEN})"
-            );
-            let committed: i64 = sqlx::query_scalar(&sql)
-                .bind(&workspace_id.0)
-                .bind(&workspace_id.0)
-                .bind(now_iso())
-                .fetch_one(&mut *conn)
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!("capped member add guest count failed: {e}"))
-                })?;
+            crate::sharing_projection::reconcile_invite_expiry(&mut conn, std::slice::from_ref(workspace_id), &now_iso()).await?;
+            let committed: i64 = sqlx::query_scalar("SELECT guest_count + open_invite_count FROM workspace_sharing_summary WHERE workspace_id = ?")
+                .bind(workspace_id.as_str()).fetch_one(&mut *conn).await
+                .map_err(|e| Error::Internal(format!("capped member add guest count failed: {e}")))?;
             if u64::try_from(committed).unwrap_or(u64::MAX) >= u64::from(max_guests) {
                 return Ok(CollaboratorAddOutcome::WorkspaceFull);
             }
             let insert =
                 format!("INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?)");
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
             sqlx::query(&insert)
                 .bind(&workspace_id.0)
                 .bind(&principal_id.0)
@@ -604,8 +971,10 @@ impl Store {
         }
         .await;
 
-        crate::commit_with_rollback_guard(conn, body_result, "capped member add commit failed")
-            .await
+        let result =
+            crate::commit_with_rollback_guard(conn, body_result, "capped member add commit failed")
+                .await;
+        lifecycle.finish(result)
     }
 
     /// Change an existing member's role. `workspace.owner_principal_id` is
@@ -626,9 +995,17 @@ impl Store {
     ) -> Result<()> {
         let pool = self.write_pool();
         crate::with_write_txn_retry(|| async {
+            let mut lifecycle = self.repository_lifecycle_write().await?;
             let mut tx = pool.begin().await.map_err(|e| {
                 Error::Internal(format!("set workspace member role begin failed: {e}"))
             })?;
+            let previous = member_role_in_txn(&mut tx, workspace_id, principal_id).await?;
+            if previous.is_some()
+                && (previous.as_deref() != Some(role.as_str())
+                    || workspace_owner_needs_sync(&mut tx, workspace_id).await?)
+            {
+                lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+            }
             let res = sqlx::query(
                 "UPDATE workspace_member SET role = ? WHERE workspace_id = ? AND principal_id = ?",
             )
@@ -647,6 +1024,7 @@ impl Store {
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("set workspace member role commit failed: {e}"))
             })?;
+            lifecycle.settle();
             Ok(())
         })
         .await
@@ -666,9 +1044,17 @@ impl Store {
     ) -> Result<bool> {
         let pool = self.write_pool();
         crate::with_write_txn_retry(|| async {
+            let mut lifecycle = self.repository_lifecycle_write().await?;
             let mut tx = pool.begin().await.map_err(|e| {
                 Error::Internal(format!("remove workspace member begin failed: {e}"))
             })?;
+            if member_role_in_txn(&mut tx, workspace_id, principal_id)
+                .await?
+                .is_some()
+                || workspace_owner_needs_sync(&mut tx, workspace_id).await?
+            {
+                lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+            }
             let res = sqlx::query(
                 "DELETE FROM workspace_member WHERE workspace_id = ? AND principal_id = ?",
             )
@@ -681,9 +1067,65 @@ impl Store {
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("remove workspace member commit failed: {e}"))
             })?;
+            lifecycle.settle();
             Ok(res.rows_affected() > 0)
         })
         .await
+    }
+
+    /// Remove a direct guest grant, refusing inherited access under the same
+    /// write lock as deletion. An upgrade racing removal cannot lose its
+    /// retained collaborator row. Host-wide revocation uses its own transaction.
+    ///
+    /// # Errors
+    /// Returns `HostMembershipRequired` for active members, `InvalidParams`
+    /// for an owner, and `Internal` on database failure.
+    pub async fn remove_workspace_guest(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+    ) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let mut tx = self
+            .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::Internal(format!("remove guest begin failed: {e}")))?;
+        let inherited: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?)")
+                .bind(principal_id.as_str())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("remove guest role failed: {e}")))?;
+        if inherited {
+            return Err(Error::HostMembershipRequired);
+        }
+        let owner:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_member WHERE workspace_id = ? AND principal_id = ? AND role = 'owner')")
+            .bind(workspace_id.as_str()).bind(principal_id.as_str()).fetch_one(&mut *tx).await
+            .map_err(|e|Error::Internal(format!("remove guest owner check failed: {e}")))?;
+        if owner {
+            return Err(Error::InvalidParams(
+                "the workspace owner cannot leave or be removed".into(),
+            ));
+        }
+        if member_role_in_txn(&mut tx, workspace_id, principal_id)
+            .await?
+            .is_some()
+        {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+        }
+        let deleted =
+            sqlx::query("DELETE FROM workspace_member WHERE workspace_id = ? AND principal_id = ?")
+                .bind(workspace_id.as_str())
+                .bind(principal_id.as_str())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("remove guest failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("remove guest commit failed: {e}")))?;
+        lifecycle.settle();
+        Ok(deleted.rows_affected() > 0)
     }
 
     /// Record a bearer credential for a principal, keyed by `token_hash`
@@ -698,7 +1140,9 @@ impl Store {
         principal_id: &PrincipalId,
         token_hash: &str,
     ) -> Result<PrincipalCredential> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         let now = now_iso();
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
         sqlx::query(
             "INSERT INTO principal_credential (token_hash, principal_id, created_at) \
              VALUES (?,?,?)",
@@ -709,6 +1153,7 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("insert principal credential failed: {e}")))?;
+        lifecycle.settle();
         Ok(PrincipalCredential {
             token_hash: token_hash.to_string(),
             principal_id: principal_id.clone(),
@@ -813,15 +1258,26 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn revoke_principal_credential(&self, token_hash: &str) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let mut conn = self.write_pool().acquire().await.map_err(|e| {
+            Error::Internal(format!("revoke principal credential acquire failed: {e}"))
+        })?;
+        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM principal_credential WHERE token_hash = ? AND revoked_at IS NULL)")
+            .bind(token_hash).fetch_one(&mut *conn).await
+            .map_err(|e| Error::Internal(format!("read credential authority failed: {e}")))?;
+        if active {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+        }
         let res = sqlx::query(
             "UPDATE principal_credential SET revoked_at = ? \
              WHERE token_hash = ? AND revoked_at IS NULL",
         )
         .bind(now_iso())
         .bind(token_hash)
-        .execute(self.write_pool())
+        .execute(&mut *conn)
         .await
         .map_err(|e| Error::Internal(format!("revoke principal credential failed: {e}")))?;
+        lifecycle.settle();
         Ok(res.rows_affected() > 0)
     }
 
@@ -835,15 +1291,26 @@ impl Store {
         &self,
         principal_id: &PrincipalId,
     ) -> Result<u64> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let mut conn = self.write_pool().acquire().await.map_err(|e| {
+            Error::Internal(format!("revoke principal credentials acquire failed: {e}"))
+        })?;
+        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM principal_credential WHERE principal_id = ? AND revoked_at IS NULL)")
+            .bind(&principal_id.0).fetch_one(&mut *conn).await
+            .map_err(|e| Error::Internal(format!("read principal credentials authority failed: {e}")))?;
+        if active {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+        }
         let res = sqlx::query(
             "UPDATE principal_credential SET revoked_at = ? \
              WHERE principal_id = ? AND revoked_at IS NULL",
         )
         .bind(now_iso())
         .bind(&principal_id.0)
-        .execute(self.write_pool())
+        .execute(&mut *conn)
         .await
         .map_err(|e| Error::Internal(format!("revoke principal credentials failed: {e}")))?;
+        lifecycle.settle();
         Ok(res.rows_affected())
     }
 
@@ -877,8 +1344,8 @@ impl Store {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
-    /// The guest-cap usage of one workspace: its `collaborator` memberships
-    /// and its open invites, in one round trip.
+    /// The guest-cap usage of one workspace: direct non-host collaborators
+    /// and open invites, from maintained scalars after indexed expiry reconciliation.
     ///
     /// # Errors
     ///
@@ -887,20 +1354,18 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<WorkspaceGuestCount> {
-        let sql = format!(
-            "SELECT \
-                (SELECT COUNT(*) FROM workspace_member m \
-                    WHERE m.workspace_id = ? AND m.role = 'collaborator') AS collaborators, \
-                (SELECT COUNT(*) FROM workspace_invite i WHERE i.workspace_id = ? \
-                    AND {INVITE_OPEN}) AS open_invites"
-        );
-        let row = sqlx::query(&sql)
-            .bind(&workspace_id.0)
-            .bind(&workspace_id.0)
-            .bind(now_iso())
-            .fetch_one(self.read_pool())
-            .await
+        let mut tx = self
+            .sharing_snapshot(std::slice::from_ref(workspace_id), None)
+            .await?;
+        let row = sqlx::query("SELECT guest_count AS collaborators, open_invite_count AS open_invites FROM workspace_sharing_summary WHERE workspace_id = ?")
+            .bind(workspace_id.as_str()).fetch_optional(&mut *tx).await
             .map_err(|e| Error::Internal(format!("count workspace guests failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("guest snapshot commit failed: {e}")))?;
+        let Some(row) = row else {
+            return Ok(WorkspaceGuestCount::default());
+        };
         Ok(WorkspaceGuestCount {
             collaborators: u64::try_from(row.get::<i64, _>("collaborators")).unwrap_or(0),
             open_invites: u64::try_from(row.get::<i64, _>("open_invites")).unwrap_or(0),
@@ -910,38 +1375,120 @@ impl Store {
     /// Persist a freshly minted invite (multiplayer w4). `secret_hash` is the
     /// hex SHA-256 of the link secret — the service layer hashes; the
     /// plaintext `secret` is kept alongside so the link can be rebuilt on
-    /// `workspace.invite.list`.
+    /// `workspace.invite.list`. The insert runs in a `BEGIN IMMEDIATE`
+    /// transaction behind an archived check on the same connection: an
+    /// archived workspace is `WorkspaceArchived` and nothing is written, so
+    /// no open invite can be minted after an archive's sweep committed.
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
-    pub async fn insert_workspace_invite(&self, invite: &WorkspaceInvite) -> Result<()> {
-        let sql = format!(
-            "INSERT INTO workspace_invite ({INVITE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
-        );
-        sqlx::query(&sql)
-            .bind(&invite.id)
-            .bind(&invite.workspace_id.0)
-            .bind(&invite.secret_hash)
-            .bind(&invite.secret)
-            .bind(&invite.created_by_principal_id.0)
-            .bind(invite.pin_github_user_id)
-            .bind(&invite.pin_login)
-            .bind(&invite.created_at)
-            .bind(&invite.expires_at)
-            .bind(&invite.redeemed_at)
-            .bind(
-                invite
-                    .redeemed_by_principal_id
-                    .as_ref()
-                    .map(|p| p.0.as_str()),
-            )
-            .bind(&invite.revoked_at)
-            .bind(i64::try_from(invite.redemption_count).unwrap_or(i64::MAX))
-            .execute(self.write_pool())
+    pub async fn insert_workspace_invite(
+        &self,
+        invite: &WorkspaceInvite,
+    ) -> Result<InviteInsertOutcome> {
+        self.insert_workspace_invite_with_limit(invite, None).await
+    }
+
+    /// Mint a workspace invitation only if a guest seat remains. The limit,
+    /// expiry reconciliation, issuer and archive checks share the insert's
+    /// write transaction with direct guest admissions and invite joins.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn insert_workspace_invite_within_cap(
+        &self,
+        invite: &WorkspaceInvite,
+        max_guests: u32,
+    ) -> Result<InviteInsertOutcome> {
+        self.insert_workspace_invite_with_limit(invite, Some(max_guests))
             .await
-            .map_err(|e| Error::Internal(format!("insert workspace invite failed: {e}")))?;
-        Ok(())
+    }
+
+    async fn insert_workspace_invite_with_limit(
+        &self,
+        invite: &WorkspaceInvite,
+        max_guests: Option<u32>,
+    ) -> Result<InviteInsertOutcome> {
+        let mut conn =
+            self.write_pool().acquire().await.map_err(|e| {
+                Error::Internal(format!("insert workspace invite acquire failed: {e}"))
+            })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("insert workspace invite begin failed: {e}")))?;
+
+        let body_result: Result<InviteInsertOutcome> = async {
+            if workspace_archived_in_txn(&mut conn, &invite.workspace_id, "insert workspace invite")
+                .await?
+                == Some(true)
+            {
+                return Ok(InviteInsertOutcome::WorkspaceArchived);
+            }
+            let authorized: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM principal p WHERE p.id = ? AND (p.is_primary = 1 \
+                 OR EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = p.id) \
+                 OR EXISTS(SELECT 1 FROM workspace_member m WHERE m.principal_id = p.id AND m.workspace_id = ? AND m.role = 'owner')))"
+            ).bind(&invite.created_by_principal_id.0).bind(&invite.workspace_id.0)
+                .fetch_one(&mut *conn).await.map_err(|e| Error::Internal(format!("invite issuer check failed: {e}")))?;
+            if !authorized { return Ok(InviteInsertOutcome::IssuerForbidden); }
+            if let Some(max_guests) = max_guests {
+                crate::sharing_projection::reconcile_invite_expiry(&mut conn, std::slice::from_ref(&invite.workspace_id), &now_iso()).await?;
+                let committed: i64 = sqlx::query_scalar("SELECT guest_count + open_invite_count FROM workspace_sharing_summary WHERE workspace_id = ?")
+                    .bind(invite.workspace_id.as_str()).fetch_one(&mut *conn).await
+                    .map_err(|e| Error::Internal(format!("invite seat check failed: {e}")))?;
+                if u64::try_from(committed).unwrap_or(u64::MAX) >= u64::from(max_guests) {
+                    return Ok(InviteInsertOutcome::WorkspaceFull);
+                }
+            }
+            let sql = format!(
+                "INSERT INTO workspace_invite ({INVITE_COLUMNS}) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            );
+            // The pin is dual-written like a principal's identity: the triple
+            // the row resolves by, plus its github.com projection.
+            let pin_identity = invite.pin_identity_key();
+            let pin_github_user_id = invite.pin_github_user_id.or_else(|| {
+                pin_identity
+                    .as_ref()
+                    .and_then(PrincipalIdentity::github_user_id)
+            });
+            sqlx::query(&sql)
+                .bind(&invite.id)
+                .bind(&invite.workspace_id.0)
+                .bind(&invite.secret_hash)
+                .bind(&invite.secret)
+                .bind(&invite.created_by_principal_id.0)
+                .bind(pin_github_user_id)
+                .bind(&invite.pin_login)
+                .bind(&invite.created_at)
+                .bind(&invite.expires_at)
+                .bind(&invite.redeemed_at)
+                .bind(
+                    invite
+                        .redeemed_by_principal_id
+                        .as_ref()
+                        .map(|p| p.0.as_str()),
+                )
+                .bind(&invite.revoked_at)
+                .bind(i64::try_from(invite.redemption_count).unwrap_or(i64::MAX))
+                .bind(pin_identity.as_ref().map(|i| i.provider.as_str()))
+                .bind(pin_identity.as_ref().map(|i| i.host.as_str()))
+                .bind(pin_identity.as_ref().map(|i| i.external_user_id.as_str()))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("insert workspace invite failed: {e}")))?;
+            Ok(InviteInsertOutcome::Inserted)
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(
+            conn,
+            body_result,
+            "insert workspace invite commit failed",
+        )
+        .await
     }
 
     /// Fetch an invite by id, open or closed (`None` when unknown).
@@ -1005,6 +1552,121 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
+    /// `workspace.archive`'s durable write: flip the row to Archived
+    /// (scoped `status`/`archived`/`archived_at`/`updated_at` write), delete
+    /// every direct guest membership, revoke every open invite and count the
+    /// surviving members — in ONE `BEGIN IMMEDIATE` transaction, so the
+    /// archive and the access revocation commit together or not at all.
+    /// Under IMMEDIATE an `invite.accept` / capped member add (both write
+    /// transactions of their own) serializes entirely before or entirely
+    /// after this sweep: a join that committed first is swept here, one that
+    /// commits later finds its invite closed. A failed statement rolls the
+    /// whole transaction back and the workspace stays active.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist;
+    /// `Error::Internal` if the database operation fails.
+    pub async fn archive_workspace_detaching_guests(
+        &self,
+        id: &WorkspaceId,
+        archived_at: &str,
+    ) -> Result<ArchivedGuestSweep> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("archive workspace acquire failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("archive workspace begin failed: {e}")))?;
+
+        let body_result: Result<ArchivedGuestSweep> = async {
+            let archived: Option<bool> = sqlx::query_scalar("SELECT archived FROM workspace WHERE id=?")
+                .bind(&id.0).fetch_optional(&mut *conn).await
+                .map_err(|e| Error::Internal(format!("read archive binding failed: {e}")))?;
+            if archived == Some(false) {
+                lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(id.clone())])?;
+            }
+            let flipped = sqlx::query(
+                "UPDATE workspace SET status=?, archived=1, archived_at=?, updated_at=? \
+                 WHERE id=?",
+            )
+            .bind(enum_to_db(&WorkspaceStatus::Archived)?)
+            .bind(archived_at)
+            .bind(archived_at)
+            .bind(&id.0)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("archive workspace failed: {e}")))?;
+            if flipped.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("workspace {id}")));
+            }
+            let removed_collaborators: Vec<PrincipalId> = sqlx::query_scalar::<_, String>(
+                "SELECT principal_id FROM workspace_member m \
+                 WHERE workspace_id = ? AND role <> 'owner' \
+                 AND NOT EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = m.principal_id) \
+                 ORDER BY added_at, principal_id",
+            )
+            .bind(&id.0)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("archive guest listing failed: {e}")))?
+            .into_iter()
+            .map(PrincipalId)
+            .collect();
+            if archived != Some(false) && !removed_collaborators.is_empty() {
+                lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+            }
+            let deleted = sqlx::query(
+                "DELETE FROM workspace_member AS m WHERE workspace_id = ? AND role <> 'owner' \
+                 AND NOT EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = m.principal_id)",
+            )
+            .bind(&id.0)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("archive guest detach failed: {e}")))?;
+            if usize::try_from(deleted.rows_affected()).ok() != Some(removed_collaborators.len()) {
+                return Err(Error::Internal(format!(
+                    "archive guest detach removed {} rows, expected {}",
+                    deleted.rows_affected(),
+                    removed_collaborators.len()
+                )));
+            }
+            let revoke_sql = format!(
+                "UPDATE workspace_invite AS i SET revoked_at = ? \
+                 WHERE i.workspace_id = ? AND {INVITE_OPEN}"
+            );
+            let revoked = sqlx::query(&revoke_sql)
+                .bind(archived_at)
+                .bind(&id.0)
+                .bind(archived_at)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("archive invite revoke failed: {e}")))?;
+            let remaining: i64 =
+                sqlx::query_scalar("SELECT CASE WHEN s.workspace_id = ? THEN s.direct_count ELSE s.non_host_count + h.member_count END FROM workspace_sharing_summary s CROSS JOIN host_membership_state h WHERE s.workspace_id = ? AND h.id = 1")
+                    .bind(intent_core::CHIEF_WORKSPACE_ID)
+                    .bind(&id.0)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| Error::Internal(format!("archive member count failed: {e}")))?;
+            Ok(ArchivedGuestSweep {
+                removed_collaborators,
+                revoked_invites: revoked.rows_affected(),
+                member_count: u64::try_from(remaining).unwrap_or(0),
+            })
+        }
+        .await;
+
+        let result =
+            crate::commit_with_rollback_guard(conn, body_result, "archive workspace commit failed")
+                .await;
+        lifecycle.finish(result)
+    }
+
     /// Record a redemption of an **open** invite by `principal_id`: stamps
     /// the last redemption and counts one more membership. The conditional
     /// `UPDATE` returns `false` when the invite was revoked or expired
@@ -1037,65 +1699,33 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// The invite join as ONE write transaction (multiplayer w4): resolve or
-    /// mint the principal keyed by `identity.github_user_id`, apply the
-    /// fetched profile, redeem the invite (the conditional `UPDATE` is the
-    /// single-use guard of a pinned invite; a reusable one stays open), add
-    /// the `collaborator` membership and record the credential hash. Either
-    /// every row lands or none does — a credential insert failure cannot
-    /// consume the link or leave a member without a credential — and, under
-    /// `BEGIN IMMEDIATE` on the single-connection write pool, two first
-    /// joins of the same account cannot both miss the lookup and race a
-    /// duplicate `github_user_id` insert.
+    /// Admit a verified identity through one open workspace invitation transaction.
+    /// Resolve the full identity triple before inserting: an existing person keeps
+    /// its principal ID. Redeem the link, apply the profile and grant access together;
+    /// every refusal writes nothing and any failure rolls all changes back.
     ///
-    /// `identity.id` is used only when no principal has linked the account;
-    /// `identity.is_primary` / `created_at` likewise. Returns
-    /// [`InviteJoinOutcome::Joined`] with the principal (existing row
-    /// refreshed, or the minted one) when a membership was added, or
-    /// [`InviteJoinOutcome::Rejoined`] when the account was already a member
-    /// (so the caller can tell a membership change from a mere credential
-    /// mint); [`InviteJoinOutcome::Closed`] when the
-    /// invite was no longer open at redemption; or
-    /// [`InviteJoinOutcome::WorkspaceFull`] when the workspace already has
-    /// `max_guests` collaborators and the joining account is not one of them
-    /// (a returning collaborator re-joining takes no new seat, and its
-    /// re-join is idempotent: the membership is kept and the invite's
-    /// `redemption_count` does not grow); or
-    /// [`InviteJoinOutcome::OwnerSelfJoin`] when the account is the primary
-    /// principal's own (the owner never holds a per-principal credential).
-    /// Every refusal
-    /// (including [`InviteJoinOutcome::CredentialInvalid`] below) is decided
-    /// first, inside the transaction, so it writes nothing at all — and,
-    /// under `BEGIN IMMEDIATE`, two concurrent joins cannot both pass the cap
-    /// check and overshoot it.
-    ///
-    /// `rotate_from_hash` is the credential a returning guest presented as
-    /// its proof of identity (`invite.accept`): it is validated and consumed
-    /// inside this transaction — the revoke must flip exactly one
-    /// still-active row of the joining principal, otherwise the join is
-    /// refused as [`InviteJoinOutcome::CredentialInvalid`] before anything
-    /// is written. Under `BEGIN IMMEDIATE` that makes the presented
-    /// credential single-use across concurrent joins: of two accepts
-    /// presenting the same credential exactly one mints, and a revoke that
-    /// lands between the caller's lookup and the join refuses the mint.
+    /// Existing credentials are rechecked and reused; proofs mint a credential only
+    /// if the challenge's authorization generation still permits the person.
+    /// Effective host members never spend a guest seat or gain a direct grant.
+    /// Pinned invitations remain single-use, including an existing member's join.
+    /// Rejoining a reusable invitation does not increase its redemption count.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Internal` if the database operation fails (including
-    /// a duplicate credential hash or an unknown invite / workspace) and
-    /// `Error::InvalidInput` for a one-owner violation on the membership.
+    /// Returns `Error::Internal` on storage failure or a missing identity key, and
+    /// `Error::InvalidInput` for an empty credential hash or a one-owner violation.
     pub async fn join_workspace_by_invite(
         &self,
         invite_id: &str,
         workspace_id: &WorkspaceId,
         identity: &Principal,
-        credential_hash: &str,
-        rotate_from_hash: Option<&str>,
+        credential: HostJoinCredential<'_>,
         max_guests: u32,
     ) -> Result<InviteJoinOutcome> {
-        let github_user_id = identity
-            .github_user_id
-            .ok_or_else(|| Error::Internal("invite join requires a github_user_id".to_string()))?;
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let identity_key = identity
+            .identity_key()
+            .ok_or_else(|| Error::Internal("invite join requires an identity key".to_string()))?;
         let mut conn = self
             .write_pool()
             .acquire()
@@ -1108,27 +1738,40 @@ impl Store {
 
         let body_result: Result<InviteJoinOutcome> = async {
             let now = now_iso();
+            if workspace_archived_in_txn(&mut conn, workspace_id, "invite join").await?
+                == Some(true)
+            {
+                return Ok(InviteJoinOutcome::WorkspaceArchived);
+            }
             // Open-invite check before any write: under IMMEDIATE no other
             // writer can close it between here and the UPDATE below, so a
             // refused join commits a read-only transaction (no-op).
             let open_sql = format!(
-                "SELECT 1 FROM workspace_invite i \
+                "SELECT {INVITE_COLUMNS} FROM workspace_invite i \
                  WHERE i.id = ? AND i.workspace_id = ? AND {INVITE_OPEN}"
             );
-            let open: Option<i64> = sqlx::query_scalar(&open_sql)
+            let open = sqlx::query(&open_sql)
                 .bind(invite_id)
                 .bind(&workspace_id.0)
                 .bind(&now)
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(|e| Error::Internal(format!("invite join open check failed: {e}")))?;
-            if open.is_none() {
-                return Ok(InviteJoinOutcome::Closed);
+            let Some(open) = open else { return Ok(InviteJoinOutcome::Closed); };
+            let issuer: String = open.get("created_by_principal_id");
+            let authorized: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM principal p WHERE p.id = ? AND (p.is_primary = 1 \
+                 OR EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = p.id) \
+                 OR EXISTS(SELECT 1 FROM workspace_member m WHERE m.principal_id = p.id AND m.workspace_id = ? AND m.role = 'owner')))"
+            ).bind(&issuer).bind(&workspace_id.0).fetch_one(&mut *conn).await
+                .map_err(|e| Error::Internal(format!("invite issuer check failed: {e}")))?;
+            if !authorized { return Ok(InviteJoinOutcome::Closed); }
+            if map_invite_row(&open).pin_identity_key().is_some_and(|pin| pin != identity_key) {
+                return Ok(InviteJoinOutcome::PinMismatch);
             }
             let lookup =
-                format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE github_user_id = ?");
-            let existing = sqlx::query(&lookup)
-                .bind(github_user_id)
+                format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE {PRINCIPAL_BY_IDENTITY}");
+            let existing = bind_identity(sqlx::query(&lookup), &identity_key)
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(|e| Error::Internal(format!("invite join principal lookup failed: {e}")))?
@@ -1137,12 +1780,17 @@ impl Store {
             // The owner's own account resolves to the primary row: refuse
             // before any write, so the primary principal never gains a
             // per-principal credential or a redeemed invite.
-            if existing.as_ref().is_some_and(|p| p.is_primary) {
+            if identity.is_primary || existing.as_ref().is_some_and(|p| p.is_primary) {
                 return Ok(InviteJoinOutcome::OwnerSelfJoin);
             }
+            let effective_member = match &existing {
+                Some(p) => sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?)")
+                    .bind(&p.id.0).fetch_one(&mut *conn).await.map_err(|e| Error::Internal(format!("invite host role check failed: {e}")))?,
+                None => false,
+            };
             // Guest-cap check, same transaction as the membership insert: a
             // seat is only needed when the account is not already a member.
-            let already_member = match &existing {
+            let already_member = effective_member || match &existing {
                 Some(p) => sqlx::query_scalar::<_, i64>(
                     "SELECT 1 FROM workspace_member WHERE workspace_id = ? AND principal_id = ?",
                 )
@@ -1155,67 +1803,58 @@ impl Store {
                 None => false,
             };
             if !already_member {
-                let collaborators: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM workspace_member \
-                     WHERE workspace_id = ? AND role = 'collaborator'",
-                )
-                .bind(&workspace_id.0)
-                .fetch_one(&mut *conn)
-                .await
-                .map_err(|e| Error::Internal(format!("invite join guest count failed: {e}")))?;
+                let collaborators: i64 = sqlx::query_scalar("SELECT guest_count FROM workspace_sharing_summary WHERE workspace_id = ?")
+                    .bind(workspace_id.as_str()).fetch_one(&mut *conn).await
+                    .map_err(|e| Error::Internal(format!("invite join guest count failed: {e}")))?;
                 if u64::try_from(collaborators).unwrap_or(u64::MAX) >= u64::from(max_guests) {
                     return Ok(InviteJoinOutcome::WorkspaceFull);
                 }
             }
-            // Consume the presented credential before any write: a miss
-            // (unknown, revoked, foreign, or no principal for the account)
-            // refuses with nothing written; a hit is the single authoritative
-            // check that the credential was still active at join time.
-            if let Some(previous) = rotate_from_hash {
-                let Some(holder) = &existing else {
-                    return Ok(InviteJoinOutcome::CredentialInvalid);
-                };
-                let rotated = sqlx::query(
-                    "UPDATE principal_credential SET revoked_at = ? \
-                     WHERE token_hash = ? AND principal_id = ? AND revoked_at IS NULL",
-                )
-                .bind(&now)
-                .bind(previous)
-                .bind(&holder.id.0)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!("invite join rotate credential failed: {e}"))
-                })?;
-                if rotated.rows_affected() != 1 {
-                    return Ok(InviteJoinOutcome::CredentialInvalid);
+            let credential_hash = match credential {
+                HostJoinCredential::Existing { token_hash } => {
+                    let Some(holder) = &existing else { return Ok(InviteJoinOutcome::CredentialInvalid); };
+                    let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM principal_credential WHERE token_hash = ? AND principal_id = ? AND revoked_at IS NULL)")
+                        .bind(token_hash).bind(&holder.id.0).fetch_one(&mut *conn).await
+                        .map_err(|e| Error::Internal(format!("invite credential check failed: {e}")))?;
+                    if !active { return Ok(InviteJoinOutcome::CredentialInvalid); }
+                    token_hash
                 }
-            }
+                HostJoinCredential::Proof { token_hash, authorization_generation } => {
+                    let current: i64 = sqlx::query_scalar("SELECT authorization_generation FROM host_membership_state WHERE id = 1")
+                        .fetch_one(&mut *conn).await.map_err(|e| Error::Internal(format!("invite generation failed: {e}")))?;
+                    let revoked: Option<i64> = if let Some(person) = &existing {
+                        sqlx::query_scalar("SELECT generation FROM principal_revocation WHERE principal_id = ?")
+                            .bind(&person.id.0).fetch_optional(&mut *conn).await.map_err(|e| Error::Internal(format!("invite revocation failed: {e}")))?
+                    } else { None };
+                    if authorization_generation > u64::try_from(current).unwrap_or(0)
+                        || revoked.is_some_and(|r| u64::try_from(r).unwrap_or(u64::MAX) > authorization_generation) {
+                        return Ok(InviteJoinOutcome::AccessRevoked);
+                    }
+                    token_hash
+                }
+            };
+            if credential_hash.is_empty() { return Err(Error::InvalidInput("empty credential hash".into())); }
+            let was_existing = existing.is_some();
             let mut principal = existing.unwrap_or_else(|| identity.clone());
-            principal.github_user_id = Some(github_user_id);
+            principal.github_user_id = identity_key.github_user_id();
+            principal.identity = Some(identity_key.clone());
             principal.login.clone_from(&identity.login);
             principal.display_name.clone_from(&identity.display_name);
             principal.avatar_url.clone_from(&identity.avatar_url);
             principal.updated_at.clone_from(&now);
 
+            if principal_authority_changes(&mut conn, &principal).await?
+                || !already_member
+                || matches!(credential, HostJoinCredential::Proof { .. })
+            {
+                lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+            }
+
             let upsert = format!(
-                "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?) \
-                 ON CONFLICT(id) DO UPDATE SET \
-                     github_user_id = excluded.github_user_id, \
-                     login = excluded.login, \
-                     display_name = excluded.display_name, \
-                     avatar_url = excluded.avatar_url, \
-                     updated_at = excluded.updated_at"
+                "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?){}",
+                if was_existing { format!(" ON CONFLICT(id) DO UPDATE SET {PRINCIPAL_UPSERT_SET}") } else { String::new() }
             );
-            sqlx::query(&upsert)
-                .bind(&principal.id.0)
-                .bind(principal.github_user_id)
-                .bind(&principal.login)
-                .bind(&principal.display_name)
-                .bind(&principal.avatar_url)
-                .bind(i64::from(principal.is_primary))
-                .bind(&principal.created_at)
-                .bind(&principal.updated_at)
+            bind_principal(sqlx::query(&upsert), &principal)
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| {
@@ -1245,29 +1884,32 @@ impl Store {
                 )));
             }
 
-            let member = format!(
-                "INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?) \
-                 ON CONFLICT(workspace_id, principal_id) DO NOTHING"
-            );
-            sqlx::query(&member)
-                .bind(&workspace_id.0)
+            if !effective_member {
+                let member = format!(
+                    "INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?) \
+                     ON CONFLICT(workspace_id, principal_id) DO NOTHING"
+                );
+                sqlx::query(&member)
+                    .bind(&workspace_id.0)
+                    .bind(&principal.id.0)
+                    .bind(WorkspaceRole::Collaborator.as_str())
+                    .bind(&now)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| map_owner_violation(&e, workspace_id, "invite join add member"))?;
+            }
+            if matches!(credential, HostJoinCredential::Proof { .. }) {
+                sqlx::query(
+                    "INSERT INTO principal_credential (token_hash, principal_id, created_at) \
+                     VALUES (?,?,?)",
+                )
+                .bind(credential_hash)
                 .bind(&principal.id.0)
-                .bind(WorkspaceRole::Collaborator.as_str())
                 .bind(&now)
                 .execute(&mut *conn)
                 .await
-                .map_err(|e| map_owner_violation(&e, workspace_id, "invite join add member"))?;
-
-            sqlx::query(
-                "INSERT INTO principal_credential (token_hash, principal_id, created_at) \
-                 VALUES (?,?,?)",
-            )
-            .bind(credential_hash)
-            .bind(&principal.id.0)
-            .bind(&now)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("invite join insert credential failed: {e}")))?;
+                .map_err(|e| Error::Internal(format!("invite join insert credential failed: {e}")))?;
+            }
             Ok(if already_member {
                 InviteJoinOutcome::Rejoined(principal)
             } else {
@@ -1276,7 +1918,9 @@ impl Store {
         }
         .await;
 
-        crate::commit_with_rollback_guard(conn, body_result, "invite join commit failed").await
+        let result =
+            crate::commit_with_rollback_guard(conn, body_result, "invite join commit failed").await;
+        lifecycle.finish(result)
     }
 }
 
@@ -1287,6 +1931,12 @@ fn map_invite_row(r: &SqliteRow) -> WorkspaceInvite {
         secret_hash: r.get("secret_hash"),
         secret: r.get("secret"),
         created_by_principal_id: PrincipalId(r.get("created_by_principal_id")),
+        pin_identity: map_identity_columns(
+            r,
+            "pin_identity_provider",
+            "pin_instance_host",
+            "pin_external_user_id",
+        ),
         pin_github_user_id: r.get("pin_github_user_id"),
         pin_login: r.get("pin_login"),
         created_at: r.get("created_at"),
@@ -1329,9 +1979,63 @@ async fn sync_workspace_owner(
     Ok(())
 }
 
-fn map_principal_row(r: &SqliteRow) -> Principal {
+/// `WHERE` body selecting a principal by its identity triple; bind the three
+/// parts with [`bind_identity`].
+pub(crate) const PRINCIPAL_BY_IDENTITY: &str =
+    "identity_provider = ? AND instance_host = ? AND external_user_id = ?";
+
+type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
+
+pub(crate) fn bind_identity<'q>(
+    query: SqliteQuery<'q>,
+    identity: &'q PrincipalIdentity,
+) -> SqliteQuery<'q> {
+    query
+        .bind(identity.provider.as_str())
+        .bind(identity.host.as_str())
+        .bind(identity.external_user_id.as_str())
+}
+
+/// Bind a principal's values in `PRINCIPAL_COLUMNS` order for an insert /
+/// upsert, with the identity columns dual-written
+/// ([`principal_identity_columns`]).
+pub(crate) fn bind_principal<'q>(query: SqliteQuery<'q>, p: &'q Principal) -> SqliteQuery<'q> {
+    let (identity, github_user_id) = principal_identity_columns(p);
+    query
+        .bind(&p.id.0)
+        .bind(github_user_id)
+        .bind(&p.login)
+        .bind(&p.display_name)
+        .bind(&p.avatar_url)
+        .bind(i64::from(p.is_primary))
+        .bind(&p.created_at)
+        .bind(&p.updated_at)
+        .bind(identity.as_ref().map(|i| i.provider.clone()))
+        .bind(identity.as_ref().map(|i| i.host.clone()))
+        .bind(identity.map(|i| i.external_user_id))
+}
+
+/// The identity triple stored in three nullable columns; `Some` only when
+/// the provider column is set (the partial unique index's predicate).
+fn map_identity_columns(
+    r: &SqliteRow,
+    provider: &str,
+    host: &str,
+    external_user_id: &str,
+) -> Option<PrincipalIdentity> {
+    Some(PrincipalIdentity {
+        provider: r.get::<Option<String>, _>(provider)?,
+        host: r.get::<Option<String>, _>(host).unwrap_or_default(),
+        external_user_id: r
+            .get::<Option<String>, _>(external_user_id)
+            .unwrap_or_default(),
+    })
+}
+
+pub(crate) fn map_principal_row(r: &SqliteRow) -> Principal {
     Principal {
         id: PrincipalId(r.get("id")),
+        identity: map_identity_columns(r, "identity_provider", "instance_host", "external_user_id"),
         github_user_id: r.get("github_user_id"),
         login: r.get("login"),
         display_name: r.get("display_name"),

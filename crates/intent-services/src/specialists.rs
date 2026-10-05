@@ -8,11 +8,15 @@
 //! [`REPLACEMENT_DIR_ENV`] (startup-pinned) wholesale-replaces the base tier
 //! with an operator-supplied directory, excluding the embedded bundle and the
 //! bundled directory entirely.
+//! Claude user/project agent files are read-only fallbacks below Intent's
+//! definitions; unsupported execution settings block creation explicitly.
 
 use std::path::{Path, PathBuf};
 
 use intent_core::{Error, Result};
 use serde_json::{json, Map, Value};
+
+pub(crate) mod claude_agents;
 
 /// Folder name under `.intent/` (and the bundled `resources/`) holding files.
 const SPECIALISTS_FOLDER: &str = "specialists";
@@ -791,8 +795,7 @@ fn validate_aliases_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
     Ok(Some(out))
 }
 
-/// Retired frontmatter/wire keys, tolerated-and-ignored like the retired
-/// `model.workspaceOverrides` setting (PROTOCOL §5.11/§5.12): old files and
+/// Retired frontmatter/wire keys, tolerated-and-ignored (PROTOCOL §5.11): old files and
 /// old-client `specialist.create`/`edit` specs may still carry them, but they
 /// are stripped on parse (never echoed by `get`/`list`), silently skipped by
 /// `render_file` (never rejected with `-32602`), and dropped from the file on
@@ -1113,6 +1116,35 @@ fn auto_generate_role_reminder(behavior_prompt: &str) -> String {
     first_meaningful
 }
 
+/// Read a non-empty configuration scalar from an already resolved definition.
+pub(crate) fn config_scalar<'a>(definition: &'a Value, key: &str) -> Option<&'a str> {
+    definition
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// Match the provider/model effort without reopening the specialist's source.
+pub(crate) fn model_option_effort(
+    definition: &Value,
+    provider: Option<&str>,
+    model: &str,
+) -> Option<String> {
+    definition
+        .get(MODEL_OPTIONS_KEY)
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|option| {
+            option.get("model").and_then(Value::as_str) == Some(model)
+                && match option.get("provider").and_then(Value::as_str) {
+                    None => true,
+                    Some(option_provider) => provider == Some(option_provider),
+                }
+        })
+        .and_then(|option| config_scalar(option, "reasoningEffort"))
+        .map(str::to_string)
+}
+
 /// Stateless executor for the file-backed `specialist.*` namespace. Construct
 /// one per call from the long-lived `Services`; it carries the resolved user and
 /// bundled directory roots (project comes from each call's `workspacePath`).
@@ -1251,7 +1283,7 @@ impl SpecialistsService {
                 resolved = Some(def);
             }
         }
-        resolved
+        resolved.or_else(|| self.collect_catalog(workspace_path).remove(id))
     }
 
     /// Map an alias to the canonical id of the specialist claiming it via
@@ -1306,7 +1338,30 @@ impl SpecialistsService {
         let mut catalog = self.collect_catalog(workspace_path);
         catalog.remove("ralph");
         if let Some(canonical) = self.canonical_id(id, workspace_path) {
-            if catalog.contains_key(&canonical) {
+            if let Some(definition) = catalog.get(&canonical) {
+                if let Some(fields) = definition
+                    .get("unsupportedFields")
+                    .and_then(Value::as_array)
+                {
+                    let fields = fields
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::InvalidParams(format!(
+                        "Claude agent {canonical} uses settings Intent cannot apply: {fields}. Edit the original agent file or create an Intent specialist with the required behavior."
+                    )));
+                }
+                if let Some(skills) = definition.get("missingSkills").and_then(Value::as_array) {
+                    let skills = skills
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::InvalidParams(format!(
+                        "Claude agent {canonical} requires skills that are unavailable: {skills}. Restore the required skills or update the original agent file."
+                    )));
+                }
                 return Ok(canonical);
             }
         }
@@ -1399,6 +1454,12 @@ impl SpecialistsService {
         let Some(canonical) = self.canonical_id(id, workspace_path) else {
             return RoleResolution::Unknown;
         };
+        if self
+            .resolve_direct(&canonical, workspace_path)
+            .is_some_and(|def| def.get("importedFrom").is_some())
+        {
+            return RoleResolution::Cleared;
+        }
         let mut state = RoleResolution::Absent;
         if let Some((_, content)) = self.embedded.iter().find(|(k, _)| *k == canonical) {
             fold_role_directive(&mut state, content);
@@ -1465,12 +1526,8 @@ impl SpecialistsService {
     /// unknown or declares no `model`, allowing the caller to fall through to
     /// the settings chain. Validation is now performed inside `resolve()`.
     pub(crate) fn resolve_model(&self, id: &str, workspace_path: Option<&Path>) -> Option<String> {
-        self.resolve(id, workspace_path).and_then(|def| {
-            def.get("model")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        })
+        self.resolve(id, workspace_path)
+            .and_then(|def| config_scalar(&def, "model").map(str::to_string))
     }
 
     /// Resolve a specialist's `reasoningEffort` frontmatter scalar through the
@@ -1484,12 +1541,8 @@ impl SpecialistsService {
         id: &str,
         workspace_path: Option<&Path>,
     ) -> Option<String> {
-        self.resolve(id, workspace_path).and_then(|def| {
-            def.get("reasoningEffort")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        })
+        self.resolve(id, workspace_path)
+            .and_then(|def| config_scalar(&def, "reasoningEffort").map(str::to_string))
     }
 
     /// Resolve the `reasoningEffort` declared by the specialist's
@@ -1508,22 +1561,8 @@ impl SpecialistsService {
         provider: Option<&str>,
         model: &str,
     ) -> Option<String> {
-        self.resolve(id, workspace_path).and_then(|def| {
-            def.get(MODEL_OPTIONS_KEY)
-                .and_then(Value::as_array)?
-                .iter()
-                .find(|o| {
-                    o.get("model").and_then(Value::as_str) == Some(model)
-                        && match o.get("provider").and_then(Value::as_str) {
-                            None => true,
-                            Some(op) => provider == Some(op),
-                        }
-                })
-                .and_then(|o| o.get("reasoningEffort"))
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        })
+        self.resolve(id, workspace_path)
+            .and_then(|def| model_option_effort(&def, provider, model))
     }
 
     /// Resolve a specialist's `codingAgent` frontmatter scalar through the
@@ -1538,12 +1577,8 @@ impl SpecialistsService {
         id: &str,
         workspace_path: Option<&Path>,
     ) -> Option<String> {
-        self.resolve(id, workspace_path).and_then(|def| {
-            def.get("codingAgent")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        })
+        self.resolve(id, workspace_path)
+            .and_then(|def| config_scalar(&def, "codingAgent").map(str::to_string))
     }
 
     /// Enumerate every `<id>.md` in `dir`, inserting resolved defs into `acc`
@@ -1580,6 +1615,14 @@ impl SpecialistsService {
         &self,
         workspace_path: Option<&Path>,
     ) -> std::collections::BTreeMap<String, Value> {
+        self.collect_catalog_with_diagnostics(workspace_path)
+            .definitions
+    }
+
+    fn collect_native_catalog(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> std::collections::BTreeMap<String, Value> {
         let mut acc = std::collections::BTreeMap::new();
         for (id, content) in self.embedded {
             acc.insert(
@@ -1599,24 +1642,141 @@ impl SpecialistsService {
         acc
     }
 
+    fn collect_catalog_with_diagnostics(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> claude_agents::Catalog {
+        let mut acc = self.collect_native_catalog(workspace_path);
+        let mut native_aliases = std::collections::BTreeMap::new();
+        for (canonical, definition) in &acc {
+            if let Some(aliases) = definition.get(ALIASES_KEY).and_then(Value::as_array) {
+                for alias in aliases.iter().filter_map(Value::as_str) {
+                    native_aliases
+                        .entry(alias.to_string())
+                        .or_insert_with(|| canonical.clone());
+                }
+            }
+        }
+        let mut imports = self.claude_catalog_with_diagnostics(workspace_path);
+        for (id, definition) in imports.definitions {
+            let native_winner = acc.get(&id).or_else(|| {
+                native_aliases
+                    .get(&id)
+                    .and_then(|canonical| acc.get(canonical))
+            });
+            if let Some(winner) = native_winner {
+                claude_agents::add_diagnostic(
+                    &mut imports.diagnostics,
+                    claude_agents::shadowed(&definition, winner),
+                );
+            } else {
+                acc.insert(id, definition);
+            }
+        }
+        claude_agents::Catalog {
+            definitions: acc,
+            diagnostics: imports.diagnostics,
+        }
+    }
+
+    fn claude_catalog_with_diagnostics(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> claude_agents::Catalog {
+        let mut catalog = claude_agents::user_root(self.user_dir.as_deref())
+            .map(|root| claude_agents::collect(&root, "user"))
+            .unwrap_or_default();
+        if let Some(workspace) = workspace_path {
+            let project = claude_agents::collect(&workspace.join(".claude/agents"), "project");
+            for diagnostic in project.diagnostics {
+                claude_agents::add_diagnostic(&mut catalog.diagnostics, diagnostic);
+            }
+            for (id, definition) in project.definitions {
+                if let Some(previous) = catalog.definitions.insert(id, definition.clone()) {
+                    claude_agents::add_diagnostic(
+                        &mut catalog.diagnostics,
+                        claude_agents::shadowed(&previous, &definition),
+                    );
+                }
+            }
+        }
+        if catalog
+            .definitions
+            .values()
+            .any(|definition| definition.get("requiredSkills").is_some())
+        {
+            let home = self.user_dir.as_deref().and_then(|path| {
+                let intent = path.parent()?;
+                (intent.file_name()? == ".intent")
+                    .then(|| intent.parent().map(Path::to_path_buf))
+                    .flatten()
+            });
+            let available = crate::skills::discover_skills_sync(workspace_path, home)
+                .into_iter()
+                .map(|skill| skill.name)
+                .collect::<std::collections::BTreeSet<_>>();
+            for definition in catalog.definitions.values_mut() {
+                if let Some(required) = definition.get("requiredSkills").and_then(Value::as_array) {
+                    let missing = required
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|name| !available.contains(*name))
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    if !missing.is_empty() {
+                        definition["missingSkills"] = json!(missing);
+                    }
+                }
+            }
+        }
+        catalog
+    }
+
+    fn reject_imported_mutation(&self, id: &str, workspace_path: Option<&Path>) -> Result<()> {
+        if self
+            .resolve_direct(id, workspace_path)
+            .is_some_and(|def| def.get("importedFrom").is_some())
+        {
+            return Err(Error::InvalidParams(format!(
+                "Imported Claude agent {id} is read-only. Edit its original Claude file or create an Intent specialist override."
+            )));
+        }
+        Ok(())
+    }
+
     /// `specialist.list` → `{ specialists: SpecialistDef[] }`, the resolved
     /// catalog ([`Self::collect_catalog`]); `workspace_path` adds the project
     /// tier.
     #[expect(clippy::unnecessary_wraps)] // WorkspaceApi surface; keeps the uniform Result shape
     pub(crate) fn list(&self, workspace_path: Option<&Path>) -> Result<Value> {
-        let mut acc = self.collect_catalog(workspace_path);
+        let mut catalog = self.collect_catalog_with_diagnostics(workspace_path);
         // Ralph remains in the pinned v1 doctrine for existing sessions, but
         // is retired from new-session catalogs (including Settings).
-        acc.remove("ralph");
-        let specialists: Vec<Value> = acc.into_values().collect();
-        Ok(json!({ "specialists": specialists }))
+        catalog.definitions.remove("ralph");
+        let specialists: Vec<Value> = catalog.definitions.into_values().collect();
+        let mut result = json!({ "specialists": specialists });
+        if !catalog.diagnostics.is_empty() {
+            result["importDiagnostics"] = json!(catalog.diagnostics);
+        }
+        Ok(result)
     }
 
     /// `specialist.get` → `{ specialist: SpecialistDef }`, the resolved view;
     /// unknown id → `-32602` (PROTOCOL §5.11).
     pub(crate) fn get(&self, id: &str, workspace_path: Option<&Path>) -> Result<Value> {
         validate_id(id)?;
-        match self.resolve(id, workspace_path) {
+        // Resolve direct ids and aliases against one request-local catalog.
+        // In particular, an alias miss must not trigger another import scan.
+        let catalog = self.collect_catalog(workspace_path);
+        let definition = catalog.get(id).or_else(|| {
+            catalog.values().find(|definition| {
+                definition
+                    .get(ALIASES_KEY)
+                    .and_then(Value::as_array)
+                    .is_some_and(|aliases| aliases.iter().any(|alias| alias.as_str() == Some(id)))
+            })
+        });
+        match definition {
             Some(def) => Ok(json!({ "specialist": def })),
             None => Err(Error::NotFound(format!("specialist not found: {id}"))),
         }
@@ -1770,6 +1930,7 @@ impl SpecialistsService {
     ) -> Result<Value> {
         validate_id(id)?;
         let scope = parse_scope(scope)?;
+        self.reject_imported_mutation(id, workspace_path)?;
         if !spec.is_object() {
             return Err(Error::InvalidParams("spec must be an object".to_string()));
         }
@@ -1808,6 +1969,7 @@ impl SpecialistsService {
     ) -> Result<Value> {
         validate_id(id)?;
         let scope = parse_scope(scope)?;
+        self.reject_imported_mutation(id, workspace_path)?;
         let dir = match scope {
             "project" => {
                 let wp = workspace_path.ok_or_else(|| {

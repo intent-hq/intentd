@@ -488,3 +488,217 @@ async fn workspace_channel_snapshot_then_updated_delta() {
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }
+
+/// Reduce the actual channel envelopes, keyed by the contract's thread ID.
+fn reduce_comments(state: &mut Vec<Value>, push: &Value, sub_id: &str, seq: u64) {
+    assert_eq!(push["method"], "subscription.push");
+    assert_eq!(push["params"]["subscriptionId"], sub_id);
+    assert_eq!(push["params"]["kind"], "delta");
+    assert_eq!(push["params"]["seq"], seq);
+    let delta = &push["params"]["delta"];
+    if let Some(ids) = delta["removedIds"].as_array() {
+        state.retain(|thread| !ids.contains(&thread["threadId"]));
+    }
+    for key in ["added", "updated"] {
+        if let Some(threads) = delta[key].as_array() {
+            for thread in threads {
+                state.retain(|old| old["threadId"] != thread["threadId"]);
+                state.push(thread.clone());
+            }
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn comment_deletion_updates_authenticated_subscribers() {
+    comment_deletion_scenario(false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn comment_deletion_isolates_same_note_id_across_workspaces() {
+    comment_deletion_scenario(true).await;
+}
+
+async fn comment_deletion_scenario(shared_note_id: bool) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let primary = store.get_primary_principal().await.unwrap();
+    let bus = EventBus::new(store);
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
+    let (read, mut write) = connect_retry(&socket).await.into_split();
+    let mut reader = BufReader::new(read);
+    // UDS admission binds the stored primary principal, not an unbound stub.
+    let me = rpc(&mut write, &mut reader, 10, "principal.me", json!({})).await;
+    assert_eq!(me["id"], primary.id.as_str());
+    let mut scopes = Vec::new();
+    for index in 0..2 {
+        let ws = rpc(
+            &mut write,
+            &mut reader,
+            11,
+            "workspace.create",
+            json!({"title": format!("comments-{index}")}),
+        )
+        .await;
+        scopes.push(ws["workspace"]["id"].as_str().unwrap().to_string());
+    }
+    let mut notes: Vec<String> = Vec::new();
+    let mut comments = Vec::new();
+    for (index, ws) in [&scopes[0], &scopes[0], &scopes[1]].into_iter().enumerate() {
+        let note_id = if shared_note_id && index == 2 {
+            // The persisted note identity is workspace-scoped (e.g. `spec`).
+            // Duplicate the first note's ID, not its content or comments.
+            let mut note = bus
+                .store()
+                .get_note(
+                    &intent_core::WorkspaceId::from(scopes[0].clone()),
+                    &intent_core::NoteId::from(notes[0].clone()),
+                )
+                .await
+                .unwrap();
+            note.workspace_id = intent_core::WorkspaceId::from(ws.clone());
+            note.content = "anchor target text".into();
+            bus.store().insert_note(&note).await.unwrap();
+            note.id.to_string()
+        } else {
+            let note = rpc(
+                &mut write,
+                &mut reader,
+                12,
+                "note.create",
+                json!({"workspaceId":ws,"title":"N","content":"anchor target text"}),
+            )
+            .await;
+            note["note"]["id"].as_str().unwrap().to_string()
+        };
+        let comment = rpc(&mut write, &mut reader, 13, "comment.add", json!({"workspaceId":ws,"noteId":note_id,"searchContext":"anchor target text","commentTarget":"target","comment":"root","authorType":"user"})).await;
+        notes.push(note_id);
+        comments.push(comment["commentId"].as_str().unwrap().to_string());
+    }
+    let reply = rpc(&mut write, &mut reader, 14, "comment.respond", json!({"workspaceId":scopes[0],"noteId":notes[0],"threadId":comments[0],"comment":"reply","authorType":"user"})).await;
+    let reply_id = reply["comment"]["id"].as_str().unwrap();
+    let (mut sub_reader, _sub_write, sub_id, mut state) = subscribe(
+        &socket,
+        "comment.subscribe",
+        json!({"workspaceId":scopes[0],"noteId":notes[0]}),
+    )
+    .await;
+    assert_eq!(
+        state.len(),
+        1,
+        "snapshot must contain only this workspace's thread"
+    );
+    assert_eq!(state[0]["threadId"], comments[0]);
+    assert_eq!(state[0]["commentCount"], 2);
+    let root = state[0]["comments"][0].clone();
+    assert_eq!(root["authorPrincipalId"], primary.id.as_str());
+    // These subscriptions also provide causal barriers for isolation checks:
+    // the first delivered change must be their own final-comment removal.
+    let (mut other_reader, _other_write, other_sub, mut other_state) = subscribe(
+        &socket,
+        "comment.subscribe",
+        json!({"workspaceId":scopes[0],"noteId":notes[1]}),
+    )
+    .await;
+    let (mut foreign_reader, _foreign_write, foreign_sub, mut foreign_state) = subscribe(
+        &socket,
+        "comment.subscribe",
+        json!({"workspaceId":scopes[1],"noteId":notes[2]}),
+    )
+    .await;
+
+    assert_eq!(other_state.len(), 1);
+    assert_eq!(foreign_state.len(), 1);
+    assert_eq!(foreign_state[0]["threadId"], comments[2]);
+
+    for (seq, comment_id) in [(1, reply_id), (2, comments[0].as_str())] {
+        rpc(
+            &mut write,
+            &mut reader,
+            15,
+            "comment.delete",
+            json!({"workspaceId":scopes[0],"noteId":notes[0],"commentId":comment_id}),
+        )
+        .await;
+        let push = read_json(&mut sub_reader).await;
+        reduce_comments(&mut state, &push, &sub_id, seq);
+        let fresh = rpc(
+            &mut write,
+            &mut reader,
+            16,
+            "comment.list",
+            json!({"workspaceId":scopes[0],"noteId":notes[0],"includeComments":true}),
+        )
+        .await;
+        assert_eq!(
+            json!(state),
+            fresh["threads"],
+            "accumulated channel state must equal a fresh list"
+        );
+        if seq == 1 {
+            assert_eq!(state[0]["comments"], json!([root]));
+            assert_eq!(state[0]["commentCount"], 1);
+            assert_eq!(
+                state[0]["latestCommentAuthorPrincipalId"],
+                primary.id.as_str()
+            );
+        } else {
+            assert_eq!(push["params"]["delta"]["removedIds"], json!([comments[0]]));
+            assert!(state.is_empty());
+        }
+    }
+    for (ws, note, comment, sub_reader, sub, state) in [
+        (
+            &scopes[0],
+            &notes[1],
+            &comments[1],
+            &mut other_reader,
+            &other_sub,
+            &mut other_state,
+        ),
+        (
+            &scopes[1],
+            &notes[2],
+            &comments[2],
+            &mut foreign_reader,
+            &foreign_sub,
+            &mut foreign_state,
+        ),
+    ] {
+        rpc(
+            &mut write,
+            &mut reader,
+            17,
+            "comment.delete",
+            json!({"workspaceId":ws,"noteId":note,"commentId":comment}),
+        )
+        .await;
+        let push = read_json(sub_reader).await;
+        assert_eq!(push["params"]["delta"]["removedIds"], json!([comment]));
+        reduce_comments(state, &push, sub, 1);
+        let fresh = rpc(
+            &mut write,
+            &mut reader,
+            18,
+            "comment.list",
+            json!({"workspaceId":ws,"noteId":note,"includeComments":true}),
+        )
+        .await;
+        assert_eq!(json!(state), fresh["threads"]);
+    }
+    // An own-note creation traverses the same forwarder after the unrelated
+    // deletions, proving they emitted no stray delta on the target channel.
+    rpc(&mut write, &mut reader, 19, "comment.add", json!({"workspaceId":scopes[0],"noteId":notes[0],"searchContext":"anchor target text","commentTarget":"target","comment":"barrier"})).await;
+    reduce_comments(&mut state, &read_json(&mut sub_reader).await, &sub_id, 3);
+    let fresh = rpc(
+        &mut write,
+        &mut reader,
+        20,
+        "comment.list",
+        json!({"workspaceId":scopes[0],"noteId":notes[0],"includeComments":true}),
+    )
+    .await;
+    assert_eq!(json!(state), fresh["threads"]);
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}

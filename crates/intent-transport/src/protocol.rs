@@ -511,8 +511,11 @@
 //! `workspace.invite.list` rows (and the `invite` of `workspace.invite.create`)
 //! carry the additive `url` — the open invite's `intent://invite?…` link
 //! rebuilt from the stored secret — omitted when the row predates the
-//! stored secret or no link can be built right now (listener down, no
-//! dialable route); the secret itself never appears as a field. Also within
+//! stored secret or no link can be built right now (listener down, tunnel
+//! down — invite links are tunnel-only: `workspace.invite.create` refuses
+//! with `error.data.code` `tunnel-down` without a tunnel address, and the
+//! link carries `tc` but no `host`); the secret itself never appears as a
+//! field. Also within
 //! 10.3, guest caps: `workspace.invite.create` refuses with
 //! `error.data.code` `guest-limit` once a workspace's collaborators plus
 //! open invites reach `sharing.maxGuestsPerWorkspace`, the join refuses with
@@ -577,13 +580,14 @@
 //! collaborator's `agent.editQueuedMessage` of an agent-authored (A2A /
 //! automatic) entry is not preambled — its sender stays the originating
 //! agent's header; the edit is recorded by the stamp only. Also within
-//! 10.3, direct member add (additive): `principal.list` (owner-only, no
+//! 10.3, direct member add (additive; sharing access extended to active host
+//! members by shared-host-membership §5.49): `principal.list` (no
 //! params) → `{ principals: [{ principalId, login?, displayName?,
-//! avatarUrl?, githubUserId? }] }`, every non-primary principal holding at
+//! avatarUrl?, githubUserId?, identity?, hostRole }] }`, every non-primary principal holding at
 //! least one active (non-revoked) credential, by creation time; a guest
-//! that revoked itself is omitted. A per-principal (collaborator) caller
-//! is `-32003`. `workspace.members.add { workspaceId, principalId }`
-//! (owner-only) → `{ added, memberCount }`: attaches such a guest as a
+//! that revoked itself is omitted. A workspace guest is `-32003`.
+//! `workspace.members.add { workspaceId, principalId }`
+//! (owner/member) → `{ added, memberCount }`: attaches such a guest as a
 //! collaborator; `added: false` when already a member (idempotent, nothing
 //! published); `-32602` for an unknown principal, the primary principal, a
 //! principal without an active credential (`invalid-params`) or a spent
@@ -619,12 +623,118 @@
 //! and `agentProcessCount` (buckets with a live root pid), `null` until the
 //! first sample lands. The catalog contains 325 router methods, 53
 //! fast-path methods, and two aliases: 380 client-callable names.
+//!
+//! Version 10.5 adds the provider-generic auth surface (§5.27):
+//! `sourceControl.authStatus` / `connect` / `cancelAuth` / `revoke` /
+//! `getUser` with `provider: "github" | "gitlab"` and an optional gitlab
+//! `host`, the `device-grant-unsupported` / `source-control-unauthorized`
+//! typed errors, the `sourceControl:auth-changed { provider, host, status }`
+//! event and the `sourceControl.gitlab.*` settings. The `github.*` auth
+//! quintet is served as byte-identical aliases. The catalog contains 334
+//! router methods, 56 fast-path methods, and two aliases: 392
+//! client-callable names.
+//!
+//! Versions 10.5 (`sourceControl.*` forge auth) and 10.6 (provider-neutral
+//! principal identity) are documented in the monorepo's
+//! `docs/protocol/versioning.md`.
+//!
+//! Version 10.7 is an additive minor bump over 10.6: the image dimension
+//! sidecar (§5.5, §7.1). A `text` content block gains
+//! `media?: { [src]: { width, height } }` — intrinsic dimensions of every
+//! probeable Markdown image reference, keyed by the `src` exactly as
+//! written, omitted when nothing resolved; live `chat.subscribe` text chunk
+//! deltas carry only the entries that chunk resolved and the persisted block
+//! carries the union. An `image` block gains `width?` / `height?` (the
+//! original's intrinsic dimensions, kept by the slim projection). Both are
+//! computed on the write path and stored; no method-catalog change.
+//!
+//! Version 10.8 is an additive minor bump over 10.7: the provider-neutral
+//! identity key. Every projected principal gains an optional `identity:
+//! { provider, host, externalUserId }` object (`principal.list` rows
+//! alongside the kept `githubUserId`; a github.com account carries both,
+//! `identity.externalUserId` being the decimal `githubUserId`), and a
+//! pinned invite gains the matching optional `pinIdentity` next to the kept
+//! `pinGithubUserId` / `pinLogin`. Identities are stored and resolved by
+//! the triple (`0130_principal_identity`), so an account on another
+//! provider or host with the same numeric id is a distinct principal.
+//! `invite.inspect` and `invite.challenge` return the required `pinIdentity`
+//! triple (including a legacy GitHub pin) or explicit `null` when unpinned,
+//! after validating the open invite and secret, with no forge call. Errors
+//! disclose no pin; older daemons omit the field. Guests can select the
+//! matching connected account before publishing a proof, while the host
+//! retains its final provider/host/account pin enforcement.
+//! The same version adds the provider-neutral guest half of the identity
+//! proof: `sourceControl.identityProof.create` / `delete` with `provider:
+//! "github" | "gitlab"` and an optional gitlab `host` (a public personal
+//! snippet on GitLab, the existing gist on GitHub; the result carries
+//! `proofId`, `provider`, `host`, `login`, `externalUserId`, `avatarUrl`
+//! and, for github, the compatibility `gistId`). The `github.identityProof.*`
+//! pair is kept as aliases with `provider: "github"` pinned: the same
+//! params (`delete` spells the proof id `gistId`), with the `create` result
+//! projected to its documented `{ gistId, login }` — not byte-identical to
+//! the provider-neutral result. New typed errors:
+//! `gitlab-not-connected`, `gitlab-scope-missing`, `gitlab-unreachable` on
+//! the guest half and `identity-unverifiable { host }` when the host can
+//! read neither anonymously nor with its own connection to the same
+//! instance. No event is added. The catalog contains 336 router methods,
+//! 56 fast-path methods, and two aliases: 394 client-callable names.
+//!
+//! Version 10.9 adds the collaboration credential purpose: six owner-only
+//! `identity.*` methods, isolated credential/proof resolution and explicit
+//! identity selection, plus `identity:auth-changed`. The hello capability
+//! `collaborationIdentity: 1` gates purpose-aware proof calls. This does not
+//! advertise the separately implemented host-membership capability.
+//!
+//! Version 10.10 adds user-initiated `agent.retire`, advertised by the hello
+//! capability `agentRetire: 1`. Workspace members can retire a target directly,
+//! stopping its running turn and cancelling wake sources while preserving
+//! conversation history. MCP retirement remains self-only and feature-gated.
+//!
+//! Version 13.1 adds `agent.sendQueuedMessagesNow`: explicit delivery of a
+//! selected ready queue snapshot as one interrupt-priority batch.
+//!
+//! Version 10.11 adds script purpose and durable, workspace-scoped
+//! `script.archive` / `script.restore`, plus the `script.list` archive filter.
+//! An omitted filter preserves the legacy all-definitions list. The
+//! `scriptLifecycle: 1` capability includes atomic command results, one-off
+//! retirement for every settled outcome, and durable admission recovery.
+//!
+//! Version 13.2 adds explicitly addressed read-only PR checks, reviews, and
+//! changed-file pages, including head guards and forge truncation reporting.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "10.4";
+// Version 11.0 changes omitted-purpose creation: new commands default to
+// oneOff; services remain saved. Omitted-purpose upserts preserve stored
+// purpose. Autostart commands must explicitly request saved. There is no
+// per-client negotiation of this default; scriptLifecycle remains version 1.
+// Version 11.1 adds optional gitRootId to file.read and file.readChunk:
+// registered workspace-owned roots share existing filesystem confinement.
+// Version 11.2 adds complete script.list rows to created/updated script:changed
+// events, including committed result/archive state. Presence detects support.
+// Version 11.3 adds workspace-scoped manual specialist preferences; platform
+// support remains independently capability-gated.
+// Version 12.0 retires git.diff/git.log aliases, pr.status,
+// file-tracking.getLineStats, metrics.getWorkspaceStats/getAllWorkspaceStats/
+// clearAgentStats, and forward.create/list/close. Canonical git reads,
+// pr.refresh, metrics.getAgentStats, MCP operations and binary /tunnel remain.
+// Version 12.1 adds durable one-shot script monitors with guarded cancellation,
+// bounded output triggers and automatic owner wakes (scriptMonitors: 1).
+// Version 13.0 removes the deprecated keyed git.commit RPC. Human and agent
+// commits continue to use git.agentCommit with its existing permissions and
+// non-idempotent contract; MCP ws.git.commit is unchanged.
+// Version 13.3 adds qualified repository context, selection, native review,
+// companion confirmation, and explicit MR/issue detail-read capabilities.
+// Version 13.4 adds trusted, persisted submission correlation for optimistic
+// display. Support requires exactly submissionCorrelation: 1; discover other
+// extensions through their independent capabilities and permission checks.
+// Version 13.5 adds original-socket GitLab checkout discovery and native
+// private checkout. Clients require gitlabCheckout: 1 before using it.
+// Version 13.6 adds best-effort host.prepareProviderAdapters. Acknowledgement
+// promises admission only; clients tolerate -32601 on older daemons.
+pub const PROTOCOL_VERSION: &str = "13.6";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

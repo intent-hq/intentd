@@ -23,6 +23,13 @@
 //! The host half reads the gist back through
 //! [`crate::SourceControl::get_proof_gist`] → [`ProofGistView`]; the
 //! comparison against the issued nonce is the service layer's.
+//!
+//! The GitLab twin (a public personal snippet) lives in [`gitlab`]; both sit
+//! behind the provider seam in [`provider`] ([`provider::ProofProvider`]),
+//! which is what the service layer drives.
+
+pub mod gitlab;
+pub mod provider;
 
 use serde_json::{json, Value};
 
@@ -104,11 +111,24 @@ pub enum IdentityProofError {
     /// (its files are not exactly one [`PROOF_FILE_NAME`]); nothing deleted.
     #[error("gist {gist_id:?} is not an Intent identity-proof gist")]
     NotProofGist { gist_id: String },
-    /// GitHub rejected the token (`401` / `403`).
-    #[error("github rejected the token: {0}")]
+    /// The GitLab snippet named for deletion exists but is not an Intent
+    /// proof snippet ([`gitlab::is_proof_snippet`]); nothing deleted.
+    #[error("snippet {snippet_id:?} is not an Intent identity-proof snippet")]
+    NotProofSnippet { snippet_id: String },
+    /// Host half: no proof has this id (the read answered `404`, or the id
+    /// is not shaped like one of the provider's ids).
+    #[error("identity proof {proof_id:?} not found")]
+    NotFound { proof_id: String },
+    /// Host half: the forge at `host` will not serve the proof to this host
+    /// — anonymous reads are restricted and the host holds no credential for
+    /// that instance (or it was refused too).
+    #[error("cannot verify identity on {host}")]
+    Unverifiable { host: String },
+    /// The forge rejected the token (`401` / `403`).
+    #[error("forge rejected the token: {0}")]
     Unauthorized(String),
-    /// GitHub could not be reached (connect / read / TLS failure).
-    #[error("github unreachable: {0}")]
+    /// The forge could not be reached (connect / read / TLS failure).
+    #[error("forge unreachable: {0}")]
     Unreachable(String),
     /// Any other forge / decode failure.
     #[error(transparent)]
@@ -186,7 +206,7 @@ pub async fn create_proof_gist(
 ) -> Result<ProofGist> {
     let sc = client(token, api_base_url)?;
     let crab = sc.client();
-    let (login, scopes) = user_and_scopes(crab).await?;
+    let (login, scopes) = user_and_scopes(&crab).await?;
     if !has_gist_scope(scopes.as_deref()) {
         return Err(IdentityProofError::ScopeMissing {
             granted: scopes.unwrap_or_default(),
@@ -263,13 +283,13 @@ pub async fn delete_proof_gist(
 ) -> Result<()> {
     let sc = client(token, api_base_url)?;
     let crab = sc.client();
-    let (_login, scopes) = user_and_scopes(crab).await?;
+    let (_login, scopes) = user_and_scopes(&crab).await?;
     if !has_gist_scope(scopes.as_deref()) {
         return Err(IdentityProofError::ScopeMissing {
             granted: scopes.unwrap_or_default(),
         });
     }
-    let Some(gist) = read_gist(crab, gist_id).await? else {
+    let Some(gist) = read_gist(&crab, gist_id).await? else {
         return Ok(());
     };
     if !is_proof_gist(&gist) {
@@ -503,6 +523,32 @@ mod tests {
             matches!(err, IdentityProofError::Unauthorized(_)),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn create_under_an_exhausted_quota_is_rate_limited_not_unauthorized() {
+        // GitHub answers an exhausted primary quota with 403 (not 429) and a
+        // body naming the rate limit; `Error::from` classifies that before
+        // the auth arm, so the proof surfaces `Other(RateLimited)` — never
+        // `Unauthorized`, whose sign-in remedy would not help
+        // (intent-hq/intent#5627).
+        let (base, seen) = spawn_mock(|_| {
+            json_answer(
+                403,
+                &json!({ "message": "API rate limit exceeded for user ID 1." }),
+            )
+        })
+        .await;
+        let err = create_proof_gist("tok", Some(&base), "n", "h")
+            .await
+            .expect_err("rate limited");
+        assert!(
+            matches!(&err, IdentityProofError::Other(Error::RateLimited(msg)) if msg.contains("rate limit")),
+            "{err:?}"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "no gist is posted: {seen:?}");
+        assert_eq!(seen[0].0, "GET /user");
     }
 
     #[tokio::test]

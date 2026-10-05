@@ -10,6 +10,14 @@
 //! data; the read path never decodes or resizes (RPC cost contract rung 1).
 //! Generation failure is non-fatal: the block is skipped with a WARN and slim
 //! reads degrade to serving the image with `data` omitted.
+//!
+//! The same write path also stamps the intrinsic pixel `width` / `height` of
+//! every base64 `image` block onto the block itself (protocol v10.7 image
+//! dimension sidecar) via a header-only decode — the stored block carries the
+//! ORIGINAL dimensions, so the slim projection (which swaps only `data` /
+//! `mimeType` for the thumbnail) serves them unchanged next to
+//! `dataIsThumbnail`. Undecodable data leaves the block untouched; rows are
+//! never backfilled.
 
 use base64::Engine as _;
 use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
@@ -88,15 +96,93 @@ pub(crate) fn generate_message_thumbnails(content: &Value) -> Option<Value> {
     }
 }
 
+/// Cheap predicate for the write path: does `content` carry a base64 `image`
+/// block not yet stamped with both `width` and `height`? Lets callers skip
+/// the content clone and blocking-pool hop for the common no-image message
+/// and for re-persisted content (transfer, replace) that already carries its
+/// dimensions.
+pub(crate) fn needs_dimensions(content: &Value) -> bool {
+    content
+        .as_array()
+        .is_some_and(|blocks| blocks.iter().any(image_block_needs_dimensions))
+}
+
+/// A slim-read block (`dataIsThumbnail: true`) carries the downscaled
+/// thumbnail as `data`, so decoding it would record the thumbnail's size as
+/// the original's. Such a block is stampable only through dimensions it
+/// already carries; a pre-v10.7 one re-persisted by a transfer/replace stays
+/// without `width`/`height` rather than lying about them.
+fn image_block_needs_dimensions(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("image")
+        && block.get("data").and_then(Value::as_str).is_some()
+        && block.get("dataIsThumbnail").and_then(Value::as_bool) != Some(true)
+        && !(block.get("width").and_then(Value::as_u64).is_some()
+            && block.get("height").and_then(Value::as_u64).is_some())
+}
+
+/// Stamp the intrinsic pixel `width` / `height` onto every base64 `image`
+/// block of `content` that does not carry both yet (header-only decode — the
+/// pixels are never materialized). A block whose data does not decode is left
+/// untouched (logged at DEBUG: garbage data is a client concern, not a daemon
+/// fault). Returns `true` when at least one block was stamped.
+pub(crate) fn stamp_image_dimensions(content: &mut Value) -> bool {
+    let Some(blocks) = content.as_array_mut() else {
+        return false;
+    };
+    let mut stamped = false;
+    for (ordinal, block) in blocks.iter_mut().enumerate() {
+        if !image_block_needs_dimensions(block) {
+            continue;
+        }
+        let Some(data) = block.get("data").and_then(Value::as_str) else {
+            continue;
+        };
+        match decode_dimensions(data) {
+            Ok((width, height)) => {
+                if let Some(obj) = block.as_object_mut() {
+                    obj.insert("width".to_string(), json!(width));
+                    obj.insert("height".to_string(), json!(height));
+                    stamped = true;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    block_ordinal = ordinal,
+                    data_len = data.len(),
+                    error = %e,
+                    "image dimensions undecodable; block persisted without width/height"
+                );
+            }
+        }
+    }
+    stamped
+}
+
+/// Read `(width, height)` from base64 image data by decoding only the image
+/// header (format sniffed from the bytes, not the block's `mimeType`).
+fn decode_dimensions(data: &str) -> Result<(u32, u32), String> {
+    let bytes = decode_base64(data)?;
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("image format sniff: {e}"))?
+        .into_dimensions()
+        .map_err(|e| format!("image header decode: {e}"))
+}
+
+/// Decode base64 image data, accepting both padded and unpadded input.
+fn decode_base64(data: &str) -> Result<Vec<u8>, String> {
+    base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(data))
+        .map_err(|e| format!("base64 decode: {e}"))
+}
+
 /// Decode base64 image data, downscale to fit [`THUMBNAIL_MAX_EDGE`], and
 /// re-encode as PNG (JPEG fallback when the PNG overflows the base64 target).
 /// Returns `(base64, mimeType)`.
 fn generate_thumbnail(data: &str) -> Result<(String, String), String> {
     let std_engine = base64::engine::general_purpose::STANDARD;
-    let bytes = std_engine
-        .decode(data)
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(data))
-        .map_err(|e| format!("base64 decode: {e}"))?;
+    let bytes = decode_base64(data)?;
     let img = image::load_from_memory(&bytes).map_err(|e| format!("image decode: {e}"))?;
     // `thumbnail` preserves aspect ratio within the bounding box and never
     // upscales smaller inputs.
@@ -230,5 +316,99 @@ mod tests {
         let thumbs = generate_message_thumbnails(&content).expect("second image thumbnailed");
         assert!(thumbs.get("0").is_none(), "failed block persists nothing");
         assert!(thumbs.get("1").is_some(), "ordinal counts the failed block");
+    }
+
+    /// Every decodable base64 image block — under or over the slim budget —
+    /// is stamped with its intrinsic dimensions; non-image blocks and blocks
+    /// without `data` are untouched.
+    #[test]
+    fn stamps_intrinsic_dimensions_on_decodable_image_blocks() {
+        let big = noise_png_base64(512, 384);
+        let small = noise_png_base64(8, 8);
+        assert!(small.len() <= SLIM_PROJECTION_BUDGET_BYTES);
+        let mut content = json!([
+            { "type": "text", "text": "hi" },
+            { "type": "image", "data": big, "mimeType": "image/png" },
+            { "type": "image", "data": small, "mimeType": "image/png" },
+            { "type": "image", "attachmentId": "att-1", "mimeType": "image/png" },
+        ]);
+        assert!(needs_dimensions(&content));
+        assert!(stamp_image_dimensions(&mut content));
+        assert_eq!(content[1]["width"], 512);
+        assert_eq!(content[1]["height"], 384);
+        assert_eq!(content[2]["width"], 8);
+        assert_eq!(content[2]["height"], 8);
+        assert!(content[0].get("width").is_none());
+        assert!(
+            content[3].get("width").is_none(),
+            "no data → nothing to decode"
+        );
+        assert!(
+            !needs_dimensions(&content),
+            "a stamped message is idempotent on re-persist"
+        );
+        assert!(!stamp_image_dimensions(&mut content));
+    }
+
+    /// Undecodable data leaves the block untouched (no `width`/`height`,
+    /// nothing else changed); a stamped sibling is unaffected.
+    #[test]
+    fn undecodable_image_data_is_left_untouched() {
+        let garbage = "A".repeat(64);
+        let valid = noise_png_base64(16, 4);
+        let mut content = json!([
+            { "type": "image", "data": garbage, "mimeType": "image/png" },
+            { "type": "image", "data": valid, "mimeType": "image/png" },
+        ]);
+        let before = content[0].clone();
+        assert!(stamp_image_dimensions(&mut content));
+        assert_eq!(content[0], before);
+        assert_eq!(content[1]["width"], 16);
+        assert_eq!(content[1]["height"], 4);
+        assert!(!needs_dimensions(&json!([{ "type": "text", "text": "x" }])));
+        assert!(!needs_dimensions(&json!("not an array")));
+        assert!(!stamp_image_dimensions(&mut json!("not an array")));
+    }
+
+    /// A block arriving with client-supplied dimensions keeps them (the
+    /// slim-read shape `dataIsThumbnail: true` re-persisted by a transfer
+    /// must keep the ORIGINAL dimensions, not the thumbnail's).
+    #[test]
+    fn existing_dimensions_are_kept() {
+        let thumb = noise_png_base64(8, 8);
+        let mut content = json!([
+            { "type": "image", "data": thumb, "mimeType": "image/png",
+              "dataIsThumbnail": true, "width": 1024, "height": 768 },
+        ]);
+        assert!(!needs_dimensions(&content));
+        assert!(!stamp_image_dimensions(&mut content));
+        assert_eq!(content[0]["width"], 1024);
+        assert_eq!(content[0]["height"], 768);
+    }
+
+    /// A pre-v10.7 slim-read block (`dataIsThumbnail: true`, no dimensions)
+    /// re-persisted by a transfer/replace is NOT stamped: its `data` is the
+    /// downscaled thumbnail, so decoding it would record the thumbnail's size
+    /// as the original's. The block stays dimensionless; a sibling full
+    /// image block in the same message is still stamped.
+    #[test]
+    fn legacy_thumbnail_block_without_dimensions_is_not_stamped() {
+        let thumb = noise_png_base64(8, 8);
+        let full = noise_png_base64(16, 4);
+        let mut content = json!([
+            { "type": "image", "data": thumb, "mimeType": "image/png",
+              "dataIsThumbnail": true, "dataTruncated": true, "dataBytes": 123_456 },
+            { "type": "image", "data": full, "mimeType": "image/png" },
+        ]);
+        let legacy_before = content[0].clone();
+        assert!(needs_dimensions(&content), "sibling full image needs dims");
+        assert!(stamp_image_dimensions(&mut content));
+        assert_eq!(content[0], legacy_before, "thumbnail block untouched");
+        assert_eq!(content[1]["width"], 16);
+        assert_eq!(content[1]["height"], 4);
+        let mut only_legacy = json!([legacy_before.clone()]);
+        assert!(!needs_dimensions(&only_legacy));
+        assert!(!stamp_image_dimensions(&mut only_legacy));
+        assert_eq!(only_legacy[0], legacy_before);
     }
 }

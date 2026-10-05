@@ -8,6 +8,22 @@
 /// Domain error type for intentd.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Safe member recovery for a classified execution authorization error.
+    /// The source preserves the owner's established error contract internally.
+    #[error("{}", authorization.message())]
+    ExecutionAuthorization {
+        source: Box<Error>,
+        authorization: Box<crate::execution::ExecutionAuthorizationFailure>,
+    },
+    /// The verified account or selection changed during collaboration sign-in.
+    #[error("collaboration identity does not match the selected account")]
+    IdentityMismatch,
+    /// Explicit selection cannot merge independently admitted people.
+    #[error("collaboration identity is already bound to another principal")]
+    IdentityInUse,
+    /// Workspace access is inherited from active host membership.
+    #[error("workspace access is inherited; change host membership instead")]
+    HostMembershipRequired,
     /// A required parameter was missing or malformed.
     #[error("invalid params: {0}")]
     InvalidParams(String),
@@ -15,6 +31,11 @@ pub enum Error {
     /// A requested entity does not exist.
     #[error("not found: {0}")]
     NotFound(String),
+
+    /// libgit2 classified an authentication failure. Legacy wire rendering
+    /// matches Internal; shared execution may attach safe recovery.
+    #[error("internal error: {0}")]
+    GitAuthorization(String),
 
     /// An unexpected internal failure (I/O, persistence, serialization).
     #[error("internal error: {0}")]
@@ -89,6 +110,17 @@ pub enum Error {
     )]
     ListenerDown,
 
+    /// The tunnel is not running, so `workspace.invite.create` has no `tc`
+    /// address to embed in the (tunnel-only) invite link. Surfaces as
+    /// `-32603` with machine-readable `error.data = { code: "tunnel-down" }`
+    /// so clients route it without matching on prose. Distinct from
+    /// [`Error::ListenerDown`]: the WSS listener IS up here.
+    #[error(
+        "tunnel is not running — invite links are tunnel-only; enable the tunnel \
+         (server.tunnel.enabled) and wait for it to come up before inviting"
+    )]
+    TunnelDown,
+
     /// A `repo.warmCache` request was rejected because an opportunistic warm
     /// is already in flight (global single-flight — at most one warm
     /// daemon-wide). Surfaces as `-32603` with machine-readable
@@ -116,6 +148,24 @@ pub enum Error {
         waited_ms: u64,
         limit: u32,
     },
+
+    /// `sourceControl.connect { method: "device" }` against a forge host that
+    /// cannot run an OAuth device grant: no client id resolves for it, or the
+    /// instance rejected the grant (GitLab < 17.1 / application not enabled
+    /// for it). Surfaces as `-32603` with machine-readable
+    /// `error.data = { code: "device-grant-unsupported", provider, host }` —
+    /// the FE keys its PAT fallback on this code (PROTOCOL §5.27).
+    #[error("device grant unsupported on {provider} host {host}")]
+    DeviceGrantUnsupported { provider: String, host: String },
+
+    /// The forge rejected a source-control credential: a PAT offered to
+    /// `sourceControl.connect { method: "pat" }` that fails the host's user
+    /// probe (nothing is stored), or a stored/env credential the host rejects
+    /// on `sourceControl.getUser`. Surfaces as `-32603` with machine-readable
+    /// `error.data = { code: "source-control-unauthorized", provider, host }`.
+    /// A merely *absent* credential is not an error (PROTOCOL §5.27).
+    #[error("{provider} host {host} rejected the credential")]
+    SourceControlUnauthorized { provider: String, host: String },
 
     /// The source-control forge rate-limited a request (REST 403/429 with an
     /// exhausted quota). Distinct from `Internal` so background sweeps can
@@ -145,18 +195,30 @@ pub enum Error {
     #[error("{}", .0.message())]
     Invite(InviteErrorKind),
 
-    /// A guest-side gist identity-proof operation
-    /// (`github.identityProof.create` / `github.identityProof.delete`) was
-    /// refused for a reason the client must key off machine-readably: no
-    /// GitHub token is stored, the stored token lacks the `gist` scope, or
-    /// GitHub could not be reached. Surfaces as `-32603` with
+    /// A guest-side identity-proof operation
+    /// (`sourceControl.identityProof.create` / `.delete`, or the
+    /// `github.identityProof.*` aliases) was refused for a reason the client
+    /// must key off machine-readably: no token is stored for the provider,
+    /// the stored token lacks the scope the proof needs, or the forge could
+    /// not be reached. Surfaces as `-32603` with
     /// `error.data = { code: kind.as_str() }`.
     #[error("{}", .0.message())]
     IdentityProof(IdentityProofErrorKind),
+
+    /// Host half of the identity proof: the forge at `host` will not serve
+    /// the guest's proof to this daemon — anonymous reads are restricted on
+    /// that instance and the host holds no credential for it (or the one it
+    /// holds was refused) — so the claimed identity can be neither confirmed
+    /// nor denied. Surfaces as `-32603` with
+    /// `error.data = { code: "identity-unverifiable", host }` (protocol 10.8).
+    #[error("cannot verify identity on {host}")]
+    IdentityUnverifiable { host: String },
 }
 
-/// Machine-readable reason a gist identity-proof operation was refused,
-/// surfaced on the wire as `error.data.code`.
+/// Machine-readable reason an identity-proof operation was refused,
+/// surfaced on the wire as `error.data.code`. The GitHub kinds are the
+/// gist proof's original codes; the GitLab kinds are their snippet-proof
+/// twins (protocol 10.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityProofErrorKind {
     /// No GitHub token is stored (`github.connect` never completed, or the
@@ -167,6 +229,15 @@ pub enum IdentityProofErrorKind {
     ScopeMissing,
     /// GitHub could not be reached.
     Unreachable,
+    /// No GitLab token is stored for the instance (`sourceControl.connect`
+    /// never completed for it, the instance is not the bound one, or the
+    /// token was revoked / rejected).
+    GitlabNotConnected,
+    /// The stored GitLab token lacks the `api` scope snippets need; the user
+    /// must reconnect with a token that grants it.
+    GitlabScopeMissing,
+    /// The GitLab instance could not be reached.
+    GitlabUnreachable,
 }
 
 impl IdentityProofErrorKind {
@@ -177,6 +248,9 @@ impl IdentityProofErrorKind {
             IdentityProofErrorKind::NotConnected => "github-not-connected",
             IdentityProofErrorKind::ScopeMissing => "github-scope-missing",
             IdentityProofErrorKind::Unreachable => "github-unreachable",
+            IdentityProofErrorKind::GitlabNotConnected => "gitlab-not-connected",
+            IdentityProofErrorKind::GitlabScopeMissing => "gitlab-scope-missing",
+            IdentityProofErrorKind::GitlabUnreachable => "gitlab-unreachable",
         }
     }
 
@@ -193,6 +267,17 @@ impl IdentityProofErrorKind {
                  (github.connect) to grant it"
             }
             IdentityProofErrorKind::Unreachable => "internal error: GitHub could not be reached",
+            IdentityProofErrorKind::GitlabNotConnected => {
+                "internal error: GitLab is not connected for this host — sign in \
+                 (sourceControl.connect) before proving your identity"
+            }
+            IdentityProofErrorKind::GitlabScopeMissing => {
+                "internal error: the stored GitLab token lacks the `api` scope — reconnect \
+                 (sourceControl.connect) with a token that grants it"
+            }
+            IdentityProofErrorKind::GitlabUnreachable => {
+                "internal error: the GitLab instance could not be reached"
+            }
         }
     }
 }
@@ -209,7 +294,11 @@ pub enum InviteErrorKind {
     Revoked,
     /// The invite was already redeemed (single use).
     Redeemed,
-    /// The invite is pinned to another GitHub login.
+    /// The requested scope differs from the stored invitation.
+    ScopeMismatch,
+    /// The person was revoked after the proof challenge was issued.
+    AccessRevoked,
+    /// The invite is pinned to another forge account.
     PinMismatch,
     /// The pinned login does not name a GitHub account.
     PinUnknown,
@@ -249,6 +338,11 @@ pub enum InviteErrorKind {
     /// guest: no per-principal credential is ever minted for the primary
     /// row, and the invite stays open.
     OwnerSelfJoin,
+    /// The workspace is archived: archiving detaches every guest and closes
+    /// every open invite, so no invite is minted, no member is added and no
+    /// join is committed against it until it is unarchived. Nothing was
+    /// written.
+    WorkspaceArchived,
 }
 
 impl InviteErrorKind {
@@ -257,6 +351,8 @@ impl InviteErrorKind {
     pub fn as_str(self) -> &'static str {
         match self {
             InviteErrorKind::NotFound => "invite-not-found",
+            InviteErrorKind::ScopeMismatch => "invite-scope-mismatch",
+            InviteErrorKind::AccessRevoked => "access-revoked",
             InviteErrorKind::Expired => "invite-expired",
             InviteErrorKind::Revoked => "invite-revoked",
             InviteErrorKind::Redeemed => "invite-redeemed",
@@ -272,6 +368,7 @@ impl InviteErrorKind {
             InviteErrorKind::ProofExpired => "proof-expired",
             InviteErrorKind::GithubUnreachable => "github-unreachable",
             InviteErrorKind::OwnerSelfJoin => "owner-self-join",
+            InviteErrorKind::WorkspaceArchived => "workspace-archived",
         }
     }
 
@@ -280,6 +377,10 @@ impl InviteErrorKind {
     pub fn message(self) -> &'static str {
         match self {
             InviteErrorKind::NotFound => "invalid params: invite not found",
+            InviteErrorKind::ScopeMismatch => "invalid params: invitation scope does not match",
+            InviteErrorKind::AccessRevoked => {
+                "invalid params: access was revoked during proof; start a new join"
+            }
             InviteErrorKind::Expired => "invalid params: invite has expired",
             InviteErrorKind::Revoked => "invalid params: invite was revoked",
             InviteErrorKind::Redeemed => "invalid params: invite was already redeemed",
@@ -290,8 +391,8 @@ impl InviteErrorKind {
                 "invalid params: pinLogin does not name a GitHub account"
             }
             InviteErrorKind::GithubIdentityRequired => {
-                "unsupported: inviting requires a linked GitHub identity — connect GitHub \
-                 (github.connect) before creating an invite"
+                "unsupported: inviting requires a linked forge identity — connect GitHub \
+                 (github.connect) or GitLab (sourceControl.connect) before creating an invite"
             }
             InviteErrorKind::IdentityLocked => {
                 "unsupported: the primary GitHub identity cannot change while other \
@@ -326,6 +427,10 @@ impl InviteErrorKind {
                 "invalid params: this GitHub account owns the host; open it from your \
                  paired daemons instead of joining as a guest"
             }
+            InviteErrorKind::WorkspaceArchived => {
+                "invalid params: this workspace is archived; unarchive it before inviting \
+                 or adding members"
+            }
         }
     }
 
@@ -334,6 +439,8 @@ impl InviteErrorKind {
     pub fn code(self) -> i32 {
         match self {
             InviteErrorKind::NotFound
+            | InviteErrorKind::ScopeMismatch
+            | InviteErrorKind::AccessRevoked
             | InviteErrorKind::Expired
             | InviteErrorKind::Revoked
             | InviteErrorKind::Redeemed
@@ -344,7 +451,8 @@ impl InviteErrorKind {
             | InviteErrorKind::CredentialInvalid
             | InviteErrorKind::ProofInvalid
             | InviteErrorKind::ProofExpired
-            | InviteErrorKind::OwnerSelfJoin => -32602,
+            | InviteErrorKind::OwnerSelfJoin
+            | InviteErrorKind::WorkspaceArchived => -32602,
             InviteErrorKind::GithubIdentityRequired
             | InviteErrorKind::IdentityLocked
             | InviteErrorKind::FlowBusy
@@ -400,11 +508,29 @@ impl CloneErrorCategory {
 }
 
 impl Error {
+    #[must_use]
+    pub fn execution_authorization(
+        &self,
+    ) -> Option<&crate::execution::ExecutionAuthorizationFailure> {
+        match self {
+            Self::ExecutionAuthorization { authorization, .. } => Some(authorization),
+            _ => None,
+        }
+    }
+
     /// JSON-RPC 2.0 numeric error code for this error (PROTOCOL §9).
     #[must_use]
     pub fn code(&self) -> i32 {
         match self {
-            Error::InvalidParams(_)
+            Error::ExecutionAuthorization { source, .. } => match source.as_ref() {
+                Error::CloneFailed { .. } | Error::SourceControlUnauthorized { .. } => source.code(),
+                _ => -32603,
+            },
+
+            Error::IdentityMismatch
+            | Error::IdentityInUse
+            | Error::HostMembershipRequired
+            | Error::InvalidParams(_)
             | Error::NotFound(_)
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
@@ -421,12 +547,17 @@ impl Error {
                 | CloneErrorCategory::Other => -32603,
             },
             Error::Internal(_)
+            | Error::GitAuthorization(_)
             | Error::VoiceNotConfigured { .. }
             | Error::ListenerDown
+            | Error::TunnelDown
             | Error::WarmInFlight { .. }
             | Error::AdapterBusy { .. }
+            | Error::DeviceGrantUnsupported { .. }
+            | Error::SourceControlUnauthorized { .. }
             | Error::RateLimited(_)
             | Error::IdentityProof(_)
+            | Error::IdentityUnverifiable { .. }
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,
             Error::Conflict { .. } => -32005,

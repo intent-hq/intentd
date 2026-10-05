@@ -15,18 +15,18 @@ use crate::model::{
     AgentSession, BrowserTab, BrowserTabInput, ClientHostInfo, CommentAddResult,
     CommentDeleteResult, CommentGetThreadResult, CommentListResult, CommentResolveThreadResult,
     CommentRespondResult, ContextItem, Draft, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
-    GitMergeConflicts, GitPullResult, GitStatus, LineAttributionComputeResult, LineAttributionData,
-    MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    EventUnsubscribeResult, GitAgentCommitResult, GitBranchStatus, GitBranches, GitMergeConflicts,
+    GitPullResult, GitStatus, InvitePin, InviteProofClaim, LineAttributionComputeResult,
+    LineAttributionData, MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate,
+    NoteCreateResult, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
+    NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
     RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
     TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
     TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
     TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
     TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
-    WorkspaceTask, WorkspaceUpdate,
+    WorkspaceSetupStatus, WorkspaceTask, WorkspaceUpdate,
 };
 use crate::repo_ref::RepoRef;
 
@@ -43,6 +43,230 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `intent-services` (§3.2 rule 3). The default bodies return an internal error
 /// so downstream stubs compile until they override these methods.
 pub trait WorkspaceApi: Send + Sync {
+    /// Internal host-policy gate for tool-free provider utilities. Not exposed
+    /// as a workspace binding or wire method; callers cannot supply policy.
+    fn provider_configuration_preflight(&self, _provider: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Provider policy context unavailable".into(),
+            ))
+        })
+    }
+
+    fn repository_checkout_capture(
+        &self,
+        _query: crate::repository_checkout::CheckoutCaptureQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            crate::repository_checkout::CheckoutResult<crate::repository_checkout::CheckoutCapture>,
+        >,
+    > {
+        Box::pin(async { Err(Error::Forbidden("Repository checkout unavailable".into())) })
+    }
+    fn repository_checkout_projects(
+        &self,
+        _query: crate::repository_checkout::CheckoutProjectsQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            crate::repository_checkout::CheckoutResult<
+                crate::repository_checkout::CheckoutProjects,
+            >,
+        >,
+    > {
+        Box::pin(async { Err(Error::Forbidden("Repository checkout unavailable".into())) })
+    }
+    fn repository_checkout_project(
+        &self,
+        _query: crate::repository_checkout::CheckoutProjectQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            crate::repository_checkout::CheckoutResult<
+                crate::repository_checkout::CheckoutProjectDetail,
+            >,
+        >,
+    > {
+        Box::pin(async { Err(Error::Forbidden("Repository checkout unavailable".into())) })
+    }
+    fn repository_checkout_branches(
+        &self,
+        _query: crate::repository_checkout::CheckoutBranchesQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            crate::repository_checkout::CheckoutResult<
+                crate::repository_checkout::CheckoutBranches,
+            >,
+        >,
+    > {
+        Box::pin(async { Err(Error::Forbidden("Repository checkout unavailable".into())) })
+    }
+    fn repository_checkout_warm(
+        &self,
+        _query: crate::repository_checkout::CheckoutSelection,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            crate::repository_checkout::CheckoutResult<crate::repository_checkout::CheckoutWarm>,
+        >,
+    > {
+        Box::pin(async { Err(Error::Forbidden("Repository checkout unavailable".into())) })
+    }
+    fn repository_checkout_release(
+        &self,
+        _query: crate::repository_checkout::CheckoutBinding,
+    ) -> BoxFuture<'_, Result<crate::repository_checkout::CheckoutReleased>> {
+        Box::pin(async { Err(Error::Forbidden("Repository checkout unavailable".into())) })
+    }
+    /// Capture a transport-owned repository read connection under its original
+    /// caller/credential binding. This carrier alone grants no read authority.
+    #[doc(hidden)]
+    fn repository_read_connection(
+        &self,
+        _entry: crate::repository_request::RepositoryWireEntry,
+    ) -> Option<std::sync::Arc<dyn crate::repository_request::RepositoryReadConnection>> {
+        None
+    }
+
+    /// Acquire read-only repository context under the original native connection.
+    /// Explicit original-socket resource reads; older implementations refuse.
+    fn repository_resource_capture(
+        &self,
+        _query: crate::repository_request::RepositoryResourceQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryResourceCapture>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_detail(
+        &self,
+        _query: crate::repository_request::RepositoryResourceDetailQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryResourceResult>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_release(
+        &self,
+        _query: crate::repository_request::RepositoryResourceBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+
+    fn repository_context_capture(
+        &self,
+        query: crate::repository_request::RepositoryContextQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextCapture>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository context unavailable".into())) })
+    }
+
+    fn repository_context(
+        &self,
+        query: crate::repository_request::RepositoryContextBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::RepositoryContext>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository context unavailable".into())) })
+    }
+
+    fn repository_context_release(
+        &self,
+        query: crate::repository_request::RepositoryContextBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository context unavailable".into())) })
+    }
+
+    fn native_review_prepare(
+        &self,
+        _query: crate::repository_request::NativeReviewPrepareQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository review unavailable".into(),
+            ))
+        })
+    }
+    fn native_review_execute(
+        &self,
+        _query: crate::repository_request::NativeReviewExecuteQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository review unavailable".into(),
+            ))
+        })
+    }
+    fn native_review_reconcile(
+        &self,
+        _query: crate::repository_request::NativeReviewBoundQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository review unavailable".into(),
+            ))
+        })
+    }
+    fn native_review_release(
+        &self,
+        _query: crate::repository_request::NativeReviewBoundQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository review unavailable".into(),
+            ))
+        })
+    }
+    fn repository_selection_capture(
+        &self,
+        query: crate::repository_request::RepositorySelectionQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionCapture>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
+    fn repository_selection_save(
+        &self,
+        query: crate::repository_request::RepositorySelectionSaveQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionAttempt>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
+    fn repository_selection_reset(
+        &self,
+        query: crate::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionAttempt>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
+    fn repository_selection_reconcile(
+        &self,
+        query: crate::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionAttempt>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
+    fn repository_selection_release(
+        &self,
+        query: crate::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositorySelectionReleased>> {
+        let _ = query;
+        Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
+    }
+
     /// List workspaces, optionally including archived ones (PROTOCOL §5.1).
     fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let _ = include_archived;
@@ -78,6 +302,18 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::get_workspace not implemented".to_string(),
             ))
         })
+    }
+
+    /// The daemon-owned, in-memory setup-stage state for `id` (§6.5
+    /// lifecycle: `pending` → `running` → `completed` | `failed`, or
+    /// `skipped`), backing `ws.workspace.details().setupStatus` and the
+    /// turn-start setup notice. Synchronous (no I/O); a workspace with no
+    /// record in this daemon lifetime — including every workspace created
+    /// before boot — reads `state: "unknown"`, which is also the default so
+    /// non-services `WorkspaceApi` impls need not implement it.
+    fn workspace_setup_status(&self, id: &WorkspaceId) -> WorkspaceSetupStatus {
+        let _ = id;
+        WorkspaceSetupStatus::unknown()
     }
 
     /// `workspace.diskUsage`: on-demand cached physical footprint of the
@@ -1838,6 +2074,19 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Read the workspace's last explicitly remembered manual specialist.
+    fn agent_get_creation_preferences(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "agent.getCreationPreferences not implemented".into(),
+            ))
+        })
+    }
+
     /// `agent.sendToTask`: follow up with the agent assigned to a task note
     /// (PROTOCOL §5.5). `message_metadata` is the same opaque per-message
     /// payload as `agent.sendMessage` (persisted on the user row; e.g. the
@@ -1941,6 +2190,22 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_send_queued_message_now not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.sendQueuedMessagesNow`: atomically select a nonempty set of
+    /// visible, ready entries and deliver them in queue order as one turn.
+    fn agent_send_queued_messages_now(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, message_ids);
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "explicit queue batching requires an agent manager".into(),
             ))
         })
     }
@@ -2072,6 +2337,33 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::agent_queue_message not implemented".to_string(),
             ))
         })
+    }
+
+    /// Queue a prepared submission with a caller identity. Legacy implementors
+    /// continue to support requests which omit the optional identity.
+    fn agent_queue_submission(
+        &self,
+        agent_id: AgentId,
+        message_id: Option<String>,
+        content: String,
+        image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        if message_id.is_some() {
+            return Box::pin(async {
+                Err(Error::Unsupported(
+                    "submission correlation is unavailable".into(),
+                ))
+            });
+        }
+        self.agent_queue_message(
+            agent_id,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+        )
     }
 
     /// `agent.editQueuedMessage`: edit a queued message's content (PROTOCOL §5.5).
@@ -2307,7 +2599,10 @@ pub trait WorkspaceApi: Send + Sync {
     /// resolves that override then `quickActions.defaultModel` before the
     /// provider CLI default (monorepo#1734). An explicit `model` must be a
     /// bare model id (compound `provider:model` ids reject `-32602` at the
-    /// wire boundary, §5.5).
+    /// wire boundary, §5.5). `reasoning_effort` independently overrides the
+    /// quick-action effort settings; live ACP validation happens after model
+    /// selection and before the prompt (§5.32).
+    #[expect(clippy::too_many_arguments)]
     fn agent_complete_once(
         &self,
         prompt: String,
@@ -2316,6 +2611,7 @@ pub trait WorkspaceApi: Send + Sync {
         quick_action_type: Option<String>,
         workspace_id: Option<WorkspaceId>,
         timeout_ms: Option<u64>,
+        reasoning_effort: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             prompt,
@@ -2324,6 +2620,7 @@ pub trait WorkspaceApi: Send + Sync {
             quick_action_type,
             workspace_id,
             timeout_ms,
+            reasoning_effort,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -3407,23 +3704,6 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `git.commit` (deprecated; prefer `git_agent_commit`): commit the already
-    /// staged changes with `message`. Failures (incl. nothing to commit) are
-    /// `-32603` (PROTOCOL §5.6).
-    fn git_commit(
-        &self,
-        workspace_id: WorkspaceId,
-        message: String,
-        idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<GitCommitResult>> {
-        let _ = (workspace_id, message, idempotency_key);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::git_commit not implemented".to_string(),
-            ))
-        })
-    }
-
     /// `git.agentCommit`: stage the agent's changes (or `files` when given) and
     /// commit them; `user_requested` bypasses the auto-commit gate (PROTOCOL
     /// §5.6). When `agent_id` (and optionally `linked_note_id`) are present, the
@@ -3880,6 +4160,20 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Automatic `pr.refresh` calls share daemon admission with the sweep.
+    /// Kept separate from explicit refresh to preserve existing callers.
+    fn pr_refresh_automatic(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "automatic PR refresh not implemented".into(),
+            ))
+        })
+    }
+
     /// `ws.pr.snapshot` engine (MCP-only surface, not in the FE router
     /// catalog): a compact, diff-friendly snapshot of PR `pr_number` — state,
     /// mergeability + blocked reason, check-run tally, review decision, and
@@ -3940,6 +4234,56 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_pulls_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Read-only explicitly addressed PR checks (PROTOCOL §5.27).
+    fn github_pulls_checks(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_checks not implemented".into(),
+            ))
+        })
+    }
+
+    /// Read-only explicitly addressed PR reviews (PROTOCOL §5.27).
+    fn github_pulls_reviews(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number, limit, next_token);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_reviews not implemented".into(),
+            ))
+        })
+    }
+
+    /// Read-only explicitly addressed PR files (PROTOCOL §5.27).
+    fn github_pulls_files(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+        next_token: Option<String>,
+        expected_head_sha: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number, limit, next_token, expected_head_sha);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_files not implemented".into(),
             ))
         })
     }
@@ -4008,6 +4352,24 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_pulls_search not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Owner-wide form of `github.pulls.search` (organization or personal account).
+    fn github_org_pulls_search(
+        &self,
+        org: String,
+        filter: Option<String>,
+        state: Option<String>,
+        query: Option<String>,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (org, filter, state, query, limit, next_token);
+        Box::pin(async {
+            Err(Error::InvalidParams(
+                "organization PR search is not supported".into(),
             ))
         })
     }
@@ -4251,8 +4613,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `github.connect`: start (or return the still-pending) GitHub OAuth
-    /// device flow → `{ ok, userCode, verificationUri, expiresIn, interval }`.
-    /// The daemon polls GitHub in the background and emits
+    /// device flow → `{ ok, flowId, userCode, verificationUri, expiresIn,
+    /// interval }`. `flowId` is the opaque handle `github.cancelAuth` scopes
+    /// to. The daemon polls GitHub in the background and emits
     /// `github:auth-changed` on terminal transitions; the token is persisted
     /// server-side and never crosses the wire.
     fn github_connect(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -4265,7 +4628,15 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.cancelAuth`: abort the in-flight device flow, if any →
     /// `{ ok, cancelled }` (`cancelled: false` when nothing was pending).
-    fn github_cancel_auth(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+    /// With `flow_id` (the `flowId` a `github.connect` returned) only that
+    /// flow is cancelled: any other pending flow is left untouched and the
+    /// call answers `cancelled: false`. `None` cancels whichever flow is
+    /// pending.
+    fn github_cancel_auth(
+        &self,
+        flow_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = flow_id;
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_cancel_auth not implemented".to_string(),
@@ -4410,6 +4781,329 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `sourceControl.identityProof.create` (protocol 10.8): the
+    /// provider-generic form of `github.identityProof.create`. `provider` is
+    /// `github` (a secret gist, as the alias) or `gitlab` (a **public**
+    /// personal snippet on `host` — the bound instance when omitted); the
+    /// proof is made with the stored token for that `(provider, host)` only.
+    /// → `{ proofId, provider, host, login, externalUserId, avatarUrl }`
+    /// (`externalUserId` / `avatarUrl` are `null` when the forge's create
+    /// does not report them — GitHub). Refused with `Error::IdentityProof`
+    /// (`<provider>-not-connected` / `-scope-missing` / `-unreachable`).
+    /// Owner-client only. Never returns the token.
+    fn source_control_identity_proof_create(
+        &self,
+        provider: String,
+        host: Option<String>,
+        nonce: String,
+        host_label: String,
+        purpose: Option<String>,
+        expected_identity: Option<crate::PrincipalIdentity>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            provider,
+            host,
+            nonce,
+            host_label,
+            purpose,
+            expected_identity,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_identity_proof_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.identityProof.delete` (protocol 10.8): delete the
+    /// proof `proofId` (a gist id / snippet id) created by
+    /// `sourceControl.identityProof.create` for the same `(provider, host)`
+    /// → `{ ok: true }`. Idempotent (an already-deleted proof is `ok`); the
+    /// proof is read back first and anything that is not an Intent proof is
+    /// refused with `-32602`, nothing deleted. Same bounded
+    /// `Error::IdentityProof` codes as create. Owner-client only.
+    fn source_control_identity_proof_delete(
+        &self,
+        provider: String,
+        host: Option<String>,
+        proof_id: String,
+        purpose: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, proof_id, purpose);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_identity_proof_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    // ========================================================================
+    // sourceControl.* — provider-generic forge auth (PROTOCOL §5.27
+    // "Provider-generic auth — `sourceControl.*`", v10.5). `provider` is
+    // `"github"` | `"gitlab"` (anything else → `-32602`); `host` is
+    // gitlab-only (a non-empty host with `provider: "github"` → `-32602`).
+    // The `github.authStatus` / `connect` / `cancelAuth` / `revoke` /
+    // `getUser` quintet above is served as aliases of these with
+    // `provider: "github"` pinned and the additive fields projected away.
+    // ========================================================================
+
+    /// Collaboration-only `identity.authStatus`; administrator of the local signing-in daemon only.
+    fn identity_auth_status(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.connect`; administrator of the local signing-in daemon only.
+    fn identity_connect(
+        &self,
+        provider: String,
+        host: Option<String>,
+        method: Option<String>,
+        token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, method, token);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.cancelAuth`; administrator of the local signing-in daemon only.
+    fn identity_cancel_auth(
+        &self,
+        provider: String,
+        host: Option<String>,
+        flow_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, flow_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.revoke`; administrator of the local signing-in daemon only.
+    fn identity_revoke(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.getUser`; administrator of the local signing-in daemon only.
+    fn identity_get_user(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// Collaboration-only `identity.select`; administrator of the local signing-in daemon only.
+    fn identity_select(
+        &self,
+        provider: String,
+        host: Option<String>,
+        external_user_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, external_user_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "collaboration identity not implemented".into(),
+            ))
+        })
+    }
+
+    /// `sourceControl.authStatus { provider, host? }`: the `github.authStatus`
+    /// shape plus additive `provider`, `host`, `method`
+    /// (`"device" | "pat" | "env" | null`), `user?` (iff `isConfigured`) and
+    /// `deviceGrantSupported`.
+    fn source_control_auth_status_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        if instance_base_url.is_some() {
+            return Box::pin(async {
+                Err(Error::InvalidParams(
+                    "full GitLab instance target is unsupported".into(),
+                ))
+            });
+        }
+        self.source_control_auth_status(provider, host)
+    }
+
+    fn source_control_auth_status(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_auth_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.connect { provider, host?, method?, token? }`: start (or
+    /// return the still-pending) device grant for `(provider, host)` →
+    /// `{ ok, userCode, verificationUri, expiresIn, interval }`, or with
+    /// `method: "pat"` validate + persist the in-band `token` →
+    /// `{ ok: true, method: "pat" }`. 🔒 `token` is never logged or echoed.
+    /// A provider holds one credential for one bound host, so a connect that
+    /// binds `host` — device or PAT — supersedes a device flow still pending
+    /// for any host (its late completion is discarded: no write, no event).
+    fn source_control_connect_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        method: Option<String>,
+        token: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        if instance_base_url.is_some() {
+            return Box::pin(async {
+                Err(Error::InvalidParams(
+                    "full GitLab instance target is unsupported".into(),
+                ))
+            });
+        }
+        self.source_control_connect(provider, host, method, token)
+    }
+
+    fn source_control_connect(
+        &self,
+        provider: String,
+        host: Option<String>,
+        method: Option<String>,
+        token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, method, token);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_connect not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.cancelAuth { provider, host? }`: abort the pending device
+    /// grant for `(provider, host)` → `{ ok: true, cancelled }`.
+    fn source_control_cancel_auth_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        if instance_base_url.is_some() {
+            return Box::pin(async {
+                Err(Error::InvalidParams(
+                    "full GitLab instance target is unsupported".into(),
+                ))
+            });
+        }
+        self.source_control_cancel_auth(provider, host)
+    }
+
+    fn source_control_cancel_auth(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_cancel_auth not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.revoke { provider, host? }`: delete the stored
+    /// `sourceControl.<provider>.token`, abort any in-flight grant and emit
+    /// `sourceControl:auth-changed { status: "revoked" }` → `{ ok: true }`.
+    fn source_control_revoke_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        if instance_base_url.is_some() {
+            return Box::pin(async {
+                Err(Error::InvalidParams(
+                    "full GitLab instance target is unsupported".into(),
+                ))
+            });
+        }
+        self.source_control_revoke(provider, host)
+    }
+
+    fn source_control_revoke(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_revoke not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `sourceControl.getUser { provider, host? }`: the authenticated identity
+    /// from the host's user probe → `{ user: SourceControlUser | null }`; a
+    /// rejected credential → `source-control-unauthorized`.
+    fn source_control_get_user_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        if instance_base_url.is_some() {
+            return Box::pin(async {
+                Err(Error::InvalidParams(
+                    "full GitLab instance target is unsupported".into(),
+                ))
+            });
+        }
+        self.source_control_get_user(provider, host)
+    }
+
+    fn source_control_get_user(
+        &self,
+        provider: String,
+        host: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::source_control_get_user not implemented".to_string(),
+            ))
+        })
+    }
+
     // ========================================================================
     // principal.* (multiplayer w1)
     // ========================================================================
@@ -4427,13 +5121,13 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `principal.list` (direct member add): the host's credentialed guests
+    /// `principal.list` (direct guest add): the host's credentialed people
     /// → `{ principals: [{ principalId, login?, displayName?, avatarUrl?,
-    /// githubUserId? }] }` — every non-primary principal holding at least
+    /// githubUserId?, identity?, hostRole }] }` — every non-primary principal holding at least
     /// one active (non-revoked) credential, by `createdAt`; a guest that
     /// revoked itself is omitted (it cannot connect). No params.
-    /// Owner-only: a per-principal (collaborator) wire caller is
-    /// `Forbidden`; the administrator, agents and the daemon pass.
+    /// Available to the owner and active host members; workspace guests
+    /// are `Forbidden`. Trusted agents and the daemon retain their access.
     fn principal_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             Err(Error::Internal(
@@ -4529,13 +5223,13 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// Transport seam (multiplayer w4): a live feed of principal ids whose
+    /// Transport seam (multiplayer w4): a live feed of committed invalidations for principals whose
     /// credentials were just revoked, so a listener can close the connections
     /// still bound to them. `None` when the implementation has no principal
     /// store (test stubs).
     fn subscribe_principal_revocations(
         &self,
-    ) -> Option<tokio::sync::broadcast::Receiver<PrincipalId>> {
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::PrincipalRevocation>> {
         None
     }
 
@@ -4601,6 +5295,18 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::presence_snapshot not implemented".to_string(),
             ))
         })
+    }
+
+    /// Caller-authorized current focus for one member of a source workspace.
+    /// Used only by the connection-owned presence.focus channel. Returns a full
+    /// replacement snapshot; source/person refusal carries no destination data.
+    fn presence_focus_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: crate::PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, principal_id);
+        Box::pin(async { Err(Error::Internal("presence focus not implemented".into())) })
     }
 
     /// A connection closed (clean close or heartbeat reap alike): drop its
@@ -4670,21 +5376,22 @@ pub trait WorkspaceApi: Send + Sync {
     /// next to its hash (migration `0128`) so the owner can copy the link
     /// again later, but it never serialises as a field: this result carries
     /// it exactly once, and afterwards it reaches the wire only inside the
-    /// rebuilt `url` of `workspace_invite_list`. Owner-only.
-    /// Refused with `InviteErrorKind::GithubIdentityRequired` unless the
-    /// owner's GitHub identity is linked; `pin_login` (a GitHub login) is
-    /// resolved to its account id and stored as the pin
-    /// (`InviteErrorKind::PinUnknown` when it names no account). The first
-    /// invite of a workspace sets its `legacy_author_principal_id` to the
-    /// owner when unset. `expires_in_secs` defaults to 7 days. The transport
-    /// wraps the result into the `intent://invite?…` link.
+    /// rebuilt `url` of `workspace_invite_list`. Workspace-manager-only.
+    /// Intent workspace management authority suffices without a forge connection; `pin` names
+    /// the login to pin to on `pin.provider` / `pin.host` (both default to
+    /// the owner's own identity forge), resolved to its account and stored
+    /// as the pin triple (`InviteErrorKind::PinUnknown` when it names no
+    /// account). The first invite of a workspace sets its
+    /// `legacy_author_principal_id` to the owner when unset.
+    /// `expires_in_secs` defaults to 7 days. The transport wraps the result
+    /// into the `intent://invite?…` link.
     fn workspace_invite_create(
         &self,
         workspace_id: WorkspaceId,
-        pin_login: Option<String>,
+        pin: Option<InvitePin>,
         expires_in_secs: Option<u64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, pin_login, expires_in_secs);
+        let _ = (workspace_id, pin, expires_in_secs);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::workspace_invite_create not implemented".to_string(),
@@ -4697,8 +5404,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// serialised `WorkspaceInvite` (secrets never included as fields) plus
     /// the additive `url`, the invite's `intent://invite?…` link rebuilt from
     /// the stored secret; `url` is omitted when the row predates the stored
-    /// secret or no link can be built right now (listener down, no dialable
-    /// route). Owner-only.
+    /// secret or no link can be built right now (listener down, tunnel
+    /// down — invite links are tunnel-only). Workspace-manager-only.
     fn workspace_invite_list(
         &self,
         workspace_id: WorkspaceId,
@@ -4713,7 +5420,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `workspace.invite.revoke` (multiplayer w4): revoke an open invite of
     /// `workspace_id` → `{ revoked: bool }` (`false` when already closed).
-    /// Owner-only; an invite of another workspace is `NotFound`.
+    /// Workspace-manager-only; an invite of another workspace is `NotFound`.
     fn workspace_invite_revoke(
         &self,
         workspace_id: WorkspaceId,
@@ -4727,11 +5434,140 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Owner-only roster: primary first, then members by addedAt / principalId.
+    /// Returns `{ members: HostMember[], revision }`, excluding workspace guests.
+    fn host_members_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_members_list not implemented".into(),
+            ))
+        })
+    }
+
+    /// Owner-only atomic removal and credential/invitation revocation.
+    /// The primary cannot be removed; an inactive member is a no-op.
+    fn host_members_remove(
+        &self,
+        principal_id: PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = principal_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_members_remove not implemented".into(),
+            ))
+        })
+    }
+
+    /// Owner-authorized bounded public account suggestions; create still resolves the pin.
+    fn host_invite_search_accounts(
+        &self,
+        provider: String,
+        host: Option<String>,
+        query: String,
+        limit: Option<u8>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider, host, query, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_invite_search_accounts not implemented".into(),
+            ))
+        })
+    }
+
+    /// Owner-only, pinned, single-use host membership invitation, lasting seven days.
+    /// Provider and nonblank login are required; the transport resolves the tunnel
+    /// envelope before this operation persists anything.
+    fn host_invite_create(&self, pin: InvitePin) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = pin;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_invite_create not implemented".into(),
+            ))
+        })
+    }
+
+    /// Owner/member allowlisted execution defaults and credential policy.
+    fn host_execution_context(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_execution_context not implemented".into(),
+            ))
+        })
+    }
+
+    /// Internal discovery input: connected-host paths without exposing settings.*.
+    /// Not a wire method. The default supports legacy/test API compositions.
+    fn execution_provider_paths(
+        &self,
+    ) -> BoxFuture<'_, Result<std::collections::HashMap<String, String>>> {
+        Box::pin(async move {
+            let mut paths = std::collections::HashMap::new();
+            if let Ok(value) = self.settings_get("providers.paths".into()).await {
+                if let Some(map) = value.get("value").and_then(serde_json::Value::as_object) {
+                    for (key, value) in map {
+                        if let Some(path) = value.as_str().filter(|s| !s.trim().is_empty()) {
+                            paths.insert(key.clone(), path.to_string());
+                        }
+                    }
+                }
+            }
+            if let Ok(value) = self.settings_get("context.auggiePath".into()).await {
+                if let Some(path) = value
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    paths.insert("auggie".into(), path.into());
+                }
+            }
+            Ok(paths)
+        })
+    }
+
+    /// Internal owner setup invalidation; never carries setup details on the wire.
+    fn notify_execution_setup_changed(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Internal bounded probe observation; no provider metadata is broadcast.
+    fn observe_execution_readiness(
+        &self,
+        _readiness: serde_json::Value,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Owner-only open host invitations, ordered by createdAt / id.
+    /// URLs require both a stored secret and an available tunnel envelope.
+    fn host_invite_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_invite_list not implemented".into(),
+            ))
+        })
+    }
+
+    /// Owner-only host invite revocation; closed rows return `{ revoked: false }`.
+    /// Unknown or workspace-scoped IDs return `Error::NotFound`.
+    fn host_invite_revoke(&self, invite_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = invite_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::host_invite_revoke not implemented".into(),
+            ))
+        })
+    }
+
     /// `invite.inspect` (multiplayer w4, unauthenticated `/invite`
-    /// endpoint): validate `(invite_id, secret)` — the
+    /// endpoint): validate `(invite_id, secret, scope)` — the
     /// [`crate::InviteErrorKind`] refusals for an unknown / expired /
-    /// revoked / (pinned and) redeemed link — and answer `{ workspaceId, workspaceTitle }`
-    /// without touching GitHub or issuing a nonce. The `/invite` transport
+    /// revoked / (pinned and) redeemed link — and answer
+    /// `{ scope, role, pinIdentity }` without contacting a forge or issuing
+    /// a nonce. Workspace previews also carry `workspaceId` / `workspaceTitle`;
+    /// host previews have role `member` and no workspace. `pinIdentity` is the
+    /// `{ provider, host, externalUserId }` triple (including legacy GitHub
+    /// pins), or explicit `null` for an unpinned link; older daemons omit it.
+    /// Errors disclose no pin. The `/invite` transport
     /// extends the result with the host's `hostname` / `prettyHostname`
     /// (same sources as `system.status`), so a client can show the consent
     /// prompt before it decides between `invite.accept` and
@@ -4740,8 +5576,9 @@ pub trait WorkspaceApi: Send + Sync {
         &self,
         invite_id: String,
         secret: String,
+        scope: crate::InviteScope,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (invite_id, secret);
+        let _ = (invite_id, secret, scope);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::invite_inspect not implemented".to_string(),
@@ -4758,18 +5595,18 @@ pub trait WorkspaceApi: Send + Sync {
     /// owner's own account) is [`crate::InviteErrorKind::OwnerSelfJoin`]
     /// (`owner-self-join`). The invite is then validated like
     /// [`Self::invite_inspect`], a pin is checked against the
-    /// principal's stored `github_user_id` (`invite-pin-mismatch`), and the
-    /// join commits with the stored identity (no GitHub call, no profile
-    /// refresh) → the [`Self::invite_prove`] shape
-    /// `{ status: "authorized", token, principalId, login, workspaceId }`
-    /// with a fresh credential.
+    /// principal's stored full identity (`invite-pin-mismatch`), and the join
+    /// commits without a forge call or profile refresh. Returns the same
+    /// scoped authorization as [`Self::invite_prove`] with the presented bearer
+    /// unchanged. Scope defaults to workspace on the wire.
     fn invite_accept(
         &self,
         invite_id: String,
         secret: String,
+        scope: crate::InviteScope,
         credential: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (invite_id, secret, credential);
+        let _ = (invite_id, secret, scope, credential);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::invite_accept not implemented".to_string(),
@@ -4778,19 +5615,21 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `invite.challenge` (gist identity-proof join, unauthenticated
-    /// `/invite` endpoint): validate `(invite_id, secret)` exactly like
+    /// `/invite` endpoint): validate `(invite_id, secret, scope)` exactly like
     /// [`Self::invite_inspect`] and issue a single-use nonce bound to the
-    /// invite → `{ workspaceId, workspaceTitle, nonce, nonceExpiresAt }`.
+    /// invite and scope. Returns its scoped preview plus `nonce` / `nonceExpiresAt`.
+    /// Captures the authorization generation for the proof commit's revocation guard.
     /// The nonce is 32 random bytes (base64url, unpadded), lives 10 minutes
     /// and is consumed by the first [`Self::invite_prove`] that names it.
-    /// GitHub is never contacted. The `/invite` transport extends the result
+    /// No forge is contacted. The `/invite` transport extends the result
     /// with the host's `hostname` / `prettyHostname`.
     fn invite_challenge(
         &self,
         invite_id: String,
         secret: String,
+        scope: crate::InviteScope,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (invite_id, secret);
+        let _ = (invite_id, secret, scope);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::invite_challenge not implemented".to_string(),
@@ -4798,34 +5637,39 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `invite.prove` (gist identity-proof join, unauthenticated `/invite`
-    /// endpoint): the guest published `nonce` in a gist under its own
-    /// account and names it. The host reads `GET /gists/{gist_id}` and
-    /// requires the owner login to equal `login` (case-insensitively), the
-    /// file `intent-join-proof.txt` to start with the nonce and the gist to
-    /// have been created no earlier than the nonce was issued; then resolves
-    /// `GET /users/{login}` and commits the join → `{ status: "authorized",
-    /// token, principalId, login, workspaceId }`. Refusals:
+    /// `invite.prove` (forge identity-proof join, unauthenticated `/invite`
+    /// endpoint): the guest published `nonce` in a proof under its own
+    /// account — a gist on GitHub, a personal snippet on GitLab — and names
+    /// it in `claim` (`proof_id`, `login`, the forge `provider` / `host`;
+    /// protocol 10.8). The host reads the proof back through the provider
+    /// seam and requires the owner login to equal `login`
+    /// (case-insensitively), the proof file to start with the nonce and the
+    /// proof to have been created no earlier than the nonce was issued; then
+    /// resolves the account and commits the join → `{ status: "authorized",
+    /// token, principalId, login, identity, hostRole, scope }`, adding `workspaceId`
+    /// only for workspace scope. Identity is the full forge triple, and hostRole
+    /// is effective authority. Refusals:
     /// [`crate::InviteErrorKind::ProofInvalid`]
-    /// (any mismatch, an unknown gist, or a nonce not issued for this invite
+    /// (any mismatch, an unknown proof, or a nonce not issued for this invite
     /// / already consumed), [`crate::InviteErrorKind::ProofExpired`],
-    /// [`crate::InviteErrorKind::GithubUnreachable`];
-    /// [`crate::InviteErrorKind::OwnerSelfJoin`] (`owner-self-join`) when
-    /// the proven account is the primary principal's own — the host owner
-    /// cannot join its own host as a guest and no credential is minted; a
-    /// closed invite, a pin
-    /// mismatch and a full workspace answer their existing kinds. The nonce
-    /// is consumed by the first attempt that reaches the verification,
-    /// except when GitHub was unreachable (the guest may retry).
+    /// [`crate::InviteErrorKind::GithubUnreachable`],
+    /// [`Error::IdentityUnverifiable`] (a GitLab instance that will not
+    /// serve the proof to this host); [`crate::InviteErrorKind::OwnerSelfJoin`]
+    /// (`owner-self-join`) when the proven account is the primary
+    /// principal's own — the host owner cannot join its own host as a guest
+    /// and no credential is minted; a closed invite, a pin mismatch and a
+    /// full workspace answer their existing kinds. The nonce is consumed by
+    /// the first attempt that reaches the verification, except when the
+    /// forge was unreachable (the guest may retry).
     fn invite_prove(
         &self,
         invite_id: String,
         secret: String,
+        scope: crate::InviteScope,
         nonce: String,
-        gist_id: String,
-        login: String,
+        claim: InviteProofClaim,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (invite_id, secret, nonce, gist_id, login);
+        let _ = (invite_id, secret, scope, nonce, claim);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::invite_prove not implemented".to_string(),
@@ -4855,6 +5699,17 @@ pub trait WorkspaceApi: Send + Sync {
     ) -> BoxFuture<'_, Result<Option<PrincipalId>>> {
         let _ = token_hash;
         Box::pin(async { Ok(None) })
+    }
+
+    /// Transport seam: resolve a credential-bound principal's current host
+    /// authority. Never infer a role from credential storage or client input.
+    /// Unknown principals and unavailable authority fail closed.
+    fn principal_host_role(
+        &self,
+        principal_id: PrincipalId,
+    ) -> BoxFuture<'_, Result<crate::HostRole>> {
+        let _ = principal_id;
+        Box::pin(async { Err(Error::Forbidden("host authority unavailable".into())) })
     }
 
     /// `linear.authStatus`: validate the resolved Linear API key via the GraphQL
@@ -5361,6 +6216,11 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Best-effort bounded host adapter preparation admission; never waits for probes or downloads.
+    fn prepare_provider_adapters(&self, provider_ids: Vec<String>) {
+        let _ = provider_ids;
+    }
+
     /// Default-provider self-heal (monorepo#3044), invoked by the transport
     /// after a `host.providerDiscovery` pass with the registry-ordered ids of
     /// the providers discovery reported as installed. When no default
@@ -5851,7 +6711,9 @@ pub trait WorkspaceApi: Send + Sync {
     fn mcp_list_servers(
         &self,
         workspace_id: Option<WorkspaceId>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = caller_agent_id;
         let _ = workspace_id;
         Box::pin(async {
             Err(Error::Internal(
@@ -5869,7 +6731,9 @@ pub trait WorkspaceApi: Send + Sync {
         &self,
         server_id: String,
         workspace_id: Option<WorkspaceId>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = caller_agent_id;
         let _ = (server_id, workspace_id);
         Box::pin(async {
             Err(Error::Internal(
@@ -5890,7 +6754,9 @@ pub trait WorkspaceApi: Send + Sync {
         args: serde_json::Value,
         timeout_ms: Option<u64>,
         workspace_id: Option<WorkspaceId>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = caller_agent_id;
         let _ = (server_id, tool_name, args, timeout_ms, workspace_id);
         Box::pin(async {
             Err(Error::Internal(
@@ -6098,14 +6964,26 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `search.notes`: GLOBAL substring search over the BE notes store (no
-    /// `workspaceId`). Returns `{ requestId, matches: NoteMatch[] }` (PROTOCOL §5.15).
+    /// `search.notes`: ranked full-text search across visible workspaces, with
+    /// optional hard scope and soft preference. Always returns inline
+    /// `{ requestId, matches: NoteMatch[], indexed: true }` (PROTOCOL §5.15).
     fn search_notes(
         &self,
         query: String,
+        workspace_id: Option<WorkspaceId>,
+        prefer_workspace_id: Option<WorkspaceId>,
+        limit: Option<i64>,
+        include_archived: bool,
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (query, request_id);
+        let _ = (
+            query,
+            workspace_id,
+            prefer_workspace_id,
+            limit,
+            include_archived,
+            request_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::search_notes not implemented".to_string(),
@@ -6266,6 +7144,56 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Select active, archived or all retained definitions, preserving the list envelope.
+    fn script_list_filtered(
+        &self,
+        workspace_id: WorkspaceId,
+        archive: crate::ScriptArchiveFilter,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let mut result = self.script_list(workspace_id).await?;
+            if let Some(scripts) = result
+                .get_mut("scripts")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                scripts.retain(|script| match archive {
+                    crate::ScriptArchiveFilter::All => true,
+                    crate::ScriptArchiveFilter::Active => script.get("archivedAt").is_none(),
+                    crate::ScriptArchiveFilter::Archived => script.get("archivedAt").is_some(),
+                });
+            }
+            Ok(result)
+        })
+    }
+
+    /// Archive an explicit workspace-scoped selection without stopping processes.
+    fn script_archive(
+        &self,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_ids);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::script_archive not implemented".into(),
+            ))
+        })
+    }
+
+    /// Restore retained definitions without starting processes.
+    fn script_restore(
+        &self,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_ids);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::script_restore not implemented".into(),
+            ))
+        })
+    }
+
     /// `script.create`: register a script definition; returns the created
     /// [`Script`](crate::model::Script) (PROTOCOL §5.8).
     fn script_create(
@@ -6296,6 +7224,38 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::script_remove not implemented".to_string(),
             ))
         })
+    }
+
+    /// Register a script monitor using authenticated MCP owner context.
+    fn script_monitor(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, script_id, options);
+        Box::pin(async { Err(Error::Internal("script monitoring unavailable".into())) })
+    }
+    /// List retained script monitors in an authorized workspace.
+    fn script_monitor_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async { Err(Error::Internal("script monitoring unavailable".into())) })
+    }
+    /// Stop observation or atomically stop the bound run; owner is set by MCP only.
+    fn script_monitor_cancel(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+        stop_run: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, monitor_id, owner, stop_run);
+        Box::pin(async { Err(Error::Internal("script monitoring unavailable".into())) })
     }
 
     /// `script.start`: spawn the script on the PTY host (service mode auto-
@@ -6613,13 +7573,15 @@ pub trait WorkspaceApi: Send + Sync {
     /// `file.read`: the file's UTF-8 contents as a **bare JSON string** (not an
     /// object), per the TS `ws.file.read` builder (PROTOCOL §5.10).
     /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `git_root_id` selects a registered root owned by this workspace instead.
     fn file_read(
         &self,
         workspace_id: WorkspaceId,
         path: String,
         caller_agent_id: Option<AgentId>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, path, caller_agent_id);
+        let _ = (workspace_id, path, caller_agent_id, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_read not implemented".to_string(),
@@ -6633,6 +7595,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// monorepo#2458). `length` is capped at 16 MiB decoded (over-cap →
     /// `Error::InvalidParams`); a read at/past EOF returns an empty chunk.
     /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `git_root_id` selects a registered root owned by this workspace instead.
     fn file_read_chunk(
         &self,
         workspace_id: WorkspaceId,
@@ -6640,8 +7603,16 @@ pub trait WorkspaceApi: Send + Sync {
         offset: u64,
         length: u64,
         caller_agent_id: Option<AgentId>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, path, offset, length, caller_agent_id);
+        let _ = (
+            workspace_id,
+            path,
+            offset,
+            length,
+            caller_agent_id,
+            git_root_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_read_chunk not implemented".to_string(),
@@ -7271,9 +8242,13 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `ws.pr.monitor`: register (idempotently) a centralized monitor on
     /// `pr_number` for `agent_id`, returning the monitor row plus the freshly
-    /// fetched merge-requirements checklist. `repo` is an optional
-    /// `"owner/name"` override; `None` resolves the workspace repo. MCP-only
-    /// — monitors are agent-owned, so there is no wire registration method.
+    /// fetched merge-requirements checklist — `requirements: null` plus a
+    /// `pausedUntil` deadline when the forge quota is exhausted and the
+    /// baseline fetch is deferred to the end of the daemon's global
+    /// rate-limit pause (the monitor is still registered). `repo` is an
+    /// optional `"owner/name"` override; `None` resolves the workspace repo.
+    /// MCP-only — monitors are agent-owned, so there is no wire registration
+    /// method.
     fn pr_monitor_start(
         &self,
         workspace_id: WorkspaceId,
@@ -7558,6 +8533,19 @@ pub struct ResolvedClient {
 #[serde(rename_all = "camelCase")]
 pub struct ReverseLiveClient {
     pub client_id: ClientId,
+    /// Admission-bound identity. Absent only on legacy/internal registry adapters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<crate::PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_role: Option<crate::HostRole>,
+    #[serde(default)]
+    pub login: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::PrincipalIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub capabilities: serde_json::Value,
@@ -7618,6 +8606,18 @@ pub trait AgentReverseDispatch: Send + Sync {
     fn live_clients(&self) -> Vec<ReverseLiveClient> {
         Vec::new()
     }
+
+    /// All hello'd devices, including guests that cannot host a browser.
+    /// Services apply current person/role projection and caller visibility.
+    fn authenticated_clients(&self) -> Vec<ReverseLiveClient> {
+        self.live_clients()
+    }
+
+    /// Queue full device updates after a durable person/role mutation.
+    fn client_profile_changed(&self, _principal: &crate::PrincipalId) {}
+
+    /// Remove the revoked person's devices before allowing fresh admission.
+    fn client_principal_removed(&self, _principal: &crate::PrincipalId) {}
 
     /// Dispatch a reverse JSON-RPC request to the client `target` resolves to
     /// and await its response.

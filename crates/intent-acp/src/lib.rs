@@ -15,6 +15,7 @@
 //! baseline-env + redaction helpers ([`mcp_env`]), and the per-agent-type tool
 //! denylist ([`tool_restrictions`]).
 
+pub mod callback_registration;
 #[cfg(unix)]
 pub mod descendant_sweep;
 pub mod error;
@@ -58,7 +59,7 @@ pub use permission::{
     PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,
 };
 pub use session::{MappedToolCall, MappedUpdate};
-pub use spawn::{spawn_provider, LaunchMode, SpawnOptions};
+pub use spawn::{spawn_provider, LaunchMode, NpxLaunchDir, SpawnOptions};
 pub use terminal::{TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo};
 pub use tool_restrictions::{
     get_native_tools_to_remove, get_tool_denylist_for_agent_type, get_tools_to_remove,

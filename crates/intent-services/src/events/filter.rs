@@ -80,6 +80,10 @@ pub(crate) const DEFAULT_BATCH_WINDOW: Duration = Duration::from_millis(500);
 /// Criteria a [`super::bus::Subscription`] matches events against. Empty
 /// collections / `None` fields are ignored (AND-combined like the TS filter).
 #[derive(Debug, Clone, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "orthogonal subscription filters compose independently; member delivery still rechecks durable authority"
+)]
 pub struct SubscriptionFilter {
     /// Event-type patterns; empty matches every type. Each entry is an exact
     /// type or a `prefix:*` wildcard (see [`event_type_matches`]).
@@ -107,6 +111,9 @@ pub struct SubscriptionFilter {
     /// before the pattern check, so a `terminal:*` or `client:*` pattern is
     /// accepted at subscribe time but stays silent.
     pub collaborator_only: bool,
+    /// Admit the safe member execution/prompt additions, subject to the
+    /// transport's delivery-time durable role and workspace check.
+    pub member_execution_events: bool,
     /// When set, types on [`is_channel_only_event_type`] never match — the
     /// match-time guard for the raw `events.subscribe` firehose (owner and
     /// collaborator alike), which keeps `note:presence` on the lease-gated
@@ -202,7 +209,11 @@ pub(crate) fn event_matches(filter: &SubscriptionFilter, event: &Event) -> bool 
     if filter.exclude_agent_events && is_agent_restricted_event_type(&event.event_type) {
         return false;
     }
-    if filter.collaborator_only && !is_collaborator_event_type(&event.event_type) {
+    if filter.collaborator_only
+        && !is_collaborator_event_type(&event.event_type)
+        && !(filter.member_execution_events
+            && intent_core::events::is_member_execution_event_type(&event.event_type))
+    {
         return false;
     }
     if filter.exclude_channel_only && is_channel_only_event_type(&event.event_type) {
@@ -385,14 +396,14 @@ mod tests {
     #[test]
     fn collaborator_only_guards_match_time() {
         // A non-administrator's subscription may NAME owner-only patterns
-        // (`terminal:*`, `client:connected`, even an empty filter = all
+        // (`terminal:*`, `settings:changed`, even an empty filter = all
         // types); none of them ever deliver an off-allowlist event, while
         // allowlisted types under the same patterns still match.
         let f = SubscriptionFilter {
             event_types: vec![
                 "terminal:*".to_string(),
                 "note:*".to_string(),
-                "client:connected".to_string(),
+                "settings:changed".to_string(),
                 "host:exec:stdout".to_string(),
             ],
             collaborator_only: true,
@@ -400,7 +411,7 @@ mod tests {
         };
         for denied in [
             "terminal:data",
-            "client:connected",
+            "settings:changed",
             "host:exec:stdout",
             "note:bogus",
         ] {
@@ -424,7 +435,7 @@ mod tests {
         ));
         assert!(!event_matches(
             &all,
-            &event("client:disconnected", None, ActorType::System)
+            &event("settings:changed", None, ActorType::System)
         ));
         assert!(event_matches(
             &all,

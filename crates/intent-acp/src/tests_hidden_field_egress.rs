@@ -158,6 +158,7 @@ fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
         waiting_for_agent_ids: vec![],
         waiting_on_hooks: vec![],
         waiting_on_pr_monitors: vec![],
+        waiting_on_script_monitors: vec![],
         turn_in_flight: false,
         last_stream_activity_at: None,
         context_usage: None,
@@ -201,6 +202,7 @@ fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
             last_seen_message_id: None,
             is_initial_agent: None,
             sponsor_agent_id: None,
+            chief_prompt_version: None,
         },
     })
 }
@@ -220,6 +222,7 @@ fn stub_workspace(id: &str) -> Workspace {
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,

@@ -97,6 +97,28 @@ async fn mints_client_id_when_omitted() {
 }
 
 #[test]
+fn shared_host_capabilities_are_independent_of_client_authority() {
+    for local in [true, false] {
+        let server = server_json(false, "linux", "x86_64", "test", None, local);
+        assert_eq!(server["capabilities"]["hostMembership"], 1);
+        assert_eq!(server["capabilities"]["invitationAccountSearch"], 1);
+        assert_eq!(server["capabilities"]["personalPairing"], 1);
+        assert_eq!(server["capabilities"]["authenticatedDevices"], 1);
+        assert_eq!(server["capabilities"]["agentRetire"], 1);
+        assert_eq!(server["capabilities"]["submissionCorrelation"], json!(1));
+        for capability in [
+            "repositoryContext",
+            "repositorySelection",
+            "nativeReview",
+            "nativeReviewCompanion",
+            "repositoryResourceRead",
+        ] {
+            assert_eq!(server["capabilities"][capability], json!(1));
+        }
+    }
+}
+
+#[test]
 fn server_identity_omits_an_unknown_build_commit() {
     let server = server_json(true, "linux", "x86_64", "1.2.3", None, true);
     assert_eq!(server["version"], "1.2.3");
@@ -231,7 +253,11 @@ async fn notification_has_no_response_but_sets_binding() {
 async fn non_administrator_client_ids_are_scoped_to_their_principal() {
     let wire = |principal: &str, is_administrator: bool| Caller::Wire {
         principal_id: PrincipalId::from_string(principal),
-        is_administrator,
+        host_role: if is_administrator {
+            intent_core::HostRole::Owner
+        } else {
+            intent_core::HostRole::Guest
+        },
     };
     let hello = |id: i64, client_id: &str| {
         classify(&json!({
@@ -344,4 +370,48 @@ async fn non_administrator_client_ids_are_scoped_to_their_principal() {
 fn classify_ignores_other_methods_and_bad_envelope() {
     assert!(classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "host.status" })).is_none());
     assert!(classify(&json!({ "jsonrpc": "1.0", "id": 1, "method": "client.hello" })).is_none());
+}
+
+/// Characterization of the daemon half of the desktop's shared-pref defect.
+/// A foreign canonical ID must be scoped, not stripped: stripping would let
+/// another principal claim legacy drafts/pins by supplying a matching suffix.
+#[tokio::test]
+async fn identity_drift_cross_principal_round_trip_keeps_foreign_namespaces() {
+    let api = RecordingApi::default();
+    let mut binding = None;
+    for (principal, presented, expected) in [
+        ("alice", "desktop", "alice:desktop"),
+        ("alice", "alice:desktop", "alice:desktop"),
+        ("bob", "alice:desktop", "bob:alice:desktop"),
+        ("alice", "bob:alice:desktop", "alice:bob:alice:desktop"),
+        (
+            "alice",
+            "alice:bob:alice:desktop",
+            "alice:bob:alice:desktop",
+        ),
+        ("alice", "alice-other:desktop", "alice:alice-other:desktop"),
+    ] {
+        let req = classify(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "client.hello",
+            "params": { "clientId": presented, "capabilities": { "browserExec": true } }
+        }))
+        .unwrap();
+        let response = parsed(
+            with_request_context(
+                true,
+                Some(Caller::Wire {
+                    principal_id: PrincipalId::from_string(principal),
+                    host_role: intent_core::HostRole::Guest,
+                }),
+                handle(req, &api, &mut binding, false),
+            )
+            .await,
+        );
+        assert_eq!(response["result"]["clientId"], expected);
+        assert_eq!(binding.as_ref().unwrap().as_str(), expected);
+        assert_eq!(api.last.lock().unwrap().as_ref().unwrap().0, expected);
+        // A fresh transport binding (reconnect/restart) with the same canonical
+        // input takes the same path; there is no connection-local namespace map.
+        binding = None;
+    }
 }

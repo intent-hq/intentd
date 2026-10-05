@@ -254,6 +254,42 @@ pub struct Review {
     pub submitted_at: String,
 }
 
+/// One changed PR file; absent patches include binary or forge-omitted diffs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestFile {
+    pub filename: String,
+    #[serde(alias = "previous_filename")]
+    pub previous_filename: Option<String>,
+    pub status: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changes: u64,
+    pub patch: Option<String>,
+    #[serde(alias = "blob_url")]
+    pub url: Option<String>,
+}
+
+/// A bounded changed-file page with an explicit forge-limit signal.
+#[derive(Debug, Clone)]
+pub struct PullRequestFilesPage {
+    pub items: Vec<PullRequestFile>,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+}
+
+/// A review detail row preserving dismissed/pending states and stable identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestReview {
+    pub id: u64,
+    pub author: String,
+    pub state: String,
+    pub body: Option<String>,
+    pub submitted_at: Option<String>,
+    pub url: Option<String>,
+}
+
 /// A conversation (issue/PR) comment, optionally line-anchored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -395,7 +431,7 @@ pub struct AuthStatus {
     pub scopes: Vec<String>,
 }
 
-/// The host's REST core quota as reported by its quota-free probe
+/// Conservative headroom for the resources used by PR reads, from the host's probe
 /// ([`crate::SourceControl::rate_limit_status`]); every field is `None`
 /// when the host lacks the signal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -512,6 +548,11 @@ pub struct MergeRequirementSignals {
     /// Whether the rollup's `isRequired` flags are trustworthy — `false` when
     /// the host did not report the rollup at all.
     pub checks_known: bool,
+    /// Internal observation identity, when the host supplies one. The service
+    /// must not combine these checks with a PR read for a different head.
+    /// This is adapter bookkeeping, not an addition to the public wire payload.
+    #[serde(skip)]
+    pub checks_head_sha: Option<String>,
     /// Base-branch rules, or `None` when they are unreadable (missing scope,
     /// unsupported endpoint) — a degraded but non-fatal probe. Quota
     /// exhaustion on that read is never folded into `None`; it fails the
@@ -553,8 +594,166 @@ pub struct ReviewThreadTally {
 #[serde(rename_all = "camelCase")]
 pub struct PrObservation {
     pub pr: PullRequest,
+    /// Live revisions from the same observation, never the PR's stored base OID.
+    /// Internal cache/adapter identity; absent for REST-only observations.
+    #[serde(skip)]
+    pub ancestry_identity: Option<PrAncestryIdentity>,
     pub signals: MergeRequirementSignals,
     pub reviews: Option<Vec<Review>>,
     pub threads: Option<ReviewThreadTally>,
     pub conversation_count: i64,
+}
+
+/// A measured, revision-bound ancestry result. Missing old baseline fields
+/// decode to unknown; an unreadable comparison is never a zero count.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum PrAncestry {
+    #[default]
+    Unknown,
+    Known {
+        #[serde(rename = "baseSha")]
+        base_sha: String,
+        #[serde(rename = "headSha")]
+        head_sha: String,
+        #[serde(rename = "behindBy")]
+        behind_by: u64,
+    },
+}
+
+/// Immutable comparison inputs and the branch/fork identity that scopes reuse.
+/// Kept in the existing in-memory PR cache, not persisted or projected on PRs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrAncestryIdentity {
+    pub base_sha: String,
+    pub head_sha: String,
+    pub target_branch: String,
+    pub head_repository: Option<String>,
+}
+
+impl PrAncestryIdentity {
+    /// GitHub object IDs must be full commit hashes, never symbolic refs.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let sha = |s: &str| s.len() == 40 && s.bytes().all(|c| c.is_ascii_hexdigit());
+        sha(&self.base_sha) && sha(&self.head_sha) && !self.target_branch.is_empty()
+    }
+}
+/// Availability of one provider field; absent evidence is never a passing result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderAvailability {
+    Available,
+    Restricted,
+    Unavailable,
+    Transient,
+    RateLimited,
+    #[default]
+    Unknown,
+}
+
+/// Provider-confirmed project and branch, within one logical instance.
+/// Missing identities stay `None` in the containing detail envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewBranchIdentity {
+    pub instance_base_url: String,
+    pub project_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
+    pub branch: String,
+}
+
+/// Positively observed provider state, independent of the legacy PR projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfirmedReviewState {
+    Open,
+    Locked,
+    Closed,
+    Merged,
+}
+
+/// Additive detail projection; the legacy `PullRequest` and GitHub shapes stay unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewDetails {
+    pub review: PullRequest,
+    pub source: Option<ReviewBranchIdentity>,
+    pub target: Option<ReviewBranchIdentity>,
+    /// Actual provider boolean; absence or a malformed value cannot establish non-draft status.
+    #[serde(default)]
+    pub confirmed_draft: Option<bool>,
+    /// Actual provider state; consumers must not infer this from legacy `review.state`.
+    #[serde(default)]
+    pub confirmed_state: Option<ConfirmedReviewState>,
+}
+impl ReviewDetails {
+    /// Reuse requires positively open state, known draft status and exact project/branch identities.
+    #[must_use]
+    pub fn matches_open(
+        &self,
+        source: &ReviewBranchIdentity,
+        target: &ReviewBranchIdentity,
+    ) -> bool {
+        let equal = |actual: &ReviewBranchIdentity, expected: &ReviewBranchIdentity| {
+            actual.instance_base_url == expected.instance_base_url
+                && actual.project_id == expected.project_id
+                && actual.branch == expected.branch
+                && match (&actual.project_path, &expected.project_path) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                }
+        };
+        self.confirmed_state == Some(ConfirmedReviewState::Open)
+            && self.confirmed_draft.is_some()
+            && self.review.state == PrState::Open
+            && !source.instance_base_url.is_empty()
+            && source.instance_base_url == target.instance_base_url
+            && source.project_id > 0
+            && source.project_id == target.project_id
+            && !source.branch.is_empty()
+            && !target.branch.is_empty()
+            && source.branch != target.branch
+            && self.source.as_ref().is_some_and(|s| equal(s, source))
+            && self.target.as_ref().is_some_and(|t| equal(t, target))
+    }
+}
+
+/// Availability accompanying optional reads, separate from their legacy projections.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewAvailability {
+    pub policy: ProviderAvailability,
+    pub approvals: ProviderAvailability,
+    pub checks: ProviderAvailability,
+    pub discussions: ProviderAvailability,
+}
+
+/// Review observation with explicit unknown/restricted fields and confirmed identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewObservation {
+    pub details: ReviewDetails,
+    pub signals: MergeRequirementSignals,
+    pub reviews: Option<Vec<Review>>,
+    pub threads: Option<ReviewThreadTally>,
+    pub conversation_count: Option<i64>,
+    pub availability: ReviewAvailability,
+}
+
+/// Outcome of the API stage only; this says nothing about local commit publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewCreateOutcome {
+    Created,
+    Reused,
+}
+
+/// An actual API response or an existing open review, never synthesized request metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCreateResult {
+    pub outcome: ReviewCreateOutcome,
+    pub details: ReviewDetails,
 }

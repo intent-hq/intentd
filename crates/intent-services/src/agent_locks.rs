@@ -53,24 +53,17 @@ impl AgentLockSnapshot {
     }
 }
 
-/// Whether the session is mid-turn (the same running set as the §5.5 retire
-/// guard): `pending` / `active` / legacy `Processing`.
-fn is_running_turn(status: AgentStatus) -> bool {
-    matches!(
-        status,
-        AgentStatus::Pending | AgentStatus::Active | AgentStatus::Processing
-    )
-}
-
 /// Whether `session` counts as actively working for lock purposes (FE
-/// `isAgentActivelyWorking` parity): running a turn, or linked to a task note
-/// whose status is not terminal (`complete`/`cancelled`). Retired and deleted
-/// sessions never lock — they cannot run again.
+/// `isAgentActivelyWorking` parity): running a turn
+/// ([`AgentStatus::is_running_turn`], the same set as the §5.5 retire guard),
+/// or linked to a task note whose status is not terminal
+/// (`complete`/`cancelled`). Retired and deleted sessions never lock — they
+/// cannot run again.
 async fn is_actively_working(services: &Services, session: &AgentSession) -> bool {
     if session.retired_at.is_some() || session.status == AgentStatus::Deleted {
         return false;
     }
-    if is_running_turn(session.status) {
+    if session.status.is_running_turn() {
         return true;
     }
     let Some(note_id) = session.task_note_id.as_ref() else {

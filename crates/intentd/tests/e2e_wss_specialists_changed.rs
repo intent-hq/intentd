@@ -8,8 +8,11 @@
 
 #![cfg(unix)]
 
+#[path = "wss_integration/claude_agents.rs"]
+mod claude_agents;
 mod common;
 
+use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Stdio};
 use std::sync::Arc;
@@ -37,20 +40,61 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
 /// Spawn `intentd serve` with a hermetic HOME so the user-tier specialists
 /// directory (`~/.intent/specialists`) never touches the real home.
 fn spawn_serve(data_dir: &Path, home_dir: &Path) -> Child {
-    let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    spawn_serve_with_claude_config(data_dir, home_dir, None)
+}
+
+fn spawn_serve_with_claude_config(
+    data_dir: &Path,
+    home_dir: &Path,
+    claude_config: Option<&Path>,
+) -> Child {
+    // Keep both boots' logs so restart teardown can be diagnosed.
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("daemon.log"))
+        .expect("open daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    common::serve_command()
+    let mut cmd = common::serve_command();
+    common::hermetic_github_identity(&mut cmd, data_dir);
+    // gh can resolve enterprise credentials when GH_HOST is inherited.
+    cmd.env_remove("GH_HOST")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
+        .stdin(Stdio::null())
         .env("HOME", home_dir)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve")
+        .stderr(Stdio::from(log));
+    if let Some(path) = claude_config {
+        cmd.env("CLAUDE_CONFIG_DIR", path).env(
+            "RUST_LOG",
+            "warn,intent_services::events::linked_watch=debug",
+        );
+    }
+    // Assert before spawning, so a broken fixture fails without using an
+    // inherited credential. Name missing contracts without printing values.
+    for key in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_HOST",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ] {
+        assert!(
+            cmd.get_envs()
+                .any(|(name, value)| name == key && value.is_none()),
+            "specialist fixture must remove inherited {key} before spawning"
+        );
+    }
+    cmd.spawn().expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -77,12 +121,29 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     write_half.write_all(line.as_bytes()).await.unwrap();
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
-        .await
-        .expect("uds rpc timed out")
-        .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
+    timeout(common::rpc_read_timeout(), async {
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            assert!(
+                reader.read_line(&mut buf).await.expect("read uds frame") > 0,
+                "UDS closed before the original RPC response"
+            );
+            let frame: Value = serde_json::from_str(buf.trim_end()).expect("invalid JSON frame");
+            if frame["id"] == json!(id) {
+                return frame;
+            }
+            // Retirement notifications may precede a shutdown reply on this
+            // same connection; a notification is not the request's result.
+            assert!(
+                common::is_repository_retirement_notification(&frame),
+                "unexpected UDS response: {frame}"
+            );
+            eprintln!("UDS RPC {id}: original notification {}", frame["method"]);
+        }
+    })
+    .await
+    .expect("uds rpc timed out")
 }
 
 #[derive(Debug)]
@@ -170,6 +231,18 @@ async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let reply = wss_reply(ws, id, method, params).await;
+    assert!(
+        reply.get("error").is_none(),
+        "rpc {method} errored: {reply}"
+    );
+    reply["result"].clone()
+}
+
+async fn wss_reply<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string().into()))
         .await
@@ -182,8 +255,7 @@ where
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["id"] == json!(id) {
-                    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
-                    return v["result"].clone();
+                    return v;
                 }
             }
             Some(Ok(Message::Ping(p))) => {
@@ -272,8 +344,15 @@ where
 
 /// Boot (or re-boot) a daemon over an existing data dir, returning the child
 /// and a pinned-TLS WSS client config for its live port.
-async fn boot(data_dir: &Path, home_dir: &Path) -> (Child, u16, Arc<ClientConfig>) {
-    let child = spawn_serve(data_dir, home_dir);
+async fn boot(data_dir: &Path, home_dir: &Path) -> (common::DaemonGuard, u16, Arc<ClientConfig>) {
+    let child = common::DaemonGuard::process_only(spawn_serve(data_dir, home_dir));
+    await_boot(data_dir, child).await
+}
+
+async fn await_boot(
+    data_dir: &Path,
+    child: common::DaemonGuard,
+) -> (common::DaemonGuard, u16, Arc<ClientConfig>) {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = common::await_wss_status(&socket).await;
@@ -286,9 +365,23 @@ async fn boot(data_dir: &Path, home_dir: &Path) -> (Child, u16, Arc<ClientConfig
     (child, port, client_config(&fingerprint))
 }
 
-fn stop(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+async fn stop(mut daemon: common::DaemonGuard, socket: &Path) {
+    // Give the daemon's child processes a chance to finish and be reaped
+    // before restarting it; the guard remains a backstop if shutdown fails.
+    let shutdown = uds_rpc(socket, 4, "system.shutdown", json!({})).await;
+    assert_eq!(shutdown["result"]["ok"], true, "{shutdown}");
+    let status = timeout(common::test_timeout(Duration::from_secs(10)), async {
+        loop {
+            if let Some(status) = daemon.child_mut().try_wait().expect("wait for daemon") {
+                return status;
+            }
+            // timing-guard: poll the requested process exit within a fixed deadline.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("daemon did not exit after system.shutdown");
+    assert!(status.success(), "daemon exited unsuccessfully: {status}");
 }
 
 fn specialist_md(name: &str, body: &str) -> String {
@@ -330,11 +423,10 @@ async fn specialist_file_change_emits_specialists_changed_over_wss() {
         .as_str()
         .expect("workspace id")
         .to_string();
-    stop(child);
+    stop(child, &socket).await;
 
     // Boot #2: the specialists watcher now covers the workspace's project tier.
-    let (child, port, cfg) = boot(&data_dir, &home_dir).await;
-    let _guard = common::DaemonGuard::process_only(child);
+    let (daemon, port, cfg) = boot(&data_dir, &home_dir).await;
 
     let mut sub = connect_ws(port, cfg.clone()).await;
     let sub_res = wss_rpc(
@@ -349,27 +441,60 @@ async fn specialist_file_change_emits_specialists_changed_over_wss() {
     // Let the OS watch establish before mutating (FSEvents/inotify warm-up).
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Mutate: create a project-tier specialist file.
-    std::fs::write(
-        specialists_dir.join("custom.md"),
-        specialist_md("Custom", "project-tier body"),
-    )
-    .expect("write specialist");
+    let mut previous_event_id = Value::Null;
+    for body in ["project-tier body", "later independent edit"] {
+        // A direct fs::write creates/truncates the visible .md file before
+        // writing its contents. A watcher scan between those operations can
+        // legitimately publish the empty and then the complete definition.
+        // Publish one complete catalog change, even if staging is interrupted.
+        let mut staged = tempfile::Builder::new()
+            .prefix(".stage-")
+            .tempfile_in(&specialists_dir)
+            .expect("stage specialist");
+        staged
+            .write_all(specialist_md("Custom", body).as_bytes())
+            .expect("write staged specialist");
+        let unpublished = drain_extra(&mut sub, "specialists:changed", 700).await;
+        assert!(
+            unpublished.is_none(),
+            "staging must not change the specialist catalog: {unpublished:?}"
+        );
+        staged
+            .persist(specialists_dir.join("custom.md"))
+            .expect("publish specialist");
 
-    let evt = next_event(&mut sub, &["specialists:changed"], 20).await;
-    assert_eq!(evt["type"], json!("specialists:changed"));
-    assert_eq!(evt["workspaceId"], ws_id.as_str());
-    assert!(evt["id"].is_string(), "event id: {evt}");
-    assert!(evt["timestamp"].is_string(), "timestamp: {evt}");
-    // The watcher emits a bare system actor (no id/name; optional fields are
-    // omitted from the wire per §9.1).
-    assert_eq!(evt["actor"], json!({ "type": "system" }));
-    assert_eq!(evt["data"], json!({ "workspaceId": ws_id }));
+        let evt = next_event(&mut sub, &["specialists:changed"], 20).await;
+        assert_eq!(evt["type"], json!("specialists:changed"));
+        assert_eq!(evt["workspaceId"], ws_id.as_str());
+        assert!(evt["id"].is_string(), "event id: {evt}");
+        assert_ne!(
+            evt["id"], previous_event_id,
+            "later write needs its own event"
+        );
+        previous_event_id = evt["id"].clone();
+        assert!(evt["timestamp"].is_string(), "timestamp: {evt}");
+        // The watcher emits a bare system actor (no id/name; optional fields
+        // are omitted from the wire per §9.1).
+        assert_eq!(evt["actor"], json!({ "type": "system" }));
+        assert_eq!(evt["data"], json!({ "workspaceId": ws_id }));
 
-    // Debounce coalesces the single write to exactly one emission.
-    let extra = drain_extra(&mut sub, "specialists:changed", 700).await;
-    assert!(
-        extra.is_none(),
-        "single specialist write must publish exactly one specialists:changed, got extra: {extra:?}"
-    );
+        let current = uds_rpc(
+            &socket,
+            3,
+            "specialist.get",
+            json!({ "workspacePath": checkout, "id": "custom" }),
+        )
+        .await;
+        assert_eq!(current["result"]["specialist"]["prompt"], body, "{current}");
+
+        // Keep the single-write exactly-once assertion for BOTH independent
+        // publications; do not discard events while checking the catalog.
+        let extra = drain_extra(&mut sub, "specialists:changed", 700).await;
+        assert!(
+            extra.is_none(),
+            "single specialist write must publish exactly one specialists:changed, first: {evt}, extra: {extra:?}"
+        );
+    }
+    drop(sub);
+    stop(daemon, &socket).await;
 }

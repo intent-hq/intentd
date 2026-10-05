@@ -763,3 +763,125 @@ async fn git_status_rename_is_single_r_entry_over_wss() {
 
     drop(daemon);
 }
+
+/// Routing context never replaces the explicit path, including when a root ID
+/// is also present. Pulls use a local origin and advance actual file contents.
+#[tokio::test]
+async fn integration_context_git_paths_and_pull_over_wss() {
+    let root = scratch_dir("routing-git");
+    let (daemon, port, cfg) = boot(root.path()).await;
+    let source = make_source_repo(&daemon.scratch);
+    run_git(&["remote", "remove", "origin"], &source);
+    let target = daemon.scratch.join("target");
+    run_git(
+        &["clone", source.to_str().unwrap(), target.to_str().unwrap()],
+        &daemon.scratch,
+    );
+    run_git(
+        &["update-ref", "refs/remotes/origin/remote-only", "HEAD"],
+        &target,
+    );
+    let mut ws = connect_ws(port, cfg).await;
+    let (workspace, worktree) = create_workspace(&mut ws, &source, "Routing context").await;
+    let untouched = std::fs::read_to_string(worktree.join("tracked.txt")).unwrap();
+    for (i, context) in [None, Some(workspace.as_str()), Some("other-route")]
+        .into_iter()
+        .enumerate()
+    {
+        let mut path = json!({"repoPath":target,"gitRootId":"unknown-root"});
+        if let Some(context) = context {
+            path["workspaceId"] = json!(context);
+        }
+        for include_remote in [false, true] {
+            let mut params = path.clone();
+            params["includeRemote"] = json!(include_remote);
+            let v = wss_rpc(&mut ws, 10, "git.getBranches", params).await;
+            assert_eq!(v["jsonrpc"], "2.0");
+            assert!(v.get("error").is_none(), "{v}");
+            assert_eq!(v["result"]["currentBranch"], "main");
+            assert_eq!(v["result"]["defaultBranch"], "main");
+            assert_eq!(
+                v["result"]["remoteBranches"],
+                if include_remote {
+                    json!(["origin/remote-only"])
+                } else {
+                    json!([])
+                }
+            );
+        }
+        let v = wss_rpc(&mut ws, 11, "git.getRemoteUrl", path.clone()).await;
+        assert_eq!(v["result"], json!({"url":source.to_string_lossy()}));
+        let mut missing_remote = path.clone();
+        missing_remote["remoteName"] = json!("absent");
+        let v = wss_rpc(&mut ws, 12, "git.getRemoteUrl", missing_remote).await;
+        assert_eq!(v["result"], json!({"url":null}));
+        let mut branch = path.clone();
+        branch["branchName"] = json!("main");
+        let v = wss_rpc(&mut ws, 13, "git.branchStatus", branch.clone()).await;
+        assert!(
+            v.get("error").is_none(),
+            "path must win over unknown root: {v}"
+        );
+        assert_eq!(v["result"]["currentBranch"], "main");
+        assert_eq!(v["result"]["isCurrentBranch"], true);
+        let contents = format!("remote revision {i}\n");
+        std::fs::write(source.join("tracked.txt"), &contents).unwrap();
+        run_git(&["add", "tracked.txt"], &source);
+        run_git(&["commit", "-m", "remote revision"], &source);
+        let v = wss_rpc(&mut ws, 14, "git.pull", branch.clone()).await;
+        assert!(v.get("error").is_none(), "{v}");
+        assert_eq!(v["result"]["ok"], true, "{v}");
+        assert_eq!(
+            std::fs::read_to_string(target.join("tracked.txt")).unwrap(),
+            contents
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("tracked.txt")).unwrap(),
+            untouched
+        );
+        branch["branchName"] = json!("missing-branch");
+        let v = wss_rpc(&mut ws, 15, "git.pull", branch.clone()).await;
+        assert!(
+            v.get("error").is_none(),
+            "ordinary pull failure is a result: {v}"
+        );
+        assert_eq!(v["result"]["ok"], false, "{v}");
+        assert!(v["result"]["error"].is_string());
+        for method in [
+            "git.getBranches",
+            "git.getRemoteUrl",
+            "git.branchStatus",
+            "git.pull",
+        ] {
+            let mut invalid = branch.clone();
+            invalid["repoPath"] = json!(daemon.scratch.join("nonexistent"));
+            let v = wss_rpc(&mut ws, 16, method, invalid).await;
+            assert_eq!(v["error"]["code"], -32602, "{method}: {v}");
+            assert!(v.get("result").is_none());
+        }
+    }
+    let v = wss_rpc(
+        &mut ws,
+        17,
+        "git.branchStatus",
+        json!({"workspaceId":workspace,"gitRootId":"unknown-root","branchName":"main"}),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown git root"));
+    let v = wss_rpc(
+        &mut ws,
+        18,
+        "git.branchStatus",
+        json!({"gitRootId":"unknown-root","branchName":"main"}),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("workspaceId"));
+}

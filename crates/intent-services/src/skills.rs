@@ -1,16 +1,15 @@
-//! Skills discovery module - ports skills-loader.ts faithfully.
+//! Intent-owned skill discovery for personal and project catalogs.
 //!
-//! Scans user and project directories for SKILL.md files following the
-//! precedence order (higher p wins name collisions):
-//! 1. `~/.agents/skills` (p1)
-//! 2. `~/.claude/skills` (p2)
-//! 3. `~/.augment/skills` (p3, auggie convention for back-compat)
-//! 4. `~/.intent/skills` (p4, app-owned)
-//! 5. `<workspace>/.agents/skills` (p5)
-//! 6. `<workspace>/.augment/skills` (p6, auggie convention for back-compat)
-//! 7. `<workspace>/.intent/skills` (p7, app-owned)
+//! Only `~/.intent/skills` is an implicit personal source. Third-party home
+//! roots and config environment overrides belong to native suppression
+//! inventories, never this catalog. All project roots outrank personal skills;
+//! the ordered roots below preserve `.intent` as the highest project tier.
+//! Explicit links inside these roots may refer outside the workspace (shared
+//! skill libraries); canonical deduplication and global scan budgets still
+//! apply. Discovery never walks ancestor projects or fetches remote/plugin roots.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -18,6 +17,9 @@ use std::time::SystemTime;
 const SKILL_FILENAME: &str = "SKILL.md";
 const MAX_SCAN_DEPTH: usize = 4;
 const MAX_SCANNED_DIRECTORIES: usize = 2000;
+const MAX_SCANNED_ENTRIES: usize = 20_000;
+const MAX_SKILL_BYTES: u64 = 1024 * 1024;
+const MAX_TOTAL_SKILL_BYTES: u64 = 32 * 1024 * 1024;
 const NO_WORKSPACE_CACHE_KEY: &str = "__no_workspace__";
 
 static NOISE_DIRECTORIES: &[&str] = &[
@@ -33,20 +35,29 @@ static NOISE_DIRECTORIES: &[&str] = &[
 ];
 
 /// Resolve the user's home directory from the environment (cross-platform).
-#[cfg(not(test))]
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+pub(crate) fn skill_home_dir() -> Option<PathBuf> {
+    // Test processes must not watch or import the developer's ambient skills.
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+    }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillMetadata {
     pub name: String,
     pub description: String,
     pub location: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_directory: Option<String>,
     pub scope: String, // "project" or "user"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<String>,
@@ -66,8 +77,8 @@ struct DiscoveredSkill {
 }
 
 #[derive(Debug, Clone)]
-struct ScanTarget {
-    root: PathBuf,
+pub(crate) struct SkillRoot {
+    pub root: PathBuf,
     precedence: u8,
     scope: String, // "project" or "user"
 }
@@ -76,7 +87,11 @@ struct ScanTarget {
 struct PathFingerprint {
     path: PathBuf,
     exists: bool,
-    mtime_ms: u128,
+    mtime_ns: u128,
+    length: u64,
+    canonical: Option<PathBuf>,
+    #[cfg(unix)]
+    change_identity: (i64, i64, u64, u64),
 }
 
 #[derive(Debug, Clone)]
@@ -84,21 +99,46 @@ struct CachePayload {
     skills: Vec<SkillMetadata>,
     catalog: String,
     fingerprints: Vec<PathFingerprint>,
+    watch_directories: Vec<PathBuf>,
+    project_watch_directories: Vec<PathBuf>,
 }
 
 struct CacheEntry {
     payload: CachePayload,
+    dirty: bool,
     load_promise: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 /// Global discovery cache keyed by normalized workspace path
 static DISCOVERY_CACHE: std::sync::LazyLock<Mutex<HashMap<String, CacheEntry>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static SKILL_IO_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 /// Public API: discover skills for a workspace
 pub(crate) async fn discover_skills(workspace_path: &str) -> Vec<SkillMetadata> {
     let payload = load_skills_payload(workspace_path).await;
     payload.skills.clone()
+}
+
+/// Fresh bounded discovery for callers already running in a blocking pool.
+/// Shares parsing/precedence with the async catalog and never enters its cache.
+pub(crate) fn discover_skills_sync(
+    workspace_path: Option<&Path>,
+    home_override: Option<PathBuf>,
+) -> Vec<SkillMetadata> {
+    let workspace = workspace_path.and_then(|path| path.canonicalize().ok());
+    let workspace = workspace.as_ref().map(|path| path.to_string_lossy());
+    scan_skills_sync(workspace.as_deref(), home_override).skills
+}
+
+/// Filesystem events are authoritative even when size and mtime were restored.
+/// Keep an in-flight scan's dirty flag so it cannot overwrite this invalidation.
+pub(crate) fn invalidate_skills_cache(workspace_path: &Path) {
+    let key = normalize_workspace_path(&workspace_path.to_string_lossy());
+    let mut cache = DISCOVERY_CACHE.lock().unwrap();
+    if let Some(entry) = cache.get_mut(key.as_deref().unwrap_or(NO_WORKSPACE_CACHE_KEY)) {
+        entry.dirty = true;
+    }
 }
 
 /// Public API: format skills catalog for prompt injection
@@ -126,20 +166,8 @@ pub(crate) async fn check_skills_changed(workspace_path: &str) -> (Vec<SkillMeta
     let payload = load_skills_payload(workspace_path).await;
     let new_skills = payload.skills.clone();
 
-    // Compare: changed if cache was empty or skill names/count differ
-    let changed = match old_skills {
-        None => !new_skills.is_empty(), // Changed if we now have skills
-        Some(old) => {
-            if old.len() == new_skills.len() {
-                // Compare sorted skill names
-                let old_names: Vec<_> = old.iter().map(|s| &s.name).collect();
-                let new_names: Vec<_> = new_skills.iter().map(|s| &s.name).collect();
-                old_names != new_names
-            } else {
-                true
-            }
-        }
-    };
+    // Metadata and alias locations are observable catalog changes too.
+    let changed = old_skills.map_or(!new_skills.is_empty(), |old| old != new_skills);
 
     (new_skills, changed)
 }
@@ -155,68 +183,46 @@ fn normalize_workspace_path(workspace_path: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Get scan targets in precedence order
-/// If `home_override` is provided, use it instead of reading from env (for tests)
-fn get_scan_targets(
-    workspace_path: Option<&str>,
-    home_override: Option<PathBuf>,
-) -> Vec<ScanTarget> {
-    let mut targets = Vec::new();
-
-    // Hermetic-test seam (intent-hq/monorepo#3029): unit tests never fall
-    // back to the developer's real home directory — user-installed skills
-    // would otherwise leak into prompts assembled by tests. Tests that need
-    // user-scope targets pass an explicit `home_override`.
-    #[cfg(test)]
-    let home = home_override;
-    #[cfg(not(test))]
-    let home = home_override.or_else(home_dir);
+/// Ordered roots, lowest to highest precedence. This is the single source for
+/// synchronous discovery, cached discovery and filesystem watch registration.
+/// `home` is the actual user home; only its Intent-owned skill directory is used.
+/// Missing roots stay in the list so their later creation invalidates the cache.
+pub(crate) fn skill_roots(workspace: Option<&Path>, home: Option<&Path>) -> Vec<SkillRoot> {
+    const PROJECT_ROOTS: &[&str] = &[
+        ".agent/skills",
+        ".agents/skills",
+        ".codex/skills",
+        ".factory/skills",
+        ".grok/skills",
+        ".opencode/skill",
+        ".opencode/skills",
+        ".pi/skills",
+        ".cortex/skills",
+        ".claude/skills",
+        ".augment/skills",
+        ".intent/skills",
+    ];
+    let mut roots = Vec::new();
     if let Some(home) = home {
-        targets.push(ScanTarget {
-            root: home.join(".agents").join("skills"),
-            precedence: 1,
-            scope: "user".to_string(),
-        });
-        targets.push(ScanTarget {
-            root: home.join(".claude").join("skills"),
-            precedence: 2,
-            scope: "user".to_string(),
-        });
-        targets.push(ScanTarget {
-            root: home.join(".augment").join("skills"),
-            precedence: 3,
-            scope: "user".to_string(),
-        });
-        targets.push(ScanTarget {
-            root: home.join(".intent").join("skills"),
-            precedence: 4,
+        roots.push(SkillRoot {
+            root: home.join(".intent/skills"),
+            precedence: 0,
             scope: "user".to_string(),
         });
     }
-
-    if let Some(ws) = workspace_path {
-        let ws_path = PathBuf::from(ws);
-        targets.push(ScanTarget {
-            root: ws_path.join(".agents").join("skills"),
-            precedence: 5,
-            scope: "project".to_string(),
-        });
-        targets.push(ScanTarget {
-            root: ws_path.join(".augment").join("skills"),
-            precedence: 6,
-            scope: "project".to_string(),
-        });
-        targets.push(ScanTarget {
-            root: ws_path.join(".intent").join("skills"),
-            precedence: 7,
-            scope: "project".to_string(),
-        });
+    if let Some(workspace) = workspace {
+        for (index, relative) in PROJECT_ROOTS.iter().enumerate() {
+            roots.push(SkillRoot {
+                root: workspace.join(relative),
+                precedence: u8::try_from(index + 1).expect("bounded project skill roots"),
+                scope: "project".to_string(),
+            });
+        }
     }
-
-    targets
+    roots
 }
 
-/// Load skills payload with caching and concurrent-load coalescing
+/// Internal: load cached skills for the process home.
 async fn load_skills_payload(workspace_path: &str) -> CachePayload {
     load_skills_payload_with_home(workspace_path, None).await
 }
@@ -240,7 +246,7 @@ async fn load_skills_payload_with_home(
                 if let Some(lock) = &entry.load_promise {
                     (Some(lock.clone()), false, Vec::new())
                 } else {
-                    (None, true, entry.payload.fingerprints.clone())
+                    (None, !entry.dirty, entry.payload.fingerprints.clone())
                 }
             } else {
                 (None, false, Vec::new())
@@ -257,7 +263,9 @@ async fn load_skills_payload_with_home(
             if fingerprints_current {
                 let cache = DISCOVERY_CACHE.lock().unwrap();
                 if let Some(entry) = cache.get(&cache_key) {
-                    return entry.payload.clone();
+                    if !entry.dirty {
+                        return entry.payload.clone();
+                    }
                 }
             }
         }
@@ -268,6 +276,14 @@ async fn load_skills_payload_with_home(
 
         {
             let mut cache = DISCOVERY_CACHE.lock().unwrap();
+            if cache
+                .get(&cache_key)
+                .is_some_and(|entry| entry.load_promise.is_some())
+            {
+                drop(cache);
+                drop(guard);
+                continue;
+            }
             let old_payload = cache.get(&cache_key).map(|e| e.payload.clone());
             cache.insert(
                 cache_key.clone(),
@@ -276,7 +292,10 @@ async fn load_skills_payload_with_home(
                         skills: Vec::new(),
                         catalog: String::new(),
                         fingerprints: Vec::new(),
+                        watch_directories: Vec::new(),
+                        project_watch_directories: Vec::new(),
                     }),
+                    dirty: false,
                     load_promise: Some(load_lock.clone()),
                 },
             );
@@ -284,40 +303,70 @@ async fn load_skills_payload_with_home(
 
         let result = scan_skills_with_home(normalized.as_deref(), home_override.clone()).await;
 
-        {
+        let invalidated = {
             let mut cache = DISCOVERY_CACHE.lock().unwrap();
+            let dirty = cache.get(&cache_key).is_some_and(|entry| entry.dirty);
             cache.insert(
                 cache_key.clone(),
                 CacheEntry {
                     payload: result.clone(),
+                    dirty,
                     load_promise: None,
                 },
             );
-        }
+            dirty
+        };
         drop(guard);
+        if invalidated {
+            continue;
+        }
 
         return result;
     }
 }
 
-/// Internal: scan skills with optional home directory override (for tests)
+/// Run filesystem traversal off async executor threads; synchronous consumers
+/// reuse the same scanner directly from their existing blocking pool.
 async fn scan_skills_with_home(
     workspace_path: Option<&str>,
     home_override: Option<PathBuf>,
 ) -> CachePayload {
+    let workspace_path = workspace_path.map(str::to_owned);
+    let permit = SKILL_IO_LIMIT
+        .acquire()
+        .await
+        .expect("skills I/O limiter closed");
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        scan_skills_sync(workspace_path.as_deref(), home_override)
+    })
+    .await
+    .expect("skills discovery worker panicked")
+}
+
+/// Internal: scan skills with optional home directory override (for tests)
+fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>) -> CachePayload {
     let mut observed_paths = std::collections::HashSet::new();
     let mut discovered_by_name = BTreeMap::new();
-    let mut scan_state = ScanState {
-        scanned_directories: 0,
-    };
+    let mut scan_state = ScanState::default();
+    let mut project_watch_directories = HashSet::new();
 
-    for target in get_scan_targets(workspace_path, home_override) {
+    // Visit the winning tier first so canonical deduplication cannot erase it.
+    let home = home_override.or_else(skill_home_dir);
+    for target in skill_roots(workspace_path.map(Path::new), home.as_deref())
+        .into_iter()
+        .rev()
+    {
         observed_paths.insert(target.root.clone());
-        let skill_files =
-            find_skill_files(&target.root, &mut observed_paths, &mut scan_state).await;
+        let skill_files = find_skill_files(&target.root, &mut observed_paths, &mut scan_state);
+        // Project tiers are visited first. Capture their paths before user
+        // discovery adds shared directories to the same bounded scan state.
+        if target.scope == "project" {
+            project_watch_directories.extend(scan_state.watch_directories.iter().cloned());
+        }
 
         for skill_file in skill_files {
-            if let Some(parsed) = parse_skill_file(&skill_file).await {
+            if let Some(parsed) = parse_skill_file(&skill_file, &mut scan_state) {
                 let name = parsed.metadata.name.clone();
 
                 if let Some(existing) = discovered_by_name.get(&name) {
@@ -354,58 +403,147 @@ async fn scan_skills_with_home(
         .collect();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
 
+    observed_paths.extend(scan_state.watch_directories.iter().cloned());
     let mut fingerprint_paths: Vec<_> = observed_paths.into_iter().collect();
     fingerprint_paths.sort();
     let mut fingerprints = Vec::new();
     for path in fingerprint_paths {
-        fingerprints.push(get_path_fingerprint(&path).await);
+        fingerprints.push(get_path_fingerprint(&path));
     }
 
+    let mut watch_directories: Vec<_> = scan_state.watch_directories.into_iter().collect();
+    watch_directories.sort();
     let catalog = build_skills_catalog(&skills);
 
     CachePayload {
         skills,
         catalog,
         fingerprints,
+        watch_directories,
+        project_watch_directories: project_watch_directories.into_iter().collect(),
     }
 }
 
+/// Link parents and targets need supplemental watches even inside ordinary
+/// tiers, whose filename filters can exclude the target. The scan bounds them.
+pub(crate) async fn linked_skill_watch_directories(workspace_path: &str) -> Vec<PathBuf> {
+    let payload = load_skills_payload(workspace_path).await;
+    if workspace_path.is_empty() {
+        payload.watch_directories
+    } else {
+        payload.project_watch_directories
+    }
+}
+
+#[derive(Default)]
 struct ScanState {
     scanned_directories: usize,
+    scanned_entries: usize,
+    directories: HashMap<PathBuf, usize>,
+    skill_bytes: u64,
+    files: HashSet<PathBuf>,
+    watch_directories: HashSet<PathBuf>,
+}
+
+impl ScanState {
+    fn watch_directory(&mut self, path: PathBuf) {
+        if self.watch_directories.len() < MAX_SCANNED_DIRECTORIES {
+            self.watch_directories.insert(path);
+        }
+    }
+}
+
+/// Observe both ends of a link. Parent watches detect replacement of the alias
+/// and atomic replacement of a file target with an arbitrary filename. A broken
+/// target watches only its nearest existing ancestor until it can be resolved.
+fn observe_link(path: &Path, state: &mut ScanState) {
+    let canonical = std::fs::canonicalize(path).ok();
+    if canonical.as_deref() == Some(path)
+        || (canonical.is_none() && !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink()))
+    {
+        return;
+    }
+    let mut link = path.to_path_buf();
+    // Match the OS symlink-resolution bound and cover intermediary links too.
+    for _ in 0..40 {
+        let mut alias = link.as_path();
+        while let Some(parent) = alias.parent() {
+            if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+                let unchanged = canonical_parent == parent;
+                state.watch_directory(canonical_parent);
+                if unchanged {
+                    break;
+                }
+            }
+            alias = parent;
+        }
+        let Ok(target) = std::fs::read_link(&link) else {
+            break;
+        };
+        link = link.parent().unwrap_or(&link).join(target);
+    }
+    if let Some(target) = canonical {
+        if std::fs::metadata(&target).is_ok_and(|m| m.is_dir()) {
+            state.watch_directory(target);
+        } else if let Some(parent) = target.parent() {
+            state.watch_directory(parent.to_path_buf());
+        }
+    } else if let Ok(target) = std::fs::read_link(path) {
+        let target = path.parent().unwrap_or(path).join(target);
+        let mut ancestor = target.as_path();
+        while let Some(parent) = ancestor.parent() {
+            if let Ok(canonical) = std::fs::canonicalize(parent) {
+                state.watch_directory(canonical);
+                break;
+            }
+            ancestor = parent;
+        }
+    }
 }
 
 /// Find all SKILL.md files under `root_path`
-async fn find_skill_files(
+fn find_skill_files(
     root_path: &Path,
     observed_paths: &mut std::collections::HashSet<PathBuf>,
     scan_state: &mut ScanState,
 ) -> Vec<PathBuf> {
-    if !tokio::fs::try_exists(root_path).await.unwrap_or(false) {
+    observe_link(root_path, scan_state);
+    if !root_path.try_exists().unwrap_or(false) {
         return Vec::new();
     }
 
     let mut skill_files = Vec::new();
-    walk_directory(root_path, 0, observed_paths, scan_state, &mut skill_files).await;
+    walk_directory(root_path, 0, observed_paths, scan_state, &mut skill_files);
     skill_files
 }
 
 /// Recursive directory walker
-#[async_recursion::async_recursion]
-async fn walk_directory(
+fn walk_directory(
     current_path: &Path,
     depth: usize,
     observed_paths: &mut std::collections::HashSet<PathBuf>,
     scan_state: &mut ScanState,
     skill_files: &mut Vec<PathBuf>,
 ) {
+    observed_paths.insert(current_path.to_path_buf());
+    observe_link(current_path, scan_state);
     if scan_state.scanned_directories >= MAX_SCANNED_DIRECTORIES {
         return;
     }
-
+    let Ok(canonical) = std::fs::canonicalize(current_path) else {
+        return;
+    };
+    if scan_state
+        .directories
+        .get(&canonical)
+        .is_some_and(|best_depth| *best_depth <= depth)
+    {
+        return;
+    }
+    scan_state.directories.insert(canonical, depth);
     scan_state.scanned_directories += 1;
-    observed_paths.insert(current_path.to_path_buf());
 
-    let mut entries = match tokio::fs::read_dir(current_path).await {
+    let mut entries = match std::fs::read_dir(current_path) {
         Ok(entries) => entries,
         Err(e) => {
             eprintln!(
@@ -418,10 +556,14 @@ async fn walk_directory(
     };
 
     let mut dir_entries = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    while scan_state.scanned_entries < MAX_SCANNED_ENTRIES {
+        let Some(Ok(entry)) = entries.next() else {
+            break;
+        };
+        scan_state.scanned_entries += 1;
         dir_entries.push(entry);
     }
-    dir_entries.sort_by_key(tokio::fs::DirEntry::file_name);
+    dir_entries.sort_by_key(std::fs::DirEntry::file_name);
 
     // Check for SKILL.md in this directory
     let has_skill_file = dir_entries
@@ -431,8 +573,15 @@ async fn walk_directory(
     if has_skill_file {
         let skill_path = current_path.join(SKILL_FILENAME);
         observed_paths.insert(skill_path.clone());
-        skill_files.push(skill_path);
-        return; // Stop descending once SKILL.md is found
+        observe_link(&skill_path, scan_state);
+        if let Ok(canonical) = std::fs::canonicalize(&skill_path) {
+            if std::fs::metadata(&skill_path).is_ok_and(|m| m.is_file())
+                && scan_state.files.insert(canonical)
+            {
+                skill_files.push(skill_path);
+            }
+            return; // Stop descending once a real SKILL.md is found.
+        }
     }
 
     if depth >= MAX_SCAN_DEPTH {
@@ -444,19 +593,22 @@ async fn walk_directory(
         let file_name = entry.file_name();
         let file_name_str = file_name.to_string_lossy();
 
-        if let Ok(metadata) = entry.metadata().await {
-            if metadata.is_dir()
-                && !metadata.is_symlink()
-                && !NOISE_DIRECTORIES.contains(&file_name_str.as_ref())
-            {
+        if NOISE_DIRECTORIES.contains(&file_name_str.as_ref()) {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+            observed_paths.insert(entry.path());
+            observe_link(&entry.path(), scan_state);
+        }
+        if let Ok(metadata) = std::fs::metadata(entry.path()) {
+            if metadata.is_dir() {
                 walk_directory(
                     &entry.path(),
                     depth + 1,
                     observed_paths,
                     scan_state,
                     skill_files,
-                )
-                .await;
+                );
                 if scan_state.scanned_directories >= MAX_SCANNED_DIRECTORIES {
                     eprintln!(
                         "WARN: Skills discovery stopped after reaching directory scan limit: rootPath={}, limit={}",
@@ -471,8 +623,28 @@ async fn walk_directory(
 }
 
 /// Parse a SKILL.md file
-async fn parse_skill_file(skill_path: &Path) -> Option<ParsedSkillFile> {
-    let content = match tokio::fs::read_to_string(skill_path).await {
+fn parse_skill_file(skill_path: &Path, state: &mut ScanState) -> Option<ParsedSkillFile> {
+    let metadata = std::fs::metadata(skill_path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_SKILL_BYTES {
+        return None;
+    }
+    let budget = MAX_TOTAL_SKILL_BYTES
+        .saturating_sub(state.skill_bytes)
+        .min(MAX_SKILL_BYTES);
+    if budget == 0 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(skill_path)
+        .and_then(|file| file.take(budget + 1).read_to_end(&mut bytes));
+    state.skill_bytes = state.skill_bytes.saturating_add(bytes.len() as u64);
+    if bytes.len() as u64 > budget {
+        return None;
+    }
+    let content = match read.and_then(|_| {
+        String::from_utf8(bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }) {
         Ok(content) => content,
         Err(e) => {
             eprintln!(
@@ -537,6 +709,12 @@ async fn parse_skill_file(skill_path: &Path) -> Option<ParsedSkillFile> {
             name,
             description,
             location: skill_path.to_string_lossy().into_owned(),
+            resource_directory: skill_path
+                .canonicalize()
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .filter(|parent| Some(parent.as_path()) != skill_path.parent())
+                .map(|parent| parent.to_string_lossy().into_owned()),
             scope: "user".to_string(), // Will be overridden by scan_skills
             allowed_tools: parsed.allowed_tools,
             compatibility: parsed.compatibility,
@@ -656,22 +834,40 @@ pub(crate) fn build_skills_catalog(skills: &[SkillMetadata]) -> String {
     let skill_xml = skills
         .iter()
         .map(|skill| {
+            let resource = skill.resource_directory.as_ref().map_or_else(String::new, |directory| {
+                format!("\n    <resource_directory>{}</resource_directory>", escape_xml(directory))
+            });
             format!(
-                "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>",
+                "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>{}\n  </skill>",
                 escape_xml(&skill.name),
                 escape_xml(&skill.description),
-                escape_xml(&skill.location)
+                escape_xml(&skill.location),
+                resource
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
 
+    let (resource_intro, resource_detail) = if skills
+        .iter()
+        .any(|skill| skill.resource_directory.is_some())
+    {
+        (
+            "When a skill references relative paths, use its resource_directory when listed;",
+            "otherwise use the parent of SKILL.md. Use absolute paths in tool calls.",
+        )
+    } else {
+        (
+            "When a skill references relative paths, resolve them against the skill's",
+            "directory (the parent of SKILL.md) and use absolute paths in tool calls.",
+        )
+    };
     [
         "The following skills provide specialized instructions for specific tasks.",
         "When a task matches a skill's description, use your file-read tool to load",
         "the SKILL.md at the listed location before proceeding.",
-        "When a skill references relative paths, resolve them against the skill's",
-        "directory (the parent of SKILL.md) and use absolute paths in tool calls.",
+        resource_intro,
+        resource_detail,
         "",
         "<available_skills>",
         &skill_xml,
@@ -688,34 +884,72 @@ fn escape_xml(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Get path fingerprint (existence + mtime)
-async fn get_path_fingerprint(path: &Path) -> PathFingerprint {
-    match tokio::fs::metadata(path).await {
+/// Metadata fingerprint; Unix change time/inode also detects restored mtimes.
+fn get_path_fingerprint(path: &Path) -> PathFingerprint {
+    match std::fs::metadata(path) {
         Ok(metadata) => {
-            let mtime_ms = metadata
+            let mtime_ns = metadata
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_millis());
+                .map_or(0, |d| d.as_nanos());
             PathFingerprint {
                 path: path.to_path_buf(),
                 exists: true,
-                mtime_ms,
+                mtime_ns,
+                length: metadata.len(),
+                canonical: std::fs::canonicalize(path).ok(),
+                #[cfg(unix)]
+                change_identity: {
+                    use std::os::unix::fs::MetadataExt;
+                    (
+                        metadata.ctime(),
+                        metadata.ctime_nsec(),
+                        metadata.dev(),
+                        metadata.ino(),
+                    )
+                },
             }
         }
         Err(_) => PathFingerprint {
             path: path.to_path_buf(),
             exists: false,
-            mtime_ms: 0,
+            mtime_ns: 0,
+            length: 0,
+            canonical: None,
+            #[cfg(unix)]
+            change_identity: (0, 0, 0, 0),
         },
     }
 }
 
 /// Check if all fingerprints are still current
 async fn are_fingerprints_current(fingerprints: &[PathFingerprint]) -> bool {
+    let fingerprints = fingerprints.to_vec();
+    let permit = SKILL_IO_LIMIT
+        .acquire()
+        .await
+        .expect("skills I/O limiter closed");
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        fingerprints_current_sync(&fingerprints)
+    })
+    .await
+    .expect("skills fingerprint worker panicked")
+}
+
+fn fingerprints_current_sync(fingerprints: &[PathFingerprint]) -> bool {
     for fingerprint in fingerprints {
-        let current = get_path_fingerprint(&fingerprint.path).await;
-        if current.exists != fingerprint.exists || current.mtime_ms != fingerprint.mtime_ms {
+        let current = get_path_fingerprint(&fingerprint.path);
+        #[cfg(unix)]
+        if current.change_identity != fingerprint.change_identity {
+            return false;
+        }
+        if current.exists != fingerprint.exists
+            || current.mtime_ns != fingerprint.mtime_ns
+            || current.length != fingerprint.length
+            || current.canonical != fingerprint.canonical
+        {
             return false;
         }
     }
@@ -725,6 +959,143 @@ async fn are_fingerprints_current(fingerprints: &[PathFingerprint]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const AUDITED_PROJECT_ROOTS: &[&str] = &[
+        ".agent/skills",
+        ".agents/skills",
+        ".codex/skills",
+        ".factory/skills",
+        ".grok/skills",
+        ".opencode/skill",
+        ".opencode/skills",
+        ".pi/skills",
+        ".cortex/skills",
+        ".claude/skills",
+        ".augment/skills",
+        ".intent/skills",
+    ];
+
+    #[tokio::test]
+    async fn catalog_ownership_excludes_native_home_skills_from_both_consumers() {
+        let dir = crate::test_support::test_tempdir("skills-ownership-");
+        let home = dir.path().join("home");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        for (index, root) in AUDITED_PROJECT_ROOTS.iter().enumerate() {
+            let name = format!("personal-{index}");
+            write_skill(
+                &home.join(root),
+                &name,
+                &build_skill_content(&format!("name: {name}\ndescription: personal"), "Body"),
+            )
+            .await;
+        }
+        let expected = vec![format!("personal-{}", AUDITED_PROJECT_ROOTS.len() - 1)];
+        let asynchronous = discover_skills_test(&project.to_string_lossy(), home.clone()).await;
+        let synchronous = discover_skills_sync(Some(&project), Some(home));
+        assert_eq!(asynchronous, synchronous);
+        assert_eq!(
+            asynchronous
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(asynchronous[0].scope, "user");
+    }
+
+    #[tokio::test]
+    async fn catalog_ownership_discovers_new_roots_and_preserves_order() {
+        let dir = crate::test_support::test_tempdir("skills-project-roots-");
+        let project = dir.path().join("project");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(
+            discover_skills_test(&project.to_string_lossy(), home.clone())
+                .await
+                .is_empty()
+        );
+        for (index, root) in AUDITED_PROJECT_ROOTS.iter().enumerate() {
+            let name = format!("project-{index:02}");
+            write_skill(
+                &project.join(root),
+                &name,
+                &build_skill_content(&format!("name: {name}\ndescription: {root}"), "Body"),
+            )
+            .await;
+            write_skill(
+                &project.join(root),
+                "duplicate",
+                &build_skill_content(&format!("name: duplicate\ndescription: {root}"), "Body"),
+            )
+            .await;
+            let skills = discover_skills_test(&project.to_string_lossy(), home.clone()).await;
+            assert_eq!(
+                skills.len(),
+                index + 2,
+                "new root {root} must invalidate the cache"
+            );
+            assert_eq!(
+                skills
+                    .iter()
+                    .find(|s| s.name == "duplicate")
+                    .unwrap()
+                    .description,
+                *root
+            );
+            assert_eq!(
+                skills,
+                discover_skills_sync(Some(&project), Some(home.clone()))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn catalog_ownership_new_roots_keep_link_dedup_and_bounds() {
+        use std::os::unix::fs::symlink;
+        let dir = crate::test_support::test_tempdir("skills-root-links-");
+        let project = dir.path().join("project");
+        let external = dir.path().join("explicitly-linked");
+        let home = dir.path().join("home");
+        let file = write_skill(
+            &external,
+            "shared",
+            &build_skill_content("name: shared\ndescription: external", "Body"),
+        )
+        .await;
+        for root in [".codex/skills", ".factory/skills"] {
+            let link = project.join(root);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(&external, link).unwrap();
+        }
+        symlink(&external, external.join("cycle")).unwrap();
+        write_skill(&external, "malformed", "no frontmatter").await;
+        write_skill(
+            &external.join("a/b/c/d"),
+            "too-deep",
+            &build_skill_content("name: too-deep\ndescription: excluded", "Body"),
+        )
+        .await;
+        let oversized = write_skill(&external, "oversized", "oversized").await;
+        std::fs::File::options()
+            .write(true)
+            .open(oversized)
+            .unwrap()
+            .set_len(MAX_SKILL_BYTES + 1)
+            .unwrap();
+        let skills = discover_skills_test(&project.to_string_lossy(), home.clone()).await;
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "shared");
+        assert!(skills[0].location.contains(".factory/skills"));
+        std::fs::write(
+            file,
+            build_skill_content("name: shared\ndescription: updated", "Body"),
+        )
+        .unwrap();
+        let updated = discover_skills_test(&project.to_string_lossy(), home).await;
+        assert_eq!(updated[0].description, "updated");
+    }
 
     fn build_skill_content(frontmatter: &str, body: &str) -> String {
         format!("---\n{frontmatter}\n---\n\n{body}\n")
@@ -762,14 +1133,49 @@ mod tests {
     /// skills installed there) stays out of test-assembled prompts.
     #[test]
     fn test_scan_targets_without_home_override_skip_user_scope() {
-        let targets = get_scan_targets(Some("/tmp/ws"), None);
+        let targets = skill_roots(Some(Path::new("/tmp/ws")), skill_home_dir().as_deref());
         assert!(
             targets.iter().all(|t| t.scope == "project"),
             "no user-scope scan targets without an explicit home override"
         );
 
-        let with_home = get_scan_targets(Some("/tmp/ws"), Some(PathBuf::from("/tmp/home")));
+        let with_home = skill_roots(Some(Path::new("/tmp/ws")), Some(Path::new("/tmp/home")));
         assert!(with_home.iter().any(|t| t.scope == "user"));
+    }
+
+    #[tokio::test]
+    async fn test_repo_less_scan_uses_only_user_skills_with_existing_precedence() {
+        let root = crate::test_support::test_tempdir("repo-less-skills-");
+        let home = root.path().join("home");
+        let empty = scan_skills_with_home(None, Some(home.clone())).await;
+        assert!(empty.skills.is_empty());
+        assert!(
+            !home.exists(),
+            "discovery must not create missing directories"
+        );
+        for (tier, description) in [(".agents", "base"), (".intent", "override")] {
+            write_skill(
+                &home.join(tier).join("skills"),
+                "shared",
+                &build_skill_content(&format!("name: shared\ndescription: {description}"), "Body"),
+            )
+            .await;
+        }
+        let user = scan_skills_with_home(None, Some(home.clone())).await;
+        assert_eq!(user.skills.len(), 1);
+        assert_eq!(user.skills[0].scope, "user");
+        assert_eq!(user.skills[0].description, "override");
+        let project = root.path().join("project");
+        write_skill(
+            &project.join(".agents/skills"),
+            "shared",
+            &build_skill_content("name: shared\ndescription: project", "Body"),
+        )
+        .await;
+        let configured = scan_skills_with_home(Some(&project.to_string_lossy()), Some(home)).await;
+        assert_eq!(configured.skills.len(), 1);
+        assert_eq!(configured.skills[0].scope, "project");
+        assert_eq!(configured.skills[0].description, "project");
     }
 
     #[tokio::test]

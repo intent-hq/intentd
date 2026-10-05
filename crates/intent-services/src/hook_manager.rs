@@ -40,7 +40,7 @@
 //! (still-active) hook so a silently broken check is observable via
 //! `ws.hook.list`; a later all-healthy run clears it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -53,7 +53,7 @@ use intent_core::{
     now_iso, AgentId, AgentStatus, Error, Hook, HookId, HookState, Result, WorkspaceApi,
     WorkspaceId,
 };
-use intent_store::NewEvent;
+use intent_store::{ActiveHookMetadata, NewEvent};
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -87,6 +87,17 @@ pub(crate) const MAX_HOOK_NAME_LEN: usize = 50;
 /// killed and the hook evicted). Tests compress it via the `#[cfg(test)]`-only
 /// [`Services::with_hook_eval_timeout`].
 pub(crate) const HOOK_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+// Validation runs are inline: their ws.hook.schedule calls re-enter the
+// service before any hook is persisted. Bound the evaluation chain, allowing
+// a running hook to validate one replacement, but not another generation.
+const MAX_HOOK_EVAL_DEPTH: usize = 2;
+tokio::task_local! {
+    // Scope follows future polls (including the QuickJS host futures), not a
+    // worker thread or agent. Sibling futures are independent and dropping a
+    // cancelled/timed-out eval restores the enclosing depth automatically.
+    static HOOK_EVAL_DEPTH: usize;
+}
 
 /// Bounded retry budget for a hook run's persistence steps
 /// (intent-hq/intent#5035): a store/pool error (`Error::Internal`) on any
@@ -122,6 +133,28 @@ const HOOK_WAKE_LOGS_CAP: usize = crate::harness::v1::HOOK_WAKE_LOGS_CAP;
 /// `state` is dropped (the previous state is kept) with a warning line
 /// appended to that run's logs.
 const HOOK_STATE_MAX_BYTES: usize = 16 * 1024;
+
+/// How a cancel transition ([`Services::cancel_active_hook`],
+/// [`Services::cancel_active_pr_monitor`]) settles the owner's deferred
+/// completion watches. A completion watch on an idle owner defers while the
+/// owner has active hooks / PR monitors, so cancelling the LAST one must
+/// re-run the deferral backstop
+/// ([`Services::redeliver_completion_after_queue_mutation`]) — either
+/// through a wake or directly — or the watch strands forever.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CancelSettlement<'a> {
+    /// Wake the owner with this notice; the wake runs the backstop itself
+    /// after the delivery attempt (FE/app cancel).
+    Notify(&'a str),
+    /// No wake; run the backstop directly (owner-side cancel, retire sweep).
+    Resettle,
+    /// Neither: the caller sweeps several items and runs the backstop ONCE
+    /// per owner after queueing its consolidated wake (archive sweep). The
+    /// per-item backstop would otherwise see an empty queue and no remaining
+    /// watches on the final item and synthesize a genuine completion,
+    /// consuming a parent's watch BEFORE the consolidated notice is queued.
+    Deferred,
+}
 
 /// Cap (in chars) on the `message` a dispatching run returns and on the error
 /// text an eviction wake carries. Longer text is head-kept and tail-marked
@@ -539,6 +572,7 @@ async fn run_hook_script(
     timeout: Duration,
     agent_features: &AgentFeaturesSettings,
     is_sub_agent: bool,
+    cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> RunOutcome {
     let host = intent_acp::make_workspace_host_for_bridge(
         api,
@@ -644,9 +678,17 @@ async fn run_hook_script(
     };
     // Hook runs are daemon-internal work: every `ws.*` call the script makes
     // is bound to the `Daemon` caller (multiplayer w1).
-    let eval = intent_core::with_caller(
-        intent_core::Caller::Daemon,
-        intent_js::eval(&full_code, &opts, Some(host)),
+    let depth = HOOK_EVAL_DEPTH.try_with(|depth| *depth).unwrap_or(0);
+    let eval = HOOK_EVAL_DEPTH.scope(
+        depth + 1,
+        intent_core::with_caller(intent_core::Caller::Daemon, async {
+            match cancelled {
+                Some(flag) => {
+                    intent_js::eval_with_cancellation(&full_code, &opts, Some(host), flag).await
+                }
+                None => intent_js::eval(&full_code, &opts, Some(host)).await,
+            }
+        }),
     );
     match eval.await {
         Ok(v) => {
@@ -820,7 +862,7 @@ fn bound_wake_text(text: &str) -> String {
 /// Project one active hook into its idle-visibility `waitingOnHooks` entry:
 /// `{ hookId, name, nextRunAt?, expiresAt? }` — light metadata only, no
 /// code/lastState/logs.
-fn waiting_on_hooks_entry(h: Hook) -> Value {
+fn waiting_on_hooks_entry(h: ActiveHookMetadata) -> Value {
     let mut v = json!({
         "hookId": h.hook_id,
         "name": h.name,
@@ -862,6 +904,13 @@ impl Services {
         agent_id: &AgentId,
         params: &Value,
     ) -> Result<Value> {
+        if HOOK_EVAL_DEPTH.try_with(|depth| *depth).unwrap_or(0) >= MAX_HOOK_EVAL_DEPTH {
+            return Err(Error::InvalidParams(
+                "hook.schedule: nested hook validation limit reached; a hook may validate \
+                 one replacement, but that validation must not schedule another hook"
+                    .into(),
+            ));
+        }
         let agent_features = self.effective_settings().agent_features;
         if !agent_features.background_hooks {
             return Err(Error::InvalidParams(
@@ -991,8 +1040,43 @@ impl Services {
             self.hook_eval_timeout,
             &agent_features,
             is_sub_agent,
+            (HOOK_EVAL_DEPTH.try_with(|depth| *depth).unwrap_or(0) > 0)
+                .then(|| self.delivery_tasks.cancellation_flag()),
         )
         .await;
+        // A failed validation has no durable outcome or notification to own.
+        // Preserve its original error, including pre-closed JS cancellation.
+        if matches!(outcome, RunOutcome::Failed { .. }) {
+            return self.commit_hook_validation(hook, kind, outcome).await;
+        }
+        // Inline validation may be running inside a parent's cancellable JS
+        // evaluation. Transfer the outcome before the first durable write so
+        // cancelling that parent cannot discard a committed child notification.
+        let services = self.clone();
+        let (finished, result) = tokio::sync::oneshot::channel();
+        self.delivery_tasks
+            .spawn_draining(async move {
+                let outcome = crate::workspace_mutations::boxed(
+                    services.commit_hook_validation(hook, kind, outcome),
+                )
+                .await;
+                let _ = finished.send(outcome);
+            })
+            .ok_or_else(|| Error::Internal("daemon is shutting down".into()))?;
+        result
+            .await
+            .map_err(|_| Error::Internal("hook validation commit task failed".into()))?
+    }
+
+    async fn commit_hook_validation(
+        &self,
+        hook: Hook,
+        kind: ScheduleKind,
+        outcome: RunOutcome,
+    ) -> Result<Value> {
+        let workspace_id = &hook.workspace_id.clone();
+        let _mutation = self.workspace_mutations.enter(workspace_id)?;
+        self.store.get_workspace(workspace_id).await?;
         match outcome {
             RunOutcome::Failed { error, .. } => Err(Error::InvalidParams(format!(
                 "hook.schedule: first run failed: {error}"
@@ -1157,7 +1241,7 @@ impl Services {
     /// empty (visibility is best-effort and must never block an idle emit or
     /// wake delivery).
     pub(crate) async fn active_hooks_for_agent(&self, agent_id: &AgentId) -> Vec<Value> {
-        let hooks = match self.store.list_hooks_by_agent(agent_id).await {
+        let hooks = match self.store.active_hook_metadata_by_agent(agent_id).await {
             Ok(hooks) => hooks,
             Err(e) => {
                 tracing::warn!(
@@ -1168,11 +1252,7 @@ impl Services {
                 return Vec::new();
             }
         };
-        hooks
-            .into_iter()
-            .filter(|h| matches!(h.state, HookState::Scheduled | HookState::Running))
-            .map(waiting_on_hooks_entry)
-            .collect()
+        hooks.into_iter().map(waiting_on_hooks_entry).collect()
     }
 
     /// Workspace-batched variant of
@@ -1184,7 +1264,11 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> HashMap<String, Vec<Value>> {
-        let hooks = match self.store.list_hooks_by_workspace(workspace_id).await {
+        let hooks = match self
+            .store
+            .active_hook_metadata_by_workspace(workspace_id)
+            .await
+        {
             Ok(hooks) => hooks,
             Err(e) => {
                 tracing::warn!(
@@ -1196,10 +1280,7 @@ impl Services {
             }
         };
         let mut by_agent: HashMap<String, Vec<Value>> = HashMap::new();
-        for h in hooks
-            .into_iter()
-            .filter(|h| matches!(h.state, HookState::Scheduled | HookState::Running))
-        {
+        for h in hooks {
             let agent = h.agent_id.0.clone();
             by_agent
                 .entry(agent)
@@ -1293,20 +1374,26 @@ impl Services {
         let notice = caller
             .is_none()
             .then(|| crate::harness::latest().hook_cancelled_from_app_notice());
-        let hook = self.cancel_active_hook(hook, notice.as_deref()).await?;
+        let settlement = match notice.as_deref() {
+            Some(notice) => CancelSettlement::Notify(notice),
+            None => CancelSettlement::Resettle,
+        };
+        let hook = self.cancel_active_hook(hook, settlement).await?;
         Ok(json!({ "ok": true, "hook": hook }))
     }
 
     /// Core cancel transition shared by [`Services::hook_cancel_op`] and the
-    /// archive sweep ([`Services::cancel_workspace_hooks`]): abort the
-    /// scheduler task, persist `cancelled`, clear `nextRunAt`, and emit
-    /// `hook:cancelled`. With a `wake_notice` the owner is woken (the wake
-    /// runs the deferral backstop itself, inside `wake_hook_owner`, after
-    /// the delivery attempt); without one, no wake is delivered — a deferred
-    /// completion watch on the (idle) owner would otherwise never settle
-    /// when this was its last active hook, so the backstop runs directly.
-    /// The caller must have verified the hook is ACTIVE.
-    async fn cancel_active_hook(&self, mut hook: Hook, wake_notice: Option<&str>) -> Result<Hook> {
+    /// archive / retire sweeps ([`Services::cancel_workspace_hooks`],
+    /// [`Services::cancel_agent_hooks`]): abort the scheduler task, persist
+    /// `cancelled`, clear `nextRunAt`, and emit `hook:cancelled`. How the
+    /// owner's deferred completion watches settle is the caller's
+    /// [`CancelSettlement`] choice. The caller must have verified the hook
+    /// is ACTIVE.
+    async fn cancel_active_hook(
+        &self,
+        mut hook: Hook,
+        settlement: CancelSettlement<'_>,
+    ) -> Result<Hook> {
         self.abort_hook_task(&hook.hook_id);
         self.store
             .update_hook_state(&hook.hook_id, HookState::Cancelled)
@@ -1315,9 +1402,12 @@ impl Services {
         hook.state = HookState::Cancelled;
         hook.next_run_at = None;
         self.emit_hook_event(HOOK_CANCELLED, &hook, None).await;
-        match wake_notice {
-            Some(notice) => self.wake_hook_owner(&hook, notice, "cancelled").await,
-            None => self.resettle_owner_after_hook_terminal(&hook).await,
+        match settlement {
+            CancelSettlement::Notify(notice) => {
+                self.wake_hook_owner(&hook, notice, "cancelled").await;
+            }
+            CancelSettlement::Resettle => self.resettle_owner_after_hook_terminal(&hook).await,
+            CancelSettlement::Deferred => {}
         }
         // The last active hook settling can demote the derived displayStatus
         // (§6.5) and drop the orthogonal `waiting` flag (§5.1) —
@@ -1329,18 +1419,28 @@ impl Services {
     }
 
     /// Archive sweep (`workspace.archive`): cancel every ACTIVE
-    /// (`scheduled`/`running`) hook in the workspace through the
-    /// `hook.cancel` machinery — task aborted, state persisted to
-    /// `cancelled`, `hook:cancelled` emitted — plus an owner-wake notice so
-    /// the agent learns why its watch stopped. Runs AFTER the archived row
-    /// is persisted: the wake rides the archived gate in
-    /// [`Services::deliver_wake_message`], so it parks in the queue (at
-    /// most) and never starts a turn while the workspace is archived.
+    /// (`scheduled`/`running`) hook in the workspace through the shared
+    /// cancel transition ([`Services::cancel_active_hook`]) — task aborted,
+    /// state persisted to `cancelled`, `hook:cancelled` emitted, waiting
+    /// recomputed (§5.1). Each cancel is SILENT (no per-hook wake) and
+    /// DEFERRED ([`CancelSettlement::Deferred`]: no per-item completion
+    /// backstop either): the cancelled hooks are returned grouped by owner
+    /// as `(name, hook_id)` pairs, and the archive tail
+    /// ([`crate::Services::notify_owners_of_archived_watches`]) folds them
+    /// with the swept PR monitors into ONE consolidated notice per agent and
+    /// only THEN runs the backstop — so a completion watch deferred on a
+    /// monitoring-idle owner sees the queued notice and stays armed, exactly
+    /// as it did behind the retired per-item wakes.
     /// Terminal hooks (`dispatched`/`evicted`/`cancelled`/`expired`) are
-    /// untouched. Best-effort per hook: a store failure is logged and the
-    /// sweep moves on — archiving must not fail because one hook row would
-    /// not update.
-    pub(crate) async fn cancel_workspace_hooks(&self, workspace_id: &WorkspaceId) {
+    /// untouched, and unarchive does NOT resurrect cancelled hooks — the
+    /// notice tells the owner to reschedule if the condition still matters.
+    /// Best-effort per hook: a store failure is logged and the sweep moves
+    /// on — archiving must not fail because one hook row would not update.
+    pub(crate) async fn cancel_workspace_hooks(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> BTreeMap<AgentId, Vec<(String, HookId)>> {
+        let mut cancelled: BTreeMap<AgentId, Vec<(String, HookId)>> = BTreeMap::new();
         let hooks = match self.store.list_hooks_by_workspace(workspace_id).await {
             Ok(hooks) => hooks,
             Err(e) => {
@@ -1349,7 +1449,7 @@ impl Services {
                     error = %e,
                     "archive hook sweep: hook list failed; skipping"
                 );
-                return;
+                return cancelled;
             }
         };
         for hook in hooks {
@@ -1357,21 +1457,25 @@ impl Services {
                 continue;
             }
             let hook_id = hook.hook_id.clone();
-            if let Err(e) = self
-                .cancel_active_hook(
-                    hook,
-                    Some(&crate::harness::latest().hook_cancelled_workspace_archived_notice()),
-                )
+            match self
+                .cancel_active_hook(hook, CancelSettlement::Deferred)
                 .await
             {
-                tracing::warn!(
-                    workspace = %workspace_id.0,
-                    hook = %hook_id.0,
-                    error = %e,
-                    "archive hook sweep: cancel failed; continuing"
-                );
+                Ok(hook) => cancelled
+                    .entry(hook.agent_id)
+                    .or_default()
+                    .push((hook.name, hook.hook_id)),
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace_id.0,
+                        hook = %hook_id.0,
+                        error = %e,
+                        "archive hook sweep: cancel failed; continuing"
+                    );
+                }
             }
         }
+        cancelled
     }
 
     /// Retire sweep (`ws.agent.retire`): cancel every ACTIVE
@@ -1403,7 +1507,10 @@ impl Services {
                 continue;
             }
             let hook_id = hook.hook_id.clone();
-            if let Err(e) = self.cancel_active_hook(hook, None).await {
+            if let Err(e) = self
+                .cancel_active_hook(hook, CancelSettlement::Resettle)
+                .await
+            {
                 tracing::warn!(
                     agent = %agent_id.0,
                     hook = %hook_id.0,
@@ -1587,7 +1694,7 @@ impl Services {
         let (control_tx, mut control_rx) = mpsc::channel::<HookControl>(4);
         let services = self.clone();
         let hook_id = hook.hook_id.clone();
-        let join = intent_core::spawn_daemon(async move {
+        let Some(join) = self.delivery_tasks.spawn_draining(async move {
             let mut hook = hook;
             let mut delay = initial_delay
                 .unwrap_or_else(|| Duration::from_millis(hook.delay_ms.max(0).cast_unsigned()));
@@ -1603,8 +1710,11 @@ impl Services {
                     }
                 };
                 tokio::select! {
+                    biased;
+                    () = services.delivery_tasks.closed() => break,
                     () = tokio::time::sleep(delay) => {}
                     () = expiry => {
+                        if services.delivery_tasks.is_closed() { break; }
                         services.expire_hook(&mut hook).await;
                         break;
                     }
@@ -1617,6 +1727,9 @@ impl Services {
                             None => break,
                         }
                     }
+                }
+                if services.delivery_tasks.is_closed() {
+                    break;
                 }
                 // Never start a run at/after expiresAt (guards a `runNow`
                 // — or a sleep expiry — racing the deadline).
@@ -1642,7 +1755,9 @@ impl Services {
                 }
             }
             services.hook_tasks.lock().unwrap().remove(&hook.hook_id);
-        });
+        }) else {
+            return;
+        };
         self.hook_tasks.lock().unwrap().insert(
             hook_id,
             HookHandle {
@@ -1695,14 +1810,35 @@ impl Services {
         // owner's sub-agent status is likewise re-derived per run.
         let agent_features = self.effective_settings().agent_features;
         let is_sub_agent = self.hook_owner_is_sub_agent(&hook.agent_id).await;
-        let outcome = run_hook_script(
-            api,
-            hook,
-            self.hook_eval_timeout,
-            &agent_features,
-            is_sub_agent,
-        )
-        .await;
+        let evaluation = async {
+            #[cfg(test)]
+            if let Some(park) = &self.hook_eval_park {
+                park.entered.notify_one();
+                park.release.notified().await;
+            }
+            run_hook_script(
+                api,
+                hook,
+                self.hook_eval_timeout,
+                &agent_features,
+                is_sub_agent,
+                Some(self.delivery_tasks.cancellation_flag()),
+            )
+            .await
+        };
+        // No outcome has committed yet: leave the Running row recoverable
+        // and drop evaluation on shutdown. Once selected, the outcome below
+        // owns its durable handoff and must finish queueing any wake.
+        let outcome = tokio::select! {
+            biased;
+            () = self.delivery_tasks.closed() => return Ok(None),
+            outcome = evaluation => outcome,
+        };
+        // A non-yielding script can finish its interrupt handler in the same
+        // poll that observes shutdown. Cancellation is not a failed hook run.
+        if self.delivery_tasks.is_closed() {
+            return Ok(None);
+        }
         let last_run_at = now_iso();
         match outcome {
             RunOutcome::Continue {
@@ -2218,6 +2354,11 @@ impl Services {
     /// messageMetadata (`true` only for the re-armed perpetual branch) so
     /// consumers can tell the two apart without parsing the note text.
     async fn wake_hook_owner(&self, hook: &Hook, message: &str, reason: &str) {
+        #[cfg(test)]
+        if let Some(park) = &self.hook_wake_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
         // Only meaningful for `dispatched` wakes: a perpetual dispatch that
         // also lands at/after `expiresAt` is terminalized (Expired), not
         // re-armed — the caller sends a separate `finish_expiry` wake for
@@ -2352,6 +2493,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -2479,6 +2621,57 @@ mod tests {
         (tmp, root, services, ws, owner)
     }
 
+    #[tokio::test]
+    async fn self_queue_owner_hook_retains_stale_warning_without_payloads() {
+        let (_db, _root, svc, ws, owner) = setup().await;
+        let mut session = svc.store().get_agent_session(&owner).await.unwrap();
+        session.status = AgentStatus::Idle;
+        svc.store()
+            .update_agent_session(&ws, &session)
+            .await
+            .unwrap();
+        svc.enqueue_message(
+            &owner,
+            "PENDING-SECRET-content".into(),
+            Some(json!([{"type":"image", "data":"PENDING-SECRET-image"}])),
+            Some(json!([{"type":"resource", "uri":"PENDING-SECRET-file"}])),
+            Some(json!({"extra":"PENDING-SECRET-metadata"})),
+            None,
+            false,
+            intent_core::MessageOrigin::Automatic,
+        );
+        {
+            let mut queues = svc.agent_queues.lock().unwrap();
+            queues.get_mut(&owner).unwrap()[0].queued_at = "2020-01-01T00:00:00Z".into();
+        }
+        let before = svc.queue_snapshot(&owner);
+        let out = svc.hook_schedule_op(&ws, &owner, &json!({
+            "name":"stale self queue", "delayMs":600_000,
+            "code": r"
+                for (const opts of [{}, {agentId:'agent-hooks'}]) {
+                    const d = await ws.agent.diagnostics(opts);
+                    const q = d.diagnostics.queues.find(q => q.agentId === 'agent-hooks');
+                    if (q.queueLength !== 1 || q.entries.length !== 0 || JSON.stringify(d).includes('PENDING-SECRET'))
+                        throw new Error('owner hook exposed pending payloads or lost count');
+                    const risk = d.diagnostics.stuckRisks.find(r => r.type === 'stale-queue-entry');
+                    if (!risk || risk.count !== 1 || risk.ageMs <= 300000 || !d.text.includes('stale-queue-entry'))
+                        throw new Error('owner hook lost stale warning');
+                    if (!d.text.includes('contents hidden')) throw new Error('owner hook lost delivery notice');
+                }
+                return {dispatch:false};
+            "
+        })).await.expect("owner hook validation preserves stale warning");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.queue_snapshot(&owner),
+            before,
+            "hook reads never consume"
+        );
+    }
+
     /// Fixed deadline for the polling helpers below. Generous on purpose:
     /// under a loaded host (e.g. a parallel `cargo build`) persistence can
     /// lag far behind the happy path, and a short deadline fails
@@ -2562,6 +2755,328 @@ mod tests {
                 return types;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Exercise the real service/QuickJS/host-dispatch chain in a disposable
+    /// process. The payload is finite even if the depth guard regresses.
+    #[cfg(unix)]
+    #[test]
+    fn recursive_hook_validation_is_bounded() {
+        const WORKER: &str = "INTENTD_HOOK_RECURSION_WORKER";
+        if let Ok(mode) = std::env::var(WORKER) {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(recursive_hook_worker(&mode));
+            return;
+        }
+        for mode in ["direct", "indirect"] {
+            let root = crate::test_support::test_tempdir("hook-recursion-");
+            let log_path = root.path().join("worker.log");
+            let log = std::fs::File::create(&log_path).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "hook_manager::tests::recursive_hook_validation_is_bounded",
+                    "--nocapture",
+                ])
+                .env(WORKER, mode)
+                .env("TMPDIR", root.path())
+                .env("INTENT_CONFIG_DIR", root.path())
+                .current_dir(root.path())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log);
+            let mut child = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
+            let status = child.wait_with_timeout(Duration::from_secs(30)).unwrap();
+            assert!(
+                status.is_some_and(|s| s.success()),
+                "{mode} worker failed ({status:?}): {}",
+                std::fs::read_to_string(log_path).unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    async fn recursive_hook_worker(mode: &str) {
+        let (_db, _root, svc, ws, owner) = setup().await;
+        // Three finite child validations exceed the two-evaluation boundary.
+        // Repeat a name for direct nesting; alternate names and an async
+        // helper for indirect nesting. Neither payload can reproduce itself.
+        let mut code = "return {dispatch: false};".to_string();
+        for generation in 0..3 {
+            let name = if mode == "direct" || generation % 2 == 0 {
+                "first"
+            } else {
+                "second"
+            };
+            let call = format!(
+                "return await ws.hook.schedule({{name: {name:?}, delayMs: 600000, code: {}}});",
+                json!(code)
+            );
+            code = if mode == "indirect" {
+                format!("async function next() {{ {call} }} return await next();")
+            } else {
+                call
+            };
+        }
+        let err = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "root", "delayMs": 600_000, "code": code
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("nested hook validation limit"),
+            "{err}"
+        );
+        assert!(svc
+            .store
+            .list_hooks_by_agent(&owner)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(svc.hook_tasks.lock().unwrap().is_empty());
+
+        // A rejected chain must not poison the owner or unrelated work.
+        let other = AgentId::from("agent-unrelated");
+        svc.store
+            .insert_agent_session(&agent(&ws, &other.0))
+            .await
+            .unwrap();
+        for id in [&owner, &other] {
+            let result = svc
+                .hook_schedule_op(
+                    &ws,
+                    id,
+                    &json!({
+                        "name": "ordinary", "delayMs": 600_000, "code": "return {dispatch: false};"
+                    }),
+                )
+                .await
+                .unwrap();
+            let hook: Hook = serde_json::from_value(result["hook"].clone()).unwrap();
+            svc.hook_cancel_op(&ws, &hook.hook_id, Some(id))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_validation_allows_one_level_renewal() {
+        let (_db, _root, svc, ws, owner) = setup().await;
+        // A finite two-generation renewal chain: each replacement only
+        // schedules its successor on a later run, after its validation.
+        let mut code = "return {dispatch: false, state: {armed: true}};".to_string();
+        for _ in 0..2 {
+            code = format!(
+                "if (!hookState) return {{dispatch: false, state: {{armed: true}}}}; \
+                 await ws.hook.schedule({{name: 'replacement', delayMs: 600000, code: {}}}); \
+                 return {{dispatch: true, message: 'renewed'}};",
+                json!(code)
+            );
+        }
+        let result = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "original", "delayMs": 600_000, "code": code
+                }),
+            )
+            .await
+            .unwrap();
+        let mut current: Hook = serde_json::from_value(result["hook"].clone()).unwrap();
+        // A spawned replacement starts with a fresh depth on its later run.
+        for _ in 0..2 {
+            svc.hook_run_now_op(&ws, &current.hook_id).await.unwrap();
+            wait_for_hook(&svc, &current.hook_id, |h| h.state == HookState::Dispatched).await;
+            wait_for_task_exit(&svc, &current.hook_id).await;
+            let active: Vec<_> = svc
+                .store
+                .list_hooks_by_agent(&owner)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|h| h.state == HookState::Scheduled)
+                .collect();
+            assert_eq!(active.len(), 1);
+            current = active.into_iter().next().unwrap();
+            assert_eq!(current.name, "replacement");
+            assert_eq!(current.run_count, 1);
+        }
+        svc.hook_cancel_op(&ws, &current.hook_id, Some(&owner))
+            .await
+            .unwrap();
+        wait_for_task_exit(&svc, &current.hook_id).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_nested_inline_validation_before_poll() {
+        let (_db, _root, svc, ws, owner) = setup().await;
+        let svc = svc.with_hook_eval_timeout(Duration::from_millis(500));
+        svc.delivery_tasks.close();
+        // The same task-local depth used by a scheduled parent's ws.hook.schedule
+        // binding. Pre-close removes the host-return/loop-entry scheduling race.
+        let error = HOOK_EVAL_DEPTH
+            .scope(
+                1,
+                svc.hook_schedule_op(
+                    &ws,
+                    &owner,
+                    &json!({
+                        "name":"closed-child", "delayMs":10_000, "code":"for (;;) {}"
+                    }),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("execution cancelled"),
+            "nested validation ignored closure: {error}"
+        );
+        assert!(svc
+            .store
+            .list_hooks_by_agent(&owner)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_cancels_nested_hook_validation_hot_loop() {
+        use crate::agent_manager::{AgentManager, BusEventSink};
+        let (_db, _root, svc, ws, owner) = setup().await;
+        let svc = svc.with_hook_eval_timeout(Duration::from_secs(5));
+        let mgr = Arc::new(AgentManager::new(
+            svc.clone(),
+            Arc::new(BusEventSink::new(svc.event_bus.clone().unwrap())),
+            8,
+        ));
+        svc.attach_agent_manager(&mgr);
+        let child_code =
+            "await ws.workspace.setStatusMessage('nested hot loop entered'); for (;;) {}";
+        let code = format!("if (!hookState) return {{dispatch:false,state:{{armed:true}}}}; await ws.hook.schedule({{name:'nested-spinner',delayMs:600000,code:{}}}); return {{dispatch:false}};", json!(child_code));
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({"name":"nested-root","delayMs":600_000,"code":code}),
+            )
+            .await
+            .unwrap();
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap();
+        tokio::time::timeout(POLL_DEADLINE, async {
+            loop {
+                if svc
+                    .store
+                    .get_workspace(&ws)
+                    .await
+                    .unwrap()
+                    .status_message
+                    .as_deref()
+                    == Some("nested hot loop entered")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        mgr.begin_shutdown();
+        let shutdown_svc = svc.clone();
+        let mut shutdown = tokio::spawn(async move {
+            shutdown_svc.shutdown_agent_deliveries().await;
+        });
+        let timely = tokio::time::timeout(Duration::from_secs(1), &mut shutdown)
+            .await
+            .is_ok();
+        if !timely {
+            tokio::time::timeout(POLL_DEADLINE, shutdown)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        mgr.shutdown().await;
+        assert!(
+            timely,
+            "nested validation must observe scheduled hook shutdown, not its five-second budget"
+        );
+        let hooks = svc.store.list_hooks_by_agent(&owner).await.unwrap();
+        assert_eq!(
+            hooks.len(),
+            1,
+            "cancelled child validation must not persist a schedule"
+        );
+        assert_eq!(hooks[0].state, HookState::Running);
+    }
+
+    #[tokio::test]
+    async fn hook_validation_scope_survives_cancellation_and_parallel_work() {
+        let (_db, _root, svc, ws, owner) = setup().await;
+        let other = AgentId::from("agent-parallel");
+        svc.store
+            .insert_agent_session(&agent(&ws, &other.0))
+            .await
+            .unwrap();
+        let child_code = "await ws.workspace.setStatusMessage('validation entered'); \
+                          await new Promise(() => {});";
+        let params = json!({
+            "name": "cancelled-root", "delayMs": 600_000,
+            "code": format!("await ws.hook.schedule({{name: 'cancelled-child', delayMs: 600000, code: {}}});", json!(child_code))
+        });
+        let mut pending = Box::pin(svc.hook_schedule_op(&ws, &owner, &params));
+        let ordinary_nested = json!({
+            "name": "healthy-root", "delayMs": 600_000,
+            "code": "await ws.hook.schedule({name: 'healthy-child', delayMs: 600000, code: 'return {dispatch: false};'});"
+        });
+        // Poll independent work on the SAME task while the nested evaluation
+        // is suspended. A process-wide or thread-local depth leaks here.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut pending => panic!("pending validation completed: {result:?}"),
+                () = async {
+                    loop {
+                        if svc.store.get_workspace(&ws).await.unwrap().status_message.as_deref()
+                            == Some("validation entered") { break; }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    svc.hook_schedule_op(&ws, &other, &ordinary_nested).await.unwrap();
+                } => {}
+            }
+        })
+        .await
+        .unwrap();
+        drop(pending);
+        assert!(svc
+            .store
+            .list_hooks_by_agent(&owner)
+            .await
+            .unwrap()
+            .is_empty());
+        // Dropping a suspended validation must restore its enclosing scope.
+        svc.hook_schedule_op(&ws, &owner, &ordinary_nested)
+            .await
+            .unwrap();
+        for id in [&owner, &other] {
+            let hooks = svc.store.list_hooks_by_agent(id).await.unwrap();
+            assert_eq!(hooks.len(), 2);
+            for hook in hooks {
+                assert!(hook.name.starts_with("healthy-"));
+                svc.hook_cancel_op(&ws, &hook.hook_id, Some(id))
+                    .await
+                    .unwrap();
+                wait_for_task_exit(&svc, &hook.hook_id).await;
+            }
         }
     }
 
@@ -3397,6 +3912,7 @@ mod tests {
             Duration::from_secs(10),
             &AgentFeaturesSettings::default(),
             false,
+            None,
         )
         .await;
         assert!(
@@ -3590,6 +4106,323 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_nested_committed_hook_dispatch_keeps_one_durable_wake() {
+        shutdown_nested_committed_validation(false).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_nested_expired_perpetual_validation_preserves_wakes() {
+        shutdown_nested_committed_validation(true).await;
+    }
+
+    async fn shutdown_nested_committed_validation(expired_perpetual: bool) {
+        use crate::agent_manager::{AgentManager, BusEventSink};
+        let (_tmp, _root, mut svc, ws, owner) = setup().await;
+        if expired_perpetual {
+            // Child TTL is ten seconds; the parent's default TTL is a day.
+            svc = svc.with_hook_clock_skew(Arc::new(std::sync::atomic::AtomicI64::new(20_000)));
+        }
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        svc.hook_wake_park = Some(park.clone());
+        let mgr = Arc::new(AgentManager::new(
+            svc.clone(),
+            Arc::new(BusEventSink::new(svc.event_bus.clone().unwrap())),
+            8,
+        ));
+        svc.attach_agent_manager(&mgr);
+        let mut probe = note(&ws, "nested-shutdown-probe", "wait");
+        svc.store.insert_note(&probe).await.unwrap();
+        let code = r#"
+            const n = await ws.note.read('nested-shutdown-probe');
+            if (!n.content.includes('go')) return {dispatch:false};
+            await ws.hook.schedule({name:'nested committed child',delayMs:600000,ttlMs:10000,perpetual:EXPIRED_PERPETUAL,
+                code:"console.log('child evaluated once'); return {dispatch:true,message:'preserve nested committed wake'};"});
+            return {dispatch:false};
+        "#;
+        let code = code.replace(
+            "EXPIRED_PERPETUAL",
+            if expired_perpetual { "true" } else { "false" },
+        );
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name":"nested shutdown parent", "delayMs":600_000, "code":code
+                }),
+            )
+            .await
+            .unwrap();
+        let parent: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        probe.content = "go".into();
+        svc.store.update_note(&probe).await.unwrap();
+        svc.hook_run_now_op(&ws, &parent.hook_id).await.unwrap();
+        tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+            .await
+            .unwrap();
+        let child = svc
+            .store
+            .list_hooks_by_agent(&owner)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|h| h.name == "nested committed child")
+            .unwrap();
+        let terminal = if expired_perpetual {
+            HookState::Expired
+        } else {
+            HookState::Dispatched
+        };
+        assert_eq!(child.state, terminal);
+        assert_eq!(child.run_count, 1);
+        mgr.begin_shutdown();
+        mgr.checkpoint_shutdown().await;
+        let draining = svc.clone();
+        let shutdown = tokio::spawn(async move {
+            draining.shutdown_agent_deliveries().await;
+        });
+        park.release.notify_one();
+        if expired_perpetual {
+            // Expired perpetual validation sends a dispatch and an expiry notice.
+            tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+                .await
+                .unwrap();
+            park.release.notify_one();
+        }
+        tokio::time::timeout(POLL_DEADLINE, shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        mgr.shutdown().await;
+        let restarted = Services::new(svc.store.clone());
+        restarted.rehydrate_agent_queues().await.unwrap();
+        let queue = restarted.queue_snapshot(&owner);
+        assert_eq!(
+            queue.len(),
+            if expired_perpetual { 2 } else { 1 },
+            "cancelling the parent evaluator must not discard its child's committed wake"
+        );
+        assert!(queue[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("preserve nested committed wake"));
+        restarted.rehydrate_agent_queues().await.unwrap();
+        assert_eq!(restarted.queue_snapshot(&owner).len(), queue.len());
+        assert_eq!(
+            queue
+                .iter()
+                .filter(|entry| entry["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("preserve nested committed wake"))
+                .count(),
+            1
+        );
+        let recovered = restarted.store.get_hook(&child.hook_id).await.unwrap();
+        assert_eq!(recovered.state, terminal);
+        assert_eq!(
+            recovered.run_count, 1,
+            "recovery must not rerun the committed child script"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_committed_hook_dispatch_keeps_one_durable_wake() {
+        use crate::agent_manager::{AgentManager, BusEventSink};
+        use std::sync::Arc;
+        let (_tmp, _root, mut svc, ws, owner) = setup().await;
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        svc.hook_wake_park = Some(park.clone());
+        let mgr = Arc::new(AgentManager::new(
+            svc.clone(),
+            Arc::new(BusEventSink::new(svc.event_bus.clone().unwrap())),
+            8,
+        ));
+        svc.attach_agent_manager(&mgr);
+        let mut probe = note(&ws, "shutdown-probe", "wait");
+        svc.store().insert_note(&probe).await.unwrap();
+        let out = svc.hook_schedule_op(&ws, &owner, &json!({
+            "name": "shutdown-committed",
+            "code": "const n = await ws.note.read('shutdown-probe'); return {dispatch:n.content.includes('go'),message:'keep committed wake'};",
+            "delayMs": 10000
+        })).await.unwrap();
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        probe.content = "go".into();
+        svc.store().update_note(&probe).await.unwrap();
+        svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap();
+        tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.store().get_hook(&hook.hook_id).await.unwrap().state,
+            HookState::Dispatched
+        );
+        assert!(mgr.try_begin_turn(&owner, &ws).await.is_some());
+        svc.set_live_turn(
+            &owner,
+            "committed-hook-partial",
+            vec![json!({"type":"text","text":"save before waiting"})],
+        );
+        svc.enqueue_message_with_id(
+            &owner,
+            Some("committed-hook-popped".into()),
+            "popped payload".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::User,
+        );
+        svc.persist_queue_snapshot(&owner).await;
+        let (_entry, draining) = svc.dequeue_message_draining(&owner).unwrap();
+        svc.persist_queue_snapshot(&owner).await;
+        mgr.begin_shutdown();
+        // A committed tail may still be waiting on event publication. Recovery
+        // must already be durable before shutdown awaits that tail.
+        tokio::time::timeout(POLL_DEADLINE, mgr.checkpoint_shutdown())
+            .await
+            .unwrap();
+        assert!(svc
+            .store
+            .get_interrupted_agent(&owner)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(svc
+            .store
+            .get_agent_message_by_id(&owner, "committed-hook-partial")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(svc.store.load_all_agent_queues().await.unwrap().len(), 1);
+        let shutdown_svc = svc.clone();
+        let shutdown = tokio::spawn(async move {
+            shutdown_svc.shutdown_agent_deliveries().await;
+        });
+        while !svc.delivery_tasks.is_closed() {
+            tokio::task::yield_now().await;
+        }
+        park.release.notify_one();
+        tokio::time::timeout(POLL_DEADLINE, shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        mgr.shutdown().await;
+        drop(draining);
+        let restarted = Services::new(svc.store.clone());
+        restarted.rehydrate_agent_queues().await.unwrap();
+        let queue = restarted.queue_snapshot(&owner);
+        assert_eq!(
+            queue.len(),
+            2,
+            "committed hook dispatch must survive scheduler shutdown"
+        );
+        assert_eq!(queue[0]["id"], "committed-hook-popped");
+        assert!(queue[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("keep committed wake"));
+        assert!(mgr.list_busy().is_empty());
+        assert_eq!(
+            svc.store().get_hook(&hook.hook_id).await.unwrap().run_count,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_hook_evaluation_and_persists_recovery() {
+        use crate::agent_manager::{AgentManager, BusEventSink};
+        use std::sync::Arc;
+        let (_tmp, _root, mut svc, ws, owner) = setup().await;
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        svc.hook_eval_park = Some(park.clone());
+        let mgr = Arc::new(AgentManager::new(
+            svc.clone(),
+            Arc::new(BusEventSink::new(svc.event_bus.clone().unwrap())),
+            8,
+        ));
+        svc.attach_agent_manager(&mgr);
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "parked-evaluation", "code": "return {dispatch:false};", "delayMs":10000
+                }),
+            )
+            .await
+            .unwrap();
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap();
+        tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+            .await
+            .unwrap();
+        assert!(mgr.try_begin_turn(&owner, &ws).await.is_some());
+        svc.set_live_turn(
+            &owner,
+            "hook-shutdown-partial",
+            vec![json!({"type":"text","text":"partial output"})],
+        );
+        svc.enqueue_message_with_id(
+            &owner,
+            Some("hook-shutdown-queue".into()),
+            "keep payload".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::User,
+        );
+        svc.persist_queue_snapshot(&owner).await;
+        let (_entry, draining) = svc.dequeue_message_draining(&owner).unwrap();
+        svc.persist_queue_snapshot(&owner).await;
+        let shutdown_mgr = mgr.clone();
+        let mut shutdown = tokio::spawn(async move {
+            shutdown_mgr.shutdown().await;
+        });
+        let timely = tokio::time::timeout(Duration::from_secs(2), &mut shutdown)
+            .await
+            .is_ok();
+        // Always release the fixture before asserting the expected baseline failure.
+        park.release.notify_one();
+        if !timely {
+            tokio::time::timeout(POLL_DEADLINE, shutdown)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        drop(draining);
+        assert!(
+            timely,
+            "shutdown must cancel evaluation before waiting out the hook budget"
+        );
+        let restarted = Services::new(svc.store.clone());
+        restarted.rehydrate_agent_queues().await.unwrap();
+        assert_eq!(
+            restarted.queue_snapshot(&owner)[0]["id"],
+            "hook-shutdown-queue"
+        );
+        assert!(svc
+            .store
+            .get_interrupted_agent(&owner)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(svc
+            .store
+            .get_agent_message_by_id(&owner, "hook-shutdown-partial")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            svc.store.get_hook(&hook.hook_id).await.unwrap().state,
+            HookState::Running
+        );
     }
 
     #[tokio::test]
@@ -5395,6 +6228,40 @@ mod tests {
         wait_for_task_exit(&svc, &hook.hook_id).await;
         let text = wait_for_wake(&svc, &owner, "timer went off").await;
         assert!(text.contains("now retired"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn provider_policy_hook_uses_owner_identity_and_reloads_live_policy() {
+        let (_tmp, root, base, ws, owner) = setup().await;
+        let store = base.store().clone();
+        let svc = Services::new_with_file_secrets(
+            store.clone(),
+            intent_core::FileSecretStore::with_path(root.path().join("secrets.json")),
+        )
+        .with_event_bus(EventBus::new(store))
+        .with_workspaces_root(root.path().to_owned());
+        let mut session = svc.store().get_agent_session(&owner).await.unwrap();
+        session.provider = Some("claude-code".into());
+        svc.store()
+            .update_agent_session(&ws, &session)
+            .await
+            .unwrap();
+        let file = root.path().join("policy.json");
+        std::fs::write(&file, "{}").unwrap();
+        svc.set_provider_policy_sources(
+            "claude-code",
+            vec![crate::provider_profiles::PolicySource::ClaudeSettings(file)],
+        );
+        let code = "await ws.mcp.listServers(); return {dispatch:true,message:'policy checked'};";
+        let input = json!({"name":"policy hook", "code":code,"delayMs":10000});
+        let first = svc.hook_schedule_op(&ws, &owner, &input).await.unwrap();
+        assert_eq!(first["dispatched"], true);
+        svc.set_provider_policy_sources(
+            "claude-code",
+            vec![crate::provider_profiles::PolicySource::Unavailable],
+        );
+        let error = svc.hook_schedule_op(&ws, &owner, &input).await.unwrap_err();
+        assert!(error.to_string().contains("policy"), "{error}");
     }
 
     #[tokio::test]

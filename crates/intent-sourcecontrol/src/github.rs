@@ -18,9 +18,10 @@ use crate::error::{Error, Result};
 use crate::model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
-    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
-    PrObservation, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review,
-    ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
+    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrAncestry,
+    PrAncestryIdentity, PrInvolvement, PrObservation, PrPatch, PrQuery, PrState, PullRequest,
+    PullRequestFile, PullRequestFilesPage, PullRequestReview, RateLimitStatus, Repo, RepoRef,
+    Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
     ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
 };
 use crate::SourceControl;
@@ -35,9 +36,77 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// rationale as [`CONNECT_TIMEOUT`] (intent-hq/monorepo#1988).
 pub(crate) const READ_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Only headers on an enforced request describe its actual quota. In
+/// particular, `/rate_limit` can report a healthy overview while these
+/// counters reject requests (intent#5837). Missing/malformed headers never
+/// establish recovery, nor does an unrelated resource's allowance.
+fn enforced_quota(headers: &http::HeaderMap, resource: &str) -> RateLimitStatus {
+    if headers
+        .get("x-ratelimit-resource")
+        .and_then(|v| v.to_str().ok())
+        != Some(resource)
+    {
+        return RateLimitStatus::default();
+    }
+    let number = |name| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+    };
+    let status = RateLimitStatus {
+        reset_at: number("x-ratelimit-reset"),
+        remaining: number("x-ratelimit-remaining"),
+        limit: number("x-ratelimit-limit"),
+    };
+    match (status.remaining, status.limit) {
+        (Some(remaining), Some(limit)) if limit > 0 && remaining <= limit => status,
+        _ => RateLimitStatus::default(),
+    }
+}
+
+/// PR reads spend both REST and GraphQL quota. Preserve an exhausted
+/// resource's reset (the later one when both are exhausted); otherwise use
+/// conservative headroom across BOTH resources. One unreadable resource
+/// cannot be declared recovered just because the other has quota left.
+fn pr_read_quota(core: RateLimitStatus, graphql: RateLimitStatus) -> RateLimitStatus {
+    if let Some(exhausted) = [core, graphql]
+        .into_iter()
+        .filter(|status| status.remaining == Some(0))
+        .max_by_key(|status| status.reset_at)
+    {
+        return exhausted;
+    }
+    match (core.remaining, graphql.remaining, core.limit, graphql.limit) {
+        (Some(rest), Some(gql), Some(rest_limit), Some(gql_limit)) => RateLimitStatus {
+            remaining: Some(rest.min(gql)),
+            limit: Some(rest_limit.max(gql_limit)),
+            reset_at: match rest.cmp(&gql) {
+                std::cmp::Ordering::Less => core.reset_at,
+                std::cmp::Ordering::Greater => graphql.reset_at,
+                // Equal headroom remains constrained until both refill.
+                std::cmp::Ordering::Equal => core.reset_at.max(graphql.reset_at),
+            },
+        },
+        _ => RateLimitStatus::default(),
+    }
+}
+
 /// GitHub implementation of [`SourceControl`].
 pub struct GitHubSourceControl {
-    client: octocrab::Octocrab,
+    transport: crate::github_transport::Transport,
+    cache_scope: crate::cache_scope::CacheScope,
+}
+
+fn github_cache_scope(
+    token: Option<&str>,
+    base: Option<&str>,
+) -> Result<crate::cache_scope::CacheScope> {
+    let base = reqwest::Url::parse(base.unwrap_or("https://api.github.com"))
+        .map_err(|_| Error::Config("invalid github apiBaseUrl".into()))?;
+    Ok(crate::cache_scope::CacheScope::github(
+        token,
+        base.as_str().trim_end_matches('/'),
+    ))
 }
 
 impl GitHubSourceControl {
@@ -48,18 +117,27 @@ impl GitHubSourceControl {
     ///
     /// Returns an error if the octocrab client cannot be built (e.g. an invalid `api_base_url`).
     pub fn new(token: &str, api_base_url: Option<&str>) -> Result<Self> {
-        let mut builder = octocrab::Octocrab::builder()
-            .personal_token(token.to_string())
-            .set_connect_timeout(Some(CONNECT_TIMEOUT))
-            .set_read_timeout(Some(READ_WRITE_TIMEOUT))
-            .set_write_timeout(Some(READ_WRITE_TIMEOUT));
-        if let Some(base) = api_base_url {
-            builder = builder
-                .base_uri(base)
-                .map_err(|e| Error::Config(format!("invalid github apiBaseUrl {base:?}: {e}")))?;
-        }
-        let client = builder.build()?;
-        Ok(Self { client })
+        Ok(Self {
+            transport: crate::github_transport::Transport::new(Some(token), api_base_url)?,
+            cache_scope: github_cache_scope(Some(token), api_base_url)?,
+        })
+    }
+
+    /// Read the authenticated account and actual OAuth grant from the same response.
+    /// An omitted scope header is unknown, not an empty or requested grant.
+    ///
+    /// # Errors
+    /// Returns the same typed API/auth/rate-limit errors as `get_user`.
+    pub async fn get_user_with_scopes(&self) -> Result<(UserIdentity, Option<Vec<String>>)> {
+        use octocrab::FromResponse;
+        let response = octocrab::map_github_error(self.client()._get("/user").await?).await?;
+        let scopes = response
+            .headers()
+            .get("x-oauth-scopes")
+            .and_then(|v| v.to_str().ok())
+            .map(crate::device_flow::parse_scopes);
+        let value = Value::from_response(response).await?;
+        Ok((map_user_identity(value)?, scopes))
     }
 
     /// Build a client with **no** credential (same base URI and timeouts as
@@ -72,23 +150,61 @@ impl GitHubSourceControl {
     /// Returns an error if the octocrab client cannot be built (e.g. an
     /// invalid `api_base_url`).
     pub fn anonymous(api_base_url: Option<&str>) -> Result<Self> {
-        let mut builder = octocrab::Octocrab::builder()
-            .set_connect_timeout(Some(CONNECT_TIMEOUT))
-            .set_read_timeout(Some(READ_WRITE_TIMEOUT))
-            .set_write_timeout(Some(READ_WRITE_TIMEOUT));
-        if let Some(base) = api_base_url {
-            builder = builder
-                .base_uri(base)
-                .map_err(|e| Error::Config(format!("invalid github apiBaseUrl {base:?}: {e}")))?;
-        }
-        let client = builder.build()?;
-        Ok(Self { client })
+        Ok(Self {
+            transport: crate::github_transport::Transport::new(None, api_base_url)?,
+            cache_scope: github_cache_scope(None, api_base_url)?,
+        })
     }
 
-    /// The underlying octocrab client (token + base URI + timeouts), for
-    /// crate-internal callers outside the [`SourceControl`] surface.
-    pub(crate) fn client(&self) -> &octocrab::Octocrab {
-        &self.client
+    /// A facade over the shared HTTP pool capturing this caller's accounting context.
+    pub(crate) fn client(&self) -> octocrab::Octocrab {
+        self.transport.client(false, None)
+    }
+
+    fn quota_client(&self) -> octocrab::Octocrab {
+        self.transport.client(true, None)
+    }
+
+    async fn graphql_accounted(&self, payload: &Value) -> octocrab::Result<Value> {
+        let mut payload = payload.clone();
+        let is_mutation = payload
+            .get("query")
+            .and_then(Value::as_str)
+            .is_some_and(|q| q.trim_start().starts_with("mutation"));
+        let operation = if is_mutation {
+            crate::traffic::Operation::Other
+        } else {
+            crate::traffic::Operation::PrDetail
+        };
+        // All documents here are daemon-owned. Queries can request their actual
+        // cost alongside the existing selections; mutations do not expose it.
+        if let Some(query) = payload.get("query").and_then(Value::as_str) {
+            if !is_mutation {
+                if let Some(end) = query.rfind('}') {
+                    payload["query"] = Value::String(format!(
+                        "{} rateLimit {{ cost }} {}",
+                        &query[..end],
+                        &query[end..]
+                    ));
+                }
+            }
+        }
+        let result: octocrab::Result<Value> = self
+            .transport
+            .client(false, Some(operation))
+            .graphql(&payload)
+            .await;
+        let cost = result
+            .as_ref()
+            .ok()
+            .and_then(|v| v.pointer("/rateLimit/cost"))
+            .and_then(Value::as_u64);
+        crate::traffic::graphql_result(
+            operation,
+            cost,
+            matches!(&result, Err(octocrab::Error::Graphql { .. })),
+        );
+        result
     }
 
     fn repo_path(repo: &RepoRef, suffix: &str) -> String {
@@ -103,6 +219,20 @@ impl GitHubSourceControl {
         per_page: u64,
         page_no: u64,
     ) -> Result<Vec<Value>> {
+        let v = self.search_issues_response(q, per_page, page_no).await?;
+        Ok(serde_json::from_value(
+            v.get("items")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+        )?)
+    }
+
+    async fn search_issues_response(
+        &self,
+        q: String,
+        per_page: u64,
+        page_no: u64,
+    ) -> Result<Value> {
         let params: Vec<(&str, String)> = vec![
             ("q", q),
             ("sort", "updated".to_string()),
@@ -110,12 +240,10 @@ impl GitHubSourceControl {
             ("per_page", per_page.to_string()),
             ("page", page_no.to_string()),
         ];
-        let v: Value = self.client.get("/search/issues", Some(&params)).await?;
-        Ok(serde_json::from_value(
-            v.get("items")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new())),
-        )?)
+        self.client()
+            .get("/search/issues", Some(&params))
+            .await
+            .map_err(Into::into)
     }
 
     /// [`Self::search_issues_page`] over a repo `scope`, tolerant of
@@ -153,7 +281,7 @@ impl GitHubSourceControl {
         let mut readable: Vec<RepoRef> = Vec::with_capacity(scope.len());
         for repo in scope {
             match self
-                .client
+                .client()
                 .get::<Value, _, _>(&Self::repo_path(repo, ""), None::<&()>)
                 .await
             {
@@ -478,7 +606,19 @@ pub(crate) fn build_pr_search_query(
     involvement: Option<PrInvolvement>,
     search: Option<&str>,
 ) -> String {
-    let mut q = format!("is:pr {} is:{state}", repo_qualifiers(repos));
+    build_pr_search_with_scope(&repo_qualifiers(repos), state, involvement, search)
+}
+
+fn build_pr_search_with_scope(
+    scope: &str,
+    state: &str,
+    involvement: Option<PrInvolvement>,
+    search: Option<&str>,
+) -> String {
+    let mut q = format!("is:pr {scope}");
+    if state != "all" {
+        let _ = write!(q, " is:{state}");
+    }
     if let Some(involvement) = involvement {
         let involve = match involvement {
             PrInvolvement::Created => "author:@me",
@@ -921,16 +1061,13 @@ fn parse_review_decision(data: &Value) -> Option<ReviewDecision> {
     }
 }
 
-/// Known ceiling: `contexts(first: 100)` is a single unpaginated page, so a
-/// PR whose rollup exceeds 100 contexts (very large CI matrices) silently
-/// truncates — checks beyond the page are invisible to the requirements
-/// probe, and a monitor diffing two truncated pages can report phantom
-/// "check removed" lines for whatever fell off. Paginating `contexts` is the
-/// complete fix if that ceiling is ever hit in practice.
+/// The first page of a head-bound check observation. Both entrypoints drain
+/// the connection through `graphql_with_all_checks` before trusting it.
 const MERGE_REQUIREMENTS_QUERY: &str = r"
-query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
+query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!, $checksCursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $prNumber) {
+      headRefOid
       mergeStateStatus
       isInMergeQueue
       timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
@@ -946,8 +1083,11 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!) {
       commits(last: 1) {
         nodes {
           commit {
+            oid
             statusCheckRollup {
-              contexts(first: 100) {
+              contexts(first: 100, after: $checksCursor) {
+                pageInfo { hasNextPage endCursor }
+                totalCount
                 nodes {
                   __typename
                   ... on CheckRun {
@@ -1015,8 +1155,8 @@ fn without_merge_queue_selections(query: &str) -> String {
 ///
 /// Windows: `reviews(last: 100)` and `reviewThreads(first: 100)` are single
 /// pages; `pageInfo` tells the caller when a PR outgrew them so it can take
-/// the paged reads instead of trusting a truncated tally. `contexts(first:
-/// 100)` keeps the probe's known ceiling.
+/// the paged reads instead of trusting a truncated tally. Check contexts are
+/// drained across pages with a consistent head before the observation returns.
 ///
 /// Count parity: the `totalCount`s are unbounded, but the per-signal reads
 /// they replace are not — `list_comments` is a single `per_page=100` page
@@ -1026,7 +1166,7 @@ fn without_merge_queue_selections(query: &str) -> String {
 /// per-signal reads on a busy PR would report a different count for the
 /// same forge state and fabricate a new-comment change.
 const PR_OBSERVATION_QUERY: &str = r"
-query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!) {
+query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checksCursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $prNumber) {
       number
@@ -1037,6 +1177,7 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!) {
       isDraft
       headRefName
       headRefOid
+      headRepository { id }
       author { login }
       mergeable
       createdAt
@@ -1053,11 +1194,15 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!) {
       }
       reviewDecision
       baseRefName
+      baseRef { target { oid } }
       commits(last: 1) {
         nodes {
           commit {
+            oid
             statusCheckRollup {
-              contexts(first: 100) {
+              contexts(first: 100, after: $checksCursor) {
+                pageInfo { hasNextPage endCursor }
+                totalCount
                 nodes {
                   __typename
                   ... on CheckRun {
@@ -1137,6 +1282,19 @@ fn map_graphql_pull(pr: &Value) -> Result<PullRequest> {
     })
 }
 
+fn parse_ancestry_identity(pr: &Value) -> Option<PrAncestryIdentity> {
+    let identity = PrAncestryIdentity {
+        base_sha: pr.pointer("/baseRef/target/oid")?.as_str()?.to_string(),
+        head_sha: pr.get("headRefOid")?.as_str()?.to_string(),
+        target_branch: pr.get("baseRefName")?.as_str()?.to_string(),
+        head_repository: pr
+            .pointer("/headRepository/id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    };
+    identity.is_valid().then_some(identity)
+}
+
 /// `author { login }` → login, `"unknown"` for a deleted account (`null`
 /// author) — parity with the REST [`login_of`].
 fn graphql_login(author: Option<&Value>) -> String {
@@ -1165,6 +1323,10 @@ fn parse_merge_requirement_signals(data: &Value) -> MergeRequirementSignals {
             .map(|nodes| nodes.iter().filter_map(map_rollup_context).collect())
             .unwrap_or_default(),
         checks_known: rollup.is_some(),
+        checks_head_sha: pr
+            .and_then(|p| p.get("headRefOid"))
+            .and_then(Value::as_str)
+            .map(String::from),
         branch_rules: None,
         // Absent on hosts that do not report it: degrades to `None`.
         is_in_merge_queue: pr
@@ -1349,6 +1511,49 @@ fn map_rollup_context(value: &Value) -> Option<RollupCheck> {
     }
 }
 
+/// A malformed/partial policy must never become a cacheable empty ruleset.
+/// Unknown future rule types remain ignored, matching the existing projection.
+fn validate_branch_rules(value: &Value) -> Result<()> {
+    let invalid = || Error::Decode("incomplete branch rules response".into());
+    let items = value.as_array().ok_or_else(invalid)?;
+    for item in items {
+        let kind = item
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?;
+        let params = item.get("parameters");
+        match kind {
+            "pull_request" => {
+                if params
+                    .and_then(|p| p.get("required_approving_review_count"))
+                    .and_then(Value::as_u64)
+                    .is_none()
+                    || params
+                        .and_then(|p| p.get("required_review_thread_resolution"))
+                        .and_then(Value::as_bool)
+                        .is_none()
+                {
+                    return Err(invalid());
+                }
+            }
+            "required_status_checks" => {
+                let checks = params
+                    .and_then(|p| p.get("required_status_checks"))
+                    .and_then(Value::as_array)
+                    .ok_or_else(invalid)?;
+                if checks
+                    .iter()
+                    .any(|c| c.get("context").and_then(Value::as_str).is_none())
+                {
+                    return Err(invalid());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Map the `GET /repos/{o}/{r}/rules/branches/{branch}` payload (a flat array
 /// of the rules that apply to the branch) onto the merge-relevant subset.
 /// Unknown rule types are ignored; the strictest value wins when several
@@ -1422,6 +1627,10 @@ query GetReviewThreads($owner: String!, $repo: String!, $prNumber: Int!, $first:
 
 #[async_trait]
 impl SourceControl for GitHubSourceControl {
+    fn cache_scope(&self) -> Option<crate::cache_scope::CacheScope> {
+        Some(self.cache_scope.clone())
+    }
+
     fn provider_id(&self) -> &'static str {
         "github"
     }
@@ -1431,7 +1640,11 @@ impl SourceControl for GitHubSourceControl {
     }
 
     async fn check_auth(&self) -> Result<AuthStatus> {
-        match self.client.get::<Value, _, ()>("/user", None::<&()>).await {
+        match self
+            .client()
+            .get::<Value, _, ()>("/user", None::<&()>)
+            .await
+        {
             Ok(user) => Ok(AuthStatus {
                 authenticated: true,
                 login: user.get("login").and_then(Value::as_str).map(String::from),
@@ -1446,22 +1659,50 @@ impl SourceControl for GitHubSourceControl {
     }
 
     async fn rate_limit_status(&self) -> Result<RateLimitStatus> {
-        // `GET /rate_limit` is quota-free, so it stays usable while the core
-        // quota is exhausted (monorepo#2961).
-        let v: Value = self.client.get("/rate_limit", None::<&()>).await?;
-        let core = |field: &str| {
-            v.pointer(&format!("/resources/core/{field}"))
-                .and_then(Value::as_u64)
+        // GitHub explicitly makes request headers authoritative over its
+        // quota overview: https://docs.github.com/en/rest/rate-limit/rate-limit.
+        // These small reads cost at most one point per resource; never query
+        // PR details merely to decide whether to resume them. Bypass HTTP
+        // caches; the shared gate bounds how often these reads can run.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("no-cache"),
+        );
+        let rest = self
+            .quota_client()
+            ._get_with_headers("/user", Some(headers))
+            .await?;
+        let core = enforced_quota(rest.headers(), "core");
+        let core = if rest.status().is_success() || core.remaining == Some(0) {
+            core
+        } else {
+            RateLimitStatus::default()
         };
-        Ok(RateLimitStatus {
-            reset_at: core("reset"),
-            remaining: core("remaining"),
-            limit: core("limit"),
-        })
+        let _body = self.quota_client().body_to_string(rest).await?;
+        let graphql = self
+            .quota_client()
+            ._post(
+                "/graphql",
+                Some(&json!({"query": "query { rateLimit { remaining } }"})),
+            )
+            .await?;
+        let quota = enforced_quota(graphql.headers(), "graphql");
+        let quota = if graphql.status().is_success() || quota.remaining == Some(0) {
+            quota
+        } else {
+            RateLimitStatus::default()
+        };
+        let _body = self.quota_client().body_to_string(graphql).await?;
+        Ok(pr_read_quota(core, quota))
+    }
+
+    fn rate_limit_probe_interval(&self) -> Duration {
+        Duration::from_secs(60)
     }
 
     async fn get_user(&self) -> Result<UserIdentity> {
-        let v: Value = self.client.get("/user", None::<&()>).await?;
+        let v: Value = self.client().get("/user", None::<&()>).await?;
         map_user_identity(v)
     }
 
@@ -1471,7 +1712,7 @@ impl SourceControl for GitHubSourceControl {
             return Err(Error::NotFound(format!("github user {login:?}")));
         }
         let v: Value = self
-            .client
+            .client()
             .get(format!("/users/{login}"), None::<&()>)
             .await?;
         map_user_identity(v)
@@ -1483,7 +1724,7 @@ impl SourceControl for GitHubSourceControl {
             return Err(Error::NotFound(format!("gist {gist_id:?}")));
         }
         let v: Value = self
-            .client
+            .client()
             .get(format!("/gists/{gist_id}"), None::<&()>)
             .await?;
         crate::identity_proof::proof_gist_view(&v)
@@ -1496,7 +1737,7 @@ impl SourceControl for GitHubSourceControl {
         }
         let params: Vec<(&str, String)> =
             vec![("q", search_query), ("per_page", limit.max(1).to_string())];
-        let v: Value = self.client.get("/search/users", Some(&params)).await?;
+        let v: Value = self.client().get("/search/users", Some(&params)).await?;
         let items: Vec<Value> = serde_json::from_value(
             v.get("items")
                 .cloned()
@@ -1513,7 +1754,7 @@ impl SourceControl for GitHubSourceControl {
             ("page", page_no.to_string()),
             ("sort", "updated".to_string()),
         ];
-        let v: Value = self.client.get("/user/repos", Some(&params)).await?;
+        let v: Value = self.client().get("/user/repos", Some(&params)).await?;
         let items: Vec<Value> = serde_json::from_value(v)?;
         let fetched = items.len();
         let repos = items
@@ -1544,7 +1785,7 @@ impl SourceControl for GitHubSourceControl {
             ("page", page_no.to_string()),
         ];
         let v: Value = self
-            .client
+            .client()
             .get("/search/repositories", Some(&params))
             .await?;
         let items: Vec<Value> = serde_json::from_value(
@@ -1565,7 +1806,7 @@ impl SourceControl for GitHubSourceControl {
 
     async fn get_repo(&self, owner: &str, name: &str) -> Result<Repo> {
         let route = format!("/repos/{owner}/{name}");
-        let v: Value = self.client.get(&route, None::<&()>).await?;
+        let v: Value = self.client().get(&route, None::<&()>).await?;
         map_repo(v)
     }
 
@@ -1594,7 +1835,7 @@ impl SourceControl for GitHubSourceControl {
                 "/repos/{owner}/{name}/git/matching-refs/heads/{}",
                 encode_path_segments(prefix)
             );
-            let v: Value = self.client.get(&route, None::<&()>).await?;
+            let v: Value = self.client().get(&route, None::<&()>).await?;
             let items: Vec<Value> = serde_json::from_value(v)?;
             let branches: Vec<Branch> = items
                 .into_iter()
@@ -1606,7 +1847,7 @@ impl SourceControl for GitHubSourceControl {
             return Ok(page_full_set(branches, page_no, per_page));
         }
         let route = format!("/repos/{owner}/{name}/branches");
-        let v: Value = self.client.get(&route, Some(&params)).await?;
+        let v: Value = self.client().get(&route, Some(&params)).await?;
         let items: Vec<Value> = serde_json::from_value(v)?;
         let fetched = items.len();
         let branches = items
@@ -1627,7 +1868,7 @@ impl SourceControl for GitHubSourceControl {
     ) -> Result<Option<String>> {
         let route = Self::repo_path(repo, &format!("/contents/{}", encode_path_segments(path)));
         let params: Option<Vec<(&str, String)>> = git_ref.map(|r| vec![("ref", r.to_string())]);
-        let v: Value = match self.client.get(&route, params.as_ref()).await {
+        let v: Value = match self.client().get(&route, params.as_ref()).await {
             Ok(v) => v,
             Err(e) => {
                 // 404 (file/repo/ref absent) is the graceful "no such file"
@@ -1650,13 +1891,13 @@ impl SourceControl for GitHubSourceControl {
             "draft": input.draft,
         });
         let route = Self::repo_path(repo, "/pulls");
-        let v: Value = self.client.post(route, Some(&body)).await?;
+        let v: Value = self.client().post(route, Some(&body)).await?;
         map_pull(v)
     }
 
     async fn get_pr(&self, repo: &RepoRef, number: u64) -> Result<PullRequest> {
         let route = Self::repo_path(repo, &format!("/pulls/{number}"));
-        let v: Value = self.client.get(&route, None::<&()>).await?;
+        let v: Value = self.client().get(&route, None::<&()>).await?;
         map_pull(v)
     }
 
@@ -1711,17 +1952,93 @@ impl SourceControl for GitHubSourceControl {
         params.push(("per_page", per_page.to_string()));
         params.push(("page", page_no.to_string()));
         let route = Self::repo_path(repo, "/pulls");
-        let v: Value = self.client.get(&route, Some(&params)).await?;
-        let raw: Vec<Value> = serde_json::from_value(v)?;
-        // Paging is measured on the raw GitHub page; the optional client-side
-        // `author` filter only narrows what this page returns.
-        let next_cursor = rest_next_cursor(page_no, raw.len(), per_page);
-        let prs = raw.into_iter().map(map_pull).collect::<Result<Vec<_>>>()?;
+        let page: octocrab::Page<Value> = self.client().get(&route, Some(&params)).await?;
+        // Consume GitHub's continuation when supplied, but never follow its URL
+        // with credentials. Only a strictly advancing numeric page is accepted;
+        // the next request reconstructs this same repository route and filters.
+        let next_cursor = if let Some(next) = page.next.as_ref() {
+            let next = reqwest::Url::parse(&next.to_string())
+                .map_err(|_| Error::Decode("invalid PR pagination link".into()))?;
+            let pages: Vec<_> = next.query_pairs().filter(|(k, _)| k == "page").collect();
+            let number = if pages.len() == 1 {
+                pages[0].1.parse::<u64>().ok()
+            } else {
+                None
+            };
+            Some(
+                number
+                    .filter(|n| Some(*n) == page_no.checked_add(1))
+                    .ok_or_else(|| Error::Decode("non-advancing PR pagination link".into()))?
+                    .to_string(),
+            )
+        } else if page.prev.is_some() || page.first.is_some() || page.last.is_some() {
+            None
+        } else {
+            // Hosts/fixtures omitting Link need the empty sentinel page at an
+            // exact page-size boundary; a full page alone cannot prove absence.
+            rest_next_cursor(page_no, page.items.len(), per_page)
+        };
+        let prs = page
+            .items
+            .into_iter()
+            .map(map_pull)
+            .collect::<Result<Vec<_>>>()?;
         let items = match &query.author {
             Some(author) => prs.into_iter().filter(|p| &p.author == author).collect(),
             None => prs,
         };
         Ok(Page { items, next_cursor })
+    }
+
+    async fn list_org_prs(&self, org: &str, query: PrQuery) -> Result<Page<PullRequest>> {
+        // Validate at the engine boundary too: the owner is search syntax,
+        // not free text, and must never inject qualifiers into the query.
+        if org.is_empty()
+            || org.len() > 39
+            || !org.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(Error::Config("org must be a GitHub owner slug".into()));
+        }
+        if !query.extra_repos.is_empty()
+            || query.base.is_some()
+            || query.head.is_some()
+            || query.author.is_some()
+        {
+            return Err(Error::Config(
+                "organization PR search does not accept repository filters".into(),
+            ));
+        }
+        let state = match query.state {
+            Some(PrState::Open) => "open",
+            Some(PrState::Closed) => "closed",
+            Some(PrState::Merged) => "merged",
+            None => "all",
+        };
+        let per_page = rest_per_page(query.limit.unwrap_or(30));
+        let page_no = rest_page(query.cursor.as_deref());
+        let q = build_pr_search_with_scope(
+            &format!("user:{org}"),
+            state,
+            query.involvement,
+            query.search.as_deref(),
+        );
+        let response = self.search_issues_response(q, per_page, page_no).await?;
+        if response.get("incomplete_results").and_then(Value::as_bool) == Some(true) {
+            return Err(Error::Api(
+                "GitHub organization search returned incomplete results; retry or narrow the query"
+                    .into(),
+            ));
+        }
+        let items: Vec<Value> =
+            serde_json::from_value(response.get("items").cloned().unwrap_or_else(|| json!([])))?;
+        let next_cursor = rest_next_cursor(page_no, items.len(), per_page);
+        Ok(Page {
+            items: items
+                .into_iter()
+                .map(map_pull)
+                .collect::<Result<Vec<_>>>()?,
+            next_cursor,
+        })
     }
 
     async fn update_pr(&self, repo: &RepoRef, number: u64, patch: PrPatch) -> Result<PullRequest> {
@@ -1745,7 +2062,10 @@ impl SourceControl for GitHubSourceControl {
             None => {}
         }
         let route = Self::repo_path(repo, &format!("/pulls/{number}"));
-        let v: Value = self.client.patch(route, Some(&Value::Object(body))).await?;
+        let v: Value = self
+            .client()
+            .patch(route, Some(&Value::Object(body)))
+            .await?;
         map_pull(v)
     }
 
@@ -1772,7 +2092,7 @@ impl SourceControl for GitHubSourceControl {
             body.insert("commit_message".into(), json!(message));
         }
         let route = Self::repo_path(repo, &format!("/pulls/{number}/merge"));
-        let v: Value = self.client.put(route, Some(&Value::Object(body))).await?;
+        let v: Value = self.client().put(route, Some(&Value::Object(body))).await?;
         Ok(MergeOutcome {
             merged: v.get("merged").and_then(Value::as_bool).unwrap_or(false),
             message: v
@@ -1786,13 +2106,13 @@ impl SourceControl for GitHubSourceControl {
 
     async fn mergeability(&self, repo: &RepoRef, number: u64) -> Result<Mergeability> {
         let route = Self::repo_path(repo, &format!("/pulls/{number}"));
-        let v: Value = self.client.get(&route, None::<&()>).await?;
+        let v: Value = self.client().get(&route, None::<&()>).await?;
         map_mergeability(v)
     }
 
     async fn update_branch(&self, repo: &RepoRef, number: u64) -> Result<()> {
         let route = Self::repo_path(repo, &format!("/pulls/{number}/update-branch"));
-        let _: Value = self.client.put(route, None::<&()>).await?;
+        let _: Value = self.client().put(route, None::<&()>).await?;
         Ok(())
     }
 
@@ -1810,15 +2130,73 @@ impl SourceControl for GitHubSourceControl {
         }
         let route = Self::repo_path(repo, &format!("/pulls/{number}/reviews"));
         let v: Value = self
-            .client
+            .client()
             .post(route, Some(&Value::Object(payload)))
             .await?;
         map_review(v)
     }
 
+    async fn pull_files(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        page: PageParams,
+    ) -> Result<PullRequestFilesPage> {
+        let per_page = rest_per_page(page.limit);
+        let page_no = rest_page(page.cursor.as_deref());
+        let route = Self::repo_path(repo, &format!("/pulls/{number}/files"));
+        let params = [
+            ("per_page", per_page.to_string()),
+            ("page", page_no.to_string()),
+        ];
+        let items: Vec<PullRequestFile> = self.client().get(&route, Some(&params)).await?;
+        // GitHub never serves more than 3,000 PR files. Treat reaching that
+        // boundary conservatively as incomplete, even when it is exactly full.
+        let truncated = page_no
+            .saturating_sub(1)
+            .saturating_mul(per_page)
+            .saturating_add(items.len() as u64)
+            >= 3_000;
+        let next_cursor = if truncated {
+            None
+        } else {
+            rest_next_cursor(page_no, items.len(), per_page)
+        };
+        Ok(PullRequestFilesPage {
+            items,
+            next_cursor,
+            truncated,
+        })
+    }
+
+    async fn pull_reviews(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        page: PageParams,
+    ) -> Result<Page<PullRequestReview>> {
+        let per_page = rest_per_page(page.limit);
+        let page_no = rest_page(page.cursor.as_deref());
+        let route = Self::repo_path(repo, &format!("/pulls/{number}/reviews"));
+        let params = [
+            ("per_page", per_page.to_string()),
+            ("page", page_no.to_string()),
+        ];
+        let rows: Vec<Value> = self.client().get(&route, Some(&params)).await?;
+        let next_cursor = rest_next_cursor(page_no, rows.len(), per_page);
+        let items = rows.into_iter().map(|row| {
+            serde_json::from_value(json!({
+                "id": row["id"], "author": row.pointer("/user/login").and_then(Value::as_str).unwrap_or(""),
+                "state": row["state"], "body": row["body"], "submittedAt": row["submitted_at"], "url": row["html_url"],
+            })).map_err(Error::from)
+        }).collect::<Result<Vec<PullRequestReview>>>()?;
+        Ok(Page { items, next_cursor })
+    }
+
     async fn list_reviews(&self, repo: &RepoRef, number: u64) -> Result<Vec<Review>> {
         let route = Self::repo_path(repo, &format!("/pulls/{number}/reviews"));
-        self.rest_collect_all(&route, |v| v, map_review).await
+        self.rest_collect_all(&route, false, |v| v, map_review)
+            .await
     }
 
     async fn review_decision(&self, repo: &RepoRef, number: u64) -> Result<Option<ReviewDecision>> {
@@ -1830,7 +2208,7 @@ impl SourceControl for GitHubSourceControl {
                 "prNumber": number,
             },
         });
-        let resp: Value = self.client.graphql(&payload).await?;
+        let resp: Value = self.graphql_accounted(&payload).await?;
         let data = graphql_data(resp)?;
         Ok(parse_review_decision(&data))
     }
@@ -1841,7 +2219,7 @@ impl SourceControl for GitHubSourceControl {
         number: u64,
     ) -> Result<MergeRequirementSignals> {
         let data = self
-            .graphql_tolerating_merge_queue_schema(MERGE_REQUIREMENTS_QUERY, repo, number)
+            .graphql_with_all_checks(MERGE_REQUIREMENTS_QUERY, repo, number)
             .await?;
         let mut signals = parse_merge_requirement_signals(&data);
 
@@ -1876,13 +2254,17 @@ impl SourceControl for GitHubSourceControl {
             repo,
             &format!("/rules/branches/{}", encode_path_segments(branch)),
         );
-        let v: Value = self.client.get(&route, None::<&()>).await?;
-        Ok(map_branch_rules(&v))
+        crate::branch_rules_cache::read(self.cache_scope.clone(), repo, branch, async {
+            let v: Value = self.client().get(&route, None::<&()>).await?;
+            validate_branch_rules(&v)?;
+            Ok(map_branch_rules(&v))
+        })
+        .await
     }
 
     async fn pr_observation(&self, repo: &RepoRef, number: u64) -> Result<Option<PrObservation>> {
         let data = self
-            .graphql_tolerating_merge_queue_schema(PR_OBSERVATION_QUERY, repo, number)
+            .graphql_with_all_checks(PR_OBSERVATION_QUERY, repo, number)
             .await?;
         let pr = data
             .pointer("/repository/pullRequest")
@@ -1890,12 +2272,46 @@ impl SourceControl for GitHubSourceControl {
             .ok_or_else(|| Error::NotFound(format!("PR #{number} not found")))?;
         Ok(Some(PrObservation {
             pr: map_graphql_pull(pr)?,
+            ancestry_identity: parse_ancestry_identity(pr),
             signals: parse_merge_requirement_signals(&data),
             reviews: parse_observed_reviews(pr),
             threads: parse_observed_threads(pr),
             // Saturated like `list_comments`' single page below.
             conversation_count: observed_count(pr.get("comments")),
         }))
+    }
+
+    async fn pr_ancestry(
+        &self,
+        repo: &RepoRef,
+        identity: &PrAncestryIdentity,
+    ) -> Result<PrAncestry> {
+        if !identity.is_valid() {
+            return Ok(PrAncestry::Unknown);
+        }
+        // Validated full hashes contain only hex; no symbolic refs or path
+        // characters can reach this route. Fork commits use the base repo's
+        // network, and inaccessible commits fail rather than becoming current.
+        let route = Self::repo_path(
+            repo,
+            &format!(
+                "/compare/{}...{}?per_page=1&page=1",
+                identity.base_sha, identity.head_sha
+            ),
+        );
+        let value: Value = self
+            .transport
+            .comparison_client()
+            .get(&route, None::<&()>)
+            .await?;
+        Ok(match value.get("behind_by").and_then(Value::as_u64) {
+            Some(behind_by) => PrAncestry::Known {
+                base_sha: identity.base_sha.clone(),
+                head_sha: identity.head_sha.clone(),
+                behind_by,
+            },
+            None => PrAncestry::Unknown,
+        })
     }
 
     // Known ceiling: a single `per_page=100` page (newest first), not a full
@@ -1905,9 +2321,9 @@ impl SourceControl for GitHubSourceControl {
     async fn list_comments(&self, repo: &RepoRef, number: u64) -> Result<Vec<Comment>> {
         let route = Self::repo_path(
             repo,
-            &format!("/issues/{number}/comments?per_page=100&sort=created&direction=desc"),
+            &format!("/issues/{number}/comments?per_page=100&page=1&sort=created&direction=desc"),
         );
-        let v: Value = self.client.get(&route, None::<&()>).await?;
+        let v: Value = self.client().get(&route, None::<&()>).await?;
         map_list(v, map_issue_comment)
     }
 
@@ -1922,7 +2338,7 @@ impl SourceControl for GitHubSourceControl {
             None => {
                 let route = Self::repo_path(repo, &format!("/issues/{number}/comments"));
                 let v: Value = self
-                    .client
+                    .client()
                     .post(route, Some(&json!({ "body": body })))
                     .await?;
                 map_issue_comment(v)
@@ -1937,7 +2353,7 @@ impl SourceControl for GitHubSourceControl {
                 }
                 let route = Self::repo_path(repo, &format!("/pulls/{number}/comments"));
                 let v: Value = self
-                    .client
+                    .client()
                     .post(route, Some(&Value::Object(payload)))
                     .await?;
                 Ok(review_comment_as_comment(map_review_comment(v)?))
@@ -1960,7 +2376,7 @@ impl SourceControl for GitHubSourceControl {
             ("sort", "created".to_string()),
             ("direction", "desc".to_string()),
         ];
-        let v: Value = self.client.get(&route, Some(&params)).await?;
+        let v: Value = self.client().get(&route, Some(&params)).await?;
         let items: Vec<Value> = serde_json::from_value(v)?;
         let fetched = items.len();
         let comments = items
@@ -1982,7 +2398,7 @@ impl SourceControl for GitHubSourceControl {
     ) -> Result<ReviewComment> {
         let route = Self::repo_path(repo, &format!("/pulls/{number}/comments"));
         let payload = json!({ "body": body, "in_reply_to": comment_id });
-        let v: Value = self.client.post(route, Some(&payload)).await?;
+        let v: Value = self.client().post(route, Some(&payload)).await?;
         map_review_comment(v)
     }
 
@@ -2005,7 +2421,13 @@ impl SourceControl for GitHubSourceControl {
                 "after": after,
             },
         });
-        let resp: Value = self.client.graphql(&payload).await?;
+        let attempt = if after.is_some() {
+            crate::traffic::Attempt::Continuation
+        } else {
+            crate::traffic::Attempt::Initial
+        };
+        let resp: Value =
+            crate::traffic::with_attempt(attempt, self.graphql_accounted(&payload)).await?;
         let data = graphql_data(resp)?;
         let threads = data.pointer("/repository/pullRequest/reviewThreads");
         let nodes = threads
@@ -2037,14 +2459,12 @@ impl SourceControl for GitHubSourceControl {
 
     async fn check_runs(&self, repo: &RepoRef, git_ref: &str) -> Result<Vec<CheckRun>> {
         let route = Self::repo_path(repo, &format!("/commits/{git_ref}/check-runs"));
-        // The check-runs payload nests the item array under `check_runs`.
+        // Missing data and a page-cap stop are unreadable, not authoritative
+        // empty/partial checks. The monitor must retain its last observation.
         self.rest_collect_all(
             &route,
-            |v| {
-                v.get("check_runs")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()))
-            },
+            true,
+            |v| v.get("check_runs").cloned().unwrap_or(Value::Null),
             map_check_run,
         )
         .await
@@ -2058,7 +2478,7 @@ impl SourceControl for GitHubSourceControl {
         }
         let route = Self::repo_path(repo, "/issues");
         let v: Value = self
-            .client
+            .client()
             .post(route, Some(&Value::Object(payload)))
             .await?;
         map_issue(v)
@@ -2066,7 +2486,7 @@ impl SourceControl for GitHubSourceControl {
 
     async fn get_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue> {
         let route = Self::repo_path(repo, &format!("/issues/{number}"));
-        let v: Value = self.client.get(&route, None::<&()>).await?;
+        let v: Value = self.client().get(&route, None::<&()>).await?;
         map_issue_at_number(v, number)
     }
 
@@ -2114,7 +2534,7 @@ impl SourceControl for GitHubSourceControl {
         params.push(("per_page", per_page.to_string()));
         params.push(("page", page_no.to_string()));
         let route = Self::repo_path(repo, "/issues");
-        let v: Value = self.client.get(&route, Some(&params)).await?;
+        let v: Value = self.client().get(&route, Some(&params)).await?;
         let raw: Vec<Value> = serde_json::from_value(v)?;
         // Paging is measured on the raw GitHub page; the `pull_request` filter
         // only narrows what this page returns (parity with the `author` filter
@@ -2133,10 +2553,12 @@ impl GitHubSourceControl {
     /// Fetch a REST listing to exhaustion: request `per_page=100` pages from
     /// page 1, extract each page's item array with `extract`, map items with
     /// `map`, and stop on a short page or at the [`REST_EXHAUSTIVE_MAX_PAGES`]
-    /// safety cap (see [`rest_fetch_next_page`]).
+    /// safety cap (see [`rest_fetch_next_page`]). `require_complete` makes a
+    /// cap stop an error rather than returning a partial check observation.
     async fn rest_collect_all<T>(
         &self,
         route: &str,
+        require_complete: bool,
         extract: impl Fn(Value) -> Value,
         map: impl Fn(Value) -> Result<T>,
     ) -> Result<Vec<T>> {
@@ -2148,18 +2570,136 @@ impl GitHubSourceControl {
                 ("per_page", per_page.to_string()),
                 ("page", page.to_string()),
             ];
-            let v: Value = self.client.get(route, Some(&params)).await?;
+            let v: Value = self.client().get(route, Some(&params)).await?;
             let items: Vec<Value> = serde_json::from_value(extract(v))?;
             let fetched = items.len();
             for item in items {
                 out.push(map(item)?);
             }
             if !rest_fetch_next_page(page, fetched, per_page) {
+                if require_complete && fetched as u64 == per_page {
+                    return Err(Error::Decode(
+                        "incomplete check-runs observation: page limit exceeded".into(),
+                    ));
+                }
                 break;
             }
             page += 1;
         }
         Ok(out)
+    }
+
+    /// Collect the whole rollup or fail the read: no partial vector escapes.
+    /// Re-query the PR so each page's head and commit OID can be checked against
+    /// page one, retaining that first page's other signals. Cursor cycles,
+    /// malformed metadata, count changes and the safety cap are errors; callers
+    /// may retry via their ordinary fallback/poll path. Quota errors propagate.
+    async fn graphql_with_all_checks(
+        &self,
+        query: &str,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Value> {
+        const MAX_PAGES: usize = 100;
+        const COMMIT: &str = "/repository/pullRequest/commits/nodes/0/commit";
+        let mut data = self
+            .graphql_tolerating_merge_queue_schema(query, repo, number, None)
+            .await?;
+        // A missing rollup retains the existing REST fallback. An existing
+        // connection with missing/invalid metadata must not be trusted instead.
+        if data
+            .pointer(&format!("{COMMIT}/statusCheckRollup"))
+            .is_none_or(Value::is_null)
+        {
+            return Ok(data);
+        }
+        let invalid =
+            |reason: &str| Error::Decode(format!("incomplete PR check observation: {reason}"));
+        let head = data
+            .pointer("/repository/pullRequest/headRefOid")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid("missing head"))?
+            .to_string();
+        let mut page = data.clone();
+        let ancestry_identity = data
+            .pointer("/repository/pullRequest")
+            .and_then(parse_ancestry_identity);
+        let mut contexts = Vec::new();
+        let mut cursors = std::collections::HashSet::new();
+        let mut expected_total = None;
+        for _ in 0..MAX_PAGES {
+            if page
+                .pointer("/repository/pullRequest")
+                .and_then(parse_ancestry_identity)
+                != ancestry_identity
+            {
+                // A moving base, retarget or changed fork must not attach a
+                // comparison to mixed observations. Preserve unrelated checks.
+                if let Some(pr) = data.pointer_mut("/repository/pullRequest") {
+                    pr.as_object_mut().expect("PR object").remove("baseRef");
+                }
+            }
+            if page
+                .pointer("/repository/pullRequest/headRefOid")
+                .and_then(Value::as_str)
+                != Some(&head)
+                || page
+                    .pointer(&format!("{COMMIT}/oid"))
+                    .and_then(Value::as_str)
+                    != Some(&head)
+            {
+                return Err(invalid("head changed during collection"));
+            }
+            let connection = page
+                .pointer(&format!("{COMMIT}/statusCheckRollup/contexts"))
+                .ok_or_else(|| invalid("missing connection"))?;
+            let nodes = connection
+                .get("nodes")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid("missing nodes"))?;
+            if nodes.iter().any(|n| map_rollup_context(n).is_none()) {
+                return Err(invalid("unreadable context"));
+            }
+            let total = connection
+                .get("totalCount")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| invalid("missing total count"))?;
+            if *expected_total.get_or_insert(total) != total {
+                return Err(invalid("context count changed during collection"));
+            }
+            contexts.extend(nodes.iter().cloned());
+            let more = connection
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| invalid("missing page info"))?;
+            if !more {
+                if contexts.len() as u64 != total {
+                    return Err(invalid("context count does not match collected pages"));
+                }
+                *data
+                    .pointer_mut(ROLLUP_CONTEXTS_POINTER)
+                    .expect("first page has nodes") = json!(contexts);
+                return Ok(data);
+            }
+            let cursor = connection
+                .pointer("/pageInfo/endCursor")
+                .and_then(Value::as_str)
+                .filter(|c| !c.is_empty())
+                .ok_or_else(|| invalid("missing continuation cursor"))?;
+            if !cursors.insert(cursor.to_string()) {
+                return Err(invalid("repeated continuation cursor"));
+            }
+            if cursors.len() == MAX_PAGES {
+                break;
+            }
+            page = crate::traffic::with_attempt(
+                crate::traffic::Attempt::Continuation,
+                self.graphql_tolerating_merge_queue_schema(query, repo, number, Some(cursor)),
+            )
+            .await?;
+        }
+        Err(invalid("page limit exceeded"))
     }
 
     /// Run a per-PR GraphQL `query` (the merge-requirements probe or the
@@ -2172,14 +2712,16 @@ impl GitHubSourceControl {
         query: &str,
         repo: &RepoRef,
         number: u64,
+        checks_cursor: Option<&str>,
     ) -> Result<Value> {
         let variables = json!({
             "owner": repo.owner,
             "repo": repo.name,
             "prNumber": number,
+            "checksCursor": checks_cursor,
         });
         let payload = json!({ "query": query, "variables": variables });
-        let resp: Value = match self.client.graphql(&payload).await {
+        let resp: Value = match self.graphql_accounted(&payload).await {
             Ok(resp) => resp,
             Err(err) => {
                 let err = Error::from(err);
@@ -2194,7 +2736,11 @@ impl GitHubSourceControl {
                     "query": without_merge_queue_selections(query),
                     "variables": variables,
                 });
-                self.client.graphql(&fallback).await?
+                crate::traffic::with_attempt(
+                    crate::traffic::Attempt::Fallback,
+                    self.graphql_accounted(&fallback),
+                )
+                .await?
             }
         };
         graphql_data(resp)
@@ -2213,7 +2759,7 @@ impl GitHubSourceControl {
             )
         };
         let payload = json!({ "query": mutation, "variables": { "id": thread_id } });
-        let resp: Value = self.client.graphql(&payload).await?;
+        let resp: Value = self.graphql_accounted(&payload).await?;
         let data = graphql_data(resp)?;
         Ok(data
             .pointer(&format!("/{field}/thread/isResolved"))
@@ -2427,6 +2973,8 @@ mod tests {
 
     #[test]
     fn pr_observation_query_embeds_the_probe_and_strips_the_same_way() {
+        assert!(PR_OBSERVATION_QUERY.contains("baseRef { target { oid } }"));
+        assert!(!PR_OBSERVATION_QUERY.contains("baseRefOid"));
         // The folded read carries every probe selection verbatim (so the
         // same parser serves both) and the schema fallback strips exactly
         // the merge-queue lines from it too.
@@ -2728,6 +3276,7 @@ mod tests {
                 url: None,
                 started_at: None,
             }],
+            checks_head_sha: None,
             checks_known: true,
             branch_rules: Some(BranchRules {
                 required_approving_review_count: Some(1),

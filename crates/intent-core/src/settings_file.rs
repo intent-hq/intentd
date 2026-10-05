@@ -38,6 +38,7 @@ use crate::config::{
     ACP_NODE_MAX_OLD_SPACE_MB_MAX, ACP_NODE_MAX_OLD_SPACE_MB_MIN,
     DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS, DEFAULT_HOOKS_MAX_PER_AGENT,
     DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS, DEFAULT_MAX_TOP_LEVEL_AGENTS,
+    DEFAULT_PR_CACHE_MAX_AGE_SECONDS, DEFAULT_PR_MONITORS_MAX_PER_AGENT,
     DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
     DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
     DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
@@ -70,6 +71,7 @@ pub struct SettingsFile {
     pub server: ServerSettings,
     pub sharing: SharingSettings,
     pub source_control: SourceControlSettings,
+    pub identity: IdentitySettings,
     pub accounts: AccountsSettings,
     pub voice: VoiceSettings,
     pub context: ContextSettings,
@@ -83,6 +85,7 @@ pub struct SettingsFile {
     pub agent_features: AgentFeaturesSettings,
     pub wake_resume: WakeResumeSettings,
     pub pr_monitor: PrMonitorSettings,
+    pub pr_cache: PrCacheSettings,
     pub updates: UpdatesSettings,
 }
 
@@ -98,6 +101,8 @@ pub struct ProvidersSettings {
     pub enabled: Option<BTreeMap<String, bool>>,
     /// `providers.paths` — per-provider CLI path overrides.
     pub paths: BTreeMap<String, String>,
+    /// Session-only Fast mode preference; absent providers default to off.
+    pub fast_mode: BTreeMap<String, bool>,
 }
 
 /// `[model]` — model defaults (`model.*`). The per-workspace override layer
@@ -136,6 +141,11 @@ pub struct QuickActionsSettings {
     /// `quickActions.typeOverrides` — per-quick-action model overrides
     /// (`commit`, `pr`, `review`, `fast`).
     pub type_overrides: BTreeMap<String, String>,
+    /// Shared effort for quick actions; blank reads as unset.
+    #[serde(deserialize_with = "de_blank_as_none")]
+    pub default_reasoning_effort: Option<String>,
+    /// Per-action effort, independent of the per-action model override.
+    pub type_reasoning_effort_overrides: BTreeMap<String, String>,
     /// `quickActions.providerSettings` — per-provider quick-action settings
     /// (opaque FE-owned bags; validated structurally as a table only).
     pub provider_settings: toml::Table,
@@ -375,7 +385,8 @@ pub struct ServerSettings {
     /// Defaults to loopback (`127.0.0.1`); set `0.0.0.0` to expose the
     /// listener on every interface, including untrusted networks.
     pub bind_address: BindAddress,
-    /// `server.port` — TCP port for the WSS listener (1024–65535).
+    /// `server.port` — legacy value preserved for compatibility (1024–65535).
+    /// Unused by listeners; the backend connection port is `server.wsApi.port`.
     pub port: u16,
     /// `server.originAllowList` — permitted WS origins.
     pub origin_allow_list: Option<Vec<String>>,
@@ -415,6 +426,8 @@ impl Default for ServerSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SharingSettings {
+    /// Owner-chosen label for collaborators; empty keeps the OS-name fallback.
+    pub machine_name: String,
     /// `sharing.maxGuestsPerWorkspace` — guests one workspace admits besides
     /// its owner: open invites count against it at mint time, collaborators
     /// at join time (0–100; `0` closes every workspace to guests).
@@ -427,9 +440,33 @@ pub struct SharingSettings {
     pub max_connections_per_guest: u32,
 }
 
+impl SharingSettings {
+    /// The optional collaboration label, separate from OS and personal device names.
+    #[must_use]
+    pub fn collaboration_name(&self) -> Option<&str> {
+        let name = self.machine_name.trim();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// Validate and trim an owner-supplied collaboration label.
+    ///
+    /// # Errors
+    /// Returns invalid input for control characters or over 100 Unicode scalar values.
+    pub fn normalize_machine_name(name: &str) -> Result<String> {
+        if name.chars().any(char::is_control) || name.trim().chars().count() > 100 {
+            return Err(Error::InvalidInput(
+                "sharing.machineName must contain at most 100 characters and no control characters"
+                    .into(),
+            ));
+        }
+        Ok(name.trim().to_string())
+    }
+}
+
 impl Default for SharingSettings {
     fn default() -> Self {
         Self {
+            machine_name: String::new(),
             max_guests_per_workspace: DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE,
             max_guest_connections: DEFAULT_SHARING_MAX_GUEST_CONNECTIONS,
             max_connections_per_guest: DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST,
@@ -444,6 +481,8 @@ pub struct WsApiSettings {
     /// `server.wsApi.enabled` — enable the TCP/WSS listener at runtime.
     pub enabled: bool,
     /// `server.wsApi.port` — TCP port for the WSS listener (1024–65535).
+    /// An omitted key is unassigned; the registry tracks that distinction
+    /// while this typed view keeps the effective default 5181 for clients.
     pub port: u16,
 }
 
@@ -497,7 +536,8 @@ impl Default for AuthSettings {
 }
 
 /// `[sourceControl]` — forge integration (`sourceControl.*`). The GitHub PAT
-/// (`sourceControl.github.token`) is a secret and lives in `.secrets.json`.
+/// (`sourceControl.github.token`) and the GitLab credential
+/// (`sourceControl.gitlab.token`) are secrets and live in `.secrets.json`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SourceControlSettings {
@@ -505,6 +545,46 @@ pub struct SourceControlSettings {
     pub active_provider: SourceControlProvider,
     /// `[sourceControl.github]` — GitHub client config.
     pub github: GithubSettings,
+    /// `[sourceControl.gitlab]` — GitLab instance config (§5.27
+    /// "Provider-generic auth — `sourceControl.*`").
+    pub gitlab: GitlabSettings,
+}
+
+/// Default `sourceControl.gitlab.host`: the hosted instance.
+pub const DEFAULT_GITLAB_HOST: &str = "gitlab.com";
+
+/// `[sourceControl.gitlab]` — GitLab instance config (`sourceControl.gitlab.*`).
+/// One bound instance per daemon; the credential itself is the
+/// `sourceControl.gitlab.token` secret.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct GitlabSettings {
+    /// Explicit canonical HTTPS instance root, including its installation prefix.
+    /// Transport overrides never supply this logical identity.
+    pub instance_base_url: Option<String>,
+    /// `sourceControl.gitlab.host` — the bound instance as a bare
+    /// `host[:port]` (no scheme). Written by a successful
+    /// `sourceControl.connect { provider: "gitlab" }`.
+    pub host: String,
+    /// `sourceControl.gitlab.oauthClientId` — public OAuth application id for
+    /// the device authorization grant against `host`. Empty ⇒ the compiled
+    /// gitlab.com default applies on gitlab.com only.
+    pub oauth_client_id: String,
+    /// `sourceControl.gitlab.apiBaseUrl` — optional origin override for the
+    /// API calls to the bound host (test seam); never changes the reported
+    /// `host`.
+    pub api_base_url: Option<String>,
+}
+
+impl Default for GitlabSettings {
+    fn default() -> Self {
+        Self {
+            host: DEFAULT_GITLAB_HOST.to_string(),
+            instance_base_url: None,
+            oauth_client_id: String::new(),
+            api_base_url: None,
+        }
+    }
 }
 
 /// `sourceControl.activeProvider` values.
@@ -560,6 +640,20 @@ pub enum GithubTokenSource {
     Env,
     GhCli,
     Explicit,
+}
+
+/// `[identity]` — which linked forge account keys the primary principal
+/// (`identity.*`, protocol 10.8).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct IdentitySettings {
+    /// `identity.provider` — `"github"` | `"gitlab"`, or unset: the forge the
+    /// primary principal's identity triple is refreshed from. Unset, the
+    /// daemon uses the only connected forge (github when both are). Setting
+    /// it while the primary carries another forge's identity is the explicit
+    /// re-key (`principal:identity-changed`).
+    #[serde(deserialize_with = "de_blank_as_none")]
+    pub provider: Option<String>,
 }
 
 /// `[accounts]` — external account config (`accounts.*`). The Sentry API
@@ -778,12 +872,6 @@ pub struct AgentsSettings {
     /// [`TOOL_PAYLOAD_RETENTION_DAYS_MAX`]; read live at each sweep tick, no
     /// restart required).
     pub tool_payload_retention_days: u32,
-    /// `agents.flushQueuedMessages` — how the whole queued-message backlog
-    /// is delivered when an idle agent drains its queue: `all` batches every
-    /// ready entry into one turn, `systemOnly` batches only system-origin
-    /// entries (user-origin entries stay FIFO), `off` is one turn per queued
-    /// message.
-    pub flush_queued_messages: FlushQueuedMessagesMode,
     /// `agents.resumeInterruptedOnStart` — whether the daemon resumes
     /// interrupted agents at startup when `--resume-all` is absent: `auto`
     /// resumes only on headless hosts (no display detected), `on` always
@@ -804,7 +892,6 @@ impl Default for AgentsSettings {
             report_to_parent_debounce_seconds: DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS,
             history_replay_tool_content_chars: DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS,
             tool_payload_retention_days: DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
-            flush_queued_messages: FlushQueuedMessagesMode::All,
             resume_interrupted_on_start: ResumeInterruptedOnStart::Auto,
         }
     }
@@ -835,49 +922,6 @@ impl ResumeInterruptedOnStart {
             ResumeInterruptedOnStart::Auto => "auto",
             ResumeInterruptedOnStart::On => "on",
             ResumeInterruptedOnStart::Off => "off",
-        }
-    }
-}
-
-/// `agents.flushQueuedMessages` values. Serializes as camelCase strings
-/// (`"all"`, `"systemOnly"`, `"off"`); deserialization also accepts the
-/// legacy boolean shape (`true` → [`FlushQueuedMessagesMode::All`], `false` →
-/// [`FlushQueuedMessagesMode::Off`]) so an existing `config.toml` written by
-/// an older daemon still loads.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum FlushQueuedMessagesMode {
-    /// Batch every ready-to-send entry into one combined turn.
-    #[default]
-    All,
-    /// Batch only system-origin ready entries; user-origin entries stay FIFO.
-    SystemOnly,
-    /// One turn per queued message (legacy `false`).
-    Off,
-}
-
-impl<'de> Deserialize<'de> for FlushQueuedMessagesMode {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Bool(bool),
-            String(String),
-        }
-        match Repr::deserialize(deserializer)? {
-            Repr::Bool(true) => Ok(FlushQueuedMessagesMode::All),
-            Repr::Bool(false) => Ok(FlushQueuedMessagesMode::Off),
-            Repr::String(s) => match s.as_str() {
-                "all" => Ok(FlushQueuedMessagesMode::All),
-                "systemOnly" => Ok(FlushQueuedMessagesMode::SystemOnly),
-                "off" => Ok(FlushQueuedMessagesMode::Off),
-                other => Err(serde::de::Error::custom(format!(
-                    "unknown variant `{other}`, expected one of `all`, `systemOnly`, `off`"
-                ))),
-            },
         }
     }
 }
@@ -939,8 +983,8 @@ impl Default for HooksSettings {
 }
 
 /// `[agentFeatures]` — per-feature toggles for what agents see and may call
-/// (`agentFeatures.*`). All default **on** except the opt-in `peerAgents`;
-/// changes apply to new agent sessions only.
+/// (`agentFeatures.*`). All default **on**; changes apply to new agent
+/// sessions only.
 // One bool per independent settings toggle; the flat shape IS the settings
 // file contract.
 #[expect(clippy::struct_excessive_bools)]
@@ -992,8 +1036,8 @@ pub struct AgentFeaturesSettings {
     /// intent-hq/monorepo#2445 — before the default flipped).
     pub task_graph: bool,
     /// `agentFeatures.peerAgents` — expose independent top-level-agent
-    /// creation (`ws.agent.create({ topLevel: true })`) to agents. Defaults
-    /// **off** (opt-in), unlike the other toggles.
+    /// creation (`ws.agent.create({ topLevel: true })`) and self-retirement
+    /// (`ws.agent.retire`) to agents. Defaults **on**.
     pub peer_agents: bool,
     /// `agentFeatures.mcpTools` — expose the user's external MCP servers'
     /// tools to agents (`ws.mcp.*`). Unlike the prompt-gating toggles, this
@@ -1016,7 +1060,7 @@ impl Default for AgentFeaturesSettings {
             state_snapshot: true,
             pr_monitor: true,
             task_graph: true,
-            peer_agents: false,
+            peer_agents: true,
             mcp_tools: true,
         }
     }
@@ -1048,6 +1092,10 @@ impl Default for WakeResumeSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct PrMonitorSettings {
+    /// `prMonitor.maxPerAgent` — active monitors per owner, across repositories
+    /// and workspaces. Read live on registration/adoption; lowering the limit
+    /// preserves existing monitors. Supported range 1–100, clamped at read time.
+    pub max_per_agent: u32,
     /// `prMonitor.debounceSeconds` — quiet window a changed PR must observe
     /// before its consolidated wake is delivered.
     pub debounce_seconds: u64,
@@ -1063,7 +1111,7 @@ pub struct PrMonitorSettings {
     /// exposed in the Settings UI).
     pub hourly_request_budget: u64,
     /// `prMonitor.quotaSharePercent` — the share of the forge's REMAINING
-    /// quota (read once per tick from its quota-free `rate_limit` probe)
+    /// quota (from a shared probe; GitHub probes at most once per minute)
     /// the loop may plan to spend before the window resets. Stretches the
     /// per-PR interval ahead of exhaustion; a host without the signal
     /// falls back to the hourly-budget model alone (config-file key; not
@@ -1074,10 +1122,31 @@ pub struct PrMonitorSettings {
 impl Default for PrMonitorSettings {
     fn default() -> Self {
         Self {
+            max_per_agent: DEFAULT_PR_MONITORS_MAX_PER_AGENT,
             debounce_seconds: DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
             poll_seconds: DEFAULT_PR_MONITOR_POLL_SECONDS,
             hourly_request_budget: DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
             quota_share_percent: DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT,
+        }
+    }
+}
+
+/// `[prCache]` — the shared in-memory PR cache every PR read goes through
+/// (`prCache.*`). Read live like `prMonitor.*`; out-of-range values are
+/// clamped at read time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct PrCacheSettings {
+    /// `prCache.maxAgeSeconds` — how old a cached PR read may be and still
+    /// be served to an on-demand reader (`github.pulls.get`,
+    /// `ws.pr.snapshot`) without a forge call.
+    pub max_age_seconds: u64,
+}
+
+impl Default for PrCacheSettings {
+    fn default() -> Self {
+        Self {
+            max_age_seconds: DEFAULT_PR_CACHE_MAX_AGE_SECONDS,
         }
     }
 }
@@ -1188,6 +1257,7 @@ pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "server.listenMode",
     "workspace.autoFetch",
     "backgroundAgents",
+    "agents.flushQueuedMessages",
 ];
 
 /// Legacy values captured during a tolerant parse: dotted wire path → the
@@ -1333,6 +1403,18 @@ impl SettingsFile {
     pub fn validate(&self) -> Result<()> {
         fn bad(key: &str, msg: &str) -> Error {
             Error::InvalidInput(format!("invalid config.toml at `{key}`: {msg}"))
+        }
+        SharingSettings::normalize_machine_name(&self.sharing.machine_name)?;
+        if self
+            .providers
+            .fast_mode
+            .keys()
+            .any(|id| !matches!(id.as_str(), "claude-code" | "codex"))
+        {
+            return Err(bad(
+                "providers.fastMode",
+                "only claude-code and codex support Fast mode",
+            ));
         }
         let v = self.notifications.volume;
         if !(0.0..=1.0).contains(&v) {
@@ -1555,8 +1637,9 @@ fn toml_table_remove(table: &mut toml::Table, path: &str) -> Option<toml::Value>
 /// [`SettingsFile::load_or_init`] when no file exists. Every key appears with
 /// its default value (or a commented-out example when there is no default),
 /// annotated with its catalog label and description — except
-/// `agentFeatures.taskGraph`, deliberately not seeded so configs without the
-/// key track default flips automatically (intent-hq/monorepo#2643).
+/// `agentFeatures.taskGraph` (intent-hq/monorepo#2643) and
+/// `agentFeatures.peerAgents`, deliberately not seeded so configs without
+/// those keys track default flips automatically.
 /// Parsing this template must yield exactly [`SettingsFile::default`]
 /// (enforced by a unit test).
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# intentd configuration (non-secret settings).
@@ -1590,6 +1673,10 @@ providerDefaults = {}
 # defaultModel = "claude-sonnet-4-5"
 # Quick action type overrides -- per-quick-action model overrides.
 typeOverrides = {}
+# Quick action effort -- provider-defined; blank means provider default.
+# defaultReasoningEffort = "high"
+# Per-action effort overrides; blank or absent inherits the shared effort.
+typeReasoningEffortOverrides = {}
 # Quick action provider settings -- per-provider quick-action settings.
 providerSettings = {}
 
@@ -1645,8 +1732,8 @@ enabled = false
 # IPs (e.g. ["192.168.1.7", "100.64.0.3"] -- one listener per address, same
 # port); 0.0.0.0 exposes it on every interface, including untrusted networks.
 bindAddress = "127.0.0.1"
-# WS port -- TCP port for the WSS listener (1024-65535).
-port = 5181
+# Backend connection port is configured under [server.wsApi] below.
+# The legacy [server] port value is accepted but unused by listeners.
 # Origin allow-list -- permitted WS origins.
 # originAllowList = ["https://example.com"]
 # Max outstanding RPCs -- daemon-wide cap on outstanding slow-path RPCs across
@@ -1657,8 +1744,11 @@ maxOutstandingRpcs = 256
 [server.wsApi]
 # WS API enabled -- enable the TCP/WSS listener at runtime.
 enabled = false
-# WSS API port -- TCP port for the WSS listener (1024-65535).
-port = 5181
+# Backend connection port -- omit to select once on first enable, trying 5181 upward.
+# The selected port is saved here and required on every later start.
+# Set a number (1024-65535) to require that port without selection.
+# To deliberately select again, disable WSS, remove this key, and re-enable.
+# port = 5181
 
 [server.tunnel]
 # Tunnel enabled -- run the bundled tailcat sidecar forwarding tunnel traffic
@@ -1681,6 +1771,8 @@ enabled = false
 enabled = true
 
 [sharing]
+# Name shown to collaborators; empty uses the OS machine name.
+# machineName = ""
 # Max guests per workspace -- guests one workspace admits besides its owner;
 # open invites count at mint time, collaborators at join time (0-100, 0
 # closes every workspace to guests).
@@ -1711,6 +1803,26 @@ oauthClientId = "Ov23li8bvmPsd4B4pW38"
 # GitHub credential into child process environments as a scoped
 # github.com-only credential helper (never raw GITHUB_TOKEN/GH_TOKEN).
 exposeGitCredentialToChildren = true
+
+[sourceControl.gitlab]
+# Explicit logical HTTPS root for installations with a port or path prefix.
+# instanceBaseUrl = "https://gitlab.com"
+# GitLab host -- the bound instance as a bare host[:port], no scheme. Written
+# by a successful sourceControl.connect { provider: "gitlab" }.
+host = "gitlab.com"
+# GitLab OAuth client ID -- public OAuth application id for the device
+# authorization grant against the host (empty: the built-in gitlab.com id
+# applies on gitlab.com only; self-managed instances need their own).
+oauthClientId = ""
+# GitLab API base URL -- optional origin override for API calls to the bound
+# host (test seam); never changes the reported host. Unset means the host.
+# apiBaseUrl = "https://gitlab.acme.internal"
+
+[identity]
+# Identity provider -- the linked forge the primary user's identity is keyed
+# by: "github" or "gitlab". Unset means the only connected forge (github when
+# both are connected). Changing it re-keys the primary identity.
+# provider = "gitlab"
 
 [accounts.sentry]
 # Sentry organization -- Sentry organization slug (non-secret companion of the
@@ -1850,9 +1962,6 @@ historyReplayToolContentChars = 4000
 # be recovered); 0 disables the sweep and keeps full bodies forever (max 3650;
 # read live at each sweep tick, no restart required).
 toolPayloadRetentionDays = 0
-# Flush queued messages -- how the queued-message backlog is delivered when
-# an idle agent drains its queue: "all", "systemOnly", or "off".
-flushQueuedMessages = "all"
 # Resume interrupted on start -- whether the daemon resumes interrupted
 # agents at startup when --resume-all is absent: "auto" resumes only on
 # headless hosts (no display detected), "on" always resumes, "off" never
@@ -1916,12 +2025,18 @@ enabled = true
 thresholdSeconds = 10
 
 [prMonitor]
+# Active PR monitors per agent across repositories (minimum 1, maximum 100).
+# Raise for review orchestrators; shared polling slows as inventory grows.
+# Lowering the limit preserves existing monitors; applies without restart.
+maxPerAgent = 5
 # PR monitor debounce seconds -- quiet window (in seconds) a changed PR must
 # observe before its consolidated wake is delivered (minimum 10).
 debounceSeconds = 60
 # PR monitor poll seconds -- tick cadence (in seconds) of the centralized loop
-# and the per-PR poll interval floor (minimum 10).
-pollSeconds = 30
+# and the active per-PR poll interval floor (minimum 10). Idle workspaces
+# back off to 120/300/600/900 seconds at 15m/1h/6h/24h without content work.
+# Running agents restore active cadence; slower configured intervals win.
+pollSeconds = 60
 # PR monitor hourly request budget -- forge REST calls per hour the loop
 # plans to spend across all monitored PRs. A cadence cost model, not a hard
 # ceiling: each PR poll is costed at 3 calls (a single-page estimate), so the
@@ -1929,13 +2044,20 @@ pollSeconds = 30
 # exceeds it; requests are not counted or blocked against it (minimum 60,
 # maximum 5000).
 hourlyRequestBudget = 1500
-# PR monitor quota share percent -- the share of the forge's REMAINING core
-# quota (read once per tick from its quota-free rate_limit probe) the loop
+# PR monitor quota share percent -- the share of the forge's REMAINING PR-read
+# quota (from a shared probe; GitHub probes at most once per minute) the loop
 # may plan to spend before the window resets; the per-PR interval stretches
 # ahead of exhaustion so the monitor slows down before the rate-limit pause
 # has to stop it. A host without the signal uses the hourly budget alone
 # (minimum 1, maximum 100).
 quotaSharePercent = 50
+
+[prCache]
+# PR cache max age seconds -- how old (in seconds) a cached PR read may be
+# and still be served to an on-demand reader (github.pulls.get,
+# ws.pr.snapshot) without a forge call. PR-monitor polls refresh the cache
+# (minimum 10, maximum 600).
+maxAgeSeconds = 60
 
 [updates]
 # Check for updates when idle -- ask the sitter (via SIGUSR2) to check for
@@ -1955,6 +2077,24 @@ mod tests {
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("intentd-sf-{}-{}", name, uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn gitlab_instance_base_url_is_optional_and_structurally_typed() {
+        let settings = SettingsFile::parse_str(
+            "[sourceControl.gitlab]\ninstanceBaseUrl = \"https://forge.test:8443/gitlab\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            settings.source_control.gitlab.instance_base_url.as_deref(),
+            Some("https://forge.test:8443/gitlab")
+        );
+        let encoded = serde_json::to_value(&settings).unwrap();
+        assert_eq!(
+            encoded["sourceControl"]["gitlab"]["instanceBaseUrl"],
+            "https://forge.test:8443/gitlab"
+        );
+        assert!(SettingsFile::parse_str("[sourceControl.gitlab]\ninstanceBaseUrl = 42\n").is_err());
     }
 
     #[test]
@@ -2017,6 +2157,10 @@ mod tests {
             DEFAULT_GITHUB_OAUTH_CLIENT_ID
         );
         assert!(d.source_control.github.expose_git_credential_to_children);
+        assert_eq!(d.source_control.gitlab.host, DEFAULT_GITLAB_HOST);
+        assert!(d.source_control.gitlab.oauth_client_id.is_empty());
+        assert_eq!(d.source_control.gitlab.api_base_url, None);
+        assert_eq!(d.source_control.gitlab.instance_base_url, None);
         assert_eq!(d.accounts.sentry.organization, None);
         assert_eq!(d.voice.provider, VoiceProvider::Elevenlabs);
         assert_eq!(d.voice.language, None);
@@ -2039,7 +2183,6 @@ mod tests {
             d.agents.tool_payload_retention_days,
             DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS
         );
-        assert_eq!(d.agents.flush_queued_messages, FlushQueuedMessagesMode::All);
         assert_eq!(
             d.events.stream_retention_hours,
             DEFAULT_STREAM_RETENTION_HOURS
@@ -2062,7 +2205,7 @@ mod tests {
         assert!(d.agent_features.structured_questions);
         assert!(d.agent_features.attention_requests);
         assert!(d.agent_features.state_snapshot);
-        assert!(!d.agent_features.peer_agents);
+        assert!(d.agent_features.peer_agents);
         assert_eq!(d.wake_resume.enabled, DEFAULT_WAKE_RESUME_ENABLED);
         assert_eq!(
             d.wake_resume.threshold_seconds,
@@ -2073,17 +2216,13 @@ mod tests {
     #[test]
     fn camel_case_keys_parse() {
         let parsed = SettingsFile::parse_str(
-            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\nhistoryReplayToolContentChars = 8000\ntoolPayloadRetentionDays = 30\nflushQueuedMessages = false\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n\n[agentFeatures]\nbackgroundHooks = false\nhostExec = false\nrichChatBlocks = false\n",
+            "[agents]\nidleReapMinutes = 5\nmaxConcurrent = 4\nhistoryReplayToolContentChars = 8000\ntoolPayloadRetentionDays = 30\n\n[events]\nstreamRetentionHours = 24\n\n[workspaceApi]\nmaxOutputChars = 5000\ntoonOutput = false\n\n[server.wsApi]\nenabled = true\nport = 2000\n\n[hooks]\nmaxPerAgent = 9\n\n[agentFeatures]\nbackgroundHooks = false\nhostExec = false\nrichChatBlocks = false\n",
         )
         .unwrap();
         assert_eq!(parsed.agents.idle_reap_minutes, 5);
         assert_eq!(parsed.agents.max_concurrent, 4);
         assert_eq!(parsed.agents.history_replay_tool_content_chars, 8000);
         assert_eq!(parsed.agents.tool_payload_retention_days, 30);
-        assert_eq!(
-            parsed.agents.flush_queued_messages,
-            FlushQueuedMessagesMode::Off
-        );
         assert_eq!(parsed.events.stream_retention_hours, 24);
         assert_eq!(parsed.workspace_api.max_output_chars, 5000);
         assert!(!parsed.workspace_api.toon_output);
@@ -2101,9 +2240,12 @@ mod tests {
         assert!(parsed.agent_features.attention_requests);
         assert!(parsed.agent_features.state_snapshot);
         assert!(parsed.agent_features.pr_monitor);
+        assert_eq!(
+            parsed.pr_monitor.max_per_agent,
+            DEFAULT_PR_MONITORS_MAX_PER_AGENT
+        );
         assert!(parsed.agent_features.task_graph);
-        // peerAgents is the one default-off toggle.
-        assert!(!parsed.agent_features.peer_agents);
+        assert!(parsed.agent_features.peer_agents);
     }
 
     #[test]
@@ -2131,6 +2273,33 @@ mod tests {
         let parsed = SettingsFile::parse_str("[agentFeatures]\ntaskGraph = false\n")
             .expect("override parses");
         assert!(!parsed.agent_features.task_graph);
+    }
+
+    #[test]
+    fn peer_agents_defaults_on_and_opts_out() {
+        for config in [
+            "",
+            "[agentFeatures]\n",
+            "[agentFeatures]\nhostExec = false\n",
+        ] {
+            let parsed = SettingsFile::parse_str(config).expect("config parses");
+            assert!(parsed.agent_features.peer_agents);
+        }
+        // The shipped template leaves the toggle unset so new files track
+        // the default without recording an explicit user choice.
+        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("peerAgents"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert!(templated.agent_features.peer_agents);
+
+        for enabled in [false, true] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[agentFeatures]\npeerAgents = {enabled}\n"))
+                    .expect("explicit setting parses");
+            assert_eq!(parsed.agent_features.peer_agents, enabled);
+            let saved = toml::to_string(&parsed).expect("serialize settings");
+            let reloaded = SettingsFile::parse_str(&saved).expect("saved settings parse");
+            assert_eq!(reloaded.agent_features.peer_agents, enabled);
+        }
     }
 
     #[test]
@@ -2172,40 +2341,16 @@ mod tests {
     }
 
     #[test]
-    fn flush_queued_messages_accepts_string_variants() {
-        for (raw, expected) in [
-            ("\"all\"", FlushQueuedMessagesMode::All),
-            ("\"systemOnly\"", FlushQueuedMessagesMode::SystemOnly),
-            ("\"off\"", FlushQueuedMessagesMode::Off),
-        ] {
-            let parsed =
-                SettingsFile::parse_str(&format!("[agents]\nflushQueuedMessages = {raw}\n"))
-                    .expect("parses");
-            assert_eq!(parsed.agents.flush_queued_messages, expected, "{raw}");
+    fn flush_queued_messages_is_captured_as_retired() {
+        for raw in [r#""all""#, r#""systemOnly""#, r#""off""#, "true", "false"] {
+            let text = format!("[agents]\nflushQueuedMessages = {raw}\n");
+            let (parsed, legacy) =
+                SettingsFile::parse_str_with_legacy(&text).expect("legacy parses");
+            assert!(legacy.contains_key("agents.flushQueuedMessages"));
+            assert!(!serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("flushQueuedMessages"));
         }
-    }
-
-    #[test]
-    fn flush_queued_messages_accepts_legacy_booleans() {
-        let parsed = SettingsFile::parse_str("[agents]\nflushQueuedMessages = true\n")
-            .expect("legacy true parses");
-        assert_eq!(
-            parsed.agents.flush_queued_messages,
-            FlushQueuedMessagesMode::All
-        );
-        let parsed = SettingsFile::parse_str("[agents]\nflushQueuedMessages = false\n")
-            .expect("legacy false parses");
-        assert_eq!(
-            parsed.agents.flush_queued_messages,
-            FlushQueuedMessagesMode::Off
-        );
-    }
-
-    #[test]
-    fn flush_queued_messages_rejects_unknown_string() {
-        let err =
-            SettingsFile::parse_str("[agents]\nflushQueuedMessages = \"sometimes\"\n").unwrap_err();
-        assert!(err.to_string().contains("flushQueuedMessages"), "{err}");
     }
 
     #[test]
@@ -2537,6 +2682,18 @@ mod tests {
     }
 
     #[test]
+    fn new_config_omits_legacy_port_but_existing_ports_remain_readable() {
+        let template: toml::Value = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        assert!(template["server"].get("port").is_none());
+        for legacy_port in [5182, 6200] {
+            let text = format!("[server]\nport = {legacy_port}\n[server.wsApi]\nport = 5182\n");
+            let parsed = SettingsFile::parse_str(&text).unwrap();
+            assert_eq!(parsed.server.port, legacy_port);
+            assert_eq!(parsed.server.ws_api.port, 5182);
+        }
+    }
+
+    #[test]
     fn legacy_parse_tolerates_listen_mode_values_the_old_enum_rejected() {
         // Legacy paths are captured BEFORE the strict parse, so even a value
         // the retired ListenMode enum would have rejected (`"quic"` was a
@@ -2567,6 +2724,22 @@ mod tests {
             }))
         );
         assert_eq!(legacy.len(), 1);
+    }
+
+    #[test]
+    fn quick_action_effort_blank_reads_unset_but_nonblank_spelling_survives() {
+        for (input, expected) in [("", None), ("   ", None), (" High ", Some(" High "))] {
+            let text = format!("[quickActions]\ndefaultReasoningEffort = {input:?}\n[quickActions.typeReasoningEffortOverrides]\ncommit = \"   \"\n");
+            let parsed = SettingsFile::parse_str(&text).unwrap();
+            assert_eq!(
+                parsed.quick_actions.default_reasoning_effort.as_deref(),
+                expected
+            );
+            assert_eq!(
+                parsed.quick_actions.type_reasoning_effort_overrides["commit"],
+                "   "
+            );
+        }
     }
 
     #[test]
@@ -2809,6 +2982,10 @@ mod tests {
         let parsed = SettingsFile::parse_str("").expect("empty file parses");
         assert!(parsed.agent_features.pr_monitor);
         assert_eq!(
+            parsed.pr_monitor.max_per_agent,
+            DEFAULT_PR_MONITORS_MAX_PER_AGENT
+        );
+        assert_eq!(
             parsed.pr_monitor.debounce_seconds,
             DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS
         );
@@ -2816,6 +2993,7 @@ mod tests {
             parsed.pr_monitor.poll_seconds,
             DEFAULT_PR_MONITOR_POLL_SECONDS
         );
+        assert_eq!(parsed.pr_monitor.poll_seconds, 60);
         assert_eq!(
             parsed.pr_monitor.hourly_request_budget,
             DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET
@@ -2828,6 +3006,25 @@ mod tests {
         let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
         assert_eq!(templated.pr_monitor, parsed.pr_monitor);
         assert!(templated.agent_features.pr_monitor);
+    }
+
+    #[test]
+    fn pr_cache_defaults_template_and_override_round_trip() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(
+            parsed.pr_cache.max_age_seconds,
+            DEFAULT_PR_CACHE_MAX_AGE_SECONDS
+        );
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[prCache]"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(templated.pr_cache, parsed.pr_cache);
+        let overridden =
+            SettingsFile::parse_str("[prCache]\nmaxAgeSeconds = 120\n").expect("override parses");
+        assert_eq!(overridden.pr_cache.max_age_seconds, 120);
+        let err = SettingsFile::parse_str("[prCache]\nmaxAge = 30\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("prCache"), "names the table: {msg}");
+        assert!(msg.contains("maxAge"), "names the bad key: {msg}");
     }
 
     #[test]
@@ -2884,6 +3081,25 @@ mod tests {
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[sharing]"));
         let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
         assert_eq!(templated.sharing, parsed.sharing);
+    }
+
+    #[test]
+    fn collaboration_machine_name_config_validation_and_unicode() {
+        let name = "🦀".repeat(100);
+        let parsed =
+            SettingsFile::parse_str(&format!("[sharing]\nmachineName = \"  {name}  \"\n")).unwrap();
+        assert_eq!(parsed.sharing.collaboration_name(), Some(name.as_str()));
+        for invalid in ["x".repeat(101), "line\nname".into(), "\tname".into()] {
+            assert!(SharingSettings::normalize_machine_name(&invalid).is_err());
+            let mut settings = SettingsFile::default();
+            settings.sharing.machine_name = invalid;
+            assert!(settings.validate().is_err());
+        }
+        assert_eq!(SharingSettings::normalize_machine_name("   ").unwrap(), "");
+        assert!(SettingsFile::default()
+            .sharing
+            .collaboration_name()
+            .is_none());
     }
 
     #[test]

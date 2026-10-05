@@ -27,13 +27,79 @@ pub enum Caller {
     /// A client connection (UDS or WSS) bound to a principal at admission.
     Wire {
         principal_id: PrincipalId,
-        /// Whether the principal administers this daemon (the primary user).
-        is_administrator: bool,
+        /// Role resolved from durable host authority at admission. Services
+        /// revalidate mutable membership; this snapshot is not a grant cache.
+        host_role: crate::HostRole,
     },
     /// An agent session calling back through the `workspace_api` bridge.
     Agent { agent_id: AgentId },
     /// Daemon-internal background work (hook runs).
     Daemon,
+}
+
+/// Queue contents reach the recipient through normal delivery, never through
+/// its own read tools. Human, daemon and other-agent inspection is unchanged.
+#[must_use]
+pub fn queue_contents_visible_to(caller: Option<&Caller>, target: &AgentId) -> bool {
+    !matches!(caller, Some(Caller::Agent { agent_id }) if agent_id == target)
+}
+
+/// Explanation shared by explicit self queue reads at both boundaries.
+pub const SELF_QUEUE_DELIVERY_MESSAGE: &str =
+    "Your queued messages will be delivered after the current turn. Their contents cannot be read early; queueLength reports the pending count.";
+
+/// Remove payload copies from the recipient's queue event history. Applies
+/// to old snapshots too: delivery belongs to the transcript, and consulting
+/// historical queue events must not recover messages still pending now.
+/// Preserve event rows and page tokens; never modify the stored event.
+pub fn redact_self_queue_events(value: &mut serde_json::Value, agent_id: &AgentId) {
+    use serde_json::{json, Value};
+    match value {
+        Value::Array(rows) => {
+            for row in rows {
+                redact_self_queue_events(row, agent_id);
+            }
+        }
+        Value::Object(obj) => {
+            let queue_event = obj
+                .get("type")
+                .or_else(|| obj.get("eventType"))
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.starts_with("agent:queue:"));
+            let target = obj
+                .get("data")
+                .and_then(|d| d.get("agentId"))
+                .and_then(Value::as_str)
+                .or_else(|| obj.get("sessionId").and_then(Value::as_str))
+                .or_else(|| {
+                    obj.get("actor")
+                        .and_then(|a| a.get("id"))
+                        .and_then(Value::as_str)
+                });
+            if queue_event && target == Some(agent_id.as_str()) {
+                let data = obj.get("data");
+                let count = data
+                    .and_then(|d| d.get("queueLength"))
+                    .and_then(Value::as_u64)
+                    .or_else(|| {
+                        data.and_then(|d| d.get("queue").or_else(|| d.get("queuedMessages")))
+                            .and_then(Value::as_array)
+                            .map(|q| q.len() as u64)
+                    });
+                let mut projected = json!({"agentId": agent_id});
+                if let Some(count) = count {
+                    projected["queueLength"] = json!(count);
+                }
+                obj.insert("data".into(), projected);
+                obj.remove("metadata");
+            } else {
+                for child in obj.values_mut() {
+                    redact_self_queue_events(child, agent_id);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 impl Caller {
@@ -52,13 +118,25 @@ impl Caller {
     #[must_use]
     pub fn is_administrator(&self) -> bool {
         match self {
-            Caller::Wire {
-                is_administrator, ..
-            } => *is_administrator,
+            Caller::Wire { host_role, .. } => *host_role == crate::HostRole::Owner,
             Caller::Daemon => true,
             Caller::Agent { .. } => false,
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn host_members_are_not_administrators() {
+    let member = Caller::Wire {
+        principal_id: PrincipalId::new(),
+        host_role: crate::HostRole::Member,
+    };
+    assert!(!member.is_administrator());
+    assert!(queue_attribution_visible_to(
+        &member,
+        &QueueAttribution::UnknownHuman
+    ));
 }
 
 tokio::task_local! {
@@ -87,6 +165,59 @@ where
     CALLER.scope(caller, f)
 }
 
+/// A short-lived authorization lease. The transport owns its implementation;
+/// services retain it only through an irreversible admission decision, never
+/// through a running agent turn. Neither credentials nor their hashes serialize.
+pub type CredentialLease = Box<dyn Send + Sync>;
+
+/// Revalidate a legacy credential and exclude rotation until the returned lease
+/// drops. Per-principal credentials are checked with durable role in the store.
+pub trait LegacyCredentialAuthority: Send + Sync {
+    fn authorize(&self) -> crate::BoxFuture<'_, crate::Result<CredentialLease>>;
+}
+
+/// Exact wire admission provenance, independent of the caller's role snapshot.
+/// UDS and explicitly unauthenticated local transports have no bearer binding.
+#[derive(Clone)]
+pub enum WireCredential {
+    Legacy {
+        principal_id: PrincipalId,
+        authority: std::sync::Arc<dyn LegacyCredentialAuthority>,
+    },
+    Principal {
+        principal_id: PrincipalId,
+        token_hash: String,
+    },
+}
+
+impl WireCredential {
+    #[must_use]
+    pub fn principal_id(&self) -> &PrincipalId {
+        match self {
+            Self::Legacy { principal_id, .. } | Self::Principal { principal_id, .. } => {
+                principal_id
+            }
+        }
+    }
+}
+
+tokio::task_local! {
+    static WIRE_CREDENTIAL: Option<WireCredential>;
+}
+
+#[must_use]
+pub fn current_wire_credential() -> Option<WireCredential> {
+    WIRE_CREDENTIAL.try_with(Clone::clone).ok().flatten()
+}
+
+/// Transport request spawns must capture and re-establish this alongside Caller.
+pub fn with_wire_credential<F: Future>(
+    credential: Option<WireCredential>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    WIRE_CREDENTIAL.scope(credential, future)
+}
+
 /// `tokio::spawn` for daemon-internal background work: the spawned task runs
 /// with [`Caller::Daemon`] bound, so the capability gates it reaches (event
 /// fan-out, refreshers, timers, finalisers) see the daemon rather than an
@@ -101,15 +232,420 @@ where
     tokio::spawn(with_caller(Caller::Daemon, f))
 }
 
+/// Spawn work with the current caller and wire credential captured at spawn.
+/// Unlike daemon-internal work, a request's child must not acquire daemon
+/// authority. An absent caller stays absent, including for standalone tools.
+/// Dropping the returned handle detaches the task, just like `tokio::spawn`;
+/// resource owners can therefore finish cleanup after their waiter is canceled.
+pub fn spawn_with_current_caller<F>(f: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let caller = current_caller();
+    let credential = current_wire_credential();
+    tokio::spawn(with_wire_credential(credential, async move {
+        match caller {
+            Some(caller) => with_caller(caller, f).await,
+            None => f.await,
+        }
+    }))
+}
+
+/// Who a queued-message entry is attributed to under the per-user queue
+/// visibility rule (multiplayer): the three tiers of the `agent.getQueue`
+/// contract, resolved by [`queue_attribution_with`] from the entry's
+/// `messageMetadata` plus the workspace author fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueAttribution {
+    /// A person: the entry's principal stamp ([`crate::FROM_PRINCIPAL_ID_KEY`]),
+    /// else the workspace fallback author of an unstamped human-origin entry.
+    Principal(PrincipalId),
+    /// An unstamped entry of human origin (a legacy pre-attribution row)
+    /// whose workspace fallback could not be resolved (no owner / legacy
+    /// author, or the read failed): SOMEONE wrote it, nobody knows who.
+    /// Visible in the shared queue, but never confers authorship for editing
+    /// or same-author merging.
+    UnknownHuman,
+    /// No human author at all: an agent-sent or automatic (hook / monitor /
+    /// system) entry. Public to every caller.
+    Unattributed,
+}
+
+/// `true` when an unstamped queue entry's `messageMetadata` still reads as
+/// human-authored — the same rule the fe applies to transcript rows: an
+/// entry is agent/automatic origin iff its metadata is an object with a
+/// string `type` (other than the user-authored `question_answers` wizard
+/// tag), a non-empty `fromAgentId`, or `source == "system"`. Absent or
+/// non-object metadata reads as human (a legacy typed message).
+#[must_use]
+pub fn is_human_authored_metadata(message_metadata: Option<&serde_json::Value>) -> bool {
+    // The daemon's authenticated stamp takes precedence over client labels.
+    if crate::lift_from_principal_id(message_metadata).is_some() {
+        return true;
+    }
+    let Some(serde_json::Value::Object(obj)) = message_metadata else {
+        return true;
+    };
+    match obj.get("type").and_then(serde_json::Value::as_str) {
+        Some("question_answers") => return true,
+        Some(_) => return false,
+        None => {}
+    }
+    if obj
+        .get("fromAgentId")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        return false;
+    }
+    obj.get("source").and_then(serde_json::Value::as_str) != Some("system")
+}
+
+/// The attribution of a queue entry with `metadata`, given the workspace
+/// author `fallback` already resolved (`None` when the workspace has none or
+/// the read failed): its stamp, else `fallback` for an unstamped entry whose
+/// metadata still reads as human-authored ([`is_human_authored_metadata`]) —
+/// [`QueueAttribution::UnknownHuman`] when that fallback is missing — else
+/// [`QueueAttribution::Unattributed`]. Synchronous so a mutation can evaluate
+/// it under the queue lock against the entry it is about to touch.
+#[must_use]
+pub fn queue_attribution_with(
+    metadata: Option<&serde_json::Value>,
+    fallback: Option<&PrincipalId>,
+) -> QueueAttribution {
+    if crate::human_author::is_unbound_historical_human(metadata) {
+        return QueueAttribution::UnknownHuman;
+    }
+    match crate::lift_from_principal_id(metadata) {
+        Some(id) => QueueAttribution::Principal(id),
+        None if is_human_authored_metadata(metadata) => fallback
+            .cloned()
+            .map_or(QueueAttribution::UnknownHuman, QueueAttribution::Principal),
+        None => QueueAttribution::Unattributed,
+    }
+}
+
+/// Queue reads are shared by all callers admitted to the workspace. This is
+/// an egress policy, not authorization to mutate someone else's entry.
+#[must_use]
+pub fn queue_attribution_visible_to(_caller: &Caller, _attribution: &QueueAttribution) -> bool {
+    true
+}
+
+/// The attribution of a queued-message entry in wire shape (`author` already
+/// attached by the serve-time resolver): an `author` object with a string
+/// `principalId` is that principal; otherwise the entry is re-read from its
+/// own `messageMetadata` with NO fallback — a stamp still names its
+/// principal, an unstamped human-origin entry the resolver left author-less
+/// (or a malformed `author`) is an unknown human, and only an agent-sent /
+/// automatic entry is unattributed.
+#[must_use]
+pub fn queue_entry_attribution(entry: &serde_json::Value) -> QueueAttribution {
+    if let Some(author) = entry
+        .get("author")
+        .and_then(|a| a.get("principalId"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return QueueAttribution::Principal(PrincipalId(author.to_string()));
+    }
+    queue_attribution_with(entry.get("messageMetadata"), None)
+}
+
+/// [`queue_attribution_visible_to`] over a queued-message entry in wire
+/// shape ([`queue_entry_attribution`]).
+#[must_use]
+pub fn queue_visible_to(caller: &Caller, entry: &serde_json::Value) -> bool {
+    queue_attribution_visible_to(caller, &queue_entry_attribution(entry))
+}
+
+/// `metadata` key of an `agent:queue:processing` event marking the drained
+/// entry as an [`QueueAttribution::UnknownHuman`] (`true`), so the transport
+/// can redact the frame's `content` for a non-administrator wire subscriber
+/// without a principal to stamp; a principal-attributed entry is stamped
+/// under [`crate::FROM_PRINCIPAL_ID_KEY`] instead, an unattributed one
+/// carries neither.
+pub const QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY: &str = "queueAuthorUnknownHuman";
+
+/// The event `metadata` an `agent:queue:processing` publisher stamps for a
+/// drained entry with `attribution` (see [`QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY`]);
+/// `None` for an unattributed entry.
+#[must_use]
+pub fn queue_processing_event_metadata(
+    attribution: &QueueAttribution,
+) -> Option<serde_json::Value> {
+    match attribution {
+        QueueAttribution::Principal(author) => {
+            Some(serde_json::json!({ crate::FROM_PRINCIPAL_ID_KEY: author.0 }))
+        }
+        QueueAttribution::UnknownHuman => {
+            Some(serde_json::json!({ QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY: true }))
+        }
+        QueueAttribution::Unattributed => None,
+    }
+}
+
+/// Inverse of [`queue_processing_event_metadata`]: the drained entry's
+/// attribution read back from an `agent:queue:processing` event's `metadata`.
+#[must_use]
+pub fn queue_processing_event_attribution(
+    metadata: Option<&serde_json::Value>,
+) -> QueueAttribution {
+    if let Some(author) = crate::lift_from_principal_id(metadata) {
+        return QueueAttribution::Principal(author);
+    }
+    if metadata
+        .and_then(|m| m.get(QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return QueueAttribution::UnknownHuman;
+    }
+    QueueAttribution::Unattributed
+}
+
+/// Shared queue projection. Workspace admission is checked before this egress;
+/// authorship is enforced separately by each mutation.
+#[must_use]
+pub fn project_queue_for_caller(
+    _caller: Option<&Caller>,
+    queue: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    queue
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FROM_PRINCIPAL_ID_KEY;
+    use serde_json::{json, Value};
 
     fn wire(admin: bool) -> Caller {
         Caller::Wire {
             principal_id: PrincipalId("p-1".into()),
-            is_administrator: admin,
+            host_role: if admin {
+                crate::HostRole::Owner
+            } else {
+                crate::HostRole::Guest
+            },
         }
+    }
+
+    fn entry(id: &str, position: u64, author: &Value) -> Value {
+        json!({ "id": id, "content": id, "position": position, "author": author })
+    }
+
+    fn agent_metadata() -> Value {
+        json!({ "type": "agent_message", "fromAgentId": "agent-1" })
+    }
+
+    fn mixed_queue() -> Vec<Value> {
+        let mut agent = entry("agent", 2, &Value::Null);
+        agent["messageMetadata"] = agent_metadata();
+        let mut system = json!({ "id": "system", "content": "no author key", "position": 3 });
+        system["messageMetadata"] = json!({ "source": "system" });
+        vec![
+            entry("own", 0, &json!({ "principalId": "p-1", "login": "me" })),
+            entry(
+                "foreign",
+                1,
+                &json!({ "principalId": "p-2", "login": "other" }),
+            ),
+            agent,
+            system,
+            entry("unknown-human", 4, &Value::Null),
+        ]
+    }
+
+    fn ids(queue: &[Value]) -> Vec<&str> {
+        queue.iter().map(|e| e["id"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn guest_sees_shared_queue_including_foreign_and_unknown_humans() {
+        let guest = wire(false);
+        let queue = mixed_queue();
+        assert!(queue_visible_to(&guest, &queue[0]), "own entry");
+        assert!(queue_visible_to(&guest, &queue[1]), "foreign entry");
+        assert!(
+            queue_visible_to(&guest, &queue[2]),
+            "agent-sent, null author"
+        );
+        assert!(
+            queue_visible_to(&guest, &queue[3]),
+            "system, absent author key"
+        );
+        assert!(
+            queue_visible_to(&guest, &queue[4]),
+            "unstamped human entry the resolver could not attribute"
+        );
+
+        let projected = project_queue_for_caller(Some(&guest), queue);
+        assert_eq!(
+            ids(&projected),
+            ["own", "foreign", "agent", "system", "unknown-human"]
+        );
+        let positions: Vec<u64> = projected
+            .iter()
+            .map(|e| e["position"].as_u64().unwrap())
+            .collect();
+        assert_eq!(positions, [0, 1, 2, 3, 4], "positions are not renumbered");
+    }
+
+    #[test]
+    fn administrator_agent_daemon_and_unbound_callers_see_everything() {
+        let admin = wire(true);
+        let agent = Caller::Agent {
+            agent_id: AgentId("a-1".into()),
+        };
+        for e in mixed_queue() {
+            assert!(queue_visible_to(&admin, &e), "admin: {e}");
+            assert!(queue_visible_to(&agent, &e), "agent: {e}");
+            assert!(queue_visible_to(&Caller::Daemon, &e), "daemon: {e}");
+        }
+        for caller in [Some(&admin), Some(&agent), Some(&Caller::Daemon), None] {
+            assert_eq!(
+                project_queue_for_caller(caller, mixed_queue()),
+                mixed_queue(),
+                "{caller:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attribution_resolves_in_three_tiers() {
+        let p1 = PrincipalId("p-1".into());
+        let p2 = PrincipalId("p-2".into());
+        let stamped = json!({ FROM_PRINCIPAL_ID_KEY: "p-2" });
+        assert_eq!(
+            queue_attribution_with(Some(&stamped), Some(&p1)),
+            QueueAttribution::Principal(p2.clone()),
+            "the stamp wins over the fallback"
+        );
+        assert_eq!(
+            queue_attribution_with(None, Some(&p1)),
+            QueueAttribution::Principal(p1),
+            "unstamped human falls back to the workspace author"
+        );
+        assert_eq!(
+            queue_attribution_with(None, None),
+            QueueAttribution::UnknownHuman,
+            "unstamped human with no resolvable fallback fails closed"
+        );
+        let answers = json!({ "type": "question_answers" });
+        assert_eq!(
+            queue_attribution_with(Some(&answers), None),
+            QueueAttribution::UnknownHuman,
+            "the wizard answer tag is user-authored"
+        );
+        for md in [
+            agent_metadata(),
+            json!({ "source": "system" }),
+            json!({ "type": "event_notification" }),
+        ] {
+            assert_eq!(
+                queue_attribution_with(Some(&md), None),
+                QueueAttribution::Unattributed,
+                "{md}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_visibility_includes_unknown_humans() {
+        let guest = wire(false);
+        let own = QueueAttribution::Principal(PrincipalId("p-1".into()));
+        let foreign = QueueAttribution::Principal(PrincipalId("p-2".into()));
+        assert!(queue_attribution_visible_to(&guest, &own), "own");
+        assert!(queue_attribution_visible_to(&guest, &foreign), "foreign");
+        assert!(
+            queue_attribution_visible_to(&guest, &QueueAttribution::UnknownHuman),
+            "unknown human"
+        );
+        assert!(
+            queue_attribution_visible_to(&guest, &QueueAttribution::Unattributed),
+            "unattributed"
+        );
+        for caller in [
+            wire(true),
+            Caller::Agent {
+                agent_id: AgentId("a-1".into()),
+            },
+            Caller::Daemon,
+        ] {
+            assert!(
+                queue_attribution_visible_to(&caller, &foreign),
+                "{caller:?}"
+            );
+            assert!(
+                queue_attribution_visible_to(&caller, &QueueAttribution::UnknownHuman),
+                "{caller:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_author_falls_back_to_the_entry_metadata() {
+        let guest = wire(false);
+        for e in [
+            json!({ "id": "s", "author": "p-2" }),
+            json!({ "id": "n", "author": { "principalId": 7 } }),
+            json!({ "id": "e", "author": {} }),
+            json!({ "id": "b", "author": { "principalId": "" } }),
+        ] {
+            assert!(queue_visible_to(&guest, &e), "human origin, no stamp: {e}");
+        }
+        assert!(
+            queue_visible_to(
+                &guest,
+                &json!({ "id": "a", "author": {}, "messageMetadata": agent_metadata() })
+            ),
+            "agent-sent stays public whatever `author` reads"
+        );
+        assert!(
+            queue_visible_to(
+                &guest,
+                &json!({ "id": "m", "author": Value::Null,
+                    "messageMetadata": { FROM_PRINCIPAL_ID_KEY: "p-1" } })
+            ),
+            "own stamp on the entry metadata"
+        );
+        assert!(
+            queue_visible_to(
+                &guest,
+                &json!({ "id": "f", "author": Value::Null,
+                    "messageMetadata": { FROM_PRINCIPAL_ID_KEY: "p-2" } })
+            ),
+            "foreign stamp on the entry metadata"
+        );
+    }
+
+    #[test]
+    fn processing_event_metadata_round_trips_the_attribution() {
+        for attribution in [
+            QueueAttribution::Principal(PrincipalId("p-2".into())),
+            QueueAttribution::UnknownHuman,
+            QueueAttribution::Unattributed,
+        ] {
+            let metadata = queue_processing_event_metadata(&attribution);
+            assert_eq!(
+                queue_processing_event_attribution(metadata.as_ref()),
+                attribution,
+                "{metadata:?}"
+            );
+        }
+        assert_eq!(
+            queue_processing_event_metadata(&QueueAttribution::Unattributed),
+            None
+        );
+        assert_eq!(
+            queue_processing_event_attribution(Some(
+                &json!({ QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY: "yes" })
+            )),
+            QueueAttribution::Unattributed,
+            "only a literal `true` marks an unknown human"
+        );
     }
 
     #[tokio::test]
@@ -148,6 +684,163 @@ mod tests {
     async fn spawn_daemon_binds_the_daemon_caller() {
         let seen = spawn_daemon(async { current_caller() }).await.unwrap();
         assert_eq!(seen, Some(Caller::Daemon));
+        assert_eq!(current_caller(), None);
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_preserves_identity_and_absence() {
+        for caller in [
+            wire(true),
+            wire(false),
+            Caller::Agent {
+                agent_id: AgentId("worker".into()),
+            },
+            Caller::Daemon,
+        ] {
+            // Return the handle as data; join it only after the parent scope ends.
+            let (task,) = with_caller(caller.clone(), async {
+                (spawn_with_current_caller(async {
+                    tokio::task::yield_now().await;
+                    (current_caller(), current_wire_credential().is_none())
+                }),)
+            })
+            .await;
+            let observed = with_caller(Caller::Daemon, task).await.unwrap();
+            assert_eq!(observed, (Some(caller), true));
+            assert_eq!(current_caller(), None);
+        }
+        let task = spawn_with_current_caller(async {
+            (current_caller(), current_wire_credential().is_none())
+        });
+        assert_eq!(
+            with_caller(Caller::Daemon, task).await.unwrap(),
+            (None, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_preserves_wire_credential() {
+        let credential = WireCredential::Principal {
+            principal_id: PrincipalId("p-1".into()),
+            token_hash: "fixture-hash".into(),
+        };
+        let (task,) = with_wire_credential(
+            Some(credential),
+            with_caller(wire(false), async {
+                (spawn_with_current_caller(async {
+                    tokio::task::yield_now().await;
+                    (current_caller(), current_wire_credential())
+                }),)
+            }),
+        )
+        .await;
+        let (caller, credential) = task.await.unwrap();
+        assert_eq!(caller, Some(wire(false)));
+        let Some(WireCredential::Principal {
+            principal_id,
+            token_hash,
+        }) = credential
+        else {
+            panic!("request credential must survive the task boundary");
+        };
+        assert_eq!(principal_id, PrincipalId("p-1".into()));
+        assert_eq!(token_hash, "fixture-hash");
+        assert!(current_wire_credential().is_none());
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_credential_alone_never_creates_a_caller() {
+        let credential = WireCredential::Principal {
+            principal_id: PrincipalId("p-1".into()),
+            token_hash: "fixture-hash".into(),
+        };
+        let (task,) = with_wire_credential(Some(credential), async {
+            (spawn_with_current_caller(async {
+                (
+                    current_caller(),
+                    current_wire_credential().map(|c| c.principal_id().clone()),
+                )
+            }),)
+        })
+        .await;
+        assert_eq!(task.await.unwrap(), (None, Some(PrincipalId("p-1".into()))));
+        assert!(current_caller().is_none());
+        assert!(current_wire_credential().is_none());
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_keeps_legacy_authority_revocable() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        struct Authority(AtomicBool);
+        impl LegacyCredentialAuthority for Authority {
+            fn authorize(&self) -> crate::BoxFuture<'_, crate::Result<CredentialLease>> {
+                Box::pin(async {
+                    if self.0.load(Ordering::SeqCst) {
+                        Ok(Box::new(()) as CredentialLease)
+                    } else {
+                        Err(crate::Error::Forbidden("fixture credential revoked".into()))
+                    }
+                })
+            }
+        }
+        let authority = Arc::new(Authority(AtomicBool::new(true)));
+        assert!(authority.authorize().await.is_ok());
+        let expected: Arc<dyn LegacyCredentialAuthority> = authority.clone();
+        let credential = WireCredential::Legacy {
+            principal_id: PrincipalId("p-1".into()),
+            authority: expected.clone(),
+        };
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (task,) = with_wire_credential(
+            Some(credential),
+            with_caller(wire(false), async {
+                (spawn_with_current_caller(async move {
+                    released.await.unwrap();
+                    let Some(WireCredential::Legacy {
+                        principal_id,
+                        authority,
+                    }) = current_wire_credential()
+                    else {
+                        panic!("legacy authority must survive the task boundary");
+                    };
+                    assert_eq!(principal_id, PrincipalId("p-1".into()));
+                    assert!(Arc::ptr_eq(&authority, &expected));
+                    let result = authority.authorize().await;
+                    (
+                        current_caller(),
+                        matches!(result, Err(crate::Error::Forbidden(_))),
+                    )
+                }),)
+            }),
+        )
+        .await;
+        authority.0.store(false, Ordering::SeqCst);
+        release.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), (Some(wire(false)), true));
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_detached_owner_finishes_without_elevation() {
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        let (owner,) = with_caller(wire(false), async {
+            (spawn_with_current_caller(async move {
+                released.await.unwrap();
+                finished.send(current_caller()).unwrap();
+            }),)
+        })
+        .await;
+        drop(owner);
+        release.send(()).unwrap();
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(1), completion)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed, Some(wire(false)));
         assert_eq!(current_caller(), None);
     }
 

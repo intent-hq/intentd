@@ -14,7 +14,8 @@ use std::time::Duration;
 use intent_core::{
     AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, GitAgentCommitResult, NoteId,
     Result, SaveAssetResult, ScriptCreateParams, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus, WorkspaceUpdate, CHIEF_WORKSPACE_ID,
+    WorkspaceAttention, WorkspaceId, WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus,
+    WorkspaceUpdate, CHIEF_WORKSPACE_ID,
 };
 use serde_json::{json, Value};
 
@@ -30,6 +31,7 @@ type AgentCommitCall = (String, Option<String>, bool, Option<String>);
 struct FakeApi {
     agent_commit_calls: Mutex<Vec<AgentCommitCall>>,
     script_list_calls: Mutex<u32>,
+    script_monitor_calls: Mutex<Vec<Value>>,
     script_create_calls: Mutex<Vec<ScriptCreateParams>>,
     script_start_calls: Mutex<Vec<String>>,
     script_output_calls: Mutex<Vec<(String, Option<i64>)>>,
@@ -62,6 +64,9 @@ struct FakeApi {
     /// Recorded `git_root_unregister` calls: path.
     git_root_unregister_calls: Mutex<Vec<String>>,
     git_root_list_calls: Mutex<u32>,
+    /// `workspace_setup_status` override; `None` leaves the trait default
+    /// (`unknown`) in place.
+    setup_status: Mutex<Option<WorkspaceSetupStatus>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -92,6 +97,7 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
         last_activity: None,
+        last_content_activity: None,
         tags: vec!["red".to_string()],
         path: None,
         repository_path: None,
@@ -141,6 +147,14 @@ impl WorkspaceApi for FakeApi {
             };
             Ok(json!({ "path": path, "value": value }))
         })
+    }
+
+    fn workspace_setup_status(&self, _id: &WorkspaceId) -> WorkspaceSetupStatus {
+        self.setup_status
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(WorkspaceSetupStatus::unknown)
     }
 
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
@@ -342,7 +356,11 @@ impl WorkspaceApi for FakeApi {
         // reshaping it to the reference bare-array contract before it
         // reaches JS callers — returning the wrapped shape here keeps the
         // test exercising that reshape.
-        Box::pin(async { Ok(json!({ "scripts": [{ "id": "s-1", "name": "dev" }] })) })
+        Box::pin(async {
+            Ok(
+                json!({ "scripts": [{ "id": "s-1", "name": "dev" }, {"id":"archived", "archivedAt":"2026-09-30T00:00:00Z"}] }),
+            )
+        })
     }
 
     fn script_create(
@@ -355,6 +373,38 @@ impl WorkspaceApi for FakeApi {
             .unwrap()
             .push(params.clone());
         Box::pin(async move { Ok(json!({ "id": "s-1" })) })
+    }
+
+    fn script_monitor(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        options: Value,
+    ) -> BoxFuture<'_, Result<Value>> {
+        self.script_monitor_calls.lock().unwrap().push(json!({"workspaceId":workspace_id,"agentId":agent_id,"scriptId":script_id,"options":options}));
+        Box::pin(async { Ok(json!({"ok":true,"monitor":{"monitorId":"m1"}})) })
+    }
+    fn script_monitor_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        self.script_monitor_calls
+            .lock()
+            .unwrap()
+            .push(json!({"workspaceId":workspace_id,"agentId":agent_id}));
+        Box::pin(async { Ok(json!({"monitors":[{"monitorId":"m1"}]})) })
+    }
+    fn script_monitor_cancel(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+        stop_run: bool,
+    ) -> BoxFuture<'_, Result<Value>> {
+        self.script_monitor_calls.lock().unwrap().push(json!({"workspaceId":workspace_id,"owner":owner,"monitorId":monitor_id,"stopRun":stop_run}));
+        Box::pin(async { Ok(json!({"ok":true,"monitor":{"monitorId":"m1","state":"cancelled"}})) })
     }
 
     fn script_start(&self, _id: WorkspaceId, script_id: String) -> BoxFuture<'_, Result<Value>> {
@@ -421,6 +471,7 @@ impl WorkspaceApi for FakeApi {
         _id: WorkspaceId,
         path: String,
         _caller_agent_id: Option<AgentId>,
+        _git_root_id: Option<intent_core::WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<Value>> {
         self.file_read_calls.lock().unwrap().push(path.clone());
         Box::pin(async move {
@@ -550,6 +601,8 @@ async fn workspace_details_returns_reference_shape() {
     assert_eq!(v["branch"], json!("main"));
     assert_eq!(v["repositoryName"], json!("intentd"));
     assert_eq!(v["tags"], json!(["red"]));
+    // No setup record (the trait default): `unknown`, optional fields omitted.
+    assert_eq!(v["setupStatus"], json!({ "state": "unknown" }));
 }
 
 #[tokio::test]
@@ -561,6 +614,54 @@ async fn workspace_details_not_found_returns_defaults() {
     let v = body(&resp);
     assert_eq!(v["hasTitle"], json!(false));
     assert_eq!(v["title"], json!("(untitled)"));
+    assert_eq!(v["setupStatus"], json!({ "state": "unknown" }));
+}
+
+/// `details().setupStatus` surfaces the daemon-owned setup state verbatim:
+/// a `running` record carries `terminalId` / `startedAt` and omits the
+/// terminal-only fields; a `failed` record carries the exit code and
+/// `finishedAt`. No field is ever emitted as `null`.
+#[tokio::test]
+async fn workspace_details_surfaces_setup_status() {
+    let (srv, api) = server();
+    let mut running = WorkspaceSetupStatus::new(WorkspaceSetupState::Running);
+    running.terminal_id = Some("term-7".to_string());
+    running.started_at = Some("2026-01-01T00:00:00Z".to_string());
+    *api.setup_status.lock().unwrap() = Some(running);
+    let resp = call(&srv, "return await ws.workspace.details();").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let v = body(&resp);
+    assert_eq!(
+        v["setupStatus"],
+        json!({
+            "state": "running",
+            "terminalId": "term-7",
+            "startedAt": "2026-01-01T00:00:00Z",
+        })
+    );
+
+    let mut failed = WorkspaceSetupStatus::new(WorkspaceSetupState::Failed);
+    failed.exit_code = Some(3);
+    failed.terminal_id = Some("term-7".to_string());
+    failed.started_at = Some("2026-01-01T00:00:00Z".to_string());
+    failed.finished_at = Some("2026-01-01T00:00:05Z".to_string());
+    *api.setup_status.lock().unwrap() = Some(failed);
+    let resp = call(&srv, "return await ws.workspace.details();").await;
+    let v = body(&resp);
+    assert_eq!(v["setupStatus"]["state"], json!("failed"));
+    assert_eq!(v["setupStatus"]["exitCode"], json!(3));
+    assert_eq!(
+        v["setupStatus"]["finishedAt"],
+        json!("2026-01-01T00:00:05Z")
+    );
+
+    // The field also rides the not-found fallback shape.
+    *api.setup_status.lock().unwrap() =
+        Some(WorkspaceSetupStatus::new(WorkspaceSetupState::Pending));
+    *api.workspace_variant.lock().unwrap() = WorkspaceVariant::NotFound;
+    let resp = call(&srv, "return await ws.workspace.details();").await;
+    let v = body(&resp);
+    assert_eq!(v["setupStatus"], json!({ "state": "pending" }));
 }
 
 #[tokio::test]
@@ -802,6 +903,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         waiting_for_agent_ids: vec![],
         waiting_on_hooks: vec![],
         waiting_on_pr_monitors: vec![],
+        waiting_on_script_monitors: vec![],
         turn_in_flight: false,
         last_stream_activity_at: None,
         context_usage: None,
@@ -845,6 +947,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
             last_seen_message_id: None,
             is_initial_agent: None,
             sponsor_agent_id: None,
+            chief_prompt_version: None,
         },
     }
 }
@@ -919,7 +1022,7 @@ async fn workspace_archive_refuses_in_chief_workspace() {
     let (srv, api) = chief_server();
     let resp = call(&srv, "return await ws.workspace.archive();").await;
     assert_eq!(resp["result"]["isError"], json!(true));
-    assert!(text(&resp).contains("chief-of-staff"));
+    assert!(text(&resp).contains("Assistant"));
     assert!(api.archive_calls.lock().unwrap().is_empty());
 }
 
@@ -928,7 +1031,7 @@ async fn workspace_unarchive_refuses_in_chief_workspace() {
     let (srv, api) = chief_server();
     let resp = call(&srv, "return await ws.workspace.unarchive();").await;
     assert_eq!(resp["result"]["isError"], json!(true));
-    assert!(text(&resp).contains("chief-of-staff"));
+    assert!(text(&resp).contains("Assistant"));
     assert!(api.unarchive_calls.lock().unwrap().is_empty());
 }
 
@@ -939,7 +1042,7 @@ async fn workspace_set_status_image_refuses_in_chief_workspace() {
         "return await ws.workspace.setStatusImage({ data: 'aGVsbG8=', mimeType: 'image/png' });";
     let resp = call(&srv, code).await;
     assert_eq!(resp["result"]["isError"], json!(true));
-    assert!(text(&resp).contains("chief-of-staff"));
+    assert!(text(&resp).contains("Assistant"));
     assert!(api.save_asset_calls.lock().unwrap().is_empty());
     assert!(api.update_calls.lock().unwrap().is_empty());
 }
@@ -1215,7 +1318,7 @@ async fn script_run_accepts_timeout_alias() {
 async fn script_run_rejects_timeout_above_eval_budget_before_spawning() {
     // A wait longer than the eval budget would be aborted by the transport
     // while the process kept running (monorepo#4703): refuse it up front,
-    // naming the ceiling and the start + hook + status pattern.
+    // naming the ceiling and the start + monitor + output pattern.
     let (srv, api) = server();
     let resp = call(
         &srv,
@@ -1227,8 +1330,9 @@ async fn script_run_rejects_timeout_above_eval_budget_before_spawning() {
     assert!(t.contains("timeoutSeconds 600 exceeds"), "unexpected: {t}");
     assert!(t.contains("ceiling 25s, budget 30s"), "unexpected: {t}");
     assert!(t.contains("ws.script.start"), "unexpected: {t}");
-    assert!(t.contains("ws.hook.schedule"), "unexpected: {t}");
-    assert!(t.contains("ws.script.status"), "unexpected: {t}");
+    assert!(t.contains("ws.script.monitor"), "unexpected: {t}");
+    assert!(t.contains("required ttlMs"), "unexpected: {t}");
+    assert!(t.contains("ws.script.output"), "unexpected: {t}");
     assert!(
         api.script_run_calls.lock().unwrap().is_empty(),
         "no process may be started for a rejected timeout"
@@ -1432,5 +1536,133 @@ async fn file_rename_forwards_pair() {
     assert_eq!(
         api.file_rename_calls.lock().unwrap()[0],
         ("a.txt".to_string(), "b.txt".to_string())
+    );
+}
+
+#[tokio::test]
+async fn script_list_archive_filters_are_explicit_and_strict() {
+    let (srv, _) = server();
+    for (options, expected) in [
+        ("{}", 1),
+        ("{archive:'all'}", 2),
+        ("{archive:'archived'}", 1),
+    ] {
+        let resp = call(&srv, &format!("return await ws.script.list({options});")).await;
+        assert_eq!(resp["result"]["isError"], false);
+        assert_eq!(body(&resp).as_array().unwrap().len(), expected);
+    }
+    for options in ["{archive:null}", "{archive:'unknown'}"] {
+        let resp = call(&srv, &format!("return await ws.script.list({options});")).await;
+        assert_eq!(resp["result"]["isError"], true);
+    }
+}
+
+#[tokio::test]
+async fn script_create_purpose_is_forwarded_and_null_refused() {
+    let (srv, api) = server();
+    let resp = call(
+        &srv,
+        "return await ws.script.create('check','true','command',{purpose:'oneOff'});",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], false);
+    assert_eq!(
+        api.script_create_calls.lock().unwrap()[0].purpose,
+        Some(intent_core::ScriptPurpose::OneOff)
+    );
+    let resp = call(
+        &srv,
+        "return await ws.script.create('check','true','command',{purpose:null});",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], true);
+    assert_eq!(api.script_create_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn script_create_keeps_omission_distinct_from_explicit_purpose() {
+    let (srv, api) = server();
+    for (code, purpose, script_id) in [
+        (
+            "return await ws.script.create('check','true','command');",
+            None,
+            None,
+        ),
+        (
+            "return await ws.script.create('check','true','command',{purpose:'saved'});",
+            Some(intent_core::ScriptPurpose::Saved),
+            None,
+        ),
+        (
+            "return await ws.script.create('dev','cat','service');",
+            None,
+            None,
+        ),
+        (
+            "return await ws.script.create('check','true','command',{scriptId:'existing'});",
+            None,
+            Some("existing"),
+        ),
+    ] {
+        let resp = call(&srv, code).await;
+        assert_eq!(resp["result"]["isError"], false, "{resp}");
+        let calls = api.script_create_calls.lock().unwrap();
+        let params = calls.last().unwrap();
+        assert_eq!(params.purpose, purpose);
+        assert_eq!(params.script_id.as_deref(), script_id);
+    }
+}
+
+#[tokio::test]
+async fn script_monitor_helpers_bind_authenticated_owner_and_workspace() {
+    let (srv, api) = server_with_caller("agent-self");
+    let response=call(&srv,"return await ws.script.monitor('s1',{ttlMs:60000,runId:'r1',outputPattern:'^ready$',lineCount:2,agentId:'spoof',workspaceId:'foreign'});").await;
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let list = call(&srv, "return await ws.script.monitors();").await;
+    assert_eq!(body(&list), json!([{"monitorId":"m1"}]));
+    assert_eq!(
+        call(&srv, "return await ws.script.unmonitor('m1');").await["result"]["isError"],
+        false
+    );
+    let calls = api.script_monitor_calls.lock().unwrap();
+    assert_eq!(calls[0]["agentId"], "agent-self");
+    assert_eq!(calls[0]["workspaceId"], "ws-1");
+    assert_eq!(calls[0]["options"]["outputPattern"], "^ready$");
+    assert_eq!(calls[0]["options"]["lineCount"], 2);
+    assert_eq!(
+        calls[1],
+        json!({"workspaceId":"ws-1","agentId":"agent-self"})
+    );
+    assert_eq!(
+        calls[2],
+        json!({"workspaceId":"ws-1","owner":"agent-self","monitorId":"m1","stopRun":false})
+    );
+}
+
+#[tokio::test]
+async fn script_monitor_helpers_refuse_anonymous_and_do_not_escape_chief_scope() {
+    let (srv, api) = server();
+    for code in [
+        "return await ws.script.monitor('s1',{ttlMs:1});",
+        "return await ws.script.monitors();",
+        "return await ws.script.unmonitor('m1');",
+    ] {
+        assert_eq!(call(&srv, code).await["result"]["isError"], true);
+    }
+    assert!(api.script_monitor_calls.lock().unwrap().is_empty());
+    let api = Arc::new(FakeApi::default());
+    let chief = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from(CHIEF_WORKSPACE_ID))
+        .with_caller_agent_id(Some(AgentId::from("agent-chief")));
+    assert_eq!(
+        call(
+            &chief,
+            "return await ws.script.monitor('s1',{ttlMs:1,workspaceId:'foreign'});"
+        )
+        .await["result"]["isError"],
+        false
+    );
+    assert_eq!(
+        api.script_monitor_calls.lock().unwrap()[0]["workspaceId"],
+        CHIEF_WORKSPACE_ID
     );
 }

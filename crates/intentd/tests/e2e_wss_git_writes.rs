@@ -64,7 +64,10 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         common::enable_ws_api(data_dir);
     }
     let mut cmd = common::serve_command();
+    common::hermetic_github_identity(&mut cmd, data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
+        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -906,6 +909,121 @@ async fn git_hunk_and_lockfile_ops_round_trip_over_wss() {
     assert!(!lock.exists(), "index.lock deleted from linked gitdir");
 
     drop(daemon);
+}
+
+/// A linked primary worktree can finish a genuine ancestry-only merge through
+/// the public staged-only helper (intent-hq/intent#6044).
+#[tokio::test]
+async fn git_agent_commit_ancestry_only_over_wss() {
+    assert!(gate(), "git is required for the ancestry-only regression");
+    let root_guard = scratch_dir("root-ancestry");
+    let (daemon, port, cfg) = boot(root_guard.path()).await;
+    let repo = make_source_repo(&daemon.scratch);
+    let mut ws = connect_ws(port, cfg).await;
+    let (ws_id, wt) = create_workspace(&mut ws, &repo, "Git ancestry merge").await;
+
+    let branch = run_git(&["branch", "--show-current"], &wt);
+    let seed = run_git(&["rev-parse", "HEAD"], &wt);
+    run_git(&["checkout", "-q", "-b", "incoming"], &wt);
+    std::fs::write(wt.join("tracked.txt"), "same change\n").unwrap();
+    run_git(&["add", "tracked.txt"], &wt);
+    run_git(&["commit", "-q", "-m", "incoming change"], &wt);
+    let incoming = run_git(&["rev-parse", "HEAD"], &wt);
+    run_git(&["checkout", "-q", &branch], &wt);
+    std::fs::write(wt.join("tracked.txt"), "same change\n").unwrap();
+    run_git(&["add", "tracked.txt"], &wt);
+    run_git(&["commit", "-q", "-m", "our change"], &wt);
+    let ours = run_git(&["rev-parse", "HEAD"], &wt);
+    let tree = run_git(&["rev-parse", "HEAD^{tree}"], &wt);
+    assert_ne!(ours, incoming);
+    assert_eq!(run_git(&["merge-base", "HEAD", "incoming"], &wt), seed);
+    run_git(&["merge", "--no-ff", "--no-commit", "incoming"], &wt);
+    assert_eq!(run_git(&["rev-parse", "MERGE_HEAD"], &wt), incoming);
+    assert_eq!(run_git(&["write-tree"], &wt), tree);
+    assert!(run_git(&["diff", "--cached", "--name-only"], &wt).is_empty());
+    std::fs::write(wt.join("unstaged.txt"), "not part of the merge\n").unwrap();
+
+    let resp = wss_rpc(
+        &mut ws,
+        3,
+        "workspace.setAutoCommit",
+        json!({ "workspaceId": ws_id, "enabled": false }),
+    )
+    .await;
+    assert_eq!(resp["result"]["autoCommit"]["enabled"], false, "{resp}");
+    for (id, extra, expected) in [
+        (4, json!({}), "Auto-commit is disabled"),
+        (
+            5,
+            json!({ "files": ["tracked.txt"], "userRequested": true }),
+            "cannot do a partial commit during a merge",
+        ),
+    ] {
+        let mut params = json!({ "workspaceId": ws_id, "message": "refused merge" });
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let resp = wss_rpc(&mut ws, id, "git.agentCommit", params).await;
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], id);
+        assert!(resp.get("result").is_none(), "{resp}");
+        assert_eq!(resp["error"]["code"], -32603, "{resp}");
+        assert!(
+            resp["error"]["data"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(expected),
+            "{resp}"
+        );
+        assert_eq!(run_git(&["rev-parse", "HEAD"], &wt), ours);
+        assert_eq!(run_git(&["rev-parse", "MERGE_HEAD"], &wt), incoming);
+        assert_eq!(run_git(&["write-tree"], &wt), tree);
+    }
+
+    let params = json!({
+        "workspaceId": ws_id,
+        "message": "fix: record shared ancestry",
+        "userRequested": true,
+    });
+    let resp = wss_rpc(&mut ws, 6, "git.agentCommit", params.clone()).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 6);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["ok"], true, "{resp}");
+    assert_eq!(resp["result"]["files"], json!([]));
+    assert_eq!(resp["result"]["fileCount"], 0);
+    let hash = resp["result"]["hash"].as_str().expect("commit hash");
+    assert_eq!(run_git(&["rev-parse", "HEAD"], &wt), hash);
+    assert_eq!(
+        run_git(&["show", "-s", "--format=%P", "HEAD"], &wt),
+        format!("{ours} {incoming}")
+    );
+    assert_eq!(run_git(&["rev-parse", "HEAD^{tree}"], &wt), tree);
+    assert_eq!(
+        run_git(&["show", "-s", "--format=%an <%ae>", "HEAD"], &wt),
+        "e2e <e2e@example.com>"
+    );
+    let git_dir = PathBuf::from(run_git(&["rev-parse", "--absolute-git-dir"], &wt));
+    assert!(!git_dir.join("MERGE_HEAD").exists());
+    assert_eq!(
+        std::fs::read_to_string(wt.join("unstaged.txt")).unwrap(),
+        "not part of the merge\n"
+    );
+    assert_eq!(run_git(&["ls-tree", "HEAD", "unstaged.txt"], &wt), "");
+
+    // Once the merge is complete, an identical request is an ordinary empty
+    // commit and must still be refused, without moving HEAD.
+    let resp = wss_rpc(&mut ws, 7, "git.agentCommit", params).await;
+    assert_eq!(resp["error"]["code"], -32603, "{resp}");
+    assert!(
+        resp["error"]["data"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("No staged changes found to commit"),
+        "{resp}"
+    );
+    assert_eq!(run_git(&["rev-parse", "HEAD"], &wt), hash);
 }
 
 /// WSS counterpart of the UDS submodule-gitlink guard (monorepo#1714 follow-up):

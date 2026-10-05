@@ -1679,17 +1679,19 @@ fn send_narrowed(
 }
 
 /// Whether an event should be forwarded for a tier-style watch: any of its
-/// paths falls under one of `tier_roots` and either matches `filename_matches`
-/// or is directory-level. Mirrors [`super::root_watch`]'s per-root filter, which
-/// the skills/specialists project tiers used before they rode the shared
-/// stream, so tier-directory deletions (`rm -rf`) still surface.
+/// paths falls under a tier or names an ancestor inside the workspace, and
+/// either matches `filename_matches` or is directory-level.
 fn tier_event_matches(
     event: &notify::Event,
+    workspace_root: &Path,
     tier_roots: &[PathBuf],
     filename_matches: fn(&Path) -> bool,
 ) -> bool {
     event.paths.iter().any(|p| {
-        tier_roots.iter().any(|root| p.starts_with(root))
+        p.starts_with(workspace_root)
+            && tier_roots
+                .iter()
+                .any(|root| p.starts_with(root) || root.starts_with(p))
             && (filename_matches(p) || super::root_watch::directory_level(p))
     })
 }
@@ -1753,7 +1755,7 @@ pub(super) fn watch_tiers(
         wait_settled(&registration, ESTABLISH_TIMEOUT).await;
         on_change();
         while let Some(event) = rx.recv().await {
-            if tier_event_matches(&event, &tier_roots, filename_matches) {
+            if tier_event_matches(&event, &canonical, &tier_roots, filename_matches) {
                 on_change();
             }
         }
@@ -1769,6 +1771,34 @@ mod tests {
     use crate::events::LIVENESS;
     #[cfg(target_os = "linux")]
     use crate::events::{inode_of, inotify_watched_inodes};
+
+    #[test]
+    fn tier_ancestor_events_stay_within_the_workspace() {
+        let dir = crate::test_support::test_tempdir("tier-ancestor-events");
+        let workspace = dir.path().join("workspace");
+        let claude = workspace.join(".claude");
+        let tier = claude.join("agents");
+        std::fs::create_dir_all(&tier).unwrap();
+        let unrelated_file = tier.join("notes.txt");
+        std::fs::write(&unrelated_file, "unrelated").unwrap();
+        let matches = |path: &Path| {
+            tier_event_matches(
+                &notify::Event::new(notify::EventKind::Any).add_path(path.to_path_buf()),
+                &workspace,
+                std::slice::from_ref(&tier),
+                |path| path.extension().is_some_and(|extension| extension == "md"),
+            )
+        };
+        assert!(matches(&claude));
+        assert!(matches(&workspace));
+        assert!(matches(&tier.join("reviewer.md")));
+        assert!(!matches(&unrelated_file));
+        assert!(!matches(&workspace.join(".claudette")));
+        assert!(!matches(&dir.path().join("other/.claude/agents")));
+        assert!(!matches(dir.path()));
+        std::fs::remove_dir_all(&claude).unwrap();
+        assert!(matches(&claude), "deleted ancestors must reach the tier");
+    }
 
     /// Self-cleaning temp directory.
     struct TempDir {

@@ -305,6 +305,193 @@ where
     }
 }
 
+async fn chief_collection_push<S>(ws: &mut WebSocketStream<S>) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    timeout(Duration::from_secs(15), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).unwrap();
+                    if v["method"] == "subscription.push" {
+                        return v["params"].clone();
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    ws.send(Message::Pong(p)).await.unwrap();
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected collection push, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("collection push timed out")
+}
+
+#[tokio::test]
+async fn chief_prompt_version_wss_restart_roundtrip_and_collection_invalidation() {
+    let data = temp_data_dir();
+    let env = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let daemon = Daemon {
+        child: spawn_serve(data.path(), "both", &env),
+    };
+    let socket = data.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut events = connect_ws(port, cfg).await;
+    let sub = wss_rpc_envelope(
+        &mut events,
+        1,
+        "events.subscribe",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID, "eventTypes": ["agent:created"]
+        }),
+    )
+    .await;
+    assert!(sub["result"]["subscriptionId"].is_string());
+    let invalid = wss_rpc_envelope(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID, "provider": "mock", "model": "default",
+            "metadata": {"chiefPromptVersion": "3"}
+        }),
+    )
+    .await;
+    assert_eq!(invalid["id"], 2);
+    assert_eq!(invalid["jsonrpc"], "2.0");
+    assert_eq!(invalid["error"]["code"], -32602);
+    assert!(invalid.get("result").is_none());
+
+    let mut agents = Vec::new();
+    for metadata in [
+        json!({}),
+        json!({"chiefPromptVersion": null}),
+        json!({"chiefPromptVersion": 2}),
+        json!({"chiefPromptVersion": 3}),
+    ] {
+        let expected = metadata
+            .get("chiefPromptVersion")
+            .filter(|v| !v.is_null())
+            .cloned();
+        let created = wss_rpc_envelope(
+            &mut rpc,
+            3,
+            "agent.create",
+            json!({
+                "workspaceId": CHIEF_WORKSPACE_ID, "name": "My saved Assistant chat",
+                "provider": "mock", "model": "default", "specialistId": "chief-of-staff",
+                "metadata": metadata
+            }),
+        )
+        .await;
+        assert_eq!(created["jsonrpc"], "2.0");
+        assert_eq!(created["id"], 3);
+        assert!(created.get("error").is_none(), "{created}");
+        let row = &created["result"]["agent"];
+        assert_eq!(row["metadata"].get("chiefPromptVersion").cloned(), expected);
+        let id = row["id"].as_str().unwrap().to_string();
+        let event = wss_event(&mut events, 15).await;
+        assert_eq!(event["params"]["event"]["type"], "agent:created");
+        assert_eq!(event["params"]["event"]["data"]["agentId"], id);
+        agents.push((id, expected));
+    }
+    drop(rpc);
+    drop(events);
+    drop(daemon);
+
+    // Reopen the same database with a new daemon process and new WSS connection.
+    let _daemon = Daemon {
+        child: spawn_serve(data.path(), "both", &env),
+    };
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let listed = wss_rpc_envelope(
+        &mut rpc,
+        4,
+        "agent.list",
+        json!({"workspaceId": CHIEF_WORKSPACE_ID}),
+    )
+    .await;
+    assert_eq!(listed["id"], 4);
+    assert_eq!(listed["jsonrpc"], "2.0");
+    assert!(listed.get("error").is_none());
+    let rows = listed["result"]["agents"].as_array().unwrap();
+    assert_eq!(rows.len(), agents.len());
+    for (id, expected) in &agents {
+        let got = wss_rpc_envelope(&mut rpc, 5, "agent.get", json!({"agentId": id})).await;
+        assert_eq!(got["id"], 5);
+        assert_eq!(got["jsonrpc"], "2.0");
+        assert!(got.get("error").is_none());
+        for row in [
+            &got["result"]["agent"],
+            rows.iter().find(|r| r["id"] == *id).unwrap(),
+        ] {
+            assert_eq!(row["metadata"].get("chiefPromptVersion"), expected.as_ref());
+            assert_eq!(row["name"], "My saved Assistant chat");
+            assert_eq!(row["messageCount"], 0);
+        }
+    }
+
+    let mut collection = connect_ws(port, cfg).await;
+    let subscribed = wss_rpc_envelope(
+        &mut collection,
+        6,
+        "agent.subscribe",
+        json!({"workspaceId": CHIEF_WORKSPACE_ID}),
+    )
+    .await;
+    assert_eq!(subscribed["jsonrpc"], "2.0");
+    assert!(subscribed["result"]["subscriptionId"].is_string());
+    let snapshot = chief_collection_push(&mut collection).await;
+    assert_eq!(snapshot["kind"], "snapshot");
+    assert_eq!(snapshot["seq"], 0);
+    for (id, expected) in &agents {
+        let row = snapshot["snapshot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == *id)
+            .unwrap();
+        assert_eq!(row["metadata"].get("chiefPromptVersion"), expected.as_ref());
+    }
+    let (id, _) = agents.last().unwrap();
+    for (changes, expected) in [
+        (json!({"name": "Custom thread name"}), Some(json!(3))),
+        (json!({"systemPrompt": "Custom replacement prompt"}), None),
+    ] {
+        let updated = wss_rpc_envelope(
+            &mut rpc,
+            7,
+            "agent.update",
+            json!({"agentId": id, "changes": changes}),
+        )
+        .await;
+        assert_eq!(updated["jsonrpc"], "2.0");
+        assert_eq!(updated["id"], 7);
+        assert!(updated.get("error").is_none(), "{updated}");
+        assert_eq!(
+            updated["result"]["agent"]["metadata"].get("chiefPromptVersion"),
+            expected.as_ref()
+        );
+        let delta = chief_collection_push(&mut collection).await;
+        assert_eq!(delta["kind"], "delta");
+        let row = &delta["delta"]["updated"][0];
+        assert_eq!(row["id"], *id);
+        assert_eq!(row["metadata"].get("chiefPromptVersion"), expected.as_ref());
+        assert_eq!(row["name"], "Custom thread name");
+    }
+}
+
 /// Full Chief-workspace slice over the real WSS transport. Asserts every
 /// envelope on the wire matches the JSON-RPC contract (`id`, `jsonrpc`, no
 /// `error`, exact `result` payload) so an FE regressing against the
@@ -344,7 +531,7 @@ async fn chief_workspace_over_wss() {
     assert!(resp.get("error").is_none(), "workspace.get errored: {resp}");
     let chief = &resp["result"]["workspace"];
     assert_eq!(chief["id"], json!(CHIEF_WORKSPACE_ID));
-    assert_eq!(chief["title"], json!("Chief of Staff"));
+    assert_eq!(chief["title"], json!("Assistant"));
     assert_eq!(chief["branch"], json!(""));
     assert_eq!(chief["status"], json!("Active"));
     assert_eq!(chief["attention"], json!("none"));
@@ -1049,6 +1236,450 @@ fn tool_result_jsons(messages: &Value) -> Vec<Value> {
         .filter_map(|item| item["text"].as_str())
         .filter_map(|text| serde_json::from_str(text).ok())
         .collect()
+}
+
+/// Chief transfer proposals traverse the real MCP bridge and persist as inline
+/// resources over WSS while the source agent and dirty worktree stay untouched.
+#[tokio::test]
+async fn chief_workspace_transfer_proposal_readonly_over_wss() {
+    assert_transfer_proposal_readonly_over_wss(false).await;
+}
+
+#[tokio::test]
+async fn chief_workspace_transfer_status_only_failure_over_wss() {
+    assert_transfer_proposal_readonly_over_wss(true).await;
+}
+
+async fn assert_transfer_proposal_readonly_over_wss(omit_tool_output: bool) {
+    async fn chat_push<S>(ws: &mut WebSocketStream<S>) -> Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        if frame["method"] == "subscription.push" {
+                            return frame["params"].clone();
+                        }
+                        assert!(frame.get("error").is_none(), "{frame}");
+                    }
+                    Some(Ok(Message::Ping(p))) => ws.send(Message::Pong(p)).await.unwrap(),
+                    Some(Ok(_)) => {}
+                    other => panic!("unexpected chat frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("chat subscription timed out")
+    }
+    let Some(script) = gate("WSS transfer proposal E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path();
+    let source = data_dir.join("source-project");
+    std::fs::create_dir(&source).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&source)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "seed",
+    ]);
+    std::fs::write(source.join("work.txt"), "unfinished work\n").unwrap();
+    let head_before = git(&["rev-parse", "HEAD"]);
+    let branch_before = git(&["symbolic-ref", "--short", "HEAD"]);
+    let status_before = git(&["status", "--porcelain"]);
+    let release_file = data_dir.join("release-source");
+    let js = r"
+        const workspace = (await ws.app.workspaces.list({})).find(w => w.title === 'Transfer Source');
+        const errors = [];
+        for (const run of [
+            () => ws.app.workspaces.transfer(),
+            () => ws.app.workspaces.transfer(workspace.id, 'Laptop'),
+            () => ws.app.workspaces.transfer(workspace.id, {destination: 42}),
+            () => ws.app.workspaces.transfer('__chief__'),
+            () => ws.app.workspaces.transfer('missing-workspace')
+        ]) {
+            try { await run(); errors.push(null); } catch(e) { errors.push(e.message); }
+        }
+        const first = await ws.app.workspaces.transfer(workspace.id, {destination: '  Laptop  '});
+        const second = await ws.app.workspaces.transfer(workspace.id);
+        return { errors, firstId: first.proposal.applyToolCallId, secondId: second.proposal.applyToolCallId };
+    ";
+    let behavior = json!({
+        "response": "ok",
+        "rules": [
+            { "ifPromptContains": "HOLD_SOURCE", "releaseFile": release_file, "response": "source released" },
+            { "ifPromptContains": "TRANSFER_GATE", "toolCall": {
+                "name": "workspace_api", "arguments": {
+                    "code": "try { await ws.app.workspaces.transfer('missing'); return {denied: false}; } catch(e) { return {denied: true, error: e.message}; }",
+                    "summary": "Check transfer chief gate"
+                }
+            }, "emitToolBlocks": true },
+            { "ifPromptContains": "PROPOSE_TRANSFER", "toolCall": {
+                "name": "workspace_api", "arguments": { "code": js, "summary": "Preview transfer without changing source" }
+            }, "emitToolBlocks": true },
+            { "ifPromptContains": "PROPOSE_THROW", "toolCall": {
+                "name": "workspace_api", "arguments": {
+                    "code": "const workspace = (await ws.app.workspaces.list({})).find(w => w.title === 'Transfer Source'); await ws.app.workspaces.transfer(workspace.id, {destination: 'After exception'}); throw new Error('intentional failure after proposal');",
+                    "summary": "Keep transfer card after a later JavaScript error"
+                }
+            }, "emitToolBlocks": true, "omitToolOutput": omit_tool_output }
+        ]
+    }).to_string();
+    let child = spawn_serve(
+        data_dir,
+        "both",
+        &[
+            ("INTENTD_AUTH_TOKEN", TOKEN),
+            ("MOCK_AGENT_SCRIPT_PATH", &script),
+            ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ],
+    );
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    disable_toon_output(&socket).await;
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc_envelope(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({
+            "title": "Transfer Source", "worktreePath": source, "path": source,
+        }),
+    )
+    .await;
+    assert_eq!(created["jsonrpc"], "2.0");
+    assert_eq!(created["id"], 1);
+    let workspace_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let created_agent = wss_rpc_envelope(&mut rpc, 2, "agent.create", json!({
+        "workspaceId": workspace_id, "name": "Source worker", "model": "default", "provider": "mock"
+    })).await;
+    let source_agent = created_agent["result"]["agent"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let created_chief = wss_rpc_envelope(&mut rpc, 3, "agent.create", json!({
+        "workspaceId": CHIEF_WORKSPACE_ID, "name": "Transfer Chief", "model": "default", "provider": "mock"
+    })).await;
+    let chief = created_chief["result"]["agent"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sent = wss_rpc_envelope(
+        &mut rpc,
+        4,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": workspace_id, "agentId": source_agent, "content": "TRANSFER_GATE"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["success"], true);
+    let gate_result = poll_conversation(&mut rpc, 100, &source_agent, "transfer chief gate", |m| {
+        tool_result_jsons(m)
+            .into_iter()
+            .find(|v| v.get("denied").is_some())
+    })
+    .await;
+    assert_eq!(gate_result["denied"], true);
+    assert!(gate_result["error"]
+        .as_str()
+        .unwrap()
+        .contains("only available in the Assistant"));
+    wss_rpc_envelope(
+        &mut rpc,
+        5,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": workspace_id, "agentId": source_agent, "content": "HOLD_SOURCE"
+        }),
+    )
+    .await;
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let active = wss_rpc_envelope(&mut rpc, 6, "agent.listActive", json!({})).await;
+            if active["result"]["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["agentId"] == source_agent)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("source agent running");
+    // This fixture supplies an existing worktree without a branch parameter.
+    // Creation seeds a generated branch; the watcher started at setup completion
+    // reconciles it to HEAD after its first debounced refresh. Capture the
+    // baseline only after that initialization, before requesting any proposals.
+    let before = timeout(Duration::from_secs(20), async {
+        loop {
+            let current = wss_rpc_envelope(
+                &mut rpc,
+                7,
+                "workspace.get",
+                json!({"workspaceId": workspace_id}),
+            )
+            .await;
+            assert!(current.get("error").is_none(), "{current}");
+            if current["result"]["workspace"]["branch"] == branch_before.trim() {
+                break current;
+            }
+            // timing-guard: poll metadata reconciliation within the enclosing timeout.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("source workspace branch metadata reconciled to Git HEAD");
+    let sent = wss_rpc_envelope(
+        &mut rpc,
+        8,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID, "agentId": chief, "content": "PROPOSE_TRANSFER"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["success"], true);
+    let (messages, result) =
+        poll_conversation(&mut rpc, 200, &chief, "transfer proposal resources", |m| {
+            tool_result_jsons(m)
+                .into_iter()
+                .find(|v| v.get("firstId").is_some())
+                .map(|v| (m.clone(), v))
+        })
+        .await;
+    for error in result["errors"].as_array().unwrap() {
+        assert!(error.is_string(), "{result}");
+    }
+    assert_ne!(result["firstId"], result["secondId"]);
+    let resources: Vec<_> = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .filter(|b| {
+            b["type"] == "resource"
+                && b["resource"]["mimeType"] == "application/vnd.intent.proposal+json"
+        })
+        .map(|b| &b["resource"])
+        .collect();
+    assert_eq!(
+        resources.len(),
+        2,
+        "Both proposals persist even though JS returns other data: {messages}"
+    );
+    let proposals: Vec<Value> = resources
+        .iter()
+        .map(|r| serde_json::from_str(r["text"].as_str().unwrap()).unwrap())
+        .collect();
+    let first = proposals
+        .iter()
+        .find(|p| p["applyToolCallId"] == result["firstId"])
+        .unwrap();
+    assert_eq!(first["kind"], "workspace-transfer");
+    assert_eq!(
+        first["payload"],
+        json!({
+            "operation": "workspace.transfer", "workspaceId": workspace_id,
+            "sourceWorkspacePath": source, "destination": "Laptop"
+        })
+    );
+    assert_eq!(first["preview"]["title"], "Transfer Transfer Source");
+    let warnings = first["preview"]["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("running or starting")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("uncommitted")),
+        "{warnings:?}"
+    );
+    let second = proposals
+        .iter()
+        .find(|p| p["applyToolCallId"] == result["secondId"])
+        .unwrap();
+    assert!(second["payload"].get("destination").is_none());
+    for resource in resources {
+        assert!(resource["uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("intent-proposal://workspace-transfer/workspace-transfer-"));
+    }
+    let subscribe =
+        json!({"jsonrpc":"2.0", "id":30, "method":"chat.subscribe", "params":{"agentId":chief}})
+            .to_string();
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    chat.send(Message::Text(subscribe.clone().into()))
+        .await
+        .unwrap();
+    assert_eq!(chat_push(&mut chat).await["kind"], "snapshot");
+    wss_rpc_envelope(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID, "agentId": chief, "content": "PROPOSE_THROW"
+        }),
+    )
+    .await;
+    let live_block = timeout(Duration::from_secs(10), async {
+        loop {
+            let push = chat_push(&mut chat).await;
+            if let Some(entity) = push["delta"]["added"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|e| e["block"]["type"] == "resource")
+            {
+                assert_ne!(
+                    entity["streamingComplete"], true,
+                    "card must arrive before terminal reconciliation"
+                );
+                return entity["block"].clone();
+            }
+        }
+    })
+    .await
+    .expect("live proposal after JavaScript error");
+    let (after_exception, failed_blocks) = poll_conversation(
+        &mut rpc,
+        400,
+        &chief,
+        "proposal after JavaScript error",
+        |messages| {
+            messages
+                .as_array()?
+                .iter()
+                .filter_map(|m| m["contentBlocks"].as_array())
+                .find_map(|blocks| {
+                    blocks
+                        .iter()
+                        .find(|b| b["id"] == live_block["id"])
+                        .map(|b| (b.clone(), blocks.clone()))
+                })
+        },
+    )
+    .await;
+    assert!(failed_blocks
+        .iter()
+        .any(|b| b["type"] == "tool_use" && b["metadata"]["status"] == "error"));
+    assert_eq!(
+        failed_blocks
+            .iter()
+            .filter(|b| b["type"] == "tool_result")
+            .count(),
+        usize::from(!omit_tool_output),
+        "status-only failures must not fabricate echoed output"
+    );
+    assert_eq!(
+        after_exception, live_block,
+        "live delta equals persisted block"
+    );
+    let after_exception: Value =
+        serde_json::from_str(after_exception["resource"]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(after_exception["kind"], "workspace-transfer");
+    assert_ne!(after_exception["applyToolCallId"], result["firstId"]);
+    assert_eq!(
+        after_exception["preview"]["fields"][0]["value"],
+        "Transfer Source"
+    );
+    let mut resumed = connect_ws(port, cfg).await;
+    resumed.send(Message::Text(subscribe.into())).await.unwrap();
+    let snapshot = chat_push(&mut resumed).await;
+    assert_eq!(snapshot["kind"], "snapshot");
+    let snapshot_block = snapshot["snapshot"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .find(|b| b["id"] == live_block["id"])
+        .unwrap();
+    assert_eq!(
+        *snapshot_block, live_block,
+        "fresh snapshot equals live delta"
+    );
+    let after = wss_rpc_envelope(
+        &mut rpc,
+        9,
+        "workspace.get",
+        json!({"workspaceId": workspace_id}),
+    )
+    .await;
+    for field in [
+        "status",
+        "archived",
+        "archivedAt",
+        "branch",
+        "worktreePath",
+        "statusMessage",
+    ] {
+        assert_eq!(
+            after["result"]["workspace"][field], before["result"]["workspace"][field],
+            "source {field} changed"
+        );
+    }
+    let active = wss_rpc_envelope(&mut rpc, 10, "agent.listActive", json!({})).await;
+    assert!(
+        active["result"]["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["agentId"] == source_agent),
+        "source agent was stopped: {active}"
+    );
+    assert_eq!(git(&["rev-parse", "HEAD"]), head_before);
+    assert_eq!(git(&["symbolic-ref", "--short", "HEAD"]), branch_before);
+    assert_eq!(git(&["status", "--porcelain"]), status_before);
+    assert_eq!(
+        std::fs::read_to_string(source.join("work.txt")).unwrap(),
+        "unfinished work\n"
+    );
+    assert!(!data_dir.join("workspaces/.export-staging").exists());
+    std::fs::write(release_file, "release").unwrap();
+    for agent in [&chief, &source_agent] {
+        wss_rpc_envelope(&mut rpc, 11, "agent.stop", json!({"agentId": agent})).await;
+    }
 }
 
 /// Poll the agent's transcript over WSS until `pred` returns Some, or panic
@@ -2042,7 +2673,7 @@ async fn non_chief_waitfor_gated_over_wss() {
     );
     let error_msg = gate_result["error"].as_str().expect("error string");
     assert!(
-        error_msg.contains("ws.app.* is only available in the Chief of Staff workspace"),
+        error_msg.contains("ws.app.* is only available in the Assistant workspace"),
         "clear chief-gating error, got: {error_msg}"
     );
 
@@ -2323,7 +2954,7 @@ async fn chief_workspace_archive_gated_over_wss() {
         );
         let msg = outcome["error"].as_str().expect("error string");
         assert!(
-            msg.contains("chief-of-staff"),
+            msg.contains("Assistant workspace"),
             "clear chief-gating error for {method}, got: {msg}"
         );
     }
@@ -2462,7 +3093,7 @@ async fn chief_agent_send_cross_workspace_over_wss() {
     assert_eq!(
         delivered["contentBlocks"][0]["text"],
         json!(format!(
-            "[MESSAGE FROM AGENT Chief of Staff ({chief_id})]\n\nPlease report your status"
+            "[MESSAGE FROM AGENT Assistant ({chief_id})]\n\nPlease report your status"
         ))
     );
     assert_eq!(
@@ -2470,10 +3101,11 @@ async fn chief_agent_send_cross_workspace_over_wss() {
         json!({
             "type": "chief_message",
             "fromAgentId": chief_id,
-            "fromAgentName": "Chief of Staff",
+            "fromAgentName": "Assistant",
             "fromWorkspaceId": CHIEF_WORKSPACE_ID,
             "sourceMessageId": source_message_id,
             "sourceUrl": source_url,
+            "submissionIds": [delivered["id"]],
         })
     );
 

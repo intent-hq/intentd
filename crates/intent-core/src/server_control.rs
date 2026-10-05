@@ -24,8 +24,8 @@ pub type ResolvedInviteLinkEnvelope = Option<Box<dyn InviteLinkEnvelope>>;
 pub trait InviteLinkBuilder: Send + Sync {
     /// Resolve the listener's current link envelope once, to stamp a batch
     /// of invites. `None` whenever no link can be built right now — TCP
-    /// listener down, no dialable route — which is never an error for a
-    /// read like `workspace.invite.list`.
+    /// listener down, tunnel down (invite links are tunnel-only) — which is
+    /// never an error for a read like `workspace.invite.list`.
     fn invite_link_envelope(
         &self,
     ) -> Pin<Box<dyn Future<Output = ResolvedInviteLinkEnvelope> + Send + '_>>;
@@ -36,6 +36,20 @@ pub trait InviteLinkBuilder: Send + Sync {
 pub trait InviteLinkEnvelope: Send + Sync {
     /// The full `intent://invite?…` link for one invite.
     fn invite_url(&self, invite_id: &str, secret: &str) -> String;
+
+    /// Host links explicitly opt into broader scope; workspace links retain v1 bytes.
+    fn scoped_invite_url(
+        &self,
+        invite_id: &str,
+        secret: &str,
+        scope: crate::InviteScope,
+    ) -> String {
+        let mut url = self.invite_url(invite_id, secret);
+        if scope == crate::InviteScope::Host {
+            url.push_str("&scope=host");
+        }
+        url
+    }
 }
 
 /// Runtime control surface for the WSS listener, implemented by the

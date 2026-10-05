@@ -27,6 +27,8 @@
 //! offered via the env-backed github.com-scoped credential helper
 //! ([`crate::auth::token_helper_config`]) — never argv.
 
+pub mod qualified;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -368,21 +370,17 @@ pub async fn ensure_cached_repo_with_progress(
     validate_segment("repo", repo)?;
     let cache_path = cache_path_for(cache_root, owner, repo);
 
-    let lock = lock_for(&cache_path);
-    let _guard = lock.lock().await;
-
     let path = cache_path.clone();
     let root = cache_root.to_path_buf();
     let owner = owner.to_string();
     let repo = repo.to_string();
     let url = github_url.to_string();
     let token = token.map(str::to_owned);
-    tokio::task::spawn_blocking(move || {
+    with_cache_lock_blocking(&cache_path, move || {
         adopt_case_variant_cache(&root, &owner, &repo, &path);
         ensure_blocking(&path, &url, token.as_deref(), progress.as_ref())
     })
-    .await
-    .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))??;
+    .await?;
     Ok(cache_path)
 }
 
@@ -716,7 +714,8 @@ fn chunk_fn(
 /// checkout provisioned FROM the cache never overlaps a concurrent
 /// [`ensure_cached_repo`] refresh/re-clone of the same cache (which
 /// hard-resets or deletes the directory mid-read). The closure runs on the
-/// blocking pool.
+/// blocking pool and owns the guard: cancelling the async caller must not let
+/// another operation touch the cache while its blocking work is still running.
 ///
 /// # Errors
 ///
@@ -727,10 +726,104 @@ where
     T: Send + 'static,
 {
     let lock = lock_for(cache_path);
-    let _guard = lock.lock().await;
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
+    let guard = lock.lock_owned().await;
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        f()
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
+}
+
+/// Seed a hub through temporary cache alternates, then dissociate before it is
+/// exposed. Caller MUST hold `with_cache_lock_blocking` through this operation
+/// and publication of the destination. Cache refresh, self-heal and eviction
+/// cannot run while the hub borrows objects; afterwards it has no dependency on
+/// the cache. A failed initialization remains unpublished and is rebuilt on retry.
+pub(crate) fn seed_detached_bare(cache: &Path, bare: &Path) -> Result<()> {
+    let source = Repository::open(cache).map_err(map_git_err)?;
+    let objects = source
+        .path()
+        .join("objects")
+        .canonicalize()
+        .map_err(|e| Error::Internal(format!("cache object directory: {e}")))?;
+    let objects = objects
+        .to_str()
+        .filter(|p| !p.contains(['\n', '\r']))
+        .ok_or_else(|| Error::InvalidParams("cache object path cannot be an alternate".into()))?;
+    let alternate = bare.join("objects/info/alternates");
+    std::fs::write(&alternate, format!("{objects}\n"))
+        .map_err(|e| Error::Internal(format!("write hub alternate: {e}")))?;
+    sync_bare_base(cache, bare)?;
+    // Unlike -l, -a copies the reachable objects borrowed from alternates.
+    run_git(bare, &["repack", "-a", "-d"], None, cache_clone_timeout())?;
+    std::fs::remove_file(alternate)
+        .map_err(|e| Error::Internal(format!("dissociate hub alternate: {e}")))?;
+    run_git(
+        bare,
+        &["fsck", "--connectivity-only", "--no-dangling"],
+        None,
+        cache_clone_timeout(),
+    )
+}
+
+/// Copy only the cache's forge-tracking branch refs into the head-owned base
+/// namespace. The caller holds the cache lock. No configured remote, network
+/// fetch, agent refs or checkpoint refs are involved. Fetch imports missing
+/// objects normally when refreshing an already-dissociated hub.
+pub(crate) fn sync_bare_base(cache: &Path, bare: &Path) -> Result<()> {
+    let source = Repository::open(cache).map_err(map_git_err)?;
+    let destination = Repository::open_bare(bare).map_err(map_git_err)?;
+    let mut wanted = BTreeMap::new();
+    for reference in source
+        .references_glob("refs/remotes/origin/*")
+        .map_err(map_git_err)?
+    {
+        let reference = reference.map_err(map_git_err)?;
+        // origin/HEAD is symbolic, not a forge branch.
+        if reference.symbolic_target_bytes().is_some() {
+            continue;
+        }
+        let name = reference
+            .name()
+            .map_err(|e| Error::InvalidParams(format!("non-UTF-8 cache branch: {e}")))?;
+        let branch = name
+            .strip_prefix("refs/remotes/origin/")
+            .expect("glob prefix");
+        wanted.insert(format!("refs/heads/{branch}"), name.to_string());
+    }
+    // Remove obsolete heads before fetching: topic and topic/subtopic cannot
+    // coexist as Git refs. Fetching first would fail before reaching the prune
+    // on every retry. This loop touches only the head-owned base namespace;
+    // checkpoint/agent/publication refs keep their objects pinned throughout.
+    for reference in destination
+        .references_glob("refs/heads/*")
+        .map_err(map_git_err)?
+    {
+        let mut reference = reference.map_err(map_git_err)?;
+        let name = reference
+            .name()
+            .map_err(|e| Error::InvalidParams(format!("non-UTF-8 hub base branch: {e}")))?;
+        if !wanted.contains_key(name) {
+            reference.delete().map_err(map_git_err)?;
+        }
+    }
+    if !wanted.is_empty() {
+        let specs: Vec<String> = wanted
+            .iter()
+            .map(|(dst, src)| format!("+{src}:{dst}"))
+            .collect();
+        let mut args = vec![
+            std::ffi::OsStr::new("fetch"),
+            std::ffi::OsStr::new("--no-tags"),
+            std::ffi::OsStr::new("--no-write-fetch-head"),
+            std::ffi::OsStr::new("--"),
+            cache.as_os_str(),
+        ];
+        args.extend(specs.iter().map(std::ffi::OsStr::new));
+        run_git_os(bare, &args, None, cache_clone_timeout())?;
+    }
+    Ok(())
 }
 
 /// Branches read from a cached clone by [`list_cached_branches`] — no
@@ -779,15 +872,18 @@ pub async fn list_cached_branches(
     let cache_path = cache_path_for(cache_root, owner, repo);
 
     let lock = lock_for(&cache_path);
-    let Ok(_guard) = lock.try_lock() else {
+    let Ok(guard) = lock.try_lock_owned() else {
         return Ok(None);
     };
 
     let owner = owner.to_string();
     let repo = repo.to_string();
-    tokio::task::spawn_blocking(move || list_cached_branches_blocking(&cache_path, &owner, &repo))
-        .await
-        .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        list_cached_branches_blocking(&cache_path, &owner, &repo)
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
 }
 
 /// Blocking body of [`list_cached_branches`]: read-only ref enumeration of
@@ -1441,6 +1537,32 @@ pub(crate) fn provision_plain_clone_checkout(
             None,
             cache_fetch_timeout(),
         )?;
+        // Match the CoW path's preference for an existing source-local branch.
+        // A local clone maps source heads to origin/*; the overlay above can
+        // replace that tip with a stale upstream ref (notably after a cached
+        // PR branch has advanced). Materialize the source-local branch in the
+        // new destination before checkout, without changing either source ref.
+        let source = Repository::open(source_path).map_err(map_git_err)?;
+        match source.find_branch(branch, git2::BranchType::Local) {
+            Ok(source_branch) => {
+                let destination = Repository::open(checkout_path).map_err(map_git_err)?;
+                match destination.find_branch(branch, git2::BranchType::Local) {
+                    Ok(_) => {}
+                    Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                        let tip = source_branch.get().peel_to_commit().map_err(map_git_err)?;
+                        let commit = destination.find_commit(tip.id()).map_err(map_git_err)?;
+                        let mut materialized = destination
+                            .branch(branch, &commit, false)
+                            .map_err(map_git_err)?;
+                        // Preserve Direct checkout's best-effort tracking setup.
+                        let _ = materialized.set_upstream(Some(&format!("origin/{branch}")));
+                    }
+                    Err(error) => return Err(map_git_err(error)),
+                };
+            }
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => return Err(map_git_err(error)),
+        }
         let sha =
             crate::cow_checkout::checkout_in_clone(checkout_path, branch, base_ref, "origin")?;
         let repo = Repository::open(checkout_path).map_err(map_git_err)?;
@@ -1537,7 +1659,12 @@ fn run_git_os_streamed(
         cmd.arg("-c").arg(token_helper_config());
         cmd.env(TOKEN_ENV, token);
     }
-    let mut child = cmd
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
@@ -1550,6 +1677,15 @@ fn run_git_os_streamed(
         .spawn()
         .map_err(|e| Error::Internal(format!("failed to spawn git: {e}")))?;
 
+    wait_for_cache_git(child, args, timeout, on_chunk)
+}
+
+fn wait_for_cache_git(
+    mut child: std::process::Child,
+    args: &[&std::ffi::OsStr],
+    timeout: Duration,
+    on_chunk: Option<ProgressChunkFn>,
+) -> Result<()> {
     // Drain stdout (piped only when streaming) on its own thread so the
     // child never blocks on a full pipe; its text feeds the callback only.
     let stdout_drain = child.stdout.take().map(|stdout| {
@@ -1591,9 +1727,9 @@ fn run_git_os_streamed(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // The child has exited, so both pipes are at EOF — the drain
-                // threads finish promptly; join them so every chunk reached
-                // the callback before we return.
+                // An owned helper can retain a pipe after the direct child
+                // exits. Reap the group before joining its output callbacks.
+                reap_cache_child_group(&mut child);
                 join_stdout(stdout_drain);
                 if status.success() {
                     let _ = read_stderr(drain);
@@ -1611,8 +1747,9 @@ fn run_git_os_streamed(
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    reap_cache_child_group(&mut child);
+                    join_stdout(stdout_drain);
+                    let _ = read_stderr(drain);
                     return Err(Error::Internal(format!(
                         "git {} timed out after {}s",
                         subcommand_name(args),
@@ -1622,12 +1759,28 @@ fn run_git_os_streamed(
                 std::thread::sleep(GIT_POLL);
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                reap_cache_child_group(&mut child);
+                join_stdout(stdout_drain);
+                let _ = read_stderr(drain);
                 return Err(Error::Internal(format!("git wait failed: {e}")));
             }
         }
     }
+}
+
+/// Every cache command starts in its own process group. Helpers must lose
+/// their inherited output pipes before the final progress callbacks are joined.
+fn reap_cache_child_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: this PID belongs to our child, started with process_group(0).
+        // A negative PID signals only that owned process group.
+        unsafe {
+            libc::kill(-child.id().cast_signed(), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Drain a child's stderr chunk-by-chunk: invoke `cb` once per
@@ -2543,6 +2696,115 @@ mod tests {
         assert!(path.join("a.txt").exists());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cache_timeout_joins_progress_callback_before_returning() {
+        use std::{io::BufRead, os::unix::process::CommandExt};
+
+        struct CleanupGroup(u32);
+        impl Drop for CleanupGroup {
+            fn drop(&mut self) {
+                // SAFETY: the PID came from our child spawned in a fresh
+                // process group; the negative PID selects only that group.
+                unsafe {
+                    libc::kill(-self.0.cast_signed(), libc::SIGKILL);
+                }
+            }
+        }
+        let mut child = Command::new("sh")
+            .args(["-c", "echo progress >&2; echo ready; read line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let _cleanup = CleanupGroup(child.id());
+        let _stdin = child.stdin.take().unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let finished_tx = std::sync::Mutex::new(Some(finished_tx));
+        let callback: ProgressChunkFn = Arc::new(move |_| {
+            if let Some(tx) = entered_tx.lock().unwrap().take() {
+                tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                finished_tx
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+            }
+        });
+        let mut job = tokio::task::spawn_blocking(move || {
+            wait_for_cache_git(
+                child,
+                &[std::ffi::OsStr::new("clone")],
+                Duration::ZERO,
+                Some(callback),
+            )
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let returned_while_callback_held = tokio::time::timeout(Duration::from_secs(10), &mut job)
+            .await
+            .is_ok();
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap();
+        if !returned_while_callback_held {
+            assert!(job.await.unwrap().is_err());
+        }
+        assert!(
+            !returned_while_callback_held,
+            "cache timeout returned while a progress callback still owned its persistence channel"
+        );
+    }
+
+    /// The blocking closure outlives a cancelled async caller. Its guard must
+    /// outlive that caller too, or cache cleanup/hub retry can enter mid-copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_cache_work_keeps_lock_until_blocking_closure_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = cache_path_for(&cache_root_for(root.path()), "acme", "widget");
+        let first_path = path.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(async move {
+            with_cache_lock_blocking(&first_path, move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                finished_tx.send(()).unwrap();
+                Ok(())
+            })
+            .await
+        });
+        entered_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        // The closure cannot finish before release_tx, and the cancelled task
+        // has definitely dropped its async locals. No scheduling delay needed.
+        let retained = lock_for(&path).try_lock_owned().is_err();
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap();
+        with_cache_lock_blocking(&path, || Ok(())).await.unwrap();
+        assert!(
+            retained,
+            "cancelled caller released the cache lock before its blocking work finished"
+        );
+    }
+
     /// `provision_direct_checkout` produces a standalone plain clone of the
     /// cache on the workspace branch, with `origin` retargeted at the real
     /// URL (never the cache path).
@@ -2574,6 +2836,76 @@ mod tests {
             std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
             "one\n"
         );
+    }
+
+    /// A refreshed daemon-owned PR branch must survive a stale cache
+    /// remote-tracking overlay in the Direct path, including force pushes.
+    #[tokio::test]
+    async fn direct_checkout_preserves_refreshed_pr_branch_over_stale_remote() {
+        let origin = init_repo("repocache-direct-pr");
+        commit_file(origin.path(), "a.txt", "base\n");
+        let base = head_sha(origin.path());
+        crate::testutil::create_branch(origin.path(), "topic");
+        let root = CacheRoot::new("direct-pr");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let cache_head = head_sha(&cache);
+        let checkout_root = CacheRoot::new("direct-pr-dst");
+        let mut prior_checkouts: Vec<(PathBuf, String)> = Vec::new();
+        for label in ["first", "forward", "force"] {
+            if label == "force" {
+                let repo = Repository::open(origin.path()).unwrap();
+                let base = repo.revparse_single(&base).unwrap();
+                repo.reset(&base, git2::ResetType::Hard, None).unwrap();
+            }
+            commit_file(origin.path(), "a.txt", label);
+            let expected = head_sha(origin.path());
+            let repo = Repository::open(origin.path()).unwrap();
+            repo.reference(
+                "refs/pull/42/head",
+                git2::Oid::from_str(&expected).unwrap(),
+                true,
+                "move canonical PR head",
+            )
+            .unwrap();
+            crate::fetch::prepare_cached_pr_branch(
+                &cache,
+                "origin",
+                42,
+                "topic",
+                Some(&expected),
+                None,
+            )
+            .unwrap();
+            let checkout = checkout_root.path().join(label);
+            let actual = provision_direct_checkout(&cache, &checkout, &url, "topic", None).unwrap();
+            assert_eq!(actual, expected);
+            let destination = Repository::open(&checkout).unwrap();
+            let branch = destination
+                .find_branch("topic", git2::BranchType::Local)
+                .unwrap();
+            assert_eq!(
+                branch.upstream().unwrap().get().name().unwrap(),
+                "refs/remotes/origin/topic",
+                "Direct checkout retains upstream tracking"
+            );
+            assert_eq!(
+                std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
+                label
+            );
+            assert_eq!(head_sha(&cache), cache_head, "cache HEAD stays unchanged");
+            assert_eq!(
+                crate::refs::rev_parse(&cache, "refs/remotes/origin/topic").unwrap(),
+                base,
+                "stale upstream ref is preserved, not rewritten"
+            );
+            for (path, sha) in &prior_checkouts {
+                assert_eq!(&head_sha(path), sha, "earlier destination is preserved");
+            }
+            prior_checkouts.push((checkout, expected));
+        }
     }
 
     /// A `base_ref` naming a non-default origin branch resolves through the
@@ -4053,7 +4385,14 @@ mod tests {
     /// name is not valid UTF-8 (`git check-ref-format` accepts such names, and
     /// `git_remote_delete` removes them): it matches and deletes on the raw
     /// name bytes, still leaving an unrelated ref intact.
-    #[cfg(unix)]
+    ///
+    /// Linux-only (intent-hq/intent#5585): the fixture writes the ref as a
+    /// loose file whose name carries the raw `\xff` byte, and macOS's APFS
+    /// enforces UTF-8 file names, so `git update-ref` fails there with
+    /// `Illegal byte sequence` before any production code runs. The raw-name
+    /// behaviour under test is filesystem-independent; Linux keeps the
+    /// coverage.
+    #[cfg(target_os = "linux")]
     #[test]
     fn remove_remote_local_only_deletes_non_utf8_ref_names() {
         use std::ffi::OsStr;

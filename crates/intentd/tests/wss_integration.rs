@@ -7,7 +7,57 @@
 //! M5.1 self-signed fingerprint. A separate insecure-mode test proves the
 //! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
+#[path = "wss_integration/comment_deletion.rs"]
+mod comment_deletion;
 mod common;
+#[path = "wss_integration/discovery_context.rs"]
+mod discovery_context;
+#[path = "wss_integration/git_commit_removal.rs"]
+mod git_commit_removal;
+#[path = "wss_integration/host_roles.rs"]
+mod host_roles;
+#[path = "wss_integration/human_attribution.rs"]
+mod human_attribution;
+#[path = "wss_integration/imported_queue_authorization.rs"]
+mod imported_queue_authorization;
+#[path = "wss_integration/integration_context.rs"]
+mod integration_context;
+#[path = "wss_integration/invitation_client.rs"]
+mod invitation_client;
+#[cfg(unix)]
+#[path = "wss_integration/linked_skills.rs"]
+mod linked_skills;
+#[path = "wss_integration/presence_focus.rs"]
+mod presence_focus;
+#[cfg(unix)]
+#[path = "wss_integration/removed_rpc.rs"]
+mod removed_rpc;
+#[path = "wss_integration/resource_context.rs"]
+mod resource_context;
+#[path = "wss_integration/script_lifecycle.rs"]
+mod script_lifecycle;
+#[path = "wss_integration/sharing.rs"]
+mod sharing;
+#[path = "wss_integration/skills.rs"]
+mod skills;
+#[path = "wss_integration/task_list_latency.rs"]
+mod task_list_latency;
+#[cfg(unix)]
+#[path = "wss_integration/terminal_replay.rs"]
+mod terminal_replay;
+
+#[path = "wss_integration/authenticated_devices.rs"]
+mod authenticated_devices;
+#[path = "wss_integration/content_activity.rs"]
+mod content_activity;
+#[path = "wss_integration/member_transport.rs"]
+mod member_transport;
+#[path = "wss_integration/note_search.rs"]
+mod note_search;
+#[path = "wss_integration/personal_pairing.rs"]
+mod personal_pairing;
+#[path = "wss_integration/workspace_delete.rs"]
+mod workspace_delete;
 
 use std::fmt::Write as _;
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
@@ -197,6 +247,11 @@ async fn make_services(
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry.clone())
+        .with_secret_store(Arc::new(intent_services::InMemorySecretStore::default()))
+        .with_specialist_dirs(
+            Some(dir.path().join("user-specialists")),
+            Some(dir.path().join("bundled-specialists")),
+        )
         .with_event_bus(bus.clone());
     if let Some(bin) = auggie_bin {
         services = services.with_auggie_bin(bin);
@@ -911,8 +966,6 @@ async fn wss_fast_path_invalid_params_carry_data_code() {
             r#"{"jsonrpc":"2.0","id":1,"method":"events.subscribe","params":{}}"#.to_string(),
             // drafts.set: missing workspaceId/agentId.
             r#"{"jsonrpc":"2.0","id":2,"method":"drafts.set","params":{"text":"x"}}"#.to_string(),
-            // forward.create: missing remotePort.
-            r#"{"jsonrpc":"2.0","id":3,"method":"forward.create","params":{}}"#.to_string(),
             // host.directoryStatus: missing path.
             r#"{"jsonrpc":"2.0","id":4,"method":"host.directoryStatus","params":{}}"#.to_string(),
             // browser.exec: missing actions (rejected before the reverse RPC).
@@ -1239,8 +1292,8 @@ async fn wss_agent_lite_omits_initial_message() {
     srv.ws.stop().await;
 }
 
-/// Soft retire round-trip over the real WSS transport: `agent.retire` (via
-/// the service seam the MCP binding calls) marks the session inert —
+/// Soft retire round-trip over the real WSS transport: `agent.retire`
+/// marks the session inert —
 /// excluded from default `agent.list`, served by `includeRetired: true` with
 /// `retiredAt`, still readable via `agent.get`, rejecting `agent.sendMessage`
 /// — and the wire `agent.restore` method returns it to service. Both
@@ -1330,23 +1383,57 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         "subscribe: {sub}"
     );
 
-    // Retire via the WorkspaceApi seam (the MCP `ws.agent.retire` binding
-    // routes here; there is deliberately no wire agent.retire method).
-    let retired = srv
-        .api
-        .agent_retire(
-            intent_core::AgentId::from(agent_id.as_str()),
-            Some(WorkspaceId(ws_id.clone())),
-            Some("handing off".to_string()),
+    for params in [
+        serde_json::json!({}),
+        serde_json::json!({ "agentId": "unknown-agent" }),
+        serde_json::json!({ "agentId": agent_id, "reason": 42 }),
+        serde_json::json!({ "agentId": agent_id, "workspaceId": "wrong-workspace" }),
+    ] {
+        let response = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 18, "method": "agent.retire", "params": params
+            })
+            .to_string(),
         )
-        .await
-        .expect("retire");
+        .await;
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(srv
+            .store
+            .get_agent_session(&intent_core::AgentId::from(agent_id.as_str()))
+            .await
+            .unwrap()
+            .retired_at
+            .is_none());
+    }
+
+    // Direct user retirement works independently of model peer-agent features.
+    srv.set_setting("agentFeatures.peerAgents", serde_json::json!(false));
+    let retire_frame = serde_json::json!({
+        "jsonrpc": "2.0", "id": 17, "method": "agent.retire",
+        "params": { "agentId": agent_id, "workspaceId": ws_id, "reason": "handing off" }
+    })
+    .to_string();
+    let envelope = wss_call(srv.port, srv.cfg.clone(), &retire_frame).await;
+    assert_eq!(envelope["jsonrpc"], "2.0");
+    assert_eq!(envelope["id"], 17);
+    assert!(envelope.get("error").is_none(), "{envelope}");
+    let retired = &envelope["result"];
     assert_eq!(retired["success"], serde_json::json!(true));
     let retired_at = retired["retiredAt"]
         .as_str()
         .expect("retiredAt")
         .to_string();
     let retired_at = retired_at.as_str();
+
+    let repeated = wss_call(srv.port, srv.cfg.clone(), &retire_frame).await;
+    assert_eq!(
+        repeated["result"],
+        serde_json::json!({
+            "success": true, "retiredAt": retired_at, "alreadyRetired": true
+        })
+    );
 
     // agent:retired reaches the subscriber with name + reason.
     let evt = next_event(&mut ws, "agent:retired").await;
@@ -1503,12 +1590,14 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
 /// orphaned background and a retired session, `scope: "topLevel"` /
 /// `"delegated"` / `"background"` each return exactly their bin, the bins
 /// partition the default read, `parentAgentId` narrows `delegated` to one
-/// parent's direct sub-agents, every variant carries `scopeCounts`
+/// parent's direct sub-agents, `orphanedOnly` narrows it to the children
+/// whose parent row is gone, every variant carries `scopeCounts`
 /// (workspace-wide, non-retired) and `delegatedCounts` (per direct parent,
-/// with the persisted-status running rule and `Σ total ==
-/// scopeCounts.delegated`) next to `retiredCount`, the default response is
-/// otherwise byte-identical to `scope: "all"`, and the invalid combinations
-/// are `-32602` with the documented messages.
+/// with the persisted-status running rule, `Σ total ==
+/// scopeCounts.delegated`, and the always-present `orphaned` sub-aggregate)
+/// next to `retiredCount`, the default response is otherwise byte-identical
+/// to `scope: "all"`, and the invalid combinations are `-32602` with the
+/// documented messages.
 #[intent_test_macros::daemon_test]
 async fn wss_agent_list_scope_bins_and_counts() {
     let srv = start(WsOptions::default()).await;
@@ -1583,12 +1672,35 @@ async fn wss_agent_list_scope_bins_and_counts() {
             .await
             .expect("retire child");
     }
+    // An orphan: a running child whose parent is hard-deleted over the wire
+    // (the `parent_agent_id` dangles — `agent.retire` would cascade instead).
+    let gamma = create_agent("gamma", false, 30).await;
+    let gamma_child = create_agent("under-gamma", false, 31).await;
+    {
+        let child_id = intent_core::AgentId::from(gamma_child.as_str());
+        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        session.parent_agent_id = Some(intent_core::AgentId::from(gamma.as_str()));
+        srv.store
+            .update_agent_session(&workspace_id, &session)
+            .await
+            .expect("link gamma child");
+        let deleted = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":32,"method":"agent.delete","params":{{"workspaceId":"{ws_id}","agentId":"{gamma}"}}}}"#
+            ),
+        )
+        .await;
+        assert!(deleted.get("error").is_none(), "delete gamma: {deleted}");
+    }
     // Persisted statuses drive the `running` rule: `active` counts, the
     // legacy capitalized `Processing` counts, `idle` does not.
     for (child, status) in [
         (&alpha_child, intent_core::AgentStatus::Active),
         (&alpha_bg_child, intent_core::AgentStatus::RuntimeIdle),
         (&beta_child, intent_core::AgentStatus::Processing),
+        (&gamma_child, intent_core::AgentStatus::Active),
     ] {
         let child_id = intent_core::AgentId::from(child.as_str());
         let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
@@ -1629,22 +1741,37 @@ async fn wss_agent_list_scope_bins_and_counts() {
         15,
     )
     .await;
+    let orphans = list(
+        r#","scope":"delegated","orphanedOnly":true"#.to_string(),
+        18,
+    )
+    .await;
+    // `orphanedOnly: false` is the whole-bin read byte-for-byte.
+    let delegated_not_orphaned_only = list(
+        r#","scope":"delegated","orphanedOnly":false"#.to_string(),
+        19,
+    )
+    .await;
 
     let including_retired = list(r#","includeRetired":true"#.to_string(), 16).await;
     let retired_only = list(r#","retiredOnly":true"#.to_string(), 17).await;
 
     // Envelope: every variant is
     // `{ agents, retiredCount, scopeCounts, delegatedCounts }`.
-    let expected_counts = serde_json::json!({ "topLevel": 2, "delegated": 3, "background": 1 });
+    let expected_counts = serde_json::json!({ "topLevel": 2, "delegated": 4, "background": 1 });
     // Per direct parent, non-retired only: top-a has an `active` (running)
     // and an `idle` background child, top-b a legacy `Processing` (running)
-    // child; its retired child is excluded, and Σ total == scopeCounts.delegated.
+    // child — its retired child is excluded — and the deleted gamma keeps
+    // its raw key with its `active` orphan; Σ total == scopeCounts.delegated,
+    // and `orphaned` counts exactly gamma's child.
     let expected_delegated = serde_json::json!({
-        "running": 2,
+        "running": 3,
         "byParent": {
             top_a.as_str(): { "total": 2, "running": 1 },
             top_b.as_str(): { "total": 1, "running": 1 },
-        }
+            gamma.as_str(): { "total": 1, "running": 1 },
+        },
+        "orphaned": { "total": 1, "running": 1 },
     });
     for (label, v) in [
         ("default", &default),
@@ -1653,6 +1780,7 @@ async fn wss_agent_list_scope_bins_and_counts() {
         ("delegated", &delegated),
         ("background", &background),
         ("delegated/parent", &under_a),
+        ("delegated/orphanedOnly", &orphans),
         ("includeRetired", &including_retired),
         ("retiredOnly", &retired_only),
     ] {
@@ -1697,19 +1825,33 @@ async fn wss_agent_list_scope_bins_and_counts() {
             v["result"]["delegatedCounts"]["running"].as_u64().unwrap(),
             "{label}: running == Σ byParent[*].running: {v}"
         );
+        assert!(
+            v["result"]["delegatedCounts"]["orphaned"]["total"]
+                .as_u64()
+                .unwrap()
+                <= v["result"]["scopeCounts"]["delegated"].as_u64().unwrap(),
+            "{label}: orphaned.total ≤ scopeCounts.delegated: {v}"
+        );
     }
     // `scope: "all"` IS the default read.
     assert_eq!(default["result"], all["result"]);
+    // `orphanedOnly: false` IS the whole-bin delegated read.
+    assert_eq!(delegated["result"], delegated_not_orphaned_only["result"]);
 
     // Bins.
     assert_eq!(ids(&top), set(&[&top_a, &top_b]));
     assert_eq!(
         ids(&delegated),
-        set(&[&alpha_child, &alpha_bg_child, &beta_child]),
-        "a background CHILD is delegated, not background"
+        set(&[&alpha_child, &alpha_bg_child, &beta_child, &gamma_child]),
+        "a background CHILD is delegated, not background; an orphan is delegated"
     );
     assert_eq!(ids(&background), set(&[&orphan_bg]));
     assert_eq!(ids(&under_a), set(&[&alpha_child, &alpha_bg_child]));
+    assert_eq!(
+        ids(&orphans),
+        set(&[&gamma_child]),
+        "orphanedOnly serves exactly the children whose parent row is gone"
+    );
     // Partition of the default read: union equal, pairwise disjoint, and
     // the retired row is in no bin.
     let union: std::collections::BTreeSet<String> = ids(&top)
@@ -1725,7 +1867,7 @@ async fn wss_agent_list_scope_bins_and_counts() {
     assert!(!union.contains(&retired_top));
     assert!(!union.contains(&retired_child));
     // Scoped rows are the default read's rows, unchanged.
-    for v in [&top, &delegated, &background, &under_a] {
+    for v in [&top, &delegated, &background, &under_a, &orphans] {
         for row in v["result"]["agents"].as_array().unwrap() {
             let default_row = default["result"]["agents"]
                 .as_array()
@@ -1779,6 +1921,35 @@ async fn wss_agent_list_scope_bins_and_counts() {
     assert_eq!(v["error"]["code"], -32602, "{v}");
     assert_eq!(
         v["error"]["message"], "parentAgentId requires scope \"delegated\"",
+        "{v}"
+    );
+    expect_invalid(
+        r#","scope":"delegated","orphanedOnly":"yes""#,
+        28,
+        "orphanedOnly must be a boolean",
+    )
+    .await;
+    expect_invalid(
+        r#","orphanedOnly":true"#,
+        29,
+        "orphanedOnly requires scope \"delegated\"",
+    )
+    .await;
+    expect_invalid(
+        r#","scope":"background","orphanedOnly":true"#,
+        33,
+        "orphanedOnly requires scope \"delegated\"",
+    )
+    .await;
+    let v = list(
+        format!(r#","scope":"delegated","orphanedOnly":true,"parentAgentId":"{top_a}""#),
+        34,
+    )
+    .await;
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert_eq!(
+        v["error"]["message"],
+        "orphanedOnly cannot be combined with parentAgentId: an orphan's direct children are pulled by parent",
         "{v}"
     );
 
@@ -2201,12 +2372,18 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
 
     // Guard: retire fails while a descendant is running a turn — the error
     // names the child and NOTHING is mutated.
-    let err = srv
-        .api
-        .agent_retire(parent.clone(), Some(workspace_id.clone()), None)
-        .await
-        .expect_err("retire with an active child must be rejected");
-    let msg = err.to_string();
+    let rejected = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 19, "method": "agent.retire",
+            "params": { "agentId": parent_id, "workspaceId": ws_id }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+    let msg = rejected["error"]["message"].as_str().unwrap();
     assert!(
         msg.contains("active child agent(s) still running a turn") && msg.contains("Junior"),
         "guard error names the active child: {msg}"
@@ -2301,16 +2478,17 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     }
 
     // Retire the parent: guard passes now, the cascade retires the child.
-    let retired = srv
-        .api
-        .agent_retire(
-            parent.clone(),
-            Some(workspace_id.clone()),
-            Some("shutting down".to_string()),
-        )
-        .await
-        .expect("retire parent");
-    assert_eq!(retired["success"], serde_json::json!(true), "{retired}");
+    let retired = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 20, "method": "agent.retire",
+            "params": { "agentId": parent_id, "workspaceId": ws_id, "reason": "shutting down" }
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(retired["result"]["success"], true, "{retired}");
 
     // Collect the three lifecycle events (relative order not asserted).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -2456,6 +2634,97 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
         "restore does not resurrect the consumed watch: {subs}"
     );
 
+    srv.ws.stop().await;
+}
+
+/// Real pinned TLS + authenticated JSON-RPC contract for bundled footer rows.
+#[intent_test_macros::daemon_test]
+async fn wss_get_subscriptions_bundles_slim_agents() {
+    use serde_json::json;
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", json!("auggie"));
+    let created = wss_call(srv.port, srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Subscriptions"}}"#).await;
+    let ws = created["result"]["workspace"]["id"].as_str().unwrap();
+    let mut ids = Vec::new();
+    for (id, name) in [(2, "Parent"), (3, "Participant")] {
+        let created = wss_call(srv.port, srv.cfg.clone(), &json!({
+            "jsonrpc":"2.0", "id":id, "method":"agent.create", "params":{"workspaceId":ws,"name":name}
+        }).to_string()).await;
+        ids.push(
+            created["result"]["agent"]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let parent = &ids[0];
+    let child = &ids[1];
+    let mut session = srv
+        .store
+        .get_agent_session_summary(&intent_core::AgentId::from(child.as_str()))
+        .await
+        .unwrap();
+    session.context_references = Some(json!([{"text": "context".repeat(5000)}]));
+    session.completion_report = Some("report".repeat(5000));
+    session.initial_message = Some("initial".repeat(5000));
+    srv.store
+        .update_agent_session(&WorkspaceId::from(ws), &session)
+        .await
+        .unwrap();
+    srv.store
+        .set_agent_session_status(
+            &WorkspaceId::from(ws),
+            &intent_core::AgentId::from(child.as_str()),
+            intent_core::AgentStatus::Active,
+            true,
+            &now_iso(),
+            None,
+        )
+        .await
+        .unwrap();
+    srv.api
+        .agent_watch(
+            WorkspaceId::from(ws),
+            intent_core::AgentId::from(parent.as_str()),
+            intent_core::AgentId::from(child.as_str()),
+        )
+        .await
+        .unwrap();
+    let response = wss_call(srv.port, srv.cfg.clone(), &json!({
+        "jsonrpc":"2.0", "id":5, "method":"agent.getSubscriptions", "params":{"workspaceId":ws,"agentId":parent}
+    }).to_string()).await;
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 5);
+    assert!(response.get("error").is_none(), "{response}");
+    let result = &response["result"];
+    assert_eq!(result.as_object().unwrap().len(), 5);
+    assert_eq!(result["agents"].as_array().unwrap().len(), 1);
+    let row = &result["agents"][0];
+    assert_eq!(row["id"], *child);
+    assert_eq!(row["workspaceId"], ws);
+    assert_eq!(row["name"], "Participant");
+    for key in [
+        "messages",
+        "harnessFeatures",
+        "contextReferences",
+        "fileBlocks",
+        "effortLevels",
+        "stats",
+    ] {
+        assert!(row.get(key).is_none(), "detail-only {key}: {row}");
+    }
+    assert!(row.to_string().len() <= intent_core::AGENT_LIST_ROW_BUDGET_BYTES);
+    assert!(
+        row["metadata"]["completionReport"].as_str().unwrap().len()
+            <= intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES
+    );
+    assert!(row["metadata"].get("initialMessage").is_none());
+    assert!(result["agentStatuses"].get(parent).is_some());
+    assert!(result["agentStatuses"].get(child).is_some());
+    assert_eq!(result["subscriptions"].as_array().unwrap().len(), 1);
+    assert_eq!(result["delegationGroups"], json!([]));
+    assert_eq!(result["eventSubscriptions"], json!([]));
     srv.ws.stop().await;
 }
 
@@ -3099,6 +3368,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
             cost: None,
         },
         by_model: BTreeMap::new(),
+        by_agent_model: None,
         last_scan_at: Some(now_iso()),
     };
     let ws_active = WorkspaceId::new();
@@ -3462,9 +3732,12 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
 /// membership summary relative to the caller: the primary user is `owner` of
 /// a workspace it created, an added collaborator sees `collaborator`, and a
 /// non-member sees no `myRole` at all. An unknown token is still refused.
+/// `principal.me` and every `workspace.members.list` row carry the additive
+/// `identity` triple when the principal is linked (here a non-GitHub
+/// provider / host, projected verbatim) and no `identity` key otherwise.
 #[intent_test_macros::daemon_test]
 async fn wss_principal_me_and_workspace_membership_by_caller() {
-    use intent_core::{Principal, PrincipalId, WorkspaceRole};
+    use intent_core::{Principal, PrincipalId, PrincipalIdentity, WorkspaceRole};
 
     let srv = start(WsOptions::default()).await;
     let primary = srv
@@ -3489,11 +3762,26 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
     assert_eq!(me["result"]["id"], primary.id.0);
     assert_eq!(me["result"]["isAdministrator"], true);
     assert!(me["result"]["login"].is_null() || me["result"]["login"].is_string());
+    assert!(
+        me["result"].get("identity").is_none(),
+        "unlinked primary carries no identity: {me}"
+    );
 
-    // A second principal with its own credential (hashed at rest).
+    // A second principal with its own credential (hashed at rest), linked
+    // on a non-GitHub provider / host.
     let guest_token = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    let guest_identity = serde_json::json!({
+        "provider": "gitlab",
+        "host": "gitlab.example.com",
+        "externalUserId": "4242",
+    });
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: Some(PrincipalIdentity {
+            provider: "gitlab".to_string(),
+            host: "gitlab.example.com".to_string(),
+            external_user_id: "4242".to_string(),
+        }),
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: None,
@@ -3536,6 +3824,10 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
     assert_eq!(me["result"]["login"], "guest");
     assert_eq!(me["result"]["isAdministrator"], false);
     assert_ne!(me["result"]["id"], primary.id.0);
+    assert_eq!(
+        me["result"]["identity"], guest_identity,
+        "linked guest identity: {me}"
+    );
 
     // An unknown token is refused at the upgrade (401).
     let unknown = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
@@ -3587,6 +3879,31 @@ async fn wss_principal_me_and_workspace_membership_by_caller() {
     assert_eq!(collaborator_ws["myRole"], "collaborator");
     assert_eq!(collaborator_ws["memberCount"], 2);
 
+    // The roster projects the same additive `identity` per member row.
+    let roster = guest_ws_call(format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"workspace.members.list","params":{{"workspaceId":"{}"}}}}"#,
+        ws_id.0
+    ))
+    .await;
+    assert!(roster.get("error").is_none(), "{roster}");
+    let members = roster["result"]["members"].as_array().expect("members");
+    assert_eq!(members.len(), 2, "{roster}");
+    let member_row = |id: &str| {
+        members
+            .iter()
+            .find(|m| m["principalId"] == id)
+            .unwrap_or_else(|| panic!("member {id}: {roster}"))
+    };
+    assert_eq!(
+        member_row(&guest.id.0)["identity"],
+        guest_identity,
+        "{roster}"
+    );
+    assert!(
+        member_row(&primary.id.0).get("identity").is_none(),
+        "unlinked primary row carries no identity: {roster}"
+    );
+
     let list = guest_ws_call(
         r#"{"jsonrpc":"2.0","id":4,"method":"workspace.list","params":{}}"#.to_string(),
     )
@@ -3630,6 +3947,7 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
 
     let guest = |login: &str, github_user_id: i64, created_at: &str| Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: Some(github_user_id),
         login: Some(login.to_string()),
         display_name: Some(format!("{login} name")),
@@ -3679,6 +3997,8 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
                 "displayName": "older name",
                 "avatarUrl": "https://example.test/older.png",
                 "githubUserId": 11,
+                "hostRole": "guest",
+                "identity": { "provider": "github", "host": "github.com", "externalUserId": "11" },
             },
             {
                 "principalId": newer.id.0,
@@ -3686,6 +4006,8 @@ async fn wss_principal_list_is_owner_only_and_omits_revoked_guests() {
                 "displayName": "newer name",
                 "avatarUrl": "https://example.test/newer.png",
                 "githubUserId": 12,
+                "hostRole": "guest",
+                "identity": { "provider": "github", "host": "github.com", "externalUserId": "12" },
             },
         ] }),
         "{owner_view}"
@@ -3795,6 +4117,7 @@ async fn wss_members_add_delivers_workspace_to_connected_guest() {
     // Two guests with their own credentials; one revokes itself.
     let guest_of = |login: &str| Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some(login.to_string()),
         display_name: Some(format!("{login} name")),
@@ -4150,6 +4473,7 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
     let guest_token = "edededededededededededededededededededededededededededededededed";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: Some("Guest User".to_string()),
@@ -4185,6 +4509,8 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
                 "agent.sendMessage",
                 json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hello from guest" }),
             ),
+            ("agent.retire", json!({ "agentId": agent_id })),
+            ("agent.restore", json!({ "agentId": agent_id })),
             ("git.push", json!({ "workspaceId": ws_id })),
         ]
     };
@@ -4227,6 +4553,11 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
             "collaborator {method}: {v}"
         );
         match method {
+            "agent.retire" => {
+                assert_eq!(v["result"]["success"], true, "{v}");
+                assert!(v["result"]["retiredAt"].is_string(), "{v}");
+            }
+            "agent.restore" => assert_eq!(v["result"]["restored"], true, "{v}"),
             "workspace.get" => {
                 assert_eq!(v["result"]["workspace"]["myRole"], "collaborator", "{v}");
                 assert_eq!(v["result"]["workspace"]["ownerPrincipalId"], primary.id.0);
@@ -4598,6 +4929,7 @@ async fn wss_collaborator_client_ids_are_principal_scoped() {
     ] {
         let principal = Principal {
             id: PrincipalId::new(),
+            identity: None,
             github_user_id: None,
             login: Some(login.to_string()),
             display_name: None,
@@ -4739,6 +5071,7 @@ impl Guest {
         use intent_core::{Principal, PrincipalId};
         let principal = Principal {
             id: PrincipalId::new(),
+            identity: None,
             github_user_id: None,
             login: Some("guest".to_string()),
             display_name: Some("Guest User".to_string()),
@@ -5042,7 +5375,7 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
     let agent_typed = AgentId::from_string(agent_id.clone());
     let collaborator = Caller::Wire {
         principal_id: guest.principal.id.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     };
     let tool_call = json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -5094,7 +5427,7 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
         .as_str()
         .unwrap_or_else(|| panic!("tool text: {refused}"));
     assert!(
-        refused_text.contains("forbidden: host.exec requires the daemon administrator"),
+        refused_text.contains("forbidden: host.exec requires host membership"),
         "unbound bridge must surface the gate's refusal: {refused_text}"
     );
 
@@ -5133,7 +5466,8 @@ async fn wss_collaborator_steered_agent_runs_host_exec_with_owner_capabilities()
 /// persisted queue snapshot a later drain or restart would redrive), while
 /// the removed member's connection loses access (`agent.getQueue` and
 /// `workspace.get` are `NotFound`). A second collaborator's entry is not
-/// touched.
+/// touched. Shared queue visibility throughout: all remaining participants
+/// read the same complete queue, with author identities and positions intact.
 #[tokio::test]
 async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     use intent_core::events::AGENT_QUEUE_UPDATED;
@@ -5220,9 +5554,15 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
         "{staying_queued}"
     );
 
-    let before = leaving
-        .call("agent.getQueue", json!({ "agentId": agent_id }))
-        .await;
+    // The owner (administrator) reads the full queue.
+    let before = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getQueue","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
     let queue = before["result"]["queue"].as_array().expect("queue");
     assert_eq!(queue.len(), 3, "{before}");
     // A collaborator's entry carries the sender preamble above its text
@@ -5266,6 +5606,29 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
         Some(json!(staying.principal.id.0)),
         "{before}"
     );
+
+    // Every collaborator reads the same full queue and author projections.
+    // Own-entry attribution remains independent of that shared visibility.
+    for (guest, body, position) in [
+        (&mut leaving, "from leaving", 1),
+        (&mut staying, "from staying", 2),
+    ] {
+        let own = guest
+            .call("agent.getQueue", json!({ "agentId": agent_id }))
+            .await;
+        let visible = own["result"]["queue"].as_array().expect("queue");
+        assert_eq!(
+            visible, queue,
+            "collaborator sees the full shared queue: {own}"
+        );
+        assert_eq!(body_of(&visible[position]), body, "{own}");
+        assert_eq!(visible[position]["position"], json!(position), "{own}");
+        assert_eq!(
+            visible[position]["author"]["principalId"],
+            json!(guest.principal.id.0),
+            "{own}"
+        );
+    }
 
     // Owner subscribes for the shrunk-queue echo, then removes the member.
     let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
@@ -5444,14 +5807,324 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     let still = staying
         .call("agent.getQueue", json!({ "agentId": agent_id }))
         .await;
+    let still_queue = still["result"]["queue"].as_array().expect("queue");
     assert_eq!(
-        still["result"]["queue"].as_array().map(Vec::len),
-        Some(2),
-        "{still}"
+        still_queue, queue,
+        "remaining collaborator sees both surviving rows: {still}"
+    );
+    assert_eq!(body_of(&still_queue[0]), "from owner", "{still}");
+    assert_eq!(body_of(&still_queue[1]), "from staying", "{still}");
+    assert_eq!(
+        still_queue[1]["position"],
+        json!(1),
+        "the removed entry's slot closed up ahead of it: {still}"
     );
 
     drop(leaving);
     drop(staying);
+    srv.ws.stop().await;
+}
+
+/// Archiving removes guests: `workspace.archive` over the wire on a
+/// workspace with two collaborators and one open invite. The owner's
+/// `events.subscribe` on `workspace:updated` sees the documented sequence —
+/// one `{ members: true, removedPrincipalId, memberCount }` delta per
+/// collaborator (the `members.remove` shape), one `{ invites: true }`, then
+/// the `{ archived: true, status, archivedAt }` delta — the response
+/// carries `memberCount: 1` / `openInviteCount: 0`, `workspace.members.list`
+/// keeps only the owner row, both guests' connections read `NotFound`, a
+/// `workspace.members.add` while archived is `-32602 { code:
+/// "workspace-archived" }`, and `workspace.unarchive` restores neither
+/// membership nor the invite — but admits the add again (no late sweep).
+#[tokio::test]
+async fn wss_archive_detaches_collaborators_and_revokes_open_invites() {
+    use intent_core::events::WORKSPACE_UPDATED;
+    use intent_core::{WorkspaceInvite, WorkspaceRole};
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    let primary = srv
+        .store
+        .get_primary_principal()
+        .await
+        .expect("primary principal");
+
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Archive Removes Guests"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let ws_typed = WorkspaceId::from(ws_id.as_str());
+
+    let mut guest_a = Guest::connect(
+        &srv,
+        "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+    )
+    .await;
+    let mut guest_b = Guest::connect(
+        &srv,
+        "e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6",
+    )
+    .await;
+    for guest in [&guest_a, &guest_b] {
+        srv.store
+            .add_workspace_member(&ws_typed, &guest.principal.id, WorkspaceRole::Collaborator)
+            .await
+            .expect("add collaborator");
+    }
+    // One open (unpinned, unexpired) invite, seeded at the store: the
+    // minting RPC needs a tunnel and a forge identity, which this harness
+    // does not run; the sweep only reads the row's open predicate.
+    let invite = WorkspaceInvite {
+        id: uuid::Uuid::new_v4().to_string(),
+        workspace_id: ws_typed.clone(),
+        secret_hash: sha256_hex(b"archive-invite-secret"),
+        secret: None,
+        created_by_principal_id: primary.id.clone(),
+        pin_github_user_id: None,
+        pin_login: None,
+        pin_identity: None,
+        created_at: now_iso(),
+        expires_at: intent_core::iso_ms_from_now(3_600_000),
+        redeemed_at: None,
+        redeemed_by_principal_id: None,
+        revoked_at: None,
+        redemption_count: 0,
+    };
+    srv.store
+        .insert_workspace_invite(&invite)
+        .await
+        .expect("open invite");
+
+    let before = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.get","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(before["result"]["workspace"]["memberCount"], 3, "{before}");
+    assert_eq!(
+        before["result"]["workspace"]["openInviteCount"], 1,
+        "{before}"
+    );
+    for guest in [&mut guest_a, &mut guest_b] {
+        let seen = guest
+            .call("workspace.get", json!({ "workspaceId": ws_id }))
+            .await;
+        assert_eq!(
+            seen["result"]["workspace"]["myRole"], "collaborator",
+            "{seen}"
+        );
+    }
+
+    // Owner subscribes to the workspace's `workspace:updated` stream.
+    let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub_ws
+        .send(Message::Text(
+            format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"events.subscribe","params":{{"eventTypes":["{WORKSPACE_UPDATED}"],"workspaceId":"{ws_id}"}}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .expect("subscribe");
+    loop {
+        match sub_ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json");
+                if v["id"] == 3 {
+                    assert!(v["result"]["subscriptionId"].is_string(), "{v}");
+                    break;
+                }
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+
+    let archived = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"workspace.archive","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(archived["jsonrpc"], "2.0", "{archived}");
+    let ws = &archived["result"]["workspace"];
+    assert_eq!(ws["id"], ws_id.as_str(), "{archived}");
+    assert_eq!(ws["archived"], true, "{archived}");
+    assert_eq!(ws["status"], "Archived", "{archived}");
+    assert_eq!(ws["memberCount"], 1, "{archived}");
+    assert_eq!(ws["openInviteCount"], 0, "{archived}");
+    assert_eq!(ws["myRole"], "owner", "{archived}");
+    let archived_at = ws["archivedAt"].clone();
+    assert!(archived_at.is_string(), "{archived}");
+
+    // The emitted sequence: two removals (memberCount 2 then 1), the invite
+    // delta, then the archived delta.
+    let mut changes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while changes.len() < 4 {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == WORKSPACE_UPDATED
+                    {
+                        let ev = &v["params"]["event"];
+                        assert_eq!(ev["workspaceId"], ws_id.as_str(), "{ev}");
+                        assert_eq!(ev["data"]["workspaceId"], ws_id.as_str(), "{ev}");
+                        changes.push(ev["data"]["changes"].clone());
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("four workspace:updated deltas after archive");
+    let mut removed: Vec<String> = changes[..2]
+        .iter()
+        .zip([2u64, 1])
+        .map(|(c, count)| {
+            assert_eq!(c["members"], true, "{c}");
+            assert_eq!(c["memberCount"], count, "{c}");
+            c["removedPrincipalId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("removedPrincipalId: {c}"))
+                .to_string()
+        })
+        .collect();
+    removed.sort();
+    let mut expected = vec![
+        guest_a.principal.id.0.clone(),
+        guest_b.principal.id.0.clone(),
+    ];
+    expected.sort();
+    assert_eq!(removed, expected, "{changes:?}");
+    assert_eq!(changes[2], json!({ "invites": true }), "{changes:?}");
+    assert_eq!(
+        changes[3],
+        json!({ "archived": true, "status": "Archived", "archivedAt": archived_at }),
+        "{changes:?}"
+    );
+
+    // Roster: only the owner row survives; the guests' connections lost
+    // the workspace.
+    let roster = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"workspace.members.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let members = roster["result"]["members"].as_array().expect("members");
+    assert_eq!(members.len(), 1, "{roster}");
+    assert_eq!(members[0]["principalId"], primary.id.0, "{roster}");
+    assert_eq!(members[0]["role"], "owner", "{roster}");
+    assert_eq!(roster["result"]["guestCount"], 0, "{roster}");
+    for guest in [&mut guest_a, &mut guest_b] {
+        let gone = guest
+            .call("workspace.get", json!({ "workspaceId": ws_id }))
+            .await;
+        assert_eq!(gone["error"]["code"], -32602, "{gone}");
+        assert_eq!(gone["error"]["data"]["code"], "not-found", "{gone}");
+    }
+    let stored = srv
+        .store
+        .get_workspace_invite(&invite.id)
+        .await
+        .expect("invite read")
+        .expect("invite row kept");
+    assert!(stored.revoked_at.is_some(), "{stored:?}");
+
+    // While archived, a direct add is refused as `workspace-archived`
+    // (checked inside the add's write transaction) and seats nobody.
+    let refused = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"workspace.members.add","params":{{"workspaceId":"{ws_id}","principalId":"{}"}}}}"#,
+            guest_a.principal.id.0
+        ),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    assert_eq!(
+        refused["error"]["data"]["code"], "workspace-archived",
+        "{refused}"
+    );
+    assert_eq!(
+        srv.store
+            .get_workspace_member_role(&ws_typed, &guest_a.principal.id)
+            .await
+            .expect("role"),
+        None,
+        "{refused}"
+    );
+
+    // Unarchive resurrects neither the members nor the invite.
+    let restored = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"workspace.unarchive","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        restored["result"]["workspace"]["archived"], false,
+        "{restored}"
+    );
+    let after = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"workspace.get","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(after["result"]["workspace"]["memberCount"], 1, "{after}");
+    assert_eq!(
+        after["result"]["workspace"]["openInviteCount"], 0,
+        "{after}"
+    );
+    // ... and the same add now seats the guest again: no late sweep.
+    let readded = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"workspace.members.add","params":{{"workspaceId":"{ws_id}","principalId":"{}"}}}}"#,
+            guest_a.principal.id.0
+        ),
+    )
+    .await;
+    assert_eq!(readded["result"]["added"], true, "{readded}");
+    assert_eq!(readded["result"]["memberCount"], 2, "{readded}");
+    let back = guest_a
+        .call("workspace.get", json!({ "workspaceId": ws_id }))
+        .await;
+    assert_eq!(
+        back["result"]["workspace"]["myRole"], "collaborator",
+        "{back}"
+    );
+
+    drop(guest_a);
+    drop(guest_b);
+    drop(sub_ws);
     srv.ws.stop().await;
 }
 
@@ -5506,6 +6179,7 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
     let guest_token = "dcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: None,
@@ -5579,8 +6253,17 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
         }
     }
 
-    // Owner-only methods are refused before dispatch with -32003.
+    // Methods outside guest access are refused before dispatch with -32003.
+    // Removing git.commit must not widen git.agentCommit guest access.
     for (method, params) in [
+        (
+            "git.commit",
+            json!({ "message": "retired", "idempotencyKey": "key" }),
+        ),
+        (
+            "git.agentCommit",
+            json!({ "message": "member only", "userRequested": true }),
+        ),
         ("host.exec", json!({ "command": "true" })),
         ("system.shutdown", json!({})),
         (
@@ -5607,15 +6290,13 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
         assert!(v.get("result").is_none(), "{v}");
     }
 
-    // The alias `git.diff` is canonicalised to `git.diffs` (allowed): it is
-    // not refused by the allowlist, so it reaches the router and fails on its
-    // params (unknown workspace) rather than with -32003.
-    let (id, frame) = call("git.diff", json!({ "workspaceId": WorkspaceId::new().0 }));
+    // The canonical git read remains allowed and reaches workspace validation.
+    let (id, frame) = call("git.diffs", json!({ "workspaceId": WorkspaceId::new().0 }));
     ws.send(Message::Text(frame.into())).await.expect("send");
     let v = reply(&mut ws, id).await;
     assert_ne!(
         v["error"]["code"], -32003,
-        "git.diff must classify like git.diffs (allowed): {v}"
+        "git.diffs must remain allowed: {v}"
     );
     drop(ws);
 
@@ -5757,6 +6438,7 @@ async fn wss_collaborator_system_status_is_projected_to_guest_safe_fields() {
     let guest_token = "dedededededededededededededededededededededededededededededededede";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: None,
@@ -5824,6 +6506,7 @@ async fn wss_collaborator_system_status_is_projected_to_guest_safe_fields() {
         keys,
         [
             "buildCommit",
+            "collaborationName",
             "fingerprint",
             "host",
             "hostname",
@@ -5982,6 +6665,7 @@ async fn wss_collaborator_event_fan_out_and_query_are_allowlisted() {
     let guest_token = "ececececececececececececececececececececececececececececececececec";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: None,
@@ -6196,19 +6880,15 @@ impl PresenceClient {
             .expect("send");
     }
 
-    /// The reply to request `id`; pushes and events arriving first are
-    /// skipped.
+    /// The reply to request `id`; retain unmatched pushes and events.
     async fn reply(&mut self, id: u64, method: &str) -> Value {
-        loop {
-            let v = self
-                .next_within(Duration::from_secs(10))
-                .await
-                .unwrap_or_else(|| panic!("no reply to {method} #{id} within 10s"));
-            if v["id"] == id {
-                return v;
-            }
-            self.skipped.push(v);
-        }
+        presence_matching_frame(
+            &mut self.rx,
+            &mut self.skipped,
+            |v| v["id"] == id,
+            &format!("reply to {method} #{id}"),
+        )
+        .await
     }
 
     /// Round-trip one request; pushes and events arriving first are skipped.
@@ -6217,33 +6897,28 @@ impl PresenceClient {
         self.reply(id, method).await
     }
 
-    /// The params of the next `subscription.push` on `sub` (other frames are
-    /// skipped).
+    /// The params of the next `subscription.push` on `sub`; retain other frames.
     async fn push(&mut self, sub: &str) -> Value {
-        loop {
-            let v = self
-                .next_within(Duration::from_secs(10))
-                .await
-                .unwrap_or_else(|| panic!("no push on {sub} within 10s"));
-            if v["method"] == "subscription.push" && v["params"]["subscriptionId"] == sub {
-                return v["params"].clone();
-            }
-            self.skipped.push(v);
-        }
+        presence_matching_frame(
+            &mut self.rx,
+            &mut self.skipped,
+            |v| v["method"] == "subscription.push" && v["params"]["subscriptionId"] == sub,
+            &format!("push on {sub}"),
+        )
+        .await["params"]
+            .clone()
     }
 
-    /// The next `events.event` of `event_type` (other frames are skipped).
+    /// The next `events.event` of `event_type`; retain other frames.
     async fn event(&mut self, event_type: &str) -> Value {
-        loop {
-            let v = self
-                .next_within(Duration::from_secs(10))
-                .await
-                .unwrap_or_else(|| panic!("no {event_type} event within 10s"));
-            if v["method"] == "events.event" && v["params"]["event"]["type"] == event_type {
-                return v["params"]["event"].clone();
-            }
-            self.skipped.push(v);
-        }
+        presence_matching_frame(
+            &mut self.rx,
+            &mut self.skipped,
+            |v| v["method"] == "events.event" && v["params"]["event"]["type"] == event_type,
+            &format!("{event_type} event"),
+        )
+        .await["params"]["event"]
+            .clone()
     }
 
     /// Every frame already delivered plus whatever arrives in a short grace
@@ -6281,12 +6956,147 @@ impl PresenceClient {
     }
 }
 
+/// Match the reader's frames without losing messages for another waiter.
+async fn presence_matching_frame(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+    skipped: &mut Vec<Value>,
+    matches: impl Fn(&Value) -> bool,
+    description: &str,
+) -> Value {
+    if let Some(index) = skipped.iter().position(&matches) {
+        return skipped.remove(index);
+    }
+    loop {
+        let v = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| panic!("no {description} within 10s"));
+        if matches(&v) {
+            return v;
+        }
+        skipped.push(v);
+    }
+}
+
+#[cfg(test)]
+mod presence_dispatcher {
+    use super::*;
+    use serde_json::json;
+
+    fn event(sequence: u64) -> Value {
+        json!({ "method": "events.event", "params": {
+            "event": { "type": "presence:changed", "sequence": sequence }
+        } })
+    }
+
+    fn push() -> Value {
+        json!({ "method": "subscription.push", "params": {
+            "subscriptionId": "note", "delta": { "kind": "left" }
+        } })
+    }
+
+    fn frames(values: Vec<Value>) -> tokio::sync::mpsc::UnboundedReceiver<Value> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for value in values {
+            tx.send(value).expect("queue frame");
+        }
+        // Closing the sender makes a missed buffered frame fail immediately.
+        rx
+    }
+
+    async fn next(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+        skipped: &mut Vec<Value>,
+        method: &str,
+    ) -> Value {
+        presence_matching_frame(rx, skipped, |v| v["method"] == method, method).await
+    }
+
+    #[tokio::test]
+    async fn event_before_push_is_still_available_after_push() {
+        let event = event(1);
+        let push = push();
+        let unrelated = json!({ "id": 9, "result": { "ok": true } });
+        let mut rx = frames(vec![unrelated.clone(), event.clone(), push.clone()]);
+        let mut skipped = Vec::new();
+        assert_eq!(next(&mut rx, &mut skipped, "subscription.push").await, push);
+        assert_eq!(skipped, vec![unrelated.clone(), event.clone()]);
+        assert_eq!(next(&mut rx, &mut skipped, "events.event").await, event);
+        assert_eq!(skipped, vec![unrelated]);
+    }
+
+    #[tokio::test]
+    async fn push_before_event_is_still_available_after_event() {
+        let event = event(1);
+        let push = push();
+        let unrelated = json!({ "method": "other.notification" });
+        let mut rx = frames(vec![unrelated.clone(), push.clone(), event.clone()]);
+        let mut skipped = Vec::new();
+        assert_eq!(next(&mut rx, &mut skipped, "events.event").await, event);
+        assert_eq!(skipped, vec![unrelated.clone(), push.clone()]);
+        assert_eq!(next(&mut rx, &mut skipped, "subscription.push").await, push);
+        assert_eq!(skipped, vec![unrelated]);
+    }
+
+    #[tokio::test]
+    async fn reply_wait_preserves_events_and_other_replies() {
+        let event = event(1);
+        let first_reply = json!({ "id": 1, "result": { "ok": true } });
+        let second_reply = json!({ "id": 2, "result": { "ok": true } });
+        let mut rx = frames(vec![
+            event.clone(),
+            first_reply.clone(),
+            second_reply.clone(),
+        ]);
+        let mut skipped = Vec::new();
+        assert_eq!(
+            presence_matching_frame(&mut rx, &mut skipped, |v| v["id"] == 2, "reply #2").await,
+            second_reply
+        );
+        assert_eq!(next(&mut rx, &mut skipped, "events.event").await, event);
+        assert_eq!(
+            presence_matching_frame(&mut rx, &mut skipped, |v| v["id"] == 1, "reply #1").await,
+            first_reply
+        );
+        assert!(skipped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn buffered_matches_keep_arrival_order_and_are_consumed_once() {
+        let mut rx = frames(vec![event(3)]);
+        let unrelated = json!({ "method": "other.notification" });
+        let mut skipped = vec![event(1), unrelated.clone(), event(2)];
+        for sequence in 1..=3 {
+            assert_eq!(
+                next(&mut rx, &mut skipped, "events.event").await,
+                event(sequence)
+            );
+        }
+        assert_eq!(skipped, vec![unrelated]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn matching_frames_in_wait_order_leave_unrelated_frames_for_negative_checks() {
+        let event = event(1);
+        let push = push();
+        let unrelated = json!({ "method": "other.notification" });
+        let mut rx = frames(vec![unrelated.clone(), push.clone(), event.clone()]);
+        let mut skipped = Vec::new();
+        assert_eq!(next(&mut rx, &mut skipped, "subscription.push").await, push);
+        assert_eq!(next(&mut rx, &mut skipped, "events.event").await, event);
+        assert_eq!(skipped, vec![unrelated]);
+    }
+}
+
 /// Seed a collaborator-capable principal with its own credential; `token`
 /// must be 64 hex chars (the per-principal credential is matched by SHA-256).
 async fn seed_principal(store: &Store, login: &str, token: &str) -> intent_core::Principal {
     use intent_core::{Principal, PrincipalId};
     let p = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some(login.to_string()),
         display_name: None,
@@ -6381,7 +7191,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         ev["data"]["members"],
         json!([{ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                 "avatarUrl": null, "focus": [], "typing": [] }]),
+                 "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }]),
         "{ev}"
     );
 
@@ -6423,7 +7233,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         p["snapshot"],
         json!({ "viewers": [{ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                              "avatarUrl": null, "cursor": null }] }),
+                              "avatarUrl": null, "hostRole": "guest", "cursor": null }] }),
         "{p}"
     );
     let p = alice_c.push(&sub_a).await;
@@ -6513,7 +7323,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         p["delta"],
         json!({ "kind": "updated", "viewer": { "principalId": bob.id.0, "login": "bob",
-                "displayName": null, "avatarUrl": null,
+                "displayName": null, "avatarUrl": null, "hostRole": "guest",
                 "cursor": { "rev": 3, "anchor": 10, "head": 12 } } }),
         "{p}"
     );
@@ -6896,7 +7706,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
     assert_eq!(
         alice_row(&json!({ "data": v["result"] })),
         json!({ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                "avatarUrl": null, "focus": [], "typing": [] }),
+                "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }),
         "snapshot rows match the presence:changed member shape: {v}"
     );
 
@@ -7127,6 +7937,7 @@ async fn wss_user_messages_stamp_principal_and_serve_author() {
     let guest_token = "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada";
     let guest = Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id: None,
         login: Some("guest".to_string()),
         display_name: Some("Guest User".to_string()),
@@ -9961,6 +10772,69 @@ async fn wss_providers_catalog_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Legacy identity metadata is independent of the configured default, disabled
+/// providers, authentication, installation and model discovery. This harness has
+/// no `AgentManager` or provider discovery attached; the static catalog still
+/// reports the resolver's aliases over the production TLS/JSON-RPC path.
+#[intent_test_macros::daemon_test]
+async fn wss_providers_catalog_legacy_aliases_ignore_settings() {
+    let srv = start(WsOptions::default()).await;
+    let mut first_catalog = None;
+    for (default, enabled) in [
+        (Value::Null, serde_json::json!({})),
+        (
+            serde_json::json!("codex"),
+            serde_json::json!({"auggie": true, "codex": false}),
+        ),
+        (
+            serde_json::json!("claude-code"),
+            serde_json::json!({"auggie": false, "claude-code": true}),
+        ),
+        (
+            serde_json::json!("auggie"),
+            serde_json::json!({"auggie": false}),
+        ),
+        (serde_json::json!("nope"), serde_json::json!({})),
+        (serde_json::json!(""), serde_json::json!({})),
+    ] {
+        srv.set_setting("model.defaultProvider", default.clone());
+        srv.set_setting("providers.enabled", enabled.clone());
+        let resp = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            r#"{"jsonrpc":"2.0","id":1,"method":"providers.catalog","params":{}}"#,
+        )
+        .await;
+        eprintln!("providers.catalog wire: {resp}");
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 1);
+        assert!(resp.get("error").is_none(), "{resp}");
+        let providers = resp["result"]["providers"].as_array().unwrap();
+        let auggie = providers.iter().find(|p| p["id"] == "auggie").unwrap();
+        assert_eq!(
+            auggie["legacyAliases"],
+            serde_json::json!(["default", "acp", "augment"]),
+            "default={default}, enabled={enabled}"
+        );
+        for p in providers.iter().filter(|p| p["id"] != "auggie") {
+            assert!(
+                p.get("legacyAliases").is_none(),
+                "{} has no aliases",
+                p["id"]
+            );
+        }
+        if let Some(first) = &first_catalog {
+            assert_eq!(
+                &resp["result"], first,
+                "settings must not change any catalog metadata"
+            );
+        } else {
+            first_catalog = Some(resp["result"].clone());
+        }
+    }
+    srv.ws.stop().await;
+}
+
 /// `unsloth.status` / `unsloth.stop` (monorepo#878 follow-up): no params, no
 /// workspaceId — the managed Unsloth server is daemon-global. This harness's
 /// `Services` is never attached to a real `AgentManager`
@@ -10067,6 +10941,7 @@ async fn wss_guest_connection_caps_refuse_503_and_release_on_disconnect() {
     for (n, token) in tokens.iter().enumerate() {
         let guest = Principal {
             id: PrincipalId::new(),
+            identity: None,
             github_user_id: None,
             login: Some(format!("guest-{n}")),
             display_name: None,
@@ -10184,6 +11059,7 @@ async fn wss_guest_connection_caps_apply_live_on_settings_update() {
     for (n, token) in tokens.iter().enumerate() {
         let guest = Principal {
             id: PrincipalId::new(),
+            identity: None,
             github_user_id: None,
             login: Some(format!("guest-{n}")),
             display_name: None,
@@ -10731,10 +11607,12 @@ async fn wss_models_list_preserves_legacy_metadata_through_cache() {
     let bin = dir.path().join("auggie");
     let script = format!(
         r#"#!/bin/sh
-printf '%s\n' "$*" >> '{}'
-if [ "$*" != "model list --json" ]; then
+[ "$#" = 5 ] && [ "$4" = "--mcp-config" ] && [ -f "$5" ] || exit 1
+[ "$(cat "$5")" = '{{"mcpServers":{{}}}}' ] || exit 1
+if [ "$1 $2 $3" != "model list --json" ]; then
   exit 1
 fi
+printf '%s\n' "$1 $2 $3" >> '{}'
 cat <<'JSON'
 {{"models":[{{"shortName":"current","displayName":"Current","modelGroupPriority":1,"priority":1,"isLegacyModel":false}},{{"shortName":"legacy","displayName":"Legacy","modelGroupPriority":2,"priority":1,"isLegacyModel":true}}]}}
 JSON
@@ -11850,6 +12728,11 @@ fn fake_acp_adapter_script(tag: &str, behavior: &str) -> (tempfile::TempDir, std
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() {
+    if common::codex_npx::in_subprocess(
+        "wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp",
+    ) {
+        return;
+    }
     // Provider-neutral routing (§5.32): with codex as the effective default
     // provider the daemon runs an EPHEMERAL ACP session (initialize →
     // session/new → one session/prompt → reap) against the mock agent and
@@ -11863,10 +12746,7 @@ async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() 
         fake_acp_adapter_script("complete", r#"{"response":"🤖\nfix-login-flow"}"#);
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
-    srv.set_setting(
-        "providers.paths",
-        serde_json::json!({ "codex": bin.to_string_lossy() }),
-    );
+    common::codex_npx::select_adapter(&bin);
 
     let resp = wss_call(
         srv.port,
@@ -11887,6 +12767,11 @@ async fn wss_agent_complete_once_routes_non_auggie_provider_via_ephemeral_acp() 
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
+    if common::claude_npx::in_subprocess(
+        "wss_agent_complete_once_claude_code_sends_slimmed_session_meta",
+    ) {
+        return;
+    }
     // intent-hq/intent#4587: over the real WSS transport, a claude-code
     // `agent.completeOnce` opens the ephemeral session with a slimming
     // `_meta` — the caller's `systemPrompt` as a STRING (replaces the
@@ -11922,8 +12807,9 @@ async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
     srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
     srv.set_setting(
         "providers.paths",
-        serde_json::json!({ "claude-code": bin.to_string_lossy() }),
+        serde_json::json!({ "claude-code": common::claude_npx::legacy_override() }),
     );
+    common::claude_npx::select_adapter(&bin);
 
     let resp = wss_call(
         srv.port,
@@ -11956,6 +12842,7 @@ async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
                     "tools": [],
                     "settingSources": ["user"],
                     "strictMcpConfig": true,
+                    "extraArgs": {"disable-slash-commands": null},
                 }
             },
         }),
@@ -11967,6 +12854,11 @@ async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
+    if common::codex_npx::in_subprocess(
+        "wss_agent_complete_once_acp_adapter_failure_is_internal_error",
+    ) {
+        return;
+    }
     // A RESOLVED adapter that dies before completing the turn is a hard
     // -32603 (§5.32), not `{ available: false }` — the unavailable result is
     // reserved for routing/resolution, and the reason is prefixed with the
@@ -11978,10 +12870,7 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
-    srv.set_setting(
-        "providers.paths",
-        serde_json::json!({ "codex": bin.to_string_lossy() }),
-    );
+    common::codex_npx::select_adapter(&bin);
 
     let resp = wss_call(
         srv.port,
@@ -11999,6 +12888,11 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
+    if common::codex_npx::in_subprocess(
+        "wss_host_provider_test_prompt_success_and_auth_required_paths",
+    ) {
+        return;
+    }
     // host.providerTestPrompt (§5.14) over the real wire, both terminal
     // shapes against the mock ACP fixture. A provider whose adapter answers
     // the live "say hello" turn is `{ ok: true }` and the cached
@@ -12021,10 +12915,7 @@ async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
         r#"{"promptRpcError":{"code":-32000,"message":"Authentication required"}}"#,
     );
     let srv = start(WsOptions::default()).await;
-    srv.set_setting(
-        "providers.paths",
-        serde_json::json!({ "codex": ok_bin.to_string_lossy() }),
-    );
+    common::codex_npx::select_adapter(&ok_bin);
 
     let resp = wss_call(
         srv.port,
@@ -12051,10 +12942,7 @@ async fn wss_host_provider_test_prompt_success_and_auth_required_paths() {
 
     // Same provider, now behind an adapter that rejects the prompt with the
     // claude-code auth-required shape (-32000 + auth-pattern message).
-    srv.set_setting(
-        "providers.paths",
-        serde_json::json!({ "codex": auth_bin.to_string_lossy() }),
-    );
+    common::codex_npx::select_adapter(&auth_bin);
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -12248,6 +13136,11 @@ async fn wss_acp_node_max_old_space_mb_setting_reaches_provider_test_prompt_chil
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued_calls_complete() {
+    if common::codex_npx::in_subprocess(
+        "wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued_calls_complete",
+    ) {
+        return;
+    }
     // Adapters that hold their slot for ~10s before answering the turn, so the
     // bound is saturated for a wide, non-racy window. The wrapper records one
     // line per adapter actually launched: the assertions below count it rather
@@ -12297,10 +13190,7 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
     };
     let srv = start(WsOptions::default()).await;
     srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
-    srv.set_setting(
-        "providers.paths",
-        serde_json::json!({ "codex": bin.to_string_lossy() }),
-    );
+    common::codex_npx::select_adapter(&bin);
 
     // The bound is a process-global installed once; ask for 1 and fill
     // whatever is actually in force, so this holds under any test runner.
@@ -12405,14 +13295,12 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_unavailable_when_adapter_unresolvable() {
     // The resolution tier of the gate: a one-shot-capable provider whose
-    // adapter resolves to nothing (no binary, no npx for the pinned fallback
+    // adapter resolves to nothing (no Node/npx for the pinned
     // package) returns `{ available: false, reason }`, never an error.
-    // Environment-gated — npx or an installed codex-acp both make the launch
-    // resolvable, and neither can be hidden hermetically.
-    if intent_providers::find_npx().is_some()
-        || intent_providers::find_provider_binary("codex", "codex-acp", None).is_some()
-    {
-        eprintln!("skipping unresolvable-adapter e2e: npx or codex-acp is installed");
+    // Environment-gated — missing prerequisites are covered hermetically
+    // by service tests; native codex-acp cannot substitute for Node/npx.
+    if intent_providers::find_codex_npx().is_some() {
+        eprintln!("skipping unresolvable-adapter e2e: Codex Node/npx is installed");
         return;
     }
     let srv = start(WsOptions::default()).await;
@@ -12428,7 +13316,7 @@ async fn wss_agent_complete_once_unavailable_when_adapter_unresolvable() {
         resp["result"],
         serde_json::json!({
             "available": false,
-            "reason": "codex: no adapter could be resolved (binary not found and npx unavailable)"
+            "reason": intent_providers::CODEX_ACP_PREREQUISITE_ERROR
         })
     );
     srv.ws.stop().await;
@@ -12592,6 +13480,11 @@ async fn wss_agent_complete_once_resolves_quick_action_settings() {
 #[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_provider() {
+    if common::codex_npx::in_subprocess(
+        "wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_provider",
+    ) {
+        return;
+    }
     // A user-authored `quickActions.defaultModel = "codex:gpt-5"` (legacy
     // compound; the wire rejects compounds but user files are never
     // rejected) splits on read into a (codex, gpt-5) pair and routes the
@@ -12604,6 +13497,7 @@ async fn wss_agent_complete_once_legacy_compound_quick_action_routes_to_its_prov
     }
     let (_adapter_dir, bin) =
         fake_acp_adapter_script("compound-quick", r#"{"response":"🤖\ncompound-routed"}"#);
+    common::codex_npx::select_adapter(&bin);
     let srv = start(WsOptions::default()).await;
     // Seed via reload() — the live-reload watcher path for an externally
     // edited config.toml — since settings.update rejects compound values.
@@ -13012,6 +13906,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -13289,8 +14184,8 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         .await
         .expect("insert workspace");
 
-    // One persistent connection: subscribe first so the `workspace:updated`
-    // notification from the mutation below is delivered to this client.
+    // Subscribe before mutating. Use a separate RPC connection so waiting
+    // for the response cannot discard an event delivered ahead of it.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
     let rpc = |id: i64, method: &str, params: Value| {
         serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
@@ -13315,9 +14210,10 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         "subscribe: {sub}"
     );
 
+    let mut rpc_ws = connect_ws(srv.port, srv.cfg.clone()).await;
     // Set: camelCase wire field lands on the row and echoes in the response.
     let resp = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             2,
             "workspace.update",
@@ -13366,7 +14262,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
 
     // Read-back proves persistence through the store.
     let got = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             3,
             "workspace.get",
@@ -13383,7 +14279,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
     // Clear: wire `null` (double-option `Some(None)`) empties the column and
     // the cleared field is omitted from the returned payload.
     let cleared = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             4,
             "workspace.update",
@@ -13408,7 +14304,7 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
         "cleared asset id must be omitted, not null: {cleared}"
     );
     let got = send_and_wait(
-        &mut ws,
+        &mut rpc_ws,
         rpc(
             5,
             "workspace.get",
@@ -13870,6 +14766,33 @@ async fn wss_git_root_list_and_scoped_reads_round_trip() {
     )
     .await;
     assert_eq!(resp["result"]["files"], serde_json::json!([]));
+
+    // The canonical history read must keep its root scope and page semantics
+    // independently of the retired git.log alias.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 11, "method": "git.commits",
+            "params": {"workspaceId": ws_id, "gitRootId": root.id.as_str(), "page": {"limit": 1}}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 11);
+    assert!(resp.get("error").is_none(), "{resp}");
+    let items = resp["result"]["items"].as_array().expect("history page");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["message"], "nested-second");
+    assert!(
+        items[0].get("files").is_none(),
+        "history stays metadata-only"
+    );
+    assert!(
+        resp["result"]["nextToken"].is_string(),
+        "second commit remains: {resp}"
+    );
 
     // Unknown gitRootId on git.commitDetails → -32602 (never an empty fallback).
     let resp = wss_call(
@@ -16021,6 +16944,7 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
         ..WsOptions::default()
     })
     .await;
+    let owner = srv.store.get_primary_principal().await.unwrap();
     let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
     sub.send(Message::Text(
         r#"{"jsonrpc":"2.0","id":"sub","method":"events.subscribe","params":{"eventTypes":["client:connected","client:disconnected"]}}"#
@@ -16056,7 +16980,9 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     let ev = await_client_event(&mut sub, "client:connected", "tls-aux").await;
     assert_eq!(
         ev["data"],
-        serde_json::json!({ "clientId": "tls-aux", "capabilities": {} })
+        serde_json::json!({ "clientId": "tls-aux", "capabilities": {"browserExec": false},
+            "principalId": owner.id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null })
     );
     assert!(
         !srv.reverse_registry.is_connected(),
@@ -16080,7 +17006,9 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     assert_eq!(ev["workspaceId"], "");
     assert_eq!(
         ev["data"],
-        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true } })
+        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true },
+            "principalId": owner.id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null })
     );
 
     // Leave `desktop` unpolled: no pongs, so the heartbeat reaper aborts its
@@ -16088,7 +17016,9 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     let ev = await_client_event(&mut sub, "client:disconnected", "tls-desktop").await;
     assert_eq!(
         ev["data"],
-        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true } })
+        serde_json::json!({ "clientId": "tls-desktop", "capabilities": { "browserExec": true },
+            "principalId": owner.id, "hostRole": "owner",
+            "login": null, "displayName": null, "avatarUrl": null })
     );
     assert!(!srv.reverse_registry.is_connected());
     assert!(srv
@@ -16438,10 +17368,10 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let agent = AgentId::from(agent_id.as_str());
 
     // Seed a 120-message transcript — well past the 50-message default page.
-    // Capture the id at seq 100 (inside the bounded newest page 70..=119) for
+    // Capture the id at seq 117 (inside the newest-twenty snapshot 100..=119) for
     // the `chat.subscribe` resume path below.
     let mut newest_message_id = String::new();
-    let mut seq_100_message_id = String::new();
+    let mut seq_117_message_id = String::new();
     for i in 0..120 {
         let (role, text) = if i % 2 == 0 {
             ("user", format!("prompt {i}"))
@@ -16459,8 +17389,8 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
             .await
             .expect("append message")
             .id;
-        if i == 100 {
-            seq_100_message_id = newest_message_id.clone();
+        if i == 117 {
+            seq_117_message_id = newest_message_id.clone();
         }
     }
 
@@ -16877,7 +17807,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     );
 
     // chat.subscribe — the seq-0 snapshot over WSS is the bounded newest
-    // `agent.getConversation` page (PROTOCOL §7.1), not the full history.
+    // twenty-message page (PROTOCOL §7.1), independent of the generic default 50.
     let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
     sub.send(Message::Text(
         format!(
@@ -16921,11 +17851,11 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let snap_msgs = snapshot["messages"].as_array().expect("snapshot messages");
     assert_eq!(
         snap_msgs.len(),
-        50,
-        "seq-0 snapshot is the bounded default page, not all 120"
+        20,
+        "seq-0 snapshot is the newest-twenty page, not all 120"
     );
-    assert_eq!(snap_msgs[0]["seq"], 70);
-    assert_eq!(snap_msgs[49]["seq"], 119);
+    assert_eq!(snap_msgs[0]["seq"], 100);
+    assert_eq!(snap_msgs[19]["seq"], 119);
     assert_eq!(snapshot["truncated"], true);
     assert_eq!(snapshot["totalMessages"], 120);
     assert!(
@@ -16938,6 +17868,25 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     );
     drop(sub);
 
+    // The snapshot cursor continues immediately before seq 100, without
+    // repeating its oldest row or skipping any history.
+    let snapshot_cursor = snapshot["nextToken"].as_str().unwrap();
+    let older = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":39,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":5,"nextToken":"{snapshot_cursor}"}}}}"#
+        ),
+    )
+    .await;
+    let older_seqs: Vec<i64> = older["result"]["messages"]
+        .as_array()
+        .expect("older snapshot page")
+        .iter()
+        .map(|message| message["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(older_seqs, (95..=99).collect::<Vec<i64>>());
+
     // chat.subscribe resume (PROTOCOL §7.1): `sinceMessageId` inside the
     // bounded page yields only the messages AFTER it, `resumed: true`, and no
     // older-pages cursor (the client already holds everything up to the id).
@@ -16945,7 +17894,7 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         srv.port,
         srv.cfg.clone(),
         &format!(
-            r#"{{"jsonrpc":"2.0","id":40,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","sinceMessageId":"{seq_100_message_id}"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":40,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","sinceMessageId":"{seq_117_message_id}"}}}}"#
         ),
         40,
     )
@@ -16953,11 +17902,11 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let msgs = resumed["messages"].as_array().expect("resumed messages");
     assert_eq!(
         msgs.len(),
-        19,
-        "only rows after seq 100 (101..=119): {resumed}"
+        2,
+        "only rows after seq 117 (118..=119): {resumed}"
     );
-    assert_eq!(msgs[0]["seq"], 101);
-    assert_eq!(msgs[18]["seq"], 119);
+    assert_eq!(msgs[0]["seq"], 118);
+    assert_eq!(msgs[1]["seq"], 119);
     assert_eq!(resumed["resumed"], true);
     assert_eq!(resumed["truncated"], false);
     assert!(resumed["nextToken"].is_null(), "no gap cursor: {resumed}");
@@ -16980,16 +17929,52 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let msgs = fallback["messages"].as_array().expect("fallback messages");
     assert_eq!(
         msgs.len(),
-        50,
-        "full bounded page on unknown id: {fallback}"
+        20,
+        "newest-twenty page on unknown id: {fallback}"
     );
-    assert_eq!(msgs[0]["seq"], 70);
+    assert_eq!(msgs[0]["seq"], 100);
+    assert_eq!(msgs[19]["seq"], 119);
     assert_eq!(fallback["resumed"], false);
     assert_eq!(fallback["truncated"], true);
     assert!(
         fallback["nextToken"].as_str().is_some(),
         "fallback keeps the older-pages cursor"
     );
+    assert_eq!(fallback["nextToken"], snapshot["nextToken"]);
+
+    // An explicit subscription limit selects the newest requested window.
+    for (limit, count) in [
+        (json!(50), 50),
+        (json!(1), 1),
+        (json!(5), 5),
+        (json!(200), 120),
+        (Value::Null, 20),
+    ] {
+        let request = json!({"jsonrpc":"2.0", "id":42, "method":"chat.subscribe",
+            "params":{"agentId":agent_id, "limit":limit}});
+        let configured =
+            chat_subscribe_snapshot(srv.port, srv.cfg.clone(), &request.to_string(), 42).await;
+        let messages = configured["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), count, "limit={limit}: {configured}");
+        assert_eq!(messages[0]["seq"], 120 - count);
+        assert_eq!(messages[count - 1]["seq"], 119);
+        assert_eq!(configured["truncated"], count < 120);
+    }
+    for limit in [
+        json!(0),
+        json!(-1),
+        json!(201),
+        json!(1.5),
+        json!("50"),
+        json!(true),
+    ] {
+        let request = json!({"jsonrpc":"2.0", "id":43, "method":"chat.subscribe",
+            "params":{"agentId":agent_id, "limit":limit}});
+        let invalid = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+        assert_eq!(invalid["jsonrpc"], "2.0");
+        assert_eq!(invalid["id"], 43);
+        assert_eq!(invalid["error"]["code"], -32602, "{invalid}");
+    }
 
     // Hydration regression: corrupt every row OLDER than the newest bounded
     // page — any path that fetches/decodes them now fails hard.
@@ -17390,7 +18375,7 @@ async fn wss_slim_conversation_pages_are_byte_budgeted() {
         srv.port,
         srv.cfg.clone(),
         &format!(
-            r#"{{"jsonrpc":"2.0","id":4,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","projection":"slim"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":4,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","projection":"slim","limit":50}}}}"#
         ),
         4,
     )
@@ -18297,7 +19282,7 @@ async fn wss_workspace_transfer_plan_round_trip() {
     assert_eq!(resp["id"], 2, "envelope: {resp}");
     let plan = &resp["result"]["plan"];
     let manifest = &plan["manifest"];
-    assert_eq!(manifest["formatVersion"], 1, "{resp}");
+    assert_eq!(manifest["formatVersion"], 2, "{resp}");
     assert!(
         manifest["creatingIntentdVersion"].is_string(),
         "manifest records the creating daemon version: {resp}"
@@ -18959,6 +19944,127 @@ async fn wss_file_attachment_idempotency_key_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Registered-root file reads retain root identity and containment over WSS.
+#[intent_test_macros::daemon_test]
+async fn wss_file_read_registered_roots() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+    let dir = test_tempdir("intentd-wss-read-roots-");
+    let primary = dir.path().join("primary");
+    let nested = primary.join("nested");
+    let external = dir.path().join("external");
+    for path in [&primary, &nested, &external] {
+        std::fs::create_dir_all(path).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let ws = WorkspaceId::new();
+    let foreign_ws = WorkspaceId::new();
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(primary.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.unwrap();
+    srv.store
+        .insert_workspace(&fixture_workspace(&foreign_ws))
+        .await
+        .unwrap();
+    std::fs::write(primary.join("new.txt"), "primary").unwrap();
+
+    for (path, content) in [(&nested, "nested"), (&external, "external")] {
+        std::fs::write(path.join("new.txt"), content).unwrap();
+        let ts = now_iso();
+        let mut root = intent_core::WorkspaceGitRoot {
+            id: intent_core::WorkspaceGitRootId::new(),
+            workspace_id: ws.clone(),
+            path: path.to_string_lossy().into_owned(),
+            source: intent_core::WorkspaceGitRootSource::Agent,
+            repo_owner: None,
+            repo_name: None,
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        srv.store.upsert_workspace_git_root(&root).await.unwrap();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "file.read",
+            "params": { "workspaceId": ws, "gitRootId": root.id, "path": "new.txt" }
+        });
+        let response = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+        assert_eq!(response["result"], content, "{response}");
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["jsonrpc"], "2.0");
+
+        let payload = [0xff, 0xfe, 0x01, 0x02];
+        std::fs::write(path.join("binary.bin"), payload).unwrap();
+        let chunk_request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "file.readChunk",
+            "params": { "workspaceId": ws, "gitRootId": root.id, "path": "binary.bin", "offset": 1, "length": 2 }
+        });
+        let response = wss_call(srv.port, srv.cfg.clone(), &chunk_request.to_string()).await;
+        assert_eq!(
+            response["result"],
+            serde_json::json!({
+                "content": base64::engine::general_purpose::STANDARD.encode(&payload[1..3]),
+                "bytesRead": 2, "size": 4
+            }),
+            "{response}"
+        );
+        for request in [&request, &chunk_request] {
+            for escape in [
+                "../new.txt".to_owned(),
+                primary.join("new.txt").to_string_lossy().into_owned(),
+            ] {
+                let mut denied = request.clone();
+                denied["params"]["path"] = serde_json::json!(escape);
+                let response = wss_call(srv.port, srv.cfg.clone(), &denied.to_string()).await;
+                assert_eq!(response["error"]["code"], -32603, "{response}");
+            }
+        }
+        // A foreign registered id is indistinguishable from that same unknown id.
+        srv.store.delete_workspace_git_root(&root.id).await.unwrap();
+        root.workspace_id = foreign_ws.clone();
+        srv.store.upsert_workspace_git_root(&root).await.unwrap();
+        for request in [&request, &chunk_request] {
+            let foreign = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+            srv.store.delete_workspace_git_root(&root.id).await.unwrap();
+            let unknown = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+            assert_eq!(foreign["error"]["code"], -32602, "{foreign}");
+            assert_eq!(foreign["error"], unknown["error"]);
+            srv.store.upsert_workspace_git_root(&root).await.unwrap();
+        }
+    }
+    for selector in [None, Some(""), Some("   ")] {
+        let mut request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "file.read",
+            "params": { "workspaceId": ws, "path": "new.txt" }
+        });
+        if let Some(selector) = selector {
+            request["params"]["gitRootId"] = serde_json::json!(selector);
+        }
+        let response = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+        assert_eq!(response["result"], "primary", "{response}");
+        request["method"] = serde_json::json!("file.readChunk");
+        request["params"]["offset"] = serde_json::json!(0);
+        request["params"]["length"] = serde_json::json!(16);
+        let response = wss_call(srv.port, srv.cfg.clone(), &request.to_string()).await;
+        assert_eq!(
+            response["result"]["content"],
+            base64::engine::general_purpose::STANDARD.encode("primary"),
+            "{response}"
+        );
+    }
+    srv.ws.stop().await;
+}
+
 /// `file.readChunk` over the real WSS wire (PROTOCOL §5.9, v6.18,
 /// monorepo#2458): raw bytes of a binary workspace file are served as
 /// offset-windowed base64 chunks `{ content, bytesRead, size }` and
@@ -19342,10 +20448,83 @@ async fn wss_file_attachment_upload_round_trip() {
 /// a pending session idempotently.
 #[intent_test_macros::daemon_test]
 async fn wss_workspace_import_lifecycle() {
+    // Availability is discovery-only during import. Keep its canonical CLI
+    // fixture and discovery caches in a separate process, including on Windows.
+    const TEST: &str = "wss_workspace_import_lifecycle";
+    if std::env::var("INTENTD_IMPORT_CLI_TEST").as_deref() != Ok(TEST) {
+        use std::process::{Command, Stdio};
+
+        let root = common::test_tempdir("itd-import-cli-");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let cli = bin.join("codex");
+            std::fs::write(&cli, "#!/bin/sh\n: > \"$0.launched\"\nexit 91\n").unwrap();
+            std::fs::set_permissions(cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        std::fs::write(bin.join("codex.exe"), b"discovery-only fixture").unwrap();
+        let mut paths = vec![bin.clone()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let log_path = root.path().join("test.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env("INTENTD_IMPORT_CLI_TEST", TEST)
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log));
+        #[cfg(unix)]
+        let mut child = intentd_test_support::GuardedChild::spawn(&mut cmd).unwrap();
+        #[cfg(unix)]
+        let status = child
+            .wait_with_timeout(common::test_timeout(std::time::Duration::from_secs(180)))
+            .unwrap()
+            .expect("isolated import test timed out");
+        #[cfg(not(unix))]
+        let mut child = common::DaemonGuard::process_only(cmd.spawn().unwrap());
+        #[cfg(not(unix))]
+        let status = tokio::time::timeout(
+            common::test_timeout(std::time::Duration::from_secs(180)),
+            async {
+                loop {
+                    if let Some(status) = child.child_mut().try_wait().unwrap() {
+                        break status;
+                    }
+                    // timing-guard: poll the owned test child's exit within the bounded wait.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .expect("isolated import test timed out");
+        assert!(
+            status.success(),
+            "{TEST}: {}",
+            std::fs::read_to_string(log_path).unwrap()
+        );
+        assert!(
+            !bin.join("codex.launched").exists(),
+            "import must not launch the installed CLI"
+        );
+        return;
+    }
     use base64::Engine as _;
     use std::io::Write as _;
 
     let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.enabled", serde_json::json!({"auggie":false}));
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({"codex":std::env::current_exe().unwrap()}),
+    );
+    srv.set_setting("model.defaultProvider", serde_json::json!("codex"));
+    srv.set_setting("model.default", serde_json::json!("gpt-6-astra"));
+    srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
     let ws_id = "ws-wss-imported";
     let t = "2026-08-11T00:00:00Z";
 
@@ -19389,6 +20568,9 @@ async fn wss_workspace_import_lifecycle() {
             serde_json::json!({
                 "id": "agent-wss-import", "workspace_id": ws_id, "name": "A",
                 "status": "active", "is_active": 1, "acp_session_id": "acp-stale",
+                "provider": "auggie", "model": "gpt6-astra", "reasoning_effort": "low",
+                "effort_levels": "[\"source-only\"]",
+                "last_turn_provider": "auggie", "last_turn_model": "gpt6-astra",
                 "created_at": t, "updated_at": t
             })
         )
@@ -19492,6 +20674,30 @@ async fn wss_workspace_import_lifecycle() {
         "in-flight agent surfaced as interrupted: {committed}"
     );
     assert!(committed["result"]["importedRows"].as_u64().unwrap() >= 2);
+
+    // Import persists the destination triple before it is visible to the
+    // renderer. History remains separate and no provider session was opened.
+    let selected = wss_call(srv.port, srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":60,"method":"agent.getSession","params":{"agentId":"agent-wss-import"}}"#).await;
+    assert_eq!(selected["jsonrpc"], "2.0");
+    assert_eq!(selected["id"], 60);
+    let session = &selected["result"]["session"];
+    assert_eq!(session["provider"], "codex", "{selected}");
+    assert_eq!(session["model"], "gpt-6-astra", "{selected}");
+    assert_eq!(session["reasoningEffort"], "high", "{selected}");
+    assert!(session["effortLevels"].is_null(), "{selected}");
+    assert!(session["acpSessionId"].is_null(), "{selected}");
+    assert_eq!(session["isActive"], false, "{selected}");
+    assert_eq!(
+        srv.store
+            .get_agent_session_last_turn_model(
+                &intent_core::WorkspaceId::from(ws_id),
+                &intent_core::AgentId::from("agent-wss-import")
+            )
+            .await
+            .unwrap(),
+        (Some("gpt6-astra".into()), Some("auggie".into()))
+    );
 
     // The commit's `workspace:created` event reaches the subscriber (§6.3).
     let evt = tokio::time::timeout(Duration::from_secs(10), async {
@@ -21728,4 +22934,317 @@ async fn wss_cross_workspace_siblings_resolve_by_github_identity() {
     );
 
     srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn wss_quick_action_effort_settings_and_execution_contract() {
+    if common::claude_npx::in_subprocess("wss_quick_action_effort_settings_and_execution_contract")
+    {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = test_tempdir("wss-quick-action-effort-");
+    let log = dir.path().join("requests.jsonl");
+    let behavior = dir.path().join("behavior.json");
+    std::fs::write(&behavior, "{}").unwrap();
+    let fixture = format!(
+        "{}/tests/fixtures/mock-quick-action-effort.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let bin = dir.path().join("claude-agent-acp");
+    std::fs::write(&bin, format!("#!/bin/sh\nMOCK_EFFORT_BEHAVIOR=\"$(cat {behavior:?})\" MOCK_EFFORT_LOG={log:?} exec node {fixture:?}\n")).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("claude-code"));
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({"claude-code":common::claude_npx::legacy_override()}),
+    );
+    common::claude_npx::select_adapter(&bin);
+    srv.set_setting(
+        "quickActions.typeOverrides",
+        serde_json::json!({"commit":"action-model"}),
+    );
+    let changes = serde_json::json!([
+        {"path":"quickActions.defaultReasoningEffort","value":"low"},
+        {"path":"quickActions.typeReasoningEffortOverrides","value":{"commit":"high","pr":"stale"}},
+        {"path":"quickActions.providerSettings","value":{"claude-code":{"defaultReasoningEffort":"low","typeReasoningEffortOverrides":{"commit":"high"}}}}
+    ]);
+    let updated = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"settings.update","params":{"changes":changes}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(updated["jsonrpc"], "2.0");
+    assert_eq!(updated["id"], 1);
+    assert!(updated.get("error").is_none(), "{updated}");
+    for change in changes.as_array().unwrap() {
+        let read = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":2,"method":"settings.get","params":{"path":change["path"]}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(read["result"]["value"], change["value"], "{read}");
+    }
+    // Explicit model does not bypass the independently resolved action effort.
+    for (kind, effort, expected, model) in [
+        ("commit", Value::Null, "high", Some("chosen")),
+        ("commit", serde_json::json!(" "), "high", Some("chosen")),
+        ("pr", Value::Null, "low", Some("chosen")),
+        ("fast", Value::Null, "low", Some("chosen")),
+        ("commit", serde_json::json!("low"), "low", Some("chosen")),
+        (" commit ", Value::Null, "high", Some("chosen")),
+        ("commit", Value::Null, "high", None),
+        (" commit ", Value::Null, "high", None),
+    ] {
+        std::fs::write(&log, "").unwrap();
+        let reply = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &serde_json::json!({
+                "jsonrpc":"2.0","id":3,"method":"agent.completeOnce",
+                "params":{"prompt":"hi","model":model,"type":kind,"reasoningEffort":effort}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(reply["id"], 3);
+        assert_eq!(reply["jsonrpc"], "2.0");
+        let text: Value =
+            serde_json::from_str(reply["result"]["text"].as_str().expect("completion text"))
+                .unwrap();
+        assert_eq!(
+            text,
+            serde_json::json!({"model":model.unwrap_or("action-model"),"effort":expected})
+        );
+        let requests: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| r["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "initialize",
+                "session/new",
+                "session/set_config_option",
+                "session/set_config_option",
+                "session/prompt"
+            ]
+        );
+        assert_eq!(requests[3]["params"]["value"], expected);
+    }
+    for invalid in [
+        serde_json::json!(17),
+        serde_json::json!(true),
+        serde_json::json!([]),
+        serde_json::json!({}),
+        serde_json::json!("unsupported"),
+    ] {
+        std::fs::write(&log, "").unwrap();
+        let reply = wss_call(srv.port, srv.cfg.clone(), &serde_json::json!({
+            "jsonrpc":"2.0","id":4,"method":"agent.completeOnce","params":{"prompt":"hi","reasoningEffort":invalid}
+        }).to_string()).await;
+        assert_eq!(reply["jsonrpc"], "2.0");
+        assert_eq!(reply["id"], 4);
+        assert_eq!(reply["error"]["code"], -32602, "{reply}");
+        assert!(!std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("session/prompt"));
+    }
+    std::fs::write(&behavior, r#"{"rejectEffort":true}"#).unwrap();
+    std::fs::write(&log, "").unwrap();
+    let reply = wss_call(srv.port, srv.cfg.clone(), r#"{"jsonrpc":"2.0","id":5,"method":"agent.completeOnce","params":{"prompt":"hi","reasoningEffort":"high"}}"#).await;
+    assert_eq!(reply["error"]["code"], -32603, "{reply}");
+    assert!(!std::fs::read_to_string(&log)
+        .unwrap()
+        .contains("session/prompt"));
+    srv.ws.stop().await;
+}
+
+/// First assignment owns every socket before writing and serves authenticated
+/// WSS only after the registry accepts that write. Two racing callers commit once.
+#[intent_test_macros::daemon_test]
+async fn port_assignment_reserves_persists_then_serves_and_reuses() {
+    if !ipv6_loopback_available() {
+        return;
+    }
+    let hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let base = hog.local_addr().unwrap().port();
+    let (api, bus, _store, registry, dir) = make_services(None, None).await;
+    let snapshot = registry.snapshot();
+    let tls = ensure_tls_certificate(dir.path()).unwrap();
+    let tokens = Arc::new(MemTokenStore::default());
+    tokens.store_token(TOKEN).unwrap();
+    let tokens = Arc::new(AsyncTokenStore::new(tokens));
+    let addresses = vec![
+        Ipv4Addr::LOCALHOST.into(),
+        std::net::Ipv6Addr::LOCALHOST.into(),
+    ];
+    let ws = WsApiServer::new(
+        api,
+        bus,
+        &tls,
+        &tokens,
+        WsOptions {
+            base_port: base,
+            bind_addresses: addresses.clone(),
+            ..WsOptions::default()
+        },
+        None,
+    )
+    .unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let persist = {
+        let registry = registry.clone();
+        let calls = calls.clone();
+        move |port| {
+            for address in &addresses {
+                assert!(
+                    StdTcpListener::bind((*address, port)).is_err(),
+                    "all sockets reserved at commit"
+                );
+            }
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            registry
+                .persist_selected_ws_api_port(&snapshot, port)
+                .map_err(std::io::Error::other)
+        }
+    };
+    let (a, b) = tokio::join!(
+        ws.start_with_port_assignment(persist.clone()),
+        ws.start_with_port_assignment(persist)
+    );
+    let port = a.unwrap();
+    assert!(port > base);
+    assert_eq!(b.unwrap(), port);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        registry.snapshot().ws_api_port_policy(),
+        intent_services::WsApiPortPolicy::Fixed(port)
+    );
+    let mut client = connect_ws(port, client_config(&tls.fingerprint256)).await;
+    client.send(Message::Text(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"settings.get","params":{"path":"server.wsApi.port"}}).to_string().into())).await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Message::Text(text) = client
+                .next()
+                .await
+                .expect("WSS response")
+                .expect("WSS frame")
+            {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                if frame["id"] == 1 {
+                    break frame;
+                }
+            }
+        }
+    })
+    .await
+    .expect("settings response before timeout");
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["result"]["value"].as_f64(), Some(f64::from(port)));
+    drop(client);
+    ws.stop().await;
+    drop(hog);
+    let again = ws
+        .start_with_port_assignment(|_| panic!("must never assign twice"))
+        .await
+        .unwrap();
+    assert_eq!(
+        again, port,
+        "freeing preferred port does not move the assignment"
+    );
+    ws.stop().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn port_assignment_failure_drops_reservations_without_readiness() {
+    let (api, bus, _store, registry, dir) = make_services(None, None).await;
+    let tls = ensure_tls_certificate(dir.path()).unwrap();
+    let tokens = Arc::new(AsyncTokenStore::new(Arc::new(MemTokenStore::default())));
+    // Ephemeral first bind is only a hermetic transport seam here; daemon
+    // composition never combines env-zero with assignment.
+    let ws = WsApiServer::new(
+        api,
+        bus,
+        &tls,
+        &tokens,
+        WsOptions {
+            base_port: 0,
+            bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
+            ..WsOptions::default()
+        },
+        None,
+    )
+    .unwrap();
+    let held_port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+    let observed = held_port.clone();
+    let snapshot = registry.snapshot();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "# external edit\n").unwrap();
+    let error = ws
+        .start_with_port_assignment(move |port| {
+            observed.store(port, std::sync::atomic::Ordering::SeqCst);
+            assert!(StdTcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err());
+            registry
+                .persist_selected_ws_api_port(&snapshot, port)
+                .map_err(std::io::Error::other)
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("changed"), "{error}");
+    assert_eq!(ws.bound_port().await, None);
+    let port = held_port.load(std::sync::atomic::Ordering::SeqCst);
+    assert_ne!(port, 0);
+    let released = StdTcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .expect("no listener leaked after persistence error");
+    drop(released);
+    assert_eq!(
+        std::fs::read_to_string(config).unwrap(),
+        "# external edit\n"
+    );
+    ws.stop().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn port_assignment_stop_cancels_scan_without_commit_or_socket_leak() {
+    let hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let base = hog.local_addr().unwrap().port();
+    let (api, bus, _store, _registry, _dir) = make_services(None, None).await;
+    let ws = WsApiServer::new_insecure(
+        api,
+        bus,
+        WsOptions {
+            base_port: base,
+            bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
+            ..WsOptions::default()
+        },
+        None,
+    );
+    let (started, ()) = tokio::join!(
+        ws.start_with_port_assignment(|_| panic!("cancelled scan must not commit")),
+        ws.stop()
+    );
+    assert_eq!(started.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+    assert_eq!(ws.bound_port().await, None);
+    drop(hog);
+    assert_eq!(
+        ws.start().await.unwrap(),
+        base,
+        "cancelled start leaves server reusable"
+    );
+    ws.stop().await;
 }

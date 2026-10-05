@@ -10,7 +10,7 @@ use crate::ids::WorkspaceId;
 /// Version of the transfer archive format. Bump on any breaking change to the
 /// manifest shape or archive layout; `workspace.import.begin` refuses archives
 /// whose format version it does not understand.
-pub const TRANSFER_FORMAT_VERSION: u32 = 1;
+pub const TRANSFER_FORMAT_VERSION: u32 = 2;
 
 /// Per-table row statistics for one workspace-scoped table included in a
 /// transfer (`event` is deliberately absent: event history stays on the

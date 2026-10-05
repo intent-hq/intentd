@@ -252,6 +252,11 @@ pub(crate) const TERMINAL_CWD: &str = "terminal:cwd";
 // (start, exit, auto-restart, URL detection) as `script:state`, and definition
 // mutations as `script:changed`. All payloads carry the `scriptId`.
 pub const SCRIPT_OUTPUT: &str = "script:output";
+pub const SCRIPT_MONITOR_REGISTERED: &str = "scriptMonitor:registered";
+pub const SCRIPT_MONITOR_COMPLETED: &str = "scriptMonitor:completed";
+pub const SCRIPT_MONITOR_EXPIRED: &str = "scriptMonitor:expired";
+pub const SCRIPT_MONITOR_TRIGGERED: &str = "scriptMonitor:triggered";
+pub const SCRIPT_MONITOR_CANCELLED: &str = "scriptMonitor:cancelled";
 pub const SCRIPT_STATE: &str = "script:state";
 pub const SCRIPT_CHANGED: &str = "script:changed";
 
@@ -361,6 +366,8 @@ pub(crate) const GOAL_UPDATED: &str = "goal:updated";
 
 // Comment events.
 pub const COMMENT_ADDED: &str = "comment:added";
+/// A durable deletion; retain the thread identity after the row is gone.
+pub const COMMENT_DELETED: &str = "comment:deleted";
 // Emitted by `comment.resolveThread` when a thread is (un)resolved. The
 // self-sufficient payload `{ noteId, threadId, resolved }` lets a client flip
 // the thread's resolved state without a follow-up read.
@@ -462,6 +469,30 @@ pub const SETTINGS_CHANGED: &str = "settings:changed";
 // device code — so subscribers refresh via `github.authStatus`.
 pub const GITHUB_AUTH_CHANGED: &str = "github:auth-changed";
 
+// Provider-generic forge auth events (new in intentd v10.5; PROTOCOL §5.27
+// "Provider-generic auth — `sourceControl.*`"). Emitted on every terminal
+// transition of any provider's auth surface: device-grant outcomes, a
+// successful PAT connect (`authorized`), and `sourceControl.revoke`
+// (`revoked`). Payload `{ provider, host, status }` — global like
+// `settings:changed`; never a token, device code or PAT. GitHub transitions
+// emit this event AND the unchanged `github:auth-changed`.
+pub const SOURCE_CONTROL_AUTH_CHANGED: &str = "sourceControl:auth-changed";
+
+/// Owner-only authentication transition for an isolated collaboration credential.
+/// Payload `{ provider, host, purpose: "collaboration", status, flowId? }`.
+pub const IDENTITY_AUTH_CHANGED: &str = "identity:auth-changed";
+
+// Primary-identity re-key (protocol 10.8). Emitted when the primary
+// principal's identity triple is replaced by `identity.select` or `identity.provider`
+// change — never on the implicit refresh (the identity lock blocks those).
+// Payload `{ principalId, identity: { provider, host, externalUserId },
+// login? }`; owner-only, like `sourceControl:auth-changed`.
+pub const HOST_MEMBERS_CHANGED: &str = "host:members-changed";
+pub const HOST_INVITES_CHANGED: &str = "host:invites-changed";
+pub const HOST_EXECUTION_CONTEXT_CHANGED: &str = "host:execution-context-changed";
+
+pub const PRINCIPAL_IDENTITY_CHANGED: &str = "principal:identity-changed";
+
 // App-UI events (new in intentd; daemon-owned UI-driving surface for the
 // chief workspace). `app:ui-navigate` → `{ route, workspaceId, highlightId?,
 // durationMs? }`, `app:ui-highlight` → `{ id, workspaceId, durationMs? }`,
@@ -504,10 +535,22 @@ pub const BROWSER_TAB_CLOSED: &str = "browser:tab-closed";
 // transport's primary reverse registry). Global (empty `workspaceId`, like
 // `settings:changed`): `client:connected` when a `clientId` gains its first
 // live hello'd connection, `client:disconnected` when it loses its last.
-// Payload `{ clientId, name?, capabilities }` — the owner's device identity,
-// so the pair is owner-only (see [`COLLABORATOR_EVENT_TYPES`]).
+// Payload keeps `{ clientId, name?, capabilities }` and adds the admitted
+// principal projection. Updates carry the full row. Owner/member see the host
+// roster; guests see only their own principal (live and durable reads).
 pub const CLIENT_CONNECTED: &str = "client:connected";
 pub const CLIENT_DISCONNECTED: &str = "client:disconnected";
+pub const CLIENT_UPDATED: &str = "client:updated";
+pub const CLIENT_EVENT_TYPES: &[&str] = &[CLIENT_CONNECTED, CLIENT_DISCONNECTED, CLIENT_UPDATED];
+
+/// Device audiences are checked separately from workspace membership.
+#[must_use]
+pub fn is_client_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        CLIENT_CONNECTED | CLIENT_DISCONNECTED | CLIENT_UPDATED
+    )
+}
 
 /// Every canonical event-type string in the taxonomy above. Useful for
 /// validation and the filter/subscription wiring added in later M2 tasks.
@@ -588,6 +631,11 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SCRIPT_OUTPUT,
     SCRIPT_STATE,
     SCRIPT_CHANGED,
+    SCRIPT_MONITOR_REGISTERED,
+    SCRIPT_MONITOR_COMPLETED,
+    SCRIPT_MONITOR_EXPIRED,
+    SCRIPT_MONITOR_TRIGGERED,
+    SCRIPT_MONITOR_CANCELLED,
     HOOK_SCHEDULED,
     HOOK_RUN_STARTED,
     HOOK_RUN_COMPLETED,
@@ -626,6 +674,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SPEC_UPDATED,
     GOAL_UPDATED,
     COMMENT_ADDED,
+    COMMENT_DELETED,
     COMMENT_RESOLVED,
     PRESENCE_CHANGED,
     NOTE_PRESENCE,
@@ -645,6 +694,12 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     MCP_SERVERS_STATUS_CHANGED,
     SETTINGS_CHANGED,
     GITHUB_AUTH_CHANGED,
+    SOURCE_CONTROL_AUTH_CHANGED,
+    IDENTITY_AUTH_CHANGED,
+    PRINCIPAL_IDENTITY_CHANGED,
+    HOST_MEMBERS_CHANGED,
+    HOST_INVITES_CHANGED,
+    HOST_EXECUTION_CONTEXT_CHANGED,
     APP_UI_NAVIGATE,
     APP_UI_HIGHLIGHT,
     APP_WORKSPACE_OPEN,
@@ -655,6 +710,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     BROWSER_TAB_CLOSED,
     CLIENT_CONNECTED,
     CLIENT_DISCONNECTED,
+    CLIENT_UPDATED,
 ];
 
 /// How an [`EventDiscriminator`]'s `values` relate to the field at its `path`.
@@ -776,13 +832,13 @@ pub fn is_known_event_type(event_type: &str) -> bool {
 ///
 /// Owner-only by design (never listed): `terminal:*` (raw PTY bytes),
 /// `host:exec:*` (host command output), `script:*` (host process output /
-/// state), `browser:*` (the owner's tabs), `client:*` (the owner's device
-/// identity and host info), `hook:run-*` (hook code and carried state),
-/// `agent:permission:*` (tool-permission prompts are the owner's to answer),
+/// state), `browser:*` (the owner's tabs), `hook:run-*` (hook code and carried state),
+/// `agent:permission:*` (separately admitted for current workspace managers),
 /// `workspace:transfer:*` and `git:clone:*` (host paths / transfer
 /// progress), `gitRoot:*` (host paths), `test:*` / `build:*` (host process
 /// results), `app:*` (steers a client's UI; owner clients only, like reverse
-/// RPCs), `settings:changed`, `github:auth-changed`, `mcp:*` /
+/// RPCs), `settings:changed`, `github:auth-changed`,
+/// `sourceControl:auth-changed`, `identity:auth-changed`, `principal:identity-changed`, `mcp:*` /
 /// `mcp.servers:*`, and the agent-to-agent delivery bookkeeping events.
 pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (AGENT_ATTENTION_REQUESTED, "Agent lifecycle: an agent asked for input; { agentId, kind, reason }. Needed to render attention badges."),
@@ -821,7 +877,11 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (CHANGES_METRICS_CHANGED, "Changes: line-count metrics of tracked changes."),
     (CHANGES_TRACKED, "Changes: a file change was attributed to an agent; workspace-relative path."),
     (CHAT_STREAM_DELTA, "Chat channel: incremental transcript content of a conversation the guest can read; scoped per agent by the chat forwarder."),
+    (CLIENT_CONNECTED, "Authenticated devices: host-wide for owner/member, own principal only for guests; delivery and durable reads enforce the audience."),
+    (CLIENT_DISCONNECTED, "Authenticated devices: same audience as client.list; final connection departed."),
+    (CLIENT_UPDATED, "Authenticated devices: full row after metadata, profile or role changes; same audience as client.list."),
     (COMMENT_ADDED, "Comment: a comment landed on a note."),
+    (COMMENT_DELETED, "Comment: a comment was deleted from a note."),
     (COMMENT_RESOLVED, "Comment: a thread was resolved."),
     (DRAFT_CHANGED, "Draft: a client's composer draft exists or was cleared; { workspaceId, agentId, clientId, hasDraft } — never the text."),
     (FILE_CHANGED, "File: a watched file changed; payload paths are workspace-relative (`events::watcher::relative_path`), never absolute."),
@@ -853,6 +913,11 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (PR_MONITOR_EMITTED, "PR monitor: a debounced report was delivered; PR checklist state."),
     (PR_MONITOR_REGISTERED, "PR monitor: a monitor was registered; monitor and PR identity."),
     (PRESENCE_CHANGED, "Presence: the online members of a member workspace with their focus in that workspace and typing targets; principal profile fields already exposed by workspace.members.list. Transient."),
+    (SCRIPT_MONITOR_CANCELLED, "Script monitor: cancelled; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_COMPLETED, "Script monitor: completed; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_EXPIRED, "Script monitor: expired; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_REGISTERED, "Script monitor: registered; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_TRIGGERED, "Script monitor: triggered; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
     (SEARCH_DONE, "Search: a workspace-scoped search finished; correlated by the caller's requestId."),
     (SEARCH_RESULT, "Search: a page of workspace-scoped search matches; correlated by the caller's requestId."),
     (SKILLS_CHANGED, "Skills: the discovered skill set of a workspace changed; { workspaceId } only."),
@@ -891,4 +956,59 @@ pub fn is_collaborator_event_type(event_type: &str) -> bool {
     ALLOWED
         .get_or_init(|| COLLABORATOR_EVENT_TYPES.iter().map(|(t, _)| *t).collect())
         .contains(event_type)
+}
+
+/// Additional types available to active host members. Workspace types still
+/// require effective access to the referenced ordinary workspace; global
+/// membership/context notifications have explicit delivery rules. Permission
+/// types also admit guests with current workspace-management authority.
+pub const MEMBER_EVENT_TYPES: &[&str] = &[
+    AGENT_PERMISSION_REQUEST,
+    AGENT_PERMISSION_RESOLVED,
+    BROWSER_TAB_CLOSED,
+    BROWSER_TAB_OPENED,
+    BROWSER_TAB_UPDATED,
+    BUILD_COMPLETED,
+    BUILD_STARTED,
+    GIT_CLONE_DONE,
+    GIT_CLONE_PROGRESS,
+    GIT_ROOT_REGISTERED,
+    GIT_ROOT_UNREGISTERED,
+    GIT_ROOT_UPDATED,
+    HOOK_RUN_COMPLETED,
+    HOOK_RUN_STARTED,
+    HOST_EXEC_EXIT,
+    HOST_EXEC_STDERR,
+    HOST_EXEC_STDOUT,
+    HOST_EXECUTION_CONTEXT_CHANGED,
+    HOST_MEMBERS_CHANGED,
+    SCRIPT_CHANGED,
+    SCRIPT_OUTPUT,
+    SCRIPT_STATE,
+    TERMINAL_COMMAND,
+    TERMINAL_CWD,
+    TERMINAL_DATA,
+    TERMINAL_EXIT,
+    TERMINAL_TITLE,
+    TEST_COMPLETED,
+    TEST_STARTED,
+    WORKSPACE_TRANSFER_FAILED,
+    WORKSPACE_TRANSFER_PROGRESS,
+    WORKSPACE_TRANSFER_READY,
+];
+
+/// Whether a type is a member addition; delivery still checks its scope.
+#[must_use]
+pub fn is_member_execution_event_type(event_type: &str) -> bool {
+    MEMBER_EVENT_TYPES.contains(&event_type)
+}
+
+/// Permission events use the current workspace-management grant, including
+/// retained guest ownership, rather than general host execution authority.
+#[must_use]
+pub fn is_permission_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        AGENT_PERMISSION_REQUEST | AGENT_PERMISSION_RESOLVED
+    )
 }

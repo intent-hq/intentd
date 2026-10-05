@@ -8,25 +8,22 @@ use serde_json::{json, Value};
 
 use super::*;
 
+/// The invite link is tunnel-only: no `host` parameter at all (not even an
+/// empty one), `tc` always present, never the bearer token.
 #[test]
-fn invite_uri_carries_envelope_minus_token_plus_invite_fields() {
-    let uri = build_invite_uri(
-        &["192.168.1.10".to_string(), "10.0.0.5".to_string()],
-        7443,
-        "AB:CD",
-        "inv-1",
-        "s3cret",
-        None,
-    );
+fn invite_uri_is_tunnel_only_without_a_host_parameter() {
+    let uri = build_invite_uri(7443, "AB:CD", "inv-1", "s3cret", "tc-abc");
     assert_eq!(
         uri,
-        "intent://invite?v=1&host=192.168.1.10,10.0.0.5&port=7443&fp=AB:CD&inviteId=inv-1&secret=s3cret"
+        "intent://invite?v=1&port=7443&fp=AB:CD&inviteId=inv-1&secret=s3cret&tc=tc-abc"
     );
+    assert!(!uri.contains("host="), "{uri}");
     assert!(!uri.contains("token="));
-    let with_tc = build_invite_uri(&[], 7443, "AB", "i", "s", Some("tc-abc"));
-    assert!(with_tc.ends_with("&tc=tc-abc"), "{with_tc}");
-    let encoded = build_invite_uri(&[], 1, "AB", "a&b", "x=y", None);
-    assert!(encoded.contains("inviteId=a%26b&secret=x%3Dy"), "{encoded}");
+    let encoded = build_invite_uri(1, "AB", "a&b", "x=y", "tc a");
+    assert!(
+        encoded.contains("inviteId=a%26b&secret=x%3Dy&tc=tc%20a"),
+        "{encoded}"
+    );
 }
 
 #[test]
@@ -80,6 +77,7 @@ impl WorkspaceApi for RedeemStub {
         &self,
         invite_id: String,
         secret: String,
+        _scope: InviteScope,
     ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
         self.calls
             .lock()
@@ -97,6 +95,7 @@ impl WorkspaceApi for RedeemStub {
         &self,
         invite_id: String,
         secret: String,
+        _scope: InviteScope,
         credential: String,
     ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
         self.calls
@@ -123,6 +122,7 @@ impl WorkspaceApi for RedeemStub {
         &self,
         invite_id: String,
         secret: String,
+        _scope: InviteScope,
     ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
         self.calls
             .lock()
@@ -145,12 +145,26 @@ impl WorkspaceApi for RedeemStub {
         &self,
         invite_id: String,
         secret: String,
+        _scope: InviteScope,
         nonce: String,
-        gist_id: String,
-        login: String,
+        claim: InviteProofClaim,
     ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
+        let InviteProofClaim {
+            proof_id,
+            login,
+            provider,
+            host,
+        } = claim;
+        let forge = match (provider, host) {
+            (None, None) => String::new(),
+            (provider, host) => format!(
+                ":{}@{}",
+                provider.unwrap_or_default(),
+                host.unwrap_or_default()
+            ),
+        };
         self.calls.lock().unwrap().push(format!(
-            "prove:{invite_id}:{secret}:{nonce}:{gist_id}:{login}"
+            "prove:{invite_id}:{secret}:{nonce}:{proof_id}:{login}{forge}"
         ));
         Box::pin(async move {
             match nonce.as_str() {
@@ -165,6 +179,9 @@ impl WorkspaceApi for RedeemStub {
                 "down" => Err(intent_core::Error::Invite(
                     InviteErrorKind::GithubUnreachable,
                 )),
+                "unverifiable" => Err(intent_core::Error::IdentityUnverifiable {
+                    host: "gitlab.example".to_string(),
+                }),
                 _ => Err(intent_core::Error::Invite(InviteErrorKind::ProofInvalid)),
             }
         })
@@ -294,6 +311,23 @@ async fn prove_returns_the_authorized_shape_and_maps_proof_errors() {
         assert_eq!(frame["error"]["data"]["code"], json!(code), "{frame}");
         assert_eq!(frame["error"]["code"], json!(rpc), "{frame}");
     }
+    // 10.8: the host-half proof refusal keeps its typed `data` on `/invite`
+    // too — `host` names the instance the guest must be told about.
+    let unverifiable = intent_core::Error::IdentityUnverifiable {
+        host: "gitlab.example".to_string(),
+    };
+    let frame: Value =
+        serde_json::from_str(&handle_prove(prove(2, "unverifiable"), &api).await.unwrap()).unwrap();
+    assert_eq!(
+        frame["error"]["code"],
+        json!(unverifiable.code()),
+        "{frame}"
+    );
+    assert_eq!(
+        frame["error"]["data"],
+        json!({ "code": "identity-unverifiable", "host": "gitlab.example" }),
+        "{frame}"
+    );
 
     let req = classify(&json!({
         "jsonrpc": "2.0", "id": 3, "method": "invite.prove",
@@ -305,7 +339,47 @@ async fn prove_returns_the_authorized_shape_and_maps_proof_errors() {
     assert!(
         frame["error"]["message"]
             .as_str()
-            .is_some_and(|m| m.contains("gistId")),
+            .is_some_and(|m| m.contains("gistId") && m.contains("proofId")),
+        "{frame}"
+    );
+
+    // 10.8: `proofId` aliases `gistId`; `provider` / `host` ride along.
+    // Both spellings at once are a caller error before any service call —
+    // even when they agree (exactly one of the two).
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 4, "method": "invite.prove",
+        "params": {
+            "inviteId": "inv", "secret": GOOD_SECRET, "nonce": GOOD_NONCE, "login": "guest",
+            "proofId": "77", "provider": "gitlab", "host": "gitlab.example",
+        }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_prove(req, &api).await.unwrap()).unwrap();
+    assert_eq!(frame["result"]["status"], json!("authorized"), "{frame}");
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 5, "method": "invite.prove",
+        "params": {
+            "inviteId": "inv", "secret": GOOD_SECRET, "nonce": GOOD_NONCE, "login": "guest",
+            "proofId": "77", "gistId": "abc123",
+        }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_prove(req, &api).await.unwrap()).unwrap();
+    assert_eq!(frame["error"]["code"], json!(-32602), "{frame}");
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 6, "method": "invite.prove",
+        "params": {
+            "inviteId": "inv", "secret": GOOD_SECRET, "nonce": GOOD_NONCE, "login": "guest",
+            "proofId": "abc123", "gistId": "abc123",
+        }
+    }))
+    .unwrap();
+    let frame: Value = serde_json::from_str(&handle_prove(req, &api).await.unwrap()).unwrap();
+    assert_eq!(frame["error"]["code"], json!(-32602), "{frame}");
+    assert!(
+        frame["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("exactly one")),
         "{frame}"
     );
 
@@ -316,6 +390,8 @@ async fn prove_returns_the_authorized_shape_and_maps_proof_errors() {
             format!("prove:inv:{GOOD_SECRET}:bogus:abc123:guest"),
             format!("prove:inv:{GOOD_SECRET}:expired:abc123:guest"),
             format!("prove:inv:{GOOD_SECRET}:down:abc123:guest"),
+            format!("prove:inv:{GOOD_SECRET}:unverifiable:abc123:guest"),
+            format!("prove:inv:{GOOD_SECRET}:{GOOD_NONCE}:77:guest:gitlab@gitlab.example"),
         ]
     );
 }
@@ -690,12 +766,14 @@ fn stub_provider(
 
 /// The services-facing resolver rebuilds exactly the link `create` mints —
 /// same envelope, same formatter — and answers `None` rather than an error
-/// when the listener is down or nothing is dialable (loopback bind, no
-/// tunnel), so `workspace.invite.list` never fails for it.
+/// when the listener is down or the tunnel is not running, so
+/// `workspace.invite.list` never fails for it (a listed invite simply has no
+/// `url` while the tunnel is down).
 #[tokio::test]
-async fn link_resolver_rebuilds_the_minted_link_and_is_none_when_undialable() {
+async fn link_resolver_rebuilds_the_minted_link_and_is_none_without_a_tunnel() {
     let (provider, _dir) = stub_provider(Some(7443), Some("tc-abc"));
     let minted = link_envelope(Some(&provider)).await.expect("envelope");
+    assert_eq!(minted.tc_address, "tc-abc");
     let resolved = InviteLinkResolver::new(provider.clone())
         .invite_link_envelope()
         .await
@@ -705,10 +783,11 @@ async fn link_resolver_rebuilds_the_minted_link_and_is_none_when_undialable() {
     assert_eq!(
         url,
         format!(
-            "intent://invite?v=1&host=&port=7443&fp={}&inviteId=inv-1&secret=s3cret&tc=tc-abc",
+            "intent://invite?v=1&port=7443&fp={}&inviteId=inv-1&secret=s3cret&tc=tc-abc",
             encode_query_value(&minted.fingerprint)
         )
     );
+    assert!(!url.contains("host="), "{url}");
 
     let (down, _dir) = stub_provider(None, Some("tc-abc"));
     assert!(matches!(
@@ -720,15 +799,29 @@ async fn link_resolver_rebuilds_the_minted_link_and_is_none_when_undialable() {
         .await
         .is_none());
 
-    let (undialable, _dir) = stub_provider(Some(7443), None);
+    let (tunnel_down, _dir) = stub_provider(Some(7443), None);
     assert!(matches!(
-        link_envelope(Some(&undialable)).await,
-        Err(Error::Unsupported(_))
+        link_envelope(Some(&tunnel_down)).await,
+        Err(Error::TunnelDown)
     ));
-    assert!(InviteLinkResolver::new(undialable)
+    assert!(InviteLinkResolver::new(tunnel_down)
         .invite_link_envelope()
         .await
         .is_none());
+}
+
+/// The stub snapshot binds loopback only, so this exercises the contract
+/// that the envelope ignores the bind addresses altogether: a LAN bind
+/// address would not make an invite dialable without the tunnel either.
+#[tokio::test]
+async fn link_envelope_never_carries_direct_hosts() {
+    let (provider, _dir) = stub_provider(Some(7443), Some("tc-abc"));
+    let envelope = link_envelope(Some(&provider)).await.expect("envelope");
+    assert_eq!(envelope.port, 7443);
+    assert_eq!(envelope.tc_address, "tc-abc");
+    let url = envelope.invite_url("inv-1", "s3cret");
+    assert!(!url.contains("127.0.0.1"), "{url}");
+    assert!(!url.contains("host="), "{url}");
 }
 
 /// Service half of `workspace.invite.create`: answers `{ invite, secret }`
@@ -738,10 +831,17 @@ struct CreateStub {
 }
 
 impl WorkspaceApi for CreateStub {
+    fn host_invite_create(
+        &self,
+        _pin: InvitePin,
+    ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(json!({"invite":{"id":"host-inv"},"secret":"s3cret"})) })
+    }
     fn workspace_invite_create(
         &self,
         workspace_id: WorkspaceId,
-        _pin_login: Option<String>,
+        _pin: Option<InvitePin>,
         _expires_in_secs: Option<u64>,
     ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -755,9 +855,10 @@ impl WorkspaceApi for CreateStub {
 }
 
 /// `create` resolves the envelope once and stamps the one link it formats
-/// as both the top-level `url` and `invite.url`; when no link can be built
-/// (listener down) the create is refused before the service mints anything,
-/// so neither `url` can exist without the other.
+/// as both the top-level `url` and `invite.url`; the result carries
+/// `hosts: []` and the tunnel address; when no link can be built (listener
+/// down, or tunnel down) the create is refused before the service mints
+/// anything, so neither `url` can exist without the other.
 #[tokio::test]
 async fn create_stamps_the_same_link_as_url_and_invite_url() {
     let stub = Arc::new(CreateStub {
@@ -792,6 +893,11 @@ async fn create_stamps_the_same_link_as_url_and_invite_url() {
     );
     assert_eq!(r["secret"], json!("s3cret"));
     assert_eq!(r["invite"]["id"], json!("inv-1"));
+    assert_eq!(r["hosts"], json!([]), "{r}");
+    assert_eq!(r["port"], json!(7443));
+    assert_eq!(r["tcAddress"], json!("tc-abc"), "{r}");
+    assert!(url.contains("&tc=tc-abc"), "{url}");
+    assert!(!url.contains("host="), "{url}");
     assert_eq!(stub.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     let (down, _dir) = stub_provider(None, Some("tc-abc"));
@@ -806,11 +912,32 @@ async fn create_stamps_the_same_link_as_url_and_invite_url() {
         json!("listener-down"),
         "{frame}"
     );
+    assert_eq!(frame["error"]["code"], json!(-32603), "{frame}");
     assert!(frame.get("result").is_none(), "{frame}");
     assert_eq!(
         stub.calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "nothing minted without an envelope"
+    );
+
+    let (tunnel_down, _dir) = stub_provider(Some(7443), None);
+    let frame: Value = serde_json::from_str(
+        &handle_create(create_req(), &api, Some(&tunnel_down))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        frame["error"]["data"]["code"],
+        json!("tunnel-down"),
+        "{frame}"
+    );
+    assert_eq!(frame["error"]["code"], json!(-32603), "{frame}");
+    assert!(frame.get("result").is_none(), "{frame}");
+    assert_eq!(
+        stub.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "nothing minted while the tunnel is down"
     );
 }
 
@@ -992,5 +1119,26 @@ fn every_invite_method_shares_the_throttle() {
         let refused = admit_redeem(&req, &throttle, t0).expect_err("bucket empty");
         let v: Value = serde_json::from_str(&refused.expect("frame")).unwrap();
         assert_eq!(v["error"]["data"]["code"], json!("invite-flow-busy"), "{v}");
+    }
+}
+
+#[tokio::test]
+async fn host_create_checks_listener_and_tunnel_before_service_mutation() {
+    let stub = Arc::new(CreateStub {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let api: Arc<dyn WorkspaceApi> = stub.clone();
+    for (port, tunnel, code) in [
+        (None, Some("tc-host"), "listener-down"),
+        (Some(7443), None, "tunnel-down"),
+    ] {
+        let (provider, _dir) = stub_provider(port, tunnel);
+        let request=classify(&json!({"jsonrpc":"2.0","id":1,"method":"host.invite.create","params":{"pinLogin":"guest","pinProvider":"github"}})).unwrap();
+        assert!(!request.method.on_invite_endpoint());
+        let frame: Value =
+            serde_json::from_str(&handle_create(request, &api, Some(&provider)).await.unwrap())
+                .unwrap();
+        assert_eq!(frame["error"]["data"], json!({"code":code}));
+        assert_eq!(stub.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

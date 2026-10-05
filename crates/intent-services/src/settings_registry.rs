@@ -9,10 +9,10 @@
 //! - a pin API for the composition root — pinned keys reject wire mutation
 //!   ([`Error::InvalidParams`], "overridden by startup flag") and their file
 //!   value is ignored,
-//! - [`SettingsRegistry::apply`]: validate against the typed schema, mutate
-//!   in-memory values, and atomically rewrite `config.toml` (temp file +
-//!   rename) via `toml_edit`, preserving user comments/layout — only touched
-//!   keys change in the document,
+//! - [`SettingsRegistry::apply`]: stage edits, validate the rendered TOML
+//!   against the startup schema, and atomically rewrite `config.toml`
+//!   before publishing in-memory values. `toml_edit` preserves user
+//!   comments/layout — only touched keys change in the document,
 //! - [`SettingsRegistry::reload`]: strict re-parse of externally edited file
 //!   text (the live-reload watcher feeds this),
 //! - a `tokio::sync::watch` channel notifying subscribers of changed key
@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use intent_core::settings_file::{LegacySettings, SettingsFile};
@@ -41,6 +41,10 @@ use serde_json::Value;
 use tokio::sync::watch;
 use toml_edit::DocumentMut;
 
+use crate::source_control_auth_ops::repository_owner::{
+    GitlabCredentialGate, RepositorySettingsWrite, RepositoryWrite,
+};
+
 /// Every TOML-backed setting, addressed by its dotted wire path. Mirrors the
 /// [`SettingsFile`] schema leaf-for-leaf (maps such as `providers.paths` are
 /// single leaves — their dynamic children are not individually addressable).
@@ -48,12 +52,15 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "providers.active",
     "providers.enabled",
     "providers.paths",
+    "providers.fastMode",
     "model.default",
     "model.defaultProvider",
     "model.providerDefaults",
     "model.defaultReasoningEffort",
     "quickActions.defaultModel",
     "quickActions.typeOverrides",
+    "quickActions.defaultReasoningEffort",
+    "quickActions.typeReasoningEffortOverrides",
     "quickActions.providerSettings",
     "specialists.default",
     "specialists.dir",
@@ -88,6 +95,11 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "sourceControl.github.apiBaseUrl",
     "sourceControl.github.oauthClientId",
     "sourceControl.github.exposeGitCredentialToChildren",
+    "sourceControl.gitlab.host",
+    "sourceControl.gitlab.instanceBaseUrl",
+    "sourceControl.gitlab.oauthClientId",
+    "sourceControl.gitlab.apiBaseUrl",
+    "identity.provider",
     "accounts.sentry.organization",
     "voice.provider",
     "voice.language",
@@ -108,7 +120,6 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agents.reportToParentDebounceSeconds",
     "agents.historyReplayToolContentChars",
     "agents.toolPayloadRetentionDays",
-    "agents.flushQueuedMessages",
     "agents.resumeInterruptedOnStart",
     "events.streamRetentionHours",
     "workspaceApi.maxOutputChars",
@@ -127,12 +138,15 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.peerAgents",
     "agentFeatures.mcpTools",
     "prMonitor.debounceSeconds",
+    "prMonitor.maxPerAgent",
     "prMonitor.pollSeconds",
     "prMonitor.hourlyRequestBudget",
     "prMonitor.quotaSharePercent",
+    "prCache.maxAgeSeconds",
     "updates.checkOnIdle",
     "updates.idleCheckIntervalMinutes",
     "updates.idleGraceSeconds",
+    "sharing.machineName",
     "sharing.maxGuestsPerWorkspace",
     "sharing.maxGuestConnections",
     "sharing.maxConnectionsPerGuest",
@@ -147,6 +161,16 @@ pub enum SettingOrigin {
     File,
     /// Pinned at boot by a startup flag / env var; file value ignored.
     Flag,
+}
+
+/// Binding policy for the secure WSS listener. The effective default remains
+/// 5181 for older clients, but only an absent, unpinned key permits selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsApiPortPolicy {
+    /// Select once, then persist the bound port before advertising readiness.
+    Unassigned,
+    /// Bind exactly this configured or startup-pinned port; never fall back.
+    Fixed(u16),
 }
 
 impl SettingOrigin {
@@ -167,7 +191,8 @@ impl SettingOrigin {
 pub struct SettingsChanged {
     /// Self-write generation when the change was published.
     pub generation: u64,
-    /// Dotted wire paths whose **effective** value changed.
+    /// Dotted wire paths whose effective value changed, or whose WSS port
+    /// assignment policy changed even though its numeric value did not.
     pub changed: BTreeSet<String>,
 }
 
@@ -205,11 +230,14 @@ struct Pin {
 
 /// Mutation-side state, guarded by a `Mutex`. Readers never touch this — they
 /// clone the `Arc<SettingsSnapshot>` instead.
+#[derive(Clone)]
 struct Inner {
     /// Typed parse of the file (schema defaults merged with file values).
     file: SettingsFile,
     /// Raw document for comment-preserving write-back.
     doc: DocumentMut,
+    /// Exact last loaded/written bytes, before read-time normalization.
+    source_text: String,
     /// Legacy values captured at load
     /// ([`intent_core::settings_file::LEGACY_SETTINGS_PATHS`] keys found in
     /// the file), pending the one-time boot import-and-strip.
@@ -228,6 +256,7 @@ impl Inner {
     /// Record a successful self-write of `text`: bump the generation and
     /// push its stamp onto the bounded history.
     fn record_write(&mut self, text: &str) {
+        self.source_text = text.to_string();
         self.generation += 1;
         if self.recent_writes.len() == SELF_WRITE_HISTORY {
             self.recent_writes.pop_front();
@@ -255,9 +284,22 @@ pub struct SettingsSnapshot {
 }
 
 impl SettingsSnapshot {
+    /// Distinguish an unassigned installation from an explicit port, including
+    /// an explicit 5181. Retain this snapshot across binding and pass it to
+    /// [`SettingsRegistry::persist_selected_ws_api_port`] before readiness.
+    #[must_use]
+    pub fn ws_api_port_policy(&self) -> WsApiPortPolicy {
+        if self.origin("server.wsApi.port") == Some(SettingOrigin::Default) {
+            WsApiPortPolicy::Unassigned
+        } else {
+            WsApiPortPolicy::Fixed(self.effective.server.ws_api.port)
+        }
+    }
+
     /// Effective JSON value for a dotted wire path. `None` for unknown paths
     /// (including secrets and SQLite-backed state blobs, which are not this
     /// registry's concern). Known-but-unset optional keys read `Some(Null)`.
+    #[must_use]
     pub fn get(&self, path: &str) -> Option<Value> {
         if !KNOWN_PATHS.contains(&path) {
             return None;
@@ -266,11 +308,13 @@ impl SettingsSnapshot {
     }
 
     /// Origin of a dotted wire path, or `None` when unknown.
+    #[must_use]
     pub fn origin(&self, path: &str) -> Option<SettingOrigin> {
         self.origins.get(path).copied()
     }
 
     /// All known paths with their origins (for `settings.list`-style views).
+    #[must_use]
     pub fn origins(&self) -> &BTreeMap<String, SettingOrigin> {
         &self.origins
     }
@@ -278,13 +322,80 @@ impl SettingsSnapshot {
 
 /// Layered runtime settings store. See the module docs for the full contract.
 pub struct SettingsRegistry {
+    repository_gate: OnceLock<GitlabCredentialGate>,
+    #[cfg(test)]
+    pub(crate) context_publication_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     path: PathBuf,
     inner: Mutex<Inner>,
     snapshot: RwLock<Arc<SettingsSnapshot>>,
     tx: watch::Sender<SettingsChanged>,
 }
 
+/// Fully parsed candidate tied to the snapshot it was prepared from. The
+/// original caller must acquire credential gates before the revision gate.
+pub(crate) struct PreparedRepositorySettings {
+    expected: Arc<SettingsSnapshot>,
+    candidate: Inner,
+    snapshot: Arc<SettingsSnapshot>,
+}
+impl PreparedRepositorySettings {
+    pub(crate) fn snapshot(&self) -> &SettingsSnapshot {
+        &self.snapshot
+    }
+}
+
 impl SettingsRegistry {
+    pub(crate) fn install_repository_boundary(&self, gate: GitlabCredentialGate) -> Result<()> {
+        self.repository_gate
+            .set(gate)
+            .map_err(|_| Error::Internal("repository settings boundary already installed".into()))
+    }
+
+    pub(crate) fn preview(&self, changes: &[(String, Value)]) -> Result<Arc<SettingsSnapshot>> {
+        let inner = self.inner.lock().expect("settings registry lock poisoned");
+        Self::validate_changes(&inner, changes).map(|(_, _, snapshot)| snapshot)
+    }
+
+    fn before_repository_publication(
+        &self,
+        snapshot: &SettingsSnapshot,
+        write: Option<&RepositorySettingsWrite>,
+        auth: Option<&RepositoryWrite>,
+    ) -> Result<()> {
+        // Every caller holds the existing registry writer lock. Compare the
+        // actual effective block, including pins, at publication time.
+        let old = self.snapshot();
+        if old.effective.source_control.gitlab != snapshot.effective.source_control.gitlab
+            && snapshot
+                .effective
+                .source_control
+                .gitlab
+                .instance_base_url
+                .is_some()
+        {
+            crate::source_control_auth_ops::repository_owner::logical_instance(
+                &snapshot.effective.source_control.gitlab,
+            )?;
+        }
+        if let Some(gate) = self.repository_gate.get() {
+            gate.before_settings_publication(&old, snapshot, write, auth)?;
+        }
+        Ok(())
+    }
+
+    fn repository_published(&self, snapshot: &SettingsSnapshot) {
+        if let Some(gate) = self.repository_gate.get() {
+            gate.settings_published(snapshot);
+        }
+        #[cfg(test)]
+        {
+            let probe = self.context_publication_probe.lock().unwrap().take();
+            if let Some(probe) = probe {
+                probe();
+            }
+        }
+    }
+
     /// Load (or initialize) `config.toml` at `path` and build the registry.
     /// Missing file ⇒ the fully-commented default template is written first
     /// (via [`SettingsFile::load_or_init_with_legacy`]); malformed file ⇒
@@ -309,6 +420,7 @@ impl SettingsRegistry {
         let inner = Inner {
             file,
             doc,
+            source_text: text,
             legacy,
             pins: BTreeMap::new(),
             generation: 0,
@@ -317,6 +429,9 @@ impl SettingsRegistry {
         let snapshot = Arc::new(build_snapshot(&inner)?);
         let (tx, _rx) = watch::channel(SettingsChanged::default());
         Ok(Self {
+            repository_gate: OnceLock::new(),
+            #[cfg(test)]
+            context_publication_probe: Mutex::new(None),
             path,
             inner: Mutex::new(inner),
             snapshot: RwLock::new(snapshot),
@@ -356,6 +471,7 @@ impl SettingsRegistry {
             doc_remove(&mut doc, path);
         }
         let text = doc.to_string();
+        SettingsFile::parse_str(&text)?;
         atomic_write(&self.path, &text)?;
         inner.doc = doc;
         inner.record_write(&text);
@@ -385,6 +501,27 @@ impl SettingsRegistry {
             .read()
             .expect("settings snapshot lock poisoned")
             .clone()
+    }
+
+    /// Optional delivery compares the ORIGINAL allocation under the same read
+    /// guard through its pure consuming action. Never take the writer/inner or
+    /// credential gates here; writers release P metadata before snapshot.write.
+    pub(crate) fn with_original_snapshot<T>(
+        &self,
+        original: &Arc<SettingsSnapshot>,
+        action: impl FnOnce(bool) -> T,
+    ) -> T {
+        let guard = self.snapshot.try_read();
+        let current = guard
+            .as_ref()
+            .is_ok_and(|value| Arc::ptr_eq(value, original));
+        action(current)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context_hold_snapshot_for_test(&self, action: impl FnOnce()) {
+        let _guard = self.snapshot.write().unwrap();
+        action();
     }
 
     /// Effective JSON value for a dotted wire path (see
@@ -455,6 +592,16 @@ impl SettingsRegistry {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn pin(&self, path: &str, value: Value, flag: &str) -> Result<()> {
+        self.pin_with_repository_write(path, value, flag, None)
+    }
+
+    pub(crate) fn pin_with_repository_write(
+        &self,
+        path: &str,
+        value: Value,
+        flag: &str,
+        write: Option<&RepositorySettingsWrite>,
+    ) -> Result<()> {
         if !KNOWN_PATHS.contains(&path) {
             return Err(Error::InvalidParams(format!("unknown setting: {path}")));
         }
@@ -465,21 +612,30 @@ impl SettingsRegistry {
         }
         json_set(&mut json, path, value.clone());
         typed_from_json(json, path)?;
-        inner.pins.insert(
+        let mut candidate = inner.clone();
+        candidate.pins.insert(
             path.to_string(),
             Pin {
                 value,
                 flag: flag.to_string(),
             },
         );
-        self.swap_snapshot(&inner)?;
+        let snapshot = Arc::new(build_snapshot(&candidate)?);
+        self.before_repository_publication(&snapshot, write, None)?;
+        *inner = candidate;
+        self.repository_published(&snapshot);
+        *self
+            .snapshot
+            .write()
+            .expect("settings snapshot lock poisoned") = snapshot;
         Ok(())
     }
 
     /// Validate `changes` (dotted wire path → JSON value) against the typed
-    /// schema, mutate the in-memory values, and atomically rewrite
-    /// `config.toml` (temp file + rename), preserving comments/layout — only
-    /// touched keys change in the document. `Null` clears a key back to its
+    /// schema and validate the rendered TOML with the startup parser before
+    /// atomically rewriting `config.toml` (temp file + rename) and publishing
+    /// the new state. Preserves comments/layout — only touched keys change
+    /// in the document. `Null` clears a key back to its
     /// schema default (the key is removed from the file). Unknown paths and
     /// pinned keys are rejected with [`Error::InvalidParams`] before anything
     /// mutates. Returns the changed-key notice (also broadcast to
@@ -493,7 +649,84 @@ impl SettingsRegistry {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn apply(&self, changes: &[(String, Value)]) -> Result<SettingsChanged> {
+        self.apply_with_repository_write(changes, None, None)
+    }
+
+    pub(crate) fn apply_with_repository_write(
+        &self,
+        changes: &[(String, Value)],
+        write: Option<&RepositorySettingsWrite>,
+        auth: Option<&RepositoryWrite>,
+    ) -> Result<SettingsChanged> {
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        let (mut candidate, text, snapshot) = Self::validate_changes(&inner, changes)?;
+        self.before_repository_publication(&snapshot, write, auth)?;
+        atomic_write(&self.path, &text)?;
+        candidate.record_write(&text);
+        *inner = candidate;
+        self.repository_published(&snapshot);
+        Ok(self.publish_snapshot(snapshot, inner.generation))
+    }
+
+    /// Remember a first WSS allocation while the caller retains all bound
+    /// sockets. `expected` must be this registry's current, unassigned snapshot
+    /// used to choose the bind policy. Any intervening registry mutation or
+    /// on-disk edit observed at the final pre-rename check rejects the assignment
+    /// instead of overwriting user intent. External editors do not hold the
+    /// registry lock: a write in the final check-to-rename window can still race.
+    ///
+    /// This synchronous operation atomically writes the config and installs its
+    /// snapshot without notifying subscribers or invoking runtime hooks. The
+    /// self-write guard suppresses the watcher event; a later reload of the same
+    /// file also sees no change. The listener caller owns readiness/publication
+    /// and must drop its sockets on error. Startup overrides (including the
+    /// composition root's ephemeral port-zero test seam) must not call this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale/assigned snapshot, an invalid port, an
+    /// external edit, or a failed read/write. Registry state stays unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a registry lock is poisoned.
+    pub fn persist_selected_ws_api_port(
+        &self,
+        expected: &Arc<SettingsSnapshot>,
+        port: u16,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        if !Arc::ptr_eq(expected, &self.snapshot())
+            || expected.ws_api_port_policy() != WsApiPortPolicy::Unassigned
+        {
+            return Err(Error::InvalidParams(
+                "WSS port assignment changed while binding; discard the listeners and retry with current settings".into(),
+            ));
+        }
+        let changes = [("server.wsApi.port".to_string(), Value::from(port))];
+        let (mut candidate, text, snapshot) = Self::validate_changes(&inner, &changes)?;
+        atomic_write_checked(&self.path, &text, Some(&inner.source_text))?;
+        candidate.record_write(&text);
+        *inner = candidate;
+        *self
+            .snapshot
+            .write()
+            .expect("settings snapshot lock poisoned") = snapshot;
+        Ok(())
+    }
+
+    /// Check a mixed settings batch before secret I/O without adopting or
+    /// publishing anything. `apply` validates again under its own lock: this
+    /// preflight is not a reservation across an awaited secret-store write.
+    pub(crate) fn validate(&self, changes: &[(String, Value)]) -> Result<()> {
+        let inner = self.inner.lock().expect("settings registry lock poisoned");
+        Self::validate_changes(&inner, changes).map(|_| ())
+    }
+
+    fn validate_changes(
+        inner: &Inner,
+        changes: &[(String, Value)],
+    ) -> Result<(Inner, String, Arc<SettingsSnapshot>)> {
         for (path, _) in changes {
             if !KNOWN_PATHS.contains(&path.as_str()) {
                 return Err(Error::InvalidParams(format!("unknown setting: {path}")));
@@ -513,26 +746,49 @@ impl SettingsRegistry {
         // an explicit null) so `#[serde(default)]` restores the schema default
         // for optional AND non-optional keys alike.
         let mut json = file_json(&inner.file)?;
-        let mut candidate = inner.file.clone();
+        let mut candidate = inner.clone();
         for (path, value) in changes {
             if value.is_null() {
                 json_remove(&mut json, path);
             } else {
                 json_set(&mut json, path, value.clone());
             }
-            candidate = typed_from_json(json.clone(), path)?;
+            candidate.file = typed_from_json(json.clone(), path)?;
         }
 
+        // Keep every edit local until encoding, startup validation, snapshot
+        // construction, and the disk write succeed. Otherwise a later apply
+        // could accidentally commit part of this failed batch.
         for (path, value) in changes {
-            doc_set(&mut inner.doc, path, value)?;
+            doc_set(&mut candidate.doc, path, value)?;
         }
-        inner.file = candidate;
 
-        let text = inner.doc.to_string();
-        atomic_write(&self.path, &text)?;
-        inner.record_write(&text);
-
-        self.publish(&inner)
+        let text = candidate.doc.to_string();
+        // Boot migrations apply settings before stripping captured legacy
+        // keys, so use the same legacy-aware entry point as startup. Every
+        // other unknown key, type error, and semantic failure stays strict.
+        // Validate without adopting read-time normalization (for example,
+        // dropping blank provider defaults). Keep the typed write values so
+        // service responses and repeated-write comparisons stay consistent.
+        SettingsFile::parse_str_with_legacy(&text).map_err(|e| match e {
+            Error::InvalidInput(msg) => Error::InvalidParams(msg),
+            other => other,
+        })?;
+        let snapshot = Arc::new(build_snapshot(&candidate)?);
+        if build_snapshot(inner)?.effective.source_control.gitlab
+            != snapshot.effective.source_control.gitlab
+            && snapshot
+                .effective
+                .source_control
+                .gitlab
+                .instance_base_url
+                .is_some()
+        {
+            crate::source_control_auth_ops::repository_owner::logical_instance(
+                &snapshot.effective.source_control.gitlab,
+            )?;
+        }
+        Ok((candidate, text, snapshot))
     }
 
     /// Re-parse externally edited file `text` (strict schema) and adopt it as
@@ -550,50 +806,121 @@ impl SettingsRegistry {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub fn reload(&self, text: &str) -> Result<SettingsChanged> {
-        let file = SettingsFile::parse_str(text)?;
+        let prepared = self.prepare_repository_reload(text)?;
+        self.publish_repository_reload(prepared, None)
+    }
+
+    pub(crate) fn prepare_repository_reload(
+        &self,
+        text: &str,
+    ) -> Result<PreparedRepositorySettings> {
+        self.prepare_repository_reload_at(text, self.snapshot())
+    }
+
+    pub(crate) fn prepare_repository_reload_at(
+        &self,
+        text: &str,
+        expected: Arc<SettingsSnapshot>,
+    ) -> Result<PreparedRepositorySettings> {
         let mut doc: DocumentMut = text
             .parse()
             .map_err(|e| Error::InvalidInput(format!("invalid config.toml: {e}")))?;
+        // An older client or editor may restore the retired batching key
+        // after boot stripped it. Ignore it without relaxing other keys.
+        let file = if doc_has_path(&doc, "agents.flushQueuedMessages") {
+            let mut supported = doc.clone();
+            doc_remove(&mut supported, "agents.flushQueuedMessages");
+            SettingsFile::parse_str(&supported.to_string())?
+        } else {
+            SettingsFile::parse_str(text)?
+        };
         sync_normalized_compounds(&mut doc, &file)?;
-        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
-        inner.file = file;
-        inner.doc = doc;
-        // The accepted external edit supersedes every earlier self-write:
-        // clear the history so a later external edit that happens to match
-        // earlier self-written bytes (e.g. a manual revert) is not
-        // misclassified as a self-write and skipped by the watcher.
-        inner.recent_writes.clear();
-        self.publish(&inner)
+        let inner = self.inner.lock().expect("settings registry lock poisoned");
+        // A watcher captures this identity before reading the file. Preparing
+        // older text against a snapshot published during that read would let a
+        // later reload overwrite an already completed settings.update.
+        if !Arc::ptr_eq(&expected, &self.snapshot()) {
+            return Err(Error::Internal(
+                "config snapshot changed after the reload was captured".into(),
+            ));
+        }
+        let mut candidate = inner.clone();
+        candidate.file = file;
+        candidate.doc = doc;
+        candidate.source_text = text.to_string();
+        candidate.recent_writes.clear();
+        let snapshot = Arc::new(build_snapshot(&candidate)?);
+        if expected.effective.source_control.gitlab != snapshot.effective.source_control.gitlab
+            && snapshot
+                .effective
+                .source_control
+                .gitlab
+                .instance_base_url
+                .is_some()
+        {
+            crate::source_control_auth_ops::repository_owner::logical_instance(
+                &snapshot.effective.source_control.gitlab,
+            )?;
+        }
+        Ok(PreparedRepositorySettings {
+            expected,
+            candidate,
+            snapshot,
+        })
     }
 
-    /// Rebuild the snapshot from `inner`, diff effective values against the
-    /// previous snapshot, swap, and broadcast when anything changed.
-    fn publish(&self, inner: &Inner) -> Result<SettingsChanged> {
+    pub(crate) fn publish_repository_reload(
+        &self,
+        prepared: PreparedRepositorySettings,
+        write: Option<&RepositorySettingsWrite>,
+    ) -> Result<SettingsChanged> {
+        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        if !Arc::ptr_eq(&prepared.expected, &self.snapshot()) {
+            return Err(Error::Internal(
+                "prepared config snapshot changed before publication".into(),
+            ));
+        }
+        // The watcher's startup catch-up can reread the exact current file.
+        // Keep its snapshot identity: publishing a replacement would retire
+        // admitted repository replies even though nothing changed. Validate
+        // the original snapshot first so stale reloads cannot bypass pins/ABA.
+        if prepared.candidate.source_text == inner.source_text {
+            return Ok(SettingsChanged {
+                generation: inner.generation,
+                changed: BTreeSet::new(),
+            });
+        }
+        self.before_repository_publication(&prepared.snapshot, write, None)?;
+        *inner = prepared.candidate;
+        self.repository_published(&prepared.snapshot);
+        Ok(self.publish_snapshot(prepared.snapshot, inner.generation))
+    }
+
+    /// Install an already validated snapshot without fallible work after a
+    /// successful config write.
+    fn publish_snapshot(&self, new: Arc<SettingsSnapshot>, generation: u64) -> SettingsChanged {
         let old = self.snapshot();
-        let new = self.swap_snapshot(inner)?;
         let changed: BTreeSet<String> = KNOWN_PATHS
             .iter()
-            .filter(|p| json_get(&old.effective_json, p) != json_get(&new.effective_json, p))
+            .filter(|p| {
+                json_get(&old.effective_json, p) != json_get(&new.effective_json, p)
+                    || (**p == "server.wsApi.port"
+                        && old.ws_api_port_policy() != new.ws_api_port_policy())
+            })
             .map(std::string::ToString::to_string)
             .collect();
         let notice = SettingsChanged {
-            generation: inner.generation,
+            generation,
             changed,
         };
-        if !notice.changed.is_empty() {
-            self.tx.send_replace(notice.clone());
-        }
-        Ok(notice)
-    }
-
-    /// Rebuild + install the read snapshot; returns the new snapshot.
-    fn swap_snapshot(&self, inner: &Inner) -> Result<Arc<SettingsSnapshot>> {
-        let snapshot = Arc::new(build_snapshot(inner)?);
         *self
             .snapshot
             .write()
-            .expect("settings snapshot lock poisoned") = snapshot.clone();
-        Ok(snapshot)
+            .expect("settings snapshot lock poisoned") = new;
+        if !notice.changed.is_empty() {
+            self.tx.send_replace(notice.clone());
+        }
+        notice
     }
 }
 
@@ -875,6 +1202,10 @@ fn json_to_toml_value(value: &Value) -> Result<toml_edit::Value> {
 /// directory, fsync, then rename over the target. Readers only ever observe
 /// the old or the new complete content.
 fn atomic_write(path: &Path, text: &str) -> Result<()> {
+    atomic_write_checked(path, text, None)
+}
+
+fn atomic_write_checked(path: &Path, text: &str, expected: Option<&str>) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| Error::Internal(format!("config path has no parent: {}", path.display())))?;
@@ -889,6 +1220,16 @@ fn atomic_write(path: &Path, text: &str) -> Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
+        // Recheck immediately before rename, including edits made while the
+        // candidate was being written. The registry lock serializes API edits;
+        // arbitrary external editors do not participate in that lock.
+        if let Some(expected) = expected {
+            if std::fs::read_to_string(path)? != expected {
+                return Err(std::io::Error::other(
+                    "config.toml changed while selecting the WSS port; reload settings and retry",
+                ));
+            }
+        }
         std::fs::rename(&tmp, path)?;
         // Best-effort directory fsync so the rename itself is durable across
         // a crash/power loss (without it some filesystems may surface the old
@@ -930,6 +1271,378 @@ mod tests {
 
     fn set(path: &str, value: Value) -> Vec<(String, Value)> {
         vec![(path.to_string(), value)]
+    }
+
+    #[test]
+    fn legacy_port_is_preserved_without_selecting_the_connection_port() {
+        let (_dir, path) = temp_config(Some("[server]\nport = 5182\n"));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(reg.get("server.port"), Some(json!(5182)));
+        assert_eq!(
+            reg.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Unassigned
+        );
+
+        reg.apply(&set("server.wsApi.port", json!(5182))).unwrap();
+        reg.apply(&set("server.port", json!(6200))).unwrap();
+        assert_eq!(
+            reg.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(5182)
+        );
+        let reloaded = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(reloaded.get("server.port"), Some(json!(6200)));
+        assert_eq!(reloaded.get("server.wsApi.port"), Some(json!(5182)));
+        assert_eq!(
+            reloaded.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(5182)
+        );
+
+        reloaded.apply(&set("server.port", Value::Null)).unwrap();
+        assert_eq!(reloaded.get("server.port"), Some(json!(5181)));
+        assert_eq!(
+            reloaded.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(5182)
+        );
+    }
+
+    #[test]
+    fn ws_port_generated_config_is_unassigned_but_explicit_default_is_fixed() {
+        let (_dir, path) = temp_config(None);
+        let reg = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(reg.get("server.wsApi.port"), Some(json!(5181)));
+        assert_eq!(
+            reg.origin("server.wsApi.port"),
+            Some(SettingOrigin::Default)
+        );
+        assert!(!reg.snapshot().effective.server.ws_api.enabled);
+
+        let (_dir, path) = temp_config(Some("[server.wsApi]\nport = 5181\n"));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(reg.origin("server.wsApi.port"), Some(SettingOrigin::File));
+    }
+
+    #[test]
+    fn ws_port_reset_and_explicit_default_notify_even_without_numeric_change() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let mut rx = reg.subscribe();
+        let change = reg.apply(&set("server.wsApi.port", json!(5181))).unwrap();
+        assert!(change.changed.contains("server.wsApi.port"));
+        assert!(rx.has_changed().unwrap());
+        rx.borrow_and_update();
+        let change = reg.apply(&set("server.wsApi.port", Value::Null)).unwrap();
+        assert!(change.changed.contains("server.wsApi.port"));
+        assert_eq!(
+            reg.origin("server.wsApi.port"),
+            Some(SettingOrigin::Default)
+        );
+        assert!(rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn ws_port_assignment_is_durable_comment_preserving_and_silent() {
+        for port in [5181, 5183, 65535] {
+            let seed = "# my config\n[server.wsApi]\n# choose on first enable\nenabled = true\n";
+            let (_dir, path) = temp_config(Some(seed));
+            let reg = SettingsRegistry::load(&path).unwrap();
+            let before = reg.snapshot();
+            assert_eq!(before.ws_api_port_policy(), WsApiPortPolicy::Unassigned);
+            let rx = reg.subscribe();
+            reg.persist_selected_ws_api_port(&before, port).unwrap();
+            assert_eq!(
+                reg.snapshot().ws_api_port_policy(),
+                WsApiPortPolicy::Fixed(port)
+            );
+            assert_eq!(reg.origin("server.wsApi.port"), Some(SettingOrigin::File));
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains("# my config"));
+            assert!(text.contains("# choose on first enable"));
+            assert!(reg.is_self_write(&text));
+            assert!(
+                !rx.has_changed().unwrap(),
+                "assignment must not restart listeners"
+            );
+            assert!(matches!(
+                crate::config_watcher::process_config_change(&reg),
+                crate::config_watcher::ReloadOutcome::SelfWrite
+            ));
+            assert!(reg.reload(&text).unwrap().changed.is_empty());
+            assert!(!rx.has_changed().unwrap());
+            let fresh = SettingsRegistry::load(&path).unwrap();
+            assert_eq!(
+                fresh.snapshot().ws_api_port_policy(),
+                WsApiPortPolicy::Fixed(port)
+            );
+            assert!(reg.persist_selected_ws_api_port(&before, port).is_err());
+        }
+    }
+
+    #[test]
+    fn ws_port_assignment_rejects_explicit_choices_and_startup_pins() {
+        for seed in ["", "[server.wsApi]\nport = 5181\n"] {
+            let (_dir, path) = temp_config(Some(seed));
+            let reg = SettingsRegistry::load(&path).unwrap();
+            if !seed.is_empty() {
+                assert_eq!(
+                    reg.snapshot().ws_api_port_policy(),
+                    WsApiPortPolicy::Fixed(5181)
+                );
+                assert!(reg
+                    .persist_selected_ws_api_port(&reg.snapshot(), 5182)
+                    .is_err());
+            }
+            reg.pin("server.wsApi.port", json!(7000), "INTENTD_TCP_PORT")
+                .unwrap();
+            assert_eq!(
+                reg.snapshot().ws_api_port_policy(),
+                WsApiPortPolicy::Fixed(7000)
+            );
+            assert!(reg
+                .persist_selected_ws_api_port(&reg.snapshot(), 5182)
+                .is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), seed);
+        }
+    }
+
+    #[test]
+    fn ws_port_assignment_rejects_stale_snapshots_including_reset_and_pin() {
+        for edit in [0, 1, 2, 3] {
+            let (_dir, path) = temp_config(Some(""));
+            let reg = SettingsRegistry::load(&path).unwrap();
+            let before = reg.snapshot();
+            match edit {
+                0 => {
+                    reg.apply(&set("server.wsApi.port", json!(5181))).unwrap();
+                }
+                1 => {
+                    reg.apply(&set("server.wsApi.port", json!(6000))).unwrap();
+                    reg.apply(&set("server.wsApi.port", Value::Null)).unwrap();
+                }
+                2 => {
+                    reg.pin("server.wsApi.port", json!(7000), "INTENTD_TCP_PORT")
+                        .unwrap();
+                }
+                _ => {
+                    reg.apply(&set("server.wsApi.enabled", json!(false)))
+                        .unwrap();
+                }
+            }
+            let current = reg.snapshot();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(reg.persist_selected_ws_api_port(&before, 5182).is_err());
+            assert!(Arc::ptr_eq(&current, &reg.snapshot()));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn ws_port_assignment_preserves_unreloaded_external_edits_and_errors() {
+        for text in [
+            "[server.wsApi]\nport = 5181\n",
+            "# edited comment\n",
+            "[server.wsApi]\nport = 'broken'\n",
+        ] {
+            let (_dir, path) = temp_config(Some(""));
+            let reg = SettingsRegistry::load(&path).unwrap();
+            let before = reg.snapshot();
+            std::fs::write(&path, text).unwrap();
+            assert!(reg.persist_selected_ws_api_port(&before, 5182).is_err());
+            assert!(Arc::ptr_eq(&before, &reg.snapshot()));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            assert_eq!(reg.generation(), 0);
+        }
+    }
+
+    #[test]
+    fn ws_port_assignment_rejects_missing_file_and_invalid_ports_without_changes() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let before = reg.snapshot();
+        let rx = reg.subscribe();
+        for port in [0, 80, 1023] {
+            assert!(reg.persist_selected_ws_api_port(&before, port).is_err());
+            assert_apply_unchanged(&reg, &before, "", 0, None, &rx);
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(reg.persist_selected_ws_api_port(&before, 5182).is_err());
+        assert!(!path.exists());
+        assert!(Arc::ptr_eq(&before, &reg.snapshot()));
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn ws_port_assignments_are_per_config_and_reset_is_deliberate() {
+        let (_a, a) = temp_config(Some(""));
+        let (_b, b) = temp_config(Some(""));
+        let first = SettingsRegistry::load(&a).unwrap();
+        let second = SettingsRegistry::load(&b).unwrap();
+        assert!(second
+            .persist_selected_ws_api_port(&first.snapshot(), 5182)
+            .is_err());
+        first
+            .persist_selected_ws_api_port(&first.snapshot(), 5181)
+            .unwrap();
+        second
+            .persist_selected_ws_api_port(&second.snapshot(), 5182)
+            .unwrap();
+        first
+            .apply(&set("server.wsApi.enabled", json!(true)))
+            .unwrap();
+        first
+            .apply(&set("server.wsApi.enabled", json!(false)))
+            .unwrap();
+        assert_eq!(
+            first.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(5181)
+        );
+        first.apply(&set("server.wsApi.port", json!(6000))).unwrap();
+        assert_eq!(
+            first.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(6000)
+        );
+        first.apply(&set("server.wsApi.port", Value::Null)).unwrap();
+        assert_eq!(
+            first.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Unassigned
+        );
+        first
+            .persist_selected_ws_api_port(&first.snapshot(), 5183)
+            .unwrap();
+        assert_eq!(
+            SettingsRegistry::load(&b)
+                .unwrap()
+                .snapshot()
+                .ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(5182)
+        );
+    }
+
+    #[test]
+    fn ws_port_assignment_write_failure_keeps_state_and_cleans_temp_file() {
+        let (dir, path) = temp_config(Some("# retained\n"));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let before = reg.snapshot();
+        let rx = reg.subscribe();
+        let saved = dir.path().join("saved.toml");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(reg.persist_selected_ws_api_port(&before, 5182).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        assert_apply_unchanged(&reg, &before, "# retained\n", 0, None, &rx);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        reg.persist_selected_ws_api_port(&before, 5183).unwrap();
+        assert_eq!(
+            reg.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(5183)
+        );
+    }
+
+    #[test]
+    fn ws_port_assignment_has_only_one_winner() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let before = reg.snapshot();
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                barrier.wait();
+                reg.persist_selected_ws_api_port(&before, 5181)
+            });
+            let b = scope.spawn(|| {
+                barrier.wait();
+                reg.persist_selected_ws_api_port(&before, 5182)
+            });
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_ne!(results.0.is_ok(), results.1.is_ok());
+        let port = if results.0.is_ok() { 5181 } else { 5182 };
+        assert_eq!(
+            reg.snapshot().ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(port)
+        );
+        assert_eq!(
+            SettingsRegistry::load(&path)
+                .unwrap()
+                .snapshot()
+                .ws_api_port_policy(),
+            WsApiPortPolicy::Fixed(port)
+        );
+        assert_eq!(reg.generation(), 1);
+    }
+
+    #[test]
+    fn ws_port_assignment_tracks_exact_source_across_normalization_and_reload() {
+        // Loading normalizes this compound in the TOML document. The disk
+        // comparison must still use the original bytes, not the normalized doc.
+        let (_dir, path) = temp_config(Some("[model]\ndefault = 'claude-code:model-id'\n"));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        reg.persist_selected_ws_api_port(&reg.snapshot(), 5182)
+            .unwrap();
+        let text = "# deliberate reset\n[server.wsApi]\n# port removed\n";
+        std::fs::write(&path, text).unwrap();
+        assert!(reg
+            .reload(text)
+            .unwrap()
+            .changed
+            .contains("server.wsApi.port"));
+        reg.persist_selected_ws_api_port(&reg.snapshot(), 5183)
+            .unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("# deliberate reset"));
+    }
+
+    #[test]
+    fn fast_mode_persistence_atomic_validation_and_reset() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(reg.get("providers.fastMode"), Some(json!({})));
+        let prefs = json!({"claude-code":true,"codex":false});
+        reg.apply(&set("providers.fastMode", prefs.clone()))
+            .unwrap();
+        assert_eq!(
+            SettingsRegistry::load(&path)
+                .unwrap()
+                .get("providers.fastMode"),
+            Some(prefs.clone())
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+        for invalid in [
+            json!([]),
+            json!(true),
+            json!({"codex":"on"}),
+            json!({"codex":null}),
+            json!({"claude":true}),
+            json!({"auggie":false}),
+            json!({"unknown":true}),
+        ] {
+            assert!(reg
+                .apply(&[
+                    ("git.autoCommit".into(), json!(false)),
+                    ("providers.fastMode".into(), invalid)
+                ])
+                .is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert_eq!(reg.get("providers.fastMode"), Some(prefs.clone()));
+        }
+        assert!(reg
+            .apply(&set("providers.fastMode.codex", json!(true)))
+            .is_err());
+        reg.apply(&set("providers.fastMode", Value::Null)).unwrap();
+        assert_eq!(reg.get("providers.fastMode"), Some(json!({})));
+        assert_eq!(
+            reg.origin("providers.fastMode"),
+            Some(SettingOrigin::Default)
+        );
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("fastMode"));
+        let changed = reg.reload("[providers.fastMode]\ncodex = true\n").unwrap();
+        assert!(changed.changed.contains("providers.fastMode"));
+        assert_eq!(reg.get("providers.fastMode"), Some(json!({"codex":true})));
+        assert!(reg
+            .reload("[providers.fastMode]\ncodex = \"yes\"\n")
+            .is_err());
+        assert_eq!(reg.get("providers.fastMode"), Some(json!({"codex":true})));
     }
 
     #[test]
@@ -1062,6 +1775,286 @@ mod tests {
         assert!(err.to_string().contains("unknown setting"), "{err}");
         // failed applies never touched the file
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "");
+    }
+
+    fn assert_apply_unchanged(
+        reg: &SettingsRegistry,
+        snapshot: &Arc<SettingsSnapshot>,
+        text: &str,
+        generation: u64,
+        stamp: Option<WriteStamp>,
+        rx: &watch::Receiver<SettingsChanged>,
+    ) {
+        assert_eq!(std::fs::read_to_string(reg.config_path()).unwrap(), text);
+        assert!(Arc::ptr_eq(&reg.snapshot(), snapshot));
+        assert_eq!(reg.generation(), generation);
+        assert_eq!(reg.write_stamp(), stamp);
+        assert!(!rx.has_changed().unwrap(), "failed apply must not notify");
+        let inner = reg.inner.lock().unwrap();
+        assert_eq!(inner.doc.to_string(), text, "staged edits must not leak");
+        assert_eq!(inner.file, SettingsFile::parse_str(text).unwrap());
+    }
+
+    #[test]
+    fn apply_rejects_toml_that_startup_cannot_load() {
+        let seed = "# preserve me\n[git]\nautoCommit = true\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        reg.pin("server.wsApi.port", json!(7000), "INTENTD_TCP_PORT")
+            .unwrap();
+        let snapshot = reg.snapshot();
+        let rx = reg.subscribe();
+
+        // The typed JSON schema accepts u64, but the current encoder turns
+        // integers above i64::MAX into floats that startup cannot read as u64.
+        let mut proposed: DocumentMut = seed.parse().unwrap();
+        doc_set(&mut proposed, "prMonitor.debounceSeconds", &json!(u64::MAX)).unwrap();
+        let parse_err = SettingsFile::parse_str(&proposed.to_string()).unwrap_err();
+        assert!(parse_err.to_string().contains("prMonitor.debounceSeconds"));
+        let err = reg
+            .apply(&[
+                ("git.autoCommit".into(), json!(false)),
+                ("prMonitor.debounceSeconds".into(), json!(u64::MAX)),
+            ])
+            .expect_err("must reject values that cannot round-trip through TOML");
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        assert!(
+            err.to_string().contains("prMonitor.debounceSeconds"),
+            "{err}"
+        );
+        assert_apply_unchanged(&reg, &snapshot, seed, 0, None, &rx);
+
+        reg.apply(&set("rtk.enabled", json!(true))).unwrap();
+        let fresh = SettingsRegistry::load(&path).expect("startup succeeds");
+        assert_eq!(fresh.get("git.autoCommit"), Some(json!(true)));
+        assert_eq!(fresh.get("prMonitor.debounceSeconds"), Some(json!(60)));
+        assert_eq!(reg.origin("server.wsApi.port"), Some(SettingOrigin::Flag));
+    }
+
+    #[test]
+    fn apply_write_failure_keeps_state_and_cannot_leak_into_later_writes() {
+        let (dir, path) = temp_config(Some("# preserve me\n[git]\nautoCommit = true\n"));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        reg.apply(&set("notifications.volume", json!(0.25)))
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let snapshot = reg.snapshot();
+        let generation = reg.generation();
+        let stamp = reg.write_stamp();
+        let rx = reg.subscribe();
+
+        // Force rename to fail even when tests run as root, while keeping
+        // the last-good file available to restore byte-for-byte.
+        let saved = dir.path().join("saved.toml");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let err = reg
+            .apply(&[
+                ("git.autoCommit".into(), json!(false)),
+                ("model.default".into(), json!("rejected-model")),
+            ])
+            .expect_err("cannot replace a directory with config.toml");
+        assert!(matches!(err, Error::Internal(_)), "{err}");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        assert_apply_unchanged(&reg, &snapshot, &text, generation, stamp, &rx);
+        assert!(reg.is_self_write(&text));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        reg.apply(&set("rtk.enabled", json!(true))).unwrap();
+        let fresh = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(fresh.get("git.autoCommit"), Some(json!(true)));
+        assert_eq!(fresh.get("model.default"), Some(Value::Null));
+        assert_eq!(fresh.origin("model.default"), Some(SettingOrigin::Default));
+        assert_eq!(reg.generation(), generation + 1);
+    }
+
+    #[test]
+    fn apply_rejects_unsupported_paths_and_enums_without_partial_changes() {
+        for (invalid_path, value) in [
+            ("future.setting", json!(true)),
+            ("logging.level", json!("future-level")),
+        ] {
+            let seed = "# preserve me\n[git]\nautoCommit = true\n";
+            let (_dir, path) = temp_config(Some(seed));
+            let reg = SettingsRegistry::load(&path).unwrap();
+            let snapshot = reg.snapshot();
+            let rx = reg.subscribe();
+            let err = reg
+                .apply(&[
+                    ("git.autoCommit".into(), json!(false)),
+                    (invalid_path.into(), value),
+                ])
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+            assert!(err.to_string().contains(invalid_path), "{err}");
+            assert_apply_unchanged(&reg, &snapshot, seed, 0, None, &rx);
+        }
+    }
+
+    #[test]
+    fn quick_action_effort_blank_normalizes_on_write_and_reload() {
+        let (_dir, path) = temp_config(None);
+        let reg = SettingsRegistry::load(&path).unwrap();
+        for (input, expected) in [
+            ("", Value::Null),
+            ("   ", Value::Null),
+            (" High ", json!(" High ")),
+        ] {
+            reg.apply(&[("quickActions.defaultReasoningEffort".into(), json!(input))])
+                .unwrap();
+            assert_eq!(
+                reg.get("quickActions.defaultReasoningEffort"),
+                Some(expected.clone())
+            );
+            let fresh = SettingsRegistry::load(&path).unwrap();
+            assert_eq!(
+                fresh.get("quickActions.defaultReasoningEffort"),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn quick_action_effort_round_trips_and_resets_independently() {
+        let (_dir, path) = temp_config(Some("[quickActions]\ndefaultModel = \"existing\"\n"));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(
+            reg.get("quickActions.defaultReasoningEffort"),
+            Some(Value::Null)
+        );
+        assert_eq!(
+            reg.get("quickActions.typeReasoningEffortOverrides"),
+            Some(json!({}))
+        );
+        let snapshots = json!({"codex": {
+            "defaultReasoningEffort": "high",
+            "typeReasoningEffortOverrides": {"commit": "low"}
+        }, "claude-code": {"defaultModel": "old"}});
+        reg.apply(&[
+            ("quickActions.defaultReasoningEffort".into(), json!("high")),
+            (
+                "quickActions.typeReasoningEffortOverrides".into(),
+                json!({"commit": "low", "fast": ""}),
+            ),
+            ("quickActions.providerSettings".into(), snapshots.clone()),
+        ])
+        .unwrap();
+        let fresh = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(
+            fresh.get("quickActions.defaultReasoningEffort"),
+            Some(json!("high"))
+        );
+        assert_eq!(
+            fresh.get("quickActions.typeReasoningEffortOverrides"),
+            Some(json!({"commit": "low", "fast": ""}))
+        );
+        assert_eq!(fresh.get("quickActions.providerSettings"), Some(snapshots));
+        fresh
+            .apply(&[
+                ("quickActions.defaultReasoningEffort".into(), Value::Null),
+                (
+                    "quickActions.typeReasoningEffortOverrides".into(),
+                    json!({}),
+                ),
+            ])
+            .unwrap();
+        let reset = SettingsRegistry::load(&path).unwrap();
+        assert_eq!(
+            reset.get("quickActions.defaultReasoningEffort"),
+            Some(Value::Null)
+        );
+        assert_eq!(
+            reset.get("quickActions.typeReasoningEffortOverrides"),
+            Some(json!({}))
+        );
+        assert_eq!(
+            reset.get("quickActions.defaultModel"),
+            Some(json!("existing"))
+        );
+    }
+
+    #[test]
+    fn apply_preserves_open_provider_maps_and_pending_legacy_migration() {
+        let seed = "# keep me\n[backgroundAgents]\ndefaultModel = \"old-model\"\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let legacy = reg.legacy_values();
+        let providers = json!({
+            "future.provider": {
+                "futureOption": "new-choice",
+                "nested": {"enabled": true, "values": [1, 0.5, "text"]},
+                "empty": {}
+            }
+        });
+        reg.apply(&[
+            ("providers.enabled".into(), json!({"future.provider": true})),
+            (
+                "providers.paths".into(),
+                json!({"future.provider": "/custom/bin"}),
+            ),
+            (
+                "model.providerDefaults".into(),
+                json!({"future.provider": "future-model"}),
+            ),
+            ("quickActions.providerSettings".into(), providers.clone()),
+        ])
+        .expect("open maps remain extensible while legacy import is pending");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep me"));
+        let (parsed, pending) = SettingsFile::parse_str_with_legacy(&text).unwrap();
+        assert_eq!(parsed, reg.snapshot().effective);
+        assert_eq!(pending, legacy);
+        assert_eq!(reg.legacy_values(), legacy);
+        assert_eq!(reg.get("quickActions.providerSettings"), Some(providers));
+        assert_eq!(reg.origin("providers.enabled"), Some(SettingOrigin::File));
+
+        reg.apply(&set("providers.enabled", Value::Null)).unwrap();
+        assert_eq!(reg.get("providers.enabled"), Some(Value::Null));
+        assert_eq!(
+            reg.origin("providers.enabled"),
+            Some(SettingOrigin::Default)
+        );
+        reg.strip_legacy().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            SettingsFile::parse_str(&text).unwrap(),
+            reg.snapshot().effective
+        );
+    }
+
+    #[test]
+    fn validate_is_non_mutating_and_checks_rendered_config() {
+        let seed = "# preserve me\n[git]\nautoCommit = true\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let snapshot = reg.snapshot();
+        let rx = reg.subscribe();
+        let unchanged = || {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), seed);
+            assert!(Arc::ptr_eq(&reg.snapshot(), &snapshot));
+            assert_eq!(reg.generation(), 0);
+            assert_eq!(reg.write_stamp(), None);
+            assert!(!rx.has_changed().unwrap(), "preflight must not notify");
+            let inner = reg.inner.lock().unwrap();
+            assert_eq!(inner.doc.to_string(), seed);
+            assert_eq!(inner.file, SettingsFile::parse_str(seed).unwrap());
+        };
+
+        reg.validate(&set("git.autoCommit", json!(false))).unwrap();
+        unchanged();
+
+        // JSON accepts this u64, but TOML encodes it as a float that startup
+        // cannot load. Preflight must use the same document checks as apply.
+        let error = reg
+            .validate(&[
+                ("git.autoCommit".into(), json!(false)),
+                ("prMonitor.debounceSeconds".into(), json!(u64::MAX)),
+            ])
+            .expect_err("preflight must reject config that startup cannot load");
+        assert!(matches!(error, Error::InvalidParams(_)), "{error}");
+        assert!(error.to_string().contains("prMonitor.debounceSeconds"));
+        unchanged();
     }
 
     #[test]
@@ -1243,6 +2236,71 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_reload_preserves_original_snapshot_and_self_write_history() {
+        let seed = "[git]\nautoCommit = true\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        for self_written in [false, true] {
+            if self_written {
+                reg.apply(&set("git.autoCommit", json!(false))).unwrap();
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let original = reg.snapshot();
+            let generation = reg.generation();
+            let stamp = reg.write_stamp();
+            let notices = reg.subscribe();
+            let notice = reg.reload(&text).unwrap();
+            assert!(notice.changed.is_empty());
+            assert_eq!(notice.generation, generation);
+            assert!(reg.with_original_snapshot(&original, |current| current));
+            assert_eq!(reg.write_stamp(), stamp);
+            assert!(!notices.has_changed().unwrap());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn unchanged_reload_still_rejects_superseded_preparation() {
+        let seed = "[server.wsApi]\nport = 6000\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let original = reg.snapshot();
+        let prepared = reg.prepare_repository_reload(seed).unwrap();
+        // Pins leave source_text unchanged but must invalidate the old candidate.
+        reg.pin("server.wsApi.port", json!(7000), "INTENTD_TCP_PORT")
+            .unwrap();
+        let current = reg.snapshot();
+        assert!(reg.publish_repository_reload(prepared, None).is_err());
+        assert!(reg.prepare_repository_reload_at(seed, original).is_err());
+        assert!(reg.with_original_snapshot(&current, |valid| valid));
+        assert_eq!(reg.get("server.wsApi.port"), Some(json!(7000)));
+        assert!(reg.reload(seed).unwrap().changed.is_empty());
+        assert!(reg.with_original_snapshot(&current, |valid| valid));
+        assert_eq!(reg.get("server.wsApi.port"), Some(json!(7000)));
+    }
+
+    #[test]
+    fn changed_reload_and_restoration_never_revive_original_snapshot() {
+        let seed = "[git]\nautoCommit = true\n";
+        for edited in [
+            "[git]\nautoCommit = false\n",
+            "# edited\n[git]\nautoCommit = true\n",
+        ] {
+            let (_dir, path) = temp_config(Some(seed));
+            let reg = SettingsRegistry::load(&path).unwrap();
+            let original = reg.snapshot();
+            let prepared = reg.prepare_repository_reload(seed).unwrap();
+            reg.reload(edited).unwrap();
+            assert!(!reg.with_original_snapshot(&original, |current| current));
+            reg.reload(seed).unwrap();
+            assert!(!reg.with_original_snapshot(&original, |current| current));
+            // Restoring the exact bytes cannot authorize a pre-edit candidate.
+            assert!(reg.publish_repository_reload(prepared, None).is_err());
+            assert_eq!(reg.get("git.autoCommit"), Some(json!(true)));
+        }
+    }
+
+    #[test]
     fn reload_applies_external_changes_and_ignores_pinned_keys() {
         let (_dir, path) = temp_config(Some("[server.wsApi]\nport = 6000\n"));
         let reg = SettingsRegistry::load(&path).expect("load");
@@ -1311,58 +2369,29 @@ mod tests {
     }
 
     #[test]
-    fn flush_queued_messages_defaults_on_overrides_and_reloads() {
-        let (_dir, path) = temp_config(Some(""));
-        let reg = SettingsRegistry::load(&path).expect("load");
-        // Schema default: "all".
-        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!("all")));
-        assert_eq!(
-            reg.origin("agents.flushQueuedMessages"),
-            Some(SettingOrigin::Default)
-        );
-
-        // File override via apply, surviving a fresh load from disk.
-        reg.apply(&set("agents.flushQueuedMessages", json!("systemOnly")))
-            .expect("apply");
-        assert_eq!(
-            reg.get("agents.flushQueuedMessages"),
-            Some(json!("systemOnly"))
-        );
-        assert_eq!(
-            reg.origin("agents.flushQueuedMessages"),
-            Some(SettingOrigin::File)
-        );
-        let reloaded = SettingsRegistry::load(&path).expect("reload from disk");
-        assert_eq!(
-            reloaded.get("agents.flushQueuedMessages"),
-            Some(json!("systemOnly"))
-        );
-
-        // External reload without the key restores the schema default.
-        let notice = reg.reload("").expect("reload");
-        assert!(notice.changed.contains("agents.flushQueuedMessages"));
-        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!("all")));
-    }
-
-    #[test]
-    fn flush_queued_messages_legacy_boolean_file_loads_and_reapplies() {
-        // A `config.toml` written by an older daemon still loads, reporting
-        // the equivalent string value with `File` origin.
-        let (_dir, path) = temp_config(Some("[agents]\nflushQueuedMessages = true\n"));
-        let reg = SettingsRegistry::load(&path).expect("load legacy true");
-        assert_eq!(reg.get("agents.flushQueuedMessages"), Some(json!("all")));
-        assert_eq!(
-            reg.origin("agents.flushQueuedMessages"),
-            Some(SettingOrigin::File)
-        );
-
-        let (_dir2, path2) = temp_config(Some("[agents]\nflushQueuedMessages = false\n"));
-        let reg2 = SettingsRegistry::load(&path2).expect("load legacy false");
-        assert_eq!(reg2.get("agents.flushQueuedMessages"), Some(json!("off")));
-        assert_eq!(
-            reg2.origin("agents.flushQueuedMessages"),
-            Some(SettingOrigin::File)
-        );
+    fn retired_flush_preferences_load_and_strip() {
+        for raw in [r#""all""#, r#""systemOnly""#, r#""off""#, "true", "false"] {
+            let seed = format!("[agents]\nflushQueuedMessages = {raw}\n");
+            let (_dir, path) = temp_config(Some(&seed));
+            let reg = SettingsRegistry::load(&path).expect("load legacy preference");
+            assert_eq!(reg.get("agents.flushQueuedMessages"), None);
+            assert_eq!(reg.origin("agents.flushQueuedMessages"), None);
+            assert!(reg
+                .apply(&set("agents.flushQueuedMessages", json!("off")))
+                .is_err());
+            reg.reload(&seed).expect("legacy preference reloads");
+            assert_eq!(
+                reg.strip_legacy().unwrap(),
+                vec!["agents.flushQueuedMessages"]
+            );
+            assert!(!std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("flushQueuedMessages"));
+            assert!(SettingsRegistry::load(&path)
+                .unwrap()
+                .legacy_values()
+                .is_empty());
+        }
     }
 
     #[test]

@@ -9,7 +9,9 @@
 //! transports handle by draining the two-lane outbound queue
 //! ([`OutboundSender`] / [`OutboundReceiver`], priority lane first).
 
-use intent_core::events::{NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, WORKSPACE_UPDATED};
+use intent_core::events::{
+    AGENT_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, WORKSPACE_UPDATED,
+};
 use intent_core::{AgentId, ClientId, Event, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{Delivery, EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
@@ -20,6 +22,8 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
+mod presence_focus;
+
 use crate::browser;
 use crate::catalog;
 use crate::client;
@@ -27,7 +31,6 @@ use crate::conflate::{self, ChatItem, ConflationBuffer, Enqueue, EventItem};
 use crate::control::{self, SystemControl};
 use crate::drafts;
 use crate::events::{self, FastPath};
-use crate::forward::{self, ForwardRegistry};
 use crate::host;
 use crate::panic_guard;
 use crate::presence;
@@ -73,13 +76,28 @@ pub(crate) const BULK_CAPACITY: usize = 256;
 pub(crate) struct OutboundSender {
     priority: mpsc::Sender<String>,
     bulk: mpsc::Sender<String>,
+    shutdown: Option<RpcLimiter>,
 }
 
 impl OutboundSender {
     /// Queue a latency-critical frame (RPC response / error / reverse
     /// request). `Err` means the connection's writer is gone.
     pub(crate) async fn send_priority(&self, frame: String) -> Result<(), ()> {
-        self.priority.send(frame).await.map_err(|_| ())
+        match self.priority.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+            Err(mpsc::error::TrySendError::Full(frame)) => tokio::select! {
+                () = self.shutdown_requested() => Err(()),
+                result = self.priority.send(frame) => result.map_err(|_| ()),
+            },
+        }
+    }
+
+    async fn shutdown_requested(&self) {
+        match &self.shutdown {
+            Some(shutdown) => shutdown.closed().await,
+            None => std::future::pending().await,
+        }
     }
 
     /// Queue a bulk frame (event notification / subscription push). `Err`
@@ -96,7 +114,10 @@ impl OutboundSender {
     /// claimed (see [`finish_slow_path_rpc`]). `Err` means the connection's
     /// writer is gone.
     pub(crate) async fn reserve_priority(&self) -> Result<mpsc::OwnedPermit<String>, ()> {
-        self.priority.clone().reserve_owned().await.map_err(|_| ())
+        tokio::select! {
+            () = self.shutdown_requested() => Err(()),
+            result = self.priority.clone().reserve_owned() => result.map_err(|_| ()),
+        }
     }
 
     /// Whether the writer has stopped draining (both lanes closed together;
@@ -137,6 +158,9 @@ pub(crate) struct OutboundReceiver {
 }
 
 impl OutboundReceiver {
+    pub(crate) async fn recv_priority(&mut self) -> Option<String> {
+        self.priority.recv().await
+    }
     /// Next frame to write, priority lane first. Empties the priority lane
     /// before taking a bulk frame; when both lanes are idle, waits on both
     /// (biased toward priority). Returns `None` once every sender is dropped
@@ -189,6 +213,7 @@ pub(crate) fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
         OutboundSender {
             priority: priority_tx,
             bulk: bulk_tx,
+            shutdown: None,
         },
         OutboundReceiver {
             priority: priority_rx,
@@ -218,6 +243,7 @@ struct ConnSub {
     replace_group: Option<String>,
     lifecycle: Option<ChatLifecycle>,
     note_lease: bool,
+    host_removal_control: bool,
 }
 
 impl Drop for ConnSub {
@@ -233,8 +259,11 @@ impl Drop for ConnSub {
 /// connection close) aborts every forwarder → disconnect cleanup (§6.1).
 #[derive(Default)]
 pub(crate) struct ConnSubs {
+    pub(crate) pairing: crate::pairing::ConnectionPairing,
     subs: HashMap<String, ConnSub>,
     setup: crate::provider_setup::Connection,
+    /// The server-bound hello used to refresh browser hosting on a live upgrade.
+    pub(crate) hello_identity: Option<crate::reverse::ReverseClientIdentity>,
     /// The connection's presence identity (multiplayer w5); dropping it with
     /// the registry publishes the offline transition and releases every
     /// `note.presence` lease — declared after `subs` so the forwarders'
@@ -243,6 +272,16 @@ pub(crate) struct ConnSubs {
 }
 
 impl ConnSubs {
+    /// The real committed removal event bypasses bulk delivery only for raw
+    /// subscriptions that requested it. Every other event producer is stopped.
+    pub(crate) fn removal_control(&self, event: &intent_core::Event) -> Vec<String> {
+        self.subs
+            .iter()
+            .filter(|(_, sub)| sub.host_removal_control)
+            .map(|(id, _)| events::build_event_notification(id, event))
+            .collect()
+    }
+
     fn insert(
         &mut self,
         id: String,
@@ -257,6 +296,7 @@ impl ConnSubs {
                 replace_group,
                 lifecycle,
                 note_lease: false,
+                host_removal_control: false,
             },
         );
     }
@@ -276,6 +316,7 @@ impl ConnSubs {
                 replace_group,
                 lifecycle: None,
                 note_lease: true,
+                host_removal_control: false,
             },
         );
     }
@@ -326,18 +367,18 @@ impl ConnSubs {
 /// `system.requestUpdate` on both transports;
 /// `system.shutdown`/`system.importLegacy` UDS-only via the
 /// `is_uds` guard inside `control::handle`), the `host.status` capability
-/// probe (both transports), the `forward.*` port-forwarding methods, and the
-/// `events.` fast-path, else hand to the JSON-RPC dispatcher. `control` is
+/// probe (both transports), and the `events.` fast-path, else hand to the
+/// JSON-RPC dispatcher. `control` is
 /// `Some` on every transport that wires the control surface — the composition
 /// root passes `Some(control)` to both the UDS and WSS listeners (remote
-/// `system.status` needs it); `forwards`/`reverse` are the connection's port-forward registry
-/// and reverse-RPC channel; `client_id` is the connection's logical-client
+/// `system.status` needs it); `reverse` is the connection's reverse-RPC channel;
+/// `client_id` is the connection's logical-client
 /// binding, set by `client.hello` and consumed by `drafts.*` (§16); `is_local`
 /// reflects that connection's resolved locality (§5.14). Returns `false` when
 /// the outbound channel is closed.
 ///
 /// The fast-paths that mutate per-connection state (`reverse.route_response`,
-/// `system.*`, `forward.*`, `client.hello`, `drafts.*`, `events.`/subscription
+/// `system.*`, `client.hello`, `drafts.*`, `events.`/subscription
 /// fast-paths) run inline on the read loop and stay serialized. A successful
 /// `client.hello` also binds the connection's logical identity onto its
 /// `reverse_guard` registry entry (REV-2 target selection) and publishes the
@@ -365,13 +406,51 @@ impl ConnSubs {
 /// inline with the router's `-32700`/`-32600`, so the error matrix does not
 /// change under load.
 #[expect(clippy::too_many_arguments)]
-pub(crate) async fn process_frame(
+pub(crate) fn process_frame<'a>(
+    raw: &'a str,
+    api: &'a Arc<dyn WorkspaceApi>,
+    bus: &'a EventBus,
+    out_tx: &'a OutboundSender,
+    subs: &'a mut ConnSubs,
+    reverse: &'a ReverseChannel,
+    reverse_guard: &'a PrimaryReverseGuard,
+    control: Option<&'a Arc<dyn SystemControl>>,
+    server_pairing_info: Option<&'a Arc<dyn crate::server::ServerPairingInfo>>,
+    client_id: &'a mut Option<ClientId>,
+    is_local: bool,
+    limiter: &'a RpcLimiter,
+) -> impl Future<Output = bool> + Send + 'a {
+    // Own completion before even an unpolled frame future can be discarded.
+    let context = crate::context::CapturedFrame::capture();
+    async move {
+        context
+            .run(process_captured_frame(
+                &context,
+                raw,
+                api,
+                bus,
+                out_tx,
+                subs,
+                reverse,
+                reverse_guard,
+                control,
+                server_pairing_info,
+                client_id,
+                is_local,
+                limiter,
+            ))
+            .await
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn process_captured_frame(
+    context: &crate::context::CapturedFrame,
     raw: &str,
     api: &Arc<dyn WorkspaceApi>,
     bus: &EventBus,
     out_tx: &OutboundSender,
     subs: &mut ConnSubs,
-    forwards: &mut ForwardRegistry,
     reverse: &ReverseChannel,
     reverse_guard: &PrimaryReverseGuard,
     control: Option<&Arc<dyn SystemControl>>,
@@ -380,6 +459,13 @@ pub(crate) async fn process_frame(
     is_local: bool,
     limiter: &RpcLimiter,
 ) -> bool {
+    let Some(request_guard) = limiter.admit_request() else {
+        return false;
+    };
+    // Shutdown releases response backpressure without cancelling the handler.
+    let mut outbound = out_tx.clone();
+    outbound.shutdown = Some(limiter.clone());
+    let out_tx = &outbound;
     let parsed = serde_json::from_str::<Value>(raw).ok();
     if let Some(value) = &parsed {
         // A reply to a daemon-initiated reverse request (FE-served intents such
@@ -413,7 +499,7 @@ pub(crate) async fn process_frame(
         );
         // Multiplayer w3 — default-deny allowlist for non-administrator
         // connections. Runs before every classify and dispatch path (control,
-        // server/pairing, provider setup, host, browser, forward, client,
+        // server/pairing, provider setup, host, browser, client,
         // drafts, subscription channels, events, router) so no fast path can
         // be reached by a method outside `COLLABORATOR_METHODS`; aliases are
         // canonicalised inside the lookup. Only a frame that already carries
@@ -422,10 +508,15 @@ pub(crate) async fn process_frame(
             && crate::context::is_non_administrator_caller()
             && !catalog::collaborator_may_call(&method)
         {
-            return refuse_forbidden(&method, rpc_id, out_tx).await;
+            let member = crate::context::may_manage_workspaces(api.as_ref()).await;
+            if !member || !catalog::member_may_call(&method) {
+                return refuse_forbidden(&method, rpc_id, out_tx).await;
+            }
         }
         if let Some(control) = control {
-            if let Some(req) = control::classify(value) {
+            if let Some(req) =
+                control::classify(value).filter(|req| control.services().admits(&req.method))
+            {
                 let is_uds = !crate::context::is_tcp_connection();
                 // A collaborator only ever reaches `system.status` here (the
                 // allowlist above refused the rest) and gets its guest-safe
@@ -444,7 +535,23 @@ pub(crate) async fn process_frame(
             }
         }
         if let Some(server_info) = server_pairing_info {
-            if let Some(req) = crate::server::classify(value) {
+            if let Some(req) = crate::pairing::classify_self(value)
+                .filter(|_| server_info.services() == crate::server::PairingServices::Full)
+            {
+                let frame = panic_guard::guard_frame(
+                    &method,
+                    rpc_id.clone(),
+                    crate::pairing::handle_self(req, server_info, api, &mut subs.pairing),
+                )
+                .await;
+                return match frame {
+                    Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                    None => true,
+                };
+            }
+            if let Some(req) = crate::server::classify(value)
+                .filter(|req| server_info.services().admits(&req.method))
+            {
                 // server.* RPCs are local-only; gate on real connection origin (UDS vs TCP)
                 // not the locality flag. Task-local context set by transport (§5.2).
                 let is_local = !crate::context::is_tcp_connection();
@@ -459,7 +566,9 @@ pub(crate) async fn process_frame(
                     None => true,
                 };
             }
-            if let Some(req) = crate::pairing::classify(value) {
+            if let Some(req) = crate::pairing::classify(value)
+                .filter(|_| server_info.services() == crate::server::PairingServices::Full)
+            {
                 // pairing.getInfo shares the server.* provider and local-only gating:
                 // the payload embeds the bearer token, so it never crosses TCP.
                 let is_local = !crate::context::is_tcp_connection();
@@ -483,11 +592,19 @@ pub(crate) async fn process_frame(
         // NOT served on authenticated connections — only on the `/invite`
         // endpoint.
         if let Some(req) = crate::invite::classify(value) {
-            if req.method == crate::invite::InviteMethod::Create {
+            if matches!(
+                req.method,
+                crate::invite::InviteMethod::Create | crate::invite::InviteMethod::HostCreate
+            ) {
                 let frame = panic_guard::guard_frame(
                     &method,
                     rpc_id.clone(),
-                    crate::invite::handle_create(req, api, server_pairing_info),
+                    crate::invite::handle_create(
+                        req,
+                        api,
+                        server_pairing_info
+                            .filter(|info| info.services() == crate::server::PairingServices::Full),
+                    ),
                 )
                 .await;
                 return match frame {
@@ -509,9 +626,17 @@ pub(crate) async fn process_frame(
             };
         }
         if let Some(req) = host::classify(value) {
+            // Metadata registration does not install a provider for unrelated
+            // host dispatch or invite/alias consumers. Keep their absent path.
+            let exec_runtime = limiter.host_exec();
             let host_environment = control
+                .filter(|control| control.services() == control::SystemServices::Full)
                 .map(|control| control.host_environment())
-                .or_else(|| server_pairing_info.map(|info| info.host_environment()));
+                .or_else(|| {
+                    server_pairing_info
+                        .filter(|info| info.services() == crate::server::PairingServices::Full)
+                        .map(|info| info.host_environment())
+                });
             // Slow path: spawn so `host.exec` and friends can't block the read
             // loop (UDS HOL fix). `openInEditor` in particular awaits an
             // FE-served reverse RPC on this same connection (§5.14) — running
@@ -532,30 +657,32 @@ pub(crate) async fn process_frame(
             let api = Arc::clone(api);
             let bus = bus.clone();
             let reverse = reverse.clone();
-            let is_tcp = crate::context::is_tcp_connection();
-            let caller = crate::context::current_caller();
+            let context = context.clone();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
-                crate::context::with_request_context(is_tcp, caller, async {
-                    finish_slow_path_rpc(
-                        permit,
-                        panic_guard::guard_frame(
-                            &method,
-                            rpc_id,
-                            host::handle_with_host_environment(
-                                req,
-                                api.as_ref(),
-                                Some(&bus),
-                                host_environment,
-                                is_local,
-                                &reverse,
+                let _request_guard = request_guard;
+                context
+                    .run(async {
+                        finish_slow_path_rpc(
+                            permit,
+                            panic_guard::guard_frame(
+                                &method,
+                                rpc_id,
+                                host::handle_with_host_environment(
+                                    req,
+                                    api.as_ref(),
+                                    Some(&bus),
+                                    host_environment,
+                                    is_local,
+                                    &reverse,
+                                    &exec_runtime,
+                                ),
                             ),
-                        ),
-                        slot,
-                    )
+                            slot,
+                        )
+                        .await;
+                    })
                     .await;
-                })
-                .await;
             });
             return true;
         }
@@ -589,42 +716,31 @@ pub(crate) async fn process_frame(
                 .then(|| reverse_guard.bound_client_id())
                 .flatten();
             let registry = reverse_guard.registry();
-            let is_tcp = crate::context::is_tcp_connection();
-            let caller = crate::context::current_caller();
+            let context = context.clone();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
-                crate::context::with_request_context(is_tcp, caller, async {
-                    let tabs = browser::TabContext {
-                        api: api.as_ref(),
-                        client_id: host_client_id.as_ref(),
-                        registry: registry.as_ref(),
-                    };
-                    finish_slow_path_rpc(
-                        permit,
-                        panic_guard::guard_frame(
-                            &method,
-                            rpc_id,
-                            browser::handle(req, &reverse, tabs),
-                        ),
-                        slot,
-                    )
+                let _request_guard = request_guard;
+                context
+                    .run(async {
+                        let tabs = browser::TabContext {
+                            api: api.as_ref(),
+                            client_id: host_client_id.as_ref(),
+                            registry: registry.as_ref(),
+                        };
+                        finish_slow_path_rpc(
+                            permit,
+                            panic_guard::guard_frame(
+                                &method,
+                                rpc_id,
+                                browser::handle(req, &reverse, tabs),
+                            ),
+                            slot,
+                        )
+                        .await;
+                    })
                     .await;
-                })
-                .await;
             });
             return true;
-        }
-        if let Some(req) = forward::classify(value) {
-            let frame = panic_guard::guard_frame(
-                &method,
-                rpc_id.clone(),
-                forward::handle(req, forwards, is_local),
-            )
-            .await;
-            return match frame {
-                Some(frame) => out_tx.send_priority(frame).await.is_ok(),
-                None => true,
-            };
         }
         if let Some(req) = client::classify(value) {
             let setup_requested = req.id_present
@@ -647,6 +763,14 @@ pub(crate) async fn process_frame(
             // registry queues and publishes any `client:*` transition.
             let hello_ok = bound.is_some();
             if let Some(identity) = bound {
+                reverse
+                    .set_browser_member(crate::context::may_manage_workspaces(api.as_ref()).await);
+                if let Some(principal) = crate::context::current_caller()
+                    .and_then(|caller| caller.principal_id().cloned())
+                {
+                    reverse_guard.bind_device(identity.clone(), principal);
+                }
+                subs.hello_identity = Some(identity.clone());
                 reverse_guard.bind(identity);
             }
             // Multiplayer w5: a hello'd connection is online for its
@@ -756,18 +880,24 @@ pub(crate) async fn process_frame(
     };
     let api = api.clone();
     let raw = raw.to_string();
-    let is_tcp = crate::context::is_tcp_connection();
-    let caller = crate::context::current_caller();
+    let context = context.clone();
     tokio::spawn(async move {
-        crate::context::with_request_context(is_tcp, caller, async {
-            finish_slow_path_rpc(
-                permit,
-                panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)),
-                slot,
-            )
+        let _request_guard = request_guard;
+        context
+            .run(async {
+                finish_prepared_rpc(
+                    &context,
+                    permit,
+                    panic_guard::guard_prepared(
+                        &method,
+                        rpc_id,
+                        crate::router::prepare_message(api.as_ref(), &raw),
+                    ),
+                    slot,
+                )
+                .await;
+            })
             .await;
-        })
-        .await;
     });
     true
 }
@@ -807,6 +937,52 @@ async fn finish_slow_path_rpc(
     let frame = handler.await;
     drop(permit);
     if let Some(frame) = frame {
+        slot.send(frame);
+    }
+}
+
+/// Qualified final validation is handler work. Its one-use packet already
+/// owns the original bounded slot and encoded frame; the action only moves it.
+async fn finish_prepared_rpc(
+    context: &crate::context::CapturedFrame,
+    permit: Option<OwnedSemaphorePermit>,
+    handler: impl Future<Output = Option<crate::router::PreparedReply>>,
+    slot: mpsc::OwnedPermit<String>,
+) {
+    use futures::FutureExt as _;
+
+    let Some(reply) = handler.await else { return };
+    let Some((kind, id)) = reply.service else {
+        drop(permit);
+        slot.send(reply.frame);
+        return;
+    };
+    let Some(scope) = context.read_scope() else {
+        drop(permit);
+        slot.send(reply.frame);
+        return;
+    };
+    let mut packet = Some((slot, reply.frame));
+    let mut permit = permit;
+    let mut transfer = || {
+        let (slot, frame) = packet.take().ok_or_else(|| {
+            intent_core::Error::Internal("repository response already transferred".into())
+        })?;
+        drop(permit.take());
+        slot.send(frame);
+        Ok(())
+    };
+    let result = std::panic::AssertUnwindSafe(async { scope.deliver(kind, &mut transfer).await })
+        .catch_unwind()
+        .await;
+    // A broken owner cannot send twice or undo an already admitted transfer.
+    // The refusal encoder and fallback send are outside all owner locks.
+    if let Some((slot, _withheld)) = packet {
+        let frame = match result {
+            Ok(Err(error)) => crate::router::delivery_error(&id, error),
+            Ok(Ok(())) | Err(_) => panic_guard::internal_error_frame(&id),
+        };
+        drop(permit);
         slot.send(frame);
     }
 }
@@ -932,11 +1108,21 @@ pub(crate) async fn handle_fast_path(
                         ..Default::default()
                     })
                 });
+                let host_removal_control = crate::context::is_non_administrator_caller()
+                    && api.subscribe_principal_revocations().is_some()
+                    && workspace_id.as_ref().is_none_or(String::is_empty)
+                    && event_types.iter().any(|pattern| {
+                        intent_services::events::event_type_matches(
+                            intent_core::events::HOST_MEMBERS_CHANGED,
+                            pattern,
+                        )
+                    });
                 let subscription = bus.subscribe(SubscriptionFilter {
                     event_types,
                     workspace_id,
                     batch_window: None,
                     collaborator_only: gate.is_some(),
+                    member_execution_events: true,
                     exclude_channel_only: true,
                     ..Default::default()
                 });
@@ -961,8 +1147,13 @@ pub(crate) async fn handle_fast_path(
                     scoped_workspace,
                     subscription_id.clone(),
                     out_tx.clone(),
+                    host_removal_control,
                 ));
-                subs.insert(subscription_id, handle, replace_group, None);
+                subs.insert(subscription_id.clone(), handle, replace_group, None);
+                subs.subs
+                    .get_mut(&subscription_id)
+                    .expect("just inserted")
+                    .host_removal_control = host_removal_control;
                 true
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
@@ -1006,13 +1197,17 @@ async fn send_fast_path_error(id: events::IdInfo, message: &str, out_tx: &Outbou
 /// A guarded subscriber's own unshare from `scoped_workspace` (the
 /// subscription's `workspaceId`, when one was given) ends the forwarder,
 /// like the scoped collection channels; a global stream stays alive for the
-/// subscriber's other member workspaces, the gate suppressing the rest.
+/// subscriber's other member workspaces, the gate suppressing the rest. A
+/// guarded subscriber's `agent:queue:updated` frames carry only the queue
+/// entries its principal may see
+/// ([`events::project_queue_event_for_current_caller`]).
 async fn forward_subscription(
     mut subscription: Subscription,
     membership: Option<(events::MembershipGate, Subscription)>,
     scoped_workspace: Option<String>,
     subscription_id: String,
     out_tx: OutboundSender,
+    host_removal_control: bool,
 ) {
     // Everything this forwarder emits travels on the bulk lane; conflation
     // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
@@ -1061,11 +1256,23 @@ async fn forward_subscription(
                         .await;
                     return;
                 };
-                for event in batch {
+                for mut event in batch {
+                    // The revocation branch sends this exact durable event once,
+                    // ahead of close, rather than racing its bulk forwarder.
+                    if host_removal_control && event.event_type == intent_core::events::HOST_MEMBERS_CHANGED
+                        && event.data["action"] == "removed"
+                        && crate::context::current_caller().and_then(|c| c.principal_id().cloned()).is_some_and(|id| event.data["principalId"] == id.0) {
+                        continue;
+                    }
                     if let Some(gate) = gate.as_mut() {
                         if !gate.allows(&event).await {
                             continue;
                         }
+                        // A gated (non-administrator) connection sees only
+                        // its own queue entries in `agent:queue:updated`, and
+                        // no `content` in `agent:queue:processing` for a
+                        // foreign entry.
+                        events::project_queue_event_for_current_caller(&mut event);
                     }
                     if let Some(key) = conflate::event_key(&event) {
                         let item = EventItem::new(&key, event);
@@ -1124,6 +1331,11 @@ pub(crate) async fn handle_sub_fast_path(
     subs: &mut ConnSubs,
 ) -> bool {
     match sub {
+        SubFastPath::Subscribe {
+            id,
+            channel: Channel::PresenceFocus,
+            params,
+        } => presence_focus::subscribe(id, params, api, bus, out_tx, subs).await,
         SubFastPath::Subscribe {
             id,
             channel: Channel::Note,
@@ -1281,6 +1493,7 @@ pub(crate) async fn handle_sub_fast_path(
         } => match subscriptions::parse_chat_subscribe_params(&params) {
             Ok(p) => {
                 let subscriptions::ChatSubscribeParams {
+                    limit,
                     agent_id,
                     since_message_id,
                     delta_encoding,
@@ -1318,6 +1531,7 @@ pub(crate) async fn handle_sub_fast_path(
                     workspace_id: None,
                     batch_window: None,
                     collaborator_only: gate.is_some(),
+                    member_execution_events: true,
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();
@@ -1356,6 +1570,7 @@ pub(crate) async fn handle_sub_fast_path(
                     subscription_id.clone(),
                     out_tx.clone(),
                     timer,
+                    limit,
                 ));
                 subs.insert(subscription_id, handle, replace_group, Some(lifecycle));
                 true
@@ -1397,6 +1612,7 @@ pub(crate) async fn handle_sub_fast_path(
                         workspace_id: filter_ws,
                         batch_window: None,
                         collaborator_only: crate::context::is_non_administrator_caller(),
+                        member_execution_events: true,
                         ..Default::default()
                     });
                     // The global `workspace` channel re-reads its rows and
@@ -1459,8 +1675,9 @@ where
 {
     let is_tcp = crate::context::is_tcp_connection();
     let caller = crate::context::current_caller();
-    tokio::spawn(crate::context::with_request_context(
-        is_tcp, caller, forwarder,
+    let credential = intent_core::caller::current_wire_credential();
+    tokio::spawn(crate::context::with_credential_context(
+        is_tcp, caller, credential, forwarder,
     ))
 }
 
@@ -1623,6 +1840,11 @@ async fn forward_note_subscription(
 /// after that id (`resumed: true`) or falls back to the standard full page
 /// (`resumed: false`) — see [`subscriptions::chat_snapshot`].
 ///
+/// Transcript edits and replacements also re-emit a bounded snapshot at the
+/// next seq. Recovery snapshots carry `resumed: false` so clients discard old
+/// cached rows, including history outside the served page. Metadata-only
+/// `agent:updated` events do not invalidate the transcript.
+///
 /// **Lag self-heal.** The broadcast ring drops this subscriber's oldest
 /// undelivered events when it falls behind (slow consumer — e.g. the bulk lane
 /// starved by large priority-lane responses). The loss is silent on the wire:
@@ -1666,6 +1888,7 @@ async fn forward_chat_subscription(
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
+    limit: usize,
 ) {
     let scope = agent_id.as_str().to_string();
     let reason = chat_subscription_loop(
@@ -1679,6 +1902,7 @@ async fn forward_chat_subscription(
         subscription_id.clone(),
         out_tx,
         timer,
+        limit,
     )
     .await;
     subscriptions::trace_chat_forwarder_exit(&scope, &subscription_id, reason);
@@ -1701,6 +1925,7 @@ async fn chat_subscription_loop(
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
+    limit: usize,
 ) -> &'static str {
     // Everything this forwarder emits travels on the bulk lane; conflation
     // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
@@ -1728,6 +1953,7 @@ async fn chat_subscription_loop(
         &agent_id,
         since_message_id.as_deref(),
         projection,
+        limit,
     )
     .await;
     subscriptions::stamp_delta_encoding(&mut snapshot, delta_encoding);
@@ -1758,8 +1984,8 @@ async fn chat_subscription_loop(
     // its turn's terminal frame.
     let mut buffer: ConflationBuffer<ChatItem> = ConflationBuffer::new();
     let mut seq: u64 = 1;
-    // `Some(skipped)` while a lag recovery snapshot is owed but not yet
-    // emitted (read failed persistently); cleared once a good page goes out.
+    // Some(skipped) while a recovery snapshot is owed; zero denotes an
+    // explicit transcript invalidation rather than a lag marker.
     let mut pending_recovery: Option<u64> = None;
     loop {
         tokio::select! {
@@ -1799,7 +2025,7 @@ async fn chat_subscription_loop(
             () = tokio::time::sleep(CHAT_RECOVERY_RETRY), if pending_recovery.is_some() => {
                 if !attempt_chat_recovery(
                     api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
-                    &mut seq, &out_tx, &mut state, &mut pending_recovery,
+                    &mut seq, &out_tx, &mut state, &mut pending_recovery, limit,
                 ).await {
                     return "client_closed";
                 }
@@ -1822,7 +2048,7 @@ async fn chat_subscription_loop(
                     Delivery::Batch(_) if pending_recovery.is_some() => {
                         if !attempt_chat_recovery(
                             api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
-                            &mut seq, &out_tx, &mut state, &mut pending_recovery,
+                            &mut seq, &out_tx, &mut state, &mut pending_recovery, limit,
                         ).await {
                             return "client_closed";
                         }
@@ -1858,13 +2084,35 @@ async fn chat_subscription_loop(
                         );
                         if !attempt_chat_recovery(
                             api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
-                            &mut seq, &out_tx, &mut state, &mut pending_recovery,
+                            &mut seq, &out_tx, &mut state, &mut pending_recovery, limit,
                         ).await {
                             return "client_closed";
                         }
                         continue;
                     }
                 };
+                // Transcript edits/replacements invalidate both the client's
+                // accumulated rows and this forwarder's per-turn block state.
+                // Coalesce the already-published backlog before reading, just
+                // like lag recovery: replaying it after the snapshot could
+                // restore deleted rows or append incremental text twice.
+                if batch.iter().any(|event| {
+                    event.session_id.as_deref() == Some(agent_id.as_str())
+                        && event.event_type == AGENT_UPDATED
+                        && (event.data.get("truncatedCount").is_some()
+                            || event.data.get("replacedCount").is_some())
+                }) {
+                    while subscription.try_recv_delivery().is_some() {}
+                    buffer = ConflationBuffer::new();
+                    pending_recovery = Some(0);
+                    if !attempt_chat_recovery(
+                        api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
+                        &mut seq, &out_tx, &mut state, &mut pending_recovery, limit,
+                    ).await {
+                        return "client_closed";
+                    }
+                    continue;
+                }
                 for event in batch {
                     // Cross-agent isolation: only this agent's stream events
                     // belong to this subscription.
@@ -1943,13 +2191,13 @@ async fn chat_subscription_loop(
     }
 }
 
-/// Retry cadence for a pending lag recovery whose bounded page read keeps
+/// Retry cadence for a pending recovery whose bounded page read keeps
 /// failing (see [`forward_chat_subscription`]). Long enough to give a
 /// transient store failure room to clear, short enough that a quiet bus does
 /// not leave the client stale for long.
 const CHAT_RECOVERY_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// One attempt at the owed lag-recovery snapshot: read the bounded page
+/// One attempt at the owed recovery snapshot: read the bounded page
 /// (fallibly — see [`subscriptions::chat_recovery_snapshot`]), and on success
 /// emit it at the next `seq`, reseed the mapper, and clear the pending flag.
 /// On a failed read the recovery stays pending for the caller to re-attempt.
@@ -1965,16 +2213,22 @@ async fn attempt_chat_recovery(
     out_tx: &mpsc::Sender<String>,
     state: &mut subscriptions::ChatDeltaState,
     pending_recovery: &mut Option<u64>,
+    limit: usize,
 ) -> bool {
-    let Some(mut snapshot) = subscriptions::chat_recovery_snapshot(api, agent_id, projection).await
+    let Some(mut snapshot) =
+        subscriptions::chat_recovery_snapshot(api, agent_id, projection, limit).await
     else {
         tracing::warn!(
             agent = %agent_id,
-            "chat lag recovery read failed; keeping recovery pending"
+            "chat recovery read failed; keeping recovery pending"
         );
         return true;
     };
     subscriptions::stamp_delta_encoding(&mut snapshot, delta_encoding);
+    // Recovery invalidates the whole cached transcript, including older pages.
+    // Lag may itself have swallowed a truncation event, so this also applies
+    // when recovery was triggered by lost delivery rather than a known edit.
+    snapshot["resumed"] = Value::Bool(false);
     let frame = subscriptions::build_snapshot_push(subscription_id, *seq, &snapshot);
     *seq += 1;
     if out_tx.send(frame).await.is_err() {
@@ -2135,6 +2389,48 @@ async fn forward_channel_subscription(
     let mut seq: u64 = 1;
     while let Some(batch) = recv_visible(&mut subscription, &mut membership).await {
         for event in batch {
+            if channel == Channel::Workspace
+                && event.event_type == intent_core::events::HOST_MEMBERS_CHANGED
+            {
+                let Ok(rows) = api.list_workspaces_lite(true).await else {
+                    continue;
+                };
+                let snapshot = serde_json::to_value(rows).unwrap_or_else(|_| json!([]));
+                let next = subscriptions::visible_workspace_ids(&snapshot);
+                let removed: Vec<String> = visible_workspaces
+                    .as_ref()
+                    .map(|old| old.difference(&next).cloned().collect())
+                    .unwrap_or_default();
+                let (added, updated): (Vec<_>, Vec<_>) = snapshot
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .partition(|row| {
+                        visible_workspaces.as_ref().is_some_and(|old| {
+                            row.get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| !old.contains(id))
+                        })
+                    });
+                if let Some(visible) = visible_workspaces.as_mut() {
+                    *visible = next;
+                }
+                let delta = json!({"added":added,"updated":updated,"removedIds":removed});
+                if out_tx
+                    .send_bulk(subscriptions::build_delta_push(
+                        &subscription_id,
+                        seq,
+                        &delta,
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                seq += 1;
+                continue;
+            }
             let delta = if channel == Channel::Task {
                 subscriptions::task_delta(api.as_ref(), &workspace_id, &event, &mut spec_links)
                     .await
@@ -2162,8 +2458,116 @@ async fn forward_channel_subscription(
 }
 
 #[cfg(test)]
+pub(crate) mod read_delivery_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_fences_real_dispatch_and_waits_for_admitted_persistence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        struct HeldWriter {
+            store: intent_store::Store,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            calls: AtomicUsize,
+        }
+        impl WorkspaceApi for HeldWriter {
+            fn list_workspaces(
+                &self,
+                _: bool,
+            ) -> intent_core::BoxFuture<'_, intent_core::Result<Vec<intent_core::Workspace>>>
+            {
+                Box::pin(async {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    self.store.set_setting("test.admitted", "durable").await?;
+                    Ok(Vec::new())
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = intent_store::Store::open(&dir.path().join("store.db"))
+            .await
+            .unwrap();
+        let writer = Arc::new(HeldWriter {
+            store: store.clone(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: AtomicUsize::new(0),
+        });
+        let api: Arc<dyn WorkspaceApi> = writer.clone();
+        let bus = EventBus::new(store.clone());
+        let (tx, _idle_peer) = outbound_channel();
+        let reverse = ReverseChannel::new(tx.priority_sender());
+        let primary = crate::reverse::PrimaryReverseRegistry::new();
+        let guard = primary.register(reverse.clone(), crate::reverse::ReverseTransport::Wss);
+        let limiter = RpcLimiter::unlimited();
+        let mut subs = ConnSubs::default();
+        let mut client = None;
+        let frame = r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list"}"#;
+        assert!(
+            process_frame(
+                frame,
+                &api,
+                &bus,
+                &tx,
+                &mut subs,
+                &reverse,
+                &guard,
+                None,
+                None,
+                &mut client,
+                true,
+                &limiter
+            )
+            .await
+        );
+        tokio::time::timeout(Duration::from_secs(10), writer.entered.notified())
+            .await
+            .unwrap();
+        limiter.begin_shutdown();
+        assert!(
+            !process_frame(
+                frame,
+                &api,
+                &bus,
+                &tx,
+                &mut subs,
+                &reverse,
+                &guard,
+                None,
+                None,
+                &mut client,
+                true,
+                &limiter
+            )
+            .await
+        );
+        let drained = limiter.drain();
+        tokio::pin!(drained);
+        tokio::select! {
+            biased;
+            () = &mut drained => panic!("admitted writer escaped request drain"),
+            () = std::future::ready(()) => {}
+        }
+        writer.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), drained)
+            .await
+            .unwrap();
+        assert_eq!(writer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.get_setting("test.admitted").await.unwrap().as_deref(),
+            Some("durable")
+        );
+        // Idle peer remains alive throughout drain; no socket-close handshake.
+        bus.shutdown().await.unwrap();
+        store.close().await;
+    }
 
     /// A request rejected at the outstanding-RPC cap answers `-32011 "Server
     /// overloaded"` echoing its id, and the connection stays open.
@@ -2504,3 +2908,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "conn_terminal_replay_tests.rs"]
+mod terminal_replay_tests;

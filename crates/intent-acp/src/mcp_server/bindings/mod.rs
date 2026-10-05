@@ -226,7 +226,10 @@ pub(crate) async fn try_dispatch(
             .await
             .map(Some);
     }
-    if let Some(rest) = method.strip_prefix("pr.") {
+    if let Some(rest) = method
+        .strip_prefix("pr.")
+        .or_else(|| method.strip_prefix("mr."))
+    {
         return pr::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
@@ -262,9 +265,16 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("script.") {
-        return script::dispatch(api, workspace_id, eval_budget.total, rest, args)
-            .await
-            .map(Some);
+        return script::dispatch(
+            api,
+            workspace_id,
+            eval_budget.total,
+            caller_agent_id,
+            rest,
+            args,
+        )
+        .await
+        .map(Some);
     }
     if let Some(rest) = method.strip_prefix("terminal.") {
         return terminal::dispatch(api, workspace_id, rest, args)
@@ -272,7 +282,9 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("mcp.") {
-        return mcp::dispatch(api, workspace_id, rest, args).await.map(Some);
+        return mcp::dispatch(api, workspace_id, caller_agent_id, rest, args)
+            .await
+            .map(Some);
     }
     if let Some(rest) = method.strip_prefix("file.") {
         return file::dispatch(api, workspace_id, caller_agent_id, rest, args)
@@ -528,12 +540,17 @@ mod prelude_tests {
         assert!(agent::PRELUDE.contains(agent::RETIRE_PRELUDE_SEGMENT));
     }
 
-    // `peerAgents` defaults OFF (the one opt-in toggle): the default prelude
-    // omits the `retire` installer; opting in installs it, and the
-    // `ws.agent` scrubs compose independently.
+    // `peerAgents` defaults ON: the default prelude installs `retire`;
+    // opting out omits it, and the `ws.agent` scrubs compose independently.
     #[test]
     fn peer_agents_gates_retire_installer_in_prelude() {
         let js = prelude_for(&AgentFeaturesSettings::default());
+        assert!(js.contains("retire:"), "default must install retire");
+
+        let js = prelude_for(&AgentFeaturesSettings {
+            peer_agents: false,
+            ..AgentFeaturesSettings::default()
+        });
         assert!(
             !js.contains("retire:"),
             "retire installed with peerAgents off"
@@ -544,13 +561,6 @@ mod prelude_tests {
         );
 
         let js = prelude_for(&AgentFeaturesSettings {
-            peer_agents: true,
-            ..AgentFeaturesSettings::default()
-        });
-        assert!(js.contains("retire:"), "opting in must install retire");
-
-        let js = prelude_for(&AgentFeaturesSettings {
-            peer_agents: true,
             attention_requests: false,
             ..AgentFeaturesSettings::default()
         });

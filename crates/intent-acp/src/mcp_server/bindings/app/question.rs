@@ -388,6 +388,6 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("only available in the Chief of Staff workspace"));
+        assert!(err.contains("only available in the Assistant workspace"));
     }
 }

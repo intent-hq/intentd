@@ -78,11 +78,12 @@ pub const DEFAULT_STATEMENT_WARN_THRESHOLD: u64 = 25;
 /// many SQL statements draws a WARN. Higher than
 /// [`DEFAULT_STATEMENT_WARN_THRESHOLD`] so a legitimately compound
 /// multi-entity op doesn't trip the guardrail. Sized off observed dispatch
-/// counts — `workspace.create` deterministically runs ~40 statements and
-/// `workspace.delete` ~10 regardless of workspace contents (its per-agent
-/// sweep was batched in intent-hq/monorepo#4130; 26–72 observed before that,
-/// intent-hq/monorepo#3074) — while staying an order of magnitude below the
-/// hundreds a real N+1 regression produces.
+/// counts — `workspace.create` deterministically runs ~40 statements — while
+/// staying an order of magnitude below the hundreds a real N+1 regression
+/// produces. Incremental `workspace.delete` cleanup intentionally adds
+/// statements per session and history batch (intent-hq/intent#5337), so large
+/// deletes can exceed this budget just like large imports; their responsiveness
+/// is guarded by writer-interleaving tests, not a constant total query count.
 pub const DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD: u64 = 100;
 /// Default duration threshold in milliseconds for non-network-tier methods: a
 /// dispatch running longer than this draws a WARN.
@@ -130,12 +131,12 @@ fn is_network_tier_method(method: &str) -> bool {
 /// Exact method names of legitimately compound multi-entity ops (see
 /// [`is_compound_statement_method`]). `workspace.delete` belongs here
 /// because deletion fans out over the workspace's contents — per-session
-/// teardown, completion-watch and subscription sweeps, then the store
-/// cascade — so its statement count scales with workspace size
-/// (intent-hq/monorepo#3074). `workspace.import.commit` likewise inserts one
+/// teardown, completion-watch and subscription sweeps, then incremental store
+/// cleanup — so its statement count scales with sessions and cleanup batches
+/// (intent-hq/intent#5337). `workspace.import.commit` likewise inserts one
 /// row per transferred row inside the dispatch, so its count scales with the
 /// imported workspace's contents. Import counts are unbounded (322 observed
-/// on a large import), so a big import can still overrun the compound budget
+/// on a large import), so a big import or delete can still overrun the compound budget
 /// — that residual WARN on a rare, deliberate op is accepted rather than
 /// raising the shared threshold high enough to blunt the N+1 signal for the
 /// bounded members. `workspace.unarchive` is a compound lifecycle op —

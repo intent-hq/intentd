@@ -165,12 +165,17 @@ type SearchCall = (String, Option<u32>, Option<String>);
 struct RecordingEngine {
     list_calls: Mutex<Vec<ListCall>>,
     search_calls: Mutex<Vec<SearchCall>>,
+    calls: Mutex<Vec<Value>>,
 }
 
 #[async_trait]
 impl LinearEngine for RecordingEngine {
     async fn auth_status(&self) -> LinearResult<AuthStatus> {
-        unimplemented!()
+        Ok(AuthStatus {
+            authenticated: true,
+            login: Some("fixture-user".into()),
+            scopes: vec![],
+        })
     }
 
     async fn list_issues(
@@ -212,29 +217,63 @@ impl LinearEngine for RecordingEngine {
         })
     }
 
-    async fn get_issue(&self, _: &str) -> LinearResult<LinearIssueResult> {
-        unimplemented!()
+    async fn get_issue(&self, id: &str) -> LinearResult<LinearIssueResult> {
+        self.calls.lock().unwrap().push(json!(["get", id]));
+        Ok(issue(id))
     }
     async fn viewer(&self) -> LinearResult<LinearUser> {
-        unimplemented!()
+        Ok(serde_json::from_value(json!({"id":"user","name":"Fixture"})).unwrap())
     }
-    async fn list_teams(&self, _: Option<u32>) -> LinearResult<Vec<LinearTeam>> {
-        unimplemented!()
+    async fn list_teams(&self, limit: Option<u32>) -> LinearResult<Vec<LinearTeam>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["list_teams", limit]));
+        Ok(vec![serde_json::from_value(
+            json!({"id":"team","key":"ENG","name":"Engineering"}),
+        )
+        .unwrap()])
     }
-    async fn list_workflow_states(&self, _: Option<u32>) -> LinearResult<Vec<LinearWorkflowState>> {
-        unimplemented!()
+    async fn list_workflow_states(
+        &self,
+        limit: Option<u32>,
+    ) -> LinearResult<Vec<LinearWorkflowState>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["list_workflow_states", limit]));
+        Ok(vec![serde_json::from_value(
+            json!({"id":"state","name":"Todo","type":"unstarted"}),
+        )
+        .unwrap()])
     }
-    async fn list_projects(&self, _: Option<u32>) -> LinearResult<Vec<LinearProject>> {
-        unimplemented!()
+    async fn list_projects(&self, limit: Option<u32>) -> LinearResult<Vec<LinearProject>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["list_projects", limit]));
+        Ok(vec![serde_json::from_value(
+            json!({"id":"project","name":"Project","state":"started"}),
+        )
+        .unwrap()])
     }
-    async fn list_labels(&self, _: Option<u32>) -> LinearResult<Vec<LinearLabel>> {
-        unimplemented!()
+    async fn list_labels(&self, limit: Option<u32>) -> LinearResult<Vec<LinearLabel>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["list_labels", limit]));
+        Ok(vec![serde_json::from_value(
+            json!({"id":"label","name":"Label"}),
+        )
+        .unwrap()])
     }
-    async fn create_issue(&self, _: CreateIssueRequest) -> LinearResult<LinearIssueResult> {
-        unimplemented!()
+    async fn create_issue(&self, request: CreateIssueRequest) -> LinearResult<LinearIssueResult> {
+        self.calls.lock().unwrap().push(json!(["create", request]));
+        Ok(issue("ENG-3"))
     }
-    async fn update_issue(&self, _: UpdateIssueRequest) -> LinearResult<LinearIssueResult> {
-        unimplemented!()
+    async fn update_issue(&self, request: UpdateIssueRequest) -> LinearResult<LinearIssueResult> {
+        self.calls.lock().unwrap().push(json!(["update", request]));
+        Ok(issue("ENG-3"))
     }
 }
 
@@ -292,7 +331,7 @@ async fn connect(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
     common::wss_connect_with_retry(port, cfg, &url).await
 }
 
-async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
+async fn wss_rpc_envelope(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(req.to_string().into()))
         .await
@@ -303,8 +342,9 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
                 Message::Text(text) => {
                     let v: Value = serde_json::from_str(&text).unwrap();
                     if v.get("id") == Some(&json!(id)) {
-                        assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
-                        return v["result"].clone();
+                        assert_eq!(v["jsonrpc"], "2.0");
+                        assert!(v.get("result").is_some() != v.get("error").is_some());
+                        return v;
                     }
                 }
                 Message::Ping(p) => {
@@ -333,70 +373,200 @@ fn wire_next_token(cursor: &str) -> String {
 /// carries an explicit `nextToken: null`.
 #[intent_test_macros::daemon_test]
 async fn list_issues_next_token_round_trips() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for context in [None, Some("workspace-a")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "linear.listIssues",
-        json!({ "filter": "created", "limit": 5 }),
-    )
-    .await;
-    assert_eq!(r["issues"][0]["identifier"], "ENG-1");
-    assert_eq!(r["nextToken"], json!(wire_next_token("cursor-2")));
+        let r = context_rpc(
+            context,
+            &mut ws,
+            1,
+            "linear.listIssues",
+            json!({ "filter": "created", "limit": 5 }),
+        )
+        .await;
+        assert_eq!(r["issues"][0]["identifier"], "ENG-1");
+        assert_eq!(r["nextToken"], json!(wire_next_token("cursor-2")));
 
-    let r = wss_rpc(
-        &mut ws,
-        2,
-        "linear.listIssues",
-        json!({ "filter": "created", "limit": 5, "nextToken": wire_next_token("cursor-2") }),
-    )
-    .await;
-    assert_eq!(r["issues"][0]["identifier"], "ENG-1");
-    assert_eq!(r["nextToken"], json!(null), "last page is nextToken null");
+        let r = context_rpc(
+            context,
+            &mut ws,
+            2,
+            "linear.listIssues",
+            json!({ "filter": "created", "limit": 5, "nextToken": wire_next_token("cursor-2") }),
+        )
+        .await;
+        assert_eq!(r["issues"][0]["identifier"], "ENG-1");
+        assert_eq!(r["nextToken"], json!(null), "last page is nextToken null");
 
-    let calls = fx.engine.list_calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0], (IssueFilter::Created, Some(5), None));
-    assert_eq!(
-        calls[1],
-        (IssueFilter::Created, Some(5), Some("cursor-2".to_string()))
-    );
+        let calls = fx.engine.list_calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], (IssueFilter::Created, Some(5), None));
+        assert_eq!(
+            calls[1],
+            (IssueFilter::Created, Some(5), Some("cursor-2".to_string()))
+        );
+    }
 }
 
 /// `linear.searchIssues`: same envelope and cursor semantics, with the wire
 /// `query` forwarded alongside the token.
 #[intent_test_macros::daemon_test]
 async fn search_issues_next_token_round_trips() {
+    for context in [None, Some("workspace-a")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+        let r = context_rpc(
+            context,
+            &mut ws,
+            1,
+            "linear.searchIssues",
+            json!({ "query": "login bug" }),
+        )
+        .await;
+        assert_eq!(r["issues"][0]["identifier"], "ENG-2");
+        assert_eq!(r["nextToken"], json!(wire_next_token("cursor-2")));
+
+        let r = context_rpc(
+            context,
+            &mut ws,
+            2,
+            "linear.searchIssues",
+            json!({ "query": "login bug", "nextToken": wire_next_token("cursor-2") }),
+        )
+        .await;
+        assert_eq!(r["issues"][0]["identifier"], "ENG-2");
+        assert_eq!(r["nextToken"], json!(null), "last page is nextToken null");
+
+        let calls = fx.engine.search_calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], ("login bug".to_string(), None, None));
+        assert_eq!(
+            calls[1],
+            ("login bug".to_string(), None, Some("cursor-2".to_string()))
+        );
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn integration_context_linear_preserves_payloads_and_selectors() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for (method, params, expected_call) in [
+        ("linear.authStatus", json!({}), None),
+        ("linear.viewer", json!({}), None),
+        (
+            "linear.getIssue",
+            json!({"id":"ENG-3","identifier":"ignored"}),
+            Some(json!(["get", "ENG-3"])),
+        ),
+        (
+            "linear.getIssue",
+            json!({"identifier":"ENG-3"}),
+            Some(json!(["get", "ENG-3"])),
+        ),
+        (
+            "linear.listTeams",
+            json!({"limit":7}),
+            Some(json!(["list_teams", 7])),
+        ),
+        (
+            "linear.listWorkflowStates",
+            json!({"limit":7}),
+            Some(json!(["list_workflow_states", 7])),
+        ),
+        (
+            "linear.listProjects",
+            json!({"limit":7}),
+            Some(json!(["list_projects", 7])),
+        ),
+        (
+            "linear.listLabels",
+            json!({"limit":7}),
+            Some(json!(["list_labels", 7])),
+        ),
+        (
+            "linear.createIssue",
+            json!({"title":"Title","teamId":"team","description":"workspaceId","priority":2.0,"labelIds":["label"],"assigneeId":"user","stateId":"state"}),
+            None,
+        ),
+        (
+            "linear.updateIssue",
+            json!({"issueId":"issue","title":"Changed","description":"Updated","assigneeId":"user","stateId":"state","priority":0.0}),
+            None,
+        ),
+    ] {
+        let mut baseline = None;
+        for context in [None, Some("workspace-a"), Some("workspace-b")] {
+            let mut request = params.clone();
+            if let Some(context) = context {
+                request["workspaceId"] = json!(context);
+            }
+            fx.engine.calls.lock().unwrap().clear();
+            let result = wss_rpc(&mut ws, 1, method, request).await;
+            if let Some(baseline) = &baseline {
+                assert_eq!(&result, baseline, "{method}");
+            } else {
+                baseline = Some(result);
+            }
+            let expected = match method {
+                "linear.createIssue" => Some(json!(["create", params])),
+                "linear.updateIssue" => Some(json!(["update", params])),
+                _ => expected_call.clone(),
+            };
+            assert_eq!(
+                *fx.engine.calls.lock().unwrap(),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{method}: {context:?}"
+            );
+        }
+    }
+}
 
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "linear.searchIssues",
-        json!({ "query": "login bug" }),
-    )
-    .await;
-    assert_eq!(r["issues"][0]["identifier"], "ENG-2");
-    assert_eq!(r["nextToken"], json!(wire_next_token("cursor-2")));
+async fn context_rpc(
+    context: Option<&str>,
+    ws: &mut TlsWs,
+    id: i64,
+    method: &str,
+    mut params: Value,
+) -> Value {
+    if let Some(context) = context {
+        params["workspaceId"] = json!(context);
+    }
+    wss_rpc(ws, id, method, params).await
+}
 
-    let r = wss_rpc(
-        &mut ws,
-        2,
-        "linear.searchIssues",
-        json!({ "query": "login bug", "nextToken": wire_next_token("cursor-2") }),
-    )
-    .await;
-    assert_eq!(r["issues"][0]["identifier"], "ENG-2");
-    assert_eq!(r["nextToken"], json!(null), "last page is nextToken null");
+async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
+    let v = wss_rpc_envelope(ws, id, method, params).await;
+    assert!(v.get("error").is_none(), "{method}: {v}");
+    v["result"].clone()
+}
 
-    let calls = fx.engine.search_calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0], ("login bug".to_string(), None, None));
-    assert_eq!(
-        calls[1],
-        ("login bug".to_string(), None, Some("cursor-2".to_string()))
-    );
+#[intent_test_macros::daemon_test]
+async fn integration_context_linear_errors_are_unchanged() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for (method, params) in [
+        ("linear.listIssues", json!({"filter":"bogus"})),
+        ("linear.getIssue", json!({})),
+        ("linear.createIssue", json!({"title":"Title"})),
+        ("linear.updateIssue", json!({"issueId":""})),
+        (
+            "linear.createIssue",
+            json!({"title":"Title","teamId":"team","priority":"wrong"}),
+        ),
+    ] {
+        let direct = wss_rpc_envelope(&mut ws, 1, method, params.clone()).await;
+        assert_eq!(direct["error"]["code"], -32602, "{method}: {direct}");
+        let mut routed = params;
+        routed["workspaceId"] = json!("workspace-route");
+        assert_eq!(
+            wss_rpc_envelope(&mut ws, 1, method, routed).await,
+            direct,
+            "{method}"
+        );
+    }
+    assert!(fx.engine.calls.lock().unwrap().is_empty());
+    assert!(fx.engine.list_calls.lock().unwrap().is_empty());
 }

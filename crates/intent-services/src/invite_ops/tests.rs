@@ -8,23 +8,31 @@ use super::*;
 use crate::tests::pr::StubForge;
 use crate::tests::{workspace, TempDb};
 use intent_core::{with_caller, WorkspaceApi};
+use intent_sourcecontrol::identity_proof::ProofGistView;
+use intent_sourcecontrol::UserIdentity;
 use intent_store::Store;
+
+/// A pre-10.8 `invite.prove` claim: GitHub gist `gist_id`, owner `login`.
+fn github_claim(gist_id: &str, login: &str) -> InviteProofClaim {
+    InviteProofClaim::github(gist_id, login)
+}
 
 /// One workspace owned by a non-administrator principal (the primary is
 /// demoted so the one-owner index admits the promotion) plus a collaborator
 /// member. Both carry a GitHub identity so invite creation needs no forge.
-struct Fixture {
-    services: Services,
-    store: Store,
-    ws: WorkspaceId,
-    primary: PrincipalId,
-    owner: PrincipalId,
-    collaborator: PrincipalId,
+pub(super) struct Fixture {
+    pub(super) services: Services,
+    pub(super) store: Store,
+    pub(super) ws: WorkspaceId,
+    pub(super) primary: PrincipalId,
+    pub(super) owner: PrincipalId,
+    pub(super) collaborator: PrincipalId,
 }
 
-fn principal(login: &str, github_user_id: Option<i64>) -> Principal {
+pub(super) fn principal(login: &str, github_user_id: Option<i64>) -> Principal {
     Principal {
         id: PrincipalId::new(),
+        identity: None,
         github_user_id,
         login: Some(login.to_string()),
         display_name: Some(format!("{login} name")),
@@ -45,14 +53,34 @@ fn identity(login: &str, id: u64) -> UserIdentity {
     }
 }
 
-fn wire(principal_id: &PrincipalId) -> Caller {
+/// The github.com account [`identity`] describes, as the join resolves it.
+pub(super) fn guest(login: &str, id: u64) -> ForgeUser {
+    ForgeUser::github(&identity(login, id))
+}
+
+/// An account on the GitLab instance `host`, as a snippet proof resolves it.
+pub(super) fn gitlab_guest(host: &str, login: &str, id: u64) -> ForgeUser {
+    ForgeUser::on("gitlab", host, &id.to_string(), login, None)
+}
+
+/// Services over `store` whose GitLab credential store is a scratch file
+/// beside the temp db: the identity resolution every mint runs
+/// ([`Services::resolve_identity_forge`]) probes GitLab through that store,
+/// so it must never read the developer's real `~/intent/.secrets.json`.
+fn services(store: &Store, tmp: &TempDb) -> Services {
+    Services::new(store.clone()).with_gitlab_secret_store(intent_core::FileSecretStore::with_path(
+        tmp.path.with_extension("secrets.json"),
+    ))
+}
+
+pub(super) fn wire(principal_id: &PrincipalId) -> Caller {
     Caller::Wire {
         principal_id: principal_id.clone(),
-        is_administrator: false,
+        host_role: intent_core::HostRole::Guest,
     }
 }
 
-async fn fixture(tmp: &TempDb) -> Fixture {
+pub(super) async fn fixture(tmp: &TempDb) -> Fixture {
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
@@ -75,7 +103,7 @@ async fn fixture(tmp: &TempDb) -> Fixture {
         .await
         .expect("collaborator");
     Fixture {
-        services: Services::new(store.clone()),
+        services: services(&store, tmp),
         store,
         ws,
         primary,
@@ -85,7 +113,7 @@ async fn fixture(tmp: &TempDb) -> Fixture {
 }
 
 impl Fixture {
-    async fn create_invite(&self, ttl: Option<u64>) -> Value {
+    pub(super) async fn create_invite(&self, ttl: Option<u64>) -> Value {
         with_caller(
             wire(&self.owner),
             self.services
@@ -96,18 +124,67 @@ impl Fixture {
     }
 }
 
-fn invite_kind<T: std::fmt::Debug>(r: &Result<T>) -> InviteErrorKind {
+pub(super) fn invite_kind<T: std::fmt::Debug>(r: &Result<T>) -> InviteErrorKind {
     match r {
         Err(Error::Invite(kind)) => *kind,
         other => panic!("expected an invite error, got {other:?}"),
     }
 }
 
-fn id_of(created: &Value) -> String {
+pub(super) fn id_of(created: &Value) -> String {
     created["invite"]["id"]
         .as_str()
         .expect("invite id")
         .to_string()
+}
+
+#[tokio::test]
+async fn intent_authority_issues_workspace_invites_without_a_profile_or_forge() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let services =
+        services(&store, &tmp).with_source_control(Arc::new(StubForge::unauthenticated()));
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.unwrap();
+    let primary = store.get_primary_principal().await.unwrap();
+    assert!(primary.identity_key().is_none());
+    let result = with_caller(
+        Caller::Daemon,
+        services.workspace_invite_create_op(&ws, None, None),
+    )
+    .await
+    .expect("Intent owner can invite without a forge identity");
+    assert_eq!(result["invite"]["createdByPrincipalId"], json!(primary.id));
+    assert!(store
+        .get_primary_principal()
+        .await
+        .unwrap()
+        .identity_key()
+        .is_none());
+}
+
+#[tokio::test]
+async fn returning_invite_accept_reuses_the_presented_bearer() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let (person, token) = f.first_join(&guest("returning", 4242)).await;
+    let (_, invite_id, secret) = f.second_workspace_invite().await;
+    let before = f.store.list_principal_credentials(&person).await.unwrap();
+    let joined = f
+        .services
+        .invite_accept_op(&invite_id, &secret, &token, InviteScope::Workspace)
+        .await
+        .unwrap();
+    assert_eq!(
+        joined["token"], token,
+        "accept must preserve paired devices"
+    );
+    let after = f.store.list_principal_credentials(&person).await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].token_hash, before[0].token_hash);
+    assert_eq!(after[0].principal_id, before[0].principal_id);
+    assert_eq!(after[0].created_at, before[0].created_at);
+    assert_eq!(after[0].revoked_at, None);
 }
 
 // --- reconnect guard -------------------------------------------------------
@@ -118,7 +195,7 @@ fn id_of(created: &Value) -> String {
 async fn primary_identity_switches_while_single_user() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let services = Services::new(store.clone());
+    let services = services(&store, &tmp);
     let mut primary = store.get_primary_principal().await.expect("primary");
     primary.github_user_id = Some(10);
     primary.login = Some("first".into());
@@ -144,7 +221,7 @@ async fn primary_identity_switches_while_single_user() {
 async fn primary_identity_locked_once_another_principal_exists() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let services = Services::new(store.clone());
+    let services = services(&store, &tmp);
     let mut primary = store.get_primary_principal().await.expect("primary");
     primary.github_user_id = Some(10);
     primary.login = Some("first".into());
@@ -182,7 +259,7 @@ async fn primary_identity_locked_once_another_principal_exists() {
 async fn stale_snapshot_cannot_bypass_the_reconnect_guard() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let services = Services::new(store.clone());
+    let services = services(&store, &tmp);
     let mut primary = store.get_primary_principal().await.expect("primary");
     primary.github_user_id = Some(10);
     primary.login = Some("first".into());
@@ -255,7 +332,7 @@ async fn stale_refresh_keeps_a_concurrent_account_switch() {
 
     // The same race from a still-unlinked snapshot (`github_user_id` None).
     let mut unlinked = stored.clone();
-    unlinked.github_user_id = None;
+    unlinked.set_github_user_id(None);
     unlinked.login = None;
     store
         .upsert_principal(&unlinked)
@@ -284,7 +361,7 @@ async fn stale_refresh_keeps_a_concurrent_account_switch() {
 async fn locked_identity_refuses_a_missing_account_id() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let services = Services::new(store.clone());
+    let services = services(&store, &tmp);
     let mut primary = store.get_primary_principal().await.expect("primary");
     primary.github_user_id = Some(10);
     primary.login = Some("original-owner".into());
@@ -315,7 +392,7 @@ async fn locked_identity_refuses_a_missing_account_id() {
 async fn connect_guard_refuses_when_the_lock_state_is_unreadable() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let services = Services::new(store.clone());
+    let services = services(&store, &tmp);
     let mut primary = store.get_primary_principal().await.expect("primary");
     primary.github_user_id = Some(10);
     primary.login = Some("original-owner".into());
@@ -348,7 +425,7 @@ async fn connect_guard_refuses_when_the_lock_state_is_unreadable() {
 async fn connect_guard_lease_pins_the_transition_until_dropped() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let services = Services::new(store.clone()).with_source_control(Arc::new(StubForge::default()));
+    let services = services(&store, &tmp).with_source_control(Arc::new(StubForge::default()));
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
 
@@ -396,7 +473,7 @@ async fn connect_guard_lease_pins_the_transition_until_dropped() {
 async fn primary_identity_locked_while_an_invite_is_open() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let services = Services::new(store.clone()).with_source_control(Arc::new(StubForge::default()));
+    let services = services(&store, &tmp).with_source_control(Arc::new(StubForge::default()));
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let mut primary = store.get_primary_principal().await.expect("primary");
@@ -448,7 +525,7 @@ async fn settles(handle: &tokio::task::JoinHandle<impl Send>) -> bool {
 async fn identity_switch_rechecks_the_lock_after_a_concurrent_mint() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let services = Services::new(store.clone()).with_source_control(Arc::new(StubForge::default()));
+    let services = services(&store, &tmp).with_source_control(Arc::new(StubForge::default()));
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let mut primary = store.get_primary_principal().await.expect("primary");
@@ -485,6 +562,7 @@ async fn identity_switch_rechecks_the_lock_after_a_concurrent_mint() {
         secret_hash: hash_secret("s"),
         secret: None,
         created_by_principal_id: primary.id.clone(),
+        pin_identity: None,
         pin_github_user_id: None,
         pin_login: None,
         created_at: now_iso(),
@@ -530,7 +608,7 @@ async fn invite_mint_waits_for_the_transition_and_revalidates_the_creator() {
     });
     assert!(!settles(&mint).await, "mint waits for the transition lock");
     let mut owner = f.store.get_principal(&f.owner).await.expect("owner");
-    owner.github_user_id = Some(9999);
+    owner.set_github_user_id(Some(9999));
     f.store
         .upsert_principal(&owner)
         .await
@@ -573,15 +651,14 @@ async fn invite_mint_waits_for_the_transition_and_revalidates_the_creator() {
     );
 }
 
-/// The primary's cached `github_user_id` survives `github.revoke`, so the
-/// cache alone must not mint: with no working credential the create is
-/// `GithubIdentityRequired`, and no invite row is written.
+/// Revoking repository credentials does not remove the Intent owner's authority
+/// to issue workspace invitations, even when a cached profile remains.
 #[tokio::test]
-async fn primary_cannot_mint_without_a_live_credential() {
+async fn primary_can_mint_without_a_live_credential() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let services =
-        Services::new(store.clone()).with_source_control(Arc::new(StubForge::unauthenticated()));
+        services(&store, &tmp).with_source_control(Arc::new(StubForge::unauthenticated()));
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let mut primary = store.get_primary_principal().await.expect("primary");
@@ -595,13 +672,13 @@ async fn primary_cannot_mint_without_a_live_credential() {
         services.workspace_invite_create_op(&ws, None, None),
     )
     .await;
-    assert_eq!(invite_kind(&r), InviteErrorKind::GithubIdentityRequired);
+    assert!(r.is_ok(), "Intent authority suffices: {r:?}");
     assert_eq!(
         store
             .count_open_workspace_invites()
             .await
             .expect("count invites"),
-        0
+        1
     );
 }
 
@@ -826,6 +903,7 @@ async fn invite_list_rebuilds_the_link_from_the_stored_secret() {
         secret_hash: hash_secret(&legacy_secret),
         secret: None,
         created_by_principal_id: f.owner.clone(),
+        pin_identity: None,
         pin_github_user_id: None,
         pin_login: None,
         created_at: now_iso(),
@@ -874,7 +952,7 @@ async fn invite_list_rebuilds_the_link_from_the_stored_secret() {
 }
 
 /// Without a builder, or with one that cannot build a link right now
-/// (listener down, no dialable route), `create` and `list` still answer —
+/// (listener down, tunnel down), `create` and `list` still answer —
 /// their rows simply carry no `url`.
 #[tokio::test]
 async fn invite_list_omits_the_url_when_no_link_can_be_built() {
@@ -952,14 +1030,14 @@ async fn invite_create_guards() {
     assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
 
     let mut unlinked = f.store.get_principal(&f.owner).await.expect("owner");
-    unlinked.github_user_id = None;
+    unlinked.set_github_user_id(None);
     f.store.upsert_principal(&unlinked).await.expect("unlink");
     let r = with_caller(
         wire(&f.owner),
         f.services.workspace_invite_create_op(&f.ws, None, None),
     )
     .await;
-    assert_eq!(invite_kind(&r), InviteErrorKind::GithubIdentityRequired);
+    assert!(r.is_ok(), "Intent authority suffices: {r:?}");
 }
 
 // --- link validation / first-time join --------------------------------------
@@ -975,9 +1053,15 @@ async fn open_invite_refuses_closed_or_unknown_invites() {
     let id = id_of(&created);
     let secret = created["secret"].as_str().expect("secret").to_string();
 
-    let r = f.services.invite_inspect_op("missing", &secret).await;
+    let r = f
+        .services
+        .invite_inspect_op("missing", &secret, InviteScope::Workspace)
+        .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
-    let r = f.services.invite_inspect_op(&id, "wrong").await;
+    let r = f
+        .services
+        .invite_inspect_op(&id, "wrong", InviteScope::Workspace)
+        .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
 
     let mut expired = f
@@ -995,12 +1079,15 @@ async fn open_invite_refuses_closed_or_unknown_invites() {
         .expect("insert expired");
     let r = f
         .services
-        .invite_inspect_op("expired", "expired-secret")
+        .invite_inspect_op("expired", "expired-secret", InviteScope::Workspace)
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::Expired);
 
     f.store.revoke_workspace_invite(&id).await.expect("revoke");
-    let r = f.services.invite_inspect_op(&id, &secret).await;
+    let r = f
+        .services
+        .invite_inspect_op(&id, &secret, InviteScope::Workspace)
+        .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::Revoked);
 }
 
@@ -1020,7 +1107,7 @@ async fn complete_join_mints_principal_membership_and_credential_once() {
 
     let joined = f
         .services
-        .complete_invite_join(&id, &identity("guest", 4242))
+        .complete_invite_join(&id, &guest("guest", 4242), InviteScope::Workspace, 0)
         .await
         .expect("join");
     assert_eq!(joined["status"], json!("authorized"));
@@ -1067,7 +1154,12 @@ async fn complete_join_mints_principal_membership_and_credential_once() {
     // credential, no second membership, not counted as a redemption.
     let again = f
         .services
-        .complete_invite_join(&id, &identity("guest-renamed", 4242))
+        .complete_invite_join(
+            &id,
+            &self::guest("guest-renamed", 4242),
+            InviteScope::Workspace,
+            0,
+        )
         .await
         .expect("re-join");
     assert_eq!(again["principalId"], json!(guest.0));
@@ -1089,7 +1181,7 @@ async fn complete_join_mints_principal_membership_and_credential_once() {
     // A second account redeems the same link: another collaborator.
     let other = f
         .services
-        .complete_invite_join(&id, &identity("other", 4343))
+        .complete_invite_join(&id, &self::guest("other", 4343), InviteScope::Workspace, 0)
         .await
         .expect("second account joins");
     let other = PrincipalId(other["principalId"].as_str().expect("pid").to_string());
@@ -1116,7 +1208,7 @@ async fn complete_join_mints_principal_membership_and_credential_once() {
     f.store.revoke_workspace_invite(&id).await.expect("revoke");
     let third = f
         .services
-        .complete_invite_join(&id, &identity("late", 4444))
+        .complete_invite_join(&id, &self::guest("late", 4444), InviteScope::Workspace, 0)
         .await;
     assert_eq!(invite_kind(&third), InviteErrorKind::Revoked);
     assert_eq!(f.store.count_principals().await.expect("count"), 5);
@@ -1146,7 +1238,12 @@ async fn complete_join_closes_a_pinned_invite_on_its_redemption() {
     assert!(!pinned.is_reusable());
 
     f.services
-        .complete_invite_join("pinned", &identity("pinned-login", 5555))
+        .complete_invite_join(
+            "pinned",
+            &guest("pinned-login", 5555),
+            InviteScope::Workspace,
+            0,
+        )
         .await
         .expect("pinned account joins");
     let row = f
@@ -1159,12 +1256,17 @@ async fn complete_join_closes_a_pinned_invite_on_its_redemption() {
     assert!(!row.is_open_at(&now_iso()));
     let again = f
         .services
-        .complete_invite_join("pinned", &identity("pinned-login", 5555))
+        .complete_invite_join(
+            "pinned",
+            &guest("pinned-login", 5555),
+            InviteScope::Workspace,
+            0,
+        )
         .await;
     assert_eq!(invite_kind(&again), InviteErrorKind::Redeemed);
     let r = f
         .services
-        .invite_inspect_op("pinned", "pinned-secret")
+        .invite_inspect_op("pinned", "pinned-secret", InviteScope::Workspace)
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::Redeemed);
 }
@@ -1177,7 +1279,7 @@ async fn complete_join_refuses_an_expired_reusable_invite() {
     let f = fixture(&tmp).await;
     let id = id_of(&f.create_invite(None).await);
     f.services
-        .complete_invite_join(&id, &identity("first", 1))
+        .complete_invite_join(&id, &guest("first", 1), InviteScope::Workspace, 0)
         .await
         .expect("first join");
     sqlx::query("UPDATE workspace_invite SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
@@ -1187,7 +1289,7 @@ async fn complete_join_refuses_an_expired_reusable_invite() {
         .expect("expire");
     let r = f
         .services
-        .complete_invite_join(&id, &identity("second", 2))
+        .complete_invite_join(&id, &guest("second", 2), InviteScope::Workspace, 0)
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::Expired);
 }
@@ -1217,7 +1319,12 @@ async fn complete_join_enforces_the_pin_by_account_id() {
 
     let r = f
         .services
-        .complete_invite_join("pinned", &identity("intruder", 6666))
+        .complete_invite_join(
+            "pinned",
+            &guest("intruder", 6666),
+            InviteScope::Workspace,
+            0,
+        )
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::PinMismatch);
     assert!(f
@@ -1231,10 +1338,157 @@ async fn complete_join_enforces_the_pin_by_account_id() {
 
     let joined = f
         .services
-        .complete_invite_join("pinned", &identity("renamed-login", 5555))
+        .complete_invite_join(
+            "pinned",
+            &guest("renamed-login", 5555),
+            InviteScope::Workspace,
+            0,
+        )
         .await
         .expect("pinned account joins");
     assert_eq!(joined["login"], json!("renamed-login"));
+}
+
+/// A pin is the identity triple, not a login: an invite pinned to a GitLab
+/// account refuses a github.com account of the same login *and* the same
+/// numeric id (`PinMismatch`, invite untouched), and admits the pinned GitLab
+/// account — whose principal carries the gitlab triple and no
+/// `github_user_id`.
+#[tokio::test]
+async fn complete_join_enforces_the_pin_triple_across_forges() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let created = f.create_invite(None).await;
+    let mut pinned = f
+        .store
+        .get_workspace_invite(&id_of(&created))
+        .await
+        .expect("get")
+        .expect("row");
+    pinned.id = "pinned".to_string();
+    pinned.secret_hash = hash_secret("pinned-secret");
+    pinned.pin_identity = Some(PrincipalIdentity {
+        provider: "gitlab".to_string(),
+        host: "gitlab.example.com".to_string(),
+        external_user_id: "5555".to_string(),
+    });
+    pinned.pin_github_user_id = None;
+    pinned.pin_login = Some("pinned-login".to_string());
+    f.store
+        .insert_workspace_invite(&pinned)
+        .await
+        .expect("insert pinned");
+    assert!(!pinned.is_reusable());
+
+    for intruder in [guest("pinned-login", 5555), guest("intruder", 6666)] {
+        let r = f
+            .services
+            .complete_invite_join("pinned", &intruder, InviteScope::Workspace, 0)
+            .await;
+        assert_eq!(invite_kind(&r), InviteErrorKind::PinMismatch);
+    }
+    let r = f
+        .services
+        .complete_invite_join(
+            "pinned",
+            &gitlab_guest("gitlab.other.example", "pinned-login", 5555),
+            InviteScope::Workspace,
+            0,
+        )
+        .await;
+    assert_eq!(
+        invite_kind(&r),
+        InviteErrorKind::PinMismatch,
+        "same provider and id on another instance is another account"
+    );
+    assert!(f
+        .store
+        .get_workspace_invite("pinned")
+        .await
+        .expect("get")
+        .expect("row")
+        .redeemed_at
+        .is_none());
+
+    let joined = f
+        .services
+        .complete_invite_join(
+            "pinned",
+            &gitlab_guest("gitlab.example.com", "pinned-login", 5555),
+            InviteScope::Workspace,
+            0,
+        )
+        .await
+        .expect("pinned gitlab account joins");
+    assert_eq!(joined["login"], json!("pinned-login"));
+    let row = f
+        .store
+        .get_principal(&PrincipalId(
+            joined["principalId"].as_str().expect("pid").to_string(),
+        ))
+        .await
+        .expect("principal");
+    assert_eq!(row.identity, pinned.pin_identity);
+    assert_eq!(row.github_user_id, None);
+    assert!(!f
+        .store
+        .get_workspace_invite("pinned")
+        .await
+        .expect("get")
+        .expect("row")
+        .is_open_at(&now_iso()));
+}
+
+/// The owner-self-join guard compares identity triples: a primary linked to
+/// a GitLab account refuses that very account as a guest and admits a
+/// github.com account sharing its login and numeric id (a different person),
+/// exactly as a github-linked primary refuses only its own github.com account.
+#[tokio::test]
+async fn complete_join_refuses_the_owners_own_account_by_triple() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let mut primary = f.store.get_primary_principal().await.expect("primary");
+    primary.set_identity(PrincipalIdentity {
+        provider: "gitlab".to_string(),
+        host: "gitlab.example.com".to_string(),
+        external_user_id: "4242".to_string(),
+    });
+    primary.login = Some("guest".into());
+    f.store
+        .upsert_principal(&primary)
+        .await
+        .expect("seed gitlab identity");
+    assert_eq!(primary.github_user_id, None);
+
+    let id = id_of(&f.create_invite(None).await);
+    let r = f
+        .services
+        .complete_invite_join(
+            &id,
+            &gitlab_guest("gitlab.example.com", "guest", 4242),
+            InviteScope::Workspace,
+            0,
+        )
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::OwnerSelfJoin);
+    assert!(f
+        .store
+        .list_principal_credentials(&f.primary)
+        .await
+        .expect("credentials")
+        .is_empty());
+
+    for other in [
+        self::guest("guest", 4242),
+        gitlab_guest("gitlab.other.example", "guest", 4242),
+    ] {
+        let joined = f
+            .services
+            .complete_invite_join(&id, &other, InviteScope::Workspace, 0)
+            .await
+            .expect("another forge's account is another person");
+        assert_ne!(joined["principalId"], json!(f.primary.0));
+    }
 }
 
 // --- returning guest: invite.inspect / invite.accept -----------------------
@@ -1267,11 +1521,11 @@ impl Fixture {
 
     /// The first-time join of `identity` on a fresh invite of the fixture
     /// workspace: the returning guest's first credential.
-    async fn first_join(&self, user: &UserIdentity) -> (PrincipalId, String) {
+    pub(super) async fn first_join(&self, user: &ForgeUser) -> (PrincipalId, String) {
         let created = self.create_invite(None).await;
         let joined = self
             .services
-            .complete_invite_join(&id_of(&created), user)
+            .complete_invite_join(&id_of(&created), user, InviteScope::Workspace, 0)
             .await
             .expect("first join");
         (
@@ -1293,12 +1547,12 @@ async fn inspect_previews_an_open_invite_without_a_nonce() {
     let permits_before = f.services.invite_nonce_permits.available_permits();
     let r = f
         .services
-        .invite_inspect_op(&invite_id, &secret)
+        .invite_inspect_op(&invite_id, &secret, InviteScope::Workspace)
         .await
         .expect("inspect");
     assert_eq!(
         r,
-        json!({ "workspaceId": ws2.0, "workspaceTitle": "Second" }),
+        json!({ "scope": "workspace", "role": "collaborator", "workspaceId": ws2.0, "workspaceTitle": "Second", "pinIdentity": null, "collaborationName": null }),
         "{r}"
     );
     assert_eq!(
@@ -1320,21 +1574,199 @@ async fn inspect_previews_an_open_invite_without_a_nonce() {
         .collect();
     assert_eq!(f.services.invite_nonce_permits.available_permits(), 0);
     f.services
-        .invite_inspect_op(&invite_id, &secret)
+        .invite_inspect_op(&invite_id, &secret, InviteScope::Workspace)
         .await
         .expect("inspect with no nonce capacity");
 
     // Same refusals as a challenge; the invite stays open throughout.
-    let r = f.services.invite_inspect_op("missing", &secret).await;
+    let r = f
+        .services
+        .invite_inspect_op("missing", &secret, InviteScope::Workspace)
+        .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
-    let r = f.services.invite_inspect_op(&invite_id, "wrong").await;
+    let r = f
+        .services
+        .invite_inspect_op(&invite_id, "wrong", InviteScope::Workspace)
+        .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
     f.store
         .revoke_workspace_invite(&invite_id)
         .await
         .expect("revoke");
-    let r = f.services.invite_inspect_op(&invite_id, &secret).await;
+    let r = f
+        .services
+        .invite_inspect_op(&invite_id, &secret, InviteScope::Workspace)
+        .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::Revoked);
+}
+
+/// Both preview methods must expose the stored requirement, including legacy
+/// GitHub pins, without a configured forge or any guest credentials.
+async fn assert_preview_pin_identity(challenge: bool) {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let created = f.create_invite(None).await;
+    let template = f
+        .store
+        .get_workspace_invite(&id_of(&created))
+        .await
+        .unwrap()
+        .unwrap();
+    for (name, pin, legacy, expected) in [
+        (
+            "gitlab",
+            Some(PrincipalIdentity {
+                provider: "gitlab".into(),
+                host: "gitlab.com".into(),
+                external_user_id: "4242".into(),
+            }),
+            None,
+            json!({"provider": "gitlab", "host": "gitlab.com", "externalUserId": "4242"}),
+        ),
+        (
+            "self-managed",
+            Some(PrincipalIdentity {
+                provider: "gitlab".into(),
+                host: "gitlab.example:8443".into(),
+                external_user_id: "4242".into(),
+            }),
+            None,
+            json!({"provider": "gitlab", "host": "gitlab.example:8443", "externalUserId": "4242"}),
+        ),
+        (
+            "github",
+            Some(PrincipalIdentity::github(4242)),
+            Some(4242),
+            json!({"provider": "github", "host": "github.com", "externalUserId": "4242"}),
+        ),
+        (
+            "legacy",
+            None,
+            Some(4242),
+            json!({"provider": "github", "host": "github.com", "externalUserId": "4242"}),
+        ),
+        ("unpinned", None, None, Value::Null),
+    ] {
+        let invite = WorkspaceInvite {
+            id: name.into(),
+            secret_hash: hash_secret(name),
+            pin_identity: pin,
+            pin_github_user_id: legacy,
+            ..template.clone()
+        };
+        f.store.insert_workspace_invite(&invite).await.unwrap();
+        if name == "legacy" {
+            // The current insert dual-writes the triple; reproduce an old row.
+            sqlx::query("UPDATE workspace_invite SET pin_identity_provider = NULL, pin_instance_host = NULL, pin_external_user_id = NULL WHERE id = ?")
+                .bind(&invite.id).execute(f.store.write_pool()).await.unwrap();
+            assert!(f
+                .store
+                .get_workspace_invite(&invite.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pin_identity
+                .is_none());
+        }
+        let secret = name;
+        let result = if challenge {
+            f.services
+                .invite_challenge_op(&invite.id, secret, InviteScope::Workspace)
+                .await
+        } else {
+            f.services
+                .invite_inspect_op(&invite.id, secret, InviteScope::Workspace)
+                .await
+        }
+        .expect("preview without a forge");
+        assert_eq!(
+            result.get("pinIdentity"),
+            Some(&expected),
+            "{name}: {result}"
+        );
+        assert_eq!(result["workspaceId"], json!(f.ws));
+        assert_eq!(result["workspaceTitle"], json!("WS"));
+        assert_eq!(result.get("collaborationName"), Some(&Value::Null));
+        assert_eq!(
+            result.as_object().unwrap().len(),
+            if challenge { 8 } else { 6 }
+        );
+        if challenge {
+            assert!(result["nonce"].is_string());
+            assert!(result["nonceExpiresAt"].is_string());
+        }
+    }
+}
+
+#[tokio::test]
+async fn inspect_exposes_pin_identity_including_legacy_and_unpinned() {
+    assert_preview_pin_identity(false).await;
+}
+
+#[tokio::test]
+async fn challenge_exposes_pin_identity_including_legacy_and_unpinned() {
+    assert_preview_pin_identity(true).await;
+}
+
+#[tokio::test]
+async fn preview_pin_identity_is_not_exposed_for_invalid_or_closed_invites() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let created = f.create_invite(None).await;
+    let template = f
+        .store
+        .get_workspace_invite(&id_of(&created))
+        .await
+        .unwrap()
+        .unwrap();
+    for (state, kind) in [
+        ("missing", InviteErrorKind::NotFound),
+        ("bad-secret", InviteErrorKind::NotFound),
+        ("expired", InviteErrorKind::Expired),
+        ("revoked", InviteErrorKind::Revoked),
+        ("redeemed", InviteErrorKind::Redeemed),
+    ] {
+        let mut invite = WorkspaceInvite {
+            id: state.into(),
+            secret_hash: hash_secret(state),
+            pin_identity: Some(PrincipalIdentity {
+                provider: "gitlab".into(),
+                host: "private.example".into(),
+                external_user_id: "4242".into(),
+            }),
+            ..template.clone()
+        };
+        match state {
+            "expired" => invite.expires_at = "2000-01-01T00:00:00.000Z".into(),
+            "revoked" => invite.revoked_at = Some(now_iso()),
+            "redeemed" => invite.redeemed_at = Some(now_iso()),
+            _ => {}
+        }
+        if state != "missing" {
+            f.store.insert_workspace_invite(&invite).await.unwrap();
+        }
+        let presented = if state == "bad-secret" {
+            "wrong"
+        } else {
+            state
+        };
+        // The typed error contains only its kind, no preview payload or pin.
+        for result in [
+            f.services
+                .invite_inspect_op(&invite.id, presented, InviteScope::Workspace)
+                .await,
+            f.services
+                .invite_challenge_op(&invite.id, presented, InviteScope::Workspace)
+                .await,
+        ] {
+            assert_eq!(invite_kind(&result), kind, "{state}: {result:?}");
+        }
+    }
+    assert!(f.services.invite_nonces.lock().await.is_empty());
+    assert_eq!(
+        f.services.invite_nonce_permits.available_permits(),
+        MAX_OUTSTANDING_NONCES
+    );
 }
 
 /// `invite.accept` with the credential a prior join minted: the same
@@ -1348,7 +1780,7 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
     let mut f = fixture(&tmp).await;
     let bus = crate::events::EventBus::new(f.store.clone());
     f.services = f.services.with_event_bus(bus.clone());
-    let (guest, first_token) = f.first_join(&identity("guest", 4242)).await;
+    let (guest, first_token) = f.first_join(&self::guest("guest", 4242)).await;
     let (ws2, invite_id, secret) = f.second_workspace_invite().await;
     let mut events = bus.subscribe(crate::events::SubscriptionFilter {
         event_types: vec!["workspace:updated".into()],
@@ -1358,7 +1790,7 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
 
     let r = f
         .services
-        .invite_accept_op(&invite_id, &secret, &first_token)
+        .invite_accept_op(&invite_id, &secret, &first_token, InviteScope::Workspace)
         .await
         .expect("accept");
     assert_eq!(r["status"], json!("authorized"));
@@ -1367,7 +1799,7 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
     assert_eq!(r["workspaceId"], json!(ws2.0));
     let second_token = r["token"].as_str().expect("token").to_string();
     assert_eq!(second_token.len(), 64);
-    assert_ne!(second_token, first_token);
+    assert_eq!(second_token, first_token);
     assert!(
         r.get("hostname").is_none(),
         "decoration is the transport's: {r}"
@@ -1380,9 +1812,8 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
             .expect("role"),
         Some(WorkspaceRole::Collaborator)
     );
-    // The presented credential is rotated out in the join transaction: the
-    // guest leaves with exactly one active credential for this host.
-    for (token, active) in [(&first_token, false), (&second_token, true)] {
+    // The presented bearer remains the same active credential across joins.
+    for (token, active) in [(&first_token, true), (&second_token, true)] {
         let cred = f
             .store
             .lookup_principal_credential(&hash_secret(token))
@@ -1390,7 +1821,7 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
             .expect("lookup")
             .expect("credential row");
         assert_eq!(cred.principal_id, guest);
-        assert_eq!(cred.is_active(), active, "rotation: {token}");
+        assert_eq!(cred.is_active(), active, "bearer reuse: {token}");
     }
     assert_eq!(
         f.store
@@ -1433,22 +1864,15 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
     // owner + the demoted primary + the guest
     assert_eq!(ev.data["changes"]["memberCount"], json!(3));
 
-    // The rotated-out credential is refused before the invite is even
-    // looked at; the live one re-joins the reusable link idempotently (one
-    // more rotation, still a single membership).
-    let stale = f
-        .services
-        .invite_accept_op(&invite_id, &secret, &first_token)
-        .await;
-    assert_eq!(invite_kind(&stale), InviteErrorKind::CredentialInvalid);
+    // Reusing the same credential keeps all previously paired devices valid.
     let again = f
         .services
-        .invite_accept_op(&invite_id, &secret, &second_token)
+        .invite_accept_op(&invite_id, &secret, &second_token, InviteScope::Workspace)
         .await
         .expect("re-join a reusable link");
     assert_eq!(again["principalId"], json!(guest.0));
     let third_token = again["token"].as_str().expect("token").to_string();
-    assert_ne!(third_token, second_token);
+    assert_eq!(third_token, second_token);
     assert_eq!(
         f.store
             .get_workspace_invite(&invite_id)
@@ -1484,6 +1908,83 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
     assert_eq!(revoked["credentials"], json!(1), "{revoked}");
 }
 
+/// The returning-guest path is forge-neutral: a principal whose first join
+/// resolved a GitLab account (gitlab triple, no `github_user_id`) inspects
+/// and accepts a second workspace's invite with its credential like any
+/// github.com guest — same principal, fresh credential, no forge consulted —
+/// and is refused by a pin to a same-numbered github.com account.
+#[tokio::test]
+async fn inspect_and_accept_serve_a_returning_gitlab_guest() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let (guest, first_token) = f
+        .first_join(&gitlab_guest("gitlab.example.com", "guest", 4242))
+        .await;
+    let row = f.store.get_principal(&guest).await.expect("principal");
+    assert_eq!(row.github_user_id, None);
+    assert!(row
+        .identity
+        .as_ref()
+        .is_some_and(|i| i.is_on("gitlab", "gitlab.example.com")));
+    let (ws2, invite_id, secret) = f.second_workspace_invite().await;
+
+    let hint = f
+        .services
+        .invite_inspect_op(&invite_id, &secret, InviteScope::Workspace)
+        .await
+        .expect("inspect");
+    assert_eq!(hint["workspaceId"], json!(ws2.0));
+
+    let r = f
+        .services
+        .invite_accept_op(&invite_id, &secret, &first_token, InviteScope::Workspace)
+        .await
+        .expect("accept");
+    assert_eq!(r["status"], json!("authorized"));
+    assert_eq!(r["principalId"], json!(guest.0));
+    assert_eq!(r["login"], json!("guest"));
+    let second_token = r["token"].as_str().expect("token").to_string();
+    assert_eq!(second_token, first_token);
+    assert_eq!(
+        f.store
+            .get_workspace_member_role(&ws2, &guest)
+            .await
+            .expect("role"),
+        Some(WorkspaceRole::Collaborator)
+    );
+
+    // A pin to the github.com account with the same numeric id names
+    // another person: the gitlab guest's credential is `PinMismatch`.
+    let mut pinned = f
+        .store
+        .get_workspace_invite(&invite_id)
+        .await
+        .expect("get")
+        .expect("row");
+    pinned.id = "pinned".to_string();
+    pinned.secret_hash = hash_secret("pinned-secret");
+    pinned.pin_github_user_id = Some(4242);
+    pinned.pin_identity = Some(PrincipalIdentity::github(4242));
+    pinned.pin_login = Some("guest".to_string());
+    pinned.redeemed_at = None;
+    pinned.redeemed_by_principal_id = None;
+    pinned.redemption_count = 0;
+    f.store
+        .insert_workspace_invite(&pinned)
+        .await
+        .expect("insert pinned");
+    let r = f
+        .services
+        .invite_accept_op(
+            "pinned",
+            "pinned-secret",
+            &second_token,
+            InviteScope::Workspace,
+        )
+        .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::PinMismatch);
+}
+
 /// `invite.accept` refusals: an unknown or revoked credential is
 /// `CredentialInvalid` (checked before the invite, so a bad credential on a
 /// bad link is still `CredentialInvalid`); a credential of a principal
@@ -1494,17 +1995,27 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
 async fn accept_refuses_bad_credentials_closed_invites_and_pins() {
     let tmp = TempDb::new();
     let f = fixture(&tmp).await;
-    let (guest, token) = f.first_join(&identity("guest", 4242)).await;
+    let (guest, token) = f.first_join(&self::guest("guest", 4242)).await;
     let (ws2, invite_id, secret) = f.second_workspace_invite().await;
 
     let r = f
         .services
-        .invite_accept_op(&invite_id, &secret, "not-a-credential")
+        .invite_accept_op(
+            &invite_id,
+            &secret,
+            "not-a-credential",
+            InviteScope::Workspace,
+        )
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::CredentialInvalid);
     let r = f
         .services
-        .invite_accept_op("missing", "wrong", "not-a-credential")
+        .invite_accept_op(
+            "missing",
+            "wrong",
+            "not-a-credential",
+            InviteScope::Workspace,
+        )
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::CredentialInvalid);
 
@@ -1517,13 +2028,13 @@ async fn accept_refuses_bad_credentials_closed_invites_and_pins() {
         .expect("anon credential");
     let r = f
         .services
-        .invite_accept_op(&invite_id, &secret, "anon-token")
+        .invite_accept_op(&invite_id, &secret, "anon-token", InviteScope::Workspace)
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::CredentialInvalid);
 
     let r = f
         .services
-        .invite_accept_op(&invite_id, "wrong", &token)
+        .invite_accept_op(&invite_id, "wrong", &token, InviteScope::Workspace)
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
 
@@ -1544,7 +2055,7 @@ async fn accept_refuses_bad_credentials_closed_invites_and_pins() {
         .expect("insert pinned");
     let r = f
         .services
-        .invite_accept_op("pinned", "pinned-secret", &token)
+        .invite_accept_op("pinned", "pinned-secret", &token, InviteScope::Workspace)
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::PinMismatch);
     assert!(f
@@ -1563,7 +2074,7 @@ async fn accept_refuses_bad_credentials_closed_invites_and_pins() {
         .expect("revoke credentials");
     let r = f
         .services
-        .invite_accept_op(&invite_id, &secret, &token)
+        .invite_accept_op(&invite_id, &secret, &token, InviteScope::Workspace)
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::CredentialInvalid);
     assert_eq!(
@@ -1594,7 +2105,7 @@ async fn accept_refuses_bad_credentials_closed_invites_and_pins() {
         .expect("revoke invite");
     let r = f
         .services
-        .invite_accept_op(&invite_id, &secret, "fresh")
+        .invite_accept_op(&invite_id, &secret, "fresh", InviteScope::Workspace)
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::Revoked);
 }
@@ -1606,93 +2117,33 @@ async fn accept_refuses_bad_credentials_closed_invites_and_pins() {
 /// minted and the guest ends with exactly one active credential; the
 /// loser's invite stays open and admits the guest with the new credential.
 #[tokio::test]
-async fn accept_consumes_the_presented_credential_once_under_contention() {
+async fn accept_reuses_the_presented_credential_for_concurrent_distinct_invites() {
     let tmp = TempDb::new();
     let f = fixture(&tmp).await;
-    let (guest, token) = f.first_join(&identity("guest", 4242)).await;
+    let (guest, token) = f.first_join(&self::guest("guest", 4242)).await;
     let (ws_a, inv_a, secret_a) = f.second_workspace_invite().await;
     let (ws_b, inv_b, secret_b) = f.second_workspace_invite().await;
-
-    let accept = |inv: String, secret: String| {
-        let (services, token) = (f.services.clone(), token.clone());
-        tokio::spawn(async move { services.invite_accept_op(&inv, &secret, &token).await })
-    };
-    let (ra, rb) = tokio::join!(
-        accept(inv_a.clone(), secret_a.clone()),
-        accept(inv_b.clone(), secret_b.clone())
+    let (a, b) = tokio::join!(
+        f.services
+            .invite_accept_op(&inv_a, &secret_a, &token, InviteScope::Workspace),
+        f.services
+            .invite_accept_op(&inv_b, &secret_b, &token, InviteScope::Workspace)
     );
-    let results = [
-        (ra.expect("task a"), &inv_a, &ws_a, &secret_a),
-        (rb.expect("task b"), &inv_b, &ws_b, &secret_b),
-    ];
-    let (winners, losers): (Vec<_>, Vec<_>) = results.iter().partition(|(r, ..)| r.is_ok());
-    assert_eq!(
-        (winners.len(), losers.len()),
-        (1, 1),
-        "exactly one accept wins: {results:?}"
-    );
-    let (won, _, won_ws, _) = winners[0];
-    let (lost, lost_inv, lost_ws, lost_secret) = losers[0];
-    assert_eq!(invite_kind(lost), InviteErrorKind::CredentialInvalid);
-    let won = won.as_ref().expect("winner");
-    assert_eq!(won["status"], json!("authorized"));
-    let new_token = won["token"].as_str().expect("token").to_string();
-    assert_ne!(new_token, token);
-
-    let active: Vec<_> = f
-        .store
-        .list_principal_credentials(&guest)
-        .await
-        .expect("credentials")
-        .into_iter()
-        .filter(intent_core::PrincipalCredential::is_active)
-        .map(|c| c.token_hash)
-        .collect();
-    assert_eq!(
-        active,
-        vec![hash_secret(&new_token)],
-        "one active credential"
-    );
-    assert_eq!(
-        f.store
-            .get_workspace_member_role(won_ws, &guest)
-            .await
-            .expect("role"),
-        Some(WorkspaceRole::Collaborator)
-    );
-    assert_eq!(
-        f.store
-            .get_workspace_member_role(lost_ws, &guest)
-            .await
-            .expect("role"),
-        None,
-        "the loser joined nothing"
-    );
-    let lost_row = f
-        .store
-        .get_workspace_invite(lost_inv)
-        .await
-        .expect("get")
-        .expect("row");
-    assert!(lost_row.redeemed_at.is_none(), "loser's invite stays open");
-
-    // The loser retries with the credential the winner minted.
-    let retry = f
-        .services
-        .invite_accept_op(lost_inv, lost_secret, &new_token)
-        .await
-        .expect("retry with the live credential");
-    assert_eq!(retry["status"], json!("authorized"));
-    assert_eq!(
-        f.store
-            .list_principal_credentials(&guest)
-            .await
-            .expect("credentials")
-            .iter()
-            .filter(|c| c.is_active())
-            .count(),
-        1
-    );
+    for joined in [a, b] {
+        assert_eq!(joined.unwrap()["token"], token);
+    }
+    for ws in [ws_a, ws_b] {
+        assert_eq!(
+            f.store
+                .get_workspace_member_role(&ws, &guest)
+                .await
+                .unwrap(),
+            Some(WorkspaceRole::Collaborator)
+        );
+    }
+    let credentials = f.store.list_principal_credentials(&guest).await.unwrap();
+    assert_eq!(credentials.len(), 1);
+    assert!(credentials[0].is_active());
 }
 
 /// A revoke landing between the service-side credential lookup and the join
@@ -1703,12 +2154,12 @@ async fn accept_consumes_the_presented_credential_once_under_contention() {
 async fn accept_refuses_a_credential_revoked_between_resolve_and_join() {
     let tmp = TempDb::new();
     let f = fixture(&tmp).await;
-    let (guest, token) = f.first_join(&identity("guest", 4242)).await;
+    let (guest, token) = f.first_join(&self::guest("guest", 4242)).await;
     let (ws2, invite_id, secret) = f.second_workspace_invite().await;
 
     let (invite, principal) = f
         .services
-        .invite_accept_resolve(&invite_id, &secret, &token)
+        .invite_accept_resolve(&invite_id, &secret, &token, InviteScope::Workspace)
         .await
         .expect("resolve sees the live credential");
     assert_eq!(principal.id, guest);
@@ -1720,7 +2171,7 @@ async fn accept_refuses_a_credential_revoked_between_resolve_and_join() {
 
     let r = f
         .services
-        .commit_invite_join(&invite, &principal, Some(&hash_secret(&token)))
+        .commit_invite_join(&invite, &principal, Some(&token), 0)
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::CredentialInvalid);
     assert!(
@@ -1755,7 +2206,7 @@ async fn accept_refuses_a_credential_revoked_between_resolve_and_join() {
 
 /// A gist view created "now" (well after any nonce issued in the test),
 /// owned by `owner` and carrying `first_line` as the proof file's first line.
-fn gist(owner: &str, first_line: Option<&str>) -> ProofGistView {
+pub(super) fn gist(owner: &str, first_line: Option<&str>) -> ProofGistView {
     ProofGistView {
         owner_login: owner.to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -1765,7 +2216,10 @@ fn gist(owner: &str, first_line: Option<&str>) -> ProofGistView {
 
 /// The fixture with a scripted forge: `guest` (id 4242) and `other` (id
 /// 5555) resolve by login; the proof gists are the caller's.
-fn with_forge(f: &mut Fixture, gists: Vec<(&str, std::result::Result<ProofGistView, String>)>) {
+pub(super) fn with_forge(
+    f: &mut Fixture,
+    gists: Vec<(&str, std::result::Result<ProofGistView, String>)>,
+) {
     let mut forge = StubForge::default();
     for (login, id) in [("guest", 4242), ("other", 5555)] {
         forge
@@ -1778,7 +2232,7 @@ fn with_forge(f: &mut Fixture, gists: Vec<(&str, std::result::Result<ProofGistVi
     f.services = f.services.clone().with_source_control(Arc::new(forge));
 }
 
-fn nonce_of(challenge: &Value) -> String {
+pub(super) fn nonce_of(challenge: &Value) -> String {
     challenge["nonce"].as_str().expect("nonce").to_string()
 }
 
@@ -1799,12 +2253,12 @@ async fn challenge_issues_a_nonce_without_a_flow() {
     let before = now_iso();
     let a = f
         .services
-        .invite_challenge_op(&invite_id, &secret)
+        .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
         .await
         .expect("challenge");
     let b = f
         .services
-        .invite_challenge_op(&invite_id, &secret)
+        .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
         .await
         .expect("challenge");
     assert_eq!(a["workspaceId"], json!(f.ws.0));
@@ -1830,13 +2284,19 @@ async fn challenge_issues_a_nonce_without_a_flow() {
         MAX_OUTSTANDING_NONCES - 2
     );
 
-    let r = f.services.invite_challenge_op(&invite_id, "wrong").await;
+    let r = f
+        .services
+        .invite_challenge_op(&invite_id, "wrong", InviteScope::Workspace)
+        .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::NotFound);
     f.store
         .revoke_workspace_invite(&invite_id)
         .await
         .expect("revoke");
-    let r = f.services.invite_challenge_op(&invite_id, &secret).await;
+    let r = f
+        .services
+        .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
+        .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::Revoked);
     assert_eq!(f.services.invite_nonces.lock().await.len(), 2);
 }
@@ -1855,11 +2315,14 @@ async fn challenge_bounds_outstanding_nonces_per_invite() {
     );
     for _ in 0..MAX_NONCES_PER_INVITE {
         f.services
-            .invite_challenge_op(&invite_id, &secret)
+            .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
             .await
             .expect("challenge");
     }
-    let r = f.services.invite_challenge_op(&invite_id, &secret).await;
+    let r = f
+        .services
+        .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
+        .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::FlowBusy);
     assert_eq!(
         f.services.invite_nonce_permits.available_permits(),
@@ -1868,7 +2331,7 @@ async fn challenge_bounds_outstanding_nonces_per_invite() {
     // Another invite is not affected by this one's bound.
     let (_, other_id, other_secret) = f.second_workspace_invite().await;
     f.services
-        .invite_challenge_op(&other_id, &other_secret)
+        .invite_challenge_op(&other_id, &other_secret, InviteScope::Workspace)
         .await
         .expect("other invite still challenges");
 
@@ -1877,7 +2340,7 @@ async fn challenge_bounds_outstanding_nonces_per_invite() {
         slot.expires_at = Instant::now() - Duration::from_secs(1);
     }
     f.services
-        .invite_challenge_op(&invite_id, &secret)
+        .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
         .await
         .expect("challenge after purge");
     assert_eq!(f.services.invite_nonces.lock().await.len(), 1);
@@ -1904,7 +2367,7 @@ async fn prove_joins_on_a_matching_gist_and_consumes_the_nonce() {
     );
     let challenge = f
         .services
-        .invite_challenge_op(&invite_id, &secret)
+        .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
         .await
         .expect("challenge");
     let nonce = nonce_of(&challenge);
@@ -1917,7 +2380,13 @@ async fn prove_joins_on_a_matching_gist_and_consumes_the_nonce() {
 
     let r = f
         .services
-        .invite_prove_op(&invite_id, &secret, &nonce, "g1", "guest")
+        .invite_prove_op(
+            &invite_id,
+            &secret,
+            &nonce,
+            github_claim("g1", "guest"),
+            InviteScope::Workspace,
+        )
         .await
         .expect("prove");
     assert_eq!(r["status"], json!("authorized"));
@@ -1972,7 +2441,13 @@ async fn prove_joins_on_a_matching_gist_and_consumes_the_nonce() {
     // itself is still open, so the refusal is the nonce's).
     let again = f
         .services
-        .invite_prove_op(&invite_id, &secret, &nonce, "g1", "guest")
+        .invite_prove_op(
+            &invite_id,
+            &secret,
+            &nonce,
+            github_claim("g1", "guest"),
+            InviteScope::Workspace,
+        )
         .await;
     assert_eq!(invite_kind(&again), InviteErrorKind::ProofInvalid);
 }
@@ -2001,7 +2476,7 @@ async fn prove_refuses_mismatched_gists_and_spends_the_nonce() {
         async move {
             nonce_of(
                 &services
-                    .invite_challenge_op(&id, &s)
+                    .invite_challenge_op(&id, &s, InviteScope::Workspace)
                     .await
                     .expect("challenge"),
             )
@@ -2031,7 +2506,13 @@ async fn prove_refuses_mismatched_gists_and_spends_the_nonce() {
         let (nonce, gist_id, login) = (nonce.to_string(), gist_id.to_string(), login.to_string());
         async move {
             services
-                .invite_prove_op(&invite_id, &secret, &nonce, &gist_id, &login)
+                .invite_prove_op(
+                    &invite_id,
+                    &secret,
+                    &nonce,
+                    github_claim(&gist_id, &login),
+                    InviteScope::Workspace,
+                )
                 .await
         }
     };
@@ -2106,7 +2587,7 @@ async fn prove_reports_expiry_and_unreachable_github() {
     );
     let n = nonce_of(
         &f.services
-            .invite_challenge_op(&invite_id, &secret)
+            .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
             .await
             .expect("challenge"),
     );
@@ -2121,7 +2602,13 @@ async fn prove_reports_expiry_and_unreachable_github() {
     // Unreachable: the nonce survives for a retry with the same proof.
     let r = f
         .services
-        .invite_prove_op(&invite_id, &secret, &n, "down", "guest")
+        .invite_prove_op(
+            &invite_id,
+            &secret,
+            &n,
+            github_claim("down", "guest"),
+            InviteScope::Workspace,
+        )
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::GithubUnreachable);
     assert_eq!(f.services.invite_nonces.lock().await.len(), 1);
@@ -2134,7 +2621,13 @@ async fn prove_reports_expiry_and_unreachable_github() {
     f.services = f.services.clone().with_source_control(Arc::new(forge));
     let r = f
         .services
-        .invite_prove_op(&invite_id, &secret, &n, "ok", "guest")
+        .invite_prove_op(
+            &invite_id,
+            &secret,
+            &n,
+            github_claim("ok", "guest"),
+            InviteScope::Workspace,
+        )
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::GithubUnreachable);
     assert_eq!(f.services.invite_nonces.lock().await.len(), 1);
@@ -2146,13 +2639,25 @@ async fn prove_reports_expiry_and_unreachable_github() {
     }
     let r = f
         .services
-        .invite_prove_op(&invite_id, &secret, &n, "ok", "guest")
+        .invite_prove_op(
+            &invite_id,
+            &secret,
+            &n,
+            github_claim("ok", "guest"),
+            InviteScope::Workspace,
+        )
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::ProofExpired);
     assert!(f.services.invite_nonces.lock().await.is_empty());
     let r = f
         .services
-        .invite_prove_op(&invite_id, &secret, &n, "ok", "guest")
+        .invite_prove_op(
+            &invite_id,
+            &secret,
+            &n,
+            github_claim("ok", "guest"),
+            InviteScope::Workspace,
+        )
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::ProofInvalid, "spent");
     assert!(
@@ -2176,8 +2681,15 @@ async fn prove_enforces_the_pin_on_the_proven_account() {
     with_forge(&mut f, vec![]);
     let created = with_caller(
         wire(&f.owner),
-        f.services
-            .workspace_invite_create_op(&f.ws, Some("other".into()), None),
+        f.services.workspace_invite_create_op(
+            &f.ws,
+            Some(InvitePin {
+                login: "other".into(),
+                provider: Some("github".into()),
+                host: None,
+            }),
+            None,
+        ),
     )
     .await
     .expect("pinned invite");
@@ -2187,14 +2699,20 @@ async fn prove_enforces_the_pin_on_the_proven_account() {
     );
     let n = nonce_of(
         &f.services
-            .invite_challenge_op(&invite_id, &secret)
+            .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
             .await
             .expect("challenge"),
     );
     with_forge(&mut f, vec![("g", Ok(gist("guest", Some(&n))))]);
     let r = f
         .services
-        .invite_prove_op(&invite_id, &secret, &n, "g", "guest")
+        .invite_prove_op(
+            &invite_id,
+            &secret,
+            &n,
+            github_claim("g", "guest"),
+            InviteScope::Workspace,
+        )
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::PinMismatch);
 }
@@ -2227,14 +2745,20 @@ async fn prove_and_accept_refuse_the_host_owners_own_account() {
     // prove: the forge proves "guest" (4242) — the owner's own account.
     let nonce = nonce_of(
         &f.services
-            .invite_challenge_op(&invite_id, &secret)
+            .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
             .await
             .expect("challenge"),
     );
     with_forge(&mut f, vec![("g", Ok(gist("guest", Some(&nonce))))]);
     let r = f
         .services
-        .invite_prove_op(&invite_id, &secret, &nonce, "g", "guest")
+        .invite_prove_op(
+            &invite_id,
+            &secret,
+            &nonce,
+            github_claim("g", "guest"),
+            InviteScope::Workspace,
+        )
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::OwnerSelfJoin);
 
@@ -2246,7 +2770,7 @@ async fn prove_and_accept_refuse_the_host_owners_own_account() {
         .expect("legacy owner credential");
     let r = f
         .services
-        .invite_accept_op(&invite_id, &secret, "owner-token")
+        .invite_accept_op(&invite_id, &secret, "owner-token", InviteScope::Workspace)
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::OwnerSelfJoin);
 
@@ -2254,7 +2778,7 @@ async fn prove_and_accept_refuse_the_host_owners_own_account() {
     // store transaction carries the same guard for anything past it).
     let r = f
         .services
-        .complete_invite_join(&invite_id, &identity("guest", 4242))
+        .complete_invite_join(&invite_id, &guest("guest", 4242), InviteScope::Workspace, 0)
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::OwnerSelfJoin);
 
@@ -2306,7 +2830,7 @@ async fn prove_consumes_the_nonce_exactly_once_under_concurrency() {
     );
     let n = nonce_of(
         &f.services
-            .invite_challenge_op(&invite_id, &secret)
+            .invite_challenge_op(&invite_id, &secret, InviteScope::Workspace)
             .await
             .expect("challenge"),
     );
@@ -2326,7 +2850,13 @@ async fn prove_consumes_the_nonce_exactly_once_under_concurrency() {
         let (invite_id, secret, n) = (invite_id.clone(), secret.clone(), n.clone());
         handles.push(tokio::spawn(async move {
             services
-                .invite_prove_op(&invite_id, &secret, &n, "g", "guest")
+                .invite_prove_op(
+                    &invite_id,
+                    &secret,
+                    &n,
+                    github_claim("g", "guest"),
+                    InviteScope::Workspace,
+                )
                 .await
         }));
     }
@@ -2361,8 +2891,14 @@ fn proof_time_and_login_rules() {
     assert!(gist_created_after("2023-11-14T22:13:21Z", issued));
     assert!(!gist_created_after("2023-11-14T22:13:19Z", issued));
     assert!(!gist_created_after("yesterday", issued));
-    assert!(valid_login("octocat") && valid_login("a-b-1"));
-    assert!(!valid_login("") && !valid_login("a/b") && !valid_login(&"x".repeat(40)));
+    assert!(valid_login("octocat", Provider::Github) && valid_login("a-b-1", Provider::Github));
+    assert!(
+        !valid_login("", Provider::Github)
+            && !valid_login("a/b", Provider::Github)
+            && !valid_login(&"x".repeat(40), Provider::Github)
+    );
+    assert!(valid_login("first.last_x", Provider::Gitlab) && !valid_login("a/b", Provider::Gitlab));
+    assert!(!valid_login("first.last", Provider::Github));
     assert_eq!(random_nonce().len(), 43);
     assert_ne!(random_nonce(), random_nonce());
 }
@@ -2382,7 +2918,7 @@ async fn capped_fixture(
     );
     set_cap(&registry, cap);
     let mut f = fixture(tmp).await;
-    f.services = Services::new(f.store.clone()).with_settings_registry(registry.clone());
+    f.services = services(&f.store, tmp).with_settings_registry(registry.clone());
     (f, registry, cfg_dir)
 }
 
@@ -2400,6 +2936,52 @@ async fn guest_summary(f: &Fixture) -> (u64, u64) {
         v["guestCount"].as_u64().expect("guestCount"),
         v["guestLimit"].as_u64().expect("guestLimit"),
     )
+}
+
+/// `workspace.invite.create` on an archived workspace is
+/// `-32602 { code: "workspace-archived" }` with no row written: the check
+/// rides the insert's own write transaction, so a mint racing the archive
+/// either lands before the sweep (and is revoked by it) or is refused.
+/// Unarchiving admits the next mint.
+#[tokio::test]
+async fn invite_create_refuses_an_archived_workspace() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    f.store
+        .archive_workspace_detaching_guests(&f.ws, &now_iso())
+        .await
+        .expect("archive");
+
+    let r = with_caller(
+        wire(&f.owner),
+        f.services.workspace_invite_create_op(&f.ws, None, None),
+    )
+    .await;
+    assert_eq!(invite_kind(&r), InviteErrorKind::WorkspaceArchived);
+    assert_eq!(r.unwrap_err().code(), -32602);
+    assert!(
+        f.store
+            .list_open_workspace_invites(&f.ws)
+            .await
+            .expect("list")
+            .is_empty(),
+        "a refused mint leaves no row"
+    );
+
+    assert!(f
+        .store
+        .unarchive_workspace_if_archived(&f.ws, &now_iso())
+        .await
+        .expect("unarchive"));
+    f.create_invite(None).await;
+    assert_eq!(
+        f.store
+            .list_open_workspace_invites(&f.ws)
+            .await
+            .expect("list")
+            .len(),
+        1
+    );
 }
 
 /// `workspace.invite.create` spends the cap on collaborators PLUS open
@@ -2556,7 +3138,7 @@ async fn complete_join_refuses_a_full_workspace_and_keeps_the_invite_open() {
     set_cap(&registry, 2);
     let r = f
         .services
-        .complete_invite_join(&id, &identity("newcomer", 7001))
+        .complete_invite_join(&id, &guest("newcomer", 7001), InviteScope::Workspace, 0)
         .await;
     assert_eq!(invite_kind(&r), InviteErrorKind::WorkspaceFull);
     assert_eq!(f.store.count_principals().await.expect("count"), principals);
@@ -2571,7 +3153,7 @@ async fn complete_join_refuses_a_full_workspace_and_keeps_the_invite_open() {
     // A seated collaborator (github 2002) needs no new seat.
     let rejoined = f
         .services
-        .complete_invite_join(&id, &identity("collab", 2002))
+        .complete_invite_join(&id, &guest("collab", 2002), InviteScope::Workspace, 0)
         .await
         .expect("member re-joins under a full cap");
     assert_eq!(rejoined["principalId"], json!(f.collaborator.0));
@@ -2579,7 +3161,7 @@ async fn complete_join_refuses_a_full_workspace_and_keeps_the_invite_open() {
     set_cap(&registry, 3);
     let joined = f
         .services
-        .complete_invite_join(&id, &identity("newcomer", 7001))
+        .complete_invite_join(&id, &guest("newcomer", 7001), InviteScope::Workspace, 0)
         .await
         .expect("join once the cap is raised");
     assert_eq!(joined["login"], json!("newcomer"));
@@ -2588,7 +3170,7 @@ async fn complete_join_refuses_a_full_workspace_and_keeps_the_invite_open() {
     assert_eq!(
         invite_kind(
             &f.services
-                .complete_invite_join(&id, &identity("late", 7002))
+                .complete_invite_join(&id, &guest("late", 7002), InviteScope::Workspace, 0)
                 .await
         ),
         InviteErrorKind::WorkspaceFull,
@@ -2614,7 +3196,12 @@ async fn concurrent_joins_cannot_overshoot_the_guest_cap() {
         let services = f.services.clone();
         handles.push(tokio::spawn(async move {
             services
-                .complete_invite_join(&id, &identity(&format!("racer-{n}"), n))
+                .complete_invite_join(
+                    &id,
+                    &guest(&format!("racer-{n}"), n),
+                    InviteScope::Workspace,
+                    0,
+                )
                 .await
         }));
     }
@@ -2700,7 +3287,12 @@ async fn concurrent_member_adds_cannot_overshoot_the_guest_cap() {
         let invite = invite.clone();
         handles.push(tokio::spawn(async move {
             let r = services
-                .complete_invite_join(&invite, &identity(&format!("joiner-{n}"), 9100 + n))
+                .complete_invite_join(
+                    &invite,
+                    &guest(&format!("joiner-{n}"), 9100 + n),
+                    InviteScope::Workspace,
+                    0,
+                )
                 .await;
             r.is_ok() || invite_kind(&r) == InviteErrorKind::WorkspaceFull
         }));
@@ -2863,7 +3455,7 @@ async fn revoke_self_revokes_credentials_memberships_and_broadcasts() {
     let r = with_caller(
         Caller::Wire {
             principal_id: f.primary.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         },
         f.services.principal_revoke_self_op(),
     )
@@ -2875,7 +3467,7 @@ async fn revoke_self_revokes_credentials_memberships_and_broadcasts() {
         .expect("revoke self");
     assert_eq!(
         revoked,
-        json!({ "revoked": true, "credentials": 2, "workspaces": 1 })
+        json!({ "revoked": true, "credentials": 2, "workspaces": 1, "hostMembershipRemoved":false })
     );
     assert!(f
         .store
@@ -2891,17 +3483,18 @@ async fn revoke_self_revokes_credentials_memberships_and_broadcasts() {
             .expect("role"),
         None
     );
-    assert_eq!(revocations.try_recv().expect("broadcast"), f.collaborator);
+    assert_eq!(
+        revocations.try_recv().expect("broadcast").principal_id,
+        f.collaborator
+    );
 }
 
 // --- verifier probes (adopted as regression tests) --------------------------
 
-/// The primary's cached `github_user_id` does not admit an invite when the
-/// live credential check fails: a real forge client pointed at a closed
-/// loopback port reports `isConfigured: false`, the mint is refused with
-/// `GithubIdentityRequired`, and no invite row is written.
+/// An unavailable repository forge cannot block unpinned invitation issuance.
+/// The real client reports disconnected while the Intent owner still mints.
 #[tokio::test]
-async fn cached_primary_identity_requires_live_auth() {
+async fn cached_primary_identity_needs_no_live_auth() {
     let tmp = TempDb::new();
     let f = fixture(&tmp).await;
     let mut primary = f.store.get_principal(&f.primary).await.expect("primary");
@@ -2925,10 +3518,10 @@ async fn cached_primary_identity_requires_live_auth() {
         services.workspace_invite_create_op(&f.ws, None, None),
     )
     .await;
-    assert_eq!(invite_kind(&r), InviteErrorKind::GithubIdentityRequired);
+    assert!(r.is_ok(), "Intent authority suffices: {r:?}");
     assert_eq!(
         f.store.count_open_workspace_invites().await.expect("count"),
-        0
+        1
     );
 }
 
@@ -3188,7 +3781,7 @@ async fn event_actor_is_the_primary_for_the_administrator() {
     with_caller(
         Caller::Wire {
             principal_id: f.primary.clone(),
-            is_administrator: true,
+            host_role: intent_core::HostRole::Owner,
         },
         f.services.create_note(
             f.ws.clone(),
@@ -3225,11 +3818,11 @@ async fn administrator_comment_author_follows_the_attached_identity() {
     let (_tmp, f, note_id) = attribution_fixture().await;
     let admin = || Caller::Wire {
         principal_id: f.primary.clone(),
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let mut primary = f.store.get_primary_principal().await.expect("primary");
     primary.login = None;
-    primary.github_user_id = None;
+    primary.set_github_user_id(None);
     f.store.upsert_principal(&primary).await.expect("seed");
     with_caller(
         admin(),
@@ -3250,7 +3843,7 @@ async fn administrator_comment_author_follows_the_attached_identity() {
     .expect("legacy comment");
 
     primary.login = Some("primary-gh".into());
-    primary.github_user_id = Some(10);
+    primary.set_github_user_id(Some(10));
     f.store.upsert_principal(&primary).await.expect("attach");
     with_caller(
         admin(),
@@ -3377,6 +3970,64 @@ async fn member_removal_drops_only_the_guest_queue() {
     assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
 }
 
+/// `principal.me` and every `workspace.members.list` Member row carry the
+/// additive `identity` triple (`{ provider, host, externalUserId }`) exactly
+/// as `principal.list` does: a github.com principal projects the backfilled
+/// triple, a principal linked on another provider / host projects that
+/// triple verbatim, and an unlinked principal carries no `identity` key.
+#[tokio::test]
+async fn principal_me_and_members_list_carry_the_identity_triple() {
+    let tmp = TempDb::new();
+    let f = fixture(&tmp).await;
+    let gitlab = PrincipalIdentity {
+        provider: "gitlab".to_string(),
+        host: "gitlab.example.com".to_string(),
+        external_user_id: "4242".to_string(),
+    };
+    let mut collaborator = f
+        .store
+        .get_principal(&f.collaborator)
+        .await
+        .expect("collaborator row");
+    collaborator.identity = Some(gitlab.clone());
+    collaborator.github_user_id = None;
+    f.store
+        .upsert_principal(&collaborator)
+        .await
+        .expect("relink collaborator");
+    let github = json!({ "provider": "github", "host": "github.com", "externalUserId": "1001" });
+    let gitlab = json!(gitlab);
+
+    for (principal, expected) in [
+        (&f.owner, Some(&github)),
+        (&f.collaborator, Some(&gitlab)),
+        (&f.primary, None),
+    ] {
+        let me = with_caller(wire(principal), f.services.principal_me_op())
+            .await
+            .expect("principal.me");
+        assert_eq!(me["id"], json!(principal), "{me}");
+        assert_eq!(me.get("identity"), expected, "principal.me: {me}");
+    }
+
+    let roster = with_caller(wire(&f.owner), f.services.workspace_members_list_op(&f.ws))
+        .await
+        .expect("members.list");
+    let members = roster["members"].as_array().expect("members");
+    assert_eq!(members.len(), 3, "{roster}");
+    for (principal, expected) in [
+        (&f.owner, Some(&github)),
+        (&f.collaborator, Some(&gitlab)),
+        (&f.primary, None),
+    ] {
+        let row = members
+            .iter()
+            .find(|m| m["principalId"] == json!(principal))
+            .expect("member row");
+        assert_eq!(row.get("identity"), expected, "members.list: {row}");
+    }
+}
+
 /// The API-base seam accepts loopback cleartext and https overrides and
 /// ignores a cleartext non-loopback host.
 #[test]
@@ -3403,4 +4054,131 @@ fn secret_hashing_shape() {
     assert!(hashes_match(&h, &hash_secret("abc")));
     assert!(!hashes_match(&h, &hash_secret("abd")));
     assert!(!hashes_match(&h, "ba78"));
+}
+
+#[tokio::test]
+async fn collaboration_machine_name_persists_resets_and_is_owner_only() {
+    let tmp = TempDb::new();
+    let (f, registry, cfg) = capped_fixture(&tmp, 10).await;
+    let owner = Caller::Wire {
+        principal_id: f.owner.clone(),
+        host_role: intent_core::HostRole::Owner,
+    };
+    let path = "sharing.machineName";
+    let saved = with_caller(
+        owner.clone(),
+        f.services.settings_update(json!([
+            {"path":path,"value":"  Team 🦀 machine  "}
+        ])),
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved["applied"][0]["value"], "Team 🦀 machine");
+    assert_eq!(registry.get(path), Some(json!("Team 🦀 machine")));
+    let reloaded = crate::SettingsRegistry::load(cfg.path().join("config.toml")).unwrap();
+    assert_eq!(reloaded.get(path), Some(json!("Team 🦀 machine")));
+    for role in [intent_core::HostRole::Member, intent_core::HostRole::Guest] {
+        let caller = Caller::Wire {
+            principal_id: f.collaborator.clone(),
+            host_role: role,
+        };
+        for result in [
+            with_caller(
+                caller.clone(),
+                f.services
+                    .settings_update(json!([{"path":path,"value":"intruder"}])),
+            )
+            .await,
+            with_caller(caller.clone(), f.services.settings_reset(path.into())).await,
+            with_caller(caller, f.services.settings_get(path.into())).await,
+        ] {
+            assert!(matches!(result, Err(Error::Forbidden(_))), "{result:?}");
+        }
+        assert_eq!(registry.get(path), Some(json!("Team 🦀 machine")));
+    }
+    for invalid in [
+        json!("x".repeat(101)),
+        json!("line\nname"),
+        json!("\tname"),
+        json!(null),
+        json!(42),
+    ] {
+        let result = with_caller(
+            owner.clone(),
+            f.services
+                .settings_update(json!([{"path":path,"value":invalid}])),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::InvalidParams(_))), "{result:?}");
+        assert_eq!(registry.get(path), Some(json!("Team 🦀 machine")));
+    }
+    with_caller(owner.clone(), f.services.settings_reset(path.into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::SettingsRegistry::load(cfg.path().join("config.toml"))
+            .unwrap()
+            .get(path),
+        Some(json!(""))
+    );
+    with_caller(
+        owner,
+        f.services
+            .settings_update(json!([{"path":path,"value":"   "}])),
+    )
+    .await
+    .unwrap();
+    assert_eq!(registry.get(path), Some(json!("")));
+}
+
+#[tokio::test]
+async fn collaboration_machine_name_reaches_both_invite_previews_and_refreshes() {
+    let tmp = TempDb::new();
+    let (mut f, registry, _cfg) = capped_fixture(&tmp, 10).await;
+    with_forge(&mut f, vec![]);
+    let workspace = f.create_invite(None).await;
+    let host = with_caller(
+        Caller::Daemon,
+        f.services.host_invite_create_op(InvitePin {
+            login: "guest".into(),
+            provider: Some("github".into()),
+            host: None,
+        }),
+    )
+    .await
+    .unwrap();
+    for name in ["", "Team machine", "Renamed", ""] {
+        with_caller(
+            Caller::Daemon,
+            f.services
+                .settings_update(json!([{"path":"sharing.machineName","value":name}])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(registry.get("sharing.machineName"), Some(json!(name)));
+        let expected = if name.is_empty() {
+            Value::Null
+        } else {
+            json!(name)
+        };
+        for (invite, scope) in [
+            (&workspace, InviteScope::Workspace),
+            (&host, InviteScope::Host),
+        ] {
+            let id = id_of(invite);
+            let secret = invite["secret"].as_str().unwrap();
+            for preview in [
+                f.services
+                    .invite_inspect_op(&id, secret, scope)
+                    .await
+                    .unwrap(),
+                f.services
+                    .invite_challenge_op(&id, secret, scope)
+                    .await
+                    .unwrap(),
+            ] {
+                assert_eq!(preview.get("collaborationName"), Some(&expected));
+            }
+        }
+    }
 }

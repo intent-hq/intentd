@@ -83,7 +83,7 @@ async fn chief_workspace_over_uds() {
     .await;
     let ws = &resp["result"]["workspace"];
     assert_eq!(ws["id"], json!(CHIEF_WORKSPACE_ID));
-    assert_eq!(ws["title"], json!("Chief of Staff"));
+    assert_eq!(ws["title"], json!("Assistant"));
     assert_eq!(ws["branch"], json!(""));
     assert_eq!(ws["status"], json!("Active"));
     assert_eq!(ws["attention"], json!("none"));

@@ -24,7 +24,7 @@ use tokio::time::timeout;
 struct Daemon {
     child: Child,
     /// Swept after `Drop` reaps the child (fields drop after `drop()` runs).
-    _data_dir: tempfile::TempDir,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
@@ -58,7 +58,7 @@ fn spawn_daemon(prefix: &str, envs: &[(&str, &str)]) -> (Daemon, PathBuf, PathBu
     (
         Daemon {
             child,
-            _data_dir: data_dir_guard,
+            data_dir: data_dir_guard,
         },
         socket,
         log_path,
@@ -380,17 +380,18 @@ async fn get_subscriptions_stays_within_statement_budget() {
 /// statement count regardless of queue depth.
 ///
 /// Hermetic shape: the workspace is archived, whose send/drain gates park
-/// AUTOMATIC-origin entries (no provider turn ever spawns). 40
-/// `agent.sendToTask` calls — the same default-origin path as A2A sends and
-/// system wakes — then grow the queue to 40 parked entries; pre-fix the
-/// later dispatches ran 40+ statements each (DELETE + one INSERT per entry),
+/// AUTOMATIC-origin entries (no provider turn ever spawns). Seed 39 durable
+/// automatic rows and restart to rehydrate them, then make 40 measured
+/// `agent.sendToTask` calls. These UDS calls carry the local human stamp, so
+/// they merge into one additional row: every mutation persists 40 real rows.
+/// Pre-fix these dispatches ran 40+ statements (DELETE + one INSERT per entry),
 /// tripping the default budget of 25 — the batched shape stays at a handful
 /// per call. `agent.queueMessage` cannot serve here: its entries are
 /// user-origin (PROTOCOL §5.5), which the archived gate exempts, so each
 /// call would revive the workspace and drive a (non-hermetic) provider turn.
 #[tokio::test]
 async fn queue_mutations_stay_within_statement_budget_at_depth() {
-    let (_daemon, socket, log_path) = spawn_daemon("itdp-queue", &[]);
+    let (mut daemon, socket, log_path) = spawn_daemon("itdp-queue", &[]);
     assert!(await_socket(&socket).await, "daemon did not start");
 
     let repo = create_repo_with_config("{}");
@@ -453,6 +454,63 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
     .await;
     assert!(resp["error"].is_null(), "workspace archive failed: {resp}");
 
+    // Seed while stopped so no in-memory snapshot can overwrite the fixture.
+    // These are genuine automatic entries, not human metadata masquerading as
+    // system messages at an authenticated RPC front door.
+    daemon.child.kill().expect("stop daemon before seeding");
+    daemon.child.wait().expect("reap daemon before seeding");
+    let data_dir = daemon.data_dir.path();
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    let queued_at = intent_core::now_iso();
+    let rows: Vec<_> = (0..39)
+        .map(|i| {
+            let id = format!("automatic-{i}");
+            intent_store::AgentQueueRow {
+                id: id.clone(),
+                agent_id: intent_core::AgentId::from(agent_id.as_str()),
+                position: i,
+                payload: json!({
+                    "id": id, "turnId": id, "content": format!("automatic message {i}"),
+                    "queuedAt": queued_at, "messageMetadata": {"source": "system"},
+                    "userOrigin": false,
+                }),
+                created_at: queued_at.clone(),
+                turn_id: id,
+            }
+        })
+        .collect();
+    store
+        .replace_agent_queue(&intent_core::AgentId::from(agent_id.as_str()), &rows)
+        .await
+        .unwrap();
+    store.close().await;
+    let log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log_path)
+        .unwrap();
+    daemon.child = common::serve_command()
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("restart seeded daemon");
+    assert!(
+        await_socket(&socket).await,
+        "restarted daemon did not start"
+    );
+    let restored = rpc_with_params(
+        &socket,
+        "agent.getQueue",
+        json!({"workspaceId": workspace_id, "agentId": agent_id}),
+    )
+    .await;
+    assert_eq!(restored["result"]["queue"].as_array().unwrap().len(), 39);
+
+    let mut human_id = None;
     for i in 0..40 {
         let resp = rpc_with_params(
             &socket,
@@ -470,6 +528,20 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
             json!(true),
             "sendToTask {i} parked behind the archived gate: {resp}"
         );
+        let snapshot = rpc_with_params(
+            &socket,
+            "agent.getQueue",
+            json!({"workspaceId": workspace_id, "agentId": agent_id}),
+        )
+        .await;
+        let queue = snapshot["result"]["queue"].as_array().unwrap();
+        assert_eq!(
+            queue.len(),
+            40,
+            "mutation {i} must persist real depth40: {snapshot}"
+        );
+        let id = queue[39]["id"].as_str().expect("human row id");
+        assert_eq!(human_id.get_or_insert_with(|| id.to_string()).as_str(), id);
     }
 
     // All 40 entries are parked (the workspace stays archived).
@@ -484,6 +556,35 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
         Some(40),
         "resp: {resp}"
     );
+
+    let queue = resp["result"]["queue"].as_array().unwrap();
+    for (i, row) in queue.iter().take(39).enumerate() {
+        assert_eq!(row["id"], format!("automatic-{i}"));
+        assert_eq!(row["turnId"], format!("automatic-{i}"));
+        assert_eq!(row["position"], i);
+        assert_eq!(row["queuedAt"], queued_at);
+        assert_eq!(row["content"], format!("automatic message {i}"));
+        assert!(
+            row["author"].is_null(),
+            "automatic row acquired an author: {row}"
+        );
+    }
+    assert_eq!(queue[39]["position"], 39);
+    assert_eq!(
+        queue[39]["content"],
+        (0..40)
+            .map(|i| format!("queued message {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    );
+    assert!(queue[39]["author"]["principalId"].is_string());
+    let workspace = rpc_with_params(
+        &socket,
+        "workspace.get",
+        json!({"workspaceId": workspace_id}),
+    )
+    .await;
+    assert_eq!(workspace["result"]["workspace"]["status"], "Archived");
 
     // The WARNs (were they wrongly emitted) land on stderr before each
     // response frame is written, so a single read after the calls suffices.
@@ -679,17 +780,31 @@ async fn workspace_get_enrichment_stays_within_statement_budget() {
 /// `list_agent_sessions` hydrated every session's transcript (message +
 /// payload SELECTs) just to read `id`/`name`, and the per-agent teardown ran
 /// one `agent_stop_redelivery` DELETE plus one `advisory_wake_delivery` DELETE
-/// each — 128 statements / 180 ms observed for a 30-agent workspace, over the
-/// compound budget of 100. The sweep now reads session summaries and folds
-/// both clears into one batched `IN`-list statement each, so the dispatch
-/// executes a constant ~10 statements regardless of how many agents, messages
-/// or notes the workspace holds. The compound threshold is lowered to 20 so
-/// even a small N+1 regression (≥ 3 agents) fires the WARN.
+/// each — 128 statements / 180 ms observed for a 30-agent workspace. Preserve
+/// the summary-only read and batched runtime clears, while allowing the
+/// intentional per-session cleanup added for intent-hq/intent#5337. For this
+/// fixture (histories smaller than one batch), cleanup costs 10 statements
+/// per agent plus fixed workspace work: 324 statements observed. A budget of
+/// 340 still catches even one extra query per agent; SQL tracing also guards
+/// the original hydration and per-agent runtime-clear regressions directly.
+/// Larger histories legitimately add batches, covered by the interleaving
+/// regressions in intent-store/services and `wss_integration/workspace_delete`.
 #[tokio::test]
 async fn workspace_delete_stays_within_statement_budget_at_scale() {
+    const AGENTS: usize = 30;
+    let statement_budget = (10 * AGENTS + 40).to_string();
     let (_daemon, socket, log_path) = spawn_daemon(
         "itdp-wsdel",
-        &[("INTENTD_RPC_COMPOUND_STATEMENT_WARN_THRESHOLD", "20")],
+        &[
+            (
+                "INTENTD_RPC_COMPOUND_STATEMENT_WARN_THRESHOLD",
+                &statement_budget,
+            ),
+            (
+                "RUST_LOG",
+                "warn,sqlx::query=debug,intent_transport::rpc_dispatch=info",
+            ),
+        ],
     );
     assert!(await_socket(&socket).await, "daemon did not start");
 
@@ -705,7 +820,7 @@ async fn workspace_delete_stays_within_statement_budget_at_scale() {
         .expect("workspace id")
         .to_string();
 
-    for a in 0..30 {
+    for a in 0..AGENTS {
         let resp = rpc_with_params(
             &socket,
             "agent.create",
@@ -750,7 +865,7 @@ async fn workspace_delete_stays_within_statement_budget_at_scale() {
     .await;
     assert_eq!(resp["result"]["success"], json!(true), "resp: {resp}");
 
-    // The cascade removed the workspace and everything under it.
+    // Incremental cleanup removed the workspace and everything under it.
     let resp = rpc_with_params(
         &socket,
         "workspace.get",
@@ -783,6 +898,45 @@ async fn workspace_delete_stays_within_statement_budget_at_scale() {
             &["exceeded SQL statement budget", "method=workspace.delete"]
         ),
         0,
-        "workspace.delete exceeded the lowered compound statement budget, log:\n{log}"
+        "workspace.delete exceeded the batch-aware statement budget, log:\n{log}"
     );
+
+    let plain_log = strip_ansi(&log);
+    let deletion_queries: Vec<_> = plain_log
+        .lines()
+        .filter(|line| {
+            line.contains("sqlx::query:") && line.contains("method=\"workspace.delete\"")
+        })
+        .collect();
+    assert!(
+        deletion_queries.iter().any(|line| {
+            line.contains("summary=\"SELECT") && line.contains("FROM agent_session")
+        }),
+        "expected session reads in the deletion SQL trace, log:\n{log}"
+    );
+    assert!(
+        !deletion_queries.iter().any(|line| {
+            line.contains("summary=\"SELECT") && line.contains("FROM agent_message")
+        }),
+        "workspace.delete must not hydrate message or payload rows, log:\n{log}"
+    );
+    for predicate in [
+        "DELETE FROM agent_stop_redelivery WHERE agent_id",
+        "DELETE FROM advisory_wake_delivery WHERE child_agent_id",
+    ] {
+        let clears: Vec<_> = deletion_queries
+            .iter()
+            .filter(|line| line.contains(predicate))
+            .collect();
+        assert_eq!(
+            clears.len(),
+            1,
+            "runtime clear must run once for all agents ({predicate}), log:\n{log}"
+        );
+        assert!(
+            clears[0].contains(" IN ("),
+            "runtime clear must use the batched IN predicate: {}",
+            clears[0]
+        );
+    }
 }

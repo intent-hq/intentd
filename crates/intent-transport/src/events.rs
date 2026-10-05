@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use intent_core::events::WORKSPACE_UPDATED;
+use intent_core::events::{AGENT_QUEUE_PROCESSING, AGENT_QUEUE_UPDATED, WORKSPACE_UPDATED};
 use intent_core::{Caller, Event, PrincipalId, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Map, Value};
 
@@ -32,6 +32,7 @@ pub(crate) struct MembershipGate {
     api: Arc<dyn WorkspaceApi>,
     principal_id: PrincipalId,
     verdicts: HashMap<String, (bool, Instant)>,
+    last_role: Option<intent_core::HostRole>,
 }
 
 impl MembershipGate {
@@ -43,11 +44,12 @@ impl MembershipGate {
         match crate::context::current_caller() {
             Some(Caller::Wire {
                 principal_id,
-                is_administrator: false,
+                host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
             }) => Some(Self {
                 api: Arc::clone(api),
                 principal_id,
                 verdicts: HashMap::new(),
+                last_role: None,
             }),
             _ => None,
         }
@@ -86,6 +88,10 @@ impl MembershipGate {
     /// by the side subscription on `workspace:updated`, so a removal takes
     /// effect even when the subscriber's own patterns exclude that type.
     pub(crate) fn observe_membership_event(&mut self, event: &Event) {
+        if event.event_type == intent_core::events::HOST_MEMBERS_CHANGED {
+            self.verdicts.clear();
+            return;
+        }
         if !Self::is_membership_change(event) {
             return;
         }
@@ -101,10 +107,77 @@ impl MembershipGate {
     /// Whether the subscriber may receive `event`.
     pub(crate) async fn allows(&mut self, event: &Event) -> bool {
         let workspace_id = event.workspace_id.as_str();
+        let role = self
+            .api
+            .principal_host_role(self.principal_id.clone())
+            .await
+            .ok();
+        if self.last_role != role {
+            self.verdicts.clear();
+            self.last_role = role;
+        }
+        if intent_core::events::is_client_event_type(&event.event_type) {
+            return workspace_id.is_empty()
+                && (matches!(
+                    role,
+                    Some(intent_core::HostRole::Owner | intent_core::HostRole::Member)
+                ) || (role == Some(intent_core::HostRole::Guest)
+                    && event.data["principalId"].as_str() == Some(self.principal_id.as_str())));
+        }
+        if event.event_type == intent_core::events::HOST_MEMBERS_CHANGED {
+            self.verdicts.clear();
+            return workspace_id.is_empty()
+                && (matches!(
+                    role,
+                    Some(intent_core::HostRole::Owner | intent_core::HostRole::Member)
+                ) || (event.data["principalId"].as_str() == Some(self.principal_id.as_str())
+                    && event.data["action"] == "removed"));
+        }
+        if intent_core::events::is_permission_event_type(&event.event_type) {
+            // Permission grants match snapshot/answer authority, not the cached
+            // collaborator visibility verdict. Recheck retained guest ownership
+            // even when no membership invalidation event reached this stream.
+            return role.is_some()
+                && !workspace_id.is_empty()
+                && self
+                    .api
+                    .get_workspace(WorkspaceId::from(workspace_id))
+                    .await
+                    .is_ok_and(|ws| ws.membership.is_some_and(|m| m.can_manage));
+        }
+        if intent_core::events::is_member_execution_event_type(&event.event_type) {
+            // Execution/context events never use the cached visibility verdict.
+            // Revocation takes effect before a socket is physically closed.
+            if !matches!(
+                role,
+                Some(intent_core::HostRole::Owner | intent_core::HostRole::Member)
+            ) {
+                return false;
+            }
+            if event.event_type == intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED {
+                return workspace_id.is_empty();
+            }
+            return !workspace_id.is_empty()
+                && self
+                    .api
+                    .get_workspace(WorkspaceId::from(workspace_id))
+                    .await
+                    .is_ok();
+        }
         if workspace_id.is_empty() {
             // Every collaborator-visible type is workspace-scoped; a global
             // event reaching here has nothing to authorize against.
             return false;
+        }
+        if role == Some(intent_core::HostRole::Member) {
+            if event.event_type == intent_core::events::WORKSPACE_DELETED {
+                return !WorkspaceId::from(workspace_id).is_chief();
+            }
+            return self
+                .api
+                .get_workspace(WorkspaceId::from(workspace_id))
+                .await
+                .is_ok();
         }
         if self.is_own_unshare(event) {
             // The removed member's own final notification.
@@ -128,6 +201,31 @@ impl MembershipGate {
         self.verdicts
             .insert(workspace_id.to_string(), (allowed, Instant::now()));
         allowed
+    }
+}
+
+/// Shared queue event projection after workspace membership admission.
+/// Queue snapshots and processing content are readable by all participants;
+/// the services enforce mutation authority separately.
+pub(crate) fn project_queue_event_for_current_caller(event: &mut Event) {
+    if event.event_type == AGENT_QUEUE_UPDATED {
+        let Some(queue) = event.data.get_mut("queue").and_then(Value::as_array_mut) else {
+            return;
+        };
+        let caller = crate::context::current_caller();
+        let entries = std::mem::take(queue);
+        *queue = intent_core::project_queue_for_caller(caller.as_ref(), entries);
+    } else if event.event_type == AGENT_QUEUE_PROCESSING {
+        let Some(caller) = crate::context::current_caller() else {
+            return;
+        };
+        let attribution = intent_core::queue_processing_event_attribution(event.metadata.as_ref());
+        if intent_core::queue_attribution_visible_to(&caller, &attribution) {
+            return;
+        }
+        if let Some(data) = event.data.as_object_mut() {
+            data.remove("content");
+        }
     }
 }
 
@@ -225,6 +323,8 @@ pub(crate) fn parse_subscribe_params(
 
 /// Validate `events.unsubscribe` params. A missing/empty `subscriptionId` throws
 /// (`-32602`); a present-but-unknown id is handled by the caller as `success:false`.
+/// Optional workspace routing context is not a registry scope: removal (including
+/// collection subscriptions and note-presence leases) remains connection-owned.
 pub(crate) fn parse_unsubscribe_id(params: &Map<String, Value>) -> Result<String, String> {
     match params.get("subscriptionId").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => Ok(s.to_string()),

@@ -7,6 +7,7 @@ pub mod bus;
 pub mod filter;
 pub(crate) mod git_metadata_watcher;
 pub mod git_status_refresher;
+pub(crate) mod linked_watch;
 pub mod registry;
 mod root_watch;
 pub(crate) mod shared_watch;

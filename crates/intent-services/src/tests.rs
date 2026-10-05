@@ -15,6 +15,11 @@ use intent_store::Store;
 
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
+mod line_attribution_retry;
+mod skill_list;
+mod task_list_latency;
+pub(crate) mod workspace_delete;
+
 /// Runs before `main()` — and therefore before any test threads exist, making
 /// `set_var` race-free. Node children spawned by lib tests (e.g. the real
 /// `auggie` CLI in `auto_commit` tests) inherit this and skip
@@ -146,6 +151,7 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -602,6 +608,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
         mergeable: Some(true),
         mergeable_state: Some("clean".to_string()),
         is_draft: Some(false),
+        is_in_merge_queue: None,
     };
     let with_detail_fields = |ws: &mut Workspace| {
         ws.setup_script = Some(SetupScript {
@@ -642,6 +649,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
             cost: None,
         },
         by_model: BTreeMap::new(),
+        by_agent_model: None,
         last_scan_at: Some(now_iso()),
     };
 
@@ -858,6 +866,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
         mergeable: Some(true),
         mergeable_state: Some("blocked".to_string()),
         is_draft: Some(false),
+        is_in_merge_queue: None,
     };
 
     let ws = WorkspaceId::new();
@@ -921,6 +930,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
             .collect(),
         totals: totals(9),
         by_model: BTreeMap::from([("claude-opus-4-1".to_string(), totals(1))]),
+        by_agent_model: None,
         last_scan_at: Some(now_iso()),
     });
     row.cow_supported = Some(true);
@@ -998,7 +1008,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
     let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
     let caller = intent_core::Caller::Wire {
         principal_id: primary.id,
-        is_administrator: true,
+        host_role: intent_core::HostRole::Owner,
     };
     let list = intent_core::with_caller(caller, svc.list_workspaces(true))
         .await
@@ -1184,6 +1194,7 @@ async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
         mergeable: None,
         mergeable_state: None,
         is_draft: None,
+        is_in_merge_queue: None,
     };
     let numbers = |ws: &Workspace| -> Vec<u64> {
         ws.pull_requests
@@ -1466,6 +1477,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
             mergeable: None,
             mergeable_state: None,
             is_draft: Some(false),
+            is_in_merge_queue: None,
         }]);
         // Fat persisted rollup: 8 agents + 3 models per workspace (the field
         // list rows must no longer carry).
@@ -1479,6 +1491,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
                 ("claude-opus-4-1".to_string(), totals(2)),
                 ("gpt-5".to_string(), totals(3)),
             ]),
+            by_agent_model: None,
             last_scan_at: Some(now_iso()),
         });
         if i >= ACTIVE {
@@ -1968,7 +1981,12 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
     let mut expected = store.list_workspaces(true).await.unwrap();
     for row in &mut expected {
         row.activity = svc.workspace_activity(&row.id);
-        row.pending_delete_at = svc.pending_workspace_deletes.deadline(row.id.as_str());
+        row.pending_delete_at = svc
+            .pending_workspace_deletes
+            .deadline(&crate::delete_grace::PendingDeleteSubject::Workspace(
+                row.id.clone(),
+            ))
+            .unwrap();
         svc.enrich_workspace_aggregates_with_unread(
             row,
             Some(unread.contains(row.id.as_str())),
@@ -2023,6 +2041,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         mergeable: None,
         mergeable_state: None,
         is_draft: None,
+        is_in_merge_queue: None,
     };
     let git_root = |ws: &WorkspaceId, path: &str, prs: Vec<PullRequestInfo>| {
         let ts = now_iso();
@@ -2380,6 +2399,7 @@ async fn display_status_folds_git_root_prs_on_every_read_surface() {
                 mergeable: None,
                 mergeable_state: None,
                 is_draft: None,
+                is_in_merge_queue: None,
             }]),
             created_at: ts.clone(),
             updated_at: ts,
@@ -2523,6 +2543,7 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
         mergeable: None,
         mergeable_state: None,
         is_draft: None,
+        is_in_merge_queue: None,
     };
     let ready = |title: &str, mergeable_state: &str, updated_at: &str, is_draft: bool| {
         let mut info = pr(
@@ -2850,6 +2871,7 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
             mergeable: None,
             mergeable_state: None,
             is_draft: None,
+            is_in_merge_queue: None,
         };
     let monitor =
         |ws: &WorkspaceId, number: i64, state: PrMonitorState, snapshot: Option<String>| {
@@ -5121,6 +5143,298 @@ async fn update_note_expected_version_gate_hit_miss_absent() {
     }
 }
 
+/// Regression (intent-hq/intent#5589): a successful content `note.update`
+/// returns the committed row — `rev` equal to the persisted rev and
+/// `updated_at` equal to the stored timestamp — so the client can chain the
+/// returned `rev` into its next `expectedVersion`. Before the fix the
+/// pre-write in-memory Note was returned (rev 0 after the rev-1 write).
+#[intent_test_macros::daemon_test]
+async fn update_note_content_returns_committed_rev() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+
+    let first = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v1".into()),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("content write");
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(first.rev, stored.rev, "response rev is the committed rev");
+    assert_eq!(first.updated_at, stored.updated_at);
+    assert_eq!(first.content, "v1");
+
+    // Chaining the returned rev as the next `expectedVersion` succeeds ...
+    let second = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v2".into()),
+                expected_version: Some(first.rev),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("chained conditional write");
+    assert_eq!(second.rev, 2);
+    assert_eq!(second.content, "v2");
+
+    // ... while the rev the first response superseded is now stale (-32005),
+    // and the rejection leaves the row untouched.
+    let stale = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("v3-should-not-persist".into()),
+                expected_version: Some(first.rev),
+                ..Default::default()
+            },
+        )
+        .await;
+    match stale {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 2);
+            assert_eq!(current["content"], "v2");
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert_eq!(stored.rev, 2);
+    assert_eq!(stored.content, "v2");
+}
+
+/// Same contract for a content `note.update` whose text carries an `@@@task`
+/// block: the auto-conversion rewrites the note, and the response `rev` is
+/// the rev of that final row (not of the caller's own write).
+#[intent_test_macros::daemon_test]
+async fn update_note_task_conversion_returns_committed_rev() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+    let updated = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("intro\n\n@@@task\n# Do it\nbody\n@@@\n".into()),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("content write with task block");
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert!(
+        stored.content.contains("intent://local/task/"),
+        "conversion rewrote the fence: {}",
+        stored.content
+    );
+    assert_eq!(updated.rev, stored.rev);
+    assert_eq!(updated.content, stored.content);
+    assert_eq!(updated.updated_at, stored.updated_at);
+    assert!(
+        updated.rev >= 1,
+        "rev advanced past the seed: {}",
+        updated.rev
+    );
+}
+
+/// The metadata arm of `note.update` (title/tags, no `content`) returns the
+/// committed row too: `rev` bumped, stored `updated_at`, and the content the
+/// row actually holds.
+#[intent_test_macros::daemon_test]
+async fn update_note_metadata_arm_returns_committed_rev() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+    let renamed = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                title: Some("Renamed".into()),
+                tags: Some(vec!["x".into()]),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("metadata write");
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(renamed.rev, stored.rev);
+    assert_eq!(renamed.updated_at, stored.updated_at);
+    assert_eq!(renamed.title, "Renamed");
+    assert_eq!(renamed.tags, vec!["x".to_string()]);
+    assert_eq!(renamed.content, "v0");
+
+    // The returned rev chains into the next conditional metadata write.
+    let again = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                title: Some("Renamed again".into()),
+                expected_version: Some(renamed.rev),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("chained metadata write");
+    assert_eq!(again.rev, 2);
+    assert_eq!(again.title, "Renamed again");
+}
+
+/// The metadata arm of `note.update` that read rev 0 while a user
+/// `setContent` lands at rev 1 (the intentd#1817 choreography) must return
+/// the row as committed — the user's content and rev 2 — never the stale
+/// pre-write copy it read.
+#[intent_test_macros::daemon_test]
+async fn update_note_metadata_arm_snapshot_carries_concurrent_content() {
+    let (tmp, svc, ws, id) = setup_versioned("abc").await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = svc.update_note(
+        ws.clone(),
+        id.clone(),
+        NoteUpdateInput {
+            title: Some("Renamed".into()),
+            ..Default::default()
+        },
+    );
+    let parked = poll_until(&mut fut, 20, || async {
+        svc.store.get_note(&ws, &id).await.expect("get note");
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    let saved = other_svc
+        .set_note_content(ws.clone(), id.clone(), "aXbc".into(), false, Some(0), None)
+        .await
+        .expect("user save");
+    assert_eq!(saved.rev, 1);
+    drop(held);
+
+    let returned = fut.await.expect("metadata write");
+    let stored = other.get_note(&ws, &id).await.expect("final note");
+    assert_eq!(stored.rev, 2);
+    assert_eq!(stored.content, "aXbc");
+    assert_eq!(
+        returned.rev, stored.rev,
+        "response rev is the committed rev"
+    );
+    assert_eq!(
+        returned.content, "aXbc",
+        "response snapshot carries the concurrently saved content, not the stale read"
+    );
+    assert_eq!(returned.title, "Renamed");
+    assert_eq!(returned.updated_at, stored.updated_at);
+}
+
+/// Regression (intent-hq/intent#5589): `note.updateMetadata` carries the
+/// committed `rev` and the stored `updated_at`, so the returned rev chains
+/// into the next conditional write; the rev it superseded is stale.
+#[intent_test_macros::daemon_test]
+async fn update_note_metadata_returns_committed_rev() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+    let first = svc
+        .update_note_metadata(
+            ws.clone(),
+            id.clone(),
+            Some("Renamed".into()),
+            Some(vec!["x".into()]),
+            Some(0),
+            None,
+        )
+        .await
+        .expect("metadata write");
+    let stored = svc.store.get_note(&ws, &id).await.expect("stored");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(
+        first.rev,
+        Some(stored.rev),
+        "response rev is the committed rev"
+    );
+    assert_eq!(
+        first.updated_at.as_deref(),
+        Some(stored.updated_at.as_str())
+    );
+    assert_eq!(first.title.as_deref(), Some("Renamed"));
+    assert_eq!(first.tags, Some(vec!["x".to_string()]));
+    assert_eq!(first.skipped, None);
+
+    let second = svc
+        .update_note_metadata(
+            ws.clone(),
+            id.clone(),
+            Some("Renamed again".into()),
+            None,
+            first.rev,
+            None,
+        )
+        .await
+        .expect("chained conditional metadata write");
+    assert_eq!(second.rev, Some(2));
+
+    let stale = svc
+        .update_note_metadata(
+            ws.clone(),
+            id.clone(),
+            Some("stale".into()),
+            None,
+            first.rev,
+            None,
+        )
+        .await;
+    match stale {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], 2);
+            assert_eq!(current["title"], "Renamed again");
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+}
+
+/// The `skipped` arm of `note.updateMetadata` (spec title only) writes
+/// nothing, so it carries no `rev`.
+#[intent_test_macros::daemon_test]
+async fn update_note_metadata_skipped_carries_no_rev() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    store
+        .insert_note(&note(&ws, "spec", "body"))
+        .await
+        .expect("note");
+    let svc = Services::new(store);
+    let skipped = svc
+        .update_note_metadata(
+            ws,
+            NoteId::from("spec"),
+            Some("Renamed".into()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("skip");
+    assert_eq!(skipped.skipped, Some(true));
+    assert_eq!(skipped.rev, None);
+}
+
 #[intent_test_macros::daemon_test]
 async fn update_metadata_skips_spec_title_but_applies_tags() {
     let tmp = TempDb::new();
@@ -5427,6 +5741,8 @@ async fn delete_note_cascades_comments_and_unlinks_children() {
         content: format!("{id} body"),
         author: "alice".to_string(),
         author_type: AuthorType::User,
+        author_principal_id: None,
+        author_identity: None,
         status: CommentStatus::Open,
         parent_id: None,
         anchor: Some(CommentAnchor {
@@ -8463,6 +8779,8 @@ fn anchored_root_comment(
         content: format!("{comment_id} body"),
         author: "User".to_string(),
         author_type: intent_core::AuthorType::User,
+        author_principal_id: None,
+        author_identity: None,
         status: CommentStatus::Open,
         parent_id: None,
         anchor: Some(CommentAnchor {
@@ -9329,6 +9647,8 @@ async fn comment_respond_rejects_cross_workspace_comment_id_probe() {
         content: "ws_a original".to_string(),
         author: "A".to_string(),
         author_type: AuthorType::User,
+        author_principal_id: None,
+        author_identity: None,
         status: CommentStatus::Open,
         parent_id: None,
         anchor: Some(CommentAnchor {
@@ -11677,6 +11997,254 @@ mod change_event_parity {
     }
 
     #[intent_test_macros::daemon_test]
+    async fn comment_delete_publishes_only_after_authorized_scoped_mutation() {
+        use intent_core::{with_caller, Caller, HostRole};
+        let h = harness().await;
+        let tn = note(&h.ws, "n-delete", "hello world");
+        h.store.insert_note(&tn).await.unwrap();
+        let other_note = note(&h.ws, "other-note", "hello world");
+        h.store.insert_note(&other_note).await.unwrap();
+        let added = h
+            .services
+            .comment_add(
+                h.ws.clone(),
+                tn.id.clone(),
+                "hello world".into(),
+                "hello".into(),
+                "root".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let reply = h
+            .services
+            .comment_respond(
+                h.ws.clone(),
+                tn.id.clone(),
+                Some(added.comment_id.clone()),
+                None,
+                "reply".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let outsider = guest_principal(&h, "outsider").await;
+        let member = seat_collaborator(&h, "member").await;
+        let caller = |id| Caller::Wire {
+            principal_id: id,
+            host_role: HostRole::Guest,
+        };
+        let mut sub = subscribe(&h);
+        let denied = with_caller(
+            caller(outsider),
+            h.services
+                .comment_delete(h.ws.clone(), tn.id.clone(), added.comment_id.clone()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(intent_core::Error::NotFound(_))),
+            "{denied:?}"
+        );
+        let wrong_note = with_caller(
+            caller(member.clone()),
+            h.services
+                .comment_delete(h.ws.clone(), other_note.id, added.comment_id.clone()),
+        )
+        .await;
+        assert!(
+            wrong_note.is_err(),
+            "a comment in another note must survive"
+        );
+        assert!(h.store.get_comment(&added.comment_id).await.is_ok());
+        // Successful root deletion is the event-stream barrier for the failed
+        // attempts. Retain the original thread ID while the reply survives.
+        with_caller(
+            caller(member.clone()),
+            h.services
+                .comment_delete(h.ws.clone(), tn.id.clone(), added.comment_id.clone()),
+        )
+        .await
+        .unwrap();
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "comment:deleted");
+        assert_eq!(ev["workspaceId"], h.ws.as_str());
+        assert!(ev["id"].is_string());
+        assert!(ev["timestamp"].is_string());
+        assert_eq!(
+            ev["actor"],
+            json!({"type":"user","id":member,"name":"member"})
+        );
+        assert_eq!(
+            ev["data"],
+            json!({"noteId":tn.id,"commentId":added.comment_id,"threadId":added.comment_id})
+        );
+        assert!(h.store.get_comment(&added.comment_id).await.is_err());
+        let threads = h
+            .services
+            .comment_list(h.ws.clone(), tn.id.clone(), None, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(threads.threads[0].thread_id, added.comment_id);
+        assert_eq!(threads.total_comments, 1);
+        // Repeated deletion fails and publishes nothing; the reply's deletion
+        // is the next observable event (no timeout-as-success assertion).
+        assert!(with_caller(
+            caller(member.clone()),
+            h.services
+                .comment_delete(h.ws.clone(), tn.id.clone(), added.comment_id.clone())
+        )
+        .await
+        .is_err());
+        with_caller(
+            caller(member),
+            h.services
+                .comment_delete(h.ws.clone(), tn.id.clone(), reply.comment.id.clone()),
+        )
+        .await
+        .unwrap();
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({"noteId":tn.id,"commentId":reply.comment.id,"threadId":added.comment_id})
+        );
+        assert!(h
+            .services
+            .comment_list(h.ws.clone(), tn.id, None, None, None, true)
+            .await
+            .unwrap()
+            .threads
+            .is_empty());
+        let persisted = h
+            .store
+            .events_by_type(&h.ws, "comment:deleted", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted.len(),
+            2,
+            "only successful deletes are durable events"
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn comment_delete_replacement_on_other_note_survives() {
+        comment_delete_replacement_race(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn comment_delete_replacement_on_same_note_emits_current_thread() {
+        comment_delete_replacement_race(true).await;
+    }
+
+    async fn comment_delete_replacement_race(same_note: bool) {
+        let h = harness().await;
+        let original = note(&h.ws, "original", "hello world");
+        let other = note(&h.ws, "other", "hello world");
+        h.store.insert_note(&original).await.unwrap();
+        h.store.insert_note(&other).await.unwrap();
+        let added = h
+            .services
+            .comment_add(
+                h.ws.clone(),
+                original.id.clone(),
+                "hello world".into(),
+                "hello".into(),
+                "root".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let reply = h
+            .services
+            .comment_respond(
+                h.ws.clone(),
+                original.id.clone(),
+                Some(added.comment_id.clone()),
+                None,
+                "reply".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let comment_id = reply.comment.id;
+        let mut subscription = subscribe(&h);
+        // As in the credential-revoke regression, hold the sole writer and
+        // drive deletion past its read-pool lookup while writes remain gated.
+        let mut held = h.store.write_pool().acquire().await.unwrap();
+        let mut deletion =
+            h.services
+                .comment_delete(h.ws.clone(), original.id.clone(), comment_id.clone());
+        let completed = super::poll_until(&mut deletion, 20, || async {
+            assert!(h.store.get_comment(&comment_id).await.is_ok());
+            false
+        })
+        .await;
+        assert!(!completed);
+        let replacement_note = if same_note { &original.id } else { &other.id };
+        // SQLite REPLACE deletes/reinserts the same client-supplied UUID,
+        // modeling another successful deletion followed by recreation while
+        // this request is parked. The original was a reply in thread R;
+        // the replacement is a root C with id == thread_id and no parent,
+        // as comment.add(commentId=C) creates after C has been deleted.
+        sqlx::query(
+            "INSERT OR REPLACE INTO comment
+            (id, thread_id, note_id, kind, content, author, author_type, status,
+             parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at, workspace_id)
+            SELECT id, id, ?, kind, content, author, author_type, status,
+             NULL, anchor_json, anchor_text, extra_json, created_at, updated_at, workspace_id
+            FROM comment WHERE id = ?",
+        )
+        .bind(replacement_note.as_str())
+        .bind(&comment_id)
+        .execute(&mut *held)
+        .await
+        .unwrap();
+        drop(held);
+        let result = deletion.await;
+        if same_note {
+            assert!(result.is_ok(), "{result:?}");
+            let event = recv_one(&mut subscription).await;
+            assert_eq!(event["type"], "comment:deleted");
+            assert_eq!(
+                event["data"],
+                json!({"noteId":original.id,"commentId":comment_id,"threadId":comment_id})
+            );
+            assert!(h.store.get_comment(&comment_id).await.is_err());
+        } else {
+            assert!(
+                result.is_err(),
+                "replacement on a different note must survive"
+            );
+            let remaining = h.store.get_comment(&comment_id).await.unwrap();
+            assert_eq!(remaining.note_id, Some(other.id));
+            assert_eq!(remaining.thread_id, comment_id);
+            assert!(remaining.parent_id.is_none());
+            assert!(h
+                .store
+                .events_by_type(&h.ws, "comment:deleted", 10)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
     async fn comment_resolved_payload() {
         let h = harness().await;
         let tn = note(&h.ws, "n-1", "hello world");
@@ -11741,11 +12309,25 @@ mod change_event_parity {
     /// `workspace:updated` with the full applied delta
     /// (`archived`/`status`/`archivedAt`). Verify `archive_workspace` fires
     /// exactly one such event whose `archivedAt` equals the persisted
-    /// timestamp (Audit D C3).
+    /// timestamp (Audit D C3). Precondition: the workspace has no guests —
+    /// the owner is its only member and no invite is open — so the guest
+    /// sweep publishes no membership / invite delta.
     #[intent_test_macros::daemon_test]
     async fn archive_workspace_emits_workspace_updated_once() {
         use intent_core::WorkspaceApi;
         let h = harness().await;
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert_eq!(members.len(), 1, "owner-only precondition: {members:?}");
+        assert!(h
+            .store
+            .list_open_workspace_invites(&h.ws)
+            .await
+            .expect("invites")
+            .is_empty());
         let mut sub = subscribe(&h);
         let ws = h
             .services
@@ -11773,19 +12355,939 @@ mod change_event_parity {
         );
     }
 
+    /// Insert a non-primary principal (not yet a member) named `login`.
+    async fn guest_principal(h: &Harness, login: &str) -> intent_core::PrincipalId {
+        let p = intent_core::Principal {
+            id: intent_core::PrincipalId::new(),
+            github_user_id: None,
+            login: Some(login.to_string()),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            identity: None,
+        };
+        h.store.upsert_principal(&p).await.expect("principal");
+        p.id
+    }
+
+    /// Seat a fresh `collaborator` named `login` on the harness workspace.
+    async fn seat_collaborator(h: &Harness, login: &str) -> intent_core::PrincipalId {
+        let id = guest_principal(h, login).await;
+        h.store
+            .add_workspace_member(&h.ws, &id, intent_core::WorkspaceRole::Collaborator)
+            .await
+            .expect("collaborator");
+        id
+    }
+
+    /// Mint one open (unpinned, unexpired) invite on the harness workspace.
+    async fn open_invite(h: &Harness) -> intent_core::WorkspaceInvite {
+        let primary = h.store.get_primary_principal().await.expect("primary");
+        let invite = intent_core::WorkspaceInvite {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: h.ws.clone(),
+            secret_hash: crate::invite_ops::hash_secret("s"),
+            secret: None,
+            created_by_principal_id: primary.id,
+            pin_github_user_id: None,
+            pin_login: None,
+            pin_identity: None,
+            created_at: now_iso(),
+            expires_at: intent_core::iso_ms_from_now(3_600_000),
+            redeemed_at: None,
+            redeemed_by_principal_id: None,
+            revoked_at: None,
+            redemption_count: 0,
+        };
+        h.store
+            .insert_workspace_invite(&invite)
+            .await
+            .expect("open invite");
+        invite
+    }
+
+    /// Archiving removes guests: on a workspace with two collaborators and
+    /// one open invite, `archive_workspace` detaches every collaborator (one
+    /// `{ members, removedPrincipalId, memberCount }` delta each, the
+    /// `members.remove` shape), revokes the invite (one `{ invites: true }`
+    /// delta), then publishes the archived delta last. The response carries
+    /// the post-sweep `memberCount == 1` / `openInviteCount == 0`, only the
+    /// owner row survives, and a following unarchive resurrects nothing.
+    #[intent_test_macros::daemon_test]
+    async fn archive_workspace_detaches_collaborators_and_revokes_open_invites() {
+        use intent_core::{WorkspaceApi, WorkspaceRole};
+        let h = harness().await;
+        let primary = h.store.get_primary_principal().await.expect("primary");
+        let mut guests = Vec::new();
+        for login in ["guest-a", "guest-b"] {
+            guests.push(seat_collaborator(&h, login).await);
+        }
+        let invite = open_invite(&h).await;
+        assert_eq!(
+            h.store
+                .workspace_membership_summaries(None, std::slice::from_ref(&h.ws))
+                .await
+                .expect("summary")[&h.ws]
+                .member_count,
+            3
+        );
+
+        let mut sub = subscribe(&h);
+        let ws = h
+            .services
+            .archive_workspace(h.ws.clone(), None)
+            .await
+            .expect("archive");
+        let membership = ws.membership.expect("membership attached");
+        assert_eq!(membership.member_count, 1, "owner only");
+        assert_eq!(membership.open_invite_count, 0, "invite revoked");
+
+        // One removal delta per collaborator, `memberCount` shrinking with
+        // each; then the invite delta; then the archived delta — nothing
+        // else.
+        let mut removed = Vec::new();
+        for expected_count in [2u64, 1] {
+            let ev = recv_one(&mut sub).await;
+            assert_envelope(&ev, &h.ws.0, "workspace:updated");
+            let changes = &ev["data"]["changes"];
+            assert_eq!(changes["members"], true, "{ev}");
+            assert_eq!(changes["memberCount"], expected_count, "{ev}");
+            removed.push(
+                changes["removedPrincipalId"]
+                    .as_str()
+                    .expect("removedPrincipalId")
+                    .to_string(),
+            );
+        }
+        let mut expected: Vec<String> = guests.iter().map(|g| g.0.clone()).collect();
+        expected.sort();
+        removed.sort();
+        assert_eq!(removed, expected);
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "changes": { "invites": true } })
+        );
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "archived": true,
+                    "status": "Archived",
+                    "archivedAt": ws.archived_at,
+                }
+            })
+        );
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
+
+        // Store: only the owner row survives; the invite is closed.
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert_eq!(members.len(), 1, "{members:?}");
+        assert_eq!(members[0].principal_id, primary.id);
+        assert_eq!(members[0].role, WorkspaceRole::Owner);
+        assert!(h
+            .store
+            .list_open_workspace_invites(&h.ws)
+            .await
+            .expect("invites")
+            .is_empty());
+        let stored = h
+            .store
+            .get_workspace_invite(&invite.id)
+            .await
+            .expect("invite read")
+            .expect("invite row kept");
+        assert!(stored.revoked_at.is_some());
+
+        // Unarchive resurrects nothing.
+        h.services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("unarchive");
+        let summary = h
+            .store
+            .workspace_membership_summaries(None, std::slice::from_ref(&h.ws))
+            .await
+            .expect("summary");
+        assert_eq!(summary[&h.ws].member_count, 1);
+        assert_eq!(summary[&h.ws].open_invite_count, 0);
+    }
+
+    /// Access revocation is never best-effort (PR #2066 review): the guest
+    /// detach commits in the archive's own transaction, so an injected
+    /// `BEFORE DELETE` failure on `workspace_member` fails the RPC and rolls
+    /// everything back — the row stays active, the collaborator keeps its
+    /// seat, the invite stays open — and nothing is published.
+    #[intent_test_macros::daemon_test]
+    async fn archive_workspace_fails_closed_when_guest_detach_fails() {
+        use intent_core::{WorkspaceApi, WorkspaceStatus};
+        let h = harness().await;
+        let guest = seat_collaborator(&h, "guest").await;
+        let invite = open_invite(&h).await;
+        sqlx::query(
+            "CREATE TRIGGER archive_detach_fail BEFORE DELETE ON workspace_member \
+             BEGIN SELECT RAISE(ABORT, 'injected detach failure'); END",
+        )
+        .execute(h.store.write_pool())
+        .await
+        .expect("arm trigger");
+
+        let mut sub = subscribe(&h);
+        let err = h
+            .services
+            .archive_workspace(h.ws.clone(), None)
+            .await
+            .expect_err("archive must fail when the detach fails");
+        assert!(
+            matches!(err, intent_core::Error::Internal(ref msg) if msg.contains("injected detach failure")),
+            "{err:?}"
+        );
+
+        let ws = h.store.get_workspace(&h.ws).await.expect("ws");
+        assert_eq!(ws.status, WorkspaceStatus::Active);
+        assert!(!ws.archived);
+        assert!(ws.archived_at.is_none());
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert!(
+            members.iter().any(|m| m.principal_id == guest),
+            "collaborator must keep its seat: {members:?}"
+        );
+        let open = h
+            .store
+            .list_open_workspace_invites(&h.ws)
+            .await
+            .expect("invites");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, invite.id);
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "a rolled-back archive publishes nothing: {quiet:?}"
+        );
+    }
+
+    /// The sweep runs inside the archive's `BEGIN IMMEDIATE` transaction,
+    /// not off a snapshot read before it (PR #2066 review): a collaborator
+    /// seated by a write transaction that commits while the archive waits
+    /// for the (single) write connection is still detached. The held
+    /// transaction guarantees the ordering — the archive cannot begin until
+    /// it commits — so the test is deterministic without timing.
+    #[intent_test_macros::daemon_test]
+    async fn archive_workspace_sweeps_a_collaborator_seated_by_a_concurrent_write() {
+        use intent_core::{WorkspaceApi, WorkspaceRole};
+        let h = harness().await;
+        let primary = h.store.get_primary_principal().await.expect("primary");
+        let guest = guest_principal(&h, "late-guest").await;
+
+        let mut held = h
+            .store
+            .write_pool()
+            .acquire()
+            .await
+            .expect("hold write conn");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *held)
+            .await
+            .expect("begin held txn");
+        let mut sub = subscribe(&h);
+        let services = h.services.clone();
+        let ws_id = h.ws.clone();
+        let archive =
+            intent_core::spawn_daemon(async move { services.archive_workspace(ws_id, None).await });
+
+        // Seat the guest through the held transaction: it commits before
+        // the archive can take the write connection, so the archive's
+        // sweep must observe it.
+        sqlx::query(
+            "INSERT INTO workspace_member (workspace_id, principal_id, role, added_at) \
+             VALUES (?, ?, 'collaborator', ?)",
+        )
+        .bind(&h.ws.0)
+        .bind(&guest.0)
+        .bind(now_iso())
+        .execute(&mut *held)
+        .await
+        .expect("seat via held txn");
+        assert!(
+            !archive.is_finished(),
+            "archive cannot commit past the held write txn"
+        );
+        sqlx::query("COMMIT")
+            .execute(&mut *held)
+            .await
+            .expect("commit held txn");
+        drop(held);
+
+        let ws = archive.await.expect("join").expect("archive");
+        assert_eq!(
+            ws.membership.expect("membership attached").member_count,
+            1,
+            "owner only"
+        );
+
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "members": true,
+                    "removedPrincipalId": guest.0,
+                    "memberCount": 1,
+                }
+            })
+        );
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(ev["data"]["changes"]["archived"], true);
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
+
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert_eq!(members.len(), 1, "{members:?}");
+        assert_eq!(members[0].principal_id, primary.id);
+        assert_eq!(members[0].role, WorkspaceRole::Owner);
+    }
+
+    /// No late sweep (PR #2066 review): the guest detach commits inside the
+    /// archive's transaction and nothing in the detached tail writes access,
+    /// so archive → unarchive → `members.add` keeps the new member. While
+    /// archived the add is refused as `workspace-archived` (checked inside
+    /// the add's own write transaction) with nothing written; the event
+    /// stream is the archive deltas, the unarchive delta, then the add delta.
+    #[intent_test_macros::daemon_test]
+    async fn archive_then_unarchive_keeps_a_member_added_afterwards() {
+        use intent_core::{InviteErrorKind, WorkspaceApi, WorkspaceRole};
+        let h = harness().await;
+        let early = seat_collaborator(&h, "early-guest").await;
+        let late = guest_principal(&h, "late-guest").await;
+        h.store
+            .insert_principal_credential(&late, &crate::invite_ops::hash_secret("late-token"))
+            .await
+            .expect("late credential");
+
+        let mut sub = subscribe(&h);
+        h.services
+            .archive_workspace(h.ws.clone(), None)
+            .await
+            .expect("archive");
+        let refused = h
+            .services
+            .workspace_members_add_op(&h.ws, &late)
+            .await
+            .expect_err("add on an archived workspace is refused");
+        assert!(
+            matches!(
+                refused,
+                intent_core::Error::Invite(InviteErrorKind::WorkspaceArchived)
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(refused.code(), -32602);
+        assert_eq!(
+            h.store
+                .get_workspace_member_role(&h.ws, &late)
+                .await
+                .expect("role"),
+            None,
+            "a refused add leaves no row"
+        );
+
+        h.services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("unarchive");
+        let added = h
+            .services
+            .workspace_members_add_op(&h.ws, &late)
+            .await
+            .expect("add after unarchive");
+        assert_eq!(added["added"], json!(true));
+        assert_eq!(added["memberCount"], json!(2));
+
+        // archive: removal of the early guest, then the archived delta;
+        // unarchive: its delta; add: the addedPrincipalId delta. No late
+        // removal anywhere after the add.
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["data"]["changes"]["removedPrincipalId"], early.0, "{ev}");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["data"]["changes"]["archived"], true, "{ev}");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["data"]["changes"]["archived"], false, "{ev}");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "members": true,
+                    "addedPrincipalId": late.0,
+                    "memberCount": 2,
+                }
+            })
+        );
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
+
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert_eq!(members.len(), 2, "{members:?}");
+        let late_row = members
+            .iter()
+            .find(|m| m.principal_id == late)
+            .expect("late guest seated");
+        assert_eq!(late_row.role, WorkspaceRole::Collaborator);
+        assert!(members.iter().all(|m| m.principal_id != early));
+    }
+
+    /// Post-commit tail fence (PR #2066 review, round 2): the archive's
+    /// detached tail is parked INSIDE its fenced window — guest sweep
+    /// committed, the guest's stale queued message dropped, its removal
+    /// delta out, fence still held. A concurrent `unarchive` cannot flip
+    /// until the fence releases (it stays pending), and `members.add`
+    /// refuses while archived — so the tail can never drop a message queued
+    /// by a re-seated member nor announce the removal of a current one. Once
+    /// released, the unarchive + re-add + fresh enqueue proceed and the
+    /// stream is: removal, unarchive, add — with NO stale `archived: true`
+    /// after the `archived: false` (the tail re-reads under the fence and
+    /// skips its lifecycle delta once the row was unarchived), and the fresh
+    /// message survives.
+    #[intent_test_macros::daemon_test]
+    async fn archive_tail_fence_orders_unarchive_and_readd_behind_the_guest_drop() {
+        use intent_core::{InviteErrorKind, MessageOrigin, WorkspaceApi, WorkspaceRole};
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let mut h = harness().await;
+        h.services = h.services.clone().with_archive_tail_park(park.clone());
+        let guest = seat_collaborator(&h, "guest").await;
+        h.store
+            .insert_principal_credential(&guest, &crate::invite_ops::hash_secret("guest-token"))
+            .await
+            .expect("guest credential");
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&auto_unarchive_session(&agent_id, &h.ws, "Builder"))
+            .await
+            .expect("session");
+        let stamp = json!({ "fromPrincipalId": guest.0 });
+        h.services.enqueue_message(
+            &agent_id,
+            "stale".into(),
+            None,
+            None,
+            Some(stamp.clone()),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+
+        let mut sub = subscribe(&h);
+        let archive = intent_core::spawn_daemon({
+            let svc = h.services.clone();
+            let ws = h.ws.clone();
+            async move { svc.archive_workspace(ws, None).await }
+        });
+        park.entered.notified().await;
+
+        // Inside the window: the sweep committed and the guest's stale
+        // message is gone, but the fence is still held.
+        assert!(
+            h.store.get_workspace(&h.ws).await.expect("row").archived,
+            "sweep committed before the park"
+        );
+        assert!(
+            h.services.queue_snapshot(&agent_id).is_empty(),
+            "the detached guest's queued message is dropped before the fence releases"
+        );
+        let mut unarchive = intent_core::spawn_daemon({
+            let svc = h.services.clone();
+            let ws = h.ws.clone();
+            async move { svc.unarchive_workspace(ws).await }
+        });
+        let pending = tokio::time::timeout(Duration::from_millis(200), &mut unarchive).await;
+        assert!(
+            pending.is_err(),
+            "unarchive must stay fenced behind the archive tail"
+        );
+        let refused = h
+            .services
+            .workspace_members_add_op(&h.ws, &guest)
+            .await
+            .expect_err("re-add inside the window is refused");
+        assert!(
+            matches!(
+                refused,
+                intent_core::Error::Invite(InviteErrorKind::WorkspaceArchived)
+            ),
+            "{refused:?}"
+        );
+
+        park.release.notify_one();
+        unarchive
+            .await
+            .expect("unarchive task")
+            .expect("unarchive after the fence releases");
+        let added = h
+            .services
+            .workspace_members_add_op(&h.ws, &guest)
+            .await
+            .expect("re-add after unarchive");
+        assert_eq!(added["added"], json!(true));
+        h.services.enqueue_message(
+            &agent_id,
+            "fresh".into(),
+            None,
+            None,
+            Some(stamp),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        let ws = archive
+            .await
+            .expect("archive task")
+            .expect("archive succeeds");
+        assert!(
+            ws.archived,
+            "the archive call reports the state it committed"
+        );
+
+        // The re-seated guest's fresh message survives the tail.
+        let queued = h.services.queue_snapshot(&agent_id);
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0]["content"], "fresh");
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        let seat = members
+            .iter()
+            .find(|m| m.principal_id == guest)
+            .expect("guest re-seated");
+        assert_eq!(seat.role, WorkspaceRole::Collaborator);
+        assert!(!h.store.get_workspace(&h.ws).await.expect("row").archived);
+
+        // Workspace lifecycle/membership deltas in order: the removal (inside
+        // the fence), then the unarchive, then the re-add. The tail's
+        // `archived: true` is skipped because the row was unarchived before
+        // its fenced re-read — no stale archived delta after the unarchive.
+        let mut lifecycle = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while lifecycle.len() < 3 {
+            let batch = tokio::time::timeout_at(deadline, sub.recv())
+                .await
+                .expect("workspace deltas delivered")
+                .expect("subscription open");
+            for ev in batch {
+                let ev = serde_json::to_value(&ev).expect("serialize event");
+                if ev["type"] == "workspace:updated"
+                    && ev["data"]["changes"].get("lastActivity").is_none()
+                {
+                    lifecycle.push(ev["data"]["changes"].clone());
+                }
+            }
+        }
+        assert_eq!(lifecycle[0]["removedPrincipalId"], guest.0, "{lifecycle:?}");
+        assert_eq!(lifecycle[1]["archived"], false, "{lifecycle:?}");
+        assert_eq!(lifecycle[2]["addedPrincipalId"], guest.0, "{lifecycle:?}");
+        let quiet = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let batch = sub.recv().await.expect("subscription open");
+                for ev in batch {
+                    let ev = serde_json::to_value(&ev).expect("serialize event");
+                    if ev["type"] == "workspace:updated"
+                        && ev["data"]["changes"].get("archived").is_some()
+                    {
+                        return ev;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            quiet.is_err(),
+            "stale archived delta after unarchive: {quiet:?}"
+        );
+    }
+
+    /// Post-commit, PRE-drop barrier (PR #2066 review, round 3): the
+    /// archive's detached tail is parked right after the guest sweep
+    /// committed and BEFORE the detached guest's queued message is dropped
+    /// (fence held, nothing announced yet). A generic `workspace.update {
+    /// archived: false, status: Active }` — the lifecycle bypass — must not
+    /// flip the row inside that window: it delegates to the fenced unarchive
+    /// and stays pending, `members.add` still refuses, so the tail cannot
+    /// drop a message a re-seated member queued nor announce the removal of
+    /// a current one. Once released: removal, then `archived: false`, then
+    /// the re-add; the fresh message and the new seat survive, and no
+    /// `archived: true` trails the unarchive.
+    #[intent_test_macros::daemon_test]
+    async fn archive_predrop_barrier_fences_workspace_update_unarchive_and_readd() {
+        use intent_core::{
+            InviteErrorKind, MessageOrigin, WorkspaceApi, WorkspaceRole, WorkspaceStatus,
+            WorkspaceUpdate,
+        };
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let mut h = harness().await;
+        h.services = h.services.clone().with_archive_predrop_park(park.clone());
+        let guest = seat_collaborator(&h, "guest").await;
+        h.store
+            .insert_principal_credential(&guest, &crate::invite_ops::hash_secret("guest-token"))
+            .await
+            .expect("guest credential");
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&auto_unarchive_session(&agent_id, &h.ws, "Builder"))
+            .await
+            .expect("session");
+        let stamp = json!({ "fromPrincipalId": guest.0 });
+        h.services.enqueue_message(
+            &agent_id,
+            "stale".into(),
+            None,
+            None,
+            Some(stamp.clone()),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+
+        let mut sub = subscribe(&h);
+        let archive = intent_core::spawn_daemon({
+            let svc = h.services.clone();
+            let ws = h.ws.clone();
+            async move { svc.archive_workspace(ws, None).await }
+        });
+        park.entered.notified().await;
+
+        // Inside the window: committed, but the stale message is NOT dropped
+        // yet and nothing has been announced.
+        assert!(
+            h.store.get_workspace(&h.ws).await.expect("row").archived,
+            "sweep committed before the park"
+        );
+        assert_eq!(
+            h.services.queue_snapshot(&agent_id).len(),
+            1,
+            "the guest's queued message is still pending inside the pre-drop window"
+        );
+        let mut update = intent_core::spawn_daemon({
+            let svc = h.services.clone();
+            let ws = h.ws.clone();
+            async move {
+                svc.update_workspace(
+                    ws,
+                    WorkspaceUpdate {
+                        archived: Some(false),
+                        status: Some(WorkspaceStatus::Active),
+                        title: Some("renamed while archiving".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }
+        });
+        let pending = tokio::time::timeout(Duration::from_millis(200), &mut update).await;
+        assert!(
+            pending.is_err(),
+            "workspace.update {{ archived: false }} must stay fenced behind the archive tail"
+        );
+        let row = h.store.get_workspace(&h.ws).await.expect("row");
+        assert!(row.archived, "the generic write never flips archived");
+        assert_eq!(row.status, WorkspaceStatus::Archived);
+        assert_eq!(
+            row.title, "renamed while archiving",
+            "the card part of the update lands without waiting on the fence"
+        );
+        let refused = h
+            .services
+            .workspace_members_add_op(&h.ws, &guest)
+            .await
+            .expect_err("re-add inside the window is refused");
+        assert!(
+            matches!(
+                refused,
+                intent_core::Error::Invite(InviteErrorKind::WorkspaceArchived)
+            ),
+            "{refused:?}"
+        );
+
+        park.release.notify_one();
+        let updated = update
+            .await
+            .expect("update task")
+            .expect("update after the fence releases");
+        assert!(!updated.archived);
+        assert_eq!(updated.status, WorkspaceStatus::Active);
+        assert!(updated.archived_at.is_none());
+        let added = h
+            .services
+            .workspace_members_add_op(&h.ws, &guest)
+            .await
+            .expect("re-add after unarchive");
+        assert_eq!(added["added"], json!(true));
+        h.services.enqueue_message(
+            &agent_id,
+            "fresh".into(),
+            None,
+            None,
+            Some(stamp),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        archive
+            .await
+            .expect("archive task")
+            .expect("archive succeeds");
+
+        // The stale message was dropped by the tail; the re-seated guest's
+        // fresh message and the new seat survive it.
+        let queued = h.services.queue_snapshot(&agent_id);
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0]["content"], "fresh");
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        let seat = members
+            .iter()
+            .find(|m| m.principal_id == guest)
+            .expect("guest re-seated");
+        assert_eq!(seat.role, WorkspaceRole::Collaborator);
+        let row = h.store.get_workspace(&h.ws).await.expect("row");
+        assert!(!row.archived);
+        assert_eq!(row.status, WorkspaceStatus::Active);
+
+        // Lifecycle/membership deltas in order: removal (inside the fence),
+        // the unarchive, the re-add — and no `archived: true` afterwards.
+        let mut lifecycle = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while lifecycle.len() < 3 {
+            let batch = tokio::time::timeout_at(deadline, sub.recv())
+                .await
+                .expect("workspace deltas delivered")
+                .expect("subscription open");
+            for ev in batch {
+                let ev = serde_json::to_value(&ev).expect("serialize event");
+                if ev["type"] == "workspace:updated"
+                    && ev["data"]["changes"].get("lastActivity").is_none()
+                    && ev["data"]["changes"].get("title").is_none()
+                {
+                    lifecycle.push(ev["data"]["changes"].clone());
+                }
+            }
+        }
+        assert_eq!(lifecycle[0]["removedPrincipalId"], guest.0, "{lifecycle:?}");
+        assert_eq!(lifecycle[1]["archived"], false, "{lifecycle:?}");
+        assert_eq!(lifecycle[2]["addedPrincipalId"], guest.0, "{lifecycle:?}");
+        let quiet = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let batch = sub.recv().await.expect("subscription open");
+                for ev in batch {
+                    let ev = serde_json::to_value(&ev).expect("serialize event");
+                    if ev["type"] == "workspace:updated"
+                        && ev["data"]["changes"].get("archived").is_some()
+                    {
+                        return ev;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            quiet.is_err(),
+            "stale archived delta after unarchive: {quiet:?}"
+        );
+    }
+
+    /// Post-commit, PRE-drop barrier, stale card-only writer (PR #2066
+    /// review, round 3): a full-row snapshot read BEFORE the archive and a
+    /// generic `workspace.update { statusMessage }` inside the pre-drop
+    /// window neither revert the archived row nor need the fence — the
+    /// generic write never touches the lifecycle columns. So the guards
+    /// keep holding (`members.add` still refused), the tail still drops the
+    /// guest's stale message and announces the removal, the archive's own
+    /// `archived: true` still goes out (the row is still archived at its
+    /// fenced re-read), and no `archived: false` ever appears.
+    #[intent_test_macros::daemon_test]
+    async fn archive_predrop_barrier_survives_stale_card_only_updates() {
+        use intent_core::{
+            InviteErrorKind, MessageOrigin, WorkspaceApi, WorkspaceStatus, WorkspaceUpdate,
+        };
+        use std::sync::Arc;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let mut h = harness().await;
+        h.services = h.services.clone().with_archive_predrop_park(park.clone());
+        let guest = seat_collaborator(&h, "guest").await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&auto_unarchive_session(&agent_id, &h.ws, "Builder"))
+            .await
+            .expect("session");
+        h.services.enqueue_message(
+            &agent_id,
+            "stale".into(),
+            None,
+            None,
+            Some(json!({ "fromPrincipalId": guest.0 })),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        // A full-row snapshot taken before the archive — the shape a
+        // `workspace.update` whose read predated the archive writes back.
+        let mut stale = h.store.get_workspace(&h.ws).await.expect("snapshot");
+        assert!(!stale.archived);
+
+        let mut sub = subscribe(&h);
+        let archive = intent_core::spawn_daemon({
+            let svc = h.services.clone();
+            let ws = h.ws.clone();
+            async move { svc.archive_workspace(ws, None).await }
+        });
+        park.entered.notified().await;
+
+        // Inside the window: the stale full-row write and a card-only
+        // update both complete without the fence and leave the row archived.
+        stale.title = "stale title".to_string();
+        stale.updated_at = intent_core::now_iso();
+        h.store
+            .update_workspace(&stale)
+            .await
+            .expect("stale full-row write");
+        let card = tokio::time::timeout(
+            Duration::from_secs(2),
+            h.services.update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    status_message: Some("card only".to_string()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("card-only update is not fenced")
+        .expect("card-only update");
+        assert!(card.archived, "{card:?}");
+        assert_eq!(card.status, WorkspaceStatus::Archived);
+        assert_eq!(card.title, "stale title");
+        assert_eq!(card.status_message.as_deref(), Some("card only"));
+        let row = h.store.get_workspace(&h.ws).await.expect("row");
+        assert!(row.archived, "stale writes must not resurrect the row");
+        assert_eq!(row.status, WorkspaceStatus::Archived);
+        assert!(row.archived_at.is_some());
+        let refused = h
+            .services
+            .workspace_members_add_op(&h.ws, &guest)
+            .await
+            .expect_err("re-add stays refused");
+        assert!(
+            matches!(
+                refused,
+                intent_core::Error::Invite(InviteErrorKind::WorkspaceArchived)
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(h.services.queue_snapshot(&agent_id).len(), 1);
+
+        park.release.notify_one();
+        let archived = archive
+            .await
+            .expect("archive task")
+            .expect("archive succeeds");
+        assert!(archived.archived);
+        assert!(
+            h.services.queue_snapshot(&agent_id).is_empty(),
+            "the detached guest's stale message is dropped by the tail"
+        );
+        let members = h
+            .store
+            .list_workspace_members(&h.ws)
+            .await
+            .expect("members");
+        assert!(members.iter().all(|m| m.principal_id != guest));
+
+        // Deltas: the card update, the removal, then the archive's own
+        // `archived: true`; never an `archived: false`.
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !seen
+            .iter()
+            .any(|c: &serde_json::Value| c["archived"] == json!(true))
+        {
+            let batch = tokio::time::timeout_at(deadline, sub.recv())
+                .await
+                .expect("workspace deltas delivered")
+                .expect("subscription open");
+            for ev in batch {
+                let ev = serde_json::to_value(&ev).expect("serialize event");
+                if ev["type"] == "workspace:updated"
+                    && ev["data"]["changes"].get("lastActivity").is_none()
+                {
+                    seen.push(ev["data"]["changes"].clone());
+                }
+            }
+        }
+        let removal = seen
+            .iter()
+            .position(|c| c["removedPrincipalId"] == guest.0)
+            .expect("removal delta");
+        let archived_delta = seen
+            .iter()
+            .position(|c| c["archived"] == json!(true))
+            .expect("archived delta");
+        assert!(removal < archived_delta, "{seen:?}");
+        assert!(
+            seen.iter().all(|c| c["archived"] != json!(false)),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|c| c["statusMessage"] == json!("card only")),
+            "{seen:?}"
+        );
+    }
+
     /// Symmetric to archive: `unarchive_workspace` emits one `workspace:updated`
     /// carrying the full applied delta with an explicit `archivedAt: null` so
     /// clients clear the field (Audit D C3).
     #[intent_test_macros::daemon_test]
     async fn unarchive_workspace_emits_workspace_updated_once() {
-        use intent_core::{WorkspaceApi, WorkspaceStatus};
+        use intent_core::WorkspaceApi;
         let h = harness().await;
         // Seed the row as archived so unarchive has a real state to flip.
-        let mut ws = workspace(&h.ws);
-        ws.status = WorkspaceStatus::Archived;
-        ws.archived = true;
-        ws.archived_at = Some(intent_core::now_iso());
-        h.store.update_workspace(&ws).await.expect("archive row");
+        h.store
+            .archive_workspace_detaching_guests(&h.ws, &intent_core::now_iso())
+            .await
+            .expect("archive row");
         let mut sub = subscribe(&h);
         h.services
             .unarchive_workspace(h.ws.clone())
@@ -11871,11 +13373,10 @@ mod change_event_parity {
     async fn auto_unarchive_on_turn_start_emits_stamped_delta() {
         use intent_core::WorkspaceStatus;
         let h = harness().await;
-        let mut ws = workspace(&h.ws);
-        ws.status = WorkspaceStatus::Archived;
-        ws.archived = true;
-        ws.archived_at = Some(intent_core::now_iso());
-        h.store.update_workspace(&ws).await.expect("archive row");
+        h.store
+            .archive_workspace_detaching_guests(&h.ws, &intent_core::now_iso())
+            .await
+            .expect("archive row");
         let agent_id = AgentId::from("agent-auto-unarchive");
         h.store
             .insert_agent_session(&auto_unarchive_session(&agent_id, &h.ws, "Builder"))
@@ -12026,13 +13527,11 @@ mod change_event_parity {
     /// `agentName: null` in the stamp.
     #[tokio::test]
     async fn auto_unarchive_stamps_null_name_when_session_missing() {
-        use intent_core::WorkspaceStatus;
         let h = harness().await;
-        let mut ws = workspace(&h.ws);
-        ws.status = WorkspaceStatus::Archived;
-        ws.archived = true;
-        ws.archived_at = Some(intent_core::now_iso());
-        h.store.update_workspace(&ws).await.expect("archive row");
+        h.store
+            .archive_workspace_detaching_guests(&h.ws, &intent_core::now_iso())
+            .await
+            .expect("archive row");
         let agent_id = AgentId::from("agent-no-row");
         let mut sub = subscribe(&h);
         let flipped = h
@@ -12775,7 +14274,7 @@ mod change_event_parity {
         use intent_core::WorkspaceCreate;
         let h = harness().await;
         let mut sub = h.bus.subscribe(SubscriptionFilter::default());
-        let created = h
+        let mut created = h
             .services
             .create_workspace(
                 WorkspaceCreate {
@@ -12791,6 +14290,15 @@ mod change_event_parity {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &created.id.0, "workspace:created");
         assert_eq!(ev["data"]["workspaceId"], created.id.0);
+        // The response carries this caller's capabilities. The shared event
+        // must not broadcast the creator's role or management rights.
+        assert!(
+            created
+                .membership
+                .take()
+                .expect("caller membership")
+                .can_manage
+        );
         assert_eq!(
             ev["data"]["workspace"],
             serde_json::to_value(&created).expect("workspace json")
@@ -13725,6 +15233,8 @@ mod change_event_parity {
             content: "hi".to_string(),
             author: "user".to_string(),
             author_type: AuthorType::User,
+            author_principal_id: None,
+            author_identity: None,
             status: CommentStatus::Open,
             parent_id: None,
             anchor: Some(CommentAnchor {
@@ -16072,6 +17582,10 @@ mod drafts_events {
 // ============================================================================
 
 pub(crate) mod pr {
+    mod accept_member;
+    mod automatic_refresh;
+    mod discovery_http;
+
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -16167,6 +17681,12 @@ pub(crate) mod pr {
         /// PR numbers `get_pr` was called with, in call order (sweep
         /// stale-pool heal tests assert cap + ordering).
         seen_get_pr: std::sync::Mutex<Vec<u64>>,
+        /// Issue numbers `get_issue` was called with, in call order (the
+        /// issue cache tests assert a hit costs no forge read).
+        seen_get_issue: std::sync::Mutex<Vec<u64>>,
+        /// Issue number whose `get_issue` fails with `NotFound`, exercising
+        /// the issue cache's never-cache-errors rule.
+        missing_issue: Option<u64>,
         /// When true, `get_pr` and `list_prs` fail with `RateLimited`
         /// (exhausted GitHub core quota, monorepo#2961), exercising the
         /// global sweep pause.
@@ -16228,10 +17748,36 @@ pub(crate) mod pr {
         /// (`add_permits(1)`): the caller proves the read it triggered from
         /// returned while `GET /user` was still in flight.
         pub(crate) get_user_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+        /// When set, the FIRST `get_pr` signals `entered` and holds until
+        /// `release` is notified, so a test can land a concurrent
+        /// signal-bearing fold while a REST refresh's read is in flight
+        /// (intent-hq/intent#5654).
+        pub(crate) get_pr_park: Option<std::sync::Arc<GetPrPark>>,
+        get_pr_error: Option<fn() -> ScError>,
+        create_pr_error: Option<fn() -> ScError>,
+        create_pr_calls: std::sync::atomic::AtomicU64,
+    }
+
+    /// One-shot park for [`StubForge::get_pr`]: `entered` fires when the
+    /// held read begins, `release` lets it return.
+    #[derive(Default)]
+    pub(crate) struct GetPrPark {
+        claimed: std::sync::atomic::AtomicBool,
+        pub(crate) entered: tokio::sync::Notify,
+        pub(crate) release: tokio::sync::Notify,
     }
 
     impl StubForge {
-        /// A forge whose `check_auth` reports `authenticated: false`.
+        pub(crate) fn with_get_pr_error(error: fn() -> ScError) -> Self {
+            Self {
+                get_pr_error: Some(error),
+                ..Default::default()
+            }
+        }
+
+        /// A forge whose `check_auth` reports `authenticated: false` and
+        /// whose `get_user` rejects the credential (`Auth`), as the real
+        /// client does on a 401.
         pub(crate) fn unauthenticated() -> Self {
             Self {
                 unauthenticated: true,
@@ -16322,6 +17868,9 @@ pub(crate) mod pr {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(gate) = &self.get_user_gate {
                 gate.acquire().await.expect("gate open").forget();
+            }
+            if self.unauthenticated {
+                return Err(ScError::Auth("Bad credentials".into()));
             }
             Ok(UserIdentity {
                 login: "octocat".into(),
@@ -16472,6 +18021,11 @@ pub(crate) mod pr {
             Ok(self.file_content.clone())
         }
         async fn create_pr(&self, _: &RepoRef, input: NewPullRequest) -> ScResult<PullRequest> {
+            self.create_pr_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(error) = self.create_pr_error {
+                return Err(error());
+            }
             Ok(PullRequest {
                 number: 7,
                 url: "https://github.com/o/r/pull/7".into(),
@@ -16499,6 +18053,9 @@ pub(crate) mod pr {
         }
         async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
             self.seen_get_pr.lock().unwrap().push(number);
+            if let Some(error) = self.get_pr_error {
+                return Err(error());
+            }
             if self.rate_limited {
                 return Err(ScError::RateLimited(
                     "API rate limit exceeded for user ID 526899.".into(),
@@ -16507,6 +18064,12 @@ pub(crate) mod pr {
             if self.hang_get_pr == Some(number) {
                 // A TCP connection that went dark: the future never resolves.
                 std::future::pending::<()>().await;
+            }
+            if let Some(park) = &self.get_pr_park {
+                if !park.claimed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    park.entered.notify_one();
+                    park.release.notified().await;
+                }
             }
             if self.missing_pr == Some(number) {
                 return Err(ScError::NotFound("no such PR".into()));
@@ -16834,6 +18397,15 @@ pub(crate) mod pr {
             unimplemented!()
         }
         async fn get_issue(&self, _: &RepoRef, number: u64) -> ScResult<Issue> {
+            self.seen_get_issue.lock().unwrap().push(number);
+            if self.rate_limited {
+                return Err(ScError::RateLimited(
+                    "API rate limit exceeded for user ID 526899.".into(),
+                ));
+            }
+            if self.missing_issue == Some(number) {
+                return Err(ScError::NotFound("no such issue".into()));
+            }
             Ok(Issue {
                 number,
                 ..stub_issue()
@@ -16957,6 +18529,7 @@ pub(crate) mod pr {
                         started_at: None,
                     },
                 ],
+                checks_head_sha: None,
                 checks_known: true,
                 branch_rules: Some(BranchRules {
                     required_approving_review_count: Some(2),
@@ -17428,17 +19001,27 @@ pub(crate) mod pr {
         assert!(forge.seen_user_searches.lock().unwrap().is_empty());
     }
 
-    /// `github.users.search` is administrator-only: a collaborator wire
-    /// caller is refused `-32003` before the forge is reached (default-deny,
-    /// the method is not in `COLLABORATOR_METHODS`).
+    /// Shared forge search admits host members, but a known workspace guest
+    /// is refused before the forge is reached. Unknown principals also refuse.
     #[tokio::test]
     async fn github_users_search_refuses_collaborator_caller() {
         let forge = Arc::new(StubForge::default());
         let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
         let collaborator = intent_core::Caller::Wire {
             principal_id: intent_core::PrincipalId::new(),
-            is_administrator: false,
+            host_role: intent_core::HostRole::Guest,
         };
+        let unknown = intent_core::with_caller(
+            collaborator.clone(),
+            svc.github_users_search("octo".into(), None),
+        )
+        .await
+        .expect_err("unknown principal must be refused");
+        assert!(matches!(unknown, Error::NotFound(_)), "{unknown:?}");
+        let mut guest = svc.store.get_primary_principal().await.unwrap();
+        guest.id = collaborator.principal_id().unwrap().clone();
+        guest.is_primary = false;
+        svc.store.upsert_principal(&guest).await.unwrap();
         let err =
             intent_core::with_caller(collaborator, svc.github_users_search("octo".into(), None))
                 .await
@@ -17481,48 +19064,114 @@ pub(crate) mod pr {
         // invalid port-0 base uri would fail the test if `start_at` ran).
         let (_t, svc) = github_svc().await;
         let svc = svc.with_github_login_base_uri("http://127.0.0.1:0");
-        {
-            let mut slot = svc.github_auth_flow.lock().await;
-            *slot = Some(crate::github_auth_ops::FlowSlot {
-                flow_id: crate::github_auth_ops::next_flow_id(),
-                user_code: "WXYZ-9876".into(),
-                verification_uri: "https://github.com/login/device".into(),
-                interval: 5,
-                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
-                phase: crate::github_auth_ops::FlowPhase::Pending,
-            });
-        }
+        let seeded_wire_id = seed_pending_github_flow(&svc).await;
         let c = svc.github_connect().await.expect("connect");
         assert_eq!(c["ok"], true);
         assert_eq!(c["userCode"], "WXYZ-9876");
+        // The wire flowId is the resident slot's generation — and a further
+        // connect while the flow is live hands out the identical id.
+        let flow_id = c["flowId"]
+            .as_str()
+            .expect("flowId is a string")
+            .to_string();
+        assert_eq!(flow_id, seeded_wire_id);
+        let again = svc.github_connect().await.expect("connect again");
+        assert_eq!(again["flowId"], flow_id.as_str());
         // authStatus surfaces the pending flow and its verification uri.
         let v = svc.github_auth_status().await.expect("auth");
         assert_eq!(v["deviceFlow"]["status"], "pending");
         assert_eq!(v["oauthUrl"], "https://github.com/login/device");
     }
 
+    /// Seed a live pending slot and return its wire `flowId`.
+    async fn seed_pending_github_flow(svc: &Services) -> String {
+        let mut slot = svc.github_auth_flow.lock().await;
+        let seeded = crate::github_auth_ops::FlowSlot {
+            flow_id: crate::github_auth_ops::next_flow_id(),
+            user_code: "WXYZ-9876".into(),
+            verification_uri: "https://github.com/login/device".into(),
+            interval: 5,
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+            phase: crate::github_auth_ops::FlowPhase::Pending,
+        };
+        let id = seeded.wire_id();
+        *slot = Some(seeded);
+        id
+    }
+
     #[intent_test_macros::daemon_test]
     async fn github_cancel_auth_clears_the_pending_flow() {
+        // No `flowId` keeps the legacy behaviour: whichever flow is pending
+        // is cancelled.
         let (_t, svc) = github_svc().await;
-        {
-            let mut slot = svc.github_auth_flow.lock().await;
-            *slot = Some(crate::github_auth_ops::FlowSlot {
-                flow_id: crate::github_auth_ops::next_flow_id(),
-                user_code: "WXYZ-9876".into(),
-                verification_uri: "https://github.com/login/device".into(),
-                interval: 5,
-                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
-                phase: crate::github_auth_ops::FlowPhase::Pending,
-            });
-        }
-        let c = svc.github_cancel_auth().await.expect("cancel");
+        seed_pending_github_flow(&svc).await;
+        let c = svc.github_cancel_auth(None).await.expect("cancel");
         assert_eq!(c["ok"], true);
         assert_eq!(c["cancelled"], true);
         let v = svc.github_auth_status().await.expect("auth");
         assert_eq!(v["deviceFlow"], serde_json::Value::Null);
         // Cancelling again is an idempotent no-op.
-        let c = svc.github_cancel_auth().await.expect("cancel twice");
+        let c = svc.github_cancel_auth(None).await.expect("cancel twice");
         assert_eq!(c["ok"], true);
+        assert_eq!(c["cancelled"], false);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn github_cancel_auth_with_matching_flow_id_clears_the_pending_flow() {
+        let (_t, svc) = github_svc().await;
+        let flow_id = seed_pending_github_flow(&svc).await;
+        let c = svc
+            .github_cancel_auth(Some(flow_id.clone()))
+            .await
+            .expect("cancel");
+        assert_eq!(c["ok"], true);
+        assert_eq!(c["cancelled"], true);
+        let v = svc.github_auth_status().await.expect("auth");
+        assert_eq!(v["deviceFlow"], serde_json::Value::Null);
+        // The id is single-use: once its flow is gone it cancels nothing.
+        let c = svc
+            .github_cancel_auth(Some(flow_id))
+            .await
+            .expect("cancel twice");
+        assert_eq!(c["cancelled"], false);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn github_cancel_auth_with_stale_flow_id_leaves_the_newer_flow_pending() {
+        // A caller holding the id of an earlier flow (replaced by a newer
+        // connect) must not be able to cancel the flow it did not start.
+        let (_t, svc) = github_svc().await;
+        let stale = seed_pending_github_flow(&svc).await;
+        let current = seed_pending_github_flow(&svc).await;
+        assert_ne!(stale, current);
+        let c = svc
+            .github_cancel_auth(Some(stale))
+            .await
+            .expect("stale cancel");
+        assert_eq!(c["ok"], true);
+        assert_eq!(c["cancelled"], false);
+        // The newer flow is untouched and still reported as pending.
+        let v = svc.github_auth_status().await.expect("auth");
+        assert_eq!(v["deviceFlow"]["status"], "pending");
+        assert_eq!(v["deviceFlow"]["userCode"], "WXYZ-9876");
+        assert_eq!(
+            svc.github_auth_flow
+                .lock()
+                .await
+                .as_ref()
+                .map(crate::github_auth_ops::FlowSlot::wire_id),
+            Some(current.clone())
+        );
+        // Nothing pending at all: an id (stale or not) cancels nothing.
+        let c = svc
+            .github_cancel_auth(Some(current.clone()))
+            .await
+            .expect("cancel current");
+        assert_eq!(c["cancelled"], true);
+        let c = svc
+            .github_cancel_auth(Some(current))
+            .await
+            .expect("cancel with nothing pending");
         assert_eq!(c["cancelled"], false);
     }
 
@@ -17543,8 +19192,23 @@ pub(crate) mod pr {
                 phase: crate::github_auth_ops::FlowPhase::Denied,
             });
         }
-        let c = svc.github_cancel_auth().await.expect("cancel");
+        let c = svc.github_cancel_auth(None).await.expect("cancel");
         assert_eq!(c["ok"], true);
+        assert_eq!(c["cancelled"], false);
+        let v = svc.github_auth_status().await.expect("auth");
+        assert_eq!(v["deviceFlow"]["status"], "denied");
+        // Even the terminal slot's own id does not make it cancellable.
+        let denied_id = svc
+            .github_auth_flow
+            .lock()
+            .await
+            .as_ref()
+            .map(crate::github_auth_ops::FlowSlot::wire_id)
+            .expect("slot kept");
+        let c = svc
+            .github_cancel_auth(Some(denied_id))
+            .await
+            .expect("cancel by id");
         assert_eq!(c["cancelled"], false);
         let v = svc.github_auth_status().await.expect("auth");
         assert_eq!(v["deviceFlow"]["status"], "denied");
@@ -17677,6 +19341,46 @@ pub(crate) mod pr {
         base
     }
 
+    /// Loopback GitHub API stub whose quota is exhausted: every request is
+    /// answered `403` with GitHub's primary rate-limit body (no
+    /// `X-OAuth-Scopes`), so the identity-proof preflight `GET /user` hits
+    /// the limit before any gist is touched.
+    async fn spawn_rate_limited_api() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let body = r#"{"message":"API rate limit exceeded for user ID 1.","documentation_url":"https://docs.github.com/rest/overview/rate-limits-for-the-rest-api"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        base
+    }
+
     #[intent_test_macros::daemon_test]
     async fn github_identity_proof_create_without_a_stored_token_is_not_connected() {
         let (_t, svc) = github_svc().await;
@@ -17763,6 +19467,43 @@ pub(crate) mod pr {
         assert_eq!(err.code(), -32603);
     }
 
+    /// A GitHub rate limit hit on the identity-proof preflight (here an
+    /// exhausted primary quota; any cause classified as `RateLimited` maps
+    /// the same way) surfaces as `Error::RateLimited` (`-32603`, wire
+    /// `data.code = "rate-limited"`) on create and delete alike — never
+    /// `github-not-connected`, whose sign-in remedy would not help
+    /// (intent-hq/intent#5627).
+    #[intent_test_macros::daemon_test]
+    async fn github_identity_proof_under_an_exhausted_quota_is_rate_limited_not_not_connected() {
+        let (_t, svc) = github_svc().await;
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_stored")
+            .expect("seed token");
+        let base = spawn_rate_limited_api().await;
+        let svc = svc.with_secret_store(mem).with_github_api_base_uri(base);
+
+        let err = svc
+            .github_identity_proof_create("nonce-1".into(), "Studio".into())
+            .await
+            .expect_err("rate limited create");
+        assert!(
+            matches!(&err, intent_core::Error::RateLimited(msg) if msg.contains("rate limit")),
+            "create: {err:?}"
+        );
+        assert_eq!(err.code(), -32603);
+        assert!(err.to_string().starts_with("source control rate limited: "));
+
+        let err = svc
+            .github_identity_proof_delete("g1".into())
+            .await
+            .expect_err("rate limited delete");
+        assert!(
+            matches!(&err, intent_core::Error::RateLimited(msg) if msg.contains("rate limit")),
+            "delete: {err:?}"
+        );
+        assert_eq!(err.code(), -32603);
+    }
+
     #[intent_test_macros::daemon_test]
     async fn github_identity_proof_create_against_a_dead_host_is_unreachable() {
         let (_t, svc) = github_svc().await;
@@ -17803,9 +19544,57 @@ pub(crate) mod pr {
 
     // ---- ws.pr.snapshot engine (`pr_state`, MCP-only) --------------------
 
+    /// Actual local Git facts for implicit GitHub snapshot routing. Kept local
+    /// to this family so unrelated forge/metadata fixtures remain unchanged.
+    async fn snapshot_git_root(svc: &Services, id: &WorkspaceId) -> tempfile::TempDir {
+        let dir = test_tempdir("snapshot-github-root-");
+        {
+            let repo = git2::Repository::init(dir.path()).unwrap();
+            repo.remote("origin", "https://github.com/o/r").unwrap();
+        }
+        let mut ws = svc.store().get_workspace(id).await.unwrap();
+        ws.worktree_path = Some(dir.path().to_string_lossy().into_owned());
+        svc.store().update_workspace(&ws).await.unwrap();
+        // Make a fresh explicit fixture choice after root setup; current Git
+        // is not evidence of a migrated historical selection.
+        let root = intent_core::RepositoryRootId {
+            workspace_id: id.clone(),
+            kind: intent_core::RepositoryRootKind::Primary,
+        };
+        let original = svc
+            .store()
+            .repository_selection_snapshot(&root)
+            .await
+            .unwrap();
+        let result = svc
+            .store()
+            .write_repository_selection(
+                &original,
+                intent_store::RepositorySelectionChange::Automatic,
+            )
+            .await;
+        assert!(matches!(
+            result.result.unwrap(),
+            intent_store::RepositorySelectionWriteResult::Applied(_)
+        ));
+        let stored = svc
+            .store()
+            .repository_selection_snapshot(&root)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.selection(),
+            Some(&intent_store::RepositoryStoredSelection::Saved(
+                intent_core::SavedReviewSelection::Automatic
+            ))
+        );
+        dir
+    }
+
     #[intent_test_macros::daemon_test]
     async fn state_snapshot_shape_and_counts() {
         let (_t, svc, ws) = setup(false, true).await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["repo"], "o/r");
         assert_eq!(v["prNumber"], 42);
@@ -17856,6 +19645,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
@@ -17874,6 +19664,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeable"], false);
         assert_eq!(v["mergeableState"], "dirty");
@@ -17891,6 +19682,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["state"], "merged");
         assert_eq!(v["isMerged"], true);
@@ -17916,6 +19708,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeableState"], "blocked");
         assert_eq!(v["reviews"]["decision"], "none");
@@ -17937,6 +19730,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeableState"], "clean");
         assert_eq!(v["reviews"]["decision"], "review_required");
@@ -17955,6 +19749,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["reviews"]["decision"], "approved");
         assert_eq!(v["reviews"]["approvals"], 1);
@@ -17970,17 +19765,18 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let err = svc.pr_state(ws, 999, None).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found in o/r")));
     }
 
     #[intent_test_macros::daemon_test]
-    async fn state_snapshot_requires_workspace_repo() {
-        // No repository on the workspace: same "No active PR" guard as the
-        // other pr.* methods (the required prNumber does not bypass it).
+    async fn state_snapshot_unknown_root_uses_fixed_discovery_refusal() {
+        // An absent original Git root cannot infer a provider from metadata or
+        // expose new discovery details through the snapshot error.
         let (_t, svc, ws) = setup(false, false).await;
         let err = svc.pr_state(ws, 42, None).await.unwrap_err();
-        assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+        assert!(matches!(err, Error::Forbidden(m) if m == crate::repository_read_source::REFUSAL));
     }
 
     #[intent_test_macros::daemon_test]
@@ -18010,8 +19806,9 @@ pub(crate) mod pr {
         // Gate open at the start, paused by the last forge read.
         let gate = svc.sweep_rate_limit.clone();
         *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
-            assert!(gate.pause_for(std::time::Duration::from_secs(3600)));
+            assert!(gate.pause_for(std::time::Duration::from_secs(3600), true));
         }));
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws.clone(), 42, None).await.expect("snapshot");
         let until = svc
             .sweep_rate_limit_paused_until()
@@ -18027,11 +19824,14 @@ pub(crate) mod pr {
             "pausedUntil is RFC 3339: {until}"
         );
 
-        // Gate paused at the start, lifted by the last forge read.
+        // Gate paused at the start, lifted by the last forge read — which
+        // only runs if the second snapshot MISSES the shared PR cache the
+        // first one seeded.
         let gate = svc.sweep_rate_limit.clone();
         *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
             assert!(gate.lift());
         }));
+        svc.backdate_pr_cache(svc.pr_cache_max_age() + std::time::Duration::from_secs(1));
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert!(
             svc.sweep_rate_limit_paused_until().is_none(),
@@ -18127,6 +19927,104 @@ pub(crate) mod pr {
             .await
             .unwrap();
         assert_eq!(evs2.len(), 1);
+    }
+
+    /// Linked workspace whose persisted pool holds the sample PR with the
+    /// given queue signal and no `activePullRequest`, so a refresh's
+    /// snapshot compare always writes; the forge parks its first `get_pr`.
+    async fn parked_refresh_setup(
+        signal: Option<bool>,
+    ) -> (TempDb, Services, WorkspaceId, Arc<GetPrPark>) {
+        let park = Arc::new(GetPrPark::default());
+        let forge = StubForge {
+            get_pr_park: Some(park.clone()),
+            ..Default::default()
+        };
+        let (t, svc, ws_id) = refresh_setup(forge, "feature", Some(42), false).await;
+        let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
+        ws.pull_requests = Some(vec![crate::pr_ops::build_pr_info_with_merge_queue(
+            &sample_pr(),
+            signal,
+        )]);
+        svc.store().update_workspace_pr_linkage(&ws).await.unwrap();
+        (t, svc, ws_id, park)
+    }
+
+    /// A REST refresh whose row read predates a signal-bearing fold must not
+    /// erase the enqueue the fold persisted (intent-hq/intent#5654): the
+    /// read is held in flight, the fold writes `Some(true)` on the same
+    /// head, and the refresh's persist re-derives the carry against the
+    /// row at write time instead of its stale snapshot.
+    #[tokio::test]
+    async fn rest_refresh_keeps_a_queue_signal_folded_while_its_read_was_in_flight() {
+        let (_t, svc, ws_id, park) = parked_refresh_setup(None).await;
+        let refresh = svc.refresh_workspace_pr(&ws_id);
+        let fold = async {
+            park.entered.notified().await;
+            svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(true), true)
+                .await
+                .expect("fold");
+            let mid = svc.store().get_workspace(&ws_id).await.unwrap();
+            assert_eq!(
+                mid.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+                Some(true),
+                "the fold landed while the REST read was held"
+            );
+            park.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(refresh, fold);
+        assert_eq!(outcome.expect("refresh"), crate::PrRefreshOutcome::Updated);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        let pooled = &after.pull_requests.as_ref().unwrap()[0];
+        assert_eq!(pooled.is_in_merge_queue, Some(true));
+        assert_eq!(
+            after
+                .active_pull_request
+                .as_ref()
+                .unwrap()
+                .is_in_merge_queue,
+            Some(true),
+            "activePullRequest mirrors the rebased pool entry"
+        );
+    }
+
+    /// The mirror image: the refresh's snapshot still carries `Some(true)`
+    /// when a fold observes the PR dequeued; the persist must not resurrect
+    /// the cleared signal from that snapshot (intent-hq/intent#5654).
+    #[tokio::test]
+    async fn rest_refresh_does_not_resurrect_a_queue_signal_a_fold_cleared_mid_read() {
+        let (_t, svc, ws_id, park) = parked_refresh_setup(Some(true)).await;
+        let refresh = svc.refresh_workspace_pr(&ws_id);
+        let fold = async {
+            park.entered.notified().await;
+            svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(false), true)
+                .await
+                .expect("fold");
+            let mid = svc.store().get_workspace(&ws_id).await.unwrap();
+            assert_eq!(
+                mid.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+                None,
+                "the fold cleared the signal while the REST read was held"
+            );
+            park.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(refresh, fold);
+        assert_eq!(outcome.expect("refresh"), crate::PrRefreshOutcome::Updated);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None
+        );
+        assert_eq!(
+            after
+                .active_pull_request
+                .as_ref()
+                .unwrap()
+                .is_in_merge_queue,
+            None
+        );
     }
 
     #[tokio::test]
@@ -18499,86 +20397,9 @@ pub(crate) mod pr {
     }
 
     #[tokio::test]
-    async fn sweep_skips_idle_workspace_between_full_ticks() {
-        // Sweep trimming (§7.7): a workspace with no recent activity is not
-        // refreshed on an in-between tick — only on every
-        // `SWEEP_IDLE_TICK_MULTIPLE`-th (full-sweep) tick.
-        let forge = StubForge {
-            discover: true,
-            ..Default::default()
-        };
-        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
-
-        // Age the workspace well past the active window.
-        let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
-        ws.updated_at =
-            intent_core::iso_minutes_ago(2 * crate::pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES);
-        ws.last_activity = None;
-        svc.store().update_workspace(&ws).await.unwrap();
-
-        // In-between tick: the idle workspace is skipped (no link, no event).
-        svc.refresh_all_workspace_prs(1).await;
-        let after = svc.store().get_workspace(&ws_id).await.unwrap();
-        assert_eq!(after.pr_number, None);
-        let evs = svc.store().events_by_workspace(&ws_id, 10).await.unwrap();
-        assert!(evs.is_empty());
-
-        // Full-sweep tick (multiple of SWEEP_IDLE_TICK_MULTIPLE): refreshed.
-        svc.refresh_all_workspace_prs(crate::pr_ops::SWEEP_IDLE_TICK_MULTIPLE)
-            .await;
-        let after = svc.store().get_workspace(&ws_id).await.unwrap();
-        assert_eq!(after.pr_number, Some(42));
-    }
-
-    #[test]
-    fn sweep_due_tiers_by_recency_and_tick() {
-        use crate::pr_ops::{sweep_due, SWEEP_ACTIVE_WINDOW_MINUTES, SWEEP_IDLE_TICK_MULTIPLE};
-        let cutoff_str = intent_core::iso_minutes_ago(SWEEP_ACTIVE_WINDOW_MINUTES);
-        let cutoff = intent_core::parse_iso(&cutoff_str);
-        assert!(cutoff.is_some());
-        let ws_id = WorkspaceId::new();
-
-        // Recently active (updated_at = now): due on every tick.
-        let active = workspace(&ws_id);
-        assert!(sweep_due(&active, cutoff, 1));
-
-        // Idle (updated_at past the window, no last_activity): due only on
-        // full-sweep ticks (multiples of SWEEP_IDLE_TICK_MULTIPLE, incl. 0).
-        let mut idle = workspace(&ws_id);
-        idle.updated_at = intent_core::iso_minutes_ago(2 * SWEEP_ACTIVE_WINDOW_MINUTES);
-        assert!(!sweep_due(&idle, cutoff, 1));
-        assert!(!sweep_due(&idle, cutoff, SWEEP_IDLE_TICK_MULTIPLE - 1));
-        assert!(sweep_due(&idle, cutoff, 0));
-        assert!(sweep_due(&idle, cutoff, SWEEP_IDLE_TICK_MULTIPLE));
-        assert!(sweep_due(&idle, cutoff, 3 * SWEEP_IDLE_TICK_MULTIPLE));
-
-        // Exact boundary: `ts == cutoff` counts as active (inclusive `>=`).
-        let mut boundary = workspace(&ws_id);
-        boundary.updated_at = cutoff_str.clone();
-        assert!(sweep_due(&boundary, cutoff, 1));
-
-        // A recent last_activity revives an otherwise-idle workspace.
-        let mut revived = idle.clone();
-        revived.last_activity = Some(now_iso());
-        assert!(sweep_due(&revived, cutoff, 1));
-
-        // Malformed timestamps fail open (count as active), on either field.
-        let mut malformed = idle.clone();
-        malformed.updated_at = "not-a-timestamp".to_string();
-        assert!(sweep_due(&malformed, cutoff, 1));
-        let mut malformed_la = idle.clone();
-        malformed_la.last_activity = Some(String::new());
-        assert!(sweep_due(&malformed_la, cutoff, 1));
-
-        // An unparseable cutoff fails open too.
-        assert!(sweep_due(&idle, None, 1));
-    }
-
-    #[tokio::test]
     async fn sweep_refreshes_recently_active_workspace_every_tick() {
-        // Sweep trimming (§7.7): a workspace active within the window is
-        // refreshed even on an in-between tick. `refresh_setup` seeds
-        // `updated_at = now`, i.e. inside `SWEEP_ACTIVE_WINDOW_MINUTES`.
+        // A workspace without a previous attempt is refreshed on its first
+        // sweep, irrespective of the loop tick number.
         let forge = StubForge {
             discover: true,
             ..Default::default()
@@ -19347,6 +21168,150 @@ pub(crate) mod pr {
         assert_eq!(issue["comments"], 0);
     }
 
+    /// `github.issues.get` reads through the issue cache under the PR
+    /// cache's `prCache.maxAgeSeconds`: the first read costs one `get_issue`,
+    /// a repeat within the window answers the identical JSON with no forge
+    /// call (case-variant addressing shares the entry), another issue is
+    /// another miss, and an entry aged past the window is re-fetched.
+    #[intent_test_macros::daemon_test]
+    async fn github_issues_get_is_served_from_the_issue_cache_within_max_age() {
+        let forge = Arc::new(StubForge::default());
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let svc = svc.with_pr_cache_max_age_seconds(60);
+
+        let first = svc
+            .github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(*forge.seen_get_issue.lock().unwrap(), vec![7]);
+        assert_eq!(svc.issue_cache_len(), 1);
+
+        let again = svc
+            .github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(again, first, "a hit answers the cached issue");
+        assert_eq!(
+            *forge.seen_get_issue.lock().unwrap(),
+            vec![7],
+            "a hit within max_age costs no forge request"
+        );
+
+        // The RepoRef identity is case-insensitive: the same slot is hit,
+        // while the DTO echoes the caller's addressing.
+        let folded = svc
+            .github_issues_get("O".into(), "R".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(*forge.seen_get_issue.lock().unwrap(), vec![7]);
+        assert_eq!(folded["issue"]["owner"], "O");
+        assert_eq!(folded["issue"]["number"], 7);
+
+        svc.github_issues_get("o".into(), "r".into(), 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            *forge.seen_get_issue.lock().unwrap(),
+            vec![7, 8],
+            "another issue is another miss"
+        );
+        assert_eq!(svc.issue_cache_len(), 2);
+
+        svc.backdate_issue_cache(std::time::Duration::from_secs(61));
+        svc.github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            *forge.seen_get_issue.lock().unwrap(),
+            vec![7, 8, 7],
+            "an entry older than max_age is re-fetched"
+        );
+    }
+
+    /// A failed `get_issue` propagates to the caller and stores nothing: the
+    /// next read reaches the forge again (a `NotFound`, then a rate-limit
+    /// error mapped to `Error::RateLimited`, neither poisons the cache).
+    #[intent_test_macros::daemon_test]
+    async fn github_issues_get_never_caches_errors() {
+        let forge = Arc::new(StubForge {
+            missing_issue: Some(404),
+            ..Default::default()
+        });
+        let (_t, svc, _ws) = setup_with_shared(forge.clone(), false).await;
+        let svc = svc.with_pr_cache_max_age_seconds(60);
+
+        for _ in 0..2 {
+            let err = svc
+                .github_issues_get("o".into(), "r".into(), 404)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Internal(_)), "{err:?}");
+        }
+        assert_eq!(*forge.seen_get_issue.lock().unwrap(), vec![404, 404]);
+        assert_eq!(svc.issue_cache_len(), 0, "a failed read is never cached");
+        assert!(!svc.issue_cached(&RepoRef::new("o", "r"), 404));
+
+        let quota = Arc::new(StubForge {
+            rate_limited: true,
+            ..Default::default()
+        });
+        let (_t2, svc2, _ws2) = setup_with_shared(quota.clone(), false).await;
+        let err = svc2
+            .github_issues_get("o".into(), "r".into(), 7)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::RateLimited(_)), "{err:?}");
+        assert_eq!(svc2.issue_cache_len(), 0);
+    }
+
+    /// Retention mirrors the PR cache's unmonitored policy: the map is
+    /// bounded by [`crate::issue_cache::ISSUE_CACHE_MAX_ENTRIES`] on every
+    /// write (oldest fetch evicted first), and an entry idle past
+    /// [`crate::issue_cache::ISSUE_CACHE_MAX_IDLE`] is dropped by the next
+    /// write.
+    #[intent_test_macros::daemon_test]
+    async fn the_issue_cache_is_bounded_and_expires_idle_entries_on_write() {
+        use crate::issue_cache::{ISSUE_CACHE_MAX_ENTRIES, ISSUE_CACHE_MAX_IDLE};
+        let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
+        let repo = RepoRef::new("o", "r");
+
+        let oldest = 1_000_u64;
+        svc.github_issues_get("o".into(), "r".into(), oldest)
+            .await
+            .unwrap();
+        svc.backdate_issue_cache(std::time::Duration::from_secs(30));
+        let overflow = 8;
+        for written in 1..=ISSUE_CACHE_MAX_ENTRIES + overflow {
+            let number = written as u64;
+            svc.github_issues_get("o".into(), "r".into(), number)
+                .await
+                .unwrap();
+            assert_eq!(
+                svc.issue_cache_len(),
+                (written + 1).min(ISSUE_CACHE_MAX_ENTRIES),
+                "bounded after write #{number}"
+            );
+        }
+        assert!(
+            !svc.issue_cached(&repo, oldest),
+            "the oldest fetch went first"
+        );
+        for number in 1..=overflow as u64 {
+            assert!(
+                !svc.issue_cached(&repo, number),
+                "#{number} was evicted in fetch order"
+            );
+        }
+        assert!(svc.issue_cached(&repo, (ISSUE_CACHE_MAX_ENTRIES + overflow) as u64));
+
+        svc.backdate_issue_cache(ISSUE_CACHE_MAX_IDLE + std::time::Duration::from_secs(1));
+        svc.github_issues_get("o".into(), "r".into(), oldest)
+            .await
+            .unwrap();
+        assert_eq!(svc.issue_cache_len(), 1, "only the fresh write survives");
+        assert!(svc.issue_cached(&repo, oldest));
+    }
+
     #[intent_test_macros::daemon_test]
     async fn github_issues_list_and_search_shapes() {
         let (_t, svc, _ws) = setup_with(StubForge::default(), false).await;
@@ -19529,7 +21494,8 @@ pub(crate) mod pr {
         std::fs::remove_dir_all(&gone_dir).unwrap();
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1, "{roots:?}");
@@ -19556,7 +21522,8 @@ pub(crate) mod pr {
 
         // Re-sweeping is idempotent: the tracked submodule is not re-upserted
         // (no `gitRoot:registered`/`gitRoot:updated` churn).
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
         let registered = svc
             .store()
             .events_by_type(&ws.id, "gitRoot:registered", 10)
@@ -19611,7 +21578,8 @@ pub(crate) mod pr {
             .unwrap();
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let a = svc
             .store()
@@ -19648,7 +21616,8 @@ pub(crate) mod pr {
             repo.commit(Some("HEAD"), &sig, &sig, "move", &tree, &[&parent])
                 .unwrap();
         }
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
         let a = svc
             .store()
             .get_workspace_git_root(&root_a.id)
@@ -19680,7 +21649,7 @@ pub(crate) mod pr {
         let root = sweep_root(&ws.id, &with_head.dir, None);
         svc.store().upsert_workspace_git_root(&root).await.unwrap();
 
-        svc.sweep_workspace_git_roots(&ws, None).await;
+        svc.sweep_workspace_git_roots(&ws, None, 60, true).await;
 
         let stamped = svc.store().get_workspace_git_root(&root.id).await.unwrap();
         assert_eq!(
@@ -19713,7 +21682,8 @@ pub(crate) mod pr {
 
         let (_t, svc, ws) = sweep_setup(&parent.dir).await;
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1, "{roots:?}");
@@ -19759,7 +21729,8 @@ pub(crate) mod pr {
         );
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         // Restore permissions so the tempdir can be cleaned up.
         std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -19790,7 +21761,8 @@ pub(crate) mod pr {
             discover: true,
             ..Default::default()
         });
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1);
@@ -19814,7 +21786,8 @@ pub(crate) mod pr {
         assert_eq!(updated[0].data["gitRoot"]["prNumber"], 42);
 
         // Identical forge state on the next sweep: no new event.
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
         let updated = svc
             .store()
             .events_by_type(&ws.id, "gitRoot:updated", 10)
@@ -19903,6 +21876,90 @@ pub(crate) mod pr {
         let merged = list.iter().find(|p| p.number == 42).expect("merged kept");
         assert_eq!(merged.status, intent_core::PullRequestStatus::Merged);
         assert!(list.iter().any(|p| p.number == 77));
+    }
+
+    /// Linked root (branch `feature` = the sample PR head) whose persisted
+    /// pool holds the sample PR with the given queue signal and no
+    /// `pr_status`, so the refresh always persists; the forge parks its
+    /// first `get_pr`.
+    async fn parked_root_setup(
+        signal: Option<bool>,
+    ) -> (
+        TempDb,
+        Services,
+        intent_core::Workspace,
+        intent_core::WorkspaceGitRoot,
+        Arc<GetPrPark>,
+        SweepRepo,
+        SweepRepo,
+    ) {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pull_requests = Some(vec![crate::pr_ops::build_pr_info_with_merge_queue(
+            &sample_pr(),
+            signal,
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        let park = Arc::new(GetPrPark::default());
+        (t, svc, ws, root, park, primary, secondary)
+    }
+
+    /// Git-root analogue of the workspace enqueue race: the root refresh's
+    /// snapshot predates a fold that enqueued the pooled PR; the persist
+    /// keeps the fold's `Some(true)` (intent-hq/intent#5654).
+    #[tokio::test]
+    async fn root_refresh_keeps_a_queue_signal_folded_while_its_read_was_in_flight() {
+        let (_t, svc, ws, root, park, _p, _s) = parked_root_setup(None).await;
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            get_pr_park: Some(park.clone()),
+            ..Default::default()
+        });
+        let refresh = svc.refresh_git_root_pr(root, &sc);
+        let fold = async {
+            park.entered.notified().await;
+            svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(true), true)
+                .await
+                .expect("fold");
+            park.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(refresh, fold);
+        assert_eq!(outcome.unwrap(), crate::PrRefreshOutcome::Updated);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let pooled = &roots[0].pull_requests.as_ref().unwrap()[0];
+        assert_eq!(pooled.number, 42);
+        assert_eq!(pooled.is_in_merge_queue, Some(true));
+    }
+
+    /// Git-root analogue of the workspace dequeue race: the snapshot still
+    /// carries `Some(true)` after a fold cleared it; the persist does not
+    /// resurrect it (intent-hq/intent#5654).
+    #[tokio::test]
+    async fn root_refresh_does_not_resurrect_a_queue_signal_a_fold_cleared_mid_read() {
+        let (_t, svc, ws, root, park, _p, _s) = parked_root_setup(Some(true)).await;
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            get_pr_park: Some(park.clone()),
+            ..Default::default()
+        });
+        let refresh = svc.refresh_git_root_pr(root, &sc);
+        let fold = async {
+            park.entered.notified().await;
+            svc.fold_served_pr(&RepoRef::new("o", "r"), &sample_pr(), Some(false), true)
+                .await
+                .expect("fold");
+            park.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(refresh, fold);
+        assert_eq!(outcome.unwrap(), crate::PrRefreshOutcome::Updated);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let pooled = &roots[0].pull_requests.as_ref().unwrap()[0];
+        assert_eq!(pooled.number, 42);
+        assert_eq!(pooled.is_in_merge_queue, None);
     }
 
     /// A spec-child task note in `status`, so it counts into the workspace's
@@ -20088,7 +22145,8 @@ pub(crate) mod pr {
             merged_linked: true,
             ..Default::default()
         });
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         let list = roots[0].pull_requests.as_ref().expect("pull_requests");
@@ -20397,6 +22455,19 @@ pub(crate) mod pr {
     async fn fold_setup(
         seed: impl FnOnce(&mut intent_core::Workspace),
     ) -> (TempDb, super::WorkspacesRoot, Services, WorkspaceId) {
+        let forge = Arc::new(StubForge {
+            merged_linked: true,
+            ..Default::default()
+        });
+        fold_setup_with(forge, seed).await
+    }
+
+    /// [`fold_setup`] over a caller-held `forge`, for tests that observe or
+    /// drive its calls directly.
+    async fn fold_setup_with(
+        forge: Arc<StubForge>,
+        seed: impl FnOnce(&mut intent_core::Workspace),
+    ) -> (TempDb, super::WorkspacesRoot, Services, WorkspaceId) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_id = WorkspaceId::new();
@@ -20415,10 +22486,7 @@ pub(crate) mod pr {
         let svc = Services::new(store)
             .with_event_bus(bus)
             .with_workspaces_root(wsroot.path().to_path_buf())
-            .with_source_control(Arc::new(StubForge {
-                merged_linked: true,
-                ..Default::default()
-            }));
+            .with_source_control(forge);
         (tmp, wsroot, svc, ws_id)
     }
 
@@ -20818,6 +22886,694 @@ pub(crate) mod pr {
         );
     }
 
+    /// Regression (intent-hq/intentd#2064 review, revised for
+    /// intent-hq/intent#5654): a concurrent fill landing between the read's
+    /// preflight cache miss and the shared path's authoritative lookup makes
+    /// that lookup a hit. The hover answers the concurrently stored record
+    /// with no forge request of its own — the cache contract — and, the hit
+    /// being a queue-signal projection, the served Merged status does NOT
+    /// fold (persisted Open stays Open, no `pr:updated`, no displayStatus
+    /// transition). A later read that fetches — the entry aged past
+    /// `max_age` — folds the record whole.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_hit_on_a_concurrent_fill_projects_nothing_but_the_queue_signal() {
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        let forge = Arc::new(StubForge {
+            merged_linked: true,
+            ..Default::default()
+        });
+        let open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
+        let (_t, _root, svc, ws_id) = fold_setup_with(forge.clone(), |ws| {
+            ws.pr_number = Some(42);
+            ws.pr_url = Some(open.url.clone());
+            ws.pr_status = Some(intent_core::PullRequestStatus::Open);
+            ws.active_pull_request = Some(open.clone());
+            ws.pull_requests = Some(vec![open.clone()]);
+        })
+        .await;
+        let svc = svc
+            .with_pr_cache_max_age_seconds(60)
+            .with_pr_read_park(park.clone());
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        let parked = intent_core::spawn_daemon({
+            let svc = svc.clone();
+            async move { svc.github_pulls_get("o".into(), "r".into(), 42).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("pulls.get reaches the miss→fetch window");
+        assert!(forge.seen_get_pr.lock().unwrap().is_empty());
+
+        // The concurrent fill (another on-demand reader or a sweep) stores
+        // #42 while the hover's read sits parked past its preflight miss.
+        crate::pr_monitor::read_pr_via(
+            forge.as_ref(),
+            &RepoRef::new("o", "r"),
+            42,
+            &svc.pr_cache,
+            crate::pr_monitor::PrReadPolicy::REFRESH,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("concurrent fill");
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+        park.release.notify_one();
+
+        let v = parked.await.expect("join").expect("pulls.get");
+        assert_eq!(v["pull"]["number"], 42);
+        assert_eq!(v["pull"]["merged"], true, "answers the concurrent fill");
+        assert_eq!(
+            *forge.seen_get_pr.lock().unwrap(),
+            vec![42],
+            "the parked read costs no forge request of its own"
+        );
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Open),
+            "a hit projects only the queue signal: a differing status does not fold"
+        );
+        assert_eq!(
+            after.pull_requests.as_ref().expect("pull_requests")[0].status,
+            intent_core::PullRequestStatus::Open
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(display_status_events(&svc, &ws_id).await.is_empty());
+
+        // Aged past max_age, the next read fetches — and that one folds the
+        // record whole. (The still-armed park is released ahead of the read.)
+        svc.backdate_pr_cache(std::time::Duration::from_secs(61));
+        park.release.notify_one();
+        svc.github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get after expiry");
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42, 42]);
+        let again = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            again.pr_status,
+            Some(intent_core::PullRequestStatus::Merged)
+        );
+        assert_eq!(
+            again.pull_requests.as_ref().expect("pull_requests")[0].status,
+            intent_core::PullRequestStatus::Merged
+        );
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "pr:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_merged")]
+        );
+    }
+
+    /// The forge for the cache-hit fold regressions: an open #42 whose
+    /// merge-requirements probe reports the given queue state, so a full
+    /// read composes `merge_queue_reported == Some(queued)`.
+    fn queue_signal_forge(queued: bool) -> Arc<StubForge> {
+        Arc::new(StubForge {
+            merge_signals: Some(MergeRequirementSignals {
+                is_in_merge_queue: Some(queued),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// Linked #42 (Open, pooled + `activePullRequest`) persisted with the
+    /// given queue signal, under a 60s cache TTL.
+    async fn cached_hover_setup(
+        forge: Arc<StubForge>,
+        signal: Option<bool>,
+    ) -> (TempDb, super::WorkspacesRoot, Services, WorkspaceId) {
+        cached_hover_setup_with(forge, |open| open.is_in_merge_queue = signal).await
+    }
+
+    /// [`cached_hover_setup`] with the persisted #42 entry shaped by `seed`
+    /// (the pooled and linked copies are the same entry).
+    async fn cached_hover_setup_with(
+        forge: Arc<StubForge>,
+        seed: impl FnOnce(&mut intent_core::PullRequestInfo),
+    ) -> (TempDb, super::WorkspacesRoot, Services, WorkspaceId) {
+        let mut open = pool_entry(42, intent_core::PullRequestStatus::Open, "");
+        seed(&mut open);
+        let (t, root, svc, ws_id) = fold_setup_with(forge, |ws| {
+            ws.pr_number = Some(42);
+            ws.pr_url = Some(open.url.clone());
+            ws.pr_status = Some(intent_core::PullRequestStatus::Open);
+            ws.active_pull_request = Some(open.clone());
+            ws.pull_requests = Some(vec![open.clone()]);
+        })
+        .await;
+        (t, root, svc.with_pr_cache_max_age_seconds(60), ws_id)
+    }
+
+    /// A cache fill that is NOT a serve — a monitor poll or another reader
+    /// storing #42 — so the entry sits in the cache without any fold.
+    async fn fill_pr_cache(forge: &StubForge, svc: &Services) {
+        crate::pr_monitor::read_pr_via(
+            forge,
+            &RepoRef::new("o", "r"),
+            42,
+            &svc.pr_cache,
+            crate::pr_monitor::PrReadPolicy::REFRESH,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .expect("cache fill");
+    }
+
+    /// Regression (intent-hq/intent#5654, intentd#2079 review): the queue
+    /// signal seeded into the shared cache by another reader — a
+    /// `ws.pr.snapshot`, a monitor poll — must land on the pool at the next
+    /// hover even though that hover is a cache hit. Persisted `None`, cache
+    /// filled with `isInMergeQueue: true`, hover within the TTL: no forge
+    /// request, the pooled and linked copies flip to `Some(true)`, one
+    /// `pr:updated`, and `displayStatus` moves `pr_ready` → `pr_queued`. A
+    /// repeat hit that agrees with the pool writes nothing.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_folds_a_queue_signal_served_from_the_cache() {
+        let forge = queue_signal_forge(true);
+        let (_t, _root, svc, ws_id) = cached_hover_setup(forge.clone(), None).await;
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        fill_pr_cache(forge.as_ref(), &svc).await;
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+        let filled = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            filled.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None,
+            "a bare cache fill folds nothing"
+        );
+
+        let v = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(v["pull"]["isInMergeQueue"], true);
+        assert_eq!(
+            *forge.seen_get_pr.lock().unwrap(),
+            vec![42],
+            "the hover is a hit: no forge request"
+        );
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            Some(true),
+            "the served signal folded on a cache hit"
+        );
+        assert_eq!(
+            after
+                .active_pull_request
+                .as_ref()
+                .unwrap()
+                .is_in_merge_queue,
+            Some(true)
+        );
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Open),
+            "the passive fold keeps the link and status"
+        );
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "pr:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_queued")]
+        );
+
+        // A repeat hit agrees with the pool: nothing persists, nothing emits.
+        svc.github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get again");
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+        let again = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(again.updated_at, after.updated_at);
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "pr:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(display_status_events(&svc, &ws_id).await.len(), 1);
+    }
+
+    /// The inverse of [`pulls_get_folds_a_queue_signal_served_from_the_cache`]:
+    /// the pool holds `Some(true)` (`pr_queued`), the cached read observed
+    /// the PR dequeued (`isInMergeQueue: false`, same head, still open) —
+    /// the cache-hit hover clears the signal on the pooled and linked copies
+    /// and `displayStatus` falls back to `pr_ready`, again without a forge
+    /// request.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_clears_a_queue_signal_the_cache_reports_lapsed() {
+        let forge = queue_signal_forge(false);
+        let (_t, _root, svc, ws_id) = cached_hover_setup(forge.clone(), Some(true)).await;
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrQueued)
+        );
+
+        fill_pr_cache(forge.as_ref(), &svc).await;
+        assert_eq!(
+            svc.store()
+                .get_workspace(&ws_id)
+                .await
+                .unwrap()
+                .pull_requests
+                .as_ref()
+                .unwrap()[0]
+                .is_in_merge_queue,
+            Some(true),
+            "a bare cache fill folds nothing"
+        );
+
+        let v = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(v["pull"]["isInMergeQueue"], false);
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None,
+            "the cached dequeue cleared the persisted signal"
+        );
+        assert_eq!(
+            after
+                .active_pull_request
+                .as_ref()
+                .unwrap()
+                .is_in_merge_queue,
+            None
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_ready")]
+        );
+    }
+
+    /// The cache-hit fold is a projection (intent-hq/intent#5654): a REST
+    /// sweep refreshed the pool (newer `updatedAt`, title, `mergeableState`)
+    /// after the cache was filled, so the cached record is the older one.
+    /// The hit lands the differing queue signal on the same head and leaves
+    /// every other pooled field as the sweep wrote it — nothing rolls back.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_hit_writes_only_the_queue_signal_over_fresher_rest_fields() {
+        let forge = queue_signal_forge(true);
+        let (_t, _root, svc, ws_id) = cached_hover_setup_with(forge.clone(), |open| {
+            open.is_in_merge_queue = None;
+            open.title = "renamed by the sweep".into();
+            open.updated_at = "2099-01-01T00:00:00Z".into();
+            open.mergeable_state = Some("blocked".into());
+        })
+        .await;
+        seed_display_status(&svc, &ws_id).await;
+        fill_pr_cache(forge.as_ref(), &svc).await;
+        let filled = svc.store().get_workspace(&ws_id).await.unwrap();
+        let before = filled.pull_requests.as_ref().unwrap()[0].clone();
+        assert_ne!(
+            before.title,
+            sample_pr().title,
+            "the cached record is older than the pool"
+        );
+
+        let v = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(v["pull"]["title"], sample_pr().title, "answers the cache");
+        assert_eq!(
+            *forge.seen_get_pr.lock().unwrap(),
+            vec![42],
+            "the hover is a hit: no forge request"
+        );
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        let pooled = &after.pull_requests.as_ref().unwrap()[0];
+        assert_eq!(pooled.is_in_merge_queue, Some(true), "the signal landed");
+        let mut expected = before.clone();
+        expected.is_in_merge_queue = Some(true);
+        assert_eq!(*pooled, expected, "only is_in_merge_queue changed");
+        let active = after.active_pull_request.as_ref().unwrap();
+        assert_eq!(
+            *active, expected,
+            "the linked copy took the same projection"
+        );
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_queued")]
+        );
+    }
+
+    /// A cached queue signal for a head the pool has left is not the pool's
+    /// signal (intent-hq/intent#5654): the persisted copy is on a newer
+    /// `headSha` than the cached record, so the hit writes nothing — no
+    /// persist, no `pr:updated`, no displayStatus transition.
+    #[intent_test_macros::daemon_test]
+    async fn pulls_get_hit_on_a_different_head_writes_nothing() {
+        let forge = queue_signal_forge(true);
+        let (_t, _root, svc, ws_id) = cached_hover_setup_with(forge.clone(), |open| {
+            open.is_in_merge_queue = None;
+            open.head_sha = Some("moved-past-the-cached-head".into());
+        })
+        .await;
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+        fill_pr_cache(forge.as_ref(), &svc).await;
+        let before = svc.store().get_workspace(&ws_id).await.unwrap();
+
+        let v = svc
+            .github_pulls_get("o".into(), "r".into(), 42)
+            .await
+            .expect("pulls.get");
+        assert_eq!(
+            v["pull"]["isInMergeQueue"], true,
+            "the hit still answers the cache"
+        );
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.updated_at, before.updated_at, "nothing persisted");
+        assert_eq!(after.pull_requests, before.pull_requests);
+        assert_eq!(after.active_pull_request, before.active_pull_request);
+        assert!(svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(display_status_events(&svc, &ws_id).await.is_empty());
+    }
+
+    /// `ws.pr.snapshot` (`pr.state`) reads through the same serve and folds
+    /// identically to the hover: a cached queue signal lands on the pool
+    /// from a snapshot too (intent-hq/intent#5654).
+    #[intent_test_macros::daemon_test]
+    async fn pr_state_folds_a_queue_signal_served_from_the_cache() {
+        let forge = queue_signal_forge(true);
+        let (_t, _root, svc, ws_id) = cached_hover_setup(forge.clone(), None).await;
+        let _git = snapshot_git_root(&svc, &ws_id).await;
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+        fill_pr_cache(forge.as_ref(), &svc).await;
+
+        let v = svc
+            .pr_state(ws_id.clone(), 42, None)
+            .await
+            .expect("snapshot");
+        assert_eq!(v["requirements"]["isInMergeQueue"], true, "{v}");
+        assert_eq!(*forge.seen_get_pr.lock().unwrap(), vec![42]);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            Some(true)
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_queued")]
+        );
+    }
+
+    /// The hit projection is atomic with the row (intent-hq/intent#5654,
+    /// intentd#2079 re-verification): a REST refresh commits fresher
+    /// same-head fields (title, `updatedAt`, `mergeableState`) and a second
+    /// pool entry AFTER the fold's referencing-rows lookup but BEFORE its
+    /// write. The projection reads the row at write time, so the fresher
+    /// fields survive, the added entry stays, only `is_in_merge_queue`
+    /// changes, and the linked scalars are never reserialized.
+    #[intent_test_macros::daemon_test]
+    async fn hit_projection_lands_on_a_same_head_refresh_committed_mid_window() {
+        let (_t, _root, svc, ws_id) = cached_hover_setup(queue_signal_forge(true), None).await;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let svc = svc.with_fold_hit_park(park.clone());
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        let (repo, pr) = (RepoRef::new("o", "r"), sample_pr());
+        let fold = svc.fold_served_pr(&repo, &pr, Some(true), false);
+        let refresh = async {
+            park.entered.notified().await;
+            let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
+            let mut fresher = ws.pull_requests.as_ref().unwrap()[0].clone();
+            fresher.title = "renamed by the sweep".into();
+            fresher.updated_at = "2099-01-01T00:00:00Z".into();
+            fresher.mergeable_state = Some("blocked".into());
+            let other = pool_entry(43, intent_core::PullRequestStatus::Open, "");
+            ws.pull_requests = Some(vec![fresher.clone(), other.clone()]);
+            ws.active_pull_request = Some(fresher.clone());
+            svc.store().update_workspace_pr_linkage(&ws).await.unwrap();
+            park.release.notify_one();
+            (fresher, other)
+        };
+        let (outcome, (fresher, other)) = tokio::join!(fold, refresh);
+        outcome.expect("fold");
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        let mut expected = fresher;
+        expected.is_in_merge_queue = Some(true);
+        assert_eq!(
+            after.pull_requests,
+            Some(vec![expected.clone(), other]),
+            "the refresh's fields and entry survive; only the signal changed"
+        );
+        assert_eq!(after.active_pull_request, Some(expected));
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(after.pr_url.as_deref(), Some(sample_pr().url.as_str()));
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "pr:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_queued")]
+        );
+    }
+
+    /// A REST refresh moves the pooled copy to a newer head inside the hit's
+    /// lookup → write window (intent-hq/intent#5654): the cached signal
+    /// describes the head the pool has left, so the projection — evaluated
+    /// against the row at write time, not the pre-read copy — writes
+    /// nothing: no persist, no `pr:updated`, no displayStatus transition,
+    /// and the refresh's record stands untouched.
+    #[intent_test_macros::daemon_test]
+    async fn hit_projection_writes_nothing_when_the_head_moved_mid_window() {
+        let (_t, _root, svc, ws_id) = cached_hover_setup(queue_signal_forge(true), None).await;
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let svc = svc.with_fold_hit_park(park.clone());
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+
+        let (repo, pr) = (RepoRef::new("o", "r"), sample_pr());
+        let fold = svc.fold_served_pr(&repo, &pr, Some(true), false);
+        let refresh = async {
+            park.entered.notified().await;
+            let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
+            let mut moved = ws.pull_requests.as_ref().unwrap()[0].clone();
+            moved.head_sha = Some("moved-past-the-cached-head".into());
+            moved.title = "renamed by the sweep".into();
+            ws.pull_requests = Some(vec![moved.clone()]);
+            ws.active_pull_request = Some(moved);
+            ws.updated_at = "2099-01-01T00:00:00Z".into();
+            svc.store().update_workspace_pr_linkage(&ws).await.unwrap();
+            park.release.notify_one();
+            ws
+        };
+        let (outcome, refreshed) = tokio::join!(fold, refresh);
+        outcome.expect("fold");
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.updated_at, refreshed.updated_at, "nothing persisted");
+        assert_eq!(after.pull_requests, refreshed.pull_requests);
+        assert_eq!(after.active_pull_request, refreshed.active_pull_request);
+        assert_eq!(
+            after.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(display_status_events(&svc, &ws_id).await.is_empty());
+    }
+
+    /// A pool-only git root whose #42 entry the fold reaches as a hit, with
+    /// the fold parked between its root lookup and its projection.
+    async fn parked_root_hit_setup() -> (
+        TempDb,
+        super::WorkspacesRoot,
+        Services,
+        WorkspaceId,
+        Arc<crate::script_ops::SupervisePark>,
+        SweepRepo,
+    ) {
+        let (t, wsroot, svc, ws_id) = fold_setup_with(queue_signal_forge(true), |_| {}).await;
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let mut root = sweep_root(&ws_id, &secondary.dir, Some(("o", "r")));
+        root.pull_requests = Some(vec![pool_entry(
+            42,
+            intent_core::PullRequestStatus::Open,
+            "",
+        )]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let svc = svc.with_fold_hit_park(park.clone());
+        assert_eq!(
+            seed_display_status(&svc, &ws_id).await,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady)
+        );
+        (t, wsroot, svc, ws_id, park, secondary)
+    }
+
+    /// Git-root analogue of the same-head race: the root sweep commits
+    /// fresher fields and a second entry inside the hit's window; the
+    /// projection lands only the signal on the refreshed row and keeps the
+    /// root's linked scalars as they were.
+    #[intent_test_macros::daemon_test]
+    async fn root_hit_projection_lands_on_a_same_head_refresh_committed_mid_window() {
+        let (_t, _root, svc, ws_id, park, _s) = parked_root_hit_setup().await;
+
+        let (repo, pr) = (RepoRef::new("o", "r"), sample_pr());
+        let fold = svc.fold_served_pr(&repo, &pr, Some(true), false);
+        let refresh = async {
+            park.entered.notified().await;
+            let mut root = svc
+                .store()
+                .list_workspace_git_roots(&ws_id)
+                .await
+                .unwrap()
+                .remove(0);
+            let mut fresher = root.pull_requests.as_ref().unwrap()[0].clone();
+            fresher.title = "renamed by the sweep".into();
+            fresher.updated_at = "2099-01-01T00:00:00Z".into();
+            fresher.mergeable_state = Some("blocked".into());
+            let other = pool_entry(43, intent_core::PullRequestStatus::Open, "");
+            root.pull_requests = Some(vec![fresher.clone(), other.clone()]);
+            svc.store()
+                .update_workspace_git_root_pr(&root)
+                .await
+                .unwrap();
+            park.release.notify_one();
+            (fresher, other)
+        };
+        let (outcome, (fresher, other)) = tokio::join!(fold, refresh);
+        outcome.expect("fold");
+
+        let roots = svc.store().list_workspace_git_roots(&ws_id).await.unwrap();
+        let mut expected = fresher;
+        expected.is_in_merge_queue = Some(true);
+        assert_eq!(roots[0].pull_requests, Some(vec![expected, other]));
+        assert_eq!(roots[0].pr_number, None, "passive fold never links");
+        assert_eq!(roots[0].pr_status, None);
+        assert_eq!(
+            svc.store()
+                .events_by_type(&ws_id, "gitRoot:updated", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            display_status_events(&svc, &ws_id).await,
+            vec![json!("pr_queued")]
+        );
+    }
+
+    /// Git-root analogue of the moved-head race: the root sweep moves the
+    /// entry to a newer head inside the hit's window, so the projection
+    /// writes nothing and the sweep's record stands.
+    #[intent_test_macros::daemon_test]
+    async fn root_hit_projection_writes_nothing_when_the_head_moved_mid_window() {
+        let (_t, _root, svc, ws_id, park, _s) = parked_root_hit_setup().await;
+
+        let (repo, pr) = (RepoRef::new("o", "r"), sample_pr());
+        let fold = svc.fold_served_pr(&repo, &pr, Some(true), false);
+        let refresh = async {
+            park.entered.notified().await;
+            let mut root = svc
+                .store()
+                .list_workspace_git_roots(&ws_id)
+                .await
+                .unwrap()
+                .remove(0);
+            let mut moved = root.pull_requests.as_ref().unwrap()[0].clone();
+            moved.head_sha = Some("moved-past-the-cached-head".into());
+            moved.title = "renamed by the sweep".into();
+            root.pull_requests = Some(vec![moved]);
+            root.updated_at = "2099-01-01T00:00:00Z".into();
+            svc.store()
+                .update_workspace_git_root_pr(&root)
+                .await
+                .unwrap();
+            park.release.notify_one();
+            root
+        };
+        let (outcome, refreshed) = tokio::join!(fold, refresh);
+        outcome.expect("fold");
+
+        let roots = svc.store().list_workspace_git_roots(&ws_id).await.unwrap();
+        assert_eq!(
+            roots[0].updated_at, refreshed.updated_at,
+            "nothing persisted"
+        );
+        assert_eq!(roots[0].pull_requests, refreshed.pull_requests);
+        assert_eq!(
+            roots[0].pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
+            None
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws_id, "gitRoot:updated", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(display_status_events(&svc, &ws_id).await.is_empty());
+    }
+
     /// Unlinking on a branch mismatch still refreshes an existing pool entry
     /// for that PR in place — the fetched snapshot is authoritative and
     /// already paid for — without the heal re-fetching it this pass.
@@ -20857,6 +23613,111 @@ pub(crate) mod pr {
         assert_eq!(list[0].status, intent_core::PullRequestStatus::Open);
     }
 
+    #[tokio::test]
+    async fn traffic_workspace_error_quota_probe_keeps_background_caller() {
+        use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+        let base = spawn_rate_limited_api().await;
+        let sc =
+            Arc::new(intent_sourcecontrol::GitHubSourceControl::new("fake", Some(&base)).unwrap());
+        let (_t, svc, _) = refresh_setup(StubForge::default(), "feature", Some(42), false).await;
+        let svc = svc.with_source_control(sc);
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert!(svc.sweeps_rate_limited());
+        let snapshot = traffic.snapshot();
+        let probes = snapshot
+            .counts
+            .get(&(Caller::WorkspaceRefresh, Operation::QuotaProbe))
+            .expect("background error probes retain caller");
+        assert_eq!((probes.rest_requests, probes.graphql_requests), (1, 1));
+        assert!(snapshot
+            .counts
+            .keys()
+            .all(|(caller, _)| *caller == Caller::WorkspaceRefresh));
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert_eq!(
+            traffic.snapshot(),
+            snapshot,
+            "paused sweep reuses the shared probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_root_error_quota_probe_keeps_background_caller() {
+        use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+        let base = spawn_rate_limited_api().await;
+        let sc: Arc<dyn SourceControl> =
+            Arc::new(intent_sourcecontrol::GitHubSourceControl::new("fake", Some(&base)).unwrap());
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        let traffic = Traffic::default();
+        with_traffic(
+            traffic.clone(),
+            svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true),
+        )
+        .await;
+        assert!(svc.sweeps_rate_limited());
+        let snapshot = traffic.snapshot();
+        let probes = snapshot
+            .counts
+            .get(&(Caller::GitRootRefresh, Operation::QuotaProbe))
+            .expect("root error probes retain caller");
+        assert_eq!((probes.rest_requests, probes.graphql_requests), (1, 1));
+        assert!(snapshot
+            .counts
+            .keys()
+            .all(|(caller, _)| *caller == Caller::GitRootRefresh));
+        with_traffic(
+            traffic.clone(),
+            svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true),
+        )
+        .await;
+        assert_eq!(
+            traffic.snapshot(),
+            snapshot,
+            "paused root sweep performs no requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_recovery_quota_probe_keeps_workspace_caller_and_pause() {
+        use intent_sourcecontrol::traffic::{with_traffic, Caller, Operation, Traffic};
+        let base = spawn_rate_limited_api().await;
+        let sc =
+            Arc::new(intent_sourcecontrol::GitHubSourceControl::new("fake", Some(&base)).unwrap());
+        let (_t, svc, _) = refresh_setup(StubForge::default(), "feature", Some(42), false).await;
+        let svc = svc.with_source_control(sc);
+        svc.sweep_rate_limit
+            .pause_for(std::time::Duration::from_secs(300), true);
+        let traffic = Traffic::default();
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert!(
+            svc.sweeps_rate_limited(),
+            "unknown quota must not lift the pause"
+        );
+        let snapshot = traffic.snapshot();
+        let probes = snapshot
+            .counts
+            .get(&(Caller::WorkspaceRefresh, Operation::QuotaProbe))
+            .expect("recovery probe retains workspace caller");
+        assert_eq!((probes.rest_requests, probes.graphql_requests), (1, 1));
+        assert_eq!(
+            snapshot.counts.len(),
+            1,
+            "paused recovery must not refresh PRs"
+        );
+        with_traffic(traffic.clone(), svc.refresh_all_workspace_prs(0)).await;
+        assert_eq!(
+            traffic.snapshot(),
+            snapshot,
+            "recovery probes stay coalesced"
+        );
+    }
+
     // ---- forge rate-limit backoff (monorepo#2961) -------------------------
 
     /// A rate-limited forge call during the git-root sweep pauses ALL
@@ -20884,7 +23745,8 @@ pub(crate) mod pr {
             ..Default::default()
         });
         let sc_dyn: Arc<dyn SourceControl> = sc.clone();
-        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn), 60, true)
+            .await;
 
         assert_eq!(
             sc.seen_get_pr.lock().unwrap().len(),
@@ -20895,7 +23757,8 @@ pub(crate) mod pr {
 
         // A whole follow-up sweep while paused performs no forge calls and
         // no further reset probes — the condition was reported once.
-        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn), 60, true)
+            .await;
         assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
     }
@@ -20904,7 +23767,7 @@ pub(crate) mod pr {
     /// workspace refresh pauses the forge work for every subsequent
     /// workspace in this and later sweeps (until the window resets), while
     /// the sweep itself keeps running its local, forge-free steps. A paused
-    /// tick spends exactly one quota-free probe on the early-lift check; a
+    /// tick spends exactly one shared quota probe on the early-lift check; a
     /// host without a `remaining` signal never lifts early.
     #[tokio::test]
     async fn pr_refresh_sweep_rate_limit_pauses_all_workspaces() {
@@ -20936,7 +23799,7 @@ pub(crate) mod pr {
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
 
         // The next tick is still inside the pause window: zero forge calls,
-        // one free probe for the early lift (no `remaining` → deadline kept).
+        // one probe for the early lift (no `remaining` → deadline kept).
         svc.refresh_all_workspace_prs(1).await;
         assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 2);
@@ -20944,8 +23807,7 @@ pub(crate) mod pr {
     }
 
     /// A paused PR-refresh tick whose probe reports the quota recovered
-    /// lifts the pause and refreshes in the SAME tick: the forge is called
-    /// again (here re-tripping the limit, which re-pauses — a fresh window).
+    /// lifts the pause and successfully refreshes in the SAME tick.
     #[tokio::test]
     async fn pr_refresh_sweep_lifts_the_pause_early_when_the_quota_recovered() {
         let tmp = TempDb::new();
@@ -20961,7 +23823,7 @@ pub(crate) mod pr {
         let sc = Arc::new(StubForge {
             rate_limited: true,
             rate_limit_reset: Some(u64::MAX / 2),
-            rate_limit_remaining: Some(5_000),
+            rate_limit_remaining: Some(0),
             rate_limit_limit: Some(5_000),
             ..Default::default()
         });
@@ -20970,21 +23832,39 @@ pub(crate) mod pr {
         svc.refresh_all_workspace_prs(0).await;
         assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
-        let first_deadline = svc.sweep_rate_limit_paused_until().unwrap();
+        assert!(svc.sweeps_rate_limited(), "exhaustion opened the pause");
 
-        // Tick 1: the early-lift probe reports a full window → the gate
-        // lifts and the workspace is refreshed in this tick; its fetch trips
-        // the limit again, opening a NEW window (its own reset probe).
+        // Keep the service and its existing gate, but let the forge report
+        // a genuinely recovered window and successful PR reads on tick 1.
+        let recovered = Arc::new(StubForge {
+            rate_limit_remaining: Some(5_000),
+            rate_limit_limit: Some(5_000),
+            ..Default::default()
+        });
+        let svc = svc.with_source_control(recovered.clone());
+        svc.refresh_all_workspace_prs(1).await;
+        assert!(
+            !svc.sweeps_rate_limited(),
+            "the recovered quota lifts the pause"
+        );
+        assert!(
+            recovered.seen_get_pr.lock().unwrap().is_empty(),
+            "recovery does not bypass automatic retry admission"
+        );
+        // Tick 1 is one minute later in production; quota recovery does not
+        // bypass the new per-workspace automatic attempt cadence.
+        svc.age_automatic_pr_refresh(&ws_id, 60);
         svc.refresh_all_workspace_prs(1).await;
         assert_eq!(
-            sc.seen_get_pr.lock().unwrap().len(),
-            2,
+            *recovered.seen_get_pr.lock().unwrap(),
+            vec![42],
             "the lifted tick refreshes instead of skipping"
         );
-        assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 3);
-        assert!(
-            svc.sweep_rate_limit_paused_until().unwrap() >= first_deadline,
-            "the re-trip opened a fresh window"
+        assert_eq!(*recovered.seen_reset_probes.lock().unwrap(), 1);
+        assert!(!svc.sweeps_rate_limited(), "successful recovery stays open");
+        assert_eq!(
+            svc.store().get_workspace(&ws_id).await.unwrap().pr_status,
+            Some(intent_core::PullRequestStatus::Open)
         );
     }
 
@@ -21015,15 +23895,22 @@ pub(crate) mod pr {
                 "2026-01-03T00:00:00Z",
             ),
         ]);
+        let mut fetched_fresh = Vec::new();
+        let (_db, svc) = github_svc().await;
         let (changed, rate_limited) = crate::pr_ops::refresh_stale_pool_entries(
+            &svc,
             &sc,
             &repo,
             &mut list,
-            &[],
+            &mut fetched_fresh,
             std::time::Duration::from_secs(1),
         )
         .await;
         assert!(!changed);
+        assert!(
+            fetched_fresh.is_empty(),
+            "a rate-limited re-fetch is not fresh"
+        );
         assert!(
             rate_limited.is_some_and(|d| d.contains("rate limit")),
             "the limit surfaces to the caller"
@@ -21102,7 +23989,8 @@ pub(crate) mod pr {
             ..Default::default()
         });
         let sc_dyn: Arc<dyn SourceControl> = sc.clone();
-        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn), 60, true)
+            .await;
 
         assert_eq!(
             sc.seen_get_pr.lock().unwrap().len(),
@@ -21915,6 +24803,102 @@ mod file_tracking {
         assert_eq!(stage_of("b.txt"), "unstaged");
     }
 
+    /// An index-refresh failure must not discard a successful receipt or skip
+    /// attribution/events. A later HEAD cannot substitute for the original SHA.
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_reports_created_sha_when_index_refresh_fails() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        let bus = crate::events::EventBus::new(svc.store().clone());
+        let svc = svc.with_event_bus(bus);
+        std::fs::write(repo.dir.join("prestaged.txt"), "other actor\n").unwrap();
+        intent_git::stage::stage(&repo.dir, &["prestaged.txt".to_string()]).unwrap();
+        std::fs::write(repo.dir.join("a.txt"), "agent a\n").unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "a.txt", "unstaged", Some("agent-a")))
+            .await
+            .unwrap();
+        let git = git2::Repository::open(&repo.dir).unwrap();
+        let parent = git.head().unwrap().target().unwrap();
+        let index_before = std::fs::read(git.path().join("index")).unwrap();
+        std::fs::write(git.path().join("index.lock"), "held by test\n").unwrap();
+
+        let (entered, release) = crate::periodic_shutdown_tests::hold(&svc, "git");
+        let committing = svc.clone();
+        let workspace_id = ws.clone();
+        let operation = tokio::spawn(intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            async move {
+                committing
+                    .git_agent_commit(
+                        workspace_id,
+                        "agent a only".to_string(),
+                        Some(AgentId::from("agent-a")),
+                        None,
+                        None,
+                        false,
+                        None,
+                    )
+                    .await
+            },
+        ));
+        crate::periodic_shutdown_tests::entered(entered).await;
+        let committed = git.head().unwrap().peel_to_commit().unwrap();
+        assert_ne!(committed.id(), parent);
+        assert_eq!(committed.parent_id(0).unwrap(), parent);
+        assert_eq!(
+            std::fs::read(git.path().join("index")).unwrap(),
+            index_before
+        );
+        assert!(committed
+            .tree()
+            .unwrap()
+            .get_name("prestaged.txt")
+            .is_none());
+        // Advance HEAD while the service holds the original outcome. Keep the
+        // stale index intact so the emitted status must still report its state.
+        let sig = git.signature().unwrap();
+        let later = git
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "later commit",
+                &committed.tree().unwrap(),
+                &[&committed],
+            )
+            .unwrap();
+        release.send(()).unwrap();
+        let outcome = operation.await.unwrap().unwrap();
+        assert_eq!(outcome.hash, committed.id().to_string());
+        assert_ne!(outcome.hash, later.to_string());
+        assert_eq!(outcome.files, vec!["a.txt".to_string()]);
+        assert_eq!(outcome.file_count, 1);
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r.path == "a.txt").unwrap().stage,
+            "committed"
+        );
+        let events = svc
+            .store()
+            .events_by_type(&ws, "git:commit", 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["commit"], outcome.hash);
+        assert_eq!(events[0].data["files"], serde_json::json!(["a.txt"]));
+        let status_events = svc
+            .store()
+            .events_by_type(&ws, "changes:git-status", 10)
+            .await
+            .unwrap();
+        assert_eq!(status_events.len(), 1);
+        assert_eq!(
+            status_events[0].data["status"],
+            serde_json::to_value(intent_git::status::status(&repo.dir).unwrap()).unwrap()
+        );
+    }
+
     /// A path another actor already staged is not swept into the
     /// attribution-filtered commit — the commit tree is built from exactly
     /// the attributed paths (`git commit -- <paths>` semantics), and the
@@ -22585,6 +25569,214 @@ mod file_tracking {
             .unwrap();
         let root_id = WorkspaceGitRootId(row["id"].as_str().unwrap().to_string());
         (tmp, svc, ws_id, secondary, root_id)
+    }
+
+    /// Two branches independently made the same change from a common seed.
+    /// Merging them needs a second parent but no change to HEAD's tree.
+    fn ancestry_only_merge(dir: &std::path::Path) -> (git2::Oid, git2::Oid, git2::Oid) {
+        let git = Repository::open(dir).unwrap();
+        let seed = git.head().unwrap().peel_to_commit().unwrap();
+        commit_file(dir, "shared.txt", "same change\n", "ours");
+        let ours = git.head().unwrap().peel_to_commit().unwrap();
+        let tree = ours.tree().unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let incoming = git
+            .commit(
+                Some("refs/heads/incoming"),
+                &sig,
+                &sig,
+                "theirs",
+                &tree,
+                &[&seed],
+            )
+            .unwrap();
+        assert_eq!(git.merge_base(ours.id(), incoming).unwrap(), seed.id());
+        assert_ne!(ours.id(), incoming);
+        git.merge(&[&git.find_annotated_commit(incoming).unwrap()], None, None)
+            .unwrap();
+        assert_eq!(git.state(), git2::RepositoryState::Merge);
+        assert_eq!(git.index().unwrap().write_tree().unwrap(), tree.id());
+        assert!(intent_git::commit::staged_paths(dir).unwrap().is_empty());
+        (ours.id(), incoming, tree.id())
+    }
+
+    async fn assert_ancestry_only_agent_commit(secondary_target: bool) {
+        let primary = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&primary).await;
+        let (target, other, root_id) = if secondary_target {
+            (&secondary.dir, &primary.dir, Some(root_id))
+        } else {
+            (&primary.dir, &secondary.dir, None)
+        };
+        let other_head = Repository::open(other).unwrap().head().unwrap().target();
+        let (ours, incoming, tree) = ancestry_only_merge(target);
+        let git = Repository::open(target).unwrap();
+        let merge_head = std::fs::read(git.path().join("MERGE_HEAD")).unwrap();
+        let index = std::fs::read(git.path().join("index")).unwrap();
+        std::fs::write(target.join("unstaged.txt"), "leave this alone\n").unwrap();
+
+        // Neither a pending merge nor an empty delta grants permission to
+        // auto-commit or to commit a partial file set.
+        svc.set_workspace_auto_commit(ws.clone(), false)
+            .await
+            .unwrap();
+        for (files, user_requested, expected) in [
+            (None, false, "Auto-commit is disabled"),
+            (
+                Some(vec!["shared.txt".to_string()]),
+                true,
+                "cannot do a partial commit during a merge",
+            ),
+        ] {
+            let err = svc
+                .git_agent_commit(
+                    ws.clone(),
+                    "refused merge".into(),
+                    Some(AgentId::from("agent-merge")),
+                    None,
+                    files,
+                    user_requested,
+                    root_id.clone(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Internal(_)), "{err}");
+            assert!(err.to_string().contains(expected), "{err}");
+            assert_eq!(git.head().unwrap().target(), Some(ours));
+            assert_eq!(std::fs::read(git.path().join("index")).unwrap(), index);
+            assert_eq!(
+                std::fs::read(git.path().join("MERGE_HEAD")).unwrap(),
+                merge_head
+            );
+        }
+
+        // Even with auto-commit enabled, an unattributed empty set cannot
+        // complete the merge. Only the explicit staged-only request can.
+        svc.set_workspace_auto_commit(ws.clone(), true)
+            .await
+            .unwrap();
+        let err = svc
+            .git_agent_commit(
+                ws.clone(),
+                "unattributed merge".into(),
+                Some(AgentId::from("agent-merge")),
+                None,
+                None,
+                false,
+                root_id.clone(),
+            )
+            .await
+            .unwrap_err();
+        let expected = if secondary_target {
+            "requires an explicit `files` list"
+        } else {
+            "No uncommitted changes found for this agent"
+        };
+        assert!(err.to_string().contains(expected), "{err}");
+        assert_eq!(git.head().unwrap().target(), Some(ours));
+        assert_eq!(std::fs::read(git.path().join("index")).unwrap(), index);
+        assert_eq!(
+            std::fs::read(git.path().join("MERGE_HEAD")).unwrap(),
+            merge_head
+        );
+        assert!(svc
+            .store()
+            .events_by_type(&ws, "git:commit", 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        svc.set_workspace_auto_commit(ws.clone(), false)
+            .await
+            .unwrap();
+        let result = svc
+            .git_agent_commit(
+                ws.clone(),
+                "fix: record shared ancestry".into(),
+                Some(AgentId::from("agent-merge")),
+                Some(NoteId::from("note-merge")),
+                secondary_target.then(Vec::new),
+                true,
+                root_id.clone(),
+            )
+            .await
+            .expect("an authorized staged-only ancestry merge must succeed");
+        assert!(result.files.is_empty());
+        assert_eq!(result.file_count, 0);
+        let commit = git
+            .find_commit(git2::Oid::from_str(&result.hash).unwrap())
+            .unwrap();
+        assert_eq!(git.head().unwrap().target(), Some(commit.id()));
+        assert_eq!(
+            commit.parent_ids().collect::<Vec<_>>(),
+            vec![ours, incoming]
+        );
+        assert_eq!(commit.tree_id(), tree);
+        assert_eq!(commit.author().name().unwrap(), "Test");
+        assert_eq!(commit.author().email().unwrap(), "test@example.com");
+        assert_eq!(commit.committer().name().unwrap(), "Test");
+        assert_eq!(commit.committer().email().unwrap(), "test@example.com");
+        let message = commit.message().unwrap();
+        assert!(message.contains("Agent-Id: agent-merge"), "{message}");
+        assert!(message.contains("Linked-Note-Id: note-merge"), "{message}");
+        assert_eq!(git.state(), git2::RepositoryState::Clean);
+        assert!(!git.path().join("MERGE_HEAD").exists());
+        assert_eq!(
+            std::fs::read_to_string(target.join("unstaged.txt")).unwrap(),
+            "leave this alone\n"
+        );
+        assert!(commit.tree().unwrap().get_name("unstaged.txt").is_none());
+        assert_eq!(
+            Repository::open(other).unwrap().head().unwrap().target(),
+            other_head
+        );
+
+        let events = svc
+            .store()
+            .events_by_type(&ws, "git:commit", 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["commit"], result.hash);
+        assert_eq!(events[0].data["files"], serde_json::json!([]));
+        assert_eq!(
+            events[0].data.get("gitRootId"),
+            root_id
+                .as_ref()
+                .map(|id| serde_json::json!(id.as_str()))
+                .as_ref()
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_ancestry_only_primary() {
+        assert_ancestry_only_agent_commit(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_ancestry_only_registered_root() {
+        assert_ancestry_only_agent_commit(true).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_empty_without_merge_is_rejected() {
+        let primary = init_git_repo();
+        let (_t, svc, ws, secondary, root_id) = svc_with_registered_root(&primary).await;
+        for (dir, root_id) in [(&primary.dir, None), (&secondary.dir, Some(root_id))] {
+            let git = Repository::open(dir).unwrap();
+            let before = git.head().unwrap().target();
+            let err = svc
+                .git_agent_commit(ws.clone(), "empty".into(), None, None, None, true, root_id)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("No staged changes found to commit"),
+                "{err}"
+            );
+            assert_eq!(git.head().unwrap().target(), before);
+            assert_eq!(git.state(), git2::RepositoryState::Clean);
+        }
     }
 
     /// `git.agentCommit` with a `gitRootId` and explicit `files` commits in
@@ -26177,11 +29369,152 @@ mod search_adapters {
         let svc = Services::new(store);
         // No workspaceId param — global search.
         let r = svc
-            .search_notes("alpha".into(), Some("srch-n".into()))
+            .search_notes(
+                "alpha".into(),
+                None,
+                None,
+                None,
+                true,
+                Some("srch-n".into()),
+            )
             .await
             .unwrap();
         assert_eq!(r["requestId"], "srch-n");
         assert_eq!(r["matches"].as_array().unwrap().len(), 2);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_uses_tokens_tags_and_readable_ranked_snippets() {
+        let (_tmp, store, ws) = store_with_ws().await;
+        let mut body = note(
+            &ws,
+            "body",
+            &format!("{} café running\n  checklist", "padding ".repeat(50)),
+        );
+        body.title = "Plain title".into();
+        body.tags = vec!["tagonly".into()];
+        store.insert_note(&body).await.unwrap();
+        let svc = Services::new(store);
+        for query in ["CAFÉ run", "run checklist", "tagonly", "café:(checkl"] {
+            let result = svc
+                .search_notes(query.into(), None, None, None, true, None)
+                .await
+                .unwrap();
+            assert_eq!(result["indexed"], true);
+            let hit = &result["matches"][0];
+            assert_eq!(hit["noteId"], "body", "{query}: {result}");
+            assert_eq!(hit["workspaceId"], ws.as_str());
+            assert!(hit["score"].is_number());
+            let preview = hit["preview"].as_str().unwrap();
+            assert!(preview.chars().count() <= 162);
+            assert!(!preview.contains('\n'));
+            if query != "tagonly" {
+                assert!(preview.contains("checklist"), "{preview}");
+            }
+        }
+        // FTS operators are literal search tokens, never parser instructions.
+        assert!(svc
+            .search_notes("café OR nonexistent".into(), None, None, None, true, None)
+            .await
+            .unwrap()["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_propagates_index_failure() {
+        let (_tmp, store, _) = store_with_ws().await;
+        sqlx::query("DROP TABLE note_fts")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        let svc = Services::new(store);
+        assert!(svc
+            .search_notes("needle".into(), None, None, None, true, None)
+            .await
+            .is_err());
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_validates_typed_scope_and_limit_before_empty_queries() {
+        let (_tmp, store, _) = store_with_ws().await;
+        let svc = Services::new(store);
+        assert!(matches!(
+            svc.search_notes(String::new(), None, None, Some(-1), true, None)
+                .await,
+            Err(intent_core::Error::InvalidParams(_))
+        ));
+        for (hard, soft) in [
+            (Some(WorkspaceId::from("")), None),
+            (None, Some(WorkspaceId::from(""))),
+        ] {
+            assert!(matches!(
+                svc.search_notes(String::new(), hard, soft, None, true, None)
+                    .await,
+                Err(intent_core::Error::InvalidParams(_))
+            ));
+        }
+        assert!(matches!(
+            svc.search_notes(
+                String::new(),
+                Some(WorkspaceId::from("missing")),
+                None,
+                Some(0),
+                true,
+                None
+            )
+            .await,
+            Err(intent_core::Error::NotFound(_))
+        ));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_preserves_rank_ties_and_soft_preference() {
+        let (_tmp, store, ws1) = store_with_ws().await;
+        let ws2 = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws2)).await.unwrap();
+        for ws in [&ws1, &ws2] {
+            for id in ["z", "a"] {
+                let mut row = note(ws, id, "identicalterm");
+                row.title = "Same title".into();
+                row.updated_at = "2026-01-01T00:00:00Z".into();
+                store.insert_note(&row).await.unwrap();
+            }
+        }
+        let svc = Services::new(store);
+        let ranked = svc
+            .search_notes(
+                "identicalterm".into(),
+                None,
+                Some(ws2.clone()),
+                Some(3),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let hits = ranked["matches"].as_array().unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0]["workspaceId"], ws2.as_str());
+        assert_eq!(hits[0]["noteId"], "a");
+        assert_eq!(hits[1]["workspaceId"], ws2.as_str());
+        assert_eq!(hits[1]["noteId"], "z");
+        assert_eq!(hits[2]["workspaceId"], ws1.as_str());
+        assert!(hits[0]["score"].as_f64().unwrap() > hits[2]["score"].as_f64().unwrap());
+        let scoped = svc
+            .search_notes(
+                "identicalterm".into(),
+                Some(ws1.clone()),
+                Some(ws2),
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(scoped["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(scoped["matches"][0]["workspaceId"], ws1.as_str());
     }
 
     /// A fake [`ContextEngine`] so the engine-available and graceful-degradation
@@ -27288,7 +30621,7 @@ mod rules {
         assert!(got["updatedAt"].as_i64().unwrap() > 0);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn get_absent_type_reads_disabled_empty() {
         let tree = worktree();
         let (_tmp, _store, svc, ws) = setup(&tree.0).await;
@@ -27854,6 +31187,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -28004,6 +31338,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -28145,6 +31480,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/worktree".into()),
             repository_path: Some("/test/repo".into()),
@@ -28281,6 +31617,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -28416,6 +31753,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -28556,6 +31894,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -29419,6 +32758,7 @@ mod known_repo {
             created_at: now.clone(),
             updated_at: now.clone(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: Some(repo_path.0.to_string_lossy().to_string()),
@@ -29652,6 +32992,51 @@ mod known_repo {
             "current B candidate emits workspace:updated"
         );
     }
+}
+
+/// Keep the caller regression observable even on hosts that skip `CoW` tests.
+/// Native acceptance additionally requires a real clone and independent contents
+/// on the same volume pair used by the workspace fixture.
+fn cow_fixture_supported(source: &std::path::Path, root: &std::path::Path) -> bool {
+    let support = intent_git::cow_probe(source, root).expect("probe fixture CoW support");
+    eprintln!("CoW fixture probe: {support:?}; source={source:?}; root={root:?}");
+    if support == intent_git::CowSupport::Supported {
+        let src = crate::test_support::test_tempdir_in(
+            source.to_str().expect("fixture source path"),
+            "cow-proof-source-",
+        );
+        let dst = crate::test_support::test_tempdir_in(
+            root.to_str().expect("fixture root path"),
+            "cow-proof-destination-",
+        );
+        let original = src.path().join("payload");
+        let cloned = dst.path().join("clone");
+        std::fs::write(&original, b"original").unwrap();
+        intent_git::cow_clone(src.path(), &cloned).expect("real fixture CoW clone");
+        let copy = cloned.join("payload");
+        assert_eq!(std::fs::read(&copy).unwrap(), b"original");
+        std::fs::write(&copy, b"clone changed").unwrap();
+        assert_eq!(std::fs::read(&original).unwrap(), b"original");
+        std::fs::write(&original, b"source changed").unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), b"clone changed");
+        dst.close().expect("remove CoW proof destination");
+        src.close().expect("remove CoW proof source");
+        eprintln!("CoW fixture clone and independent contents verified");
+        eprintln!("CoW fixture proof scratch cleaned");
+    } else {
+        assert!(
+            std::env::var_os("INTENTD_TEST_REQUIRE_COW").is_none(),
+            "native CoW acceptance requires a supported fixture volume"
+        );
+        // Supplemental regression on unsupported hosts only. Supported-volume
+        // baselines must reach the original service gate and its real refusal.
+        assert_eq!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Daemon),
+            "workspace CoW fixture must bind its daemon caller"
+        );
+    }
+    support == intent_git::CowSupport::Supported
 }
 
 mod worktree_provisioning {
@@ -30316,7 +33701,7 @@ mod worktree_provisioning {
     /// workspace branch from `baseRef`, with `worktreePath`/`baseCommitSha`
     /// populated, `checkoutMode: "cow"` persisted, and untracked source files
     /// carried over.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_provisions_cow_checkout_when_isolation_enabled() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30324,10 +33709,7 @@ mod worktree_provisioning {
         // Untracked build artifact in the source repo — CoW carries it over.
         std::fs::write(repo_dir.0.join("untracked.log"), "artifact\n").unwrap();
         let root = unique_dir("intentd-cowprov-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -30375,6 +33757,9 @@ mod worktree_provisioning {
         assert_eq!(
             persisted.checkout_mode,
             Some(intent_core::CheckoutMode::Cow)
+        );
+        eprintln!(
+            "CoW fixture assertions passed: create_provisions_cow_checkout_when_isolation_enabled"
         );
     }
 
@@ -30558,16 +33943,13 @@ mod worktree_provisioning {
     /// mirrors the create decision matrix — the duplicate gets a standalone
     /// `CoW` clone with `checkoutMode: "cow"` persisted, and the source repo
     /// gains no branch for the duplicate (the branch lives in the clone).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_provisions_cow_checkout_when_isolation_enabled() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, head_branch) = seed_repo("intentd-cowdup-repo");
         let root = unique_dir("intentd-cowdup-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -30615,6 +33997,7 @@ mod worktree_provisioning {
             persisted.checkout_mode,
             Some(intent_core::CheckoutMode::Cow)
         );
+        eprintln!("CoW fixture assertions passed: duplicate_provisions_cow_checkout_when_isolation_enabled");
     }
 
     /// cowIsolation on + CoW-incapable filesystem: `workspace.duplicate`
@@ -30670,16 +34053,13 @@ mod worktree_provisioning {
     /// unresolvable `baseRef`), the create fails without inserting a row and
     /// without leaving the empty `<root>/<wsId>` dir the probe created behind
     /// — the workspaces root ends up clean.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowfail-repo");
         let root = unique_dir("intentd-cowfail-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -30708,6 +34088,7 @@ mod worktree_provisioning {
                 .is_none(),
             "workspaces root must have no leftover empty <root>/<wsId> dir"
         );
+        eprintln!("CoW fixture assertions passed: create_cleans_up_empty_ws_dir_when_cow_provisioning_fails");
     }
 
     /// monorepo#774, `workspace.duplicate` path: a `CoW` provisioning failure
@@ -30722,16 +34103,13 @@ mod worktree_provisioning {
     /// flow, not a mutation-killing regression test. The #774 regression
     /// coverage lives in the create-path test above and the
     /// `remove_workspace_dir_if_empty` unit test below.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowdupfail-repo");
         let root = unique_dir("intentd-cowdupfail-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -30763,6 +34141,7 @@ mod worktree_provisioning {
             vec![".workspace".to_string()],
             "duplicate ws dir holds only the metadata dir"
         );
+        eprintln!("CoW fixture assertions passed: duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails");
     }
 
     /// The #774 cleanup helper only ever removes *empty* dirs: a non-empty
@@ -31833,12 +35212,30 @@ mod setup_lifecycle_events {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use intent_core::{WorkspaceApi, WorkspaceCreate};
+    use intent_core::{
+        WorkspaceApi, WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceSetupState,
+    };
     use intent_store::Store;
+    #[cfg(unix)]
+    use intentd_test_support::Barrier;
     use serde_json::{json, Value};
 
-    use super::{test_tempdir, TempDb};
+    use super::{test_registry_with_default_provider, test_tempdir, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+    /// Wait until the setup script has reached its barrier (proving the
+    /// spawn succeeded and the script is parked there).
+    #[cfg(unix)]
+    async fn wait_for_barrier(barrier: &Barrier) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !barrier.entered() {
+                // timing-guard: poll interval for the barrier's arrival file
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("setup script reached the barrier");
+    }
 
     /// Temp directory tree swept on drop (see [`test_tempdir`]).
     struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
@@ -31907,7 +35304,9 @@ mod setup_lifecycle_events {
     }
 
     /// Script runs to a zero exit: `started` then `completed` with
-    /// `ranScript: true` and `exitCode: 0`.
+    /// `ranScript: true` and `exitCode: 0`. The script parks on a barrier
+    /// so the `running` snapshot (state + `terminalId` in one write) can be
+    /// asserted without racing the script's exit.
     #[cfg(unix)]
     #[intent_test_macros::daemon_test]
     async fn script_success_emits_started_then_completed_exit_zero() {
@@ -31915,13 +35314,18 @@ mod setup_lifecycle_events {
         let root = unique_dir("intentd-setupev-ok-root");
         let (svc, bus, _tmp) = services(root.0.clone()).await;
         let mut sub = subscribe_setup(&bus);
+        let barrier = Barrier::new(&root.0, "setup");
 
         let ws = svc
             .create_workspace(
                 WorkspaceCreate {
                     repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
                     base_ref: Some(head_branch),
-                    setup_script: Some("exit 0".to_string()),
+                    setup_script: Some(format!(
+                        "{}\n{}\nexit 0",
+                        barrier.sh_arrive(),
+                        barrier.sh_wait()
+                    )),
                     ..Default::default()
                 },
                 None,
@@ -31934,6 +35338,26 @@ mod setup_lifecycle_events {
         assert_eq!(ev["type"], "workspace:setup:started");
         assert_eq!(ev["workspaceId"], ws.id.0);
         assert_eq!(ev["data"], json!({ "workspaceId": ws.id.0 }));
+        // `started` precedes the spawn attempt, so the record is still
+        // `pending` or already `running`; once the script has reached the
+        // barrier the spawn succeeded and the snapshot is `running` with
+        // its terminal attached.
+        let early = svc.workspace_setup_status(&ws.id);
+        assert!(
+            matches!(
+                early.state,
+                WorkspaceSetupState::Pending | WorkspaceSetupState::Running
+            ),
+            "after started: {early:?}"
+        );
+        wait_for_barrier(&barrier).await;
+        let running = svc.workspace_setup_status(&ws.id);
+        assert_eq!(running.state, WorkspaceSetupState::Running);
+        assert!(running.terminal_id.is_some(), "running carries terminalId");
+        assert!(running.started_at.is_some(), "running carries startedAt");
+        assert_eq!(running.exit_code, None);
+        assert_eq!(running.finished_at, None);
+        barrier.release();
 
         let ev = recv_setup(&mut sub).await;
         assert_eq!(ev["type"], "workspace:setup:completed");
@@ -31941,6 +35365,12 @@ mod setup_lifecycle_events {
         assert_eq!(ev["data"]["workspaceId"], ws.id.0);
         assert_eq!(ev["data"]["ranScript"], json!(true));
         assert_eq!(ev["data"]["exitCode"], json!(0));
+        let done = svc.workspace_setup_status(&ws.id);
+        assert_eq!(done.state, WorkspaceSetupState::Completed);
+        assert_eq!(done.exit_code, Some(0));
+        assert!(done.terminal_id.is_some(), "completed keeps the terminalId");
+        assert_eq!(done.started_at, running.started_at);
+        assert!(done.finished_at.is_some(), "completed carries finishedAt");
 
         assert_quiet(&mut sub).await;
     }
@@ -31978,6 +35408,10 @@ mod setup_lifecycle_events {
         assert_eq!(ev["type"], "workspace:setup:completed");
         assert_eq!(ev["data"]["ranScript"], json!(true));
         assert_eq!(ev["data"]["exitCode"], json!(7));
+        let failed = svc.workspace_setup_status(&ws.id);
+        assert_eq!(failed.state, WorkspaceSetupState::Failed);
+        assert_eq!(failed.exit_code, Some(7));
+        assert!(failed.finished_at.is_some());
 
         assert_quiet(&mut sub).await;
     }
@@ -32013,6 +35447,10 @@ mod setup_lifecycle_events {
             json!({ "workspaceId": ws.id.0, "ranScript": false }),
             "no exitCode key when no script ran"
         );
+        let skipped = svc.workspace_setup_status(&ws.id);
+        assert_eq!(skipped.state, WorkspaceSetupState::Skipped);
+        assert_eq!(skipped.exit_code, None);
+        assert_eq!(skipped.terminal_id, None);
 
         assert_quiet(&mut sub).await;
     }
@@ -32047,8 +35485,141 @@ mod setup_lifecycle_events {
             ev["data"],
             json!({ "workspaceId": ws.id.0, "ranScript": false })
         );
+        assert_eq!(
+            svc.workspace_setup_status(&ws.id).state,
+            WorkspaceSetupState::Skipped
+        );
 
         assert_quiet(&mut sub).await;
+    }
+
+    /// An infrastructure failure persisting the `initialAgent` returns from
+    /// the create after the workspace row (and its `pending` record) exist
+    /// but before the setup stage is scheduled, so nothing would ever settle
+    /// that record: the row must read `skipped`, never a permanent `pending`.
+    #[intent_test_macros::daemon_test]
+    async fn initial_agent_persist_failure_settles_setup_state_skipped() {
+        let (repo_dir, head_branch) = seed_repo("intentd-setupev-agentfail-repo");
+        let root = unique_dir("intentd-setupev-agentfail-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(test_registry_with_default_provider(&tmp));
+        // The workspace row lands in `workspace`; the agent row insert is the
+        // first store write that touches `agent_session`.
+        sqlx::query("DROP TABLE agent_session")
+            .execute(store.write_pool())
+            .await
+            .expect("drop agent_session table");
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    setup_script: Some("exit 0".to_string()),
+                    initial_agent: Some(WorkspaceCreateInitialAgent {
+                        prompt: Some("inspect the workspace".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("agent persist failure surfaces");
+        assert!(
+            matches!(err, crate::Error::Internal(_)),
+            "infrastructure failure is -32603, got {err:?}"
+        );
+
+        let rows = store.list_workspaces(true).await.expect("workspaces");
+        assert_eq!(rows.len(), 1, "the workspace row was inserted first");
+        assert!(
+            rows[0]
+                .worktree_path
+                .as_deref()
+                .is_some_and(|p| !p.is_empty()),
+            "a worktree was provisioned, so the record started `pending`: {rows:?}"
+        );
+        let status = svc.workspace_setup_status(&rows[0].id);
+        assert_eq!(
+            status.state,
+            WorkspaceSetupState::Skipped,
+            "no setup stage runs for this create: {status:?}"
+        );
+    }
+
+    /// The setup state map's transitions, driven directly: `pending` →
+    /// `running` (state + terminal in one write) → `completed` / `failed`;
+    /// a `started` stage whose spawn failed (`ranScript: false`) goes
+    /// straight from `pending` to `failed` with no exit code; an unrecorded
+    /// workspace reads `unknown`; the wire shape omits absent optional
+    /// fields instead of emitting `null`.
+    #[test]
+    fn setup_state_transitions_and_unknown_default() {
+        use crate::{
+            record_setup_finished, record_setup_pending, record_setup_running,
+            record_setup_skipped, WorkspaceSetupStates,
+        };
+        use intent_core::WorkspaceId;
+
+        let states = WorkspaceSetupStates::default();
+        let read = |id: &WorkspaceId| states.get(id);
+
+        let unrecorded = WorkspaceId::new();
+        let unknown = read(&unrecorded);
+        assert_eq!(unknown.state, WorkspaceSetupState::Unknown);
+        assert_eq!(
+            serde_json::to_value(&unknown).unwrap(),
+            json!({ "state": "unknown" }),
+            "optional fields are omitted, never null"
+        );
+
+        let ok = WorkspaceId::new();
+        record_setup_pending(&states, &ok);
+        assert_eq!(
+            serde_json::to_value(read(&ok)).unwrap(),
+            json!({ "state": "pending" })
+        );
+        record_setup_running(&states, &ok, "term-1");
+        let running = read(&ok);
+        assert_eq!(running.state, WorkspaceSetupState::Running);
+        assert!(running.started_at.is_some());
+        assert_eq!(running.terminal_id.as_deref(), Some("term-1"));
+        record_setup_finished(&states, &ok, true, Some(0));
+        let done = read(&ok);
+        assert_eq!(done.state, WorkspaceSetupState::Completed);
+        assert_eq!(done.exit_code, Some(0));
+        assert_eq!(done.terminal_id.as_deref(), Some("term-1"));
+        assert_eq!(done.started_at, running.started_at);
+        assert!(done.finished_at.is_some());
+
+        let nonzero = WorkspaceId::new();
+        record_setup_running(&states, &nonzero, "term-2");
+        record_setup_finished(&states, &nonzero, true, Some(3));
+        let failed = read(&nonzero);
+        assert_eq!(failed.state, WorkspaceSetupState::Failed);
+        assert_eq!(failed.exit_code, Some(3));
+        assert_eq!(failed.terminal_id.as_deref(), Some("term-2"));
+
+        let spawn_failed = WorkspaceId::new();
+        record_setup_pending(&states, &spawn_failed);
+        record_setup_finished(&states, &spawn_failed, false, None);
+        let failed = read(&spawn_failed);
+        assert_eq!(failed.state, WorkspaceSetupState::Failed);
+        assert_eq!(failed.exit_code, None);
+        assert_eq!(failed.terminal_id, None);
+        assert!(failed.finished_at.is_some());
+
+        let skipped = WorkspaceId::new();
+        record_setup_pending(&states, &skipped);
+        record_setup_skipped(&states, &skipped);
+        let skipped = read(&skipped);
+        assert_eq!(skipped.state, WorkspaceSetupState::Skipped);
+        assert!(skipped.finished_at.is_some());
+        assert_eq!(skipped.exit_code, None);
     }
 
     /// `workspace.duplicate` runs no setup script: exactly one immediate
@@ -32084,6 +35655,10 @@ mod setup_lifecycle_events {
             ev["data"],
             json!({ "workspaceId": dup.id.0, "ranScript": false })
         );
+        assert_eq!(
+            svc.workspace_setup_status(&dup.id).state,
+            WorkspaceSetupState::Skipped
+        );
 
         assert_quiet(&mut sub).await;
     }
@@ -32091,25 +35666,31 @@ mod setup_lifecycle_events {
     /// `publish_workspace_created` (the out-of-`Services` insert path used by
     /// the legacy importer) pairs its `workspace:created` with an immediate
     /// `completed { ranScript: false }` — imports run no setup stage, so the
-    /// watcher registry must not hold their watcher start until the backstop.
+    /// watcher registry must not hold their watcher start until the backstop
+    /// — and records `skipped` in the shared setup-state map, so a workspace
+    /// row the importer wrote directly through `Store` reads `skipped` (not
+    /// `unknown`) from `workspace_setup_status`.
     #[intent_test_macros::daemon_test]
     async fn publish_workspace_created_emits_immediate_completed() {
-        let root = unique_dir("intentd-setupev-legacy-root");
-        let (svc, bus, _tmp) = services(root.0.clone()).await;
+        use crate::WorkspaceSetupStates;
 
-        let ws = svc
-            .create_workspace(
-                WorkspaceCreate {
-                    title: Some("Imported".to_string()),
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .expect("create")
-            .workspace;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let states = WorkspaceSetupStates::default();
+        let svc = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_workspace_setup_states(states.clone());
 
-        // Subscribe after the create so only the re-publish is in scope.
+        // Insert directly through `Store`, as the importer does: no
+        // `create_workspace`, so nothing has pre-seeded the map.
+        let ws = super::workspace(&intent_core::WorkspaceId::new());
+        store.insert_workspace(&ws).await.expect("insert");
+        assert_eq!(
+            svc.workspace_setup_status(&ws.id).state,
+            WorkspaceSetupState::Unknown
+        );
+
         let mut sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![
                 "workspace:created".to_string(),
@@ -32117,7 +35698,7 @@ mod setup_lifecycle_events {
             ],
             ..Default::default()
         });
-        crate::publish_workspace_created(&bus, &ws).await;
+        crate::publish_workspace_created(&bus, Some(&states), &ws).await;
 
         let ev = recv_setup(&mut sub).await;
         assert_eq!(ev["type"], "workspace:created");
@@ -32130,6 +35711,9 @@ mod setup_lifecycle_events {
             ev["data"],
             json!({ "workspaceId": ws.id.0, "ranScript": false })
         );
+        let skipped = svc.workspace_setup_status(&ws.id);
+        assert_eq!(skipped.state, WorkspaceSetupState::Skipped);
+        assert!(skipped.finished_at.is_some());
 
         assert_quiet(&mut sub).await;
     }
@@ -32137,6 +35721,203 @@ mod setup_lifecycle_events {
 
 mod file_ops_service {
     use super::*;
+
+    #[intent_test_macros::daemon_test]
+    async fn file_read_registered_root_preserves_content_and_confinement() {
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.unwrap();
+        let dir = test_tempdir("intentd-file-read-roots-");
+        let primary = dir.path().join("primary");
+        let external = dir.path().join("external");
+        let sandbox = dir.path().join("sandbox");
+        for path in [&primary, &external, &sandbox] {
+            std::fs::create_dir_all(path).unwrap();
+            git2::Repository::init(path).unwrap();
+        }
+        let ws = WorkspaceId::new();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(primary.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.unwrap();
+        let caller = AgentId::new();
+        let mut session = super::turn_end_unread_gate::session(&caller, &ws);
+        session.sandbox_path = Some(sandbox.to_string_lossy().into_owned());
+        store.insert_agent_session(&session).await.unwrap();
+        let svc = Services::new(store);
+        let root = svc
+            .git_root_register(
+                ws.clone(),
+                external.to_string_lossy().into_owned(),
+                caller.clone(),
+            )
+            .await
+            .unwrap();
+        let root_id = intent_core::WorkspaceGitRootId::from(root["id"].as_str().unwrap());
+        std::fs::write(primary.join("new.txt"), "primary").unwrap();
+        std::fs::write(sandbox.join("new.txt"), "sandbox").unwrap();
+        std::fs::write(external.join("new.txt"), "external λ\n").unwrap();
+        for (agent, root, expected) in [
+            (None, None, "primary"),
+            (Some(caller.clone()), None, "sandbox"),
+            (None, Some(root_id.clone()), "external λ\n"),
+            (Some(caller), Some(root_id.clone()), "external λ\n"),
+        ] {
+            assert_eq!(
+                svc.file_read(ws.clone(), "new.txt".into(), agent.clone(), root.clone())
+                    .await
+                    .unwrap(),
+                serde_json::json!(expected)
+            );
+            let chunk = svc
+                .file_read_chunk(ws.clone(), "new.txt".into(), 0, 100, agent, root)
+                .await
+                .unwrap();
+            assert_eq!(
+                chunk["content"],
+                base64::engine::general_purpose::STANDARD.encode(expected)
+            );
+            assert_eq!(chunk["bytesRead"], expected.len());
+        }
+        // Existing full-text behavior has no chunk-size cap and no truncation.
+        let large = "x".repeat(crate::file_ops::READ_CHUNK_MAX_BYTES + 1);
+        std::fs::write(external.join("large.txt"), &large).unwrap();
+        assert_eq!(
+            svc.file_read(ws.clone(), "large.txt".into(), None, Some(root_id.clone()))
+                .await
+                .unwrap(),
+            serde_json::json!(large)
+        );
+        std::fs::write(external.join("empty.txt"), "").unwrap();
+        assert_eq!(
+            svc.file_read(ws.clone(), "empty.txt".into(), None, Some(root_id.clone()))
+                .await
+                .unwrap(),
+            serde_json::json!("")
+        );
+        std::fs::write(external.join("binary.bin"), [0xff, 0xfe]).unwrap();
+        for (offset, length, expected) in [
+            (0, 1, vec![0xff]),
+            (1, 16, vec![0xfe]),
+            (2, 16, vec![]),
+            (20, 16, vec![]),
+        ] {
+            let chunk = svc
+                .file_read_chunk(
+                    ws.clone(),
+                    "binary.bin".into(),
+                    offset,
+                    length,
+                    None,
+                    Some(root_id.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                chunk,
+                serde_json::json!({"content": base64::engine::general_purpose::STANDARD.encode(&expected), "bytesRead": expected.len(), "size": 2})
+            );
+        }
+        for length in [0, crate::file_ops::READ_CHUNK_MAX_BYTES as u64 + 1] {
+            assert!(matches!(
+                svc.file_read_chunk(
+                    ws.clone(),
+                    "binary.bin".into(),
+                    0,
+                    length,
+                    None,
+                    Some(root_id.clone())
+                )
+                .await,
+                Err(Error::InvalidParams(_))
+            ));
+        }
+        for path in ["missing.txt", "../primary/new.txt"] {
+            assert!(matches!(
+                svc.file_read_chunk(ws.clone(), path.into(), 0, 16, None, Some(root_id.clone()))
+                    .await,
+                Err(Error::Internal(_))
+            ));
+        }
+        assert!(matches!(
+            svc.file_read_chunk(ws.clone(), ".".into(), 0, 16, None, Some(root_id.clone()))
+                .await,
+            Err(Error::InvalidParams(_))
+        ));
+        for path in ["binary.bin", "missing.txt", ".", "../primary/new.txt"] {
+            assert!(
+                matches!(
+                    svc.file_read(ws.clone(), path.into(), None, Some(root_id.clone()))
+                        .await,
+                    Err(Error::Internal(_))
+                ),
+                "{path}"
+            );
+        }
+        let outside = primary.join("new.txt").to_string_lossy().into_owned();
+        assert!(matches!(
+            svc.file_read_chunk(
+                ws.clone(),
+                outside.clone(),
+                0,
+                16,
+                None,
+                Some(root_id.clone())
+            )
+            .await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            svc.file_read(ws.clone(), outside, None, Some(root_id.clone()))
+                .await,
+            Err(Error::Internal(_))
+        ));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(primary.join("new.txt"), external.join("escape.txt"))
+                .unwrap();
+            std::os::unix::fs::symlink(external.join("new.txt"), external.join("alias.txt"))
+                .unwrap();
+            assert!(matches!(
+                svc.file_read(ws.clone(), "escape.txt".into(), None, Some(root_id.clone()))
+                    .await,
+                Err(Error::Internal(_))
+            ));
+            assert!(matches!(
+                svc.file_read_chunk(
+                    ws.clone(),
+                    "escape.txt".into(),
+                    0,
+                    16,
+                    None,
+                    Some(root_id.clone())
+                )
+                .await,
+                Err(Error::Internal(_))
+            ));
+            let chunk = svc
+                .file_read_chunk(
+                    ws.clone(),
+                    "alias.txt".into(),
+                    0,
+                    100,
+                    None,
+                    Some(root_id.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                chunk["content"],
+                base64::engine::general_purpose::STANDARD.encode("external λ\n")
+            );
+            assert_eq!(
+                svc.file_read(ws, "alias.txt".into(), None, Some(root_id))
+                    .await
+                    .unwrap(),
+                serde_json::json!("external λ\n")
+            );
+        }
+    }
 
     /// `file.*` wired through `WorkspaceApi`: the workspace root resolves from
     /// `worktreePath`, writes/reads round-trip, and an out-of-workspace path
@@ -32169,7 +35950,7 @@ mod file_ops_service {
         );
 
         let read = svc
-            .file_read(ws.clone(), "notes/x.txt".to_string(), None)
+            .file_read(ws.clone(), "notes/x.txt".to_string(), None, None)
             .await
             .expect("read");
         assert_eq!(read, serde_json::Value::String("hi".to_string()));
@@ -32184,7 +35965,7 @@ mod file_ops_service {
         );
 
         let denied = svc
-            .file_read(ws.clone(), "../escape".to_string(), None)
+            .file_read(ws.clone(), "../escape".to_string(), None, None)
             .await;
         assert!(matches!(denied, Err(Error::Internal(_))));
     }
@@ -35707,13 +39488,11 @@ mod clone_orchestration {
     /// `workspace.cowIsolation` on and a CoW-capable filesystem, the local
     /// create streams the `cow-copy 30` milestone (not `worktree`) with the
     /// echoed `progressId` and one terminal done.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn progress_id_cow_create_streams_cow_copy_milestone() {
         let repo = seed_repo("intentd-prog-cow-src");
         let root = unique_dir("intentd-prog-cow-root");
-        if intent_git::cow_probe(&repo.0, &root.0).unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -35764,6 +39543,9 @@ mod clone_orchestration {
         assert!(
             !frames.iter().any(|f| f.data["phase"] == "worktree"),
             "no worktree milestone on the CoW path: {frames:?}"
+        );
+        eprintln!(
+            "CoW fixture assertions passed: progress_id_cow_create_streams_cow_copy_milestone"
         );
     }
 
@@ -36651,6 +40433,12 @@ mod browser_client_pin {
             self.clients
                 .iter()
                 .map(|(id, name, eligible)| ReverseLiveClient {
+                    principal_id: None,
+                    host_role: None,
+                    login: None,
+                    display_name: None,
+                    avatar_url: None,
+                    identity: None,
                     client_id: id.clone(),
                     name: name.clone(),
                     capabilities: json!({ "browserExec": eligible }),
@@ -36726,11 +40514,13 @@ mod browser_client_pin {
             json!([
                 {
                     "clientId": "desktop-a", "name": "Desktop A",
+                    "login": null, "displayName": null, "avatarUrl": null,
                     "capabilities": { "browserExec": true }, "connections": 1,
                     "transports": ["wss"], "connectedAt": "2026-09-06T00:00:00Z"
                 },
                 {
                     "clientId": "aux",
+                    "login": null, "displayName": null, "avatarUrl": null,
                     "capabilities": { "browserExec": false }, "connections": 1,
                     "transports": ["wss"], "connectedAt": "2026-09-06T00:00:00Z"
                 }
@@ -39362,7 +43152,7 @@ mod last_activity_events {
             .get(&h.ws)
             .copied()
             .expect("watermark set after first scan");
-        assert_eq!(watermark1, 1, "watermark should be 1 after one message");
+        assert_eq!(watermark1.0, 1, "watermark should be 1 after one message");
 
         let changed2 = h
             .services
@@ -39403,7 +43193,7 @@ mod last_activity_events {
             .get(&h.ws)
             .copied()
             .expect("watermark 1");
-        assert_eq!(watermark1, 1, "one message");
+        assert_eq!(watermark1.0, 1, "one message");
 
         let usage2 = serde_json::json!({ "usage": { "inputTokens": 20, "outputTokens": 10 } });
         h.store
@@ -39426,7 +43216,7 @@ mod last_activity_events {
             .get(&h.ws)
             .copied()
             .expect("watermark 2");
-        assert_eq!(watermark2, 2, "two messages");
+        assert_eq!(watermark2.0, 2, "two messages");
 
         let ws = h.store.get_workspace(&h.ws).await.unwrap();
         let usage = ws.token_usage.expect("usage persisted");
@@ -40002,7 +43792,7 @@ mod turn_end_unread_gate {
             "a muted agent must not raise the turn-end blue dot"
         );
         h.store
-            .set_agent_notifications_muted(&h.ws, &agent_id, false, &now_iso())
+            .set_agent_notifications_muted(&h.ws, &agent_id, false)
             .await
             .expect("unmute session");
         assert!(
@@ -40247,12 +44037,12 @@ mod turn_token_usage {
     use crate::{EventBus, Subscription, SubscriptionFilter};
     use intent_acp::session::Usage;
     use intent_core::events::WORKSPACE_TOKEN_USAGE_CHANGED;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::time::Duration;
     use tokio::time::timeout;
 
     struct Harness {
-        _tmp: TempDb,
+        tmp: TempDb,
         store: Store,
         services: Services,
         bus: EventBus,
@@ -40270,7 +44060,7 @@ mod turn_token_usage {
         let bus = EventBus::new(store.clone());
         let services = Services::new(store.clone()).with_event_bus(bus.clone());
         Harness {
-            _tmp: tmp,
+            tmp,
             store,
             services,
             bus,
@@ -40358,6 +44148,205 @@ mod turn_token_usage {
         }
     }
 
+    #[tokio::test]
+    async fn token_scan_observes_same_length_role_and_model_replacements() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "model-a"))
+            .await
+            .unwrap();
+        h.services
+            .agent_append_message_op(agent.clone(), "user".into(), json!([]), None)
+            .await
+            .unwrap();
+        assert!(h.services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        let original_watermark = h.services.token_usage_watermarks.lock().unwrap()[&h.ws];
+        let initial = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .unwrap()
+            .token_usage
+            .unwrap();
+        let initial_cells = initial.by_agent_model.unwrap();
+        assert_eq!(
+            (
+                initial_cells[0].human_messages,
+                initial_cells[0].agent_messages
+            ),
+            (1, 0)
+        );
+
+        // The role changes first; then only the model changes. Both mutations
+        // retain COUNT(*) = 1, and neither waits for another ACP turn.
+        for model in ["model-a", "model-b"] {
+            h.store
+                .set_agent_session_model(&h.ws, &agent, model, None, &now_iso())
+                .await
+                .unwrap();
+            h.services
+                .agent_replace_messages_op(
+                    agent.clone(),
+                    json!([{
+                        "role":"assistant", "contentBlocks":[{"type":"text","text":model}]
+                    }]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                h.store
+                    .get_workspace_message_watermark(&h.ws)
+                    .await
+                    .unwrap(),
+                1
+            );
+            let mut sub = subscribe_usage(&h);
+            assert!(h.services.scan_workspace_token_usage(&h.ws).await.unwrap());
+            let event = recv_usage_event(&mut sub).await;
+            assert_eq!(
+                event["data"]["tokenUsage"]["byAgentModel"][0]["model"],
+                model
+            );
+            let usage = h
+                .store
+                .get_workspace(&h.ws)
+                .await
+                .unwrap()
+                .token_usage
+                .unwrap();
+            let cells = usage.by_agent_model.unwrap();
+            assert_eq!(cells.len(), 1);
+            assert_eq!(cells[0].model, model);
+            assert_eq!((cells[0].human_messages, cells[0].agent_messages), (0, 1));
+            assert_eq!(usage.totals, intent_core::TokenUsageTotals::default());
+            let watermark = h.services.token_usage_watermarks.lock().unwrap()[&h.ws];
+            assert_eq!(watermark.0, original_watermark.0);
+            assert_ne!(watermark.1, original_watermark.1);
+            assert!(
+                !h.services.scan_workspace_token_usage(&h.ws).await.unwrap(),
+                "unchanged scan still skips"
+            );
+        }
+
+        // A committed mutation just before shutdown must be caught by the
+        // first rehydrated scan even though process-local epochs start empty.
+        h.services
+            .agent_replace_messages_op(
+                agent.clone(),
+                json!([{
+                    "role":"user", "contentBlocks":[]
+                }]),
+            )
+            .await
+            .unwrap();
+        h.store.close().await;
+        let reopened = Store::open(&h.tmp.path).await.unwrap();
+        let services = Services::new(reopened.clone());
+        assert!(services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        let usage = reopened
+            .get_workspace(&h.ws)
+            .await
+            .unwrap()
+            .token_usage
+            .unwrap();
+        let cells = usage.by_agent_model.unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].model, "model-b");
+        assert_eq!((cells[0].human_messages, cells[0].agent_messages), (1, 0));
+        assert!(!services.scan_workspace_token_usage(&h.ws).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn token_scan_observes_edit_truncate_then_append_at_unchanged_count() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "model-a"))
+            .await
+            .unwrap();
+        for role in ["user", "assistant", "user", "assistant"] {
+            h.services
+                .agent_append_message_op(agent.clone(), role.into(), json!([]), None)
+                .await
+                .unwrap();
+        }
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 20, 0, 0)), None)
+            .await;
+        h.services.scan_workspace_token_usage(&h.ws).await.unwrap();
+        let before = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .unwrap()
+            .token_usage
+            .unwrap();
+        let old_watermark = h.services.token_usage_watermarks.lock().unwrap()[&h.ws];
+        let messages = h.store.get_agent_messages(&agent, None).await.unwrap();
+        assert_eq!(
+            h.services
+                .agent_edit_truncate_op(&agent, &messages[2].id)
+                .await
+                .unwrap(),
+            2
+        );
+        h.store
+            .set_agent_session_model(&h.ws, &agent, "model-b", None, &now_iso())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            h.services
+                .agent_append_message_op(agent.clone(), "assistant".into(), json!([]), None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            h.store
+                .get_workspace_message_watermark(&h.ws)
+                .await
+                .unwrap(),
+            old_watermark.0
+        );
+        let mut sub = subscribe_usage(&h);
+        assert!(h.services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        recv_usage_event(&mut sub).await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .unwrap()
+            .token_usage
+            .unwrap();
+        assert_eq!(
+            usage.totals, before.totals,
+            "edit never reduces historical spend"
+        );
+        let cells = usage.by_agent_model.unwrap();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].model, "model-a");
+        assert_eq!((cells[0].human_messages, cells[0].agent_messages), (1, 1));
+        assert_eq!(cells[1].model, "model-b");
+        assert_eq!((cells[1].human_messages, cells[1].agent_messages), (0, 2));
+        assert_eq!(cells[1].totals, intent_core::TokenUsageTotals::default());
+        assert!(!h.services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        h.store.close().await;
+        let reopened = Store::open(&h.tmp.path).await.unwrap();
+        let services = Services::new(reopened.clone());
+        assert!(!services.scan_workspace_token_usage(&h.ws).await.unwrap());
+        assert_eq!(
+            reopened
+                .get_workspace(&h.ws)
+                .await
+                .unwrap()
+                .token_usage
+                .unwrap()
+                .by_agent_model
+                .unwrap(),
+            cells
+        );
+    }
+
     /// Two turns on the same session: the workspace tally equals the LATEST
     /// cumulative snapshot, never the sum, and each change emits one
     /// `workspace:tokenUsage-changed` carrying the new tally.
@@ -40401,7 +44390,110 @@ mod turn_token_usage {
         assert_eq!(usage.totals.cache_creation_tokens, 6);
         assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 100);
         assert_eq!(usage.by_model["opus-4.8"].input_tokens, 100);
+        let cells = usage
+            .by_agent_model
+            .expect("new snapshots carry cross-filter cells");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].agent_id, agent.0);
+        assert_eq!(cells[0].model, "opus-4.8");
+        assert_eq!(cells[0].totals.input_tokens, 100);
+        assert_eq!((cells[0].human_messages, cells[0].agent_messages), (0, 0));
         assert!(usage.last_scan_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn model_switch_assigns_only_the_new_snapshot_delta_to_the_new_cell() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "model-a"))
+            .await
+            .expect("insert session");
+
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 0, 0, 0)), None)
+            .await;
+        h.store
+            .set_agent_session_model(&h.ws, &agent, "model-b", None, &now_iso())
+            .await
+            .expect("switch model");
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(150, 0, 0, 0)), None)
+            .await;
+
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("workspace")
+            .token_usage
+            .expect("usage");
+        assert_eq!(usage.totals.input_tokens, 150);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 150);
+        assert_eq!(usage.by_model["model-a"].input_tokens, 100);
+        assert_eq!(usage.by_model["model-b"].input_tokens, 50);
+        let cells = usage.by_agent_model.expect("cross-filter cells");
+        assert_eq!(cells[0].model, "model-a");
+        assert_eq!(cells[0].totals.input_tokens, 100);
+        assert_eq!(cells[1].model, "model-b");
+        assert_eq!(cells[1].totals.input_tokens, 50);
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_fallback_merges_with_new_materialized_message_counts() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "model-a"))
+            .await
+            .expect("insert session");
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(70, 0, 0, 0)), None)
+            .await;
+        sqlx::query("DELETE FROM agent_usage_cell WHERE agent_id=?")
+            .bind(&agent.0)
+            .execute(h.store.write_pool())
+            .await
+            .expect("simulate archive without cells");
+        h.store
+            .append_agent_message(&agent, "user", &serde_json::json!([]), &now_iso())
+            .await
+            .expect("append message");
+
+        h.services
+            .recompute_workspace_token_usage(&h.ws, false)
+            .await
+            .expect("recompute");
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("workspace")
+            .token_usage
+            .expect("usage");
+        assert_eq!(usage.totals.input_tokens, 70);
+        let cells = usage.by_agent_model.expect("cross-filter cells");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].totals.input_tokens, 70);
+        assert_eq!(cells[0].human_messages, 1);
+
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(100, 0, 0, 0)), None)
+            .await;
+        let usage = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("workspace after continued report")
+            .token_usage
+            .expect("usage after continued report");
+        assert_eq!(usage.totals.input_tokens, 100);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 100);
+        assert_eq!(usage.by_model["model-a"].input_tokens, 100);
+        let cells = usage.by_agent_model.expect("cross-filter cells");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].totals.input_tokens, 100);
+        assert_eq!(cells[0].human_messages, 1);
     }
 
     /// An identical snapshot re-report leaves the tally unchanged and emits no
@@ -42020,7 +46112,7 @@ mod provider_discovery_payload {
         let ok = PiCliStatus {
             command: "pi".into(),
             resolved_path: Some(std::path::PathBuf::from("/usr/local/bin/pi")),
-            version_output: Some("0.80.4".into()),
+            version_output: Some("0.81.0".into()),
             gate: PiCliGate::Ok,
         };
         let (obj, installed) = apply(&ok);
@@ -42971,7 +47063,7 @@ mod delete_grace_window {
     use crate::{EventBus, Services};
 
     struct Harness {
-        _tmp: TempDb,
+        tmp: TempDb,
         _ws_root: WorkspacesRoot,
         services: Services,
         bus: EventBus,
@@ -42989,12 +47081,29 @@ mod delete_grace_window {
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
         Harness {
-            _tmp: tmp,
+            tmp,
             _ws_root: ws_root,
             services,
             bus,
             ws,
         }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_discards_unclaimed_delete_undo_wait() {
+        let h = harness().await;
+        h.services
+            .schedule_workspace_delete(h.ws.clone(), 60_000)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), h.services.shutdown_store_writers())
+            .await
+            .unwrap();
+        h.bus.shutdown().await.unwrap();
+        h.services.store.close().await;
+        let reopened = Store::open(&h.tmp.path).await.unwrap();
+        assert!(reopened.get_workspace(&h.ws).await.is_ok());
+        reopened.close().await;
     }
 
     /// Bounded poll until the workspace row is gone (the timer commit is
@@ -43371,7 +47480,7 @@ mod bulk_delete_pool_pressure {
         let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
         drop(guard);
 
-        assert!(trash.is_none(), "nothing to detach");
+        assert!(trash.0.is_none(), "nothing to detach");
         let loud = capture.at_or_above(tracing::Level::WARN);
         assert!(
             loud.is_empty(),
@@ -43423,7 +47532,7 @@ mod bulk_delete_pool_pressure {
         let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
         drop(guard);
 
-        assert!(trash.is_none(), "nothing detached");
+        assert!(trash.0.is_none(), "nothing detached");
         let loud = capture.at_or_above(tracing::Level::WARN);
         assert!(
             loud.iter()
@@ -43548,7 +47657,7 @@ mod agent_delete_grace_window {
     use crate::{EventBus, Services};
 
     struct Harness {
-        _tmp: TempDb,
+        tmp: TempDb,
         _ws_root: WorkspacesRoot,
         services: Services,
         bus: EventBus,
@@ -43622,13 +47731,72 @@ mod agent_delete_grace_window {
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
         Harness {
-            _tmp: tmp,
+            tmp,
             _ws_root: ws_root,
             services,
             bus,
             ws,
             agent,
         }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_retains_claimed_agent_delete() {
+        let h = harness().await;
+        h.services.shutdown_group_persistence().await;
+        h.services
+            .agent_schedule_delete_op(h.agent.clone(), None, 50)
+            .await
+            .unwrap();
+        let held = h.services.store.write_pool().acquire().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h
+                .services
+                .pending_agent_deletes
+                .deadline(&crate::delete_grace::PendingDeleteSubject::Agent {
+                    workspace_id: h.ws.clone(),
+                    agent_id: h.agent.clone(),
+                })
+                .unwrap()
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timer claimed its cascade");
+        let shutdown = h.services.shutdown_store_writers();
+        tokio::pin!(shutdown);
+        let returned_early = tokio::select! {
+            biased;
+            () = &mut shutdown => true,
+            () = std::future::ready(()) => false,
+        };
+        drop(held);
+        if !returned_early {
+            tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
+                .await
+                .unwrap();
+        }
+        assert!(
+            !returned_early,
+            "shutdown abandoned a claimed agent-delete cascade"
+        );
+        h.bus.shutdown().await.unwrap();
+        h.services.store.close().await;
+        let reopened = Store::open(&h.tmp.path).await.unwrap();
+        assert!(matches!(
+            reopened.get_agent_session(&h.agent).await,
+            Err(Error::NotFound(_))
+        ));
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "agent:deleted"));
+        reopened.close().await;
     }
 
     /// Bounded poll until the session row is gone (the timer commit is
@@ -44072,6 +48240,7 @@ mod harness_versioning {
         let (_tmp, svc, ws) = setup().await;
         let created = create_agent(&svc, &ws, None).await;
         let agent = &created["agent"];
+        assert_eq!(agent["harnessVersion"], "3.0");
         assert_eq!(
             agent["harnessVersion"],
             intent_core::CURRENT_HARNESS_VERSION,
@@ -44084,6 +48253,7 @@ mod harness_versioning {
         // spot-check the defaults (all on, taskGraph included).
         assert_eq!(features["taskGraph"], true);
         assert_eq!(features["backgroundHooks"], true);
+        assert_eq!(features["peerAgents"], true);
 
         // Persisted, not projected: the row itself carries the stamp.
         let id = AgentId::from(agent["id"].as_str().unwrap());
@@ -44094,6 +48264,51 @@ mod harness_versioning {
         );
         let persisted = session.harness_features.expect("persisted snapshot");
         assert_eq!(persisted["taskGraph"], serde_json::json!(true));
+        assert_eq!(persisted["peerAgents"], serde_json::json!(true));
+        let full = svc.agent_get_session_op(id).await.expect("getSession");
+        assert_eq!(full.harness_version, "3.0");
+        assert_eq!(full.harness_features.as_ref(), Some(&persisted));
+        assert_eq!(agent["harnessFeatures"], persisted);
+    }
+
+    #[tokio::test]
+    async fn child_of_saved_2_9_keeps_parent_stamp_and_snapshot() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let parent_id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let mut saved_features = created["agent"]["harnessFeatures"].clone();
+        saved_features["hostExec"] = serde_json::json!(false);
+        saved_features["peerAgents"] = serde_json::json!(false);
+        sqlx::query(
+            "UPDATE agent_session SET harness_version = '2.9', harness_features = ? WHERE id = ?",
+        )
+        .bind(saved_features.to_string())
+        .bind(&parent_id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+        let child = create_agent(&svc, &ws, Some(parent_id.clone())).await;
+        assert_eq!(child["agent"]["harnessVersion"], "3.0");
+        assert_eq!(child["agent"]["harnessFeatures"]["hostExec"], true);
+        assert_eq!(child["agent"]["harnessFeatures"]["peerAgents"], true);
+        let child_id = AgentId::from(child["agent"]["id"].as_str().unwrap());
+        let child_row = svc.store().get_agent_session(&child_id).await.unwrap();
+        assert_eq!(child_row.harness_version, "3.0");
+        assert_eq!(child_row.parent_agent_id.as_ref(), Some(&parent_id));
+        assert_eq!(
+            child_row.harness_features.as_ref(),
+            Some(&child["agent"]["harnessFeatures"])
+        );
+        let child_full = svc.agent_get_session_op(child_id).await.unwrap();
+        assert_eq!(child_full.harness_version, "3.0");
+        assert_eq!(child_full.harness_features, child_row.harness_features);
+        let parent = svc.store().get_agent_session(&parent_id).await.unwrap();
+        assert_eq!(parent.harness_version, "2.9");
+        assert_eq!(parent.harness_features.as_ref(), Some(&saved_features));
+        assert!(!svc.session_agent_features(&parent).peer_agents);
+        let parent_full = svc.agent_get_session_op(parent_id).await.unwrap();
+        assert_eq!(parent_full.harness_version, "2.9");
+        assert_eq!(parent_full.harness_features.as_ref(), Some(&saved_features));
     }
 
     /// Delegation mints LATEST, never inherits: a child created by a parent
@@ -44180,6 +48395,57 @@ mod harness_versioning {
         assert_eq!(raw, None, "projection never writes the snapshot back");
     }
 
+    /// Snapshots captured before peerAgents existed keep that capability
+    /// unavailable on respawn, matching the unchanged read-only projection.
+    #[tokio::test]
+    async fn older_snapshot_without_peer_agents_keeps_feature_off() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let pinned = serde_json::json!({
+            "backgroundHooks": true,
+            "hostExec": false,
+            "scripts": true,
+            "terminalAccess": true,
+            "browserAutomation": true,
+            "richChatBlocks": true,
+            "structuredQuestions": true,
+            "attentionRequests": true,
+            "stateSnapshot": true,
+            "prMonitor": true,
+            "taskGraph": true
+        });
+        sqlx::query("UPDATE agent_session SET harness_features = ? WHERE id = ?")
+            .bind(pinned.to_string())
+            .bind(&id.0)
+            .execute(svc.store().write_pool())
+            .await
+            .expect("persist older snapshot");
+
+        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let features = svc.session_agent_features(&session);
+        assert!(svc.effective_settings().agent_features.peer_agents);
+        assert!(
+            !features.peer_agents,
+            "respawn must not enable peerAgents absent from the captured snapshot"
+        );
+        assert!(!features.host_exec, "other captured values still win");
+
+        let lite = svc.project_lite_with_flags(session);
+        assert_eq!(
+            lite.harness_features.as_ref(),
+            Some(&pinned),
+            "agent.get keeps peerAgents absent for the read-only feature display"
+        );
+        let full = svc
+            .agent_get_session_op(id.clone())
+            .await
+            .expect("getSession");
+        assert_eq!(full.harness_features.as_ref(), Some(&pinned));
+        let stored = svc.store().get_agent_session(&id).await.expect("reread");
+        assert_eq!(stored.harness_features, Some(pinned));
+    }
+
     /// The runtime surface follows the persisted snapshot, not live settings:
     /// `session_agent_features` (the respawn read used for the MCP bridge and
     /// prompt assembly) decodes `harness_features` when present — so a
@@ -44192,12 +48458,13 @@ mod harness_versioning {
         let created = create_agent(&svc, &ws, None).await;
         let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-        // Pin the persisted snapshot to a non-default shape (hostExec off —
-        // live default is on).
+        // Pin the persisted snapshot to explicit opt-outs while the live
+        // defaults are on.
         let mut pinned =
             serde_json::to_value(intent_core::settings_file::AgentFeaturesSettings::default())
                 .unwrap();
         pinned["hostExec"] = serde_json::json!(false);
+        pinned["peerAgents"] = serde_json::json!(false);
         sqlx::query("UPDATE agent_session SET harness_features = ? WHERE id = ?")
             .bind(pinned.to_string())
             .bind(&id.0)
@@ -44212,9 +48479,14 @@ mod harness_versioning {
             "respawn read follows the persisted snapshot (hostExec off), not live settings"
         );
         assert!(
+            !features.peer_agents,
+            "respawn preserves a session's captured peerAgents opt-out"
+        );
+        assert!(
             svc.effective_settings().agent_features.host_exec,
             "live settings still default hostExec on — the snapshot diverged deliberately"
         );
+        assert!(svc.effective_settings().agent_features.peer_agents);
 
         // Legacy NULL-snapshot rows fall back to the live settings.
         sqlx::query("UPDATE agent_session SET harness_features = NULL WHERE id = ?")

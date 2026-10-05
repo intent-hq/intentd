@@ -150,6 +150,7 @@ fn workspace(id: &WorkspaceId, title: &str) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -201,6 +202,7 @@ fn pr_info(number: u64, status: PullRequestStatus) -> PullRequestInfo {
         mergeable: None,
         mergeable_state: None,
         is_draft: None,
+        is_in_merge_queue: None,
     }
 }
 

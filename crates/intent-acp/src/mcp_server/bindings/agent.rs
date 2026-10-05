@@ -244,16 +244,14 @@ pub(crate) const PRELUDE: &str = r"
 pub(crate) const ATTENTION_PRELUDE_SEGMENT: &str = "        requestDiscussion: (reason) =>\n            host({ method: 'agent.requestDiscussion', args: { reason } }),\n        reportBlocker: (reason) =>\n            host({ method: 'agent.reportBlocker', args: { reason } }),\n";
 
 /// The `ws.agent.retire` installer lines inside [`PRELUDE`], removed when
-/// `agentFeatures.peerAgents` is off — the default, since the toggle is
-/// opt-in (a unit test guards that this segment still matches the prelude
-/// verbatim).
+/// `agentFeatures.peerAgents` is explicitly off (a unit test guards that
+/// this segment still matches the prelude verbatim).
 pub(crate) const RETIRE_PRELUDE_SEGMENT: &str = "        retire: (reason) =>\n            host({ method: 'agent.retire', args: { reason } }),\n";
 
 /// Feature-aware `ws.agent` prelude: with `agentFeatures.attentionRequests`
 /// off the two attention-request installers are omitted, and with
-/// `agentFeatures.peerAgents` off (the default — it is the one opt-in
-/// toggle) the `retire` installer is omitted, so agent code touching them
-/// fails with a clear `not a function` `TypeError`. Every other
+/// `agentFeatures.peerAgents` off the `retire` installer is omitted, so agent
+/// code touching them fails with a clear `not a function` `TypeError`. Every other
 /// `ws.agent.*` method (including `reportToParent`) stays un-gated. With
 /// both toggles on this borrows [`PRELUDE`] byte-identically.
 pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> Cow<'static, str> {
@@ -283,7 +281,22 @@ pub(crate) async fn dispatch(
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
-    let mut out = dispatch_inner(api, ws, caller, eval_budget, method, args).await?;
+    let read = dispatch_inner(api, ws, caller, eval_budget, method, args);
+    // Hooks evaluate as Daemon, but these agent-facing reads belong to the
+    // hook owner just as they do in a live MCP turn.
+    let mut out = if let Some(agent_id) =
+        caller.filter(|_| matches!(method, "status" | "getQueue" | "diagnostics"))
+    {
+        intent_core::with_caller(
+            intent_core::Caller::Agent {
+                agent_id: agent_id.clone(),
+            },
+            read,
+        )
+        .await?
+    } else {
+        read.await?
+    };
     strip_agent_hidden_fields(&mut out);
     Ok(out)
 }
@@ -307,8 +320,8 @@ async fn dispatch_inner(
         "unwatch" => unwatch(api, ws, caller, args).await,
         "list" => list(api, ws, args).await,
         "listSpecialists" => list_specialists(api, ws).await,
-        "status" => status(api, ws, args).await,
-        "getQueue" => get_queue(api, ws, args).await,
+        "status" => status(api, ws, caller, args).await,
+        "getQueue" => get_queue(api, ws, caller, args).await,
         "removeQueuedMessage" => remove_queued_message(api, ws, caller, args).await,
         "diagnostics" => diagnostics(api, ws, args).await,
         "snapshot" => snapshot(api, ws, caller).await,
@@ -756,7 +769,11 @@ fn effective_priority(args: &Value) -> Option<String> {
 /// with the replace outcome reported on the result. Success results carry a
 /// top-level `delivery` outcome ([`delivery_outcome`]) so `ok: true` +
 /// silently-queued is unambiguous even to a sender that only glances at
-/// the result.
+/// the result. A self-targeted send (`agentId` == the caller) is rejected by
+/// the service layer's `reject_self_targeted_send` guard on the
+/// daemon-stamped `fromAgentId` (intent-hq/intent#5669) — an error naming
+/// `ws.agent.reportToParent` / notes as the alternative, before any state
+/// change.
 ///
 /// The ENTIRE daemon-side sequence — retired-caller read → pending guard
 /// read → sender-name read → send → replace retraction → sender watch —
@@ -874,7 +891,9 @@ async fn send(
 /// `replaceOutcome: "reassigned"`. An agent caller passing
 /// `replacePending: true` always gets a replace report — the fall-through
 /// paths report `replaceOutcome: "none"` rather than silently ignoring the
-/// option. The entire daemon-side sequence (retired-caller read → task
+/// option. A task whose assignee is the caller is rejected by the op's
+/// self-targeted guard (intent-hq/intent#5669), same as [`send`]. The
+/// entire daemon-side sequence (retired-caller read → task
 /// resolution → guard read → sender-name read → send → retraction → watch)
 /// is spawned and budget-bounded exactly like [`send`]
 /// (intent-hq/intent#5387) — nothing awaits before the spawn; the op mints
@@ -1175,6 +1194,7 @@ async fn list(
                 ws.clone(),
                 intent_core::AgentListRowScope::Delegated {
                     parent_agent_id: filter.parent_agent_id.as_deref().map(AgentId::from),
+                    orphaned_only: false,
                 },
             )
             .await
@@ -1321,32 +1341,52 @@ async fn require_active_target(
 async fn status(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
     let agent_id = AgentId::from(agent_id_str.as_str());
     let agent = require_active_target(api, ws, &agent_id).await?;
     let mut out = serde_json::to_value(agent).map_err(|e| e.to_string())?;
-    let queue = fetch_presented_queue(api, ws, &agent_id).await?;
-    let queue: Vec<Value> = queue.into_iter().map(truncate_entry_content).collect();
+    let (queue, count) = fetch_queue_with_count(api, ws, &agent_id).await?;
+    let queue: Vec<Value> = if caller == Some(&agent_id) {
+        Vec::new()
+    } else {
+        queue.into_iter().map(truncate_entry_content).collect()
+    };
     if let Some(obj) = out.as_object_mut() {
-        obj.insert("queueLength".to_string(), json!(queue.len()));
+        obj.insert("queueLength".to_string(), json!(count));
         obj.insert("queue".to_string(), Value::Array(queue));
+        if caller == Some(&agent_id) {
+            obj.insert(
+                "queueNotice".to_string(),
+                json!(intent_core::SELF_QUEUE_DELIVERY_MESSAGE),
+            );
+        }
     }
     Ok(out)
 }
 
 /// `ws.agent.getQueue`: the target's full pending queue — every entry
 /// regardless of sender — in actual drain order (next delivery first).
+/// A recipient read returns a count and explains normal delivery instead.
 async fn get_queue(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let agent_id_str = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
     let agent_id = AgentId::from(agent_id_str.as_str());
     let _ = require_active_target(api, ws, &agent_id).await?;
-    let queue = fetch_presented_queue(api, ws, &agent_id).await?;
+    let (queue, count) = fetch_queue_with_count(api, ws, &agent_id).await?;
+    if caller == Some(&agent_id) {
+        return Ok(json!({
+            "ok": false, "refused": true, "agentId": agent_id_str,
+            "error": intent_core::SELF_QUEUE_DELIVERY_MESSAGE,
+            "queueLength": count, "queue": [],
+        }));
+    }
     Ok(json!({
         "ok": true,
         "agentId": agent_id_str,
@@ -1724,6 +1764,17 @@ async fn fetch_presented_queue(
     ws: &WorkspaceId,
     agent_id: &AgentId,
 ) -> Result<Vec<Value>, String> {
+    fetch_queue_with_count(api, ws, agent_id)
+        .await
+        .map(|(queue, _)| queue)
+}
+
+/// A self read returns a count even though the service omits its entries.
+async fn fetch_queue_with_count(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Result<(Vec<Value>, u64), String> {
     let v = api
         .agent_get_queue(agent_id.clone(), Some(ws.clone()))
         .await
@@ -1733,7 +1784,11 @@ async fn fetch_presented_queue(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    Ok(present_queue(raw))
+    let count = v
+        .get("queueLength")
+        .and_then(Value::as_u64)
+        .unwrap_or(raw.len() as u64);
+    Ok((present_queue(raw), count))
 }
 
 /// Single-pending-message guard on `ws.agent.send` / `ws.agent.sendToTask`:
@@ -2398,6 +2453,7 @@ mod tests {
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
                         last_activity: None,
+                        last_content_activity: None,
                         tags: vec![],
                         path: None,
                         repository_path: None,

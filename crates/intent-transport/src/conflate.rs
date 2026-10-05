@@ -15,7 +15,9 @@
 //!   carrying the newest live preview.
 //! - `terminal:data` — byte-concat per terminal: chunks are decoded, merged
 //!   in arrival order, and re-encoded as one frame (size-capped; an oversized
-//!   merge seals the entry and starts a new one).
+//!   merge seals the entry and starts a new one). Positioned output merges only
+//!   across valid adjacent ranges in the same boot; legacy cursorless chunks
+//!   retain byte-concat semantics.
 //! - `file:*` — latest-wins per (workspace, path): refetch triggers, not
 //!   content carriers; burst summaries carry `path` = directory, so
 //!   per-directory conflation falls out of the same key.
@@ -33,7 +35,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use intent_core::events::{AGENT_STREAM_ACTIVITY, CHAT_STREAM_DELTA, FILE_PREFIX, TERMINAL_DATA};
 use intent_core::Event;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 
 use crate::events;
@@ -250,6 +252,44 @@ pub(crate) enum EventItem {
     },
 }
 
+/// Cursorless producers keep the legacy concat behavior. Partial or invalid
+/// cursor metadata must never be silently converted into a different range.
+enum TerminalCursor<'a> {
+    Legacy,
+    Positioned { boot: &'a str, start: u64, end: u64 },
+    Invalid,
+}
+
+fn terminal_cursor(data: &Value, byte_len: usize) -> TerminalCursor<'_> {
+    if !["daemonBootId", "startOffset", "endOffset"]
+        .iter()
+        .any(|key| data.get(*key).is_some())
+    {
+        return TerminalCursor::Legacy;
+    }
+    let Some(boot) = data
+        .get("daemonBootId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return TerminalCursor::Invalid;
+    };
+    let offset = |key: &str| {
+        let text = data.get(key)?.as_str()?;
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        text.parse::<u64>().ok()
+    };
+    let (Some(start), Some(end)) = (offset("startOffset"), offset("endOffset")) else {
+        return TerminalCursor::Invalid;
+    };
+    if end.checked_sub(start) != u64::try_from(byte_len).ok() {
+        return TerminalCursor::Invalid;
+    }
+    TerminalCursor::Positioned { boot, start, end }
+}
+
 impl EventItem {
     /// Wrap a conflatable bus event for buffering, per its key kind.
     pub(crate) fn new(key: &Key, event: Event) -> Self {
@@ -319,11 +359,34 @@ impl Conflate for EventItem {
                         bytes: Some(add),
                     });
                 }
+                let start = match (
+                    terminal_cursor(&event.data, acc.len()),
+                    terminal_cursor(&new_event.data, add.len()),
+                ) {
+                    (TerminalCursor::Legacy, TerminalCursor::Legacy) => None,
+                    (
+                        TerminalCursor::Positioned { boot, start, end },
+                        TerminalCursor::Positioned {
+                            boot: next_boot,
+                            start: next_start,
+                            ..
+                        },
+                    ) if boot == next_boot && end == next_start => Some(start),
+                    _ => {
+                        return Some(EventItem::Terminal {
+                            event: new_event,
+                            bytes: Some(add),
+                        })
+                    }
+                };
                 acc.extend_from_slice(&add);
                 // The merged frame rides the newest event's envelope
                 // (id/timestamp), carrying all bytes in arrival order.
                 let merged = std::mem::take(bytes);
                 *event = new_event;
+                if let Some(start) = start {
+                    event.data["startOffset"] = Value::String(start.to_string());
+                }
                 *bytes = merged;
                 None
             }
@@ -407,18 +470,53 @@ impl Conflate for ChatItem {
                 {
                     slot.push_str(&add);
                 }
+                // The `media` sidecar (§7.1) composes like the fragments:
+                // the newer chunk's entries join the pending block's map.
+                if let Some(Value::Object(media)) =
+                    newer.entity.get("block").and_then(|b| b.get("media"))
+                {
+                    union_media_into(&mut self.entity, media);
+                }
                 None
             }
             // Full-text encoding: latest entity wins (each carries the FULL
             // accumulated text, CS-0 D2); the bucket of the first pending
-            // delta is preserved.
+            // delta is preserved. `media` is the one per-chunk field in this
+            // encoding (§7.1: each delta carries only what it resolved), so
+            // the pending entries are carried over under the newer ones.
             (None, None) => {
+                let pending_media = match self.entity.get("block").and_then(|b| b.get("media")) {
+                    Some(Value::Object(media)) => Some(media.clone()),
+                    _ => None,
+                };
                 self.entity = newer.entity;
+                if let Some(media) = pending_media {
+                    union_media_into(&mut self.entity, &media);
+                }
                 None
             }
             // Mixed shapes never occur within one subscription (the encoding
             // is fixed at subscribe time); refuse defensively.
             _ => Some(newer),
+        }
+    }
+}
+
+/// Union `media` entries into a chat delta entity's `block.media`; entries
+/// already present in the block win on a key collision (the pending state is
+/// the newer one whenever the caller carries older entries over).
+fn union_media_into(entity: &mut Value, media: &Map<String, Value>) {
+    let Some(Value::Object(block)) = entity.get_mut("block") else {
+        return;
+    };
+    match block.get_mut("media") {
+        Some(Value::Object(acc)) => {
+            for (k, v) in media {
+                acc.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        _ => {
+            block.insert("media".to_string(), Value::Object(media.clone()));
         }
     }
 }

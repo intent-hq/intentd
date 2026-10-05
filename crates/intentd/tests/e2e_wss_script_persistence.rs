@@ -1046,3 +1046,92 @@ async fn lost_command_script_hydrates_exited_over_wss() {
     drop(ws);
     stop(child);
 }
+
+/// The canonical wrapper's waiter outlives the daemon, while saved-script status
+/// remains honestly lost. Only the independent OS receipt can settle this run.
+#[tokio::test]
+async fn durable_command_evidence_survives_daemon_restart_over_wss() {
+    let data = scratch_dir("durable-command");
+    let repo = create_test_repo();
+    let (child, _port, _cfg, mut ws, workspace) =
+        boot_with_command_script(data.path(), repo.path(), "durable-command", "durable").await;
+    let mut daemon = common::DaemonGuard::process_only(child);
+    let evidence_root = data.path().join("command-evidence");
+    let ready = data.path().join("child-ready");
+    let release = data.path().join("child-release");
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let shell = format!(
+        // timing-guard: poll the release-file barrier under the command timeout
+        "touch {}; while [ ! -f {} ]; do sleep 0.02; done; printf retained; exit 29",
+        quote(ready.to_str().unwrap()),
+        quote(release.to_str().unwrap())
+    ); // timing-guard: explicit release-file barrier, bounded by command timeout
+    let command = format!(
+        "{} command-run --record-dir {} --invocation wss-run --timeout-seconds 90 -- /bin/sh -c {}",
+        quote(env!("CARGO_BIN_EXE_intentd")),
+        quote(evidence_root.to_str().unwrap()),
+        quote(&shell)
+    );
+    let created = wss_rpc_envelope(&mut ws, 3, "script.create", json!({
+        "workspaceId":workspace, "scriptId":"durable", "name":"durable", "mode":"command", "command":command
+    })).await;
+    assert_eq!(created["jsonrpc"], "2.0");
+    assert_eq!(created["id"], 3);
+    assert_eq!(created["result"]["id"], "durable");
+    wss_rpc(
+        &mut ws,
+        4,
+        "script.start",
+        json!({"workspaceId":workspace,"scriptId":"durable"}),
+    )
+    .await;
+    timeout(Duration::from_secs(30), async {
+        while !ready.exists() {
+            // timing-guard: wait until the independently supervised child is running
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("command ready");
+    drop(ws);
+    daemon.child_mut().kill().unwrap();
+    daemon.child_mut().wait().unwrap();
+    drop(daemon);
+    let (child, port, cfg) = boot(data.path()).await;
+    let _daemon = common::DaemonGuard::process_only(child);
+    let mut ws = connect_ws(port, cfg).await;
+    let state = wss_rpc(
+        &mut ws,
+        5,
+        "script.status",
+        json!({"workspaceId":workspace,"scriptId":"durable"}),
+    )
+    .await;
+    assert_lost_command_state(&state, "wrapper caller was lost");
+    assert!(!evidence_root.join("wss-run/result.json").exists());
+    std::fs::write(release, "release").unwrap();
+    timeout(Duration::from_secs(30), async {
+        while !evidence_root.join("wss-run/result.json").exists() {
+            // timing-guard: wait for atomic publication of OS exit evidence
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("durable exit receipt");
+    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .args(["command-result", "--record-dir"])
+        .arg(&evidence_root)
+        .args(["--invocation", "wss-run"])
+        .output()
+        .unwrap();
+    let evidence: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(evidence["outcome"], "exited");
+    assert_eq!(evidence["exitCode"], 29);
+    assert_eq!(evidence["signal"], Value::Null);
+    assert_eq!(evidence["invocation"]["id"], "wss-run");
+    assert_eq!(
+        std::fs::read_to_string(evidence_root.join("wss-run/stdout.log")).unwrap(),
+        "retained"
+    );
+    drop(ws);
+}
