@@ -543,7 +543,10 @@ async fn handle_status_returns_a_response_frame() {
     // Administrator: the full snapshot, counts included.
     assert_eq!(parsed["result"]["agents"], 1);
     assert_eq!(parsed["result"]["clients"], 2);
-    assert_eq!(parsed["result"].get("collaborationName"), Some(&Value::Null));
+    assert_eq!(
+        parsed["result"].get("collaborationName"),
+        Some(&Value::Null)
+    );
     assert!(!control.shutdown_called.load(Ordering::SeqCst));
 }
 
