@@ -328,8 +328,7 @@ mod tests {
             ephemeral_command_profile("auggie", LaunchPurpose::Completion, &command, dir.path())
                 .unwrap();
         let path = profile.path().to_owned();
-        // caller-binding: allow — test owns only a subprocess and profile, with no service calls.
-        let runner = tokio::spawn(run_utility(
+        let runner = intent_core::spawn_with_current_caller(run_utility(
             command,
             profile,
             Vec::new(),
@@ -399,8 +398,7 @@ pub(crate) async fn run_utility(
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    // caller-binding: allow — subprocess I/O and tree cleanup only; policy was checked before spawn.
-    tokio::spawn(async move {
+    intent_core::spawn_with_current_caller(async move {
         let profile = std::mem::ManuallyDrop::new(profile);
         let run = async {
             let write = async {
