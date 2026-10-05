@@ -1,4 +1,4 @@
-# Only disposable Cargo profiles below m1mac's intentd CI target are eligible.
+# Only disposable Cargo debug profiles below m1mac's intentd CI target are eligible.
 # The script fails closed on live/unknown ownership and stops at disk headroom.
 name: macOS CI disk cleanup
 on:
