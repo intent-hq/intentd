@@ -768,3 +768,5 @@ mod commit;
 #[path = "staged_commit_groups.rs"]
 mod commit_groups;
 mod search_ranges;
+
+mod search_output;

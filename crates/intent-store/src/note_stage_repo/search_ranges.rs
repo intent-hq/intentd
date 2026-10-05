@@ -19,9 +19,7 @@ use sqlx::SqliteConnection;
 const SAFE: u64 = 9_007_199_254_740_991;
 const UPLOADED: &str = "SELECT chunk_sequence,ordinal,CASE WHEN length(CAST(value AS BLOB))<=65536 THEN value ELSE NULL END FROM note_stage_record WHERE operation_key=? AND stream='selection' AND (chunk_sequence,ordinal)>(?,?) ORDER BY chunk_sequence,ordinal LIMIT 1";
 const SORTED: &str = "SELECT start,end,ordinal FROM note_stage_search_input WHERE operation_key=? AND generation=? AND (start,end,ordinal)>(?,?,?) ORDER BY start,end,ordinal LIMIT 1";
-#[cfg(test)]
 const FIRST: &str = "SELECT start,end FROM note_stage_search_range WHERE operation_key=? AND generation=? ORDER BY start LIMIT 1";
-#[cfg(test)]
 const NEXT: &str = "SELECT start,end FROM note_stage_search_range WHERE operation_key=? AND generation=? AND start>? ORDER BY start LIMIT 1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,7 +240,6 @@ async fn emit(
 /// One indexed normalized interval. Caller binds cursor/operation/generation and
 /// lifetime; this function alone is not public sealed-state admission. Returned
 /// starts increase strictly and intervals never touch, so no match crosses a gap.
-#[cfg(test)]
 pub(super) async fn next_interval(
     conn: &mut SqliteConnection,
     operation: &str,

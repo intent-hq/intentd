@@ -84,6 +84,9 @@ impl Store {
         {
             return Err(fail(NoteMutationError::Invalid));
         }
+        if request.kind == NoteStageReadKind::Search {
+            return super::search_output::read(self, principal, request, rpc_id).await;
+        }
         if request.kind != NoteStageReadKind::Source {
             return Err(Error::Unsupported("staged output adapter".into()));
         }

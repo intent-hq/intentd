@@ -229,7 +229,7 @@ async fn search_detail_rejects_surrogate_endpoints_and_off_position_requests() {
 
 #[tokio::test]
 async fn search_detail_fits_complete_escaped_frame_and_never_publishes_empty() {
-    let (mut conn, length) = fixture("😀\"\\\n界more").await;
+    let (mut conn, length) = fixture(&"😀\"\\\n界more".repeat(64)).await;
     let bound = binding(length);
     let reference = issue(&bound, 0, length, 0);
     let request = SearchDetailRead {
@@ -256,6 +256,14 @@ async fn search_detail_fits_complete_escaped_frame_and_never_publishes_empty() {
         .len()
     };
     let exact = frame(&first);
+    let whole = read_fragment(&mut conn, &request, |_| Ok(true))
+        .await
+        .unwrap();
+    assert!(whole["nextRef"].is_null());
+    assert!(
+        frame(&whole) > exact,
+        "fixture must force a nonterminal frame cut"
+    );
     let item = read_fragment(&mut conn, &request, |item| Ok(frame(item) <= exact))
         .await
         .unwrap();
@@ -328,4 +336,39 @@ async fn search_detail_requires_retained_operation_generation_and_exact_extent()
     assert_eq!(item["text"], "c");
     assert_eq!(item["offset"], 0);
     assert!(item["nextRef"].is_null());
+}
+
+#[tokio::test]
+async fn search_detail_terminal_frame_can_be_smaller_than_first_fragment() {
+    let (mut conn, length) = fixture("😀small").await;
+    let bound = binding(length);
+    let reference = issue(&bound, 0, length, 0);
+    let request = SearchDetailRead {
+        context: &bound,
+        reference: &reference,
+        offset: None,
+        max_source_bytes: 4,
+    };
+    let first = read_fragment(&mut conn, &request, |_| Ok(true))
+        .await
+        .unwrap();
+    let frame = |item: &Value| {
+        json!({"jsonrpc":"2.0","id":1,"result":{"items":[item],"nextCursor":null}})
+            .to_string()
+            .len()
+    };
+    let exact = frame(&first);
+    let whole = read_fragment(
+        &mut conn,
+        &SearchDetailRead {
+            max_source_bytes: 16384,
+            ..request
+        },
+        |item| Ok(frame(item) <= exact),
+    )
+    .await
+    .unwrap();
+    assert!(frame(&whole) < exact);
+    assert_eq!(whole["text"], "😀small");
+    assert!(whole["nextRef"].is_null());
 }

@@ -36,6 +36,9 @@ impl Services {
         rpc_id: Value,
     ) -> Result<Value> {
         query.validate().map_err(Error::NoteMutation)?;
+        if query.reference.starts_with("nsh1.") {
+            return self.read_stage_search_detail(query, rpc_id).await;
+        }
         let workspace = WorkspaceId(query.scope.workspace_id.clone());
         self.require_member(&workspace).await?;
         self.store.get_workspace(&workspace).await?;

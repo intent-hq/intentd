@@ -447,3 +447,107 @@ async fn staged_source_service_rechecks_after_result_and_original_expiry() {
         assert!(service.stage_request_admission.0.lock().unwrap().is_empty());
     }
 }
+
+#[tokio::test]
+async fn staged_search_service_rechecks_results_and_detail_original_expiry() {
+    for detail in [false, true] {
+        for mode in 0..3 {
+            let (_tmp, service, workspace, note) = setup("frozen😀").await;
+            let caller = guest(&service, &workspace).await;
+            let mut begin = begin_request(&service, &workspace, &note).await;
+            begin.header.output = intent_core::note_stage::NoteStageOutput::Search;
+            begin.header.query = Some(
+                serde_json::from_value(
+                    json!({"text":"frozen", "caseSensitive":false, "mode":"source"}),
+                )
+                .unwrap(),
+            );
+            begin.header_digest = begin.computed_digest().unwrap();
+            with_caller(caller.clone(), service.begin_note_stage(begin.clone()))
+                .await
+                .unwrap();
+            with_caller(caller.clone(), call(&service, 4, begin.clone()))
+                .await
+                .unwrap();
+            let mut query = serde_json::to_value(query(&begin)).unwrap();
+            query.as_object_mut().unwrap().remove("payloadDigest");
+            query["kind"] = json!("search");
+            let first = with_caller(
+                caller.clone(),
+                service.read_stage_source(serde_json::from_value(query.clone()).unwrap(), json!(1)),
+            )
+            .await
+            .unwrap();
+            if detail {
+                query["kind"] = json!("detail");
+                query["ref"] = first["items"][0]["detailRef"].clone();
+            }
+            if mode == 1 {
+                query["headerDigest"] = json!("f".repeat(64));
+            }
+
+            let boundary = Arc::new(Boundary {
+                now: Mutex::new(None),
+                expiry: Mutex::new(None),
+                observed: AtomicU8::new(0),
+                reached: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            });
+            let read = BOUNDARY.scope(
+                boundary.clone(),
+                with_caller(caller.clone(), async {
+                    if detail {
+                        let read: intent_core::note_receipt_detail::NoteOperationReceiptRead =
+                            serde_json::from_value(query).unwrap();
+                        service
+                            .read_note_receipt(read.query().unwrap(), json!(1))
+                            .await
+                    } else {
+                        service
+                            .read_stage_source(serde_json::from_value(query).unwrap(), json!(1))
+                            .await
+                    }
+                }),
+            );
+            let change = async {
+                boundary.reached.notified().await;
+                assert_eq!(
+                    boundary.observed.load(Ordering::SeqCst),
+                    if mode == 1 { 3 } else { 1 },
+                    "Store result captured before authorization/expiry change"
+                );
+                if mode == 2 {
+                    let expiry = boundary.expiry.lock().unwrap().unwrap();
+                    assert_eq!(expiry, intent_core::parse_iso(&begin.expires_at).unwrap());
+                    *boundary.now.lock().unwrap() = Some(expiry);
+                } else {
+                    let Caller::Wire { principal_id, .. } = &caller else {
+                        panic!("wire required")
+                    };
+                    service
+                        .store
+                        .remove_workspace_member(&workspace, principal_id)
+                        .await
+                        .unwrap();
+                }
+                boundary.release.notify_one();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                tokio::join!(read, change)
+            })
+            .await
+            .unwrap();
+            if mode == 2 {
+                assert!(matches!(
+                    result,
+                    Err(Error::NotePage(
+                        intent_core::note_page::NotePageError::Expired
+                    ))
+                ));
+            } else {
+                assert!(matches!(result, Err(Error::NotFound(_))));
+            }
+            assert!(service.stage_request_admission.0.lock().unwrap().is_empty());
+        }
+    }
+}

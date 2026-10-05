@@ -2003,3 +2003,118 @@ async fn bounded_staged_commit_canonical_receipt_and_inverse_over_wss() {
     rpc.close(None).await.unwrap();
     fx.ws.stop().await;
 }
+
+#[tokio::test]
+async fn bounded_staged_source_search_and_raw_hit_details_over_wss() {
+    use intent_core::note_stage::{NoteStageBegin, NoteStageSeal};
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"title":"search frozen","path":"."}),
+    )
+    .await;
+    let ws = workspace["workspace"]["id"].as_str().unwrap();
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({"workspaceId":ws,"title":"search","content":"😀ßSS"}),
+    )
+    .await;
+    let note = created["note"]["id"].as_str().unwrap();
+    let source = wss_rpc(
+        &mut rpc,
+        3,
+        "note.get",
+        json!({"workspaceId":ws,"noteId":note,"page":{"kind":"source"}}),
+    )
+    .await;
+    let mut begin = source["scope"].clone();
+    begin["operationId"] = json!(uuid::Uuid::new_v4().to_string());
+    begin["expiresAt"] = json!(format!(
+        "{}.000Z",
+        &intent_core::iso_ms_from_now(60_000)[..19]
+    ));
+    begin["headerDigest"] = json!("0".repeat(64));
+    begin["header"] = json!({"baseRevision":source["sourceRevision"],"editorSessionId":"search-wss","localEditSequence":0,"liveGeneration":0,"selectionGeneration":0,"action":"read","output":"search","selection":"all","query":{"text":"ss","caseSensitive":false,"mode":"source"}});
+    let mut begin: NoteStageBegin = serde_json::from_value(begin).unwrap();
+    begin.header_digest = begin.computed_digest().unwrap();
+    begin.validate().unwrap();
+    let state = wss_rpc(
+        &mut rpc,
+        4,
+        "note.operation.begin",
+        serde_json::to_value(&begin).unwrap(),
+    )
+    .await;
+    assert_eq!(state["phase"], "staging");
+    let mut identity = source["scope"].clone();
+    identity["operationId"] = json!(begin.operation_id);
+    identity["headerDigest"] = json!(begin.header_digest);
+    let mut seal = identity.clone();
+    seal["payloadDigest"] = json!("0".repeat(64));
+    seal["manifest"] = json!([{"stream":"text","chunks":0,"records":0,"lastDigest":null},{"stream":"dirty","chunks":0,"records":0,"lastDigest":null},{"stream":"selection","chunks":0,"records":0,"lastDigest":null},{"stream":"mutation","chunks":0,"records":0,"lastDigest":null},{"stream":"live","chunks":0,"records":0,"lastDigest":null}]);
+    let mut seal: NoteStageSeal = serde_json::from_value(seal).unwrap();
+    seal.payload_digest = seal.computed_digest().unwrap();
+    let sealed = wss_rpc(
+        &mut rpc,
+        5,
+        "note.operation.seal",
+        serde_json::to_value(seal).unwrap(),
+    )
+    .await;
+    assert_eq!(sealed["phase"], "sealed");
+    let mut read = identity.clone();
+    read["kind"] = json!("search");
+    read["maxItems"] = json!(1);
+    read["maxSourceBytes"] = json!(4);
+    read["maxWireBytes"] = json!(4096);
+    let mut hits = Vec::new();
+    let mut exhausted = false;
+    for _ in 0..10 {
+        let frame = wss_rpc_raw(&mut rpc, 6, "note.operation.read", read.clone()).await;
+        assert!(frame.to_string().len() <= 4096, "{frame}");
+        let page = &frame["result"];
+        assert_eq!(page["outputKind"], "search", "{frame}");
+        hits.extend(page["items"].as_array().unwrap().iter().cloned());
+        assert_eq!(page["count"]["value"], hits.len());
+        if page["nextCursor"].is_null() {
+            assert_eq!(page["count"]["exact"], true);
+            exhausted = true;
+            break;
+        }
+        assert_eq!(page["count"]["exact"], false);
+        read["cursor"] = page["nextCursor"].clone();
+    }
+    assert!(exhausted);
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0]["sourceRange"], json!({"start":2,"end":3}));
+    assert_eq!(hits[1]["sourceRange"], json!({"start":3,"end":5}));
+    for (hit, expected) in hits.iter().zip(["ß", "SS"]) {
+        let mut detail = identity.clone();
+        detail["kind"] = json!("detail");
+        detail["ref"] = hit["detailRef"].clone();
+        detail["maxSourceBytes"] = json!(4);
+        detail["maxWireBytes"] = json!(4096);
+        let frame = wss_rpc_raw(&mut rpc, 7, "note.operation.read", detail.clone()).await;
+        assert!(frame.to_string().len() <= 4096);
+        let page = &frame["result"];
+        assert_eq!(page["outputKind"], "detail", "{frame}");
+        assert_eq!(page["expiresAt"], begin.expires_at);
+        assert_eq!(page["sourceLength"], 5);
+        assert_eq!(page["items"][0]["text"], expected);
+        assert_eq!(page["items"][0]["field"], "source");
+        assert_eq!(page["items"][0]["id"], hit["hitId"]);
+        assert!(page["nextCursor"].is_null() && page["items"][0]["nextRef"].is_null());
+        detail["offset"] = json!(1);
+        assert!(wss_rpc_raw(&mut rpc, 8, "note.operation.read", detail).await["error"].is_object());
+    }
+    wss_rpc(&mut rpc, 9, "note.operation.cancel", identity).await;
+    read.as_object_mut().unwrap().remove("cursor");
+    assert!(wss_rpc_raw(&mut rpc, 10, "note.operation.read", read).await["error"].is_object());
+    rpc.close(None).await.unwrap();
+    fx.ws.stop().await;
+}

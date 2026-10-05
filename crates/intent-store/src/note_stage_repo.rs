@@ -14,6 +14,8 @@ mod read;
 mod reclaim;
 pub use reclaim::NoteOperationReclaimStats;
 mod seal;
+mod search_detail;
+mod search_output;
 mod search_ranges;
 mod source;
 mod status;
