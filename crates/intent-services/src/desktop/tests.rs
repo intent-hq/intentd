@@ -5,6 +5,8 @@ use intent_core::{
     AgentReverseDispatch, BoxFuture, ClientId, ReverseDispatchError, ReverseTarget, WorkspaceApi,
 };
 
+mod lifecycle_diagnostics;
+
 struct Executor {
     connection: Mutex<DesktopConnection>,
     extra_connections: Mutex<Vec<DesktopConnection>>,
@@ -99,16 +101,16 @@ impl AgentReverseDispatch for Executor {
         })
     }
 }
-struct Harness {
+pub(crate) struct Harness {
     _tmp: TempDb,
-    services: Services,
-    workspace: WorkspaceId,
-    agent: AgentId,
+    pub(crate) services: Services,
+    pub(crate) workspace: WorkspaceId,
+    pub(crate) agent: AgentId,
     executor: Arc<Executor>,
     owner: Caller,
 }
 impl Harness {
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let tmp = TempDb::new();
         let store = intent_store::Store::open(&tmp.path).await.unwrap();
         let ws = WorkspaceId::new();
@@ -173,7 +175,7 @@ impl Harness {
             owner,
         }
     }
-    async fn agent(&self, method: &str, args: Value) -> DesktopResult<Value> {
+    pub(crate) async fn agent(&self, method: &str, args: Value) -> DesktopResult<Value> {
         intent_core::with_caller(
             Caller::Agent {
                 agent_id: self.agent.clone(),
@@ -193,7 +195,7 @@ impl Harness {
         )
         .await
     }
-    async fn remember(&self) {
+    pub(crate) async fn remember(&self) {
         self.client(
             "setPermission",
             json!({"agentId":self.agent,"computerId":"physical","allowed":true}),

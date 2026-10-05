@@ -1682,7 +1682,7 @@ impl Services {
     }
 }
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 impl Services {
     pub(crate) async fn desktop_current_state(&self, agent: &AgentId) -> DesktopState {

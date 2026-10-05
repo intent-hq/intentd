@@ -20963,3 +20963,6 @@ mod effort_notice_tests;
 #[cfg(all(test, unix))]
 #[path = "agent_manager/fast_mode_tests.rs"]
 mod fast_mode_tests;
+
+#[cfg(test)]
+mod desktop_lifecycle_tests;
