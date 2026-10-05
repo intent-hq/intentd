@@ -30,6 +30,34 @@ async fn guest(service: &Services, workspace: &WorkspaceId) -> Caller {
 }
 
 #[tokio::test]
+async fn annotation_service_requires_a_caller() {
+    if crate::capability::reran_unarmed(
+        "note_annotation::tests::annotation_service_requires_a_caller",
+    ) {
+        return;
+    }
+    let (_tmp, service, workspace, note) = setup("source").await;
+    let state = service
+        .store
+        .read_note_page_state(&workspace, &note, None)
+        .await
+        .unwrap();
+    let mut params = state["scope"].clone();
+    params["sourceRevision"] = state["sourceRevision"].clone();
+    params["page"] = json!({"kind":"attribution","ranges":[],"maxWireBytes":4096});
+    assert!(matches!(
+        service
+            .read_annotation_page(
+                AnnotationMethod::Attribution,
+                serde_json::from_value(params).unwrap(),
+                json!(1),
+            )
+            .await,
+        Err(Error::Forbidden(_))
+    ));
+}
+
+#[tokio::test]
 async fn annotation_service_authorizes_current_membership_and_context_identity() {
     let (_tmp, service, workspace, note) = setup("source").await;
     let alice = guest(&service, &workspace).await;
@@ -51,12 +79,6 @@ async fn annotation_service_authorizes_current_membership_and_context_identity()
     params["threadId"] = json!("thread");
     params["page"] = json!({"kind":"replies","maxItems":1,"maxWireBytes":4096});
     let request: AnnotationReadRequest = serde_json::from_value(params.clone()).unwrap();
-    assert!(matches!(
-        service
-            .read_annotation_page(AnnotationMethod::Replies, request.clone(), json!(1))
-            .await,
-        Err(Error::Forbidden(_))
-    ));
     let first = with_caller(
         alice.clone(),
         service.read_annotation_page(AnnotationMethod::Replies, request, json!(1)),
