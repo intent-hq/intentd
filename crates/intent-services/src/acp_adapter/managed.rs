@@ -339,6 +339,76 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn denied_descendant_kill_retains_managed_profile() {
+        if std::env::var_os("INTENT_VERIFY_REAP_SENTINEL").is_some() {
+            let marker = PathBuf::from(std::env::var_os("INTENT_VERIFY_REAP_SENTINEL").unwrap());
+            let (mut child, profile, parent) = guarded_child().await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            child.reap().await;
+            assert!(profile.exists(), "live descendant lost its managed profile");
+            assert!(parent.exists(), "live descendant lost its private parent");
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let library = fixture.path().join("reap-denial.so");
+        let marker = fixture.path().join("sentinel.pid");
+        let compiler = tokio::process::Command::new("cc")
+            .args(["-shared", "-fPIC", "-O2"])
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/acp_adapter/reap-denial.c"
+            ))
+            .args(["-ldl", "-o"])
+            .arg(&library)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            compiler.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiler.stderr)
+        );
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "acp_adapter::managed::tests::denied_descendant_kill_retains_managed_profile",
+                "--nocapture",
+            ])
+            .env("LD_PRELOAD", library)
+            .env("INTENT_VERIFY_REAP_SENTINEL", &marker)
+            .env("TMPDIR", fixture.path())
+            .output()
+            .await
+            .unwrap();
+        let pid: i32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+        let pid = nix::unistd::Pid::from_raw(pid);
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let alive = nix::sys::signal::kill(pid, None).is_ok()
+            && !matches!(
+                state.rsplit_once(") ").unwrap().1.chars().next(),
+                Some('Z' | 'X')
+            );
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        assert!(
+            alive,
+            "the injected descendant must survive the denied sweep"
+        );
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     #[ignore = "requires bwrap and pinned Claude modules at INTENT_CLAUDE_FIXTURE_MODULES"]
     async fn native_ephemeral_callers_have_zero_inventory() {
         if let Ok(mode) = std::env::var("INTENT_EPHEMERAL_CHILD") {

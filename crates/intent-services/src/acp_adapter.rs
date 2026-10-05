@@ -625,8 +625,7 @@ impl AdapterChild {
             return None;
         };
         Some(handle.spawn(async move {
-            reap_child(&mut child, spawn_pid).await;
-            let reaped = child.try_wait().is_ok_and(|status| status.is_some());
+            let reaped = reap_child(&mut child, spawn_pid).await;
             launch_dir.remove(reaped);
             drop(child);
             drop(slot);
@@ -977,7 +976,10 @@ const TERM_GRACE: Duration = Duration::from_millis(500);
 /// snapshot-before-kill rationale. The snapshot is taken only while the
 /// leader is unreaped: a reaped leader's descendants have already reparented
 /// (nothing to find), and its pid may already be reused.
-pub(crate) async fn reap_child(child: &mut tokio::process::Child, spawn_pid: u32) {
+/// Returns true only when the direct child, original group, and snapshotted
+/// descendants are confirmed gone. Failed or ambiguous probes retain the
+/// managed profile even when the direct child has exited successfully.
+pub(crate) async fn reap_child(child: &mut tokio::process::Child, spawn_pid: u32) -> bool {
     #[cfg(not(unix))]
     let _ = spawn_pid;
     #[cfg(unix)]
@@ -1004,7 +1006,18 @@ pub(crate) async fn reap_child(child: &mut tokio::process::Child, spawn_pid: u32
     let _ = child.kill().await;
     let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
     #[cfg(unix)]
-    sweep_escaped_descendants(&descendants).await;
+    {
+        sweep_escaped_descendants(&descendants).await;
+        intent_acp::descendant_sweep::confirm_tree_exit(
+            child,
+            nix::unistd::Pid::from_raw(spawn_pid.cast_signed()),
+            &descendants,
+            Duration::from_millis(500),
+        )
+        .await
+    }
+    #[cfg(not(unix))]
+    child.try_wait().is_ok_and(|status| status.is_some())
 }
 
 /// Unit tests for the daemon-wide adapter bound itself (monorepo#2062).
