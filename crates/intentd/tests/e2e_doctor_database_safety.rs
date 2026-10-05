@@ -421,7 +421,7 @@ async fn doctor_old_schema_reports_without_migrating() {
     let mut connection = sqlx::SqliteConnection::connect_with(&options)
         .await
         .unwrap();
-    sqlx::query("CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY); INSERT INTO _sqlx_migrations VALUES (1); CREATE TABLE synthetic_old (value TEXT); INSERT INTO synthetic_old VALUES ('preserve')")
+    sqlx::query("CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, success BOOLEAN NOT NULL, checksum BLOB NOT NULL); CREATE TABLE synthetic_old (value TEXT); INSERT INTO synthetic_old VALUES ('preserve')")
         .execute(&mut connection).await.unwrap();
     connection.close().await.unwrap();
     let before = fs::read(&db).unwrap();
@@ -544,4 +544,344 @@ async fn doctor_newer_schema_reports_without_modifying_database() {
     let output = fixture.doctor_output(false);
     assert!(output.contains("migrations not current"), "{output}");
     assert_eq!(fs::read(&db).unwrap(), before);
+}
+
+#[tokio::test]
+async fn dangling_database_alias_is_rejected_before_mutation() {
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let alias = fixture.data_dir().join("alias.db");
+    std::os::unix::fs::symlink("intentd.db", &alias).unwrap();
+    for _ in 0..2 {
+        assert!(
+            Store::open_for_daemon(&alias).await.is_err(),
+            "dangling final symlink must be rejected"
+        );
+        assert!(!db.exists());
+        assert!(!fixture.data_dir().join("alias.db.daemon.lock").exists());
+    }
+    let parent_alias = fixture.root.path().join("data-alias");
+    std::os::unix::fs::symlink(fixture.data_dir(), &parent_alias).unwrap();
+    let owner = Store::open_for_daemon(&parent_alias.join("intentd.db"))
+        .await
+        .unwrap();
+    let slim = seed(&owner).await;
+    let before = payloads(&owner, STAGED).await;
+    for path in [&alias, &alias, &db, &parent_alias.join("intentd.db")] {
+        assert!(Store::open_for_daemon(path).await.is_err());
+    }
+    assert_eq!(payloads(&owner, STAGED).await, before);
+    finalize(&owner, STAGED, slim).await;
+    assert!(full_body_matches(&owner, STAGED).await);
+    owner.close().await;
+    drop(owner);
+    let reopened = Store::open_for_daemon(&alias).await.unwrap();
+    assert!(full_body_matches(&reopened, STAGED).await);
+    reopened.close().await;
+}
+
+async fn assert_released(db: &Path) {
+    // Dropping a SQLx pool signals asynchronous worker shutdown. Observe the
+    // actual release, rather than assuming the signal has already closed SQLite.
+    let owner = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(owner) = Store::open_for_daemon(db).await {
+                break owner;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("last connection/options drop must eventually release ownership");
+    assert!(full_body_matches(&owner, STAGED).await);
+    owner.close().await;
+}
+
+async fn escaped_handle_retains_ownership(read_pool: bool, kind: &str) {
+    use sqlx::Connection;
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let owner = Store::open_for_daemon(&db).await.unwrap();
+    let slim = seed(&owner).await;
+    let before = payloads(&owner, STAGED).await;
+    let pool = if read_pool {
+        owner.read_pool()
+    } else {
+        owner.write_pool()
+    }
+    .clone();
+    let mut checked_out = if kind == "checked-out" {
+        Some(pool.acquire().await.unwrap())
+    } else {
+        None
+    };
+    let mut detached = if kind == "detached" {
+        Some(pool.acquire().await.unwrap().detach())
+    } else {
+        None
+    };
+    drop(owner);
+    // Drop the last pool handle for detached/checked-out cases; retain it only
+    // when testing pool clones (including their future connection creation).
+    let retained_pool = if kind == "pool" {
+        Some(pool)
+    } else {
+        drop(pool);
+        None
+    };
+    assert!(
+        Store::open_for_daemon(&db).await.is_err(),
+        "{kind}, read_pool={read_pool} outlived Store but lost ownership"
+    );
+    let query = "UPDATE agent_session SET name = 'still writable' WHERE id = 'synthetic-agent'";
+    if let Some(pool) = &retained_pool {
+        // Force a fresh connection after dropping Store: pool options must
+        // retain ownership as well as the original SQLite connection.
+        pool.acquire()
+            .await
+            .unwrap()
+            .detach()
+            .close()
+            .await
+            .unwrap();
+        assert!(Store::open_for_daemon(&db).await.is_err());
+        sqlx::query(query).execute(pool).await.unwrap();
+    }
+    if let Some(conn) = &mut checked_out {
+        sqlx::query(query).execute(&mut **conn).await.unwrap();
+    }
+    if let Some(conn) = &mut detached {
+        sqlx::query(query).execute(&mut *conn).await.unwrap();
+    }
+    let observer = Store::open(&db).await.unwrap();
+    assert_eq!(payloads(&observer, STAGED).await, before);
+    // Use the original owner's retained placeholder, without re-staging.
+    // Release a checked-out writer before finalizing on the separate pool.
+    if let Some(conn) = checked_out.take() {
+        conn.close().await.unwrap();
+    }
+    finalize(&observer, STAGED, slim).await;
+    assert!(full_body_matches(&observer, STAGED).await);
+    observer.close().await;
+    drop(observer);
+    if let Some(conn) = detached {
+        conn.close().await.unwrap();
+    }
+    if let Some(pool) = retained_pool {
+        pool.close().await;
+        drop(pool);
+    }
+    assert_released(&db).await;
+}
+
+#[tokio::test]
+async fn write_pool_clone_retains_ownership() {
+    escaped_handle_retains_ownership(false, "pool").await;
+}
+#[tokio::test]
+async fn read_pool_clone_retains_ownership() {
+    escaped_handle_retains_ownership(true, "pool").await;
+}
+#[tokio::test]
+async fn write_checked_out_retains_ownership() {
+    escaped_handle_retains_ownership(false, "checked-out").await;
+}
+#[tokio::test]
+async fn read_checked_out_retains_ownership() {
+    escaped_handle_retains_ownership(true, "checked-out").await;
+}
+#[tokio::test]
+async fn write_detached_retains_ownership() {
+    escaped_handle_retains_ownership(false, "detached").await;
+}
+#[tokio::test]
+async fn read_detached_retains_ownership() {
+    escaped_handle_retains_ownership(true, "detached").await;
+}
+
+async fn invalid_migration_is_read_only_failure(update: &str) {
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let writer = Store::open(&db).await.unwrap();
+    sqlx::query(update)
+        .execute(writer.write_pool())
+        .await
+        .unwrap();
+    writer.close().await;
+    drop(writer);
+    let before = fs::read(&db).unwrap();
+    let diagnostic = intent_store::DiagnosticStore::open(&db).await.unwrap();
+    let status = diagnostic.migration_status().await;
+    diagnostic.close().await;
+    assert!(
+        status.is_err(),
+        "invalid migration metadata must not report current"
+    );
+    fixture.doctor_output(false);
+    assert_eq!(fs::read(&db).unwrap(), before);
+    // Same rejection as writable startup, checked only after byte preservation.
+    assert!(Store::open(&db).await.is_err());
+}
+
+#[tokio::test]
+async fn failed_migration_is_rejected_without_repair() {
+    invalid_migration_is_read_only_failure(
+        "UPDATE _sqlx_migrations SET success = 0 WHERE version = 1",
+    )
+    .await;
+}
+#[tokio::test]
+async fn changed_migration_is_rejected_without_repair() {
+    invalid_migration_is_read_only_failure(
+        "UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = 1",
+    )
+    .await;
+}
+
+// Releases the blocked SQLite worker even if a contract assertion panics.
+struct WorkerRelease(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+impl Drop for WorkerRelease {
+    fn drop(&mut self) {
+        *self.0 .0.lock().unwrap() = true;
+        self.0 .1.notify_all();
+    }
+}
+
+#[tokio::test]
+async fn cancelled_query_retains_ownership_until_sqlite_worker_exits() {
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let owner = Store::open_for_daemon(&db).await.unwrap();
+    let slim = seed(&owner).await;
+    let before = payloads(&owner, STAGED).await;
+    let mut connection = owner.write_pool().acquire().await.unwrap().detach();
+    let release = WorkerRelease(std::sync::Arc::default());
+    let worker_release = release.0.clone();
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    connection
+        .lock_handle()
+        .await
+        .unwrap()
+        .create_collation("synthetic_wait", move |left, right| {
+            started_tx.send(()).unwrap();
+            let (flag, changed) = &*worker_release;
+            let _ = changed
+                .wait_timeout_while(flag.lock().unwrap(), Duration::from_secs(20), |released| {
+                    !*released
+                })
+                .unwrap();
+            left.cmp(right)
+        })
+        .unwrap();
+    let query = tokio::spawn(async move {
+        sqlx::query("SELECT 'a' < 'b' COLLATE synthetic_wait")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(10), started_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(owner);
+    query.abort();
+    assert!(query.await.unwrap_err().is_cancelled());
+    assert!(
+        Store::open_for_daemon(&db).await.is_err(),
+        "cancelled Rust task must not release ownership while SQLite is executing"
+    );
+    let observer = Store::open(&db).await.unwrap();
+    assert_eq!(payloads(&observer, STAGED).await, before);
+    finalize(&observer, STAGED, slim).await;
+    assert!(full_body_matches(&observer, STAGED).await);
+    observer.close().await;
+    drop(observer);
+    drop(release);
+    assert_released(&db).await;
+}
+
+#[tokio::test]
+async fn pending_pool_close_retains_ownership_until_connections_release() {
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let owner = Store::open_for_daemon(&db).await.unwrap();
+    let slim = seed(&owner).await;
+    let pool = owner.write_pool().clone();
+    let mut connection = pool.acquire().await.unwrap();
+    drop(owner);
+    let closing_pool = pool.clone();
+    let closing = tokio::spawn(async move {
+        closing_pool.close().await;
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !pool.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !closing.is_finished(),
+        "close must wait for the checked-out connection"
+    );
+    assert!(Store::open_for_daemon(&db).await.is_err());
+    sqlx::query("UPDATE agent_session SET name = 'closing' WHERE id = 'synthetic-agent'")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    let observer = Store::open(&db).await.unwrap();
+    finalize(&observer, STAGED, slim).await;
+    assert!(full_body_matches(&observer, STAGED).await);
+    observer.close().await;
+    connection.close().await.unwrap();
+    closing.await.unwrap();
+    // A closed pool's clonable connection options conservatively retain the
+    // lease until the handles themselves are dropped.
+    assert!(Store::open_for_daemon(&db).await.is_err());
+    drop(pool);
+    assert_released(&db).await;
+}
+
+#[tokio::test]
+async fn cancelled_startup_keeps_ownership_during_initialization() {
+    use sqlx::Connection;
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let initial = Store::open(&db).await.unwrap();
+    let slim = seed(&initial).await;
+    finalize(&initial, STAGED, slim).await;
+    initial.close().await;
+    drop(initial);
+    let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&db);
+    let mut blocker = sqlx::SqliteConnection::connect_with(&options)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE")
+        .execute(&mut blocker)
+        .await
+        .unwrap();
+    let start_path = db.clone();
+    let startup = tokio::spawn(async move { Store::open_for_daemon(&start_path).await });
+    let lock_path = fixture.data_dir().join("intentd.db.daemon.lock");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) {
+                if Flock::lock(file, FlockArg::LockExclusiveNonblock).is_err() {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    startup.abort();
+    assert!(matches!(startup.await, Err(error) if error.is_cancelled()));
+    assert!(
+        Store::open_for_daemon(&db).await.is_err(),
+        "initialization must retain ownership after caller cancellation"
+    );
+    sqlx::query("COMMIT").execute(&mut blocker).await.unwrap();
+    blocker.close().await.unwrap();
+    assert_released(&db).await;
 }

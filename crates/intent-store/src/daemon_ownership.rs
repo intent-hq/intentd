@@ -19,7 +19,7 @@ impl DaemonOwnership {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         // A non-shared Windows handle denies every competing open until the
-        // last Store clone drops it. Keep the lock file: unlinking breaks identity.
+        // last Store, pool or SQLite connection drops it. Keep the lock file: unlinking breaks identity.
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;

@@ -43,15 +43,34 @@ impl DiagnosticStore {
     /// Read the existing migration ledger without creating or repairing it.
     ///
     /// # Errors
-    /// Returns an error for a missing or unreadable migration ledger.
+    /// Returns an error for a missing/unreadable ledger, failed migration, or changed checksum.
     pub async fn migration_status(&self) -> Result<MigrationStatus> {
-        let applied = sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| Error::Internal(format!("query migrations failed: {e}")))?;
+        let rows: Vec<(i64, bool, Vec<u8>)> = sqlx::query_as(
+            "SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Internal(format!("query migrations failed: {e}")))?;
+        for (version, success, checksum) in &rows {
+            if !success {
+                return Err(Error::Internal(format!(
+                    "migration {version} is partially applied"
+                )));
+            }
+            if let Some(expected) = MIGRATOR
+                .iter()
+                .find(|migration| migration.version == *version)
+            {
+                if expected.checksum.as_ref() != checksum.as_slice() {
+                    return Err(Error::Internal(format!(
+                        "migration {version} was modified since it was applied"
+                    )));
+                }
+            }
+        }
         Ok(MigrationStatus {
             expected: MIGRATOR.iter().map(|m| m.version).collect(),
-            applied,
+            applied: rows.into_iter().map(|(version, _, _)| version).collect(),
         })
     }
 

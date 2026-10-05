@@ -10828,6 +10828,7 @@ mod tests {
                 .await
                 .expect("prestage orphan")
                 .expect("stages");
+            store.close().await;
         }
 
         let store = Store::open_for_daemon(&tmp).await.expect("reopen");

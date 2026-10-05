@@ -361,7 +361,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// constraint. See `connect_write` / `connect_read` for the pool configurations.
 #[derive(Clone)]
 pub struct Store {
-    // Retained by every clone; only owned startup can run the global sweep.
+    // Also retained by connection options and SQLite handles; see retain_owner.
     _daemon_owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
     write_pool: SqlitePool,
     read_pool: SqlitePool,
@@ -383,11 +383,24 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database cannot be opened or created, a migration fails, or the migration ledger records a version newer than this build (downgrade).
     pub async fn open(db_path: &Path) -> Result<Self> {
-        let write_pool = connect_write(db_path).await?;
+        Self::open_with_owner(db_path, None).await
+    }
+
+    async fn open_with_owner(
+        db_path: &Path,
+        owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+    ) -> Result<Self> {
+        let write_pool = match &owner {
+            Some(_) => connect_write_owned(db_path, WRITE_ACQUIRE_TIMEOUT, owner.clone()).await?,
+            None => connect_write(db_path).await?,
+        };
         let repository_lifecycle = repository_lifecycle::domain_for(db_path)?;
         let mut lifecycle = repository_lifecycle.write().await?;
         lifecycle.begin(&[RepositoryLifecycleKey::Database])?;
-        let read_pool = connect_read(db_path).await?;
+        let read_pool = match &owner {
+            Some(_) => connect_read_owned(db_path, owner.clone()).await?,
+            None => connect_read(db_path).await?,
+        };
         // Run migrations on the write pool (migrations are write operations).
         MIGRATOR.run(&write_pool).await.map_err(|e| match e {
             sqlx::migrate::MigrateError::VersionMissing(version) => Error::Internal(format!(
@@ -400,7 +413,7 @@ impl Store {
         lifecycle.settle();
         Ok(Self {
             repository_lifecycle,
-            _daemon_owner: None,
+            _daemon_owner: owner,
             write_pool,
             read_pool,
             browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
@@ -410,7 +423,9 @@ impl Store {
     }
 
     /// Open for exclusive daemon startup, sweeping dead-turn payloads before
-    /// returning a usable Store. Every clone retains ownership until dropped.
+    /// returning a usable Store. Ownership survives every Store/pool clone and
+    /// checked-out or detached connection, including pending `SQLite` worker work.
+    /// Close and drop all handles to release it; closed pool options still retain it.
     /// Ordinary opens never perform this sweep. The lock file must not be removed.
     ///
     /// # Errors
@@ -419,6 +434,15 @@ impl Store {
     pub async fn open_for_daemon(db_path: &Path) -> Result<Self> {
         // Resolve symlinks (including parent aliases for a new DB) before deriving
         // the lock path, so different config paths cannot acquire different locks.
+        // exists() follows symlinks: a dangling final alias would otherwise get
+        // a different lock name before and after SQLite creates its target.
+        if std::fs::symlink_metadata(db_path).is_ok_and(|m| m.file_type().is_symlink())
+            && !db_path.exists()
+        {
+            return Err(Error::Internal(
+                "daemon database path is a dangling symlink".into(),
+            ));
+        }
         let physical = if db_path.exists() {
             std::fs::canonicalize(db_path)
         } else {
@@ -433,10 +457,24 @@ impl Store {
         let mut lock_path = physical.as_os_str().to_os_string();
         lock_path.push(".daemon.lock");
         let owner = daemon_ownership::DaemonOwnership::acquire(Path::new(&lock_path))?;
-        let store = Self {
-            _daemon_owner: Some(std::sync::Arc::new(owner)),
-            ..Self::open(&physical).await?
-        };
+        // SQLx installs connection callbacks after its initial PRAGMAs. Keep
+        // initialization owned even if the caller cancels while those run.
+        // Dropping a JoinHandle detaches this startup task; no Store escapes
+        // until migrations and cleanup finish. Its result is dropped if the
+        // caller has gone away.
+        tokio::spawn(Self::finish_owned_startup(
+            physical,
+            std::sync::Arc::new(owner),
+        ))
+        .await
+        .map_err(|e| Error::Internal(format!("daemon database initialization task failed: {e}")))?
+    }
+
+    async fn finish_owned_startup(
+        physical: std::path::PathBuf,
+        owner: std::sync::Arc<daemon_ownership::DaemonOwnership>,
+    ) -> Result<Self> {
+        let store = Self::open_with_owner(&physical, Some(owner)).await?;
         // No Store has escaped this constructor yet, and the OS lock excludes
         // competing daemon startups. The delete trigger rebalances byte counts.
         let reaped = sqlx::query(
@@ -757,6 +795,14 @@ pub(crate) async fn connect_write_with_acquire_timeout(
     db_path: &Path,
     acquire_timeout: Duration,
 ) -> Result<SqlitePool> {
+    connect_write_owned(db_path, acquire_timeout, None).await
+}
+
+async fn connect_write_owned(
+    db_path: &Path,
+    acquire_timeout: Duration,
+    owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
@@ -769,7 +815,7 @@ pub(crate) async fn connect_write_with_acquire_timeout(
     SqlitePoolOptions::new()
         .max_connections(1)
         .acquire_timeout(acquire_timeout)
-        .connect_with(opts)
+        .connect_with(retain_owner(opts, owner))
         .await
         .map_err(|e| match e {
             sqlx::Error::PoolTimedOut => {
@@ -808,6 +854,13 @@ pub(crate) async fn connect_write_with_acquire_timeout(
 /// concurrent-agent read load, so the pool doubles to 32 to preserve the
 /// pool/agent-cap headroom ratio.
 pub(crate) async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
+    connect_read_owned(db_path, None).await
+}
+
+async fn connect_read_owned(
+    db_path: &Path,
+    owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(false)
@@ -819,7 +872,7 @@ pub(crate) async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
     SqlitePoolOptions::new()
         .max_connections(32)
         .acquire_timeout(Duration::from_secs(10))
-        .connect_with(opts)
+        .connect_with(retain_owner(opts, owner))
         .await
         .map_err(|e| match e {
             sqlx::Error::PoolTimedOut => {
@@ -827,6 +880,25 @@ pub(crate) async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
             }
             _ => Error::Internal(format!("failed to open read pool: {e}")),
         })
+}
+
+/// Attach the lease to both future connection creation and the actual `SQLite`
+/// handle. `SQLx`'s collation registration uses `sqlite3_create_collation_v2`: its
+/// destructor drops the captured Arc only when `SQLite` destroys the connection,
+/// even after `PoolConnection::detach` or cancellation of the Rust query future.
+/// A pool-only `after_connect` capture would miss those lifetimes. This private
+/// collation is never selected by our schema/queries, so it changes no ordering.
+fn retain_owner(
+    options: SqliteConnectOptions,
+    owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+) -> SqliteConnectOptions {
+    match owner {
+        Some(owner) => options.collation("intent_daemon_ownership", move |left, right| {
+            let _keep_alive = &owner;
+            left.cmp(right)
+        }),
+        None => options,
+    }
 }
 
 /// Legacy test helper: builds a single pool (`max_connections=20`) for tests
