@@ -77,15 +77,13 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-glauth-")
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
+fn mock_gitlab_command(data_dir: &Path, env: &[(&str, &str)]) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
     // The GitHub resolution chain ends at `gh auth token`; point the CLI at an
     // empty config dir so a developer's own `gh auth login` is never borrowed.
-    let gh_config_dir = data_dir.join("gh-config");
-    std::fs::create_dir_all(&gh_config_dir).expect("mkdir hermetic gh config dir");
     // Finite cold grants name both identity and the owned mock transport.
     // An ambient API override alone is intentionally insufficient.
     let endpoint = env
@@ -116,7 +114,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
         )
         .unwrap();
     }
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_REPOSITORY_TEST_TRANSPORTS", transports)
         .env("INTENTD_DISABLE_GH_CREDENTIALS", "1");
     cmd.env("INTENTD_DATA_DIR", data_dir)
@@ -127,13 +125,17 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
         .env_remove("GITLAB_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
-        .env("GH_CONFIG_DIR", &gh_config_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     for (k, v) in env {
         cmd.env(k, v);
     }
-    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
+    cmd
+}
+
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
+    GuardedChild::spawn(&mut mock_gitlab_command(data_dir, env)).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -3240,4 +3242,44 @@ async fn gitlab_gated_mutation_interleavings_over_wss() {
         "failed interleavings:\n{}",
         failed.join("\n")
     );
+}
+
+#[test]
+fn mock_gitlab_command_contract_keeps_private_secrets_across_restart() {
+    use std::ffi::OsStr;
+    let dir = temp_data_dir();
+    let secrets = dir.path().join("secrets.json");
+    let state = r#"{"sourceControl.gitlab.token":"synthetic-gitlab-token"}"#;
+    std::fs::write(&secrets, state).unwrap();
+    for _ in 0..2 {
+        let cmd = mock_gitlab_command(
+            dir.path(),
+            &[
+                ("GITHUB_TOKEN", "synthetic-host-token"),
+                ("GH_TOKEN", "synthetic-host-token"),
+                ("GH_CONFIG_DIR", "synthetic-host-config"),
+                ("INTENTD_SECRETS_FILE", "synthetic-host-secrets"),
+                ("INTENTD_GITLAB_API_BASE_URI", "http://127.0.0.1:32123"),
+            ],
+        );
+        let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        for key in ["GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN"] {
+            assert_eq!(environment.get(OsStr::new(key)), Some(&None), "{key}");
+        }
+        for (key, path) in [
+            ("GH_CONFIG_DIR", dir.path().join("gh-config")),
+            ("INTENTD_SECRETS_FILE", secrets.clone()),
+        ] {
+            assert_eq!(
+                environment.get(OsStr::new(key)),
+                Some(&Some(path.as_os_str())),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            environment.get(OsStr::new("INTENTD_GITLAB_API_BASE_URI")),
+            Some(&Some(OsStr::new("http://127.0.0.1:32123")))
+        );
+        assert_eq!(std::fs::read_to_string(&secrets).unwrap(), state);
+    }
 }

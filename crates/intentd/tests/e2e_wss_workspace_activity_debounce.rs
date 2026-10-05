@@ -47,7 +47,7 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", &format!("itd-wss-actdebounce-{prefix}-"))
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn activity_command(data_dir: &Path, env: &[(&str, &str)]) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -61,7 +61,14 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.spawn().expect("spawn intentd serve")
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
+    cmd
+}
+
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+    activity_command(data_dir, env)
+        .spawn()
+        .expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -415,5 +422,39 @@ async fn workspace_activity_changed_debounce() {
     assert_eq!(
         got["result"]["workspace"]["attention"], "unread",
         "turn-end unread flag persists: {got}"
+    );
+}
+
+#[test]
+fn activity_command_preserves_identity_after_synthetic_overrides() {
+    use std::ffi::OsStr;
+    let dir = scratch_dir("identity-contract");
+    let cmd = activity_command(
+        dir.path(),
+        &[
+            ("GITHUB_TOKEN", "synthetic-token"),
+            ("GH_TOKEN", "synthetic-token"),
+            ("GH_CONFIG_DIR", "synthetic-host-config"),
+            ("INTENTD_SECRETS_FILE", "synthetic-host-secrets"),
+            ("MOCK_AGENT_BEHAVIOR", "keep-me"),
+        ],
+    );
+    let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        assert_eq!(env.get(OsStr::new(key)), Some(&None), "{key}");
+    }
+    for (key, path) in [
+        ("GH_CONFIG_DIR", dir.path().join("gh-config")),
+        ("INTENTD_SECRETS_FILE", dir.path().join("secrets.json")),
+    ] {
+        assert_eq!(
+            env.get(OsStr::new(key)),
+            Some(&Some(path.as_os_str())),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        env.get(OsStr::new("MOCK_AGENT_BEHAVIOR")),
+        Some(&Some(OsStr::new("keep-me")))
     );
 }

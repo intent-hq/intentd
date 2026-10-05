@@ -62,11 +62,10 @@ fn spawn_serve(data_dir: &Path, mut command: Command) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    common::hermetic_github_identity(&mut command, data_dir);
+    common::hermetic_fixture_identity(&mut command, data_dir);
     command
         .env_remove("GITLAB_TOKEN")
         .env("INTENTD_DATA_DIR", data_dir)
-        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -90,7 +89,9 @@ async fn await_uds(socket: &Path) -> bool {
 }
 
 async fn boot(root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
-    boot_with_command(root, common::serve_command()).await
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).expect("mkdir data");
+    boot_with_command(root, common::hermetic_serve_command(&data)).await
 }
 
 async fn boot_with_command(root: &Path, command: Command) -> (Daemon, u16, Arc<ClientConfig>) {

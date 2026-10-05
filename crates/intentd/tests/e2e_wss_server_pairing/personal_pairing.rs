@@ -36,7 +36,7 @@ fn spawn_personal(dir: &Path, sidecar: &Path, run: u8) -> GuardedChild {
     std::fs::create_dir_all(&workspaces).unwrap();
     let log = std::fs::File::create(dir.join(format!("personal-{run}.log"))).unwrap();
     GuardedChild::spawn(
-        common::serve_command()
+        common::hermetic_serve_command(dir)
             .env_remove("GITHUB_TOKEN")
             .env_remove("GH_TOKEN")
             .env_remove("GITLAB_TOKEN")

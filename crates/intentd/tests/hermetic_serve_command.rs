@@ -225,3 +225,93 @@ fn reapplying_identity_after_overrides_restores_all_four_settings() {
         EnvSetting::Set(OsStr::new("keep-me"))
     );
 }
+
+#[test]
+fn mock_token_exception_restores_private_paths_and_confines_endpoints() {
+    let dir = common::test_tempdir("mock-token-contract-");
+    let mut cmd = fixture_command(dir.path(), false);
+    for key in [
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GH_CONFIG_DIR",
+        "INTENTD_SECRETS_FILE",
+    ] {
+        cmd.env(key, "synthetic-host-value");
+    }
+    cmd.env("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:32123");
+    // fixture-identity: allow — synthetic command-only mock token contract; no process or network.
+    common::mock_github_token(&mut cmd, dir.path(), "synthetic-mock-token");
+    assert_eq!(
+        explicit_env(&cmd, "GITHUB_TOKEN"),
+        EnvSetting::Set(OsStr::new("synthetic-mock-token"))
+    );
+    assert_eq!(
+        explicit_env(&cmd, "INTENTD_GITHUB_API_BASE_URI"),
+        EnvSetting::Set(OsStr::new("http://127.0.0.1:32123"))
+    );
+    assert_eq!(
+        explicit_env(&cmd, "INTENTD_GITHUB_LOGIN_BASE_URI"),
+        EnvSetting::Set(OsStr::new("http://127.0.0.1:0"))
+    );
+    cmd.env_remove("GITHUB_TOKEN");
+    assert_eq!(identity_contract(&cmd, dir.path()), Ok(()));
+}
+
+#[test]
+fn mock_token_exception_rejects_missing_or_nonlocal_endpoints() {
+    for (api, login) in [
+        (None, None),
+        (Some("https://api.github.com"), None),
+        (Some("http://127.0.0.1:1234"), Some("https://github.com")),
+        (Some("http://127.0.0.1.example.invalid:1234"), None),
+    ] {
+        let dir = common::test_tempdir("mock-token-invalid-");
+        let mut cmd = fixture_command(dir.path(), false);
+        if let Some(api) = api {
+            cmd.env("INTENTD_GITHUB_API_BASE_URI", api);
+        }
+        if let Some(login) = login {
+            cmd.env("INTENTD_GITHUB_LOGIN_BASE_URI", login);
+        }
+        let rejected = {
+            let _suppress = common::suppress_failure_retention();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // fixture-identity: allow — negative endpoint contract with a synthetic token; never spawned.
+                common::mock_github_token(&mut cmd, dir.path(), "synthetic-mock-token");
+            }))
+            .is_err()
+        };
+        assert!(rejected);
+    }
+}
+
+#[test]
+fn pty_wrapper_copies_complete_constructor_after_synthetic_overrides() {
+    let dir = common::test_tempdir("pty-identity-contract-");
+    let mut cmd = portable_pty::CommandBuilder::new("never-executed");
+    for key in [
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GH_CONFIG_DIR",
+        "INTENTD_SECRETS_FILE",
+    ] {
+        cmd.env(key, "synthetic-host-value");
+    }
+    cmd.env("FIXTURE", "keep-me");
+    common::hermetic_pty_fixture_identity(&mut cmd, dir.path());
+    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        assert_eq!(cmd.get_env(key), None);
+    }
+    for (key, path) in [
+        ("GH_CONFIG_DIR", dir.path().join("gh-config")),
+        ("INTENTD_SECRETS_FILE", dir.path().join("secrets.json")),
+    ] {
+        assert_eq!(cmd.get_env(key), Some(path.as_os_str()));
+    }
+    assert_eq!(
+        cmd.get_env("INTENTD_DATA_DIR"),
+        Some(dir.path().as_os_str())
+    );
+    assert_eq!(cmd.get_env("INTENTD_TCP_PORT"), Some(OsStr::new("0")));
+    assert_eq!(cmd.get_env("FIXTURE"), Some(OsStr::new("keep-me")));
+}

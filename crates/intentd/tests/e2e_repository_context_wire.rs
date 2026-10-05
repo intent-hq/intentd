@@ -215,11 +215,10 @@ impl Harness {
         let workspaces = dir.path().join("workspaces");
         std::fs::create_dir(&workspaces).unwrap();
         let log = std::fs::File::create(dir.path().join("daemon.log")).unwrap();
-        let mut cmd = common::serve_command();
-        common::hermetic_github_identity(&mut cmd, dir.path());
+        let mut cmd = common::hermetic_serve_command(dir.path());
+
         cmd.env("INTENTD_DATA_DIR", dir.path())
             .env("INTENTD_WORKSPACES_DIR", workspaces)
-            .env("INTENTD_SECRETS_FILE", dir.path().join("secrets.json"))
             .env("INTENTD_AUTH_TOKEN", TOKEN)
             .env("INTENTD_SPECIALISTS_DIR", dir.path().join("specialists"))
             .env(

@@ -61,13 +61,12 @@ async fn disabled_gh_credentials_survive_settings_and_revoke_over_wss() {
     std::fs::create_dir(&workspaces).unwrap();
     let log = std::fs::File::create(data.join("daemon.log")).unwrap();
     common::enable_ws_api(data);
-    let mut command = common::serve_command();
-    common::hermetic_github_identity(&mut command, data);
+    let mut command = common::hermetic_serve_command(data);
+
     command
         .env("HOME", data)
         .env("INTENTD_DATA_DIR", data)
         .env("INTENTD_WORKSPACES_DIR", &workspaces)
-        .env("INTENTD_SECRETS_FILE", data.join("secrets.json"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_LEGACY_APP_DIR", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -169,15 +168,19 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-ghdf-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn mock_device_flow_command(
+    data_dir: &Path,
+    listen: &str,
+    env: &[(&str, &str)],
+) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = common::serve_command();
-    common::hermetic_github_identity(&mut cmd, data_dir);
+    let mut cmd = common::hermetic_serve_command(data_dir);
+
     // gh auth token can otherwise select an inherited enterprise credential.
     cmd.env_remove("GH_HOST")
         .env_remove("GH_ENTERPRISE_TOKEN")
@@ -190,6 +193,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
     // Fail before spawning if this fixture could resolve host credentials or
     // contact public GitHub. Diagnostics name contracts, never their values.
     let explicit_env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
@@ -220,7 +224,13 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         isolated_gh && local_login && local_api && owned_secrets && no_host_auth_env,
         "device-auth fixture isolation: disposable GH_CONFIG_DIR={isolated_gh}, local login={local_login}, local API={local_api}, owned secrets={owned_secrets}, removed credential env={no_host_auth_env}"
     );
-    cmd.spawn().expect("spawn intentd serve")
+    cmd
+}
+
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+    mock_device_flow_command(data_dir, listen, env)
+        .spawn()
+        .expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -1116,4 +1126,53 @@ async fn github_rate_limited_surfaces_data_code_over_wss() {
         v["result"],
         json!({ "gistId": GIST_ID, "login": "octocat" })
     );
+}
+
+#[test]
+fn device_flow_command_restores_private_identity_and_preserves_restart_secrets() {
+    let dir = temp_data_dir();
+    let secrets = dir.path().join("secrets.json");
+    std::fs::write(
+        &secrets,
+        json!({"sourceControl.github.token": ACCESS_TOKEN}).to_string(),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let cmd = mock_device_flow_command(
+            dir.path(),
+            "both",
+            &[
+                ("GITHUB_TOKEN", "synthetic-host-token"),
+                ("GH_TOKEN", "synthetic-host-token"),
+                ("GH_CONFIG_DIR", "synthetic-host-config"),
+                ("INTENTD_SECRETS_FILE", "synthetic-host-secrets"),
+                ("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:32123"),
+                ("INTENTD_GITHUB_LOGIN_BASE_URI", "http://127.0.0.1:32123"),
+            ],
+        );
+
+        use std::ffi::OsStr;
+        let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(environment.get(OsStr::new("GH_TOKEN")), Some(&None));
+        for (key, path) in [
+            ("GH_CONFIG_DIR", dir.path().join("gh-config")),
+            ("INTENTD_SECRETS_FILE", dir.path().join("secrets.json")),
+        ] {
+            assert_eq!(
+                environment.get(OsStr::new(key)),
+                Some(&Some(path.as_os_str())),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("gh-config"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(environment.get(OsStr::new("GITHUB_TOKEN")), Some(&None));
+        let state: Value =
+            serde_json::from_str(&std::fs::read_to_string(&secrets).unwrap()).unwrap();
+        assert_eq!(state["sourceControl.github.token"], ACCESS_TOKEN);
+    }
 }

@@ -121,11 +121,10 @@ fn spawn_serve(data_dir: &Path, script: &str, behavior: &str) -> Daemon {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir workspaces dir");
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("daemon log");
-    let mut command = common::serve_command();
+    let mut command = common::hermetic_serve_command(data_dir);
     command
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("MOCK_AGENT_SCRIPT_PATH", script)

@@ -44,20 +44,24 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-gitcred-")
 }
 
-fn spawn_serve(data_dir: &Path) -> Child {
+fn mock_env_token_command(data_dir: &Path) -> Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    common::serve_command()
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::hermetic_serve_command(data_dir);
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        // Deterministic token resolution: the Auto chain finds this env token
-        // (hermetic secrets file above is empty) without shelling out to gh.
-        .env("GITHUB_TOKEN", TEST_TOKEN)
+        .env("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:0")
         .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
+        .stderr(Stdio::from(log));
+    // fixture-identity: allow — credential forwarding uses TEST_TOKEN and an inert loopback API.
+    common::mock_github_token(&mut cmd, data_dir, TEST_TOKEN);
+    cmd
+}
+
+fn spawn_serve(data_dir: &Path) -> Child {
+    mock_env_token_command(data_dir)
         .spawn()
         .expect("spawn intentd serve")
 }
@@ -195,7 +199,7 @@ async fn daemon_down_stays_silent() {
 /// **no** `GITHUB_TOKEN/GH_TOKEN` in the daemon env — the stored token is the
 /// only possible source, so `github.revoke` deleting it must leave the chain
 /// empty.
-fn spawn_serve_with_stored_token(data_dir: &Path) -> Child {
+fn mock_stored_token_command(data_dir: &Path) -> Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -209,19 +213,24 @@ fn spawn_serve_with_stored_token(data_dir: &Path) -> Child {
         "[sourceControl.github]\ntokenSource = \"explicit\"\n",
     )
     .expect("write config.toml");
-    common::serve_command()
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::hermetic_serve_command(data_dir);
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         // Mock login host: the production-host gate must skip the gh CLI
         // logout side effect of `github.revoke`, so this e2e never touches
         // a real `gh` on the host.
+        .env("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:0")
         .env("INTENTD_GITHUB_LOGIN_BASE_URI", "http://127.0.0.1:0")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
         .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
+        .stderr(Stdio::from(log));
+    cmd
+}
+
+fn spawn_serve_with_stored_token(data_dir: &Path) -> Child {
+    mock_stored_token_command(data_dir)
         .spawn()
         .expect("spawn intentd serve")
 }
@@ -270,4 +279,60 @@ async fn revoke_applies_to_next_helper_get() {
         stdout.is_empty(),
         "no credential after revocation: {stdout:?}"
     );
+}
+
+#[test]
+fn credential_forwarding_commands_keep_mock_identity_private() {
+    for stored in [false, true] {
+        let dir = temp_data_dir();
+        let cmd = if stored {
+            mock_stored_token_command(dir.path())
+        } else {
+            mock_env_token_command(dir.path())
+        };
+
+        use std::ffi::OsStr;
+        let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(environment.get(OsStr::new("GH_TOKEN")), Some(&None));
+        for (key, path) in [
+            ("GH_CONFIG_DIR", dir.path().join("gh-config")),
+            ("INTENTD_SECRETS_FILE", dir.path().join("secrets.json")),
+        ] {
+            assert_eq!(
+                environment.get(OsStr::new(key)),
+                Some(&Some(path.as_os_str())),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("gh-config"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GITHUB_TOKEN")).copied(),
+            if stored {
+                Some(None)
+            } else {
+                Some(Some(OsStr::new(TEST_TOKEN)))
+            }
+        );
+        for key in [
+            "INTENTD_GITHUB_API_BASE_URI",
+            "INTENTD_GITHUB_LOGIN_BASE_URI",
+        ] {
+            assert_eq!(
+                environment.get(OsStr::new(key)),
+                Some(&Some(OsStr::new("http://127.0.0.1:0")))
+            );
+        }
+        if stored {
+            let secrets: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.path().join("secrets.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(secrets["sourceControl.github.token"], TEST_TOKEN);
+        }
+    }
 }
