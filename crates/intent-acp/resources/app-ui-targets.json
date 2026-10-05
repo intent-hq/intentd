@@ -93,13 +93,26 @@
     "category": "settings"
   },
   {
+    "id": "mobile",
+    "tab": "mobile",
+    "scrollSelector": "#mobile",
+    "highlightSelector": "[data-highlight-id=\"mobile\"]",
+    "label": "Settings: Mobile",
+    "route": "/settings?tab=mobile#mobile",
+    "description": "Intent Mobile pairing and Remote Access for the active connection.",
+    "hashAliases": [
+      "mobile"
+    ],
+    "category": "settings"
+  },
+  {
     "id": "websocket-api",
-    "tab": "devices",
+    "tab": "mobile",
     "scrollSelector": "#websocket-api",
     "highlightSelector": "[data-highlight-id=\"websocket-api\"]",
     "label": "Settings: Remote Access",
-    "route": "/settings?tab=devices#websocket-api",
-    "description": "Remote Access on this computer. For mobile or iPhone pairing, open Connect from other apps → Show QR Code in the expanded local-machine panel. Remote Access must be enabled; TLS and tunnel switches are not required to display the QR row.",
+    "route": "/settings?tab=mobile#websocket-api",
+    "description": "For mobile or iPhone pairing, open Settings → Mobile → Intent Mobile → Show QR Code. Select the local machine first for local pairing. Remote Access must be enabled; TLS and tunnel switches are not required to display the controls.",
     "hashAliases": [
       "websocket-api",
       "remote-access"

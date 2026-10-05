@@ -3659,6 +3659,7 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 pub const CURRENT_HARNESS_VERSION: &str = "3.1";
 
 /// Explicit admission preserves repository guidance without admitting unknown versions.
+#[must_use]
 pub fn harness_supports_repository_guidance(version: &str) -> bool {
     matches!(version, "3.0" | "3.1")
 }

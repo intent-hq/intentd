@@ -22,17 +22,19 @@ requirements do not, by themselves, make a supported feature experimental.
 Multiplayer, Collaboration, and personal device pairing are currently experimental.
 Do not introduce them in routine answers about settings, devices, or mobile pairing.
 
-<!-- Sources: packages/cloudlands-fe/src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
 
 Only when explicitly asked about personal device pairing: it pairs another device
 with the signed-in person's current access. It is separate from the local Remote
 Access QR, which grants access to that computer. Do not offer the local QR as a
 substitute or unrelated alternative. If the user asks where to test personal
-pairing, use **Settings → Devices → Signed-in devices → Pair another device as me**.
-The action requires Multiplayer to be enabled, a current signed-in identity, and
-the connection's personal-pairing capability. Connected-device list support is
-independent. Do not invent a readiness date or advise enabling the experiment for
-ordinary mobile setup.
+pairing, use **Settings → Mobile → Intent Mobile → Show QR Code** on the intended
+connection. Older instructions may call it **Pair another device as me**; that is
+not the current button label. Personal pairing requires a current signed-in identity
+and the connection's personal-pairing capability. The restricted-access panel also
+requires Multiplayer and a refreshed identity; the remote-owner panel needs Remote
+Access enabled. Connected-device list support is independent. Do not invent a
+readiness date or advise enabling the experiment for ordinary mobile setup.
 
 ## Finding things
 
@@ -63,7 +65,8 @@ Open Settings and use these sidebar labels (English labels shown):
 | Agent defaults | Global instructions and agent features | `/settings?tab=agent-behavior#global-instructions` |
 | Providers | AI coding CLIs and default model | `/settings?tab=providers#providers` |
 | Connections | Integrations and MCP servers | `/settings?tab=connections#integrations` |
-| Devices | Saved remote machines and local Remote Access | `/settings?tab=devices#devices` |
+| Devices | Local machine and saved remote connections | `/settings?tab=devices#devices` |
+| Mobile | Intent Mobile pairing and Remote Access | `/settings?tab=mobile#mobile` |
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
@@ -88,22 +91,23 @@ Settings sections and controls can depend on platform, daemon capabilities, or
 access. A supported route does not grant permissions or prove that a control is
 available on the current connection.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,WebSocketApiSettings}.svelte; packages/cloudlands-fe/src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/features/settings/MobileSettings.svelte; packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow,WebSocketApiSettings}.svelte; packages/cloudlands-fe/src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts. -->
 
 ## Find the mobile pairing QR code
 
-Open **Settings → Devices**, open the local machine's actions menu, choose **Edit**,
-then choose **Connect from other apps → Show QR Code** to display the pairing QR.
-Use the mobile app's pairing scanner. The Remote Access reference route,
-`/settings?tab=devices#websocket-api`, opens the local editing panel.
+Open **Settings → Mobile → Intent Mobile → Show QR Code**. Use the mobile app's
+pairing scanner. The Remote Access reference route is
+`/settings?tab=mobile#websocket-api`. There is no need to expand a device's Edit panel.
 
-If the row is missing: it appears when **Remote Access** is enabled and that panel is
-expanded. If Remote Access is off, explain that it must be enabled for this flow;
-do not silently change it. If the row is present but generation fails, inspect the
-connection/listener error: generation needs a running listener port and loaded
-pairing data. TLS and tunnel switches are not visibility requirements for this QR row:
-do not suggest toggling them to reveal it. This QR grants access to the local
-machine; do not offer it as a substitute for someone else's restricted access.
+For ordinary local-machine pairing, select that machine as the active connection.
+If connected elsewhere, use **Settings → Devices**, then the local machine's
+**Connect** action, and return to **Mobile**. The QR controls remain visible but
+disabled when **Enable Remote Access** is off, data is loading, or no running listener
+port is available. Explain the required enablement; do not silently change it.
+For a generation error, inspect the displayed connection/listener error. TLS and
+tunnel switches are not visibility requirements: do not suggest toggling them to
+reveal the controls. Local pairing grants access to that machine; do not offer it
+as a substitute for someone else's restricted access.
 
 Pairing links and QR codes contain credentials; keep them private. A visible QR does not prove that the
 phone can reach the host. Diagnose address/network reachability separately from
@@ -115,11 +119,11 @@ Devices lists the local machine and saved remote connections. **Add device** ope
 the connection form; a remote device's actions include **Edit** and **Connect**,
 with **Test connection** inside its editing panel. Workspaces and agents belong to a
 host, so identify the intended device before explaining missing work or changing
-host settings. The local Remote Access panel
-controls the desktop's local machine even while the app is connected to a remote
-daemon; it does not configure that remote host. Enabling access, changing listening
-addresses, and configuring a tunnel are separate choices from displaying pairing
-information. Read current state and respect the user's requested scope.
+host settings. **Mobile** follows the active connection and its permissions; do not
+describe a remote connection's QR as belonging to the local desktop. To pair the
+local machine, connect to it first. Enabling access, changing listening addresses,
+and configuring a tunnel are separate choices from displaying pairing information.
+Read current state and respect the user's requested scope.
 
 ## Start or continue work
 
