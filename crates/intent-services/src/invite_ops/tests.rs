@@ -4139,7 +4139,11 @@ async fn collaboration_machine_name_reaches_both_invite_previews_and_refreshes()
     let workspace = f.create_invite(None).await;
     let host = with_caller(
         Caller::Daemon,
-        f.services.host_invite_create_op(InvitePin::login("guest")),
+        f.services.host_invite_create_op(InvitePin {
+            login: "guest".into(),
+            provider: Some("github".into()),
+            host: None,
+        }),
     )
     .await
     .unwrap();
