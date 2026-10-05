@@ -134,6 +134,8 @@ impl Key {
 /// the surface is new); the lint fails until both agree.
 const REGISTERED_EGRESS: &[(&str, Key)] = &[
     ("GetQueue", Key::Fn("agent_get_queue_op")),
+    ("QueueUpdatedEvent", Key::Fn("redact_self_queue_events")),
+    ("QueueProcessingEvent", Key::Fn("redact_self_queue_events")),
     ("QueueUpdatedEvent", Key::Fn("publish_queue_event")),
     ("QueueUpdatedEvent", Key::Event("AGENT_QUEUE_UPDATED")),
     (

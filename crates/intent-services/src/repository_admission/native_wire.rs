@@ -45,6 +45,8 @@ use crate::{Services, SettingsRegistry};
 #[path = "native_review.rs"]
 pub(crate) mod review;
 
+#[path = "native_checkout.rs"]
+pub(crate) mod checkout;
 #[path = "native_resource_read.rs"]
 pub(crate) mod resource;
 
@@ -123,6 +125,7 @@ pub(crate) fn connection(
         parent: RepositoryRetirement::default(),
         review: review::ConnectionState::default(),
         resource: resource::ConnectionState::default(),
+        checkout: checkout::ConnectionState::default(),
         selection: selection::ConnectionState::default(),
         state: Mutex::new(ConnectionState::default()),
         notify: Notify::new(),
@@ -143,6 +146,7 @@ struct Connection {
     parent: RepositoryRetirement,
     review: review::ConnectionState,
     resource: resource::ConnectionState,
+    checkout: checkout::ConnectionState,
     selection: selection::ConnectionState,
     state: Mutex<ConnectionState>,
     notify: Notify,
@@ -237,6 +241,7 @@ impl Connection {
         self.parent.end_scope();
         self.review.close();
         self.resource.close();
+        self.checkout.close();
         self.selection.close();
         self.origin.retire();
         for lease in leases {
@@ -361,6 +366,12 @@ impl Connection {
     }
 }
 impl RepositoryReadConnection for Connection {
+    fn capture_checkout(
+        &self,
+        frame: &intent_core::repository_checkout::CheckoutFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        Some(checkout::capture_frame(self, frame.clone()))
+    }
     fn capture_resource(
         &self,
         frame: &intent_core::repository_request::RepositoryResourceFrame,

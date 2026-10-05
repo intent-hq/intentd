@@ -730,6 +730,8 @@ use std::time::{Duration, Instant};
 // Version 13.4 adds trusted, persisted submission correlation for optimistic
 // display. Support requires exactly submissionCorrelation: 1; discover other
 // extensions through their independent capabilities and permission checks.
+// Version 13.5 adds original-socket GitLab checkout discovery and native
+// private checkout. Clients require gitlabCheckout: 1 before using it.
 // Version 13.6 adds best-effort host.prepareProviderAdapters. Acknowledgement
 // promises admission only; clients tolerate -32601 on older daemons.
 pub const PROTOCOL_VERSION: &str = "13.6";

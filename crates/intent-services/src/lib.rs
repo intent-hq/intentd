@@ -1188,6 +1188,7 @@ pub struct Services {
     repository_wire_owner: Arc<OnceLock<Weak<Services>>>,
     repository_review_capacity: Arc<repository_native_wire::review::Capacity>,
     repository_resource_capacity: Arc<repository_native_wire::resource::Capacity>,
+    repository_checkout_capacity: Arc<repository_native_wire::checkout::Capacity>,
     repository_selection_capacity: Arc<repository_native_wire::selection::Capacity>,
     /// Original invalidation owner for this Services instance. Clones share it;
     /// Store must accept this exact observer before it can be used.
@@ -1705,6 +1706,7 @@ impl Services {
             repository_lifecycle_registry: Arc::default(),
             repository_wire_owner: Arc::default(),
             repository_resource_capacity: Arc::default(),
+            repository_checkout_capacity: Arc::default(),
             repository_review_capacity: Arc::default(),
             repository_selection_capacity: Arc::default(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
@@ -18088,6 +18090,83 @@ impl WorkspaceApi for Services {
         repository_native_wire::selection::release(self, query)
     }
 
+    fn repository_checkout_capture(
+        &self,
+        query: intent_core::repository_checkout::CheckoutCaptureQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutCapture,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::capture(self, query)
+    }
+
+    fn repository_checkout_projects(
+        &self,
+        query: intent_core::repository_checkout::CheckoutProjectsQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutProjects,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::projects(self, query)
+    }
+
+    fn repository_checkout_project(
+        &self,
+        query: intent_core::repository_checkout::CheckoutProjectQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutProjectDetail,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::project(self, query)
+    }
+
+    fn repository_checkout_branches(
+        &self,
+        query: intent_core::repository_checkout::CheckoutBranchesQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutBranches,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::branches(self, query)
+    }
+
+    fn repository_checkout_warm(
+        &self,
+        query: intent_core::repository_checkout::CheckoutSelection,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutWarm,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::warm(self, query)
+    }
+
+    fn repository_checkout_release(
+        &self,
+        query: intent_core::repository_checkout::CheckoutBinding,
+    ) -> BoxFuture<'_, Result<intent_core::repository_checkout::CheckoutReleased>> {
+        repository_native_wire::checkout::release(self, query)
+    }
+
     fn repository_resource_capture(
         &self,
         query: intent_core::repository_request::RepositoryResourceQuery,
@@ -20558,6 +20637,7 @@ impl WorkspaceApi for Services {
         input: WorkspaceCreate,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
+        let native_checkout = repository_native_wire::checkout::create::prepare(self, &input);
         let store = self.store.clone();
         let worktree_locks = self.worktree_locks.clone();
         let workspaces_root = self.workspaces_root.clone();
@@ -20578,6 +20658,11 @@ impl WorkspaceApi for Services {
             .and_then(|r| r.origin("workspaces.root"))
             == Some(SettingOrigin::Flag);
         self.execution_call(async move {
+            let native_checkout = native_checkout.await?;
+            let idempotency_key = match &native_checkout {
+                Some(checkout) => { checkout.current().await?; checkout.idempotency_key(idempotency_key) }
+                None => idempotency_key,
+            };
             // Creation is host-wide and must also work before any workspace exists.
             services
                 .require_workspace_creator("workspace.create")
@@ -20619,7 +20704,10 @@ impl WorkspaceApi for Services {
                 "",
                 idempotency_key,
                 "workspace.create",
-                move || async move {
+                // Keep the creation operation on the heap through the generic
+                // replay and execution scopes. Its initial-message persistence
+                // path otherwise exhausts the default stack in debug builds.
+                move || Box::pin(async move {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
@@ -20816,6 +20904,10 @@ impl WorkspaceApi for Services {
                         &workspaces_root,
                     )
                     .await;
+                    if let Some(checkout) = &native_checkout {
+                        checkout.current().await?;
+                        checkout.configure(&mut input, &workspaces_root, &id)?;
+                    }
                     let progress = progress_id.and_then(|pid| {
                         bus.clone().map(|b| {
                             std::sync::Arc::new(create_progress::CreateProgress::new(
@@ -21291,7 +21383,9 @@ impl WorkspaceApi for Services {
                     // registry-only rows retain best-effort lookup semantics. With multiple pr-kind links the FIRST one
                     // wins (deliberate tie-break: the FE puts the primary
                     // link first).
-                    let pr_link = input.context_links.as_deref().and_then(|links| {
+                    // GitLab URL context is retained verbatim; it never invokes
+                    // the legacy GitHub PR-head/fork branch derivation.
+                    let pr_link = input.context_links.as_deref().filter(|_| native_checkout.is_none()).and_then(|links| {
                         links
                             .iter()
                             .find(|l| l.kind == intent_core::ContextLinkKind::Pr)
@@ -21612,7 +21706,12 @@ impl WorkspaceApi for Services {
                         .filter(|p| !p.is_empty())
                         .map(PathBuf::from);
                     let workspaces_root_pathbuf = workspaces_root.clone();
-                    if let Some((cache_path, hydration_url)) = cache_hydration {
+                    if let Some(checkout) = &native_checkout {
+                        let path = repo_dir.clone().ok_or_else(|| Error::Internal("native checkout path missing".into()))?;
+                        checkout.provision(path.clone(), ws.branch.clone(), &workspaces_root_pathbuf, progress.clone()).await?;
+                        ws.worktree_path = Some(path.to_string_lossy().into_owned());
+                        ws.checkout_mode = Some(intent_core::CheckoutMode::Direct);
+                    } else if let Some((cache_path, hydration_url)) = cache_hydration {
                         // Cache hydration (PROTOCOL §5.1): provision a
                         // **standalone** checkout from the repo cache at the
                         // `repositoryPath` chosen in the clone arm above
@@ -22320,9 +22419,11 @@ impl WorkspaceApi for Services {
                     // in the same INSERT so later global changes don't
                     // retroactively flip existing workspaces — atomic, so the
                     // row can never exist without its seed.
-                    store
-                        .insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
-                        .await?;
+                    if let Some(checkout) = &native_checkout {
+                        checkout.insert(ws.clone(), global_auto_commit).await?;
+                    } else {
+                        store.insert_workspace_with_auto_commit(&ws, Some(global_auto_commit)).await?;
+                    }
                     // Write the legacy `<root>/<id>/.workspace/workspace.json`
                     // file so renderer paths (FE `FileSystemWorkspaceRepository`)
                     // find their per-workspace metadata without ENOENT spam.
@@ -22418,6 +22519,7 @@ impl WorkspaceApi for Services {
                     // `ws.workspace.details().setupStatus`. `pending` when a
                     // worktree exists; `skipped` when the stage never runs
                     // (skipWorktree / no worktree provisioned).
+                    if let Some(checkout) = &native_checkout { checkout.current().await?; }
                     let setup_worktree = if ws.skip_worktree {
                         None
                     } else {
@@ -22600,6 +22702,7 @@ impl WorkspaceApi for Services {
                     // exactly one `workspace:setup:completed` fires per logical create
                     // on every terminal path of the setup stage. Idempotent replays
                     // publish nothing (same as `workspace:created`).
+                    if let Some(checkout) = &native_checkout { checkout.current().await?; }
                     let pty_for_setup = self.pty.clone();
                     let bus_for_setup = self.event_bus.clone();
                     let setup_states = self.workspace_setup_states.clone();
@@ -22815,7 +22918,7 @@ impl WorkspaceApi for Services {
                         workspace: ws,
                         initial_agent,
                     })
-                },
+                }),
             )
             .await;
 
@@ -28371,6 +28474,13 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         force: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let native_operation = repository_native_wire::checkout::operations::capture(
+            self,
+            &intent_core::repository_checkout::CheckoutFrame::Push {
+                workspace_id: workspace_id.clone(),
+                force,
+            },
+        );
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
@@ -28385,6 +28495,15 @@ impl WorkspaceApi for Services {
             let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                 Error::Internal("Failed to push: workspace has no worktree".to_string())
             })?;
+            if let Some(plan) = native_operation.prepare(&ws, &worktree).await? {
+                let outcome = plan
+                    .execute(Some(force))
+                    .await?
+                    .ok_or_else(|| Error::Internal("native push result missing".into()))?;
+                return Ok(
+                    serde_json::json!({"branch":outcome.branch,"pushedSha":outcome.pushed_sha}),
+                );
+            }
             // Resolve the GitHub token outside the lock (bounded async lookups)
             // so the credential chain can fall back to it for HTTPS github.com
             // remotes (see `intent_git::auth`).
@@ -28447,6 +28566,10 @@ impl WorkspaceApi for Services {
     }
 
     fn git_fetch(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
+        let native_operation = repository_native_wire::checkout::operations::capture(
+            self,
+            &intent_core::repository_checkout::CheckoutFrame::Fetch(workspace_id.clone()),
+        );
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
@@ -28461,6 +28584,10 @@ impl WorkspaceApi for Services {
             let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                 Error::Internal("Failed to fetch: workspace has no worktree".to_string())
             })?;
+            if let Some(plan) = native_operation.prepare(&ws, &worktree).await? {
+                plan.execute(None).await?;
+                return Ok(());
+            }
             // Token resolved outside the lock — see the matching note on
             // `git_push` above.
             let token = github_git_token(registry.as_deref(), &worktree).await;
@@ -32996,9 +33123,22 @@ impl WorkspaceApi for Services {
         provider: String,
         host: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_auth_status_for_instance(provider, host, None)
+    }
+
+    fn source_control_auth_status_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.authStatus")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             match target {
                 source_control_auth_ops::Target::Github => {
                     let base = self.github_auth_status().await?;
@@ -33048,18 +33188,20 @@ impl WorkspaceApi for Services {
                     let slot = guard
                         .flow
                         .as_ref()
-                        .filter(|f| f.host == host.host())
+                        .filter(|f| f.host == host.logical_base_url())
                         .map(|f| &f.slot);
-                    let device_grant_supported =
-                        client_id.is_some() && !guard.unsupported_hosts.contains(host.host());
-                    Ok(source_control_auth_ops::auth_status_to_wire(
+                    let device_grant_supported = client_id.is_some()
+                        && !guard.unsupported_hosts.contains(host.logical_base_url());
+                    let mut status = source_control_auth_ops::auth_status_to_wire(
                         github_auth_ops::auth_status_to_wire(is_configured, slot),
                         source_control_auth_ops::Provider::Gitlab,
                         host.host(),
                         method,
                         user,
                         device_grant_supported,
-                    ))
+                    );
+                    status["instanceBaseUrl"] = serde_json::json!(host.logical_base_url());
+                    Ok(status)
                 }
             }
         })
@@ -33072,9 +33214,24 @@ impl WorkspaceApi for Services {
         method: Option<String>,
         token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_connect_for_instance(provider, host, method, token, None)
+    }
+
+    fn source_control_connect_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        method: Option<String>,
+        token: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.connect")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             let use_pat = match method.as_deref().map(str::trim) {
                 None | Some("device") => false,
                 Some("pat") => true,
@@ -33119,35 +33276,29 @@ impl WorkspaceApi for Services {
         provider: String,
         host: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_cancel_auth_for_instance(provider, host, None)
+    }
+
+    fn source_control_cancel_auth_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.cancelAuth")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             match target {
                 // Unscoped cancel: `sourceControl.cancelAuth` carries no
                 // `flowId`, so it cancels whichever GitHub flow is pending
                 // (same as `github.cancelAuth` with `flowId` omitted).
                 source_control_auth_ops::Target::Github => self.github_cancel_auth(None).await,
                 source_control_auth_ops::Target::Gitlab { host, .. } => {
-                    // Host-scoped: only a pending flow for exactly this host
-                    // is cancelled; a terminal slot stays until the next
-                    // connect replaces it (same rule as `github.cancelAuth`).
-                    let mut guard = self.gitlab_auth.lock().await;
-                    let starting = guard
-                        .starting
-                        .as_ref()
-                        .is_some_and(|s| s.host == host.host());
-                    let cancelled = matches!(
-                        guard.flow.as_ref(),
-                        Some(f) if f.host == host.host()
-                            && f.slot.phase == github_auth_ops::FlowPhase::Pending
-                    );
-                    if cancelled {
-                        guard.flow = None;
-                    }
-                    if starting {
-                        guard.starting = None;
-                    }
-                    Ok(serde_json::json!({ "ok": true, "cancelled": cancelled || starting }))
+                    self.gitlab_cancel_auth(&host).await
                 }
             }
         })
@@ -33158,9 +33309,22 @@ impl WorkspaceApi for Services {
         provider: String,
         host: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_revoke_for_instance(provider, host, None)
+    }
+
+    fn source_control_revoke_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.revoke")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             match target {
                 source_control_auth_ops::Target::Github => self.github_revoke().await,
                 source_control_auth_ops::Target::Gitlab { host, .. } => {
@@ -33175,9 +33339,22 @@ impl WorkspaceApi for Services {
         provider: String,
         host: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_get_user_for_instance(provider, host, None)
+    }
+
+    fn source_control_get_user_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.getUser")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             match target {
                 source_control_auth_ops::Target::Github => {
                     // An absent credential is `{ user: null }`, a rejected one

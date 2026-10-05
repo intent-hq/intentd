@@ -39,7 +39,7 @@ impl Server {
         eprintln!(
             "resource provider instance={INSTANCE} endpoint={endpoint} credential=owned-synthetic"
         );
-        let host = GitlabHost::parse("forge.test:8443")
+        let host = GitlabHost::parse(INSTANCE)
             .unwrap()
             .with_api_origin(&endpoint)
             .unwrap();

@@ -20615,6 +20615,38 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
     let text = result["text"].as_str().expect("text");
     assert!(text.contains("stale-queue-entry"), "text: {text}");
 
+    // Recipient reads retain content-free warnings in both representations.
+    let before = svc.queue_snapshot(&target);
+    for filter in [None, Some(target.clone())] {
+        let own = intent_core::with_caller(
+            intent_core::Caller::Agent {
+                agent_id: target.clone(),
+            },
+            svc.agent_diagnostics_op(ws.clone(), filter, None, None),
+        )
+        .await
+        .expect("recipient diagnostics");
+        let queue = &own["diagnostics"]["queues"][0];
+        assert_eq!(queue["queueLength"], 2);
+        assert_eq!(queue["entries"], json!([]));
+        let own_risk = own["diagnostics"]["stuckRisks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["type"] == "stale-queue-entry")
+            .expect("recipient retains stale-queue-entry warning");
+        assert_eq!(own_risk["entryId"], entry_id);
+        assert_eq!(own_risk["count"], 1);
+        assert!(own["text"].as_str().unwrap().contains("stale-queue-entry"));
+        assert!(own["text"].as_str().unwrap().contains("contents hidden"));
+        assert!(!own.to_string().contains("\"content\""));
+    }
+    assert_eq!(
+        svc.queue_snapshot(&target),
+        before,
+        "diagnostics does not consume"
+    );
+
     // An actively-responding (non-stale) agent legitimately holds its queue
     // until the turn ends: no risk even with the old entry.
     let mut s = svc

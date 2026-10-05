@@ -174,7 +174,7 @@ fn matches_host(descriptor: &GitlabDescriptor, host: &GitlabHost) -> bool {
     let Ok(logical) = GitlabHost::parse(descriptor.instance().as_str()) else {
         return false;
     };
-    if logical.host() != host.host() {
+    if logical.host() != host.host() || logical.logical_base_url() != host.logical_base_url() {
         return false;
     }
     let transport = if logical.base_url() == host.base_url() {
@@ -210,6 +210,25 @@ struct WriteState {
 }
 
 impl RepositoryWrite {
+    /// Linearizes cancellation against the original first-effect transition.
+    /// A begun writer retains settlement ownership and cannot be cancelled here.
+    pub(super) fn cancel_preflight(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|mut state| state.mutation.is_none() && state.reservation.take().is_some())
+    }
+
+    pub(super) fn check_preflight(&self) -> intent_sourcecontrol::Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| map_owner_error(RepositoryCredentialError::Indeterminate))?;
+        if state.mutation.is_none() && state.reservation.is_none() {
+            return Err(intent_sourcecontrol::Error::AdmissionRetired);
+        }
+        Ok(())
+    }
+
     /// Refresh begins under the original gate BEFORE the exchange can rotate a
     /// token. Persistence calls the same fence again without starting twice.
     pub(super) fn begin(&self) -> intent_sourcecontrol::Result<()> {

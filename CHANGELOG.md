@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.14] - 2026-10-05
+
+### 🐛 Bug Fixes
+
+- Resume suspend-interrupted turns that fail with provider timeout/terminated errors ([#2288](https://github.com/intent-hq/intentd/pull/2288))
+
+
+## [0.10.13] - 2026-10-04
+
+### 🐛 Bug Fixes
+
+- Avoid transcript reads for chat snapshot activity ([#2282](https://github.com/intent-hq/intentd/pull/2282))
+- Keep structured ACP notices out of assistant replies ([#2285](https://github.com/intent-hq/intentd/pull/2285))
+- Hide agents own pending queue contents ([#2284](https://github.com/intent-hq/intentd/pull/2284))
+
+
 ## [0.10.12] - 2026-10-04
 
 ### 🐛 Bug Fixes

@@ -1,5 +1,5 @@
 //! Original listeners, private Store membership and managed cache on real UDS/WSS.
-//! Controlled provider only; this never launches a daemon, Git or native review.
+//! Controlled provider only; checkout controls also use disposable Git and TLS peers.
 #![cfg(unix)]
 mod common;
 use futures_util::{SinkExt, StreamExt};
@@ -35,6 +35,7 @@ const PROJECT: &str = "Team/Sub/Project";
 struct Provider {
     routes: Mutex<Vec<(String, String)>>,
     replies: Mutex<HashMap<String, (u16, Value)>>,
+    next_pages: Mutex<HashMap<String, String>>,
     pause: Mutex<Option<String>>,
     entered: Notify,
     release: Notify,
@@ -50,20 +51,28 @@ struct Server {
 }
 impl Server {
     async fn new() -> Self {
+        Self::at_instance(INSTANCE).await
+    }
+    async fn at_instance(instance: &str) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         eprintln!(
             "resource provider instance={INSTANCE} endpoint={endpoint} credential=owned-synthetic"
         );
-        let host = GitlabHost::parse("forge.test:8443")
-            .unwrap()
-            .with_api_origin(&endpoint)
-            .unwrap();
-        let descriptor = GitlabDescriptor::with_loopback_endpoint(
-            GitlabInstance::parse(INSTANCE).unwrap(),
-            &endpoint,
+        let logical = GitlabInstance::parse(instance).unwrap();
+        let host = GitlabHost::parse(
+            logical
+                .as_str()
+                .strip_prefix("https://")
+                .unwrap()
+                .split('/')
+                .next()
+                .unwrap(),
         )
+        .unwrap()
+        .with_api_origin(&endpoint)
         .unwrap();
+        let descriptor = GitlabDescriptor::with_loopback_endpoint(logical, &endpoint).unwrap();
         let state = Arc::new(Provider::default());
         let child_state = state.clone();
         let (stop, mut stopped) = tokio::sync::oneshot::channel();
@@ -87,16 +96,17 @@ impl Server {
                             }
                             let header=String::from_utf8(bytes).unwrap(); let mut words=header.split_whitespace();
                             let method=words.next().unwrap().to_owned(); let path=words.next().unwrap().to_owned();
-                            assert_eq!(method,"GET"); assert!(header.contains("stored-pat"));
+                            assert!(method=="GET" || method=="POST"); if method=="GET" {assert!(header.contains("stored-pat") || header.contains("denied-pat"));}
                             state.routes.lock().unwrap().push((method,path.clone()));
                             let route=path.split('?').next().unwrap();
                             // The response belongs to this original request, even if a newer
                             // request changes the configured reply before this hold is released.
-                            let reply=state.replies.lock().unwrap().get(route).cloned().unwrap_or_else(||default_reply(route));
+                            let reply={let replies=state.replies.lock().unwrap();replies.get(&path).or_else(||replies.get(route)).cloned().unwrap_or_else(||default_reply(route))};
                             let pause={let mut p=state.pause.lock().unwrap();if p.as_deref()==Some(route){p.take();true}else{false}};
                             if pause {state.entered.notify_one();state.release.notified().await;}
                             let body=reply.1.to_string();
-                            let head=format!("HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRateLimit-Remaining: 17\r\nRateLimit-Limit: 100\r\nRateLimit-Reset: 1900000000\r\nConnection: close\r\n\r\n",reply.0,body.len());
+                            let next=state.next_pages.lock().unwrap().get(&path).map(|n|format!("X-Next-Page: {n}\r\n")).unwrap_or_default();
+                            let head=format!("HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{next}RateLimit-Remaining: 17\r\nRateLimit-Limit: 100\r\nRateLimit-Reset: 1900000000\r\nConnection: close\r\n\r\n",reply.0,body.len());
                             let _=stream.write_all(format!("{head}{body}").as_bytes()).await;
                         });
                     },
@@ -271,6 +281,7 @@ struct Harness {
     dir: tempfile::TempDir,
     server: Option<Server>,
     store: Store,
+    services: Arc<Services>,
     workspace: WorkspaceId,
     member: PrincipalId,
     ws: Arc<WsApiServer>,
@@ -281,14 +292,29 @@ struct Harness {
 }
 impl Harness {
     async fn new() -> Self {
+        Self::with_workspace(true).await
+    }
+    async fn with_workspace(existing: bool) -> Self {
+        Self::from_server(existing, Server::new().await).await
+    }
+    async fn from_server(existing: bool, server: Server) -> Self {
+        let fixtures = vec![server.descriptor.clone()];
+        Self::with_fixtures(existing, server, fixtures).await
+    }
+    async fn with_fixtures(
+        existing: bool,
+        server: Server,
+        fixtures: Vec<GitlabDescriptor>,
+    ) -> Self {
         let dir = common::test_tempdir("itd-resource-wire-");
-        let server = Server::new().await;
         let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
         let mut workspace = intent_core::chief_workspace();
         workspace.id = WorkspaceId::new();
         workspace.path = None;
         workspace.repository_path = None;
-        store.insert_workspace(&workspace).await.unwrap();
+        if existing {
+            store.insert_workspace(&workspace).await.unwrap();
+        }
         let owner = store.get_primary_principal().await.unwrap();
         let mut member_id = None;
         for (token, is_member) in [(MEMBER, true), (GUEST, false)] {
@@ -345,10 +371,12 @@ impl Harness {
                     .await
                     .unwrap();
             }
-            store
-                .add_workspace_member(&workspace.id, &person.id, WorkspaceRole::Collaborator)
-                .await
-                .unwrap();
+            if existing {
+                store
+                    .add_workspace_member(&workspace.id, &person.id, WorkspaceRole::Collaborator)
+                    .await
+                    .unwrap();
+            }
         }
         let registry = Arc::new(SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
         registry
@@ -359,7 +387,7 @@ impl Harness {
                 ),
                 (
                     "sourceControl.gitlab.instanceBaseUrl".into(),
-                    json!(INSTANCE),
+                    json!(server.descriptor.instance().as_str()),
                 ),
                 (
                     "sourceControl.gitlab.apiBaseUrl".into(),
@@ -380,14 +408,15 @@ impl Harness {
                 Some(server.descriptor.clone()),
             )
             .with_settings_registry(registry)
+            .with_workspaces_root(dir.path().join("workspaces"))
             .with_event_bus(bus.clone()),
         );
         services
-            .initialize_repository_test_fixture(server.descriptor.clone())
+            .initialize_repository_test_fixtures(fixtures)
             .await
             .unwrap();
         services.initialize_repository_wire().await.unwrap();
-        let api: Arc<dyn WorkspaceApi> = services;
+        let api: Arc<dyn WorkspaceApi> = services.clone();
         let tls = ensure_tls_certificate(dir.path()).unwrap();
         let cfg = client_config(&tls.fingerprint256);
         let token = Arc::new(AsyncTokenStore::new(Arc::new(OwnedToken)));
@@ -430,6 +459,7 @@ impl Harness {
             dir,
             server: Some(server),
             store,
+            services,
             workspace: workspace.id,
             member: member_id.unwrap(),
             ws,
@@ -587,6 +617,10 @@ async fn repository_resource_real_owner_uds_and_member_tls_wss_contract() {
         let hello = c.rpc("client.hello", json!({})).await;
         assert_eq!(success(&hello)["protocolVersion"], "13.6");
         assert_eq!(
+            hello["result"]["server"]["capabilities"]["gitlabCheckout"],
+            1
+        );
+        assert_eq!(
             hello["result"]["server"]["capabilities"]["submissionCorrelation"],
             1
         );
@@ -733,3 +767,6 @@ async fn repository_resource_real_failure_classes_keep_original_wire_evidence() 
         h.finish().await;
     }
 }
+
+#[path = "e2e_repository_resource_read/checkout.rs"]
+mod checkout;
