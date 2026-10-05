@@ -53,6 +53,15 @@ async fn item(store: &Store, kind: &str, sequence: i64, value: Value) {
     .await
     .unwrap();
 }
+async fn register_reference(store: &Store, reference: &str) {
+    sqlx::query("INSERT INTO note_operation_reference(operation_key,reference) VALUES(?,?)")
+        .bind(KEY)
+        .bind(reference)
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+}
+
 async fn read(store: &Store, query: &ReceiptDetailQuery) -> Value {
     store
         .read_note_receipt_detail("alice", query, &json!("escaped\\\"\n😀"))
@@ -313,6 +322,7 @@ async fn receipt_inverse_text_reconstructs_scalar_safe_bytes_and_enforces_reacha
 async fn receipt_detail_pages_only_existing_scoped_metadata_or_fragments() {
     let (_dir, store, mut query) = fixture().await;
     let reference = format!("{KEY}:inverse-detail:0");
+    register_reference(&store, &reference).await;
     let records = [
         json!({"id":"root","parentId":null,"type":"string","value":"original marker metadata"}),
         json!({"kind":"fragment","id":"field","field":"text","offset":0,"text":"escaped\\\"😀","nextRef":null}),
@@ -342,6 +352,7 @@ async fn receipt_detail_pages_only_existing_scoped_metadata_or_fragments() {
 async fn receipt_detail_fragment_source_budget_applies_to_whole_page() {
     let (_dir, store, mut query) = fixture().await;
     let reference = format!("{KEY}:detail:fragments");
+    register_reference(&store, &reference).await;
     for sequence in 0..40 {
         let value = json!({"kind":"fragment","id":format!("field{sequence}"),"field":"text","offset":0,"text":"x".repeat(1024),"nextRef":null});
         sqlx::query("INSERT INTO note_operation_detail(operation_key,reference,sequence,value) VALUES(?,?,?,?)")
@@ -377,6 +388,7 @@ async fn receipt_context_uses_original_scope_and_retained_revision_without_live_
     use intent_core::note_receipt_detail::NoteGetReceiptContextRequest;
     let (_dir, store, query) = fixture().await;
     let reference = format!("{KEY}:inverse-detail:0");
+    register_reference(&store, &reference).await;
     sqlx::query("INSERT INTO note_operation_detail(operation_key,reference,sequence,value) VALUES(?,?,0,?)")
         .bind(KEY).bind(&reference)
         .bind(json!({"kind":"fragment","id":"text","field":"value","offset":0,"text":"original detail","nextRef":null}).to_string())
@@ -412,4 +424,61 @@ async fn receipt_context_uses_original_scope_and_retained_revision_without_live_
         .read_note_receipt_context("bob", &request, &json!(1))
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn receipt_detail_requires_registered_reachability_and_supports_empty_references() {
+    let (_dir, store, mut query) = fixture().await;
+    query.kind = ReceiptDetailKind::Detail;
+    query.reference = format!("{KEY}:empty-children");
+    assert!(matches!(
+        store
+            .read_note_receipt_detail("alice", &query, &json!(1))
+            .await,
+        Err(Error::NotePage(NotePageError::CursorInvalid))
+    ));
+    register_reference(&store, &query.reference).await;
+    let empty = read(&store, &query).await;
+    assert_eq!(empty["items"], json!([]));
+    assert!(empty["nextCursor"].is_null());
+
+    query.reference = format!("{KEY}:orphan");
+    sqlx::query(
+        "INSERT INTO note_operation_detail(operation_key,reference,sequence,value) VALUES(?,?,0,?)",
+    )
+    .bind(KEY)
+    .bind(&query.reference)
+    .bind(
+        json!({"id":"orphan","parentId":null,"type":"string","value":"must not leak"}).to_string(),
+    )
+    .execute(store.write_pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        store
+            .read_note_receipt_detail("alice", &query, &json!(1))
+            .await,
+        Err(Error::NotePage(NotePageError::CursorInvalid))
+    ));
+
+    let foreign = "33333333-3333-4333-8333-333333333333";
+    sqlx::query("INSERT INTO note_operation(operation_key,principal,backend_id,workspace_id,note_id,instance_id,operation_id,payload_digest,admission_expires,retain_until,outcome,converted_count) SELECT ?,'alice',backend_id,workspace_id,note_id,instance_id,?,payload_digest,admission_expires,retain_until,outcome,converted_count FROM note_operation WHERE operation_key=?")
+        .bind(foreign).bind(foreign).bind(KEY).execute(store.write_pool()).await.unwrap();
+    sqlx::query("INSERT INTO note_operation_reference(operation_key,reference) VALUES(?,?)")
+        .bind(foreign)
+        .bind(&query.reference)
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .read_note_receipt_detail("alice", &query, &json!(1))
+            .await,
+        Err(Error::NotePage(NotePageError::CursorInvalid))
+    ));
+    register_reference(&store, &query.reference).await;
+    assert_eq!(
+        read(&store, &query).await["items"][0]["value"],
+        "must not leak"
+    );
 }

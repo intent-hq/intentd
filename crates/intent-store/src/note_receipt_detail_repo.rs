@@ -233,7 +233,7 @@ impl Store {
         }
         let operation_key: String = row.get("operation_key");
         let owns_reference = if query.kind == ReceiptDetailKind::Detail {
-            sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM note_operation_detail WHERE operation_key=? AND reference=?)")
+            sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM note_operation_reference WHERE operation_key=? AND reference=?)")
                 .bind(&operation_key).bind(&query.reference).fetch_one(&mut *tx).await.map_err(db)?
         } else {
             receipt[query.kind.reference_field()] == query.reference
