@@ -1,7 +1,7 @@
 //! Change-aware catalog delivery for persistent first-turn-prepend providers.
 
 use base64::Engine;
-use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, WorkspaceId};
 use intent_providers::InjectionMechanism;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
