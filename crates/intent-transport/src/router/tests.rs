@@ -8079,3 +8079,89 @@ async fn note_operation_status_bounds_admission_and_all_reply_shapes() {
             .is_some());
     }
 }
+
+#[tokio::test]
+async fn note_splice_transport_rejects_full_escaped_budget_before_dispatch_and_bounds_errors() {
+    use intent_core::note_mutation::{NoteApplySplices, NoteSplice};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct SpliceApi {
+        calls: AtomicUsize,
+    }
+    impl WorkspaceApi for SpliceApi {
+        fn note_apply_splices(&self, request: NoteApplySplices) -> BoxFuture<'_, Result<Value>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                if request.splices[0].text == "invalid" {
+                    Err(Error::InvalidParams("secret source".repeat(8192)))
+                } else {
+                    Err(Error::Internal("secret source".repeat(8192)))
+                }
+            })
+        }
+    }
+    let api = SpliceApi {
+        calls: AtomicUsize::new(0),
+    };
+    let mut request = NoteApplySplices {
+        backend_id: "backend".into(),
+        workspace_id: "workspace".into(),
+        note_id: "note".into(),
+        note_instance_id: "instance".into(),
+        base_revision: "revision".into(),
+        operation_id: "11111111-1111-4111-8111-111111111111".into(),
+        expires_at: "2026-10-06T00:00:00.000Z".into(),
+        payload_digest: String::new(),
+        splices: vec![NoteSplice {
+            start: 0,
+            end: 0,
+            text: "\u{1}".repeat(16384),
+        }],
+    };
+    // This deliberately oversized envelope must fail before digest validation.
+    // The bounded digest helper itself correctly rejects this payload.
+    request.payload_digest = "0".repeat(64);
+    let frame =
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"note.applySplices","params":request})
+            .to_string();
+    assert!(frame.len() > 65536);
+    let result = handle_message(&api, &frame).await.unwrap();
+    assert!(result.len() <= 4096);
+    assert_eq!(
+        serde_json::from_str::<Value>(&result).unwrap()["error"]["data"]["code"],
+        "note-page-budget"
+    );
+    assert_eq!(api.calls.load(Ordering::Relaxed), 0);
+    request.splices[0].text = "valid".into();
+    request.payload_digest = request.computed_digest().unwrap();
+    for id in [
+        serde_json::json!("x".repeat(65)),
+        serde_json::json!(9_007_199_254_740_992_u64),
+        Value::Null,
+    ] {
+        let frame=serde_json::json!({"jsonrpc":"2.0","id":id,"method":"note.applySplices","params":request}).to_string();
+        let result = handle_message(&api, &frame).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&result).unwrap()["id"],
+            Value::Null
+        );
+        assert_eq!(api.calls.load(Ordering::Relaxed), 0);
+    }
+    let frame=serde_json::json!({"jsonrpc":"2.0","id":"\u{1}".repeat(64),"method":"note.applySplices","params":request}).to_string();
+    let result = handle_message(&api, &frame).await.unwrap();
+    assert!(result.len() <= 4096);
+    assert!(!result.contains("secret"));
+    assert_eq!(api.calls.load(Ordering::Relaxed), 1);
+    request.splices[0].text = "invalid".into();
+    request.payload_digest = request.computed_digest().unwrap();
+    let frame =
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"note.applySplices","params":request})
+            .to_string();
+    let result = handle_message(&api, &frame).await.unwrap();
+    assert!(result.len() <= 4096);
+    assert!(!result.contains("secret"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&result).unwrap()["error"]["code"],
+        -32602
+    );
+    assert_eq!(api.calls.load(Ordering::Relaxed), 2);
+}

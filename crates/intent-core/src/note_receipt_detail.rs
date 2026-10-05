@@ -238,7 +238,23 @@ pub struct NoteGetReceiptContextRequest {
     pub source_revision: String,
     pub page: ReceiptContextPage,
 }
+/// Select the receipt context route; this is not reference authorization.
+/// The Store still validates exact owner, scope, reachability and expiry.
+#[must_use]
+pub fn is_receipt_context_reference(reference: &str) -> bool {
+    reference
+        .split_once(':')
+        .is_some_and(|(owner, _)| uuid::Uuid::parse_str(owner).is_ok())
+}
+
 impl NoteGetReceiptContextRequest {
+    /// Validate the public envelope before resolving its original operation.
+    /// # Errors
+    /// Rejects invalid context identity and bounded page selectors.
+    pub fn validate(&self) -> Result<(), NoteMutationError> {
+        self.query(uuid::Uuid::nil().to_string()).map(|_| ())
+    }
+
     /// Normalize after the Store resolves the opaque reference's original operation.
     /// # Errors
     /// Rejects invalid context shape, retained revision identity or budgets.

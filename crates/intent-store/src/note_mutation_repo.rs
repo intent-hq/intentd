@@ -11,6 +11,8 @@ use sqlx::{Row, Sqlite, Transaction};
 
 use crate::Store;
 
+mod canonical;
+
 // Preserve the existing metadata decoder without loading unrelated source
 // bodies into the transaction's conversion workspace snapshot.
 const NOTE_METADATA_COLUMNS: &str = "id,workspace_id,title,'' AS content,content_type,tags,is_pinned,is_archived,is_default,parent_id,visibility,task_json,created_at,rev,updated_at";
@@ -584,8 +586,23 @@ impl NoteMutationWrite {
             )
             .await?;
             final_position += item.start - base_position;
-            let inverse = json!({"start":final_position,"end":final_position+item.inserted_length,
-                "source":{"phase":"base","range":{"start":item.start,"end":item.end}}});
+            let text_id = format!("{}:text:{sequence}", self.operation_key);
+            let replacement = self
+                .retain_text_reference(&text_id, "base", item.start, item.end)
+                .await?;
+            let provenance = format!("{}:inverse-detail:{sequence}", self.operation_key);
+            self.retain_detail_tree(
+                &provenance,
+                json!({"kind":"sourceProvenance",
+                "inputState":revision,"outputState":self.request.base_revision,
+                "baseRange":{"start":item.start,"end":item.end},
+                "finalRange":{"start":final_position,"end":final_position+item.inserted_length},
+                "replacement":replacement}),
+            )
+            .await?;
+            let inverse = json!({"historyGroup":"0","inputState":revision,"outputState":self.request.base_revision,
+                "ordinal":sequence,"start":final_position,"end":final_position+item.inserted_length,
+                "replacement":replacement,"provenanceRef":provenance});
             self.insert_item("inverse", sequence, &inverse).await?;
             base_position = item.end;
             final_position += item.inserted_length;
@@ -601,8 +618,9 @@ impl NoteMutationWrite {
             &self.request,
         )
         .await?;
-        sqlx::query("UPDATE note_operation SET outcome=? WHERE operation_key=?")
+        sqlx::query("UPDATE note_operation SET outcome=?,converted_count=? WHERE operation_key=?")
             .bind(receipt.to_string())
+            .bind(i64::try_from(self.converted_count).map_err(db)?)
             .bind(&self.operation_key)
             .execute(&mut *self.transaction)
             .await

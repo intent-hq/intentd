@@ -84,3 +84,15 @@ fn receipt_context_selects_retained_revision_and_rejects_other_selectors() {
     bad["page"]["maxSourceBytes"] = json!(4096);
     assert!(serde_json::from_value::<NoteGetReceiptContextRequest>(bad).is_err());
 }
+
+#[test]
+fn receipt_context_route_shape_never_grants_reference_authority() {
+    assert!(super::is_receipt_context_reference(
+        "00000000-0000-0000-0000-000000000000:inverse-detail:0"
+    ));
+    assert!(!super::is_receipt_context_reference("np1.source-context"));
+    assert!(!super::is_receipt_context_reference(
+        "na1.annotation-context"
+    ));
+    assert!(!super::is_receipt_context_reference("malformed:receipt"));
+}

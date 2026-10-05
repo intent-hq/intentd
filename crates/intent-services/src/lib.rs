@@ -204,9 +204,12 @@ mod member_removal;
 mod model_catalog;
 mod nested_repos;
 mod note_annotation;
+mod note_conversion_plan;
 mod note_merge;
 pub mod note_ops;
 mod note_page_state;
+mod note_receipt;
+mod note_splice;
 mod npx_cli;
 #[expect(
     dead_code,
@@ -25028,6 +25031,29 @@ impl WorkspaceApi for Services {
         incarnation: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(self.read_page_state(workspace_id, note_id, incarnation))
+    }
+
+    fn get_note_receipt_context(
+        &self,
+        request: intent_core::note_receipt_detail::NoteGetReceiptContextRequest,
+        rpc_id: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.read_note_receipt_context(request, rpc_id))
+    }
+
+    fn get_note_receipt_detail(
+        &self,
+        query: intent_core::note_receipt_detail::ReceiptDetailQuery,
+        rpc_id: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.read_note_receipt(query, rpc_id))
+    }
+
+    fn note_apply_splices(
+        &self,
+        request: intent_core::note_mutation::NoteApplySplices,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.apply_note_splices(request))
     }
 
     fn note_operation_status(

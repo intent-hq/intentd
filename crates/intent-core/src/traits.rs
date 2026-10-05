@@ -1072,6 +1072,35 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { Err(crate::Error::Unsupported("note page state".into())) })
     }
 
+    /// Resolve a receipt-owned context reference without a live-note snapshot.
+    fn get_note_receipt_context(
+        &self,
+        request: crate::note_receipt_detail::NoteGetReceiptContextRequest,
+        rpc_id: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (request, rpc_id);
+        Box::pin(async { Err(crate::Error::Unsupported("note receipt context".into())) })
+    }
+
+    /// Read immutable receipt data under the current caller's authorization.
+    fn get_note_receipt_detail(
+        &self,
+        query: crate::note_receipt_detail::ReceiptDetailQuery,
+        rpc_id: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (query, rpc_id);
+        Box::pin(async { Err(crate::Error::Unsupported("note receipt detail".into())) })
+    }
+
+    /// Apply exact source-addressed edits and return their durable commit receipt.
+    fn note_apply_splices(
+        &self,
+        request: crate::note_mutation::NoteApplySplices,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = request;
+        Box::pin(async { Err(crate::Error::Unsupported("note apply splices".into())) })
+    }
+
     /// Resolve a retained operation under current authorization, without live text.
     fn note_operation_status(
         &self,

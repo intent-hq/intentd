@@ -450,8 +450,27 @@ pub(crate) async fn prepare_message(
         .get("params")
         .and_then(Value::as_object)
         .and_then(|params| annotation_method(value.get("method").and_then(Value::as_str)?, params));
-    if value.get("method").and_then(Value::as_str) == Some("note.operationStatus")
-        || annotation.is_some()
+    let receipt_context = value.get("method").and_then(Value::as_str) == Some("note.get")
+        && value
+            .pointer("/params/page/contextRef")
+            .and_then(Value::as_str)
+            .is_some_and(intent_core::note_receipt_detail::is_receipt_context_reference);
+    let receipt_read = receipt_context
+        || value.get("method").and_then(Value::as_str) == Some("note.operation.read")
+        || (value.get("method").and_then(Value::as_str) == Some("note.get")
+            && matches!(
+                value
+                    .get("params")
+                    .and_then(|p| p.get("page"))
+                    .and_then(|p| p.get("kind"))
+                    .and_then(Value::as_str),
+                Some("mapping" | "effects")
+            ));
+    if matches!(
+        value.get("method").and_then(Value::as_str),
+        Some("note.operationStatus" | "note.applySplices")
+    ) || annotation.is_some()
+        || receipt_read
     {
         if value.get("id").is_some_and(|id| !valid_note_page_id(id)) {
             return Some(invalid_note_page_id());
@@ -553,6 +572,8 @@ pub(crate) async fn prepare_message(
     async move {
         let result = if let Some(annotation) = annotation {
             Box::pin(dispatch_annotation_page(api, annotation, &params, &echo_id)).await
+        } else if receipt_read {
+            dispatch_note_receipt(api, method, &params, &echo_id).await
         } else if method == "note.get" && params.contains_key("page") {
             Box::pin(dispatch_note_page(api, &params, &echo_id, message.len())).await
         } else {
@@ -569,9 +590,16 @@ pub(crate) async fn prepare_message(
             method,
             is_notification,
             result,
-            if method == "note.operationStatus" {
+            if matches!(method, "note.operationStatus" | "note.applySplices") {
                 4096
-            } else if annotation.is_some() {
+            } else if method == "note.operation.read" {
+                params
+                    .get("maxWireBytes")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .unwrap_or(65536)
+                    .clamp(4096, 65536)
+            } else if annotation.is_some() || receipt_read {
                 params
                     .get("page")
                     .and_then(|page| page.get("maxWireBytes"))
@@ -648,7 +676,7 @@ fn encode_dispatch_result(
     };
     let response_bytes = encoded.frame.len();
     if response_bytes > max_response_bytes {
-        let replacement = if method == "note.operationStatus" {
+        let replacement = if matches!(method, "note.operationStatus" | "note.applySplices") {
             error_frame(
                 id,
                 INVALID_PARAMS,
@@ -696,7 +724,10 @@ fn invalid_note_page_id() -> PreparedReply {
 // Receipt errors never echo database errors, source content or unbounded IDs.
 fn bounded_note_operation_error(error: Error) -> RpcErr {
     match error {
-        Error::NoteMutation(_) => domain_to_rpc(error),
+        Error::NoteMutation(_) | Error::NotePage(_) => domain_to_rpc(error),
+        Error::InvalidParams(_) => domain_to_rpc(Error::InvalidParams(
+            "Invalid note operation request".into(),
+        )),
         Error::NotFound(_) => not_found("Note operation not found"),
         Error::Forbidden(_) => domain_to_rpc(Error::Forbidden("Note operation unavailable".into())),
         Error::Unsupported(_) => {
@@ -773,6 +804,53 @@ async fn dispatch_annotation_page(
             }
             _ => rpc(-32603, "Annotation page unavailable"),
         })
+}
+
+async fn dispatch_note_receipt(
+    api: &dyn WorkspaceApi,
+    method: &str,
+    params: &Map<String, Value>,
+    id: &Value,
+) -> std::result::Result<Value, RpcErr> {
+    if params.values().any(Value::is_null)
+        || params
+            .get("page")
+            .and_then(Value::as_object)
+            .is_some_and(|p| p.values().any(Value::is_null))
+    {
+        return Err(invalid_params("Invalid receipt detail request"));
+    }
+    if method == "note.get"
+        && params
+            .get("page")
+            .is_some_and(|page| page.get("contextRef").is_some())
+    {
+        let request: intent_core::note_receipt_detail::NoteGetReceiptContextRequest =
+            serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|_| invalid_params("Invalid receipt context request"))?;
+        request
+            .validate()
+            .map_err(|e| domain_to_rpc(Error::NoteMutation(e)))?;
+        return api
+            .get_note_receipt_context(request, id.clone())
+            .await
+            .map_err(bounded_note_operation_error);
+    }
+    let query = if method == "note.operation.read" {
+        let request: intent_core::note_receipt_detail::NoteOperationReceiptRead =
+            serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|_| invalid_params("Invalid receipt detail request"))?;
+        request.query()
+    } else {
+        let request: intent_core::note_receipt_detail::NoteGetReceiptRequest =
+            serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|_| invalid_params("Invalid receipt detail request"))?;
+        request.query()
+    }
+    .map_err(|e| domain_to_rpc(Error::NoteMutation(e)))?;
+    api.get_note_receipt_detail(query, id.clone())
+        .await
+        .map_err(bounded_note_operation_error)
 }
 
 /// Dispatch a validated request to the injected [`WorkspaceApi`].
@@ -1420,6 +1498,17 @@ async fn dispatch_other(
                 }
                 None => Ok(json!({ "notes": notes })),
             }
+        }
+        "note.applySplices" => {
+            let request: intent_core::note_mutation::NoteApplySplices =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid note splice operation"))?;
+            request
+                .validate()
+                .map_err(|e| domain_to_rpc(Error::NoteMutation(e)))?;
+            api.note_apply_splices(request)
+                .await
+                .map_err(bounded_note_operation_error)
         }
         "note.operationStatus" => {
             if params.values().any(Value::is_null) {

@@ -617,7 +617,7 @@ async fn note_mutation_large_deletion_keeps_inverse_text_out_of_receipt_and_rows
             .unwrap();
     assert!(!inverse.contains('😀'));
     assert_eq!(
-        serde_json::from_str::<Value>(&inverse).unwrap()["source"]["range"]["end"],
+        serde_json::from_str::<Value>(&inverse).unwrap()["replacement"]["length"],
         90_000
     );
 }

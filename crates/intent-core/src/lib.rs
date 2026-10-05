@@ -39,7 +39,9 @@ pub mod note_annotation;
 pub mod note_artifact;
 pub mod note_mutation;
 pub mod note_page;
+pub mod note_receipt_detail;
 pub mod note_source_session;
+pub mod note_stage;
 pub mod path_utils;
 pub mod process_policy;
 #[doc(hidden)]

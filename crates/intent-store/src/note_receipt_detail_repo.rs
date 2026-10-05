@@ -164,13 +164,29 @@ impl Store {
     /// The service owns current authorization, including original deleted scope.
     /// # Errors
     /// Returns typed cursor/expiry/budget/digest errors without note/source data.
-    #[expect(clippy::too_many_lines)]
     pub async fn read_note_receipt_detail(
         &self,
         principal: &str,
         query: &ReceiptDetailQuery,
         rpc_id: &Value,
     ) -> Result<Value> {
+        self.read_note_receipt_detail_retained(principal, query, rpc_id)
+            .await
+            .map(|(page, _)| page)
+    }
+
+    /// Return the original immutable retention deadline with a bounded page.
+    /// Services recheck it after their final authorization awaits; mapping/effects
+    /// wire envelopes do not expose a deadline field.
+    /// # Errors
+    /// Returns the same scoped validation, storage and expiry failures as the page reader.
+    #[expect(clippy::too_many_lines)]
+    pub async fn read_note_receipt_detail_retained(
+        &self,
+        principal: &str,
+        query: &ReceiptDetailQuery,
+        rpc_id: &Value,
+    ) -> Result<(Value, i64)> {
         query.validate().map_err(Error::NoteMutation)?;
         if principal.is_empty()
             || principal.len() > 256
@@ -365,7 +381,7 @@ impl Store {
         if retain_until <= now()? {
             return Err(expired());
         }
-        Ok(out)
+        Ok((out, retain_until))
     }
 }
 

@@ -1505,3 +1505,182 @@ async fn bounded_note_operation_status_reads_committed_receipt_after_wss_reconne
     rpc.close(None).await.unwrap();
     fx.ws.stop().await;
 }
+
+#[tokio::test]
+async fn bounded_public_splices_commit_replay_and_status_over_wss() {
+    use intent_core::note_mutation::{NoteApplySplices, NoteSplice};
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"title":"inline splice","path":"."}),
+    )
+    .await;
+    let ws = workspace["workspace"]["id"].as_str().unwrap();
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({"workspaceId":ws,"title":"exact","content":"same😀\r\nsame😀"}),
+    )
+    .await;
+    let note = created["note"]["id"].as_str().unwrap();
+    let page = wss_rpc(
+        &mut rpc,
+        3,
+        "note.get",
+        json!({"workspaceId":ws,"noteId":note,"page":{"kind":"source"}}),
+    )
+    .await;
+    let mut evt = connect(fx.port, fx.cfg.clone()).await;
+    let subscription = wss_rpc(
+        &mut evt,
+        20,
+        "events.subscribe",
+        json!({"workspaceId":ws,"eventTypes":["note:updated"]}),
+    )
+    .await;
+    assert!(subscription["subscriptionId"].is_string());
+    let mut input = NoteApplySplices {
+        backend_id: page["scope"]["backendId"].as_str().unwrap().into(),
+        workspace_id: ws.into(),
+        note_id: note.into(),
+        note_instance_id: page["scope"]["noteInstanceId"].as_str().unwrap().into(),
+        base_revision: page["sourceRevision"].as_str().unwrap().into(),
+        operation_id: uuid::Uuid::new_v4().to_string(),
+        expires_at: format!("{}.000Z", &intent_core::iso_ms_from_now(60_000)[..19]),
+        payload_digest: String::new(),
+        splices: vec![NoteSplice {
+            start: 8,
+            end: 12,
+            text: "saved".into(),
+        }],
+    };
+    let mut guarded = input.clone();
+    guarded.operation_id = uuid::Uuid::new_v4().to_string();
+    guarded.splices[0].text = "   1 | secret source\n   2 | private bytes".into();
+    guarded.payload_digest = guarded.computed_digest().unwrap();
+    let rejected = wss_rpc_raw(
+        &mut rpc,
+        30,
+        "note.applySplices",
+        serde_json::to_value(&guarded).unwrap(),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], -32602);
+    assert!(rejected.to_string().len() <= 4096);
+    assert!(!rejected.to_string().contains("secret"));
+    let unchanged = wss_rpc(
+        &mut rpc,
+        31,
+        "note.get",
+        json!({"workspaceId":ws,"noteId":note}),
+    )
+    .await;
+    assert_eq!(unchanged["note"]["content"], "same😀\r\nsame😀");
+    input.payload_digest = input.computed_digest().unwrap();
+    let params = serde_json::to_value(&input).unwrap();
+    let first = wss_rpc_raw(&mut rpc, 4, "note.applySplices", params.clone()).await;
+    assert!(first.to_string().len() <= 4096);
+    assert_eq!(first["jsonrpc"], "2.0");
+    assert_eq!(first["id"], 4);
+    let receipt = &first["result"];
+    assert_eq!(receipt["kind"], "noteCommitReceipt");
+    assert_eq!(receipt["outcome"], "committed");
+    assert_eq!(receipt["operationId"], input.operation_id);
+    assert_eq!(receipt["payloadDigest"], input.payload_digest);
+    assert_eq!(receipt["scope"], page["scope"]);
+    assert_eq!(receipt["beforeRevision"], page["sourceRevision"]);
+    assert_ne!(receipt["afterRevision"], page["sourceRevision"]);
+    assert!(receipt.get("content").is_none());
+    assert!(receipt["mappingRef"].is_string());
+    assert!(receipt["effectsRef"].is_string());
+    assert!(receipt["inverseRef"].is_string());
+    assert_eq!(
+        wss_rpc(&mut rpc, 5, "note.applySplices", params.clone()).await,
+        *receipt
+    );
+    let current = wss_rpc(
+        &mut rpc,
+        6,
+        "note.get",
+        json!({"workspaceId":ws,"noteId":note}),
+    )
+    .await;
+    assert_eq!(current["note"]["content"], "same😀\r\nsaved😀");
+    let status=wss_rpc(&mut rpc,7,"note.operationStatus",json!({"backendId":input.backend_id,"workspaceId":ws,"noteId":note,"noteInstanceId":input.note_instance_id,"operationId":input.operation_id,"payloadDigest":input.payload_digest})).await;
+    assert_eq!(status, *receipt);
+    let published = drain_note_updated(&mut evt, note, Duration::from_millis(500)).await;
+    assert!(
+        !published.is_empty(),
+        "committed public write publishes its note change"
+    );
+    assert!(published.iter().all(|event| event["workspaceId"] == ws));
+    let mut wrong = params;
+    wrong["splices"][0]["text"] = json!("wrong");
+    let rejected = wss_rpc_raw(&mut rpc, 8, "note.applySplices", wrong).await;
+    assert_eq!(rejected["error"]["data"]["code"], "note-operation-mismatch");
+    let hello = wss_rpc(&mut rpc, 9, "client.hello", json!({})).await;
+    assert!(hello["server"]["capabilities"].get("notePaging").is_none());
+    let mut mapping_params = receipt["scope"].clone();
+    mapping_params["page"] = json!({"kind":"mapping","operationId":input.operation_id,"ref":receipt["mappingRef"],"maxWireBytes":4096});
+    let mapping = wss_rpc_raw(&mut rpc, 10, "note.get", mapping_params).await;
+    assert!(mapping.to_string().len() <= 4096);
+    assert_eq!(
+        mapping["result"]["items"],
+        json!([{"start":8,"end":12,"insertedLength":5}])
+    );
+    let mut effects_params = receipt["scope"].clone();
+    effects_params["page"] = json!({"kind":"effects","operationId":input.operation_id,"ref":receipt["effectsRef"],"maxWireBytes":4096});
+    let effects = wss_rpc_raw(&mut rpc, 11, "note.get", effects_params).await;
+    assert!(effects.to_string().len() <= 4096);
+    assert!(effects["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["kind"] == "annotationInvalidation"));
+    let mut read_params = receipt["scope"].clone();
+    read_params["operationId"] = json!(input.operation_id);
+    read_params["payloadDigest"] = json!(input.payload_digest);
+    read_params["kind"] = json!("inverse");
+    read_params["ref"] = receipt["inverseRef"].clone();
+    read_params["maxWireBytes"] = json!(4096);
+    let inverse = wss_rpc_raw(&mut rpc, 12, "note.operation.read", read_params.clone()).await;
+    assert!(inverse.to_string().len() <= 4096);
+    let record = &inverse["result"]["items"][0];
+    assert_eq!(record["historyGroup"], "0");
+    assert_eq!(record["start"], 8);
+    assert_eq!(record["end"], 13);
+    read_params["kind"] = json!("inverseText");
+    read_params["textId"] = record["replacement"]["textId"].clone();
+    read_params["offset"] = json!(0);
+    let text = wss_rpc_raw(&mut rpc, 13, "note.operation.read", read_params.clone()).await;
+    assert!(text.to_string().len() <= 4096);
+    assert_eq!(text["result"]["items"][0]["text"], "same");
+    assert!(text["result"]["nextCursor"].is_null());
+    read_params.as_object_mut().unwrap().remove("textId");
+    read_params.as_object_mut().unwrap().remove("offset");
+    read_params["kind"] = json!("detail");
+    read_params["ref"] = record["provenanceRef"].clone();
+    let detail = wss_rpc_raw(&mut rpc, 14, "note.operation.read", read_params).await;
+    assert!(detail.to_string().len() <= 4096);
+    assert_eq!(detail["result"]["items"][0]["type"], "object");
+    let mut context = receipt["scope"].clone();
+    context["sourceRevision"] = receipt["afterRevision"].clone();
+    context["page"] =
+        json!({"kind":"context","contextRef":record["provenanceRef"],"maxWireBytes":4096});
+    let context = wss_rpc_raw(&mut rpc, 15, "note.get", context).await;
+    assert!(context.to_string().len() <= 4096);
+    assert_eq!(context["result"]["kind"], "noteContextPage");
+    assert_eq!(
+        context["result"]["sourceRevision"],
+        receipt["afterRevision"]
+    );
+    assert_eq!(context["result"]["expiresAt"], receipt["receiptExpiresAt"]);
+    assert_eq!(context["result"]["items"], detail["result"]["items"]);
+    evt.close(None).await.unwrap();
+    rpc.close(None).await.unwrap();
+    fx.ws.stop().await;
+}

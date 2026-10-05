@@ -47,6 +47,7 @@ mod note_mutation_repo;
 mod note_page_html;
 mod note_page_index;
 mod note_page_repo;
+mod note_receipt_detail_repo;
 mod note_repo;
 mod note_search_repo;
 mod note_version_repo;

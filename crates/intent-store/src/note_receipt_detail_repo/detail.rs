@@ -37,7 +37,7 @@ pub(super) fn valid_record(item: &Value) -> bool {
     }
     if item
         .get("key")
-        .is_some_and(|v| !v.as_str().is_some_and(|s| s.len() <= 1024))
+        .is_some_and(|v| v.as_str().is_none_or(|s| s.len() > 1024))
         || ["keyRef", "valueRef", "childrenRef"]
             .into_iter()
             .any(|f| item.get(f).is_some_and(|v| !token(v)))
