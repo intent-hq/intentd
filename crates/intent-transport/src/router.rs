@@ -446,7 +446,13 @@ pub(crate) async fn prepare_message(
 
     // Receipt lookup has a stricter envelope budget, including malformed
     // requests. Validate before cloning params or echoing a caller-controlled ID.
-    if value.get("method").and_then(Value::as_str) == Some("note.operationStatus") {
+    let annotation = value
+        .get("params")
+        .and_then(Value::as_object)
+        .and_then(|params| annotation_method(value.get("method").and_then(Value::as_str)?, params));
+    if value.get("method").and_then(Value::as_str) == Some("note.operationStatus")
+        || annotation.is_some()
+    {
         if value.get("id").is_some_and(|id| !valid_note_page_id(id)) {
             return Some(invalid_note_page_id());
         }
@@ -545,7 +551,9 @@ pub(crate) async fn prepare_message(
     );
     let profile_span = span.clone();
     async move {
-        let result = if method == "note.get" && params.contains_key("page") {
+        let result = if let Some(annotation) = annotation {
+            Box::pin(dispatch_annotation_page(api, annotation, &params, &echo_id)).await
+        } else if method == "note.get" && params.contains_key("page") {
             Box::pin(dispatch_note_page(api, &params, &echo_id, message.len())).await
         } else {
             dispatch(api, method, &params).await
@@ -563,6 +571,14 @@ pub(crate) async fn prepare_message(
             result,
             if method == "note.operationStatus" {
                 4096
+            } else if annotation.is_some() {
+                params
+                    .get("page")
+                    .and_then(|page| page.get("maxWireBytes"))
+                    .and_then(Value::as_u64)
+                    .and_then(|bytes| usize::try_from(bytes).ok())
+                    .unwrap_or(65_536)
+                    .clamp(4096, 65_536)
             } else {
                 crate::MAX_OUTBOUND_MESSAGE_BYTES
             },
@@ -692,6 +708,71 @@ fn bounded_note_operation_error(error: Error) -> RpcErr {
             data: Some(json!({"code":"internal-error"})),
         },
     }
+}
+
+// Select the opt-in variant before decoding. Malformed annotation requests
+// must not fall through to the legacy full-comment or source-context paths.
+fn annotation_method(
+    method: &str,
+    params: &Map<String, Value>,
+) -> Option<intent_core::note_annotation::AnnotationMethod> {
+    use intent_core::note_annotation::AnnotationMethod;
+    match method {
+        "note.lineAttribution.load" if params.contains_key("page") => {
+            Some(AnnotationMethod::Attribution)
+        }
+        "comment.list" if params.contains_key("page") => Some(AnnotationMethod::Comments),
+        "comment.getThread" if params.contains_key("page") => Some(AnnotationMethod::Replies),
+        "note.get"
+            if params.contains_key("commentRevision")
+                || params.contains_key("attributionGeneration")
+                || params
+                    .get("page")
+                    .and_then(|page| page.get("contextRef"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|reference| reference.starts_with("na1")) =>
+        {
+            Some(AnnotationMethod::Context)
+        }
+        _ => None,
+    }
+}
+
+async fn dispatch_annotation_page(
+    api: &dyn WorkspaceApi,
+    method: intent_core::note_annotation::AnnotationMethod,
+    params: &Map<String, Value>,
+    id: &Value,
+) -> std::result::Result<Value, RpcErr> {
+    if !valid_note_page_id(id)
+        || params.values().any(Value::is_null)
+        || params
+            .get("page")
+            .and_then(Value::as_object)
+            .is_none_or(|page| page.values().any(Value::is_null))
+    {
+        return Err(invalid_params("Invalid annotation page request"));
+    }
+    let request: intent_core::note_annotation::AnnotationReadRequest =
+        serde_json::from_value(Value::Object(params.clone()))
+            .map_err(|_| invalid_params("Invalid annotation page request"))?;
+    request
+        .validate(method)
+        .map_err(|_| invalid_params("Invalid annotation page request"))?;
+    api.get_note_annotation_page(method, request, id.clone())
+        .await
+        .map_err(|error| match error {
+            Error::NotePage(_) => domain_to_rpc(error),
+            Error::InvalidParams(_) => invalid_params("Invalid annotation page request"),
+            Error::NotFound(_) => not_found("Annotation page not found"),
+            Error::Forbidden(_) => {
+                domain_to_rpc(Error::Forbidden("Annotation page unavailable".into()))
+            }
+            Error::Unsupported(_) => {
+                domain_to_rpc(Error::Unsupported("Annotation page unavailable".into()))
+            }
+            _ => rpc(-32603, "Annotation page unavailable"),
+        })
 }
 
 /// Dispatch a validated request to the injected [`WorkspaceApi`].

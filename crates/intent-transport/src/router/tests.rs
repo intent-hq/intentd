@@ -18,6 +18,111 @@ use super::handle_message;
 
 struct FakeApi;
 
+#[tokio::test]
+async fn annotation_pages_select_strict_scopes_and_bound_frames_without_legacy_fallback() {
+    use intent_core::note_annotation::{AnnotationMethod, AnnotationReadRequest};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct AnnotationApi(AtomicUsize);
+    impl WorkspaceApi for AnnotationApi {
+        fn get_note_annotation_page(
+            &self,
+            method: AnnotationMethod,
+            request: AnnotationReadRequest,
+            _rpc_id: Value,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                match request.note_id.as_str() {
+                    "error" => Err(Error::Internal("private annotation".repeat(8192))),
+                    "large" => Ok(serde_json::json!({"private":"x".repeat(8192)})),
+                    _ => Ok(serde_json::json!({"kind":format!("{method:?}")})),
+                }
+            })
+        }
+        fn get_note_page(
+            &self,
+            _workspace: WorkspaceId,
+            _note: NoteId,
+            _request: intent_core::note_page::NotePageRequest,
+            _rpc_id: Value,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async { Ok(serde_json::json!({"kind":"sourceFallback"})) })
+        }
+    }
+    let api = AnnotationApi(AtomicUsize::new(0));
+    let base = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"comment.list",
+        "params":{"backendId":"backend","workspaceId":"workspace","noteId":"note",
+        "noteInstanceId":"instance","sourceRevision":"revision",
+        "page":{"kind":"comments","maxWireBytes":4096}}});
+    for (method, kind, expected) in [
+        ("comment.list", "comments", "Comments"),
+        ("comment.getThread", "replies", "Replies"),
+        ("note.lineAttribution.load", "attribution", "Attribution"),
+        ("note.get", "context", "Context"),
+    ] {
+        let mut request = base.clone();
+        request["method"] = method.into();
+        request["params"]["page"]["kind"] = kind.into();
+        if kind == "replies" {
+            request["params"]["threadId"] = "thread".into();
+        }
+        if kind == "context" {
+            request["params"]["page"]["contextRef"] = "na1:ref".into();
+            request["params"]["commentRevision"] = "epoch".into();
+        }
+        let frame = handle_message(&api, &request.to_string()).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&frame).unwrap()["result"]["kind"],
+            expected
+        );
+    }
+    assert_eq!(api.0.load(Ordering::Relaxed), 4);
+    let invalid = [
+        ("page", Value::Null),
+        ("page", serde_json::json!({"kind":"source"})),
+        ("includeComments", Value::Bool(true)),
+        ("commentRevision", Value::Null),
+        ("unknown", Value::Bool(true)),
+        ("workspaceId", Value::String("x".repeat(70_000))),
+    ];
+    for (field, value) in invalid {
+        let mut request = base.clone();
+        request["params"][field] = value;
+        let frame = handle_message(&api, &request.to_string()).await.unwrap();
+        assert!(frame.len() <= 4096);
+        assert!(serde_json::from_str::<Value>(&frame).unwrap()["error"].is_object());
+    }
+    let mut context = base.clone();
+    context["method"] = "note.get".into();
+    context["params"]["page"] =
+        serde_json::json!({"kind":"context","contextRef":"na1:missing-epoch"});
+    let frame = handle_message(&api, &context.to_string()).await.unwrap();
+    assert!(serde_json::from_str::<Value>(&frame).unwrap()["error"].is_object());
+    assert!(!frame.contains("sourceFallback"));
+    for id in [
+        Value::Null,
+        serde_json::json!("x".repeat(65)),
+        serde_json::json!(9_007_199_254_740_992_u64),
+    ] {
+        let mut request = base.clone();
+        request["id"] = id;
+        let frame = handle_message(&api, &request.to_string()).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&frame).unwrap()["id"],
+            Value::Null
+        );
+    }
+    assert_eq!(api.0.load(Ordering::Relaxed), 4);
+    for note in ["large", "error"] {
+        let mut request = base.clone();
+        request["params"]["noteId"] = note.into();
+        let frame = handle_message(&api, &request.to_string()).await.unwrap();
+        assert!(frame.len() <= 4096);
+        assert!(serde_json::from_str::<Value>(&frame).unwrap()["error"].is_object());
+        assert!(!frame.contains("private"));
+    }
+}
+
 #[test]
 fn execution_authorization_errors_preserve_typed_codes_and_drop_provider_bodies() {
     use intent_core::execution::{

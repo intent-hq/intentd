@@ -1,5 +1,7 @@
 //! Annotation opt-in through the existing authenticated WSS harness.
 use super::*;
+use intent_core::WorkspaceRole;
+use serde_json::json;
 
 fn annotation_request(source: &Value, page: Value, epoch: Option<&Value>) -> Value {
     let mut params = source["scope"].clone();

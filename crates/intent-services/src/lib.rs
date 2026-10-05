@@ -203,6 +203,7 @@ mod linear_ops;
 mod member_removal;
 mod model_catalog;
 mod nested_repos;
+mod note_annotation;
 mod note_merge;
 pub mod note_ops;
 mod npx_cli;
@@ -24995,6 +24996,15 @@ impl WorkspaceApi for Services {
                 .read_note_page(&workspace_id.0, &note_id.0, &principal, request, &rpc_id)
                 .await
         })
+    }
+
+    fn get_note_annotation_page(
+        &self,
+        method: intent_core::note_annotation::AnnotationMethod,
+        request: intent_core::note_annotation::AnnotationReadRequest,
+        rpc_id: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.read_annotation_page(method, request, rpc_id))
     }
 
     fn note_operation_status(

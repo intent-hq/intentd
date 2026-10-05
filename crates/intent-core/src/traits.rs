@@ -1049,6 +1049,17 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { Err(crate::Error::Unsupported("note pages".into())) })
     }
 
+    /// Read an opt-in annotation page under current scope and authorization.
+    fn get_note_annotation_page(
+        &self,
+        method: crate::note_annotation::AnnotationMethod,
+        request: crate::note_annotation::AnnotationReadRequest,
+        rpc_id: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (method, request, rpc_id);
+        Box::pin(async { Err(crate::Error::Unsupported("annotation pages".into())) })
+    }
+
     /// Resolve a retained operation under current authorization, without live text.
     fn note_operation_status(
         &self,
