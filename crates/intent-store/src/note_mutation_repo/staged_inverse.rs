@@ -299,6 +299,224 @@ pub(super) async fn next_inverse(
     cursor.done = done;
     Ok(Some(inverse))
 }
+
+struct ReceiptGroup {
+    history_group: String,
+    input_state: String,
+    output_state: String,
+    input_generation: u64,
+    input_length: u64,
+}
+
+fn scalar_byte(text: &str, units: u64) -> Result<usize> {
+    let mut offset = 0;
+    for (byte, scalar) in text.char_indices() {
+        if offset == units {
+            return Ok(byte);
+        }
+        offset += u64::try_from(scalar.len_utf16()).expect("UTF16 scalar length fits");
+        if offset > units {
+            return Err(invalid());
+        }
+    }
+    if offset == units {
+        Ok(text.len())
+    } else {
+        Err(invalid())
+    }
+}
+
+// Persist only removed spans, at their original generation offsets. Disjoint
+// ordered mappings cannot collide; empty spans still get an owned text registry
+// entry through retain_text_reference. At most one <=4096-byte source chunk is
+// loaded at a time, independently of the total group/source length.
+async fn retain_input_span(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    group: &ReceiptGroup,
+    range: &InverseRange,
+) -> Result<String> {
+    if range.replacement_start > range.replacement_end || range.replacement_end > group.input_length
+    {
+        return Err(invalid());
+    }
+    if group.input_generation == 0 {
+        return Ok("base".into());
+    }
+    let phase = format!("stage-input:{}", group.input_generation);
+    let mut position = range.replacement_start;
+    while position < range.replacement_end {
+        let (end, text) = crate::note_stage_repo::view_read::read_piece(
+            conn,
+            operation,
+            group.input_generation,
+            group.input_length,
+            position,
+            4096,
+        )
+        .await?;
+        let next = end.min(range.replacement_end);
+        if next <= position {
+            return Err(invalid());
+        }
+        let text = &text[..scalar_byte(&text, next - position)?];
+        sqlx::query("INSERT INTO note_operation_source(operation_key,phase,start,end,text) VALUES(?,?,?,?,?)")
+            .bind(operation).bind(&phase).bind(i64::try_from(position).map_err(db)?).bind(i64::try_from(next).map_err(db)?).bind(text)
+            .execute(&mut *conn).await.map_err(db)?;
+        position = next;
+    }
+    Ok(phase)
+}
+
+impl super::NoteMutationWrite {
+    /// Receipt states and data stay inside the active write. Any error must abort
+    /// the outer transaction; partial inverse publication is never authoritative.
+    pub(super) async fn write_staged_inverse(&mut self, revision: &str) -> Result<()> {
+        let staged = self.staged.as_ref().ok_or_else(invalid)?;
+        let generation = staged.view_generation;
+        let mutation_present = staged.mutation_present;
+        // One group's numeric provenance only, never a cloned source/context or
+        // a collection of source snapshots from all chronological groups.
+        let newest = staged
+            .newest_history
+            .as_ref()
+            .map(intent_core::note_mutation::NoteSourceHistory::mapping);
+        let mut walk = GroupWalk::new(generation)?;
+        let mut state = revision.to_owned();
+        let mut sequence = 0;
+        let mut latest_dirty = if generation > 0 {
+            previous_group(&mut self.transaction, &self.operation_key, &mut walk).await?
+        } else {
+            None
+        };
+        if let Some(mapping) = newest {
+            let (input_generation, input_length, history_group) = if mutation_present {
+                (
+                    generation,
+                    self.inverse_generation_length(generation).await?,
+                    format!("{}:mutation", self.operation_key),
+                )
+            } else if let Some(group) = latest_dirty.take() {
+                (
+                    group.input_generation,
+                    group.input_length,
+                    group.history_group,
+                )
+            } else {
+                (
+                    0,
+                    self.inverse_generation_length(0).await?,
+                    format!("{}:operation", self.operation_key),
+                )
+            };
+            let output_state = self.inverse_generation_state(input_generation);
+            let group = ReceiptGroup {
+                history_group,
+                input_state: state.clone(),
+                output_state: output_state.clone(),
+                input_generation,
+                input_length,
+            };
+            let mut cursor = MappingCursor::new(input_length)?;
+            for item in &mapping {
+                let range = cursor.push(item)?;
+                self.write_staged_inverse_range(&group, &range, &mut sequence)
+                    .await?;
+            }
+            cursor
+                .finish(u64::try_from(self.history.source().encode_utf16().count()).map_err(db)?)?;
+            if !mapping.is_empty() {
+                state = output_state;
+            }
+        } else if mutation_present || generation != 0 {
+            return Err(invalid());
+        }
+        loop {
+            let captured = if let Some(group) = latest_dirty.take() {
+                Some(group)
+            } else {
+                previous_group(&mut self.transaction, &self.operation_key, &mut walk).await?
+            };
+            let Some(captured) = captured else {
+                break;
+            };
+            let group = ReceiptGroup {
+                history_group: captured.history_group.clone(),
+                input_state: state.clone(),
+                output_state: self.inverse_generation_state(captured.input_generation),
+                input_generation: captured.input_generation,
+                input_length: captured.input_length,
+            };
+            let mut cursor = captured.cursor()?;
+            while let Some(range) = next_inverse(
+                &mut self.transaction,
+                &self.operation_key,
+                &captured,
+                &mut cursor,
+            )
+            .await?
+            {
+                self.write_staged_inverse_range(&group, &range, &mut sequence)
+                    .await?;
+            }
+            state = group.output_state;
+        }
+        Ok(())
+    }
+    async fn inverse_generation_length(&mut self, generation: u64) -> Result<u64> {
+        let length: i64 = sqlx::query_scalar(
+            "SELECT length FROM note_stage_view WHERE operation_key=? AND generation=?",
+        )
+        .bind(&self.operation_key)
+        .bind(i64::try_from(generation).map_err(db)?)
+        .fetch_optional(&mut *self.transaction)
+        .await
+        .map_err(db)?
+        .ok_or_else(invalid)?;
+        number(length)
+    }
+    fn inverse_generation_state(&self, generation: u64) -> String {
+        if generation == 0 {
+            self.request.base_revision.clone()
+        } else {
+            format!("{}:stage:{generation}", self.operation_key)
+        }
+    }
+    async fn write_staged_inverse_range(
+        &mut self,
+        group: &ReceiptGroup,
+        range: &InverseRange,
+        sequence: &mut usize,
+    ) -> Result<()> {
+        if group.history_group.is_empty() || group.history_group.len() > 256 {
+            return Err(invalid());
+        }
+        let phase =
+            retain_input_span(&mut self.transaction, &self.operation_key, group, range).await?;
+        let text_id = format!("{}:text:{}", self.operation_key, sequence);
+        let replacement = self
+            .retain_text_reference(
+                &text_id,
+                &phase,
+                range.replacement_start,
+                range.replacement_end,
+            )
+            .await?;
+        let provenance = format!("{}:inverse-detail:{}", self.operation_key, sequence);
+        self.retain_detail_tree(&provenance,serde_json::json!({
+            "kind":"sourceProvenance","inputState":group.input_state,"outputState":group.output_state,
+            "baseRange":{"start":range.replacement_start,"end":range.replacement_end},
+            "finalRange":{"start":range.start,"end":range.end},"replacement":replacement
+        })).await?;
+        self.insert_item("inverse",*sequence,&serde_json::json!({
+            "historyGroup":group.history_group,"inputState":group.input_state,"outputState":group.output_state,
+            "ordinal":range.ordinal,"start":range.start,"end":range.end,"replacement":replacement,"provenanceRef":provenance
+        })).await?;
+        *sequence = sequence.checked_add(1).ok_or_else(invalid)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[path = "staged_inverse_tests.rs"]
 mod tests;

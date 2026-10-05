@@ -346,3 +346,74 @@ async fn malformed_retained_envelopes_and_broken_generation_chain_fail_closed() 
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn removed_spans_are_retained_sparsely_with_scalar_boundaries_and_bounded_pieces() {
+    let mut conn = connection().await;
+    sqlx::raw_sql("CREATE TABLE note_stage(operation_key TEXT PRIMARY KEY,root_key TEXT); CREATE TABLE note_stage_root(root_key TEXT PRIMARY KEY,source_length INTEGER); CREATE TABLE note_stage_view_piece(operation_key TEXT,generation INTEGER,start INTEGER,end INTEGER,origin_kind TEXT,origin_id TEXT,origin_start INTEGER,PRIMARY KEY(operation_key,generation,start)); CREATE TABLE note_stage_text(operation_key TEXT,text_id TEXT,length INTEGER,PRIMARY KEY(operation_key,text_id)); CREATE TABLE note_stage_text_piece(operation_key TEXT,text_id TEXT,start INTEGER,end INTEGER,text TEXT,PRIMARY KEY(operation_key,text_id,start)); CREATE TABLE note_operation_source(operation_key TEXT,phase TEXT,start INTEGER,end INTEGER,text TEXT,PRIMARY KEY(operation_key,phase,start)); INSERT INTO note_stage VALUES('op','root'); INSERT INTO note_stage_root VALUES('root',0);")
+        .execute(&mut conn).await.unwrap();
+    let text = format!("A{}Z", "😀".repeat(3000));
+    view(&mut conn, 0, None, 0).await;
+    view(&mut conn, 1, Some("1"), 6002).await;
+    sqlx::query("INSERT INTO note_stage_text VALUES('op','text',6002)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let mut start = 0_i64;
+    let mut from = 0;
+    while from < text.len() {
+        let mut to = (from + 4096).min(text.len());
+        while !text.is_char_boundary(to) {
+            to -= 1;
+        }
+        let fragment = &text[from..to];
+        let end = start + i64::try_from(fragment.encode_utf16().count()).unwrap();
+        sqlx::query("INSERT INTO note_stage_text_piece VALUES('op','text',?,?,?)")
+            .bind(start)
+            .bind(end)
+            .bind(fragment)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        start = end;
+        from = to;
+    }
+    sqlx::query("INSERT INTO note_stage_view_piece VALUES('op',1,0,6002,'text','text',0)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let group = ReceiptGroup {
+        history_group: "1".into(),
+        input_state: "after".into(),
+        output_state: "before".into(),
+        input_generation: 1,
+        input_length: 6002,
+    };
+    let range = InverseRange {
+        ordinal: 0,
+        start: 0,
+        end: 0,
+        replacement_start: 1,
+        replacement_end: 6001,
+    };
+    sqlx::query("BEGIN").execute(&mut conn).await.unwrap();
+    let phase = retain_input_span(&mut conn, "op", &group, &range)
+        .await
+        .unwrap();
+    let rows: Vec<(i64,i64,String)> = sqlx::query_as("SELECT start,end,text FROM note_operation_source WHERE operation_key='op' AND phase=? ORDER BY start").bind(&phase).fetch_all(&mut conn).await.unwrap();
+    assert!(rows.iter().all(|row| row.2.len() <= 4096));
+    assert_eq!(rows.first().unwrap().0, 1);
+    assert_eq!(rows.last().unwrap().1, 6001);
+    assert_eq!(
+        rows.iter().map(|row| row.2.as_str()).collect::<String>(),
+        "😀".repeat(3000)
+    );
+    sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();
+    let invalid_end = InverseRange {
+        replacement_end: 2,
+        ..range
+    };
+    assert!(retain_input_span(&mut conn, "op", &group, &invalid_end)
+        .await
+        .is_err());
+}
