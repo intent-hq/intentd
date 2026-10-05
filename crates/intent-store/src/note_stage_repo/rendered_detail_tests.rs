@@ -39,7 +39,7 @@ fn query(reference: &str) -> ReceiptDetailQuery {
             note_id: "note".into(),
             note_instance_id: "instance".into(),
         },
-        operation_id: "operation".into(),
+        operation_id: "11111111-1111-4111-8111-111111111111".into(),
         payload_digest: None,
         header_digest: Some("a".repeat(64)),
         kind: ReceiptDetailKind::Detail,
@@ -130,7 +130,7 @@ fn reconstruct(context: &Context, entry: &Value, seen: &mut BTreeSet<String>) ->
                 assert_eq!(fragment["id"], id);
                 assert_eq!(fragment["offset"], units(&output));
                 assert_eq!(
-                    fragment["field"],
+                    &fragment["field"],
                     entry.get("key").unwrap_or(&json!("value"))
                 );
                 let text = fragment["text"].as_str().unwrap();
