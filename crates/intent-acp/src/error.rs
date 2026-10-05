@@ -358,7 +358,9 @@ pub(crate) fn message_is_transient_upstream_disconnect(message: &str) -> bool {
 #[must_use]
 pub fn is_transient_upstream_disconnect(err: &AcpError) -> bool {
     match err {
-        AcpError::Auth(_)
+        // Explicit cancellation must never enroll the turn for wake recovery.
+        AcpError::Rpc(JsonRpcError { code: -32800, .. })
+        | AcpError::Auth(_)
         | AcpError::Serde(_)
         | AcpError::Protocol(_)
         | AcpError::PromptIdleTimeout(_)
@@ -387,7 +389,9 @@ pub fn is_transient_upstream_disconnect(err: &AcpError) -> bool {
 pub fn is_transient_provider_fetch_failure(err: &AcpError) -> bool {
     match err {
         AcpError::Rpc(e) => {
-            !(e.code == 0 && e.message == "agent stdout closed")
+            // Provider-supplied details cannot turn cancelled work into a retry.
+            e.code != -32800
+                && !(e.code == 0 && e.message == "agent stdout closed")
                 && message_is_transient_provider_fetch_failure(&err.to_string())
         }
         _ => false,
@@ -638,6 +642,51 @@ mod classifier_tests {
                 "expected terminal: {msg:?}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_cancellation_is_not_a_transient_provider_fetch_failure() {
+        for err in cancellation_errors_with_transient_details() {
+            assert!(!is_transient_provider_fetch_failure(&err), "{err}");
+        }
+    }
+
+    #[test]
+    fn explicit_cancellation_is_not_a_transient_upstream_disconnect() {
+        for err in cancellation_errors_with_transient_details() {
+            assert!(!is_transient_upstream_disconnect(&err), "{err}");
+        }
+    }
+
+    fn cancellation_errors_with_transient_details() -> Vec<AcpError> {
+        [
+            "The operation was aborted due to timeout",
+            "TimeoutError: request timed out",
+            "TypeError: terminated",
+            "Connection reset by peer",
+            "fetch failed (ECONNRESET)",
+        ]
+        .into_iter()
+        .flat_map(|detail| {
+            [
+                AcpError::Rpc(JsonRpcError {
+                    code: -32800,
+                    message: detail.to_string(),
+                    data: None,
+                }),
+                AcpError::Rpc(JsonRpcError {
+                    code: -32800,
+                    message: "request cancelled".to_string(),
+                    data: Some(serde_json::json!({ "details": detail })),
+                }),
+            ]
+        })
+        .chain(std::iter::once(AcpError::Rpc(JsonRpcError {
+            code: -32800,
+            message: "request cancelled".to_string(),
+            data: Some(serde_json::json!({ "details": "terminated" })),
+        })))
+        .collect()
     }
 
     #[test]

@@ -4442,8 +4442,9 @@ fn connect_with_prompt_rpc_error(
 fn spawn_mock_agent_with_prompt_rpc_error_code<R, W>(
     read: R,
     write: W,
-    code: i64,
-    error_message: String,
+    error: Value,
+    updates: Vec<String>,
+    prompt_calls: Arc<AtomicUsize>,
 ) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -4463,10 +4464,17 @@ where
                 continue;
             };
             if method == "session/prompt" {
+                prompt_calls.fetch_add(1, Ordering::SeqCst);
+                for note in &updates {
+                    write
+                        .write_all(format!("{note}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
                 let resp = json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "error": { "code": code, "message": error_message },
+                    "error": error,
                 });
                 write
                     .write_all(format!("{resp}\n").as_bytes())
@@ -4495,20 +4503,23 @@ where
 /// [`connect`] against a mock whose `session/prompt` fails with a JSON-RPC
 /// error carrying an explicit `code` + `message`.
 fn connect_with_prompt_rpc_error_code(
-    code: i64,
-    error_message: &str,
+    error: Value,
+    updates: Vec<String>,
 ) -> (
     Connection,
     mpsc::UnboundedReceiver<IncomingNotification>,
     JoinHandle<()>,
+    Arc<AtomicUsize>,
 ) {
     let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
     let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let prompt_calls = Arc::new(AtomicUsize::new(0));
     let agent = spawn_mock_agent_with_prompt_rpc_error_code(
         c2a_agent,
         a2c_agent,
-        code,
-        error_message.to_string(),
+        error,
+        updates,
+        prompt_calls.clone(),
     );
     let (note_tx, note_rx) = mpsc::unbounded_channel();
     let hooks = ConnectionHooks {
@@ -4516,7 +4527,7 @@ fn connect_with_prompt_rpc_error_code(
         ..ConnectionHooks::default()
     };
     let conn = Connection::new(c2a_client, a2c_client, None, hooks);
-    (conn, note_rx, agent)
+    (conn, note_rx, agent, prompt_calls)
 }
 
 /// Durable-before-observable on the STREAMING terminal-failure path
@@ -4605,8 +4616,10 @@ async fn streaming_terminal_failure_persists_error_before_publishing_events() {
 #[tokio::test]
 async fn streaming_benign_cancel_does_not_persist_error() {
     let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
-    let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error_code(-32800, "request cancelled");
+    let (conn, mut note_rx, _agent, _prompt_calls) = connect_with_prompt_rpc_error_code(
+        json!({ "code": -32800, "message": "request cancelled" }),
+        Vec::new(),
+    );
 
     let err = services
         .run_connection_prompt_turn(
@@ -4640,6 +4653,125 @@ async fn streaming_benign_cancel_does_not_persist_error() {
         services.take_pending_terminal_error(&agent_id).is_none(),
         "nothing stashed for a benign cancel"
     );
+}
+
+/// Explicit cancellation wins over incidental network details, even after
+/// partial output or a host suspend: never retry or enroll cancelled work.
+#[tokio::test]
+async fn explicit_cancellation_with_transient_details_never_retries_or_suspends() {
+    let _env = EnvGuard::set_all(&[("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "1")]);
+    for error in [
+        json!({ "code": -32800, "message": "request cancelled",
+            "data": { "details": "terminated" } }),
+        json!({ "code": -32800, "message": "The operation was aborted due to timeout" }),
+        json!({ "code": -32800, "message": "request cancelled",
+            "data": { "details": "TimeoutError: request timed out" } }),
+        json!({ "code": -32800, "message": "TypeError: terminated" }),
+        json!({ "code": -32800, "message": "request cancelled",
+            "data": { "details": "Connection reset by peer" } }),
+    ] {
+        for overlap in [None, Some(Duration::from_secs(120))] {
+            for partial in [false, true] {
+                assert_explicit_cancellation_is_not_recovered(error.clone(), overlap, partial)
+                    .await;
+            }
+        }
+    }
+}
+
+async fn assert_explicit_cancellation_is_not_recovered(
+    error: Value,
+    overlap: Option<Duration>,
+    partial: bool,
+) {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(Arc::new(FakeSuspend(overlap)));
+    let updates = if partial {
+        vec![suspend_chunk("partial ")]
+    } else {
+        Vec::new()
+    };
+    let (conn, mut note_rx, _agent, prompt_calls) =
+        connect_with_prompt_rpc_error_code(error.clone(), updates);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_connection_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("cancelled turn settles")
+    .expect_err("cancellation returns Err");
+    assert_eq!(
+        prompt_calls.load(Ordering::SeqCst),
+        1,
+        "cancelled prompt must not retry: {error}, overlap={overlap:?}, partial={partial}"
+    );
+    assert!(
+        crate::agent_manager::prompt_cancellation_error(&err),
+        "cancellation must reach the worker, not the suspend marker: {err}"
+    );
+    assert!(
+        bus.store()
+            .list_interrupted_agents()
+            .await
+            .unwrap()
+            .is_empty(),
+        "cancelled work must not enroll for wake recovery"
+    );
+    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_ne!(stored.status, AgentStatus::Error);
+    assert!(stored.stop_reason.is_none());
+    assert!(
+        stored.attention_request_kind.is_none(),
+        "no recovery blocker for cancellation"
+    );
+    assert!(services.take_pending_terminal_error(&agent_id).is_none());
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.len(),
+        usize::from(partial),
+        "preserve only existing partial output"
+    );
+    for message in &messages {
+        assert_eq!(message.role, "assistant");
+        assert!(message
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("interruptReason"))
+            .is_none());
+    }
+    let mut events = Vec::new();
+    while !events
+        .iter()
+        .any(|e: &Event| e.event_type == "agent:stream:end")
+    {
+        events.extend(
+            timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .expect("terminal stream event arrives")
+                .expect("subscription open"),
+        );
+    }
+    assert!(!events
+        .iter()
+        .any(|e| e.event_type == "agent:attention-requested"));
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .unwrap();
+    assert_ne!(end.data["interruptReason"], json!("system_suspend"));
 }
 
 /// Mock agent whose `session/prompt` fails the first `failures` calls with a
