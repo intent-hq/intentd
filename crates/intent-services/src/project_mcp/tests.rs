@@ -47,7 +47,7 @@ fn audited_json_formats_preserve_stdio_and_remote_semantics() {
                 args: vec!["a b.js".into(), "--flag".into()],
                 env: BTreeMap::from([
                     ("TOKEN".into(), "secret".into()),
-                    ("EMPTY".into(), "".into())
+                    ("EMPTY".into(), String::new())
                 ]),
             }
         );
