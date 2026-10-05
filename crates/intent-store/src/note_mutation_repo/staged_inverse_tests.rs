@@ -566,3 +566,37 @@ async fn base_byte_comparison_distinguishes_identity_edits_from_source_changes()
         .unwrap();
     assert!(source_matches_base(&mut conn, "op", "A😀B").await.is_err());
 }
+
+#[test]
+fn owned_empty_inverse_is_admitted_without_changing_source_bytes() {
+    use intent_core::note_mutation::apply_note_splices;
+    for source in ["", "a😀b", "\r\n\"\\"] {
+        let mut cursor =
+            MappingCursor::new(u64::try_from(source.encode_utf16().count()).unwrap()).unwrap();
+        let range = cursor
+            .push(&NoteSpliceMapping {
+                start: 0,
+                end: 0,
+                inserted_length: 0,
+            })
+            .unwrap();
+        let mut normalized = InverseCoalescer::default();
+        assert!(normalized.push(range).unwrap().is_none());
+        let record = normalized.finish().unwrap().unwrap();
+        assert_eq!(record.ordinal, 0);
+        assert_eq!((record.replacement_start, record.replacement_end), (0, 0));
+        let applied = apply_note_splices(
+            source,
+            &[NoteSplice {
+                start: record.start,
+                end: record.end,
+                text: String::new(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(applied.source, source);
+        cursor
+            .finish(u64::try_from(source.encode_utf16().count()).unwrap())
+            .unwrap();
+    }
+}

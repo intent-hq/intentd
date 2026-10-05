@@ -506,13 +506,24 @@ impl super::NoteMutationWrite {
                         .await?;
                 }
             }
+            // A captured gesture still owns a state transition when canonical
+            // composition cancels its source edits. An ordinary empty splice
+            // carries that group's owned text/provenance without changing bytes.
+            let captured_group = mutation_present || generation > 0;
+            if mapping.is_empty() && captured_group {
+                normalized.push(cursor.push(&NoteSpliceMapping {
+                    start: 0,
+                    end: 0,
+                    inserted_length: 0,
+                })?)?;
+            }
             cursor
                 .finish(u64::try_from(self.history.source().encode_utf16().count()).map_err(db)?)?;
             if let Some(range) = normalized.finish()? {
                 self.write_staged_inverse_range(&group, &range, &mut sequence)
                     .await?;
             }
-            if !mapping.is_empty() {
+            if !mapping.is_empty() || captured_group {
                 state = output_state;
             }
         } else {
