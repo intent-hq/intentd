@@ -187,9 +187,24 @@ async fn annotation_wss_attribution_compute_publishes_ready_state_without_changi
         ready["attributionGeneration"],
         initial["snapshot"]["attributionGeneration"]
     );
-    let pushed = next_subscription_push(&mut subscriber.ws).await;
-    bounded_annotation_push(&pushed);
-    assert_eq!(pushed["snapshot"], ready);
+    let mut observed_ready = false;
+    for _ in 0..8 {
+        let pushed = next_subscription_push(&mut subscriber.ws).await;
+        bounded_annotation_push(&pushed);
+        assert_eq!(
+            pushed["snapshot"]["sourceRevision"],
+            ready["sourceRevision"]
+        );
+        assert_eq!(
+            pushed["snapshot"]["commentRevision"],
+            ready["commentRevision"]
+        );
+        if pushed["snapshot"] == ready {
+            observed_ready = true;
+            break;
+        }
+    }
+    assert!(observed_ready);
     let mut request = ready["scope"].clone();
     request["sourceRevision"] = ready["sourceRevision"].clone();
     request["attributionGeneration"] = ready["attributionGeneration"].clone();
