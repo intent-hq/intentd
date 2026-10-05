@@ -172,6 +172,14 @@ pub(crate) async fn run_one_shot_acp_in(
     prompt_timeout: Duration,
     effort: &OneShotEffort,
 ) -> Result<String, OneShotError> {
+    let cmd = cmd
+        .prepare_profile(
+            crate::provider_profiles::LaunchPurpose::Completion,
+            Vec::new(),
+        )
+        .await
+        .map_err(OneShotError::Spawn)?;
+    let session_meta = cmd.merge_profile_meta(session_meta);
     let mut adapter = spawn_adapter_in(slots, &cmd, prompt_timeout)
         .await
         .map_err(|e| match e {

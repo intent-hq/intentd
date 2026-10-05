@@ -15,6 +15,8 @@
 // the fixture test in crates/intentd/tests/fixtures/pi-mcp-extension-test.mjs.
 
 import net from "node:net";
+import fs from "node:fs";
+import { spawn } from "node:child_process";
 
 const CONNECT_TIMEOUT_MS = 5_000;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
@@ -250,6 +252,7 @@ export function mapToolResult(result) {
 /// Extension entry point. pi awaits the async factory before `session_start`,
 /// so the bridge tools are registered before the first prompt.
 export default async function piMcpExtension(pi) {
+  await registerOwnedStdioServers(pi);
   const addr = process.env.INTENTD_MCP_BRIDGE_ADDR;
   if (!addr) {
     log("INTENTD_MCP_BRIDGE_ADDR not set; workspace MCP tools disabled");
@@ -339,5 +342,51 @@ export default async function piMcpExtension(pi) {
         // already down — nothing to clean up
       }
     });
+  }
+}
+
+
+// Only the daemon-owned, policy-filtered file is consumed here. Never discover
+// native config or merge ambient definitions inside the extension.
+export async function registerOwnedStdioServers(pi) {
+  const path = process.env.INTENTD_PI_MCP_CONFIG;
+  if (!path) return;
+  const servers = JSON.parse(fs.readFileSync(path, "utf8")).mcpServers ?? {};
+  const children = new Set();
+  const closeAll = () => {
+    for (const close of children) close();
+    children.clear();
+    process.removeListener("exit", closeAll);
+  };
+  if (typeof pi.on === "function") pi.on("session_shutdown", closeAll);
+  process.once("exit", closeAll);
+  for (const [name, server] of Object.entries(servers)) {
+    if (name === "workspace-mcp" || typeof server.command !== "string") continue;
+    const child = spawn(server.command, server.args ?? [], {
+      env: { ...process.env, ...(server.env ?? {}) }, stdio: ["pipe", "pipe", "pipe"],
+    });
+    // Drain diagnostics without forwarding credentials or server output to tools.
+    child.stderr.resume();
+    const client = new McpLineClient(child.stdout, child.stdin);
+    child.on("error", (err) => client.markClosed(err));
+    const close = () => { client.close(); child.kill(); };
+    children.add(close);
+    child.once("exit", () => children.delete(close));
+    try {
+      await client.initialize({ name: "intentd-pi-owned-mcp", version: "1" });
+      for (const tool of await client.listTools()) {
+        const qualified = `mcp_${Buffer.from(name).toString("hex")}__${tool.name}`;
+        pi.registerTool({
+          name: qualified, label: `${name}: ${tool.name}`, description: tool.description ?? "",
+          parameters: tool.inputSchema ?? { type: "object", properties: {} },
+          async execute(_id, args, signal) {
+            return mapToolResult(await client.callTool(tool.name, args ?? {}, { signal }));
+          },
+        });
+      }
+    } catch {
+      closeAll();
+      throw new Error(`Intent MCP server ${name} could not initialize`);
+    }
   }
 }

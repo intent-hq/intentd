@@ -2789,20 +2789,35 @@ impl Services {
         // Reached only after a successful spawn (which resolved the same
         // inputs), so a fall-through here is a settings race — fail loudly
         // rather than fabricating a positional default (monorepo#3044).
-        let provider_id = resolve_provider_id(
-            stored.provider.as_deref(),
-            derived_default_provider(&self.effective_settings()).as_deref(),
-        )
-        .ok_or_else(|| no_default_provider_error("session/new"))?;
+        let provider_id = self
+            .agent_manager()
+            .and_then(|m| m.active_profile(agent_id))
+            .map(|profile| profile.provider_id().to_owned())
+            .or_else(|| {
+                resolve_provider_id(
+                    stored.provider.as_deref(),
+                    derived_default_provider(&self.effective_settings()).as_deref(),
+                )
+            })
+            .ok_or_else(|| no_default_provider_error("session/new"))?;
         let is_orchestrator = self
             .resolve_session_is_orchestrator(&provider_id, &stored)
             .await;
-        let meta = build_session_meta(
+        let mut meta = build_session_meta(
             &provider_id,
             stored.system_prompt.as_deref(),
             Some(&stored.name),
             is_orchestrator,
         );
+        if let Some(profile) = self.agent_manager().and_then(|m| m.profile_meta(agent_id)) {
+            let mut value = serde_json::to_value(meta.take().unwrap_or_default())
+                .map_err(|_| Error::Internal("Invalid session metadata".into()))?;
+            crate::provider_profiles::merge_json(&mut value, &profile);
+            meta = Some(
+                serde_json::from_value(value)
+                    .map_err(|_| Error::Internal("Invalid provider session metadata".into()))?,
+            );
+        }
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -3079,11 +3094,17 @@ impl Services {
         // Resolve provider using the same precedence as spawn path, then build
         // provider-specific _meta for system-prompt injection. Same loud
         // fall-through as [`open_acp_session`] (monorepo#3044).
-        let provider_id = resolve_provider_id(
-            stored.provider.as_deref(),
-            derived_default_provider(&self.effective_settings()).as_deref(),
-        )
-        .ok_or_else(|| no_default_provider_error("session/load"))?;
+        let provider_id = self
+            .agent_manager()
+            .and_then(|m| m.active_profile(agent_id))
+            .map(|profile| profile.provider_id().to_owned())
+            .or_else(|| {
+                resolve_provider_id(
+                    stored.provider.as_deref(),
+                    derived_default_provider(&self.effective_settings()).as_deref(),
+                )
+            })
+            .ok_or_else(|| no_default_provider_error("session/load"))?;
         // A committed cross-provider `agent.setModel` deliberately leaves the
         // OLD provider's `acp_session_id` in place (deferred-commit: a switch
         // reverted before the next message must stay a no-op, and the original
@@ -3128,12 +3149,21 @@ impl Services {
         let is_orchestrator = self
             .resolve_session_is_orchestrator(&provider_id, &stored)
             .await;
-        let meta = build_session_meta(
+        let mut meta = build_session_meta(
             &provider_id,
             stored.system_prompt.as_deref(),
             None,
             is_orchestrator,
         );
+        if let Some(profile) = self.agent_manager().and_then(|m| m.profile_meta(agent_id)) {
+            let mut value = serde_json::to_value(meta.take().unwrap_or_default())
+                .map_err(|_| Error::Internal("Invalid session metadata".into()))?;
+            crate::provider_profiles::merge_json(&mut value, &profile);
+            meta = Some(
+                serde_json::from_value(value)
+                    .map_err(|_| Error::Internal("Invalid provider session metadata".into()))?,
+            );
+        }
         self.publish_status_event(
             &workspace_id,
             agent_id,

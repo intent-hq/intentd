@@ -10,7 +10,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, copyFileSync, rmSync } from "node:fs";
+import { mkdtempSync, copyFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -183,6 +183,22 @@ function fakePi() {
   const pi = fakePi();
   await ext.default(pi);
   assert.equal(pi.tools.length, 0, "unreachable bridge: no tools, no crash");
+}
+
+
+// Owned project stdio servers are loaded once and their tools are callable.
+{
+  const file = path.join(tmpDir, "owned-mcp.json");
+  writeFileSync(file, JSON.stringify({mcpServers:{project:{command:process.execPath,args:[mockPath]}}}));
+  process.env.INTENTD_PI_MCP_CONFIG = file;
+  const tools = [];
+  const shutdown = [];
+  await ext.registerOwnedStdioServers({registerTool: tool => tools.push(tool), on: (_event, close) => shutdown.push(close)});
+  assert.equal(tools.length, 2);
+  assert.equal(tools[0].name, "mcp_70726f6a656374__echo");
+  assert.equal((await tools[0].execute("call",{input:"owned"})).content[0].text,"echo:owned");
+  for (const close of shutdown) close();
+  delete process.env.INTENTD_PI_MCP_CONFIG;
 }
 
 for (const s of serverSockets) s.destroy();

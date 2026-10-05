@@ -95,12 +95,14 @@ function logSessionCall(method, sessionId, meta, cwd) {
         nodeOptions: process.env.NODE_OPTIONS ?? null,
         cwd: cwd ?? null,
         processCwd: process.cwd(),
+        mcpNames: sessionMcpServers.map((server) => server.name),
         argv: process.argv.slice(2),
         ...(process.env.MOCK_AGENT_LOG_CODEX_POLICY === '1'
           ? { codexPolicy: {
               config: process.env.CODEX_CONFIG ? JSON.parse(process.env.CODEX_CONFIG) : null,
               pathPresent: Object.hasOwn(process.env, 'CODEX_PATH'),
               codexPath: process.env.CODEX_PATH ?? null,
+              home: process.env.CODEX_HOME ?? null,
             } }
           : {}),
       }) + '\n'

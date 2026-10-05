@@ -110,6 +110,13 @@ async fn run_probe<F>(
 where
     F: Fn(&Value) -> Vec<Value>,
 {
+    let cmd = cmd
+        .prepare_profile(
+            crate::provider_profiles::LaunchPurpose::ModelProbe,
+            Vec::new(),
+        )
+        .await
+        .map_err(ProbeError::Spawn)?;
     let mut adapter = spawn_adapter(&cmd, cmd.setup_timeout())
         .await
         .map_err(|e| match e {

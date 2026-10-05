@@ -114,15 +114,48 @@ pub struct ProviderLaunchProfile {
     pub mcp_name_mapping: BTreeMap<String, String>,
     pub native_mcp_inventory: Vec<NativeMcpEntry>,
     pub policy: McpPolicy,
+    policy_sources: Vec<PolicySource>,
     pub diagnostics: Vec<ProviderProfileDiagnostic>,
     pub capabilities: ProfileCapabilities,
     provider: String,
     version: Option<String>,
     purpose: LaunchPurpose,
     storage: storage::ProfileStorage,
+    parent: Option<tempfile::TempDir>,
 }
 
 impl ProviderLaunchProfile {
+    pub(crate) fn write_mcp_file(&mut self) -> intent_core::Result<()> {
+        self.storage
+            .write(
+                "mcp.json",
+                to_auggie_mcp_config(&self.approved_mcp)
+                    .to_string()
+                    .as_bytes(),
+            )
+            .map_err(|e| intent_core::Error::InvalidInput(e.to_string()))?;
+        self.args.extend([
+            "--mcp-config".into(),
+            self.path().join("mcp.json").to_string_lossy().into_owned(),
+        ]);
+        Ok(())
+    }
+
+    pub(crate) fn hold_parent(&mut self, parent: tempfile::TempDir) {
+        self.parent = Some(parent);
+    }
+    pub(crate) fn reload_policy(
+        &self,
+        authoritative: &[PolicySource],
+    ) -> Result<McpPolicy, ProviderProfileError> {
+        let mut sources = self.policy_sources.clone();
+        sources.extend_from_slice(authoritative);
+        load_mcp_policy(&self.provider, &sources)
+    }
+    pub(crate) fn provider_id(&self) -> &str {
+        &self.provider
+    }
+
     #[must_use]
     pub fn path(&self) -> &Path {
         self.storage.path()
@@ -157,7 +190,7 @@ impl ProviderLaunchProfile {
     }
 }
 
-fn merge_json(target: &mut Value, overlay: &Value) {
+pub(crate) fn merge_json(target: &mut Value, overlay: &Value) {
     if let (Some(target), Some(overlay)) = (target.as_object_mut(), overlay.as_object()) {
         for (key, value) in overlay {
             merge_json(target.entry(key).or_insert(Value::Null), value);
@@ -238,6 +271,7 @@ pub fn prepare_provider_profile(
             identity,
             request.resume,
         )?,
+        parent: None,
         env: BTreeMap::new(),
         remove_env: BTreeSet::new(),
         args: Vec::new(),
@@ -248,6 +282,7 @@ pub fn prepare_provider_profile(
         mcp_name_mapping: BTreeMap::new(),
         native_mcp_inventory: Vec::new(),
         policy,
+        policy_sources: sources,
         diagnostics: Vec::new(),
         provider: request.provider_id.into(),
         version: request.detected_version.map(str::to_owned),
@@ -275,6 +310,27 @@ pub fn prepare_provider_profile(
         }
         "opencode" | "unsloth" => prepare_opencode(&request, &mut profile)?,
         "pi" => {
+            let mut external = profile.approved_mcp.clone();
+            external.remove("workspace-mcp");
+            if external
+                .values()
+                .any(|s| !matches!(s, intent_acp::NormalizedMcpServer::Stdio { .. }))
+            {
+                profile.diagnostic("pi-remote-mcp-unsupported", "The bundled Pi bridge delivers stdio project MCP only; configure remote servers in Intent and call them through ws.mcp.");
+            }
+            external.retain(|_, s| matches!(s, intent_acp::NormalizedMcpServer::Stdio { .. }));
+            profile.storage.write(
+                "pi-mcp.json",
+                to_auggie_mcp_config(&external).to_string().as_bytes(),
+            )?;
+            profile.env.insert(
+                "INTENTD_PI_MCP_CONFIG".into(),
+                profile
+                    .path()
+                    .join("pi-mcp.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
             profile.native_args = vec![
                 "--no-skills".into(),
                 "--no-extensions".into(),
@@ -397,6 +453,9 @@ fn prepare_opencode(
         merge_json(&mut config, owned);
     }
     config["mcp"] = to_opencode_mcp_config(&profile.approved_mcp);
+    if request.purpose != LaunchPurpose::Persistent {
+        config["permission"] = json!("deny");
+    }
     // Normalized imports carry explicit credentials, not an OAuth lifecycle.
     // Preserve discovery's oauth:false instead of re-enabling native OAuth.
     if let Some(servers) = config["mcp"].as_object_mut() {

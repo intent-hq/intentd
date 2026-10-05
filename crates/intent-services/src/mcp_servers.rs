@@ -24,6 +24,7 @@ use tokio::process::{Child, Command};
 use uuid::Uuid;
 
 use crate::mcp_oauth::McpOauthService;
+use crate::provider_profiles::McpPolicy;
 use crate::settings::{AsyncSecretStore, REDACTED_PLACEHOLDER};
 use crate::settings_registry::SettingsRegistry;
 use crate::{system_actor, EventBus};
@@ -117,6 +118,24 @@ fn status_auth_required(server_id: &str, last_error: &str) -> Value {
         Some(last_error),
         None,
     )
+}
+
+fn policy_allows(policy: &McpPolicy, config: &Value, tool: Option<&str>) -> bool {
+    let id = config_id(config);
+    let name = config
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&id);
+    let mut entry = config.clone();
+    if let Some(transport) = config.get("transport") {
+        entry["type"] = transport.clone();
+    }
+    let servers = intent_acp::normalize_mcp_servers(&json!({name:entry}));
+    servers.get(name).is_some_and(|server| match tool {
+        Some(tool) => policy.allows_tool(name, server, tool),
+        None => policy.allows_server(name, server),
+    })
 }
 
 /// The `id` of a config Value (empty when absent).
@@ -289,6 +308,19 @@ pub(crate) async fn read_configs(secrets: &AsyncSecretStore) -> Map<String, Valu
             .unwrap_or_default(),
         Ok(None) | Err(_) => Map::new(),
     }
+}
+
+/// Security decisions must distinguish an absent catalog from unavailable or
+/// malformed settings. Management UI keeps its existing best-effort reader.
+pub(crate) async fn read_configs_for_policy(
+    secrets: &AsyncSecretStore,
+) -> Result<Map<String, Value>> {
+    let Some(raw) = secrets.load(SETTING_KEY).await? else {
+        return Ok(Map::new());
+    };
+    serde_json::from_str::<Map<String, Value>>(&raw).map_err(|_| {
+        Error::InvalidInput("MCP configuration is malformed; cannot authorize access".into())
+    })
 }
 
 /// Persist the configured external servers back to the sensitive secret.
@@ -693,11 +725,35 @@ impl McpHub {
     /// The gate is never permanent — [`Self::health_tick`] re-probes every
     /// [`HEALTH_INTERVAL`] and a config update re-probes immediately, either
     /// of which flips a recovered server back to `running`.
+    #[cfg(test)]
     fn tool_target(&self, server_id: &str) -> Result<ToolTarget> {
+        self.authorized_target(server_id, None, None)
+    }
+
+    fn permits_running_config(&self, id: &str, policy: &McpPolicy) -> bool {
+        self.inner
+            .servers
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_none_or(|running| policy_allows(policy, &running.config, None))
+    }
+
+    fn authorized_target(
+        &self,
+        server_id: &str,
+        policy: Option<&McpPolicy>,
+        tool: Option<&str>,
+    ) -> Result<ToolTarget> {
         let map = self.inner.servers.lock().unwrap();
         let rs = map
             .get(server_id)
             .ok_or_else(|| Error::NotFound(format!("mcp server {server_id} is not running")))?;
+        if policy.is_some_and(|p| !policy_allows(p, &rs.config, tool)) {
+            return Err(Error::InvalidParams(
+                "MCP server/tool denied by provider policy".into(),
+            ));
+        }
         match &rs.runtime {
             ServerRuntime::Stdio { conn, .. } => Ok(ToolTarget::Stdio(conn.clone())),
             ServerRuntime::Remote => {
@@ -771,7 +827,23 @@ impl McpHub {
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
-        match self.tool_target(server_id)? {
+        self.forward_authorized(server_id, method, params, timeout, None)
+            .await
+    }
+
+    async fn forward_authorized(
+        &self,
+        server_id: &str,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        policy: Option<&McpPolicy>,
+    ) -> Result<Value> {
+        match self.authorized_target(
+            server_id,
+            policy,
+            params.get("name").and_then(Value::as_str),
+        )? {
             ToolTarget::Stdio(conn) => {
                 let cancel = |id: i64| {
                     (
@@ -1514,6 +1586,7 @@ pub(crate) struct McpServersService<'a> {
     secrets: &'a AsyncSecretStore,
     hub: &'a McpHub,
     store: Option<&'a Store>,
+    agent_policy: Option<McpPolicy>,
 }
 
 impl<'a> McpServersService<'a> {
@@ -1528,7 +1601,13 @@ impl<'a> McpServersService<'a> {
             secrets,
             hub,
             store,
+            agent_policy: None,
         }
+    }
+
+    pub(crate) fn with_agent_policy(mut self, policy: McpPolicy) -> Self {
+        self.agent_policy = Some(policy);
+        self
     }
 
     /// The effective typed settings; schema defaults when no registry is wired.
@@ -1557,23 +1636,6 @@ impl<'a> McpServersService<'a> {
                     .await
             }
             _ => Ok(Vec::new()),
-        }
-    }
-
-    /// Single-pair point read for the per-tool-call hot path
-    /// (`require_agent_server`); same leniency as `workspace_disabled_ids`.
-    async fn workspace_disabled(
-        &self,
-        workspace_id: Option<&str>,
-        server_id: &str,
-    ) -> Result<bool> {
-        match (self.store, workspace_id) {
-            (Some(store), Some(ws)) => {
-                store
-                    .workspace_mcp_server_disabled(&WorkspaceId(ws.to_string()), server_id)
-                    .await
-            }
-            _ => Ok(false),
         }
     }
 
@@ -1835,15 +1897,42 @@ impl<'a> McpServersService<'a> {
             .get("enabled")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if !enabled || disabled_servers(&settings).iter().any(|d| d == server_id) {
+        let configs = read_configs_for_policy(self.secrets).await?;
+        let global = disabled_servers(&settings).into_iter().collect();
+        let workspace = self
+            .workspace_disabled_ids(workspace_id)
+            .await?
+            .into_iter()
+            .collect();
+        let configs = Value::Object(configs);
+        let global_disabled = crate::project_mcp::intent_mcp_disabled_names(
+            &configs,
+            &global,
+            &std::collections::BTreeSet::new(),
+        );
+        if !enabled || global_disabled.contains(server_id) {
             return Err(Error::InvalidParams(format!(
                 "mcp server {server_id} is disabled"
             )));
         }
-        if self.workspace_disabled(workspace_id, server_id).await? {
+        let workspace_disabled = crate::project_mcp::intent_mcp_disabled_names(
+            &configs,
+            &std::collections::BTreeSet::new(),
+            &workspace,
+        );
+        if workspace_disabled.contains(server_id) {
             return Err(Error::InvalidParams(format!(
                 "mcp server {server_id} is disabled for this workspace"
             )));
+        }
+        if self
+            .agent_policy
+            .as_ref()
+            .is_some_and(|p| !policy_allows(p, &config, None))
+        {
+            return Err(Error::InvalidParams(
+                "MCP server denied by provider policy".into(),
+            ));
         }
         Ok(())
     }
@@ -1856,11 +1945,22 @@ impl<'a> McpServersService<'a> {
     /// `workspaceDisabled: true` (they stay listed — parity with globally
     /// disabled servers, which surface with `enabled: false`).
     pub(crate) async fn agent_list_servers(&self, workspace_id: Option<&str>) -> Result<Value> {
-        self.require_agent_mcp()?;
+        let settings = self.require_agent_mcp()?;
         let ws_disabled = self.workspace_disabled_ids(workspace_id).await?;
-        let configs = read_configs(self.secrets).await;
+        let configs = read_configs_for_policy(self.secrets).await?;
+        let disabled = crate::project_mcp::intent_mcp_disabled_names(
+            &Value::Object(configs.clone()),
+            &disabled_servers(&settings).into_iter().collect(),
+            &std::collections::BTreeSet::new(),
+        );
         let mut servers: Vec<Value> = configs
             .values()
+            .filter(|config| {
+                self.agent_policy.as_ref().is_none_or(|p| {
+                    policy_allows(p, config, None)
+                        && self.hub.permits_running_config(&config_id(config), p)
+                })
+            })
             .map(|config| {
                 let id = config_id(config);
                 let status = self.hub.status(&id);
@@ -1879,10 +1979,13 @@ impl<'a> McpServersService<'a> {
                 );
                 m.insert(
                     "enabled".into(),
-                    json!(config
-                        .get("enabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)),
+                    json!(
+                        !disabled.contains(&id)
+                            && config
+                                .get("enabled")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                    ),
                 );
                 m.insert(
                     "state".into(),
@@ -1891,7 +1994,12 @@ impl<'a> McpServersService<'a> {
                 if let Some(tc) = status.get("toolCount") {
                     m.insert("toolCount".into(), tc.clone());
                 }
-                if ws_disabled.contains(&id) {
+                if ws_disabled.contains(&id)
+                    || config
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| ws_disabled.iter().any(|d| d == n))
+                {
                     m.insert("workspaceDisabled".into(), json!(true));
                 }
                 Value::Object(m)
@@ -1909,7 +2017,27 @@ impl<'a> McpServersService<'a> {
         server_id: &str,
     ) -> Result<Value> {
         self.require_agent_server(workspace_id, server_id).await?;
-        self.hub.list_tools(server_id).await
+        let mut result = self
+            .hub
+            .forward_authorized(
+                server_id,
+                "tools/list",
+                json!({}),
+                TOOL_TIMEOUT,
+                self.agent_policy.as_ref(),
+            )
+            .await?;
+        if let Some(policy) = &self.agent_policy {
+            let config = self.require_config(server_id).await?;
+            if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
+                tools.retain(|t| {
+                    t.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| policy_allows(policy, &config, Some(name)))
+                });
+            }
+        }
+        Ok(result)
     }
 
     /// `ws.mcp.callTool`: forward `tools/call` to one enabled server after
@@ -1925,11 +2053,14 @@ impl<'a> McpServersService<'a> {
     ) -> Result<Value> {
         self.require_agent_server(workspace_id, server_id).await?;
         self.hub
-            .call_tool(
+            .forward_authorized(
                 server_id,
-                tool_name,
-                args,
-                timeout_ms.map(Duration::from_millis),
+                "tools/call",
+                json!({"name":tool_name,"arguments":args}),
+                timeout_ms
+                    .map_or(TOOL_TIMEOUT, Duration::from_millis)
+                    .min(TOOL_TIMEOUT_CAP),
+                self.agent_policy.as_ref(),
             )
             .await
     }
@@ -4569,5 +4700,130 @@ for line in sys.stdin:
         assert!(!msg.contains("hunter2"), "password leaked: {msg}");
         assert!(!msg.contains("tok123"), "query token leaked: {msg}");
         assert!(msg.contains("unreachable from daemon host"), "got: {msg}");
+    }
+    #[tokio::test]
+    async fn provider_policy_name_disables_are_live_and_do_not_stop_shared_hub() {
+        let (reg, _cfg) = temp_registry();
+        let (url, _guard) = http_tool_stub().await;
+        let h = remote_hub("id", "http", &url, json!({}));
+        h.inner
+            .servers
+            .lock()
+            .unwrap()
+            .get_mut("id")
+            .unwrap()
+            .config["name"] = json!("named");
+        let config = h.inner.servers.lock().unwrap()["id"].config.clone();
+        let secrets = mem_async();
+        write_configs(
+            &secrets,
+            &serde_json::from_value(json!({"id":config})).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (_tmp, store, ws) = store_with_workspace().await;
+        let service = svc_with_store(Some(&reg), &secrets, &h, &store)
+            .with_agent_policy(McpPolicy::default());
+        assert!(service
+            .agent_call_tool(Some(&ws), "id", "t1", json!({}), None)
+            .await
+            .is_ok());
+        reg.apply(&[("mcp.disabledServers".into(), json!(["named"]))])
+            .unwrap();
+        assert!(service.agent_list_tools(Some(&ws), "id").await.is_err());
+        assert_eq!(
+            service.agent_list_servers(Some(&ws)).await.unwrap()["servers"][0]["enabled"],
+            false
+        );
+        reg.apply(&[("mcp.disabledServers".into(), json!([]))])
+            .unwrap();
+        store
+            .set_workspace_mcp_server_disabled(&WorkspaceId(ws.clone()), "named", true)
+            .await
+            .unwrap();
+        assert!(service
+            .agent_call_tool(Some(&ws), "id", "t1", json!({}), None)
+            .await
+            .is_err());
+        assert!(service
+            .agent_call_tool(None, "id", "t1", json!({}), None)
+            .await
+            .is_ok());
+        assert_eq!(h.status("id")["state"], "running");
+    }
+
+    #[tokio::test]
+    async fn provider_policies_share_hub_without_changing_server_state() {
+        let (url, _guard) = http_tool_stub().await;
+        let h = remote_hub("policy", "http", &url, json!({}));
+        let secrets = mem_async();
+        let config = h.inner.servers.lock().unwrap()["policy"].config.clone();
+        secrets
+            .store(SETTING_KEY, &json!({"policy":config}).to_string())
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("policy.json");
+        std::fs::write(&file, r#"{"allowedMcpServers":[]}"#).unwrap();
+        let denied = crate::provider_profiles::load_mcp_policy(
+            "claude-code",
+            &[crate::provider_profiles::PolicySource::ClaudeSettings(file)],
+        )
+        .unwrap();
+        let restricted = McpServersService::new(None, &secrets, &h, None).with_agent_policy(denied);
+        let allowed = McpServersService::new(None, &secrets, &h, None)
+            .with_agent_policy(McpPolicy::default());
+        assert!(
+            restricted.agent_list_servers(None).await.unwrap()["servers"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(restricted.agent_list_tools(None, "policy").await.is_err());
+        assert!(restricted
+            .agent_call_tool(None, "policy", "t1", json!({}), None)
+            .await
+            .is_err());
+        assert_eq!(
+            allowed.agent_list_servers(None).await.unwrap()["servers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            allowed
+                .agent_call_tool(None, "policy", "t1", json!({}), None)
+                .await
+                .unwrap()["content"][0]["text"],
+            "http-ok"
+        );
+        assert_eq!(h.status("policy")["state"], "running");
+        // Replacing the live configuration must not reuse a check against the saved one.
+        let deny_file = dir.path().join("deny-url.json");
+        std::fs::write(
+            &deny_file,
+            r#"{"deniedMcpServers":[{"serverUrl":"https://denied.invalid"}]}"#,
+        )
+        .unwrap();
+        let p = crate::provider_profiles::load_mcp_policy(
+            "claude-code",
+            &[crate::provider_profiles::PolicySource::ClaudeSettings(
+                deny_file,
+            )],
+        )
+        .unwrap();
+        h.inner
+            .servers
+            .lock()
+            .unwrap()
+            .get_mut("policy")
+            .unwrap()
+            .config["url"] = json!("https://denied.invalid");
+        assert!(McpServersService::new(None, &secrets, &h, None)
+            .with_agent_policy(p)
+            .agent_call_tool(None, "policy", "t1", json!({}), None)
+            .await
+            .is_err());
     }
 }

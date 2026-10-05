@@ -435,7 +435,7 @@ async fn member_tools_share_configured_mcp_without_admin_authority() {
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
     with_caller(caller(&member), async {
-        svc.mcp_list_servers(None).await.unwrap();
+        svc.mcp_list_servers(None, None).await.unwrap();
         assert!(matches!(
             svc.settings_list().await,
             Err(Error::Forbidden(_))
