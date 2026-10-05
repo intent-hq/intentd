@@ -17,6 +17,20 @@ async fn fixture() -> (TempDb, Store, WorkspaceId, NoteId) {
     (db, store, ws, note.id)
 }
 
+// These low-level projection fixtures intentionally supply synthetic geometry,
+// rather than source literals. Public comment writers now publish immediately;
+// explicitly retire that derived index before exercising the publisher itself.
+async fn pending_synthetic_anchors(store: &Store, ws: &WorkspaceId, note: &NoteId) {
+    sqlx::query(
+        "UPDATE note_annotation_head SET anchors_rev=-1 WHERE workspace_id=? AND note_id=?",
+    )
+    .bind(ws.as_str())
+    .bind(note.as_str())
+    .execute(store.write_pool())
+    .await
+    .unwrap();
+}
+
 fn attribution(ws: &WorkspaceId, note: &NoteId, timestamp: i64) -> LineAttributionData {
     LineAttributionData {
         workspace_id: ws.clone(),
@@ -185,6 +199,7 @@ async fn comment_overlap_includes_outside_start_points_and_deduplicates_occurren
             .await
             .unwrap();
     }
+    pending_synthetic_anchors(&store, &ws, &note).await;
     let epoch = store.note_annotation_epochs(&ws, &note).await.unwrap();
     let anchors = [
         AnchorOccurrence {
@@ -536,31 +551,38 @@ async fn anchor_index_participates_in_source_transaction_rollback() {
     reply.parent_id = Some("root".into());
     reply.anchor = None;
     store.insert_comment(&ws, &reply).await.unwrap();
+    pending_synthetic_anchors(&store, &ws, &note).await;
     let changed = store.note_annotation_epochs(&ws, &note).await.unwrap();
-    assert!(store
-        .publish_comment_anchors(&ws, &note, &original, &[])
-        .await
-        .is_err());
-    assert!(store
-        .publish_comment_anchors(
-            &ws,
-            &note,
-            &changed,
-            &[
-                AnchorOccurrence {
-                    comment_id: "root".into(),
-                    occurrence_id: "good".into(),
-                    source_range: SourceRange { start: 1, end: 2 }
-                },
-                AnchorOccurrence {
-                    comment_id: "reply".into(),
-                    occurrence_id: "bad".into(),
-                    source_range: SourceRange { start: 1, end: 2 }
-                },
-            ]
-        )
-        .await
-        .is_err());
+    assert!(matches!(
+        store
+            .publish_comment_anchors(&ws, &note, &original, &[])
+            .await,
+        Err(intent_core::Error::NotePage(
+            intent_core::note_page::NotePageError::Stale
+        ))
+    ));
+    assert!(matches!(
+        store
+            .publish_comment_anchors(
+                &ws,
+                &note,
+                &changed,
+                &[
+                    AnchorOccurrence {
+                        comment_id: "root".into(),
+                        occurrence_id: "good".into(),
+                        source_range: SourceRange { start: 1, end: 2 }
+                    },
+                    AnchorOccurrence {
+                        comment_id: "reply".into(),
+                        occurrence_id: "bad".into(),
+                        source_range: SourceRange { start: 1, end: 2 }
+                    },
+                ]
+            )
+            .await,
+        Err(intent_core::Error::InvalidParams(_))
+    ));
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_comment_anchor")
         .fetch_one(store.read_pool())
         .await
@@ -1005,6 +1027,7 @@ async fn annotation_anchor_context_pages_canonical_occurrences_and_explicit_orph
             .await
             .unwrap();
     }
+    pending_synthetic_anchors(&store, &ws, &note).await;
     let epochs = store.note_annotation_epochs(&ws, &note).await.unwrap();
     store
         .publish_comment_anchors(
@@ -1168,6 +1191,7 @@ async fn annotation_maintained_all_orphan_counts_follow_reply_updates_anchor_reb
     let mut reply = sample_comment(&note, "root", "reply");
     reply.parent_id = Some("root".into());
     store.insert_comment(&ws, &reply).await.unwrap();
+    pending_synthetic_anchors(&store, &ws, &note).await;
     for round in 0..2 {
         let epochs = store.note_annotation_epochs(&ws, &note).await.unwrap();
         store

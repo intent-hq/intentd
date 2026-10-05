@@ -10914,9 +10914,8 @@ async fn persist_merged_content(
         note.content = content.clone();
         let now = now_iso();
         note.updated_at = now.clone();
-        match persist_note_content(store, &note, Some(current_rev), author).await {
+        match plan.persist(store, &note, Some(current_rev), author).await {
             Ok(rev) => {
-                plan.apply_orphaned(store, workspace_id).await?;
                 return Ok(MergedContentWrite {
                     note,
                     old_content,
@@ -10941,11 +10940,8 @@ async fn persist_merged_content(
 /// Returns a [`ReanchorPlan`]: the possibly-rewritten markdown plus the set
 /// of comments whose `is_orphaned` flag needs to be flipped to `true`.
 /// Already-orphaned comments are left as-is. The plan does **no** store
-/// writes — callers first persist the note-content change via an atomic
-/// versioned write (`persist_note_content` / the `*_with_version` store
-/// helpers) and then call [`ReanchorPlan::apply_orphaned`] so a failed note write
-/// cannot leave comment rows flagged orphaned while the persisted markdown
-/// still contains the original anchors.
+/// writes. Callers commit source, its version, orphan flags and anchor readiness
+/// together through the versioned writer; a failure leaves every row unchanged.
 ///
 /// The lookup is scoped to `workspace_id` because `note_id` (e.g. the
 /// well-known `spec` id) is not globally unique — see
@@ -10964,21 +10960,9 @@ async fn reanchor_note_comments(
         .list_comments_in_workspace(workspace_id, note_id)
         .await?;
     let plan = note_ops::canonical::plan_anchor_changes(&content, &comments);
-    let orphan_ids: HashSet<_> = plan.orphaned.into_iter().collect();
-    let orphaned = comments
-        .into_iter()
-        .filter_map(|mut comment| {
-            if !orphan_ids.contains(&comment.id) {
-                return None;
-            }
-            comment.is_orphaned = Some(true);
-            comment.updated_at = now_iso();
-            Some(comment)
-        })
-        .collect();
     Ok(ReanchorPlan {
         content: plan.content,
-        orphaned,
+        orphaned: plan.orphaned,
     })
 }
 
@@ -10996,22 +10980,27 @@ fn live_comment_ids(comments: &[Comment]) -> HashSet<String> {
 /// set of comment rows whose `is_orphaned` flag needs to flip to `true`.
 struct ReanchorPlan {
     content: String,
-    orphaned: Vec<Comment>,
+    orphaned: Vec<String>,
 }
 
 impl ReanchorPlan {
-    /// Persist the queued orphan flips. Callers **must** run this only after
-    /// the note-content write has succeeded so a note-write failure cannot
-    /// leave comment rows marked orphaned while the persisted markdown still
-    /// contains the original anchors. If a comment update fails after the
-    /// note has been written the anchors on disk are still a valid pointer
-    /// (either intact or scrubbed) and the next mutation's reanchor pass
-    /// will finish the job.
-    async fn apply_orphaned(self, store: &Store, workspace_id: &WorkspaceId) -> Result<()> {
-        for c in self.orphaned {
-            store.update_comment(workspace_id, &c).await?;
-        }
-        Ok(())
+    async fn persist(
+        &self,
+        store: &Store,
+        note: &Note,
+        expected_version: Option<i64>,
+        author: &NoteVersionAuthor,
+    ) -> Result<i64> {
+        store
+            .update_note_with_version_and_orphans(
+                note,
+                expected_version,
+                author,
+                &note.updated_at,
+                &self.orphaned,
+            )
+            .await
+            .map(|(revision, _)| revision)
     }
 }
 
@@ -16370,12 +16359,13 @@ impl Services {
             note.updated_at = now_iso();
             let children: Vec<Note> = created.iter().map(|(child, _)| child.clone()).collect();
             match store
-                .update_note_with_version_and_children(
+                .update_note_with_version_and_children_and_orphans(
                     &note,
                     Some(read_rev),
                     &children,
                     &author,
                     &note.updated_at,
+                    &plan.orphaned,
                 )
                 .await
             {
@@ -16389,7 +16379,6 @@ impl Services {
                         created = created.len(),
                         "task blocks converted"
                     );
-                    plan.apply_orphaned(store, &workspace_id).await?;
                     break (note, parsed, warnings, created, block_note_ids);
                 }
                 Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {}
@@ -25275,8 +25264,10 @@ impl WorkspaceApi for Services {
             if content_changed {
                 // FE-only `note.update`: no caller-agent context on this arm
                 // (transport router path), so the version author is the user.
-                persist_note_content(&store, &note, expected_version, &user_version_author())
-                    .await?;
+                if let Some(plan) = &reanchor_plan {
+                    plan.persist(&store, &note, expected_version, &user_version_author())
+                        .await?;
+                }
             } else {
                 // Metadata-scoped: leaves the stored content untouched even
                 // when a content write committed after the fetch above.
@@ -25289,9 +25280,6 @@ impl WorkspaceApi for Services {
             // concurrent write landed — rather than the pre-write copy
             // (intent-hq/intent#5589).
             note = fetch_note(&store, &workspace_id, &note_id).await?;
-            if let Some(plan) = reanchor_plan {
-                plan.apply_orphaned(&store, &workspace_id).await?;
-            }
             if content_changed {
                 services.schedule_line_attribution_recompute(
                     &note.workspace_id.clone(),
@@ -26373,9 +26361,8 @@ impl WorkspaceApi for Services {
                         .await?;
                 note.content = std::mem::take(&mut plan.content);
                 note.updated_at = now_iso();
-                match persist_note_content(&store, &note, Some(read_rev), &author).await {
+                match plan.persist(&store, &note, Some(read_rev), &author).await {
                     Ok(_) => {
-                        plan.apply_orphaned(&store, &workspace_id).await?;
                         break (note, update, redirect, true);
                     }
                     Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {

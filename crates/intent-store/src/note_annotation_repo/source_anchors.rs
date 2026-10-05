@@ -6,6 +6,19 @@ use super::{
 use intent_core::{Error, NoteId, Result, WorkspaceId};
 use sqlx::SqliteConnection;
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FinalizerPause {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+    pub observed: std::sync::Mutex<Option<super::AnnotationEpochs>>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static FINALIZER_PAUSE: std::sync::Arc<FinalizerPause>;
+}
+
 /// Project the legacy selection geometry for unique, scoped, non-orphan roots.
 /// Each literal start independently uses its first subsequent same-ID end;
 /// nested starts may share an end. IDs are opaque literal strings, not parsed
@@ -74,6 +87,12 @@ pub(crate) async fn rebuild_note_anchors(
     final_source: Option<&str>,
 ) -> Result<()> {
     let (_, epochs) = head(conn, workspace, note).await?;
+    #[cfg(test)]
+    if let Ok(pause) = FINALIZER_PAUSE.try_with(std::sync::Arc::clone) {
+        *pause.observed.lock().expect("finalizer observation") = Some(epochs.clone());
+        pause.entered.notify_one();
+        pause.release.notified().await;
+    }
     let length: i64 = sqlx::query_scalar(
         "SELECT source_length FROM note_page_head WHERE workspace_id=? AND note_id=? \
          AND indexed_rev=current_rev AND current_rev=?",

@@ -156,3 +156,172 @@ async fn parent_and_children_publish_readiness_in_the_same_versioned_write() {
         1
     );
 }
+
+#[tokio::test]
+async fn orphan_flags_and_anchor_readiness_commit_or_roll_back_with_the_source() {
+    let (store, _tmp, mut note) = setup("<!--anchor:x:start-->a<!--anchor:x:end-->").await;
+    let comment = sample_comment(&note.id, "x", "x");
+    note.rev = store
+        .update_note_with_comment(&note, Some(note.rev), &comment, &author())
+        .await
+        .unwrap();
+    let before = store.get_note(&note.workspace_id, &note.id).await.unwrap();
+    let epochs = store
+        .note_annotation_epochs(&note.workspace_id, &note.id)
+        .await
+        .unwrap();
+    let versions = store
+        .list_note_versions(&note.workspace_id, &note.id)
+        .await
+        .unwrap()
+        .len();
+    sqlx::query("CREATE TRIGGER reject_orphan_finalizer BEFORE UPDATE OF anchors_rev ON note_annotation_head WHEN NEW.anchors_rev=NEW.source_rev BEGIN SELECT RAISE(ABORT,'orphan finalizer rejected'); END")
+        .execute(store.write_pool()).await.unwrap();
+    note.content = "plain source".into();
+    let result = store
+        .update_note_with_version_and_orphans(
+            &note,
+            Some(note.rev),
+            &author(),
+            &note.updated_at,
+            &["x".into()],
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::Internal(message)) if message.contains("orphan finalizer rejected"))
+    );
+    assert_eq!(
+        store.get_note(&note.workspace_id, &note.id).await.unwrap(),
+        before
+    );
+    assert_eq!(
+        store
+            .note_annotation_epochs(&note.workspace_id, &note.id)
+            .await
+            .unwrap(),
+        epochs
+    );
+    assert_ne!(
+        store.get_comment("x").await.unwrap().is_orphaned,
+        Some(true)
+    );
+    assert_eq!(
+        store
+            .list_note_versions(&note.workspace_id, &note.id)
+            .await
+            .unwrap()
+            .len(),
+        versions
+    );
+    sqlx::query("DROP TRIGGER reject_orphan_finalizer")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    store
+        .update_note_with_version_and_orphans(
+            &note,
+            Some(note.rev),
+            &author(),
+            &note.updated_at,
+            &["x".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_comment("x").await.unwrap().is_orphaned,
+        Some(true)
+    );
+    ready(&store, &note).await;
+    assert!(anchors(&store, &note).await.is_empty());
+}
+
+#[tokio::test]
+async fn dropping_note_writer_during_finalizer_rolls_back_mutated_source_and_orphans() {
+    use crate::note_annotation_repo::{FinalizerPause, FINALIZER_PAUSE};
+    use std::{sync::Arc, time::Duration};
+    let (store, _tmp, mut note) = setup("<!--anchor:x:start-->a<!--anchor:x:end-->").await;
+    let comment = sample_comment(&note.id, "x", "x");
+    note.rev = store
+        .update_note_with_comment(&note, Some(note.rev), &comment, &author())
+        .await
+        .unwrap();
+    let before = store.get_note(&note.workspace_id, &note.id).await.unwrap();
+    let epochs = store
+        .note_annotation_epochs(&note.workspace_id, &note.id)
+        .await
+        .unwrap();
+    let rows = anchors(&store, &note).await;
+    let versions = store
+        .list_note_versions(&note.workspace_id, &note.id)
+        .await
+        .unwrap()
+        .len();
+    note.content = "changed after dropping markers".into();
+    let pause = Arc::new(FinalizerPause::default());
+    let version_author = author();
+    let orphaned = ["x".into()];
+    let mut write = Box::pin(FINALIZER_PAUSE.scope(
+        Arc::clone(&pause),
+        store.update_note_with_version_and_orphans(
+            &note,
+            Some(note.rev),
+            &version_author,
+            &note.updated_at,
+            &orphaned,
+        ),
+    ));
+    tokio::select! {
+        result = &mut write => panic!("writer finished before finalizer: {result:?}"),
+        () = pause.entered.notified() => {},
+        () = tokio::time::sleep(Duration::from_secs(5)) => panic!("writer never reached finalizer"),
+    }
+    let observed = pause.observed.lock().unwrap().clone().unwrap();
+    assert_eq!(observed.source_revision, epochs.source_revision + 1);
+    assert_ne!(observed.comment_revision, epochs.comment_revision);
+    assert!(!observed.anchors_ready);
+    drop(write);
+    // Acquire the replacement writer before reading: cancellation must release
+    // the old transaction and cannot leak either its source or orphan update.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        sqlx::query("BEGIN IMMEDIATE; ROLLBACK").execute(store.write_pool()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        store.get_note(&note.workspace_id, &note.id).await.unwrap(),
+        before
+    );
+    assert_eq!(
+        store
+            .note_annotation_epochs(&note.workspace_id, &note.id)
+            .await
+            .unwrap(),
+        epochs
+    );
+    assert_ne!(
+        store.get_comment("x").await.unwrap().is_orphaned,
+        Some(true)
+    );
+    assert_eq!(anchors(&store, &note).await, rows);
+    assert_eq!(
+        store
+            .list_note_versions(&note.workspace_id, &note.id)
+            .await
+            .unwrap()
+            .len(),
+        versions
+    );
+    store
+        .update_note_with_version_and_orphans(
+            &note,
+            Some(note.rev),
+            &version_author,
+            &note.updated_at,
+            &orphaned,
+        )
+        .await
+        .unwrap();
+    ready(&store, &note).await;
+}

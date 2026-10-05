@@ -401,15 +401,7 @@ impl Store {
         expected_version: Option<i64>,
         scope: NoteUpdateScope,
     ) -> Result<i64> {
-        let mut conn = self
-            .write_pool()
-            .acquire()
-            .await
-            .map_err(|e| Error::Internal(format!("note update connection: {e}")))?;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("note update transaction: {e}")))?;
+        let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
         let result = async {
             let revision = exec_update_note(&mut conn, note, expected_version, scope).await?;
             if revision.is_some() && scope == NoteUpdateScope::Metadata {
@@ -426,7 +418,7 @@ impl Store {
             Ok(revision)
         }
         .await;
-        match crate::commit_with_rollback_guard(conn, result, "commit note update").await? {
+        match conn.finish(result, "commit note update").await? {
             Some(rev) => Ok(rev),
             None => Err(self.note_update_miss(note).await),
         }

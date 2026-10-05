@@ -20,6 +20,8 @@ pub use page::{
     AnchorFilter, AnnotationContextRequest, AnnotationKind, AnnotationPageRequest, AnnotationRange,
 };
 pub(crate) use source_anchors::rebuild_note_anchors;
+#[cfg(test)]
+pub(crate) use source_anchors::{FinalizerPause, FINALIZER_PAUSE};
 
 pub use attribution::{AttributionJob, AttributionRow};
 pub use comments::{AnchorOccurrence, CommentFilter, CommentRow, ReplyRows, ThreadRow, ThreadRows};

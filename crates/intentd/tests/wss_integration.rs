@@ -7,6 +7,8 @@
 //! M5.1 self-signed fingerprint. A separate insecure-mode test proves the
 //! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
+#[path = "wss_integration/annotation_comment_writers.rs"]
+mod annotation_comment_writers;
 #[path = "wss_integration/annotation_pages.rs"]
 mod annotation_pages;
 #[path = "wss_integration/annotation_reads.rs"]
