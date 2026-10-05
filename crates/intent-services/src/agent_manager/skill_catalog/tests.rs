@@ -1,5 +1,9 @@
 use super::*;
 use crate::agent_manager::role_reminder_tests::manager_with;
+use crate::agent_manager::TurnOptions;
+use intent_core::now_iso;
+use serde_json::json;
+use std::path::{Path, PathBuf};
 
 async fn seed_catalog_session(mgr: &AgentManager, agent: &AgentId, repo: &Path) {
     let mut session = mgr.services.store.get_agent_session(agent).await.unwrap();

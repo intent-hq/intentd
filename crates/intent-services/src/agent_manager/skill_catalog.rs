@@ -1,9 +1,12 @@
 //! Change-aware catalog delivery for persistent first-turn-prepend providers.
 
 use base64::Engine;
+use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
+use intent_providers::InjectionMechanism;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::*;
+use super::{session_provider_id, AgentManager};
 
 const DELIVERY_KEY: &str = "skillCatalogDelivery";
 
