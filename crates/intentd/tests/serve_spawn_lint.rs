@@ -32,7 +32,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use intentd_test_support::source_lint::{
-    classify_marker, lex, rust_files, split_statements, word_at, workspace_root, Marker,
+    classify_marker, lex, rust_files, split_statements, word_at, workspace_root, Literal, Marker,
 };
 
 const ALLOW_MARKER: &str = "// serve-spawn: allow";
@@ -183,7 +183,7 @@ impl CommandState {
 fn classify(src: &str) -> Vec<Offense> {
     let parsed = lex(src);
     let mut chars: Vec<_> = parsed.blanked.chars().collect();
-    let literals: Vec<_> = parsed.literals.iter().map(|lit| lit.cooked()).collect();
+    let literals: Vec<_> = parsed.literals.iter().map(Literal::cooked).collect();
     for (i, literal) in parsed.literals.iter().enumerate() {
         chars[literal.offset] = char::from_u32(0xf0000 + i as u32).expect("literal sentinel");
     }
