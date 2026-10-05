@@ -1121,6 +1121,15 @@ jobs:
       - uses: taiki-e/install-action@nextest
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
+      - name: Prepare native startup evidence
+        id: native-evidence
+        shell: bash
+        run: |
+          # Never reuse slots from a previous job on a persistent runner.
+          umask 077
+          evidence_dir=$(mktemp -d "$RUNNER_TEMP/native-review-startup-failures.XXXXXX")
+          evidence_dir=$(realpath "$evidence_dir")
+          printf 'directory=%s\n' "$evidence_dir" >> "$GITHUB_OUTPUT"
       - name: Run e2e coverage
         # Arm the bound-caller seam for the test processes themselves, not
         # only the daemons they spawn: a direct-call test that evaluates a
@@ -1132,9 +1141,29 @@ jobs:
         # `intent_services::capability::ASSERT_BOUND_CALLER_ENV`.
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
+          NATIVE_REVIEW_FAILURE_DIR: ${{ steps.native-evidence.outputs.directory }}
         run: |
           cd ${{ github.workspace }}
           GENERATE_LCOV=1 ./scripts/coverage-e2e.sh 40
+      - name: Validate native startup evidence
+        id: native-evidence-check
+        if: ${{ failure() && steps.native-evidence.outputs.directory != '' }}
+        env:
+          NATIVE_REVIEW_FAILURE_DIR: ${{ steps.native-evidence.outputs.directory }}
+        run: python3 -I -B scripts/native-review-artifact.py "$NATIVE_REVIEW_FAILURE_DIR" >> "$GITHUB_OUTPUT"
+      # Only the sanitized owned-fixture exports: 16 fixed slots, 128 KiB each.
+      # Run before coverage reporting and independently of lcov.info existence.
+      - name: Upload native startup evidence
+        if: ${{ failure() && steps.native-evidence-check.outputs.ready == 'true' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-review-startup-failures
+          path: |
+            ${{ steps.native-evidence.outputs.directory }}/startup-failure-0[0-9].json
+            ${{ steps.native-evidence.outputs.directory }}/startup-failure-1[0-5].json
+          if-no-files-found: ignore
+          retention-days: 3
       - name: Generate coverage summary
         if: always()
         run: |
@@ -1822,6 +1851,7 @@ jobs:
           python3 -m pip install PyYAML==6.0.2
           python3 -B scripts/test-prerelease-cleanup-workflow.py
           python3 -B scripts/test-release-rust-cache.py
+          python3 -I -B scripts/test-native-review-artifact.py
       - name: Test local and CI caller policy
         run: |
           python3 -S scripts/test-test-policy.py

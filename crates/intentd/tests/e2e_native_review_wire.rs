@@ -2239,6 +2239,8 @@ impl DriverTest {
                 directory.path().join("descriptor.json"),
             )
             .env_remove("INTENT_REVIEW_DRIVER_CHILD")
+            .env("NATIVE_REVIEW_COMPANION_DIAGNOSTIC_6328", "1")
+            .env("NATIVE_REVIEW_EVIDENCE_DIR", directory.path())
             .env("INTENTD_TEST_KEEP_TMP", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::from(log.try_clone().unwrap()))
@@ -2250,24 +2252,87 @@ impl DriverTest {
             ready: Value::Null,
             run_id,
         };
-        let ready = timeout(Duration::from_secs(25), async {
-            loop {
-                if let Ok(bytes) = std::fs::read(owned.directory.path().join("ready.json")) {
-                    break serde_json::from_slice(&bytes).unwrap();
-                }
-                assert!(
-                    owned.child.poll().unwrap().is_none(),
-                    "driver exited: {}",
-                    std::fs::read_to_string(owned.directory.path().join("child.log")).unwrap()
+        owned
+            .wait_ready(Duration::from_secs(25))
+            .await
+            .unwrap_or_else(|reason| {
+                panic!(
+                    "driver startup failed: {reason}; sanitized evidence captured where available"
                 );
+            });
+        owned
+    }
+    async fn wait_ready(&mut self, deadline: Duration) -> Result<(), &'static str> {
+        let ready = timeout(deadline, async {
+            loop {
+                if let Ok(bytes) = std::fs::read(self.directory.path().join("ready.json")) {
+                    return serde_json::from_slice(&bytes).map_err(|_| "invalid-readiness");
+                }
+                match self.child.poll() {
+                    Ok(None) => {}
+                    Ok(Some(_)) => return Err("early-exit"),
+                    Err(_) => return Err("child-observation-error"),
+                }
                 // timing-guard: wait for this owned child's atomic readiness file
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
+        .await;
+        match ready {
+            Ok(Ok(ready)) => {
+                self.ready = ready;
+                Ok(())
+            }
+            failure => {
+                let reason = failure.map_or("readiness-timeout", |r| r.unwrap_err());
+                self.capture_startup_failure(reason).await;
+                Err(reason)
+            }
+        }
+    }
+    async fn capture_startup_failure(&mut self, reason: &str) {
+        // Close only our original lifetime pipe. The existing supervisor owns all
+        // signaling/reaping; a deadline is never permission to kill that owner.
+        self.child.close();
+        let observed = timeout(Duration::from_secs(2), async {
+            loop {
+                match self.child.poll() {
+                    Ok(None) => {}
+                    terminal => break terminal,
+                }
+                // timing-guard: bounded observation of original supervisor completion
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
         .await
-        .unwrap();
-        owned.ready = ready;
-        owned
+        .unwrap_or(Ok(None));
+        let mut evidence = startup_failure_evidence::capture(
+            self.directory.path(),
+            reason,
+            self.child.id(),
+            startup_failure_evidence::completion(&observed),
+        );
+        // Persist before Drop's existing ownership-preserving wait, even if cleanup
+        // is still unobserved. Never rewrite failed.json or other original receipts.
+        let export = std::env::var_os("NATIVE_REVIEW_FAILURE_DIR")
+            .map(|path| startup_failure_evidence::persist(&PathBuf::from(path), &evidence));
+        let export_state = export
+            .as_ref()
+            .map_or("disabled", startup_failure_evidence::export_state);
+        evidence["exportState"] = json!(export_state);
+        eprintln!("driver startup failure: sanitized export {export_state}");
+        if private_json(
+            &self.directory.path().join("startup-failure.json"),
+            &evidence,
+        )
+        .is_err()
+        {
+            eprintln!("driver startup failure: private capture unavailable");
+        }
+        eprintln!(
+            "driver startup failure: supervisor completion {}",
+            evidence["supervisorCompletion"]["state"]
+        );
     }
     async fn control(&self, action: Value) -> Value {
         let request = json!({"version":1,"runId":self.run_id,"id":uuid::Uuid::new_v4().to_string(),"action":action});
@@ -2928,7 +2993,7 @@ mod driver_ownership {
         pub(super) fn poll(&mut self) -> std::io::Result<Option<ExitStatus>> {
             self.child.try_wait()
         }
-        fn close(&mut self) {
+        pub(super) fn close(&mut self) {
             self.lifetime.take();
         }
         fn wait(&mut self) -> std::io::Result<ExitStatus> {
@@ -3315,6 +3380,7 @@ if role=='provider-a':
 while True:signal.pause()
 ";
     fn inert_worker(root: &std::path::Path, case: &str) -> DriverResult<()> {
+        let _phase = startup_milestones::begin(startup_milestones::Phase::Provider);
         anyhow::ensure!(
             matches!(case, "stopped-worker" | "exited-worker" | "controller-loss"),
             "inert case"
@@ -3345,6 +3411,7 @@ while True:signal.pause()
             // timing-guard: all original inert descendants acknowledge before fault injection
             std::thread::sleep(Duration::from_millis(10));
         }
+        eprintln!("\nnative-startup-fixture: inert worker entered");
         private_json(
             &root.join("inert-entered.json"),
             &json!({"worker":std::process::id(),"case":case,"children":3}),
@@ -3469,6 +3536,157 @@ while True:signal.pause()
             .filter(|e| e["kind"] == "signal")
             .all(|e| e["via"] == "pidfd" && e["flags"] == 0));
         record
+    }
+
+    #[tokio::test]
+    async fn native_review_startup_failure_timeout_capture() {
+        startup_failure_control("controller-loss", true, false).await;
+    }
+
+    #[tokio::test]
+    async fn native_review_startup_failure_early_exit_capture() {
+        startup_failure_control("exited-worker", false, false).await;
+    }
+
+    #[tokio::test]
+    async fn native_review_startup_failure_unobserved_capture() {
+        startup_failure_control("controller-loss", true, true).await;
+    }
+
+    async fn startup_failure_control(case: &str, deadline: bool, hold_completion: bool) {
+        let sentinel_directory = evidence_directory();
+        let mut sentinel = nonce_child(sentinel_directory.path(), "sentinel");
+        let before = nonce(sentinel_directory.path());
+        let directory = evidence_directory();
+        let mut command = inert_command(directory.path(), case);
+        command
+            .env("NATIVE_REVIEW_COMPANION_DIAGNOSTIC_6328", "1")
+            .env("NATIVE_REVIEW_EVIDENCE_DIR", directory.path());
+        let child = Controller::spawn(&mut command).unwrap();
+        observed_json(&directory.path().join("inert-entered.json"));
+        let mut driver = DriverTest {
+            directory,
+            child,
+            ready: Value::Null,
+            run_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let original_receipt = if deadline {
+            let partial = startup_failure_evidence::capture(
+                driver.directory.path(),
+                "readiness-timeout",
+                driver.child.id(),
+                startup_failure_evidence::completion(&driver.child.poll()),
+            );
+            assert_eq!(
+                partial["supervisorCompletion"]["state"],
+                "unobserved-at-capture"
+            );
+            assert_eq!(partial["files"]["failed.json"]["state"], "missing");
+            assert!(!partial["files"]["ownership.jsonl"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|record| record["waitResult"] == "ECHILD"));
+            None
+        } else {
+            assert!(!driver.child.wait().unwrap().success());
+            Some(std::fs::read(driver.directory.path().join("failed.json")).unwrap())
+        };
+        // Keep the original pipe writer in this control only, so capture cannot
+        // yet observe completion. Release it afterwards and retain the real wait.
+        let lifetime = if hold_completion {
+            driver.child.lifetime.take()
+        } else {
+            None
+        };
+        let failed = driver
+            .wait_ready(if deadline {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(2)
+            })
+            .await;
+        assert!(failed.is_err(), "startup must remain a failure");
+        let retained = driver.directory.path().join("startup-failure.json");
+        assert!(
+            retained.exists(),
+            "startup failure evidence was not retained"
+        );
+        let evidence: Value = serde_json::from_slice(&std::fs::read(retained).unwrap()).unwrap();
+        assert_eq!(
+            evidence["failure"],
+            if deadline {
+                "readiness-timeout"
+            } else {
+                "early-exit"
+            }
+        );
+        assert_eq!(evidence["success"], false);
+        assert_eq!(
+            evidence["supervisorCompletion"]["state"],
+            if hold_completion {
+                "unobserved-at-capture"
+            } else {
+                "observed"
+            }
+        );
+        assert_eq!(evidence["nativeCompletion"], "not-established");
+        let completed = if hold_completion {
+            assert_eq!(evidence["files"]["failed.json"]["state"], "missing");
+            drop(lifetime);
+            let actual = driver.child.wait().unwrap();
+            assert!(!actual.success());
+            let saved: Value = serde_json::from_slice(
+                &std::fs::read(driver.directory.path().join("startup-failure.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                saved, evidence,
+                "later cleanup must not rewrite the capture-time observation"
+            );
+            startup_failure_evidence::capture(
+                driver.directory.path(),
+                "readiness-timeout",
+                driver.child.id(),
+                startup_failure_evidence::completion(&Ok(Some(actual))),
+            )
+        } else {
+            evidence.clone()
+        };
+        let files = &completed["files"];
+        assert!(files[startup_milestones::FILE]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["phase"] == "provider" && record["outcome"] == "enter"));
+        assert!(files["child.log"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["message"] == "inert-worker-entered"));
+        let ownership = files["ownership.jsonl"]["records"].as_array().unwrap();
+        assert!(ownership
+            .iter()
+            .any(|record| record["waitResult"] == "ECHILD"));
+        let worker = observed_json(&driver.directory.path().join("worker.json"));
+        assert_eq!(
+            ownership
+                .iter()
+                .filter(|record| record["kind"] == "wait" && record["pid"] == worker["pid"])
+                .count(),
+            1
+        );
+        if let Some(original) = original_receipt {
+            assert_eq!(
+                std::fs::read(driver.directory.path().join("failed.json")).unwrap(),
+                original
+            );
+            assert!(ownership
+                .iter()
+                .any(|record| record["role"] == "worker" && record["status"]["code"] == 17));
+        }
+        assert_ne!(before, nonce(sentinel_directory.path()));
+        sentinel.finish().unwrap();
     }
 
     #[test]
@@ -4832,6 +5050,24 @@ mod startup_milestones {
             call()
         }
     }
+    #[cfg(target_os = "linux")]
+    pub(super) fn sanitized_frame(line: &[u8]) -> Option<Value> {
+        if line.len() > FRAME {
+            return None;
+        }
+        let frame: Frame = serde_json::from_slice(line).ok()?;
+        if frame.v != 1 || frame.clock != "worker-instant" {
+            return None;
+        }
+        // Projection intentionally omits all input strings (including binding
+        // hashes); enum/numeric observations cannot carry credentials or paths.
+        Some(
+            json!({"v":frame.v,"pid":frame.pid,"parent":frame.parent,"seq":frame.seq,
+            "ns":frame.ns,"wallMs":frame.wall_ms,"phase":frame.phase,"outcome":frame.outcome,
+            "span":frame.span,"host":frame.host,"child":frame.child,"code":frame.code,
+            "signal":frame.signal,"bindingObserved":frame.binding.is_some(),"counts":frame.counts}),
+        )
+    }
     #[derive(Debug)]
     pub(super) struct Report {
         pub complete: bool,
@@ -5458,3 +5694,457 @@ async fn native_startup_milestones_original_child_exit() {
         .any(|f| f["outcome"] == "waited" && f["child"] == pid && f["host"] == "a"));
 }
 // startup-milestones: end finite source controls
+
+// Only bounded, allowlisted observations leave the private fixture directory.
+// This is diagnostic output, never authority to signal/reap or establish success.
+#[cfg(target_os = "linux")]
+mod startup_failure_evidence {
+    use super::*;
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    pub(super) const OUTPUT_BYTES: usize = 128 * 1024;
+    pub(super) const OUTPUT_FILES: usize = 16;
+    const FILE_BYTES: usize = 16 * 1024;
+
+    fn private_read(path: &std::path::Path, cap: usize) -> std::io::Result<(Vec<u8>, u64)> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        // SAFETY: geteuid has no preconditions.
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+        {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        let mut bytes = Vec::new();
+        file.take(cap as u64).read_to_end(&mut bytes)?;
+        Ok((bytes, metadata.len()))
+    }
+
+    fn select(value: &Value, key: &str, allowed: &[&str]) -> Value {
+        value[key]
+            .as_str()
+            .filter(|s| allowed.contains(s))
+            .map_or(Value::Null, |s| json!(s))
+    }
+    fn number(value: &Value, key: &str) -> Value {
+        value[key].as_u64().map_or(Value::Null, |n| json!(n))
+    }
+    fn wait_status(value: &Value) -> Value {
+        let Some(text) = value.as_str() else {
+            return Value::Null;
+        };
+        if text == "StillAlive" {
+            return json!({"kind":"still-alive"});
+        }
+        let Some((kind, arguments)) = text.split_once('(') else {
+            return Value::Null;
+        };
+        let Some(arguments) = arguments.strip_suffix(')') else {
+            return Value::Null;
+        };
+        let parts: Vec<_> = arguments.split(", ").collect();
+        let Some(pid) = parts.first().and_then(|p| {
+            p.strip_prefix("Pid(")?
+                .strip_suffix(')')?
+                .parse::<u32>()
+                .ok()
+        }) else {
+            return Value::Null;
+        };
+        match (kind, parts.as_slice()) {
+            ("Exited", [_, code]) => code.parse::<i32>().ok().map_or(
+                Value::Null,
+                |code| json!({"kind":"exited","pid":pid,"code":code}),
+            ),
+            ("Stopped", [_, signal]) | ("Signaled", [_, signal, "false" | "true"])
+                if [
+                    "SIGKILL", "SIGSTOP", "SIGTERM", "SIGABRT", "SIGSEGV", "SIGINT",
+                ]
+                .contains(signal) =>
+            {
+                json!({"kind":if kind == "Stopped" {"stopped"} else {"signaled"},"pid":pid,"signal":signal})
+            }
+            _ => Value::Null,
+        }
+    }
+    fn ownership(value: &Value) -> Option<Value> {
+        let kind = select(
+            value,
+            "kind",
+            &[
+                "enrolled",
+                "first-status",
+                "worker-stopped",
+                "signal",
+                "wait",
+                "adopt",
+                "complete",
+            ],
+        );
+        if kind.is_null() {
+            return None;
+        }
+        Some(json!({"kind":kind,"pid":number(value,"pid"),
+            "role":select(value,"role", &["worker","adopted"]),
+            "via":select(value,"via", &["pidfd"]), "status":wait_status(&value["status"]),
+            "waitResult":select(value,"waitResult", &["ECHILD"])}))
+    }
+
+    fn file(root: &std::path::Path, name: &str) -> Value {
+        let cap = if name == startup_milestones::FILE {
+            48 * 1024
+        } else {
+            FILE_BYTES
+        };
+        let (bytes, total) = match private_read(&root.join(name), cap) {
+            Ok(observed) => observed,
+            Err(error) => {
+                return json!({"state":if error.kind() == std::io::ErrorKind::NotFound {"missing"} else {"unreadable"}})
+            }
+        };
+        let truncated = total > bytes.len() as u64;
+        let mut records = Vec::new();
+        let mut rejected = 0;
+        let mut incomplete = false;
+        if matches!(name, "failed.json" | "worker-failed.json") {
+            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                // Never retain arbitrary reason/error, worker envelopes, credentials or paths.
+                records.push(json!({"reportedSuccess":value["success"].as_bool(),
+                    "reportedOwnershipComplete":value["ownership"]["complete"].as_bool(),
+                    "reportedOwnershipFailed":value["ownership"]["failed"].as_bool()}));
+            } else {
+                incomplete = true;
+            }
+        } else {
+            for line in bytes.split_inclusive(|b| *b == b'\n').take(96) {
+                if !line.ends_with(b"\n") {
+                    incomplete = true;
+                    continue;
+                }
+                let record = if name == "child.log" {
+                    match line {
+                        b"native-startup-fixture: inert worker entered\n" => {
+                            Some(json!({"message":"inert-worker-entered"}))
+                        }
+                        b"native-startup-milestones-v1: private journal unavailable\n" => {
+                            Some(json!({"message":"private-journal-unavailable"}))
+                        }
+                        b"\n" | b"running 1 test\n" => continue,
+                        _ => None,
+                    }
+                } else if name == startup_milestones::FILE {
+                    startup_milestones::sanitized_frame(line)
+                } else {
+                    serde_json::from_slice::<Value>(line)
+                        .ok()
+                        .as_ref()
+                        .and_then(ownership)
+                };
+                if let Some(record) = record {
+                    records.push(record);
+                } else {
+                    rejected += 1;
+                }
+            }
+            if bytes.split_inclusive(|b| *b == b'\n').count() > 96 {
+                incomplete = true;
+            }
+        }
+        json!({"state": if incomplete || truncated {"partial"} else if rejected > 0 {"privacy-rejected"} else {"observed"},
+            "totalBytes":total,"readBytes":bytes.len(),"truncated":truncated,
+            "incompleteRecords":incomplete,"recordLimitReached":bytes.split_inclusive(|b| *b == b'\n').count() > 96,
+            "projection":"allowlisted-fields-only","rejectedRecords":rejected,"records":records})
+    }
+
+    pub(super) fn capture(
+        root: &std::path::Path,
+        reason: &str,
+        pid: u32,
+        completion: Value,
+    ) -> Value {
+        // Only this fresh private fixture directory is a source. No parent-link
+        // traversal or broad directory scan is allowed, including on failure.
+        let private = std::fs::canonicalize(root).is_ok_and(|p| p == root)
+            && std::fs::symlink_metadata(root).is_ok_and(|m| {
+                // SAFETY: geteuid has no preconditions.
+                m.is_dir() && m.mode() & 0o777 == 0o700 && m.uid() == unsafe { libc::geteuid() }
+            });
+        let files: serde_json::Map<String, Value> = [
+            startup_milestones::FILE,
+            "ownership.jsonl",
+            "failed.json",
+            "worker-failed.json",
+            "child.log",
+        ]
+        .into_iter()
+        .map(|name| {
+            (
+                name.to_owned(),
+                if private {
+                    file(root, name)
+                } else {
+                    json!({"state":"unreadable"})
+                },
+            )
+        })
+        .collect();
+        let mut report = json!({"version":1,"failure":reason,"success":false,"supervisorPid":pid,
+            "nativeCompletion":"not-established","files":files});
+        report["supervisorCompletion"] = completion;
+        report
+    }
+
+    pub(super) fn completion(status: &std::io::Result<Option<std::process::ExitStatus>>) -> Value {
+        use std::os::unix::process::ExitStatusExt as _;
+        match status {
+            Ok(Some(status)) => {
+                json!({"state":"observed","code":status.code(),"signal":status.signal(),"success":status.success()})
+            }
+            Ok(None) => json!({"state":"unobserved-at-capture"}),
+            Err(_) => json!({"state":"observation-error-at-capture"}),
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) enum ExportError {
+        FileLimit,
+        ByteLimit,
+        Unavailable,
+    }
+    impl From<std::io::Error> for ExportError {
+        fn from(_: std::io::Error) -> Self {
+            Self::Unavailable
+        }
+    }
+    pub(super) fn export_state(result: &Result<(), ExportError>) -> &'static str {
+        match result {
+            Ok(()) => "written",
+            Err(ExportError::FileLimit) => "file-limit",
+            Err(ExportError::ByteLimit) => "byte-limit",
+            Err(_) => "unavailable",
+        }
+    }
+
+    // The CI task supplies NATIVE_REVIEW_FAILURE_DIR, a dedicated private directory.
+    // Fixed create-new slots bound concurrent/retried tests to 16 x 128 KiB total.
+    pub(super) fn persist(root: &std::path::Path, evidence: &Value) -> Result<(), ExportError> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::fs::DirBuilderExt as _;
+        let bytes = serde_json::to_vec(evidence).map_err(|_| ExportError::Unavailable)?;
+        if bytes.len() > OUTPUT_BYTES {
+            return Err(ExportError::ByteLimit);
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        if !root.is_absolute() || std::fs::canonicalize(root)? != root {
+            return Err(ExportError::Unavailable);
+        }
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(root)?;
+        let meta = directory.metadata()?;
+        // SAFETY: geteuid has no preconditions.
+        if meta.mode() & 0o777 != 0o700 || meta.uid() != unsafe { libc::geteuid() } {
+            return Err(ExportError::Unavailable);
+        }
+        for slot in 0..OUTPUT_FILES {
+            let name = std::ffi::CString::new(format!("startup-failure-{slot:02}.json")).unwrap();
+            // SAFETY: an owned directory fd and NUL-terminated fixed basename; new fd owned once below.
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            // SAFETY: openat returned a new descriptor uniquely owned here.
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+            file.write_all(&bytes)?;
+            return file.sync_all().map_err(Into::into);
+        }
+        Err(ExportError::FileLimit)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_review_startup_failure_missing_truncated_privacy_and_bounds() {
+    use startup_failure_evidence::{capture, completion, persist, OUTPUT_BYTES, OUTPUT_FILES};
+    let root = startup_test_directory("itd-failure-");
+    let missing = capture(root.path(), "readiness-timeout", 1, completion(&Ok(None)));
+    assert_eq!(
+        missing["supervisorCompletion"]["state"],
+        "unobserved-at-capture"
+    );
+    assert_eq!(missing["files"]["ownership.jsonl"]["state"], "missing");
+    assert_eq!(missing["nativeCompletion"], "not-established");
+    let error = completion(&Err(std::io::ErrorKind::Other.into()));
+    assert_eq!(error["state"], "observation-error-at-capture");
+
+    let session = startup_milestones::Session::open(root.path());
+    let phase = startup_milestones::begin(startup_milestones::Phase::Provider);
+    let original = std::fs::read(root.path().join(startup_milestones::FILE)).unwrap();
+    drop(phase);
+    drop(session);
+    // A partial last frame must not turn into a completion observation.
+    let mut truncated = original;
+    truncated.extend_from_slice(b"{\"phase\":\"secret-value");
+    std::fs::write(root.path().join(startup_milestones::FILE), truncated).unwrap();
+    private_json(
+        &root.path().join("failed.json"),
+        &json!({"success":false,"reason":"secret-value","ownership":null}),
+    )
+    .unwrap();
+    private_json(
+        &root.path().join("ownership.jsonl"),
+        &json!({"kind":"wait","role":"worker","pid":17,"error":"secret-value"}),
+    )
+    .unwrap();
+    let log = root.path().join("child.log");
+    private_json(&log, &json!("unused")).unwrap();
+    let text = format!("native-startup-fixture: inert worker entered\nAuthorization: Bearer secret-value\npassword=secret-value\nprivateKey=secret-value\n{TOKEN}\n{MEMBER}\n{GUEST}\nstored-pat\n");
+    std::fs::write(&log, text.repeat(1000)).unwrap();
+    let report = capture(root.path(), "early-exit", 1, completion(&Ok(None)));
+    let files = &report["files"];
+    assert_eq!(files[startup_milestones::FILE]["state"], "partial");
+    assert_eq!(files[startup_milestones::FILE]["incompleteRecords"], true);
+    assert!(files[startup_milestones::FILE]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["phase"] == "provider"));
+    assert_eq!(files["child.log"]["truncated"], true);
+    assert_eq!(files["child.log"]["readBytes"], 16_384);
+    assert!(files["child.log"]["rejectedRecords"].as_u64().unwrap() > 0);
+    assert!(files["failed.json"]["records"][0]["reportedOwnershipComplete"].is_null());
+    let encoded = serde_json::to_string(&report).unwrap();
+    assert!(!encoded.contains("secret-value"));
+    assert!(driver_safe(&report));
+    assert!(encoded.len() < OUTPUT_BYTES);
+    std::fs::write(&log, "unrecognized secret-value\n").unwrap();
+    let rejected = capture(root.path(), "early-exit", 1, completion(&Ok(None)));
+    assert_eq!(rejected["files"]["child.log"]["state"], "privacy-rejected");
+
+    std::fs::write(
+        &log,
+        "native-startup-fixture: inert worker entered\n".repeat(97),
+    )
+    .unwrap();
+    let saturated = capture(root.path(), "early-exit", 1, completion(&Ok(None)));
+    assert_eq!(saturated["files"]["child.log"]["recordLimitReached"], true);
+    assert_eq!(
+        saturated["files"]["child.log"]["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        96
+    );
+    assert_eq!(saturated["success"], false);
+    std::fs::write(
+        root.path().join(startup_milestones::FILE),
+        vec![b'x'; 48 * 1024 + 1],
+    )
+    .unwrap();
+    let capped = capture(root.path(), "early-exit", 1, completion(&Ok(None)));
+    assert_eq!(
+        capped["files"][startup_milestones::FILE]["readBytes"],
+        48 * 1024
+    );
+    assert_eq!(capped["files"][startup_milestones::FILE]["truncated"], true);
+    let output = startup_test_directory("itd-export-");
+    for _ in 0..OUTPUT_FILES {
+        persist(output.path(), &report).unwrap();
+    }
+    assert_eq!(
+        startup_failure_evidence::export_state(&persist(output.path(), &report)),
+        "file-limit"
+    );
+    assert_eq!(
+        std::fs::read_dir(output.path()).unwrap().count(),
+        OUTPUT_FILES
+    );
+    for entry in std::fs::read_dir(output.path()).unwrap() {
+        let entry = entry.unwrap();
+        assert!(entry.metadata().unwrap().len() <= OUTPUT_BYTES as u64);
+        let saved: Value = serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
+        assert_eq!(saved, report);
+    }
+    assert_eq!(
+        startup_failure_evidence::export_state(&persist(
+            output.path(),
+            &json!("x".repeat(OUTPUT_BYTES))
+        )),
+        "byte-limit"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_review_startup_failure_rejects_foreign_files() {
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
+    let root = startup_test_directory("itd-owned-");
+    let foreign = startup_test_directory("itd-foreign-");
+    let file = foreign.path().join("private");
+    private_json(&file, &json!("foreign-secret")).unwrap();
+    // Unrelated pre-existing files are neither scanned nor exported.
+    private_json(&root.path().join("credentials"), &json!("foreign-secret")).unwrap();
+    symlink(&file, root.path().join("child.log")).unwrap();
+    std::fs::hard_link(&file, root.path().join("failed.json")).unwrap();
+    let report = startup_failure_evidence::capture(
+        root.path(),
+        "early-exit",
+        1,
+        json!({"state":"unobserved-at-capture"}),
+    );
+    for name in ["child.log", "failed.json"] {
+        assert_eq!(report["files"][name]["state"], "unreadable");
+    }
+    assert!(!report.to_string().contains("foreign-secret"));
+    assert_eq!(std::fs::read(&file).unwrap(), b"\"foreign-secret\"\n");
+    let alias = foreign.path().join("alias");
+    symlink(root.path(), &alias).unwrap();
+    assert!(startup_failure_evidence::persist(&alias, &report).is_err());
+    let aliased = startup_failure_evidence::capture(
+        &alias,
+        "early-exit",
+        1,
+        json!({"state":"unobserved-at-capture"}),
+    );
+    assert!(aliased["files"]
+        .as_object()
+        .unwrap()
+        .values()
+        .all(|v| v["state"] == "unreadable"));
+    let output = startup_test_directory("itd-foreign-export-");
+    startup_failure_evidence::persist(output.path(), &report).unwrap();
+    let exported = std::fs::read_to_string(output.path().join("startup-failure-00.json")).unwrap();
+    assert!(!exported.contains("foreign-secret"));
+    assert!(!exported.contains("credentials"));
+    assert_eq!(
+        std::fs::read(root.path().join("credentials")).unwrap(),
+        b"\"foreign-secret\"\n"
+    );
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(startup_failure_evidence::persist(root.path(), &report).is_err());
+}
