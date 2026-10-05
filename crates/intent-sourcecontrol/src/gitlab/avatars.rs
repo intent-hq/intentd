@@ -63,7 +63,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn project(avatar: Value) -> Value {
+    fn project(avatar: &Value) -> Value {
         json!({
             "path_with_namespace":"Team/Sub/Project",
             "avatar_url":"https://images.example/project.png",
@@ -89,7 +89,7 @@ mod tests {
             ),
             ("//cdn.example/avatar.png", "https://cdn.example/avatar.png"),
         ] {
-            let repo = super::super::to_repo(&instance, project(json!(raw))).unwrap();
+            let repo = super::super::to_repo(&instance, project(&json!(raw))).unwrap();
             assert_eq!(repo.owner_avatar_url.as_deref(), Some(expected), "{raw}");
             // This internal metadata must not leak through legacy Repo serializers.
             assert_eq!(
@@ -99,7 +99,7 @@ mod tests {
         }
         let public = GitlabInstance::parse("https://gitlab.com").unwrap();
         assert_eq!(
-            owner_avatar(&public, &project(json!("uploads/avatar.png")), "Team/Sub").as_deref(),
+            owner_avatar(&public, &project(&json!("uploads/avatar.png")), "Team/Sub").as_deref(),
             Some("https://gitlab.com/uploads/avatar.png")
         );
     }
@@ -114,7 +114,7 @@ mod tests {
             json!(""),
         ] {
             assert_eq!(
-                super::super::to_repo(&instance, project(avatar))
+                super::super::to_repo(&instance, project(&avatar))
                     .unwrap()
                     .owner_avatar_url,
                 None
@@ -127,7 +127,7 @@ mod tests {
             json!({"full_path":"Other/Sub","avatar_url":"/owner.png"}),
             json!({"full_path":"Team/Sub/Project","avatar_url":"/owner.png"}),
         ] {
-            let mut value = project(json!("/owner.png"));
+            let mut value = project(&json!("/owner.png"));
             value["namespace"] = namespace;
             assert_eq!(
                 super::super::to_repo(&instance, value)
@@ -136,7 +136,7 @@ mod tests {
                 None
             );
         }
-        let mut value = project(json!("/owner.png"));
+        let mut value = project(&json!("/owner.png"));
         value.as_object_mut().unwrap().remove("namespace");
         value["user"] = json!({"avatar_url":"https://images.example/current-user.png"});
         assert_eq!(
@@ -166,18 +166,18 @@ mod tests {
             "https://images.example\\a.png",
             " https://images.example/a.png",
         ] {
-            let repo = super::super::to_repo(&instance, project(json!(raw))).unwrap();
+            let repo = super::super::to_repo(&instance, project(&json!(raw))).unwrap();
             assert_eq!(repo.owner_avatar_url, None, "{raw}");
             assert_eq!(repo.owner, "Team/Sub");
         }
         let oversized = format!("/{}", "a".repeat(MAX_AVATAR_URL_BYTES));
         assert_eq!(
-            owner_avatar(&instance, &project(json!(oversized)), "Team/Sub"),
+            owner_avatar(&instance, &project(&json!(oversized)), "Team/Sub"),
             None
         );
         let expanded = format!("/{}", "a".repeat(MAX_AVATAR_URL_BYTES - 1));
         assert_eq!(
-            owner_avatar(&instance, &project(json!(expanded)), "Team/Sub"),
+            owner_avatar(&instance, &project(&json!(expanded)), "Team/Sub"),
             None
         );
     }
