@@ -30,7 +30,7 @@ echo "Running e2e tests with coverage instrumentation (nextest)..."
 # STAB-40, STAB-42, STAB-44 fixed (monitoring-only, multi-threaded runtime, timeout multiplier)
 # Note: capture_login_shell_path_with_fake_shell (STAB-43) is an intent-core unit test,
 # not an intentd integration test, so it runs in coverage-all.sh but not here
-INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest -p intentd \
+INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "$BASH" scripts/with-test-policy.sh cargo llvm-cov --no-report nextest -p intentd \
     -E 'kind(test) and not binary(intentd) and not binary(auggie_context_e2e)'
 
 # Generate lcov.info if requested (for CI artifact upload)

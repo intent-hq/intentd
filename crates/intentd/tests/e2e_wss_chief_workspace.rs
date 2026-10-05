@@ -3105,6 +3105,7 @@ async fn chief_agent_send_cross_workspace_over_wss() {
             "fromWorkspaceId": CHIEF_WORKSPACE_ID,
             "sourceMessageId": source_message_id,
             "sourceUrl": source_url,
+            "submissionIds": [delivered["id"]],
         })
     );
 

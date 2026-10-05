@@ -186,6 +186,7 @@ mod repository_read_source;
 mod agent_list_cache;
 pub mod artifact_recovery;
 pub mod artifact_source;
+mod automatic_pr_refresh;
 pub mod checkpoint;
 mod direct_secret_ops;
 mod fast_mode;
@@ -224,6 +225,7 @@ mod principal_ops;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
 pub mod provider_models;
+mod provider_preparation;
 pub mod provider_test_prompt;
 mod rate_limit;
 pub mod repo_config;
@@ -259,6 +261,7 @@ mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
 mod workspace_branch;
+mod workspace_check_cadence;
 mod workspace_status;
 pub mod workspace_vocabulary;
 
@@ -691,6 +694,7 @@ pub struct Services {
     terminal_tasks: Arc<delivery_tasks::DeliveryTasks>,
     pending_delete_tasks: Arc<delivery_tasks::DeliveryTasks>,
     host_exec_runtime: Arc<host_exec::HostExecRuntime>,
+    provider_preparation: Arc<provider_preparation::Preparation>,
     /// Child agent ids with an active terminal-delivery retry task, mapped
     /// to pending attempts and a schedule generation. Ownership is coalesced per CHILD, not per
     /// watch (intent-hq/intent#3728): one delivery pass processes ALL of the
@@ -1197,6 +1201,7 @@ pub struct Services {
     repository_wire_owner: Arc<OnceLock<Weak<Services>>>,
     repository_review_capacity: Arc<repository_native_wire::review::Capacity>,
     repository_resource_capacity: Arc<repository_native_wire::resource::Capacity>,
+    repository_checkout_capacity: Arc<repository_native_wire::checkout::Capacity>,
     repository_selection_capacity: Arc<repository_native_wire::selection::Capacity>,
     /// Original invalidation owner for this Services instance. Clones share it;
     /// Store must accept this exact observer before it can be used.
@@ -1370,6 +1375,7 @@ pub struct Services {
     /// read within `prCache.maxAgeSeconds` (see [`pr_monitor::PrCache`]).
     /// In-memory only; shared across clones.
     pr_cache: pr_monitor::PrCache,
+    automatic_pr_refresh: Arc<Mutex<automatic_pr_refresh::Admission>>,
     pr_discovery: pr_discovery::Discovery,
     /// The issue cache behind `github.issues.get`: each issue's last forge
     /// read, served within `prCache.maxAgeSeconds` like the PR cache and
@@ -1633,6 +1639,7 @@ impl Services {
             terminal_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             pending_delete_tasks,
             host_exec_runtime: Arc::default(),
+            provider_preparation: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
@@ -1719,6 +1726,7 @@ impl Services {
             repository_lifecycle_registry: Arc::default(),
             repository_wire_owner: Arc::default(),
             repository_resource_capacity: Arc::default(),
+            repository_checkout_capacity: Arc::default(),
             repository_review_capacity: Arc::default(),
             repository_selection_capacity: Arc::default(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1772,6 +1780,7 @@ impl Services {
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
             pr_cache: Arc::new(Mutex::new(HashMap::new())),
+            automatic_pr_refresh: Arc::new(Mutex::new(automatic_pr_refresh::Admission::default())),
             pr_discovery: pr_discovery::Discovery::default(),
             issue_cache: Arc::new(Mutex::new(HashMap::new())),
             pr_cache_max_age_seconds: None,
@@ -4967,11 +4976,13 @@ impl Services {
         &self,
         ws: &Workspace,
         sc: Option<&Arc<dyn intent_sourcecontrol::SourceControl>>,
+        interval_secs: u64,
+        local_maintenance: bool,
     ) {
         if ws.is_remote || ws.archived {
             return;
         }
-        if let Some(worktree) = git_ops::worktree_path(ws) {
+        if let Some(worktree) = git_ops::worktree_path(ws).filter(|_| local_maintenance) {
             let gitmodules = tokio::fs::read_to_string(worktree.join(".gitmodules"))
                 .await
                 .unwrap_or_default();
@@ -5060,6 +5071,16 @@ impl Services {
             }
         };
         for root in roots {
+            let admitted = sc.filter(|_| !self.sweeps_rate_limited()).and_then(|sc| {
+                let permit =
+                    self.admit_automatic_pr_refresh(&ws.id, Some(root.id.as_str()), interval_secs)?;
+                Some((sc, permit))
+            });
+            // Cached rows are cheap to list; avoid filesystem work on idle
+            // checkouts unless maintenance or their forge refresh is due.
+            if !local_maintenance && admitted.is_none() {
+                continue;
+            }
             // Auto-prune only on a genuine path-gone (`NotFound`, or a parent
             // component that is no longer a directory). Roots may live
             // anywhere on the host (network/FUSE mounts included), so a
@@ -5130,11 +5151,15 @@ impl Services {
             // local steps above have already done their work. A forge whose
             // quota is exhausted is treated the same for the remaining roots
             // — the local steps 1–3 above still ran (monorepo#2961).
-            let Some(sc) = sc.filter(|_| !self.sweeps_rate_limited()) else {
+            let Some((sc, _permit)) = admitted else {
                 continue;
             };
             let root_id = root.id.clone();
-            let refreshed = self.refresh_git_root_pr(root, sc).await;
+            let refreshed = pr_discovery::automatically_refresh(
+                interval_secs,
+                self.refresh_git_root_pr(root, sc),
+            )
+            .await;
             match refreshed {
                 Err(Error::RateLimited(detail)) => {
                     intent_sourcecontrol::traffic::with_caller(
@@ -6145,11 +6170,9 @@ impl Services {
     /// those lacking repo/branch info are skipped. Errors are logged per
     /// workspace and never abort the sweep.
     ///
-    /// To trim steady forge load (§7.7), the sweep is tiered by recency via
-    /// [`pr_ops::sweep_due`]: every [`pr_ops::SWEEP_IDLE_TICK_MULTIPLE`]-th
-    /// `tick` (including tick 0) refreshes every workspace; ticks in between
-    /// refresh only workspaces active within
-    /// [`pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES`].
+    /// Forge admission follows the shared meaningful-work idle cadence and
+    /// remembers failed attempts. Frontend automatic commands use the same
+    /// reservation; local git-root maintenance keeps its separate scan cadence.
     ///
     /// The sweep operates on the workspace snapshot taken at sweep start
     /// (`list_workspaces`); each workspace is passed into the refresh path
@@ -6175,22 +6198,32 @@ impl Services {
     }
 
     async fn refresh_all_workspace_prs_owned(&self, tick: u64) {
-        let mut workspaces = match self.store.list_workspaces(false).await {
+        let workspaces = match self.store.list_workspaces(false).await {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!(error = %e, "pr refresh: listing workspaces failed");
                 return;
             }
         };
-        // Parse the cutoff once per sweep; `sweep_due` fails open on `None`.
-        let cutoff = intent_core::parse_iso(&intent_core::iso_minutes_ago(
-            pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES,
-        ));
-        workspaces.retain(|ws| pr_ops::sweep_due(ws, cutoff, tick));
+        let ids: Vec<_> = workspaces.iter().map(|ws| ws.id.clone()).collect();
+        self.automatic_pr_refresh
+            .lock()
+            .unwrap()
+            .retain_workspaces(&ids);
+        let intervals = match self
+            .workspace_automatic_check_intervals(&ids, time::OffsetDateTime::now_utc())
+            .await
+        {
+            Ok(intervals) => intervals,
+            Err(error) => {
+                tracing::warn!(%error, "PR refresh: activity projection failed");
+                return;
+            }
+        };
         // Resolve the SourceControl provider once per sweep to avoid spamming
         // warnings when unconfigured and hitting keychain/gh on the blocking pool
-        // once per workspace (Copilot review comment on PR #131). Resolved after
-        // the due filter so an all-idle tick performs no keychain/`gh` work.
+        // once per workspace (Copilot review comment on PR #131). Forge work
+        // is admitted per workspace/root below; local root maintenance still runs.
         if workspaces.is_empty() {
             return;
         }
@@ -6221,6 +6254,7 @@ impl Services {
             // those already linked. `refresh_workspace_pr_with_sc` skips
             // ineligible workspaces internally.
             let ws_id = ws.id.clone();
+            let interval = intervals.get(&ws_id).copied().unwrap_or(60);
             // Forge reads share a deadline inside the refresh. Its admitted
             // store/event continuation remains owned after that deadline.
             //
@@ -6228,8 +6262,19 @@ impl Services {
             // sweep) so a limit hit mid-sweep stops the remaining forge
             // calls immediately instead of burning them into the exhausted
             // quota (monorepo#2961).
-            if let Some(sc) = sc.as_ref().filter(|_| !self.sweeps_rate_limited()) {
-                let refreshed = self.refresh_workspace_pr_with_sc(ws.clone(), sc).await;
+            let admitted = sc
+                .as_ref()
+                .filter(|_| !self.sweeps_rate_limited())
+                .and_then(|sc| {
+                    let permit = self.admit_automatic_pr_refresh(&ws_id, None, interval)?;
+                    Some((sc, permit))
+                });
+            if let Some((sc, _permit)) = admitted {
+                let refreshed = pr_discovery::automatically_refresh(
+                    interval,
+                    self.refresh_workspace_pr_with_sc(ws.clone(), sc),
+                )
+                .await;
                 match refreshed {
                     Err(Error::RateLimited(detail)) => {
                         intent_sourcecontrol::traffic::with_caller(
@@ -6251,27 +6296,30 @@ impl Services {
             // After the workspace's own refresh, sweep its tracked git roots
             // (submodule auto-detect, auto-prune, per-root PR refresh;
             // monorepo#2053). Fail-soft internally, per-root timeouts inside.
-            self.sweep_workspace_git_roots(&ws, sc.as_ref()).await;
+            self.sweep_workspace_git_roots(
+                &ws,
+                sc.as_ref(),
+                interval,
+                pr_ops::local_root_maintenance_due(&ws, tick, time::OffsetDateTime::now_utc()),
+            )
+            .await;
             // Release the SQLite pool slot between workspaces so queued
             // interactive acquires win it (intent-hq/monorepo#703).
             tokio::time::sleep(SWEEP_INTER_WORKSPACE_PAUSE).await;
         }
     }
 
-    /// Spawn the background PR refresh loop (§7.6): every `interval` (180 s at
+    /// Spawn the background PR refresh loop (§7.6): every `interval` (60 s at
     /// the composition root) it sweeps active workspaces — discovering open PRs
     /// by head-ref or baseRef match for unlinked workspaces (emitting
     /// `pr:linked`) and updating linked PRs (emitting
     /// `pr:updated`/`pr:unlinked`). The first sweep runs after one `interval`
-    /// and refreshes every workspace (tick 0); thereafter the sweep is tiered
-    /// by recency (see [`Services::refresh_all_workspace_prs`]) so idle
-    /// workspaces only refresh every [`pr_ops::SWEEP_IDLE_TICK_MULTIPLE`]-th
-    /// tick (~30 min). Each sweep pauses [`SWEEP_INTER_WORKSPACE_PAUSE`]
+    /// and admits each workspace immediately after restart; thereafter the
+    /// shared idle cadence gates forge work. Each sweep pauses [`SWEEP_INTER_WORKSPACE_PAUSE`]
     /// between workspaces so it never monopolizes `SQLite` pool slots. Missed
     /// ticks are skipped (no pile-up). No-op-safe when source control is
-    /// unconfigured (a sweep with due workspaces logs a single warning and
-    /// returns; an all-idle tick returns silently before resolving the
-    /// provider). Returns the task handle so the composition root can
+    /// unconfigured: local maintenance still runs and forge reads are skipped.
+    /// Returns the task handle so the composition root can
     /// hold/abort it.
     #[must_use]
     pub fn spawn_pr_refresh_loop(
@@ -6368,9 +6416,10 @@ impl Services {
     /// transaction ([`Store::update_workspace_token_usage`], monorepo#738):
     /// the tally/change-detection/zero-guard logic below executes as a sync
     /// closure over the in-transaction session rows and stored usage, and the
-    /// persist is a scoped `token_usage` + `updated_at` UPDATE — concurrent
-    /// recomputes fully serialize and a racing title/status update is never
-    /// clobbered. `workspace:tokenUsage-changed` is emitted only after the
+    /// persist is a scoped `token_usage` UPDATE that preserves workspace
+    /// activity timestamps — concurrent recomputes fully serialize and a
+    /// racing title/status update is never clobbered.
+    /// `workspace:tokenUsage-changed` is emitted only after the
     /// store reports a committed write.
     ///
     /// `guard_zero_regression` (set by the scan, not the live path): when the
@@ -6683,6 +6732,7 @@ impl Services {
     }
 
     pub async fn shutdown_store_writers(&self) {
+        self.provider_preparation.shutdown().await;
         self.shutdown_settings().await;
         // Called after RPC/agent admission is fenced, root schedulers joined,
         // and PtyHost::kill_all has refused/reaped every late PTY spawn.
@@ -13086,48 +13136,12 @@ fn remove_workspace_dir_if_empty(ws_dir: &Path) {
     let _ = std::fs::remove_dir(ws_dir);
 }
 
-/// Loud degradation probe for PR-aware creates (§5.1): when the workspace
-/// branch was derived from a PR head but the source repo has neither a local
-/// branch nor a `refs/remotes/{remote}/{branch}` tip — a fork-hosted head
-/// (the base repo carries no ref for it), or a never-fetched branch on a
-/// local-repo create (provisioning does no network fetch) — the checkout
-/// silently materializes as a FRESH branch at the base commit, named like
-/// the PR head but carrying none of its commits, while `pr_number`/`pr_url`
-/// claim PR linkage. Warn so the degradation is visible; best-effort and
-/// read-only (probe errors are ignored — provisioning surfaces real
-/// failures itself).
-fn warn_if_pr_head_missing(
-    repo_path: &Path,
-    branch: &str,
-    remote: &str,
-    link: Option<&intent_core::ContextLink>,
-) {
-    let Some(link) = link else { return };
-    let Ok(repo) = git2::Repository::open(repo_path) else {
-        return;
-    };
-    let local = repo.find_branch(branch, git2::BranchType::Local).is_ok();
-    let remote_tip = repo
-        .find_reference(&format!("refs/remotes/{remote}/{branch}"))
-        .is_ok();
-    if !local && !remote_tip {
-        tracing::warn!(
-            owner = %link.owner,
-            repo = %link.repo,
-            pr = link.number,
-            branch = %branch,
-            "workspace.create: PR head branch has no local or remote-tracking ref (fork-hosted head, or never fetched); the checkout will be a fresh branch at the base commit WITHOUT the PR's commits"
-        );
-    }
-}
-
 /// `baseCommitSha` for a PR-derived checkout (§5.1): the provisioning helpers
 /// return the CHECKED-OUT tip, which for a materialized PR head is the head
 /// SHA — not the base boundary the `baseCommitSha` contract records. Resolve
 /// the merge-base of the checkout's HEAD with the (PR-derived) `baseRef`
 /// instead, falling back to the checked-out tip when the boundary cannot be
-/// resolved (e.g. the head degraded to a fresh branch at the base commit,
-/// where tip == boundary anyway).
+/// resolved (for example, the base branch has not been fetched).
 fn pr_aware_base_commit_sha(
     checkout_path: &Path,
     base_ref: Option<&str>,
@@ -18065,6 +18079,11 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn prepare_provider_adapters(&self, provider_ids: Vec<String>) {
+        self.provider_preparation
+            .enqueue(provider_ids, self.effective_settings());
+    }
+
     fn repository_read_connection(
         &self,
         entry: intent_core::repository_request::RepositoryWireEntry,
@@ -18129,6 +18148,83 @@ impl WorkspaceApi for Services {
         query: intent_core::repository_request::RepositorySelectionBoundQuery,
     ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionReleased>> {
         repository_native_wire::selection::release(self, query)
+    }
+
+    fn repository_checkout_capture(
+        &self,
+        query: intent_core::repository_checkout::CheckoutCaptureQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutCapture,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::capture(self, query)
+    }
+
+    fn repository_checkout_projects(
+        &self,
+        query: intent_core::repository_checkout::CheckoutProjectsQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutProjects,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::projects(self, query)
+    }
+
+    fn repository_checkout_project(
+        &self,
+        query: intent_core::repository_checkout::CheckoutProjectQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutProjectDetail,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::project(self, query)
+    }
+
+    fn repository_checkout_branches(
+        &self,
+        query: intent_core::repository_checkout::CheckoutBranchesQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutBranches,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::branches(self, query)
+    }
+
+    fn repository_checkout_warm(
+        &self,
+        query: intent_core::repository_checkout::CheckoutSelection,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutWarm,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::warm(self, query)
+    }
+
+    fn repository_checkout_release(
+        &self,
+        query: intent_core::repository_checkout::CheckoutBinding,
+    ) -> BoxFuture<'_, Result<intent_core::repository_checkout::CheckoutReleased>> {
+        repository_native_wire::checkout::release(self, query)
     }
 
     fn repository_resource_capture(
@@ -18474,7 +18570,24 @@ impl WorkspaceApi for Services {
         rule_type: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            if workspace_id.as_str() == "global" && rule_type == "base-system-prompt" {
+                // Settings uses an exact placeholder, not a workspace. Recheck
+                // durable admission without exposing any other override or file.
+                if let Some(principal) = capability::gated_collaborator_caller("rules.get")? {
+                    if self.store.get_host_role(&principal).await? == intent_core::HostRole::Guest
+                        && !self.store.has_workspace_membership(&principal).await?
+                    {
+                        return Err(Error::Forbidden(
+                            "rules.get requires current admission".into(),
+                        ));
+                    }
+                }
+            } else {
+                // Guests gain only the settings read above, not the member
+                // workspace rules surface now reachable through the catalog.
+                self.require_host_execution("rules.get").await?;
+                self.require_member(&workspace_id).await?;
+            }
             rules::RulesService::new(&self.store).get(&rule_type).await
         })
     }
@@ -18487,7 +18600,8 @@ impl WorkspaceApi for Services {
         enabled: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            // All overrides are instance-wide, even with a real workspace ID.
+            Self::require_administrator("rules.update")?;
             let _revision_guard = self.settings_revision_gate.write().await;
             let path = ft_worktree(&self.store, &workspace_id).await;
             let (rules, changed) = rules::RulesService::new(&self.store)
@@ -18518,6 +18632,10 @@ impl WorkspaceApi for Services {
         // Decoration uses those resolved rows without further filesystem reads.
         let services = self.clone();
         Box::pin(async move {
+            if let Some(path) = workspace_path.as_deref() {
+                self.require_member_repo_path(path, "specialist.list")
+                    .await?;
+            }
             tokio::task::spawn_blocking(move || {
                 let provider = specialist_preview_provider(provider)?;
                 let ws_path = workspace_path.as_deref().map(Path::new);
@@ -18577,6 +18695,10 @@ impl WorkspaceApi for Services {
         // (monorepo#4148).
         let services = self.clone();
         Box::pin(async move {
+            if let Some(path) = workspace_path.as_deref() {
+                self.require_member_repo_path(path, "specialist.get")
+                    .await?;
+            }
             tokio::task::spawn_blocking(move || {
                 let provider = specialist_preview_provider(provider)?;
                 let ws_path = workspace_path.as_deref().map(Path::new);
@@ -20575,6 +20697,7 @@ impl WorkspaceApi for Services {
         input: WorkspaceCreate,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
+        let native_checkout = repository_native_wire::checkout::create::prepare(self, &input);
         let store = self.store.clone();
         let worktree_locks = self.worktree_locks.clone();
         let workspaces_root = self.workspaces_root.clone();
@@ -20595,6 +20718,11 @@ impl WorkspaceApi for Services {
             .and_then(|r| r.origin("workspaces.root"))
             == Some(SettingOrigin::Flag);
         self.execution_call(async move {
+            let native_checkout = native_checkout.await?;
+            let idempotency_key = match &native_checkout {
+                Some(checkout) => { checkout.current().await?; checkout.idempotency_key(idempotency_key) }
+                None => idempotency_key,
+            };
             // Creation is host-wide and must also work before any workspace exists.
             services
                 .require_workspace_creator("workspace.create")
@@ -20636,7 +20764,10 @@ impl WorkspaceApi for Services {
                 "",
                 idempotency_key,
                 "workspace.create",
-                move || async move {
+                // Keep the creation operation on the heap through the generic
+                // replay and execution scopes. Its initial-message persistence
+                // path otherwise exhausts the default stack in debug builds.
+                move || Box::pin(async move {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
@@ -20833,6 +20964,10 @@ impl WorkspaceApi for Services {
                         &workspaces_root,
                     )
                     .await;
+                    if let Some(checkout) = &native_checkout {
+                        checkout.current().await?;
+                        checkout.configure(&mut input, &workspaces_root, &id)?;
+                    }
                     let progress = progress_id.and_then(|pid| {
                         bus.clone().map(|b| {
                             std::sync::Arc::new(create_progress::CreateProgress::new(
@@ -21303,12 +21438,14 @@ impl WorkspaceApi for Services {
                     // materializes remote-only branches at the remote tip)
                     // and `baseRef` to the PR base branch, so ahead/behind
                     // and diffs reflect the merge target. Explicit `branch`/
-                    // `baseRef` params always win. Lookup failure is
-                    // non-fatal: the create proceeds without the PR-derived
-                    // git setup. With multiple pr-kind links the FIRST one
+                    // `baseRef` params always win. A real PR checkout must
+                    // resolve its head and fetch the canonical PR ref; only
+                    // registry-only rows retain best-effort lookup semantics. With multiple pr-kind links the FIRST one
                     // wins (deliberate tie-break: the FE puts the primary
                     // link first).
-                    let pr_link = input.context_links.as_deref().and_then(|links| {
+                    // GitLab URL context is retained verbatim; it never invokes
+                    // the legacy GitHub PR-head/fork branch derivation.
+                    let pr_link = input.context_links.as_deref().filter(|_| native_checkout.is_none()).and_then(|links| {
                         links
                             .iter()
                             .find(|l| l.kind == intent_core::ContextLinkKind::Pr)
@@ -21395,7 +21532,7 @@ impl WorkspaceApi for Services {
                                             repo = %link.repo,
                                             pr = link.number,
                                             error = %e,
-                                            "workspace.create: PR contextLink forge lookup failed; creating without PR-derived git setup"
+                                            "workspace.create: PR contextLink forge lookup failed; canonical PR checkout still requires a resolved branch and fetched head"
                                         );
                                     }
                                     Err(_) => {
@@ -21404,7 +21541,7 @@ impl WorkspaceApi for Services {
                                             repo = %link.repo,
                                             pr = link.number,
                                             timeout = ?services.pr_refresh_fetch_timeout,
-                                            "workspace.create: PR contextLink forge lookup timed out; creating without PR-derived git setup"
+                                            "workspace.create: PR contextLink forge lookup timed out; canonical PR checkout still requires a resolved branch and fetched head"
                                         );
                                     }
                                 }
@@ -21413,10 +21550,49 @@ impl WorkspaceApi for Services {
                                 tracing::warn!(
                                     pr = link.number,
                                     error = %e,
-                                    "workspace.create: no source-control provider for PR contextLink; creating without PR-derived git setup"
+                                    "workspace.create: no source-control provider for PR contextLink; canonical PR checkout still requires a resolved branch and fetched head"
                                 );
                             }
                         }
+                    }
+                    // A real PR checkout must resolve a head; never disguise a
+                    // generated branch at the base as a successful PR import.
+                    let pr_checkout = pr_link
+                        .as_ref()
+                        .filter(|_| {
+                            linked_pr
+                                .as_ref()
+                                .is_none_or(|pr| input.branch.as_deref() == Some(pr.source_branch.as_str()))
+                        })
+                        .map(|link| {
+                            (
+                                link.number,
+                                linked_pr.as_ref().and_then(|pr| pr.head_sha.clone()),
+                            )
+                        });
+                    if pr_checkout.is_some()
+                        && input
+                            .repository_path
+                            .as_deref()
+                            .is_some_and(|path| !path.is_empty())
+                    {
+                        if input.branch.as_deref().is_none_or(str::is_empty) {
+                            return Err(Error::InvalidParams(
+                                "cannot resolve the PR head branch; refresh the pull request and try again".into(),
+                            ));
+                        }
+                        if input.skip_isolation.unwrap_or(false)
+                            || input
+                                .worktree_path
+                                .as_deref()
+                                .is_some_and(|path| !path.is_empty())
+                            || input.is_remote.unwrap_or(false)
+                        {
+                            return Err(Error::InvalidParams(
+                                "PR checkout requires daemon-managed checkout provisioning".into(),
+                            ));
+                        }
+                        pr_derived_branch = true;
                     }
                     // Branch naming (TS parity): an explicit `branch` wins
                     // untouched; otherwise the branch is a friendly slug —
@@ -21523,6 +21699,7 @@ impl WorkspaceApi for Services {
                         // populated — the emit path (§9.1) still enriches
                         // with the max of notes / agents / updatedAt.
                         last_activity: Some(now),
+                        last_content_activity: None,
                         tags: input.tags.unwrap_or_default(),
                         path: input.path,
                         repository_path: input.repository_path,
@@ -21589,7 +21766,12 @@ impl WorkspaceApi for Services {
                         .filter(|p| !p.is_empty())
                         .map(PathBuf::from);
                     let workspaces_root_pathbuf = workspaces_root.clone();
-                    if let Some((cache_path, hydration_url)) = cache_hydration {
+                    if let Some(checkout) = &native_checkout {
+                        let path = repo_dir.clone().ok_or_else(|| Error::Internal("native checkout path missing".into()))?;
+                        checkout.provision(path.clone(), ws.branch.clone(), &workspaces_root_pathbuf, progress.clone()).await?;
+                        ws.worktree_path = Some(path.to_string_lossy().into_owned());
+                        ws.checkout_mode = Some(intent_core::CheckoutMode::Direct);
+                    } else if let Some((cache_path, hydration_url)) = cache_hydration {
                         // Cache hydration (PROTOCOL §5.1): provision a
                         // **standalone** checkout from the repo cache at the
                         // `repositoryPath` chosen in the clone arm above
@@ -21677,17 +21859,16 @@ impl WorkspaceApi for Services {
                             }
                             let branch = ws.branch.clone();
                             let base_ref = ws.base_ref.clone();
-                            if pr_derived_branch {
-                                warn_if_pr_head_missing(
-                                    &cache_path,
-                                    &branch,
-                                    "origin",
-                                    pr_link.as_ref(),
-                                );
-                            }
+                            let pr_token = if pr_checkout.is_some() {
+                                github_git_token(services.settings_registry.as_deref(), &cache_path).await
+                            } else {
+                                None
+                            };
                             let provision_progress = progress.clone();
                             let provision = |mode: intent_core::CheckoutMode| {
                                 let cache = cache_path.clone();
+                                let pr_checkout = pr_checkout.clone();
+                                let pr_token = pr_token.clone();
                                 let checkout = checkout_path.clone();
                                 let branch = branch.clone();
                                 let base_ref = base_ref.clone();
@@ -21719,16 +21900,26 @@ impl WorkspaceApi for Services {
                                     };
                                     let result = intent_git::repo_cache::with_cache_lock_blocking(
                                         &lock_cache,
-                                        move || match mode {
-                                            intent_core::CheckoutMode::Cow => {
-                                                // No cowCloneExclude here (unlike
-                                                // the cowIsolation arm below):
-                                                // the source is the pristine
-                                                // cache clone — tracked files
-                                                // only, no deps/build artifacts
-                                                // for excludes to skip.
-                                                let sha =
-                                                    intent_git::cow_checkout::provision_cow_checkout(
+                                        move || {
+                                            if let Some((number, sha)) = pr_checkout.as_ref() {
+                                                intent_git::fetch::prepare_cached_pr_branch(
+                                                    &cache,
+                                                    "origin",
+                                                    *number,
+                                                    &branch,
+                                                    sha.as_deref(),
+                                                    pr_token.as_deref(),
+                                                )?;
+                                            }
+                                            let result = match mode {
+                                                intent_core::CheckoutMode::Cow => {
+                                                    // No cowCloneExclude here (unlike
+                                                    // the cowIsolation arm below):
+                                                    // the source is the pristine
+                                                    // cache clone — tracked files
+                                                    // only, no deps/build artifacts
+                                                    // for excludes to skip.
+                                                    let sha = intent_git::cow_checkout::provision_cow_checkout(
                                                         &cache,
                                                         &checkout,
                                                         &branch,
@@ -21736,34 +21927,39 @@ impl WorkspaceApi for Services {
                                                         "origin",
                                                         &[],
                                                     )?;
-                                                // The CoW clone inherits the
-                                                // cache's `origin` (already the
-                                                // GitHub URL); retarget
-                                                // explicitly so the checkout
-                                                // never references the cache
-                                                // even if the cache was seeded
-                                                // differently.
-                                                intent_git::remote::set_remote_url(
-                                                    &checkout, "origin", &url,
-                                                )?;
-                                                Ok(sha)
+                                                    // The CoW clone inherits the
+                                                    // cache's `origin` (already the
+                                                    // GitHub URL); retarget
+                                                    // explicitly so the checkout
+                                                    // never references the cache
+                                                    // even if the cache was seeded
+                                                    // differently.
+                                                    intent_git::remote::set_remote_url(&checkout, "origin", &url)?;
+                                                    Ok(sha)
+                                                }
+                                                intent_core::CheckoutMode::Direct => {
+                                                    intent_git::repo_cache::provision_direct_checkout_with_progress(
+                                                        &cache,
+                                                        &checkout,
+                                                        &url,
+                                                        &branch,
+                                                        base_ref.as_deref(),
+                                                        sub_chunk,
+                                                    )
+                                                }
+                                                intent_core::CheckoutMode::Worktree => Err(Error::Internal(
+                                                    "cache hydration never provisions a linked worktree".to_string(),
+                                                )),
+                                            };
+                                            let checked_out = result?;
+                                            if let Some((number, _)) = pr_checkout.as_ref() {
+                                                let expected =
+                                                    intent_git::refs::rev_parse(&cache, &format!("refs/intent/pr/{number}/head"))?;
+                                                if checked_out != expected {
+                                                    return Err(Error::InvalidParams("provisioned checkout does not match the fetched PR head; workspace creation cancelled".into()));
+                                                }
                                             }
-                                            intent_core::CheckoutMode::Direct => {
-                                                intent_git::repo_cache::provision_direct_checkout_with_progress(
-                                                    &cache,
-                                                    &checkout,
-                                                    &url,
-                                                    &branch,
-                                                    base_ref.as_deref(),
-                                                    sub_chunk,
-                                                )
-                                            }
-                                            intent_core::CheckoutMode::Worktree => {
-                                                Err(Error::Internal(
-                                                    "cache hydration never provisions a linked worktree"
-                                                        .to_string(),
-                                                ))
-                                            }
+                                            Ok(checked_out)
                                         },
                                     )
                                     .await;
@@ -21858,9 +22054,28 @@ impl WorkspaceApi for Services {
                                 let branch = ws.branch.clone();
                                 let base_ref = ws.base_ref.clone();
                                 let repo = repo_dir.clone();
+                                let pr_checkout = pr_checkout.clone();
+                                let pr_remote = input.remote.clone().unwrap_or_else(|| "origin".into());
+                                let pr_token = if pr_checkout.is_some() {
+                                    github_git_token(services.settings_registry.as_deref(), &repo_dir).await
+                                } else {
+                                    None
+                                };
                                 let sha = worktree_locks
                                     .with_lock(&repo_dir, move || async move {
                                         tokio::task::spawn_blocking(move || {
+                                            if let Some((number, sha)) = pr_checkout.as_ref() {
+                                                intent_git::fetch::prepare_pr_branch(
+                                                    &repo,
+                                                    &pr_remote,
+                                                    *number,
+                                                    &branch,
+                                                    sha.as_deref(),
+                                                    pr_token.as_deref(),
+                                                )?;
+                                                intent_git::branches::checkout_branch(&repo, &branch)?;
+                                                return intent_git::refs::rev_parse(&repo, "HEAD");
+                                            }
                                             // Reuse an existing branch of the
                                             // same name (retried create), else
                                             // create it — at the caller's
@@ -21913,7 +22128,15 @@ impl WorkspaceApi for Services {
                                 ws.worktree_path =
                                     Some(repo_dir.to_string_lossy().into_owned());
                                 if ws.base_commit_sha.is_none() {
-                                    ws.base_commit_sha = Some(sha);
+                                    ws.base_commit_sha = Some(if pr_derived_branch {
+                                        pr_aware_base_commit_sha(
+                                            &repo_dir,
+                                            ws.base_ref.as_deref(),
+                                            sha,
+                                        )
+                                    } else {
+                                        sha
+                                    });
                                 }
                             }
                         }
@@ -21932,14 +22155,11 @@ impl WorkspaceApi for Services {
                                 let base_ref = ws.base_ref.clone();
                                 let remote =
                                     input.remote.unwrap_or_else(|| "origin".to_string());
-                                if pr_derived_branch {
-                                    warn_if_pr_head_missing(
-                                        &repo_dir,
-                                        &branch,
-                                        &remote,
-                                        pr_link.as_ref(),
-                                    );
-                                }
+                                let pr_token = if pr_checkout.is_some() {
+                                    github_git_token(services.settings_registry.as_deref(), &repo_dir).await
+                                } else {
+                                    None
+                                };
                                 let mut mode = if cow_isolation
                                     && repo_dir.join(".git").is_file()
                                 {
@@ -22034,6 +22254,8 @@ impl WorkspaceApi for Services {
                                 }
                                 let provision = |mode: intent_core::CheckoutMode| {
                                     let name = name.clone();
+                                    let pr_checkout = pr_checkout.clone();
+                                    let pr_token = pr_token.clone();
                                     let branch = branch.clone();
                                     let base_ref = base_ref.clone();
                                     let remote = remote.clone();
@@ -22062,37 +22284,51 @@ impl WorkspaceApi for Services {
                                                     std::time::Instant::now();
                                                 let repo_for_log = repo.clone();
                                                 let result = match tokio::task::spawn_blocking(
-                                                    move || match mode {
-                                                        intent_core::CheckoutMode::Cow => {
-                                                            intent_git::cow_checkout::provision_cow_checkout(
+                                                    move || {
+                                                        if let Some((number, sha)) = pr_checkout.as_ref() {
+                                                            intent_git::fetch::prepare_pr_branch(
+                                                                &repo,
+                                                                &remote,
+                                                                *number,
+                                                                &branch,
+                                                                sha.as_deref(),
+                                                                pr_token.as_deref(),
+                                                            )?;
+                                                        }
+                                                        let result = match mode {
+                                                            intent_core::CheckoutMode::Cow => intent_git::cow_checkout::provision_cow_checkout(
                                                                 &repo,
                                                                 &wt,
                                                                 &branch,
                                                                 base_ref.as_deref(),
                                                                 &remote,
                                                                 &clone_excludes,
-                                                            )
-                                                        }
-                                                        intent_core::CheckoutMode::Worktree => {
-                                                            intent_git::worktree::provision_worktree(
+                                                            ),
+                                                            intent_core::CheckoutMode::Worktree => intent_git::worktree::provision_worktree(
                                                                 &repo,
                                                                 &name,
                                                                 &wt,
                                                                 &branch,
                                                                 base_ref.as_deref(),
                                                                 &remote,
-                                                            )
+                                                            ),
+                                                            // Local-repo creates never
+                                                            // select `direct` (cache
+                                                            // hydration has its own
+                                                            // provisioning arm above).
+                                                            intent_core::CheckoutMode::Direct => Err(Error::Internal(
+                                                                "direct checkout mode is not provisioned from a local repository".to_string(),
+                                                            )),
+                                                        };
+                                                        let checked_out = result?;
+                                                        if let Some((number, _)) = pr_checkout.as_ref() {
+                                                            let expected =
+                                                                intent_git::refs::rev_parse(&repo, &format!("refs/intent/pr/{number}/head"))?;
+                                                            if checked_out != expected {
+                                                                return Err(Error::InvalidParams("provisioned checkout does not match the fetched PR head; workspace creation cancelled".into()));
+                                                            }
                                                         }
-                                                        // Local-repo creates never
-                                                        // select `direct` (cache
-                                                        // hydration has its own
-                                                        // provisioning arm above).
-                                                        intent_core::CheckoutMode::Direct => {
-                                                            Err(Error::Internal(
-                                                                "direct checkout mode is not provisioned from a local repository"
-                                                                    .to_string(),
-                                                            ))
-                                                        }
+                                                        Ok(checked_out)
                                                     },
                                                 )
                                                 .await
@@ -22208,6 +22444,27 @@ impl WorkspaceApi for Services {
                             }
                         }
                     }
+                    if pr_checkout.is_some()
+                        && ws
+                            .repository_path
+                            .as_deref()
+                            .is_some_and(|path| !path.is_empty())
+                    {
+                        let checkout = ws.worktree_path.as_deref().ok_or_else(|| {
+                            Error::InvalidParams(
+                                "PR checkout was not provisioned; select a local Git repository".into(),
+                            )
+                        })?;
+                        let actual = intent_git::refs::rev_parse(Path::new(checkout), "HEAD")?;
+                        if let Some((_, Some(expected))) = pr_checkout.as_ref() {
+                            if !actual.eq_ignore_ascii_case(expected) {
+                                return Err(Error::InvalidParams(
+                                    "provisioned checkout does not match the PR head; workspace creation cancelled"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
                     // Provisioning is done in every mode; the remaining work
                     // (row insert, spec seed, initial agent) is fast local
                     // bookkeeping — the unified scale's last milestone before
@@ -22222,9 +22479,11 @@ impl WorkspaceApi for Services {
                     // in the same INSERT so later global changes don't
                     // retroactively flip existing workspaces — atomic, so the
                     // row can never exist without its seed.
-                    store
-                        .insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
-                        .await?;
+                    if let Some(checkout) = &native_checkout {
+                        checkout.insert(ws.clone(), global_auto_commit).await?;
+                    } else {
+                        store.insert_workspace_with_auto_commit(&ws, Some(global_auto_commit)).await?;
+                    }
                     // Write the legacy `<root>/<id>/.workspace/workspace.json`
                     // file so renderer paths (FE `FileSystemWorkspaceRepository`)
                     // find their per-workspace metadata without ENOENT spam.
@@ -22320,6 +22579,7 @@ impl WorkspaceApi for Services {
                     // `ws.workspace.details().setupStatus`. `pending` when a
                     // worktree exists; `skipped` when the stage never runs
                     // (skipWorktree / no worktree provisioned).
+                    if let Some(checkout) = &native_checkout { checkout.current().await?; }
                     let setup_worktree = if ws.skip_worktree {
                         None
                     } else {
@@ -22502,6 +22762,7 @@ impl WorkspaceApi for Services {
                     // exactly one `workspace:setup:completed` fires per logical create
                     // on every terminal path of the setup stage. Idempotent replays
                     // publish nothing (same as `workspace:created`).
+                    if let Some(checkout) = &native_checkout { checkout.current().await?; }
                     let pty_for_setup = self.pty.clone();
                     let bus_for_setup = self.event_bus.clone();
                     let setup_states = self.workspace_setup_states.clone();
@@ -22717,7 +22978,7 @@ impl WorkspaceApi for Services {
                         workspace: ws,
                         initial_agent,
                     })
-                },
+                }),
             )
             .await;
 
@@ -23440,6 +23701,7 @@ impl WorkspaceApi for Services {
                 // then folds in any copied notes / activity carried over from
                 // the source workspace.
                 last_activity: Some(now.clone()),
+                last_content_activity: None,
                 tags: source.tags.clone(),
                 path: source.path.clone(),
                 repository_path: source.repository_path.clone(),
@@ -28295,6 +28557,13 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         force: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let native_operation = repository_native_wire::checkout::operations::capture(
+            self,
+            &intent_core::repository_checkout::CheckoutFrame::Push {
+                workspace_id: workspace_id.clone(),
+                force,
+            },
+        );
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
@@ -28309,6 +28578,15 @@ impl WorkspaceApi for Services {
             let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                 Error::Internal("Failed to push: workspace has no worktree".to_string())
             })?;
+            if let Some(plan) = native_operation.prepare(&ws, &worktree).await? {
+                let outcome = plan
+                    .execute(Some(force))
+                    .await?
+                    .ok_or_else(|| Error::Internal("native push result missing".into()))?;
+                return Ok(
+                    serde_json::json!({"branch":outcome.branch,"pushedSha":outcome.pushed_sha}),
+                );
+            }
             // Resolve the GitHub token outside the lock (bounded async lookups)
             // so the credential chain can fall back to it for HTTPS github.com
             // remotes (see `intent_git::auth`).
@@ -28371,6 +28649,10 @@ impl WorkspaceApi for Services {
     }
 
     fn git_fetch(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
+        let native_operation = repository_native_wire::checkout::operations::capture(
+            self,
+            &intent_core::repository_checkout::CheckoutFrame::Fetch(workspace_id.clone()),
+        );
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
@@ -28385,6 +28667,10 @@ impl WorkspaceApi for Services {
             let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                 Error::Internal("Failed to fetch: workspace has no worktree".to_string())
             })?;
+            if let Some(plan) = native_operation.prepare(&ws, &worktree).await? {
+                plan.execute(None).await?;
+                return Ok(());
+            }
             // Token resolved outside the lock — see the matching note on
             // `git_push` above.
             let token = github_git_token(registry.as_deref(), &worktree).await;
@@ -30064,12 +30350,13 @@ impl WorkspaceApi for Services {
 
     fn agent_activity_flags(&self, agent_id: AgentId) -> BoxFuture<'_, serde_json::Value> {
         Box::pin(async move {
-            // Load the session so the flags honor the same terminal-status
+            // Load only session metadata: activity and liveness do not need
+            // the transcript or its externalized payloads. Honor the same terminal-status
             // short-circuit and parent-watch lookup as the `AgentLite`
             // projection (see [`agent_activity_flags_for`]). On a read error the
             // snapshot degrades to all-`false` rather than failing the
             // subscription (matching `chat_snapshot`'s degrade-to-empty pattern).
-            match self.store.get_agent_session(&agent_id).await {
+            match self.store.get_agent_session_summary(&agent_id).await {
                 Ok(session) => {
                     let (
                         is_responding,
@@ -30223,6 +30510,14 @@ impl WorkspaceApi for Services {
             } else {
                 crate::principal_ops::strip_principal_attribution(message_metadata)
             };
+            crate::agent_ops::validate_submission_id(message_id.as_deref())?;
+            if let Some(id) = message_id.as_deref() {
+                if let Some(result) =
+                    self.submission_replay(&agent_id, id, message_metadata.as_ref())?
+                {
+                    return Ok(result);
+                }
+            }
             // Collaborator sender preamble (multiplayer): the content-level
             // counterpart of the stamp, applied once here so the runtime
             // path and the store-only fallback persist what the model sees.
@@ -30473,6 +30768,25 @@ impl WorkspaceApi for Services {
     fn agent_queue_message(
         &self,
         agent_id: AgentId,
+        content: String,
+        image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.agent_queue_submission(
+            agent_id,
+            None,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+        )
+    }
+
+    fn agent_queue_submission(
+        &self,
+        agent_id: AgentId,
+        message_id: Option<String>,
         mut content: String,
         image_blocks: Option<serde_json::Value>,
         file_blocks: Option<serde_json::Value>,
@@ -30489,8 +30803,9 @@ impl WorkspaceApi for Services {
             // entry's content, so the drain persists what the model sees.
             self.annotate_collaborator_sender_for_agent(&agent_id, &mut content)
                 .await?;
-            self.agent_queue_message_op(
+            self.agent_queue_submission_op(
                 agent_id,
+                message_id,
                 content,
                 image_blocks,
                 file_blocks,
@@ -31471,6 +31786,26 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn pr_refresh_automatic(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.execution_call(async move {
+            self.require_member(&workspace_id).await?;
+            let outcome = self
+                .refresh_workspace_pr_automatically(&workspace_id)
+                .await?;
+            let ws = self.store.get_workspace(&workspace_id).await?;
+            Ok(serde_json::json!({
+                "outcome": outcome.as_wire_str(),
+                "prNumber": ws.pr_number,
+                "prUrl": ws.pr_url,
+                "prStatus": ws.pr_status,
+                "pullRequests": ws.pull_requests.as_deref().unwrap_or_default(),
+            }))
+        })
+    }
+
     fn pr_state(
         &self,
         workspace_id: WorkspaceId,
@@ -31678,6 +32013,85 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn github_pulls_checks(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsChecks").await?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let pr = sc
+                .get_pr(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let head_sha = pr
+                .head_sha
+                .filter(|sha| !sha.is_empty())
+                .ok_or_else(|| Error::Internal("Pull request head SHA unavailable".into()))?;
+            let checks = sc
+                .check_runs(&repo_ref, &head_sha)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({ "headSha": head_sha, "checks": checks }))
+        })
+    }
+
+    fn github_pulls_reviews(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsReviews").await?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let page = sc.pull_reviews(&repo_ref, number, intent_sourcecontrol::PageParams {
+                limit: github_ops::clamp_limit(limit).min(100),
+                cursor: github_ops::decode_next_token(next_token.as_deref()),
+            }).await.map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({ "reviews": page.items, "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()) }))
+        })
+    }
+
+    fn github_pulls_files(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+        next_token: Option<String>,
+        expected_head_sha: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsFiles").await?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let head_sha = sc.get_pr(&repo_ref, number).await.map_err(pr_ops::map_sc_err)?.head_sha
+                .filter(|sha| !sha.is_empty()).ok_or_else(|| Error::Internal("Pull request head SHA unavailable".into()))?;
+            if expected_head_sha.as_ref().is_some_and(|expected| expected != &head_sha) {
+                return Err(Error::Conflict { current: serde_json::json!({"headSha": head_sha}) });
+            }
+            let page = sc.pull_files(&repo_ref, number, intent_sourcecontrol::PageParams {
+                limit: github_ops::clamp_limit(limit).min(100),
+                cursor: github_ops::decode_next_token(next_token.as_deref()),
+            }).await.map_err(pr_ops::map_sc_err)?;
+            let after = sc.get_pr(&repo_ref, number).await.map_err(pr_ops::map_sc_err)?.head_sha;
+            if after.as_ref() != Some(&head_sha) {
+                return Err(Error::Conflict { current: serde_json::json!({"headSha": after}) });
+            }
+            Ok(serde_json::json!({ "headSha": head_sha, "truncated": page.truncated, "files": page.items, "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()) }))
+        })
+    }
+
     fn github_pulls_list(
         &self,
         owner: String,
@@ -31777,6 +32191,66 @@ impl WorkspaceApi for Services {
                     github_ops::pull_to_json_with_repo(p, &github_ops::hit_repo(&scope, &p.url))
                 })
                 .collect();
+            Ok(serde_json::json!({
+                "pulls": pulls,
+                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
+            }))
+        })
+    }
+
+    fn github_org_pulls_search(
+        &self,
+        org: String,
+        filter: Option<String>,
+        state: Option<String>,
+        query: Option<String>,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsSearch").await?;
+            if org.is_empty()
+                || org.len() > 39
+                || !org.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                return Err(Error::InvalidParams(
+                    "org must be a GitHub owner slug".into(),
+                ));
+            }
+            let involvement = github_ops::parse_pr_involvement(filter.as_deref())?;
+            let state = github_ops::parse_pr_state(Some(state.as_deref().unwrap_or("open")))?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let page = sc
+                .list_org_prs(
+                    &org,
+                    intent_sourcecontrol::PrQuery {
+                        state,
+                        involvement,
+                        search: github_ops::normalize_search_query(query),
+                        limit: Some(github_ops::clamp_limit(limit)),
+                        cursor: github_ops::decode_next_token(next_token.as_deref()),
+                        ..intent_sourcecontrol::PrQuery::default()
+                    },
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let pulls = page
+                .items
+                .iter()
+                .map(|pr| {
+                    let repo = github_ops::repo_from_html_url(&pr.url)
+                        .filter(|repo| {
+                            *repo == intent_sourcecontrol::RepoRef::new(&org, &repo.name)
+                        })
+                        .ok_or_else(|| {
+                            Error::Internal(
+                                "organization PR search returned an invalid repository URL".into(),
+                            )
+                        })?;
+                    Ok(github_ops::pull_to_json_with_repo(pr, &repo))
+                })
+                .collect::<Result<Vec<_>>>()?;
             Ok(serde_json::json!({
                 "pulls": pulls,
                 "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
@@ -32752,9 +33226,22 @@ impl WorkspaceApi for Services {
         provider: String,
         host: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_auth_status_for_instance(provider, host, None)
+    }
+
+    fn source_control_auth_status_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.authStatus")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             match target {
                 source_control_auth_ops::Target::Github => {
                     let base = self.github_auth_status().await?;
@@ -32804,18 +33291,20 @@ impl WorkspaceApi for Services {
                     let slot = guard
                         .flow
                         .as_ref()
-                        .filter(|f| f.host == host.host())
+                        .filter(|f| f.host == host.logical_base_url())
                         .map(|f| &f.slot);
-                    let device_grant_supported =
-                        client_id.is_some() && !guard.unsupported_hosts.contains(host.host());
-                    Ok(source_control_auth_ops::auth_status_to_wire(
+                    let device_grant_supported = client_id.is_some()
+                        && !guard.unsupported_hosts.contains(host.logical_base_url());
+                    let mut status = source_control_auth_ops::auth_status_to_wire(
                         github_auth_ops::auth_status_to_wire(is_configured, slot),
                         source_control_auth_ops::Provider::Gitlab,
                         host.host(),
                         method,
                         user,
                         device_grant_supported,
-                    ))
+                    );
+                    status["instanceBaseUrl"] = serde_json::json!(host.logical_base_url());
+                    Ok(status)
                 }
             }
         })
@@ -32828,9 +33317,24 @@ impl WorkspaceApi for Services {
         method: Option<String>,
         token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_connect_for_instance(provider, host, method, token, None)
+    }
+
+    fn source_control_connect_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        method: Option<String>,
+        token: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.connect")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             let use_pat = match method.as_deref().map(str::trim) {
                 None | Some("device") => false,
                 Some("pat") => true,
@@ -32875,35 +33379,29 @@ impl WorkspaceApi for Services {
         provider: String,
         host: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_cancel_auth_for_instance(provider, host, None)
+    }
+
+    fn source_control_cancel_auth_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.cancelAuth")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             match target {
                 // Unscoped cancel: `sourceControl.cancelAuth` carries no
                 // `flowId`, so it cancels whichever GitHub flow is pending
                 // (same as `github.cancelAuth` with `flowId` omitted).
                 source_control_auth_ops::Target::Github => self.github_cancel_auth(None).await,
                 source_control_auth_ops::Target::Gitlab { host, .. } => {
-                    // Host-scoped: only a pending flow for exactly this host
-                    // is cancelled; a terminal slot stays until the next
-                    // connect replaces it (same rule as `github.cancelAuth`).
-                    let mut guard = self.gitlab_auth.lock().await;
-                    let starting = guard
-                        .starting
-                        .as_ref()
-                        .is_some_and(|s| s.host == host.host());
-                    let cancelled = matches!(
-                        guard.flow.as_ref(),
-                        Some(f) if f.host == host.host()
-                            && f.slot.phase == github_auth_ops::FlowPhase::Pending
-                    );
-                    if cancelled {
-                        guard.flow = None;
-                    }
-                    if starting {
-                        guard.starting = None;
-                    }
-                    Ok(serde_json::json!({ "ok": true, "cancelled": cancelled || starting }))
+                    self.gitlab_cancel_auth(&host).await
                 }
             }
         })
@@ -32914,9 +33412,22 @@ impl WorkspaceApi for Services {
         provider: String,
         host: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_revoke_for_instance(provider, host, None)
+    }
+
+    fn source_control_revoke_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.revoke")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             match target {
                 source_control_auth_ops::Target::Github => self.github_revoke().await,
                 source_control_auth_ops::Target::Gitlab { host, .. } => {
@@ -32931,9 +33442,22 @@ impl WorkspaceApi for Services {
         provider: String,
         host: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_get_user_for_instance(provider, host, None)
+    }
+
+    fn source_control_get_user_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.getUser")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             match target {
                 source_control_auth_ops::Target::Github => {
                     // An absent credential is `{ user: null }`, a rejected one

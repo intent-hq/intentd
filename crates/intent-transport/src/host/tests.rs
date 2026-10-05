@@ -1395,3 +1395,73 @@ fn discovery_context_host_classifier_retains_semantic_selectors() {
         }
     }
 }
+
+#[tokio::test]
+async fn prepare_provider_adapters_validates_before_admission() {
+    use intent_core::{Caller, HostRole, PrincipalId};
+
+    #[derive(Default)]
+    struct RecordingApi(Mutex<Vec<Vec<String>>>);
+    impl WorkspaceApi for RecordingApi {
+        fn prepare_provider_adapters(&self, ids: Vec<String>) {
+            self.0.lock().unwrap().push(ids);
+        }
+    }
+    let api = RecordingApi::default();
+    for params in [
+        json!(null),
+        json!([]),
+        json!({}),
+        json!({"providerIds":"pi"}),
+        json!({"providerIds":[null]}),
+        json!({"providerIds":[""]}),
+        json!({"providerIds":["x".repeat(65)]}),
+        json!({"providerIds":["é".repeat(33)]}),
+        json!({"providerIds":vec!["pi";33]}),
+        json!({"providerIds":[],"workspaceId":"x"}),
+    ] {
+        let req = classify(&json!({"jsonrpc":"2.0","id":1,"method":"host.prepareProviderAdapters","params":params})).unwrap();
+        let reply = handle(req, &api, None, false, &idle_reverse())
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["error"]["code"], -32602, "{params}");
+    }
+    assert!(api.0.lock().unwrap().is_empty());
+    for ids in [
+        json!([]),
+        json!(["pi", "pi", "unknown"]),
+        json!(["x".repeat(64)]),
+    ] {
+        let req = classify(&json!({"jsonrpc":"2.0","id":2,"method":"host.prepareProviderAdapters","params":{"providerIds":ids}})).unwrap();
+        let reply = handle(req, &api, None, false, &idle_reverse())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply).unwrap(),
+            json!({"jsonrpc":"2.0","id":2,"result":{"accepted":true}})
+        );
+    }
+    assert_eq!(api.0.lock().unwrap().len(), 3);
+    for role in [HostRole::Member, HostRole::Guest] {
+        let req = classify(&json!({"jsonrpc":"2.0","id":3,"method":"host.prepareProviderAdapters","params":{"providerIds":["pi"]}})).unwrap();
+        let reply = intent_core::with_caller(
+            Caller::Wire {
+                principal_id: PrincipalId::new(),
+                host_role: role,
+            },
+            handle(req, &api, None, false, &idle_reverse()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply).unwrap()["error"]["code"],
+            -32003
+        );
+    }
+    assert_eq!(
+        api.0.lock().unwrap().len(),
+        3,
+        "denied roles must schedule nothing"
+    );
+}

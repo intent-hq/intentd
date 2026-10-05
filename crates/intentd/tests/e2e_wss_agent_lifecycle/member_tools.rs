@@ -968,7 +968,12 @@ async fn member_provider_safe_reads_use_host_cache_and_preserve_administration_o
     assert!(events
         .iter()
         .any(|row| row.id.as_str() == event["id"].as_str().unwrap() && row.data == context));
-    for method in ["settings.list", "host.env", "host.providerTestPrompt"] {
+    for method in [
+        "settings.list",
+        "host.env",
+        "host.providerTestPrompt",
+        "host.prepareProviderAdapters",
+    ] {
         let denied = wss_rpc_envelope(&mut client, 9, method, json!({})).await;
         assert_eq!(denied["error"]["code"], -32003, "{method}: {denied}");
     }

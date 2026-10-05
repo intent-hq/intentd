@@ -2272,6 +2272,11 @@ async fn dispatch_other(
         }
         "agent.queueMessage" => {
             let agent_id = require_agent_id(params)?;
+            let message_id = match params.get("messageId") {
+                None => None,
+                Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+                Some(_) => return Err(invalid_params("messageId must be a nonempty string")),
+            };
             let content = require_str_param(params, "content")?;
             let image_blocks = opt_value(params, "imageBlocks");
             let file_blocks = opt_value(params, "fileBlocks");
@@ -2288,8 +2293,9 @@ async fn dispatch_other(
                 Some(_) => return Err(invalid_params("messageMetadata must be an object")),
             };
             let result = api
-                .agent_queue_message(
+                .agent_queue_submission(
                     agent_id,
+                    message_id,
                     content,
                     image_blocks,
                     file_blocks,
@@ -3186,7 +3192,13 @@ async fn dispatch_other(
         }
         "pr.refresh" => {
             let ws = require_ws_note(params)?;
-            let r = api.pr_refresh(ws).await.map_err(workspace_err)?;
+            let automatic = opt_bool_strict(params, "automatic")?.unwrap_or(false);
+            let r = if automatic {
+                api.pr_refresh_automatic(ws).await
+            } else {
+                api.pr_refresh(ws).await
+            }
+            .map_err(workspace_err)?;
             Ok(r)
         }
         // `github.*` explicit-addressing surface (PROTOCOL §5.27): every data
@@ -3260,6 +3272,38 @@ async fn dispatch_other(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "github.pulls.checks" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let number = require_u64(params, "number")?;
+            api.github_pulls_checks(owner, repo, number)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "github.pulls.reviews" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let number = require_u64(params, "number")?;
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let next_token = opt_str(params, "nextToken");
+            api.github_pulls_reviews(owner, repo, number, limit, next_token)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "github.pulls.files" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let number = require_u64(params, "number")?;
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let next_token = opt_str(params, "nextToken");
+            api.github_pulls_files(
+                owner,
+                repo,
+                number,
+                limit,
+                next_token,
+                opt_str(params, "expectedHeadSha"),
+            )
+            .await
+            .map_err(domain_to_rpc)
+        }
         "github.pulls.get" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
@@ -3316,13 +3360,29 @@ async fn dispatch_other(
             Ok(r)
         }
         "github.pulls.search" => {
-            let (owner, repo) = require_repo_slug(params)?;
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
             let query = opt_str(params, "query");
-            let repos = opt_repo_refs(params, "repos")?;
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
+            if params.contains_key("org") {
+                let org = require_str_param(params, "org")?;
+                validate_repo_slug_part("org", &org, true)?;
+                if ["owner", "repo", "repos"]
+                    .iter()
+                    .any(|key| params.contains_key(*key))
+                {
+                    return Err(invalid_params(
+                        "org cannot be combined with owner, repo, or repos".to_string(),
+                    ));
+                }
+                return api
+                    .github_org_pulls_search(org, filter, state, query, limit, next_token)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
+            let (owner, repo) = require_repo_slug(params)?;
+            let repos = opt_repo_refs(params, "repos")?;
             let r = api
                 .github_pulls_search(owner, repo, filter, state, query, repos, limit, next_token)
                 .await
@@ -3602,11 +3662,66 @@ async fn dispatch_other(
         }
         // `host` names the forge, never an intentd routing destination.
         // Optional `workspaceId` leaves provider/host credential selection intact.
+        "sourceControl.checkout.capture" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_capture(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.projects" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_projects(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.project" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_project(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.branches" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_branches(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.warm" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_warm(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.release" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_release(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
         "sourceControl.authStatus" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let r = api
-                .source_control_auth_status(provider, host)
+                .source_control_auth_status_for_instance(provider, host, instance_base_url)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3614,10 +3729,17 @@ async fn dispatch_other(
         "sourceControl.connect" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let method = opt_str_strict(params, "method")?;
             let token = opt_str_strict(params, "token")?;
             let r = api
-                .source_control_connect(provider, host, method, token)
+                .source_control_connect_for_instance(
+                    provider,
+                    host,
+                    method,
+                    token,
+                    instance_base_url,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3625,8 +3747,9 @@ async fn dispatch_other(
         "sourceControl.cancelAuth" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let r = api
-                .source_control_cancel_auth(provider, host)
+                .source_control_cancel_auth_for_instance(provider, host, instance_base_url)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3634,8 +3757,9 @@ async fn dispatch_other(
         "sourceControl.revoke" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let r = api
-                .source_control_revoke(provider, host)
+                .source_control_revoke_for_instance(provider, host, instance_base_url)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3643,8 +3767,9 @@ async fn dispatch_other(
         "sourceControl.getUser" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let r = api
-                .source_control_get_user(provider, host)
+                .source_control_get_user_for_instance(provider, host, instance_base_url)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

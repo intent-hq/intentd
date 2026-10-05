@@ -243,7 +243,14 @@ async fn transfer_human_trust_migration_cleans_legacy_keys_once_and_fences_downg
         export_author_barrier: Arc::default(),
         repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
     };
-    let (_ws, agent) = seed(&store).await;
+    // Seed the historical schema directly: current workspace inserts include
+    // content activity, which did not exist at migration 0134.
+    let ws = WorkspaceId::new();
+    let agent = AgentId::new();
+    sqlx::query("INSERT INTO workspace (id,title,branch,status,created_at,updated_at) VALUES (?,'Transfer','main','Active','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')")
+        .bind(ws.as_str()).execute(store.write_pool()).await.unwrap();
+    sqlx::query("INSERT INTO agent_session (id,workspace_id,name,status,created_at,updated_at) VALUES (?,?,'Agent','idle','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')")
+        .bind(agent.as_str()).bind(ws.as_str()).execute(store.write_pool()).await.unwrap();
     let old =
         json!({"humanAuthor":{"login":"planted"},"fromPrincipalId":"real-source","keep":{"x":7}});
     // Seed the historical schema directly: current append APIs also write

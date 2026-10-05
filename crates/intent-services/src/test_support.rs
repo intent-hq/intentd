@@ -1,7 +1,7 @@
 //! Unit-test scratch and local CLI apparatus.
 
 mod scratch;
-pub(crate) use scratch::test_tempdir;
+pub(crate) use scratch::{test_tempdir, test_tempdir_in};
 
 /// Supply the canonical installed CLI required even by a mock ACP adapter.
 /// Keep the guard alive with the fixture; it restores PATH under the test env lock.

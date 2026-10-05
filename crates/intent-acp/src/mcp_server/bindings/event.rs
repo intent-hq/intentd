@@ -41,14 +41,31 @@ pub(crate) async fn dispatch(
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
-    let mut out = match method {
-        "agentActivity" => agent_activity(api, ws, args).await,
-        "workspaceSummary" => workspace_summary(api, ws, args).await,
-        "query" => query(api, ws, args).await,
-        "subscribe" => subscribe(api, ws, caller, args).await,
-        "unsubscribe" => unsubscribe(api, ws, args).await,
-        other => Err(format!("host: unknown method `event.{other}`")),
-    }?;
+    let read = async {
+        match method {
+            "agentActivity" => agent_activity(api, ws, args).await,
+            "workspaceSummary" => workspace_summary(api, ws, args).await,
+            "query" => query(api, ws, args).await,
+            "subscribe" => subscribe(api, ws, caller, args).await,
+            "unsubscribe" => unsubscribe(api, ws, args).await,
+            other => Err(format!("host: unknown method `event.{other}`")),
+        }
+    };
+    let mut out =
+        if let Some(agent_id) = caller.filter(|_| matches!(method, "query" | "agentActivity")) {
+            intent_core::with_caller(
+                intent_core::Caller::Agent {
+                    agent_id: agent_id.clone(),
+                },
+                read,
+            )
+            .await?
+        } else {
+            read.await?
+        };
+    if let Some(agent_id) = caller {
+        intent_core::redact_self_queue_events(&mut out, agent_id);
+    }
     strip_agent_hidden_fields(&mut out);
     Ok(out)
 }

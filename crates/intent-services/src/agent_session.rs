@@ -43,6 +43,43 @@ use crate::repository_admission::lifecycle::physical_owner::{
 };
 use crate::{file_ops, token_usage, usage_stats, Services};
 
+/// Preserve live provider diagnostics without adding assistant content or
+/// changing turn/failure state. Also used when a notice arrives while idle.
+pub(crate) fn log_provider_notice(
+    notice: &session::Notice,
+    acp_session_id: Option<&str>,
+    agent_id: &AgentId,
+    workspace_id: Option<&WorkspaceId>,
+) {
+    use session::NoticeSeverity;
+    let severity = match &notice.severity {
+        NoticeSeverity::Info => "info",
+        NoticeSeverity::Warning => "warning",
+        NoticeSeverity::Error => "error",
+        NoticeSeverity::Other(value) => value.as_str(),
+        _ => "unknown",
+    };
+    macro_rules! log_notice {
+        ($level:expr) => {
+            tracing::event!(
+                $level,
+                agent = %agent_id,
+                workspace = workspace_id.map(WorkspaceId::as_str),
+                acp_session_id,
+                severity,
+                title = %notice.title,
+                description = notice.description.as_deref(),
+                "ACP provider notice"
+            )
+        };
+    }
+    match notice.severity {
+        NoticeSeverity::Info => log_notice!(tracing::Level::INFO),
+        NoticeSeverity::Error => log_notice!(tracing::Level::ERROR),
+        _ => log_notice!(tracing::Level::WARN),
+    }
+}
+
 /// Derive the cross-layer, content-free stream correlation value used only in
 /// diagnostics. The input is an existing wire `turnId` (or the assistant
 /// `messageId` on interruption paths that have no turn id); the raw id is never
@@ -140,8 +177,9 @@ pub(crate) const PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX: &str =
 pub(crate) const PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX: &str = "[turn streamed output]";
 
 /// Prefix marking a `session/prompt` failure that was recognized as
-/// sleep-induced (Task C): the turn died with a transient upstream disconnect
-/// (per [`intent_acp::is_transient_upstream_disconnect`]) whose active window
+/// sleep-induced: the turn died with a transient upstream disconnect or provider
+/// fetch failure (per [`intent_acp::is_transient_upstream_disconnect`] /
+/// [`intent_acp::is_transient_provider_fetch_failure`]) whose active window
 /// overlapped a detected host suspend (per the injected [`SuspendOverlapQuery`]).
 /// [`Services::run_prompt_turn`] enrolls such a turn as interrupted (persisting
 /// the partial with [`InterruptReason::SystemSuspend`] + an `interrupted_agent`
@@ -3165,6 +3203,9 @@ impl Services {
     /// into the transcript. Draining them here mirrors TS's "drop `session/update`
     /// when there is no active streaming handler" gate (acp-provider.ts).
     ///
+    /// Live notices are preserved in diagnostics; only replay/cancelled content
+    /// is discarded. Neither kind opens a turn or changes failure state.
+    ///
     /// Bounded so it cannot hang: empty whatever is already buffered with
     /// non-blocking `try_recv`, then wait out a short settle window for stragglers
     /// that may land just after `load_session` resolved (a per-message `recv`
@@ -3173,21 +3214,39 @@ impl Services {
     /// resume path is acceptable.
     pub(crate) async fn drain_replay_notifications(
         notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
+        agent_id: &AgentId,
+        workspace_id: Option<&WorkspaceId>,
     ) {
         use tokio::time::{timeout, Duration, Instant};
         const SETTLE: Duration = Duration::from_millis(50);
         const CAP: Duration = Duration::from_millis(500);
+        let log_notice = |note: IncomingNotification| {
+            // Notices are live diagnostics, never replayed conversation. Avoid
+            // parsing/accumulating the discarded historical text and tool payloads.
+            if note.params["update"]["sessionUpdate"] == "notice" {
+                if let Some(MappedUpdate::Notice(notice)) = session::map_notification(&note) {
+                    log_provider_notice(
+                        &notice,
+                        note.params["sessionId"].as_str(),
+                        agent_id,
+                        workspace_id,
+                    );
+                }
+            }
+        };
         let deadline = Instant::now() + CAP;
         loop {
-            while notifications.try_recv().is_ok() {}
+            while let Ok(note) = notifications.try_recv() {
+                log_notice(note);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match timeout(SETTLE.min(remaining), notifications.recv()).await {
-                Ok(Some(_)) => {} // a straggler arrived → keep draining
-                Ok(None) | Err(_) => break, // channel closed
-                                   // quiet for the settle window → done
+                Ok(Some(note)) => log_notice(note), // a straggler arrived → keep draining
+                Ok(None) | Err(_) => break,         // channel closed
+                                                     // quiet for the settle window → done
             }
         }
     }
@@ -3661,9 +3720,9 @@ impl Services {
         // append consumes `blocks`, used for the pending-proposals recording
         // below (PROTOCOL §5.5).
         let proposal_ids = crate::tool_block::proposal_ids_in(&blocks);
-        // Sleep-induced turn failure (Task C): the turn died with a transient
-        // upstream disconnect AND a detected host suspend overlapped its active
-        // window `[turn_started, now]`. Enroll it as interrupted (so the wake
+        // Sleep-induced turn failure: the turn died with a transient upstream
+        // disconnect or provider-fetch failure AND a host suspend overlapped
+        // its active window `[turn_started, now]`. Enroll it as interrupted (so the wake
         // orchestrator in Task D can resume it via `session/load`) instead of
         // surfacing a hard terminal failure. Gated on an injected
         // [`SuspendOverlapQuery`]: absent (read-only / unit wiring, or
@@ -3674,7 +3733,9 @@ impl Services {
         // resume preserves the partial turn, which a fresh-child redrive would
         // not. `PromptIdleTimeout` is classified non-transient, so an idle
         // timeout never routes here.
-        let suspend_interrupt = matches!(&result, Err(e) if intent_acp::is_transient_upstream_disconnect(e))
+        let suspend_interrupt = matches!(&result, Err(e)
+            if intent_acp::is_transient_upstream_disconnect(e)
+                || intent_acp::is_transient_provider_fetch_failure(e))
             && self
                 .suspend_tracker
                 .as_ref()
@@ -4499,8 +4560,8 @@ impl Services {
             .is_some()
     }
 
-    /// Enroll a sleep-induced turn failure (Task C): a transient upstream
-    /// disconnect whose active window overlapped a detected host suspend. The
+    /// Enroll a sleep-induced turn failure: a transient upstream disconnect or
+    /// provider-fetch failure whose active window overlapped a host suspend. The
     /// partial turn is persisted tagged [`InterruptReason::SystemSuspend`]
     /// (empty blocks still record a row — every interruption is durably
     /// anchored), an `interrupted_agent` row is written with `prev_status` = the
@@ -5562,6 +5623,16 @@ impl Services {
                     )
                     .await;
                 }
+            }
+            MappedUpdate::Notice(notice) => {
+                log_provider_notice(
+                    &notice,
+                    note.params["sessionId"].as_str(),
+                    agent_id,
+                    Some(workspace_id),
+                );
+                // Diagnostics are not output: preserve silent-redrive eligibility.
+                return false;
             }
             MappedUpdate::Usage(usage) => {
                 // Context-window occupancy (intent-hq/intent#3797): recorded

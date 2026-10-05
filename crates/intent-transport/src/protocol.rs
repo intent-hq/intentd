@@ -698,6 +698,9 @@
 //! An omitted filter preserves the legacy all-definitions list. The
 //! `scriptLifecycle: 1` capability includes atomic command results, one-off
 //! retirement for every settled outcome, and durable admission recovery.
+//!
+//! Version 13.2 adds explicitly addressed read-only PR checks, reviews, and
+//! changed-file pages, including head guards and forge truncation reporting.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -724,7 +727,14 @@ use std::time::{Duration, Instant};
 // non-idempotent contract; MCP ws.git.commit is unchanged.
 // Version 13.3 adds qualified repository context, selection, native review,
 // companion confirmation, and explicit MR/issue detail-read capabilities.
-pub const PROTOCOL_VERSION: &str = "13.3";
+// Version 13.4 adds trusted, persisted submission correlation for optimistic
+// display. Support requires exactly submissionCorrelation: 1; discover other
+// extensions through their independent capabilities and permission checks.
+// Version 13.5 adds original-socket GitLab checkout discovery and native
+// private checkout. Clients require gitlabCheckout: 1 before using it.
+// Version 13.6 adds best-effort host.prepareProviderAdapters. Acknowledgement
+// promises admission only; clients tolerate -32601 on older daemons.
+pub const PROTOCOL_VERSION: &str = "13.6";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

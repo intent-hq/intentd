@@ -43,6 +43,73 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `intent-services` (§3.2 rule 3). The default bodies return an internal error
 /// so downstream stubs compile until they override these methods.
 pub trait WorkspaceApi: Send + Sync {
+    fn repository_checkout_capture(
+        &self,
+        _query: crate::repository_checkout::CheckoutCaptureQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            crate::repository_checkout::CheckoutResult<crate::repository_checkout::CheckoutCapture>,
+        >,
+    > {
+        Box::pin(async { Err(Error::Forbidden("Repository checkout unavailable".into())) })
+    }
+    fn repository_checkout_projects(
+        &self,
+        _query: crate::repository_checkout::CheckoutProjectsQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            crate::repository_checkout::CheckoutResult<
+                crate::repository_checkout::CheckoutProjects,
+            >,
+        >,
+    > {
+        Box::pin(async { Err(Error::Forbidden("Repository checkout unavailable".into())) })
+    }
+    fn repository_checkout_project(
+        &self,
+        _query: crate::repository_checkout::CheckoutProjectQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            crate::repository_checkout::CheckoutResult<
+                crate::repository_checkout::CheckoutProjectDetail,
+            >,
+        >,
+    > {
+        Box::pin(async { Err(Error::Forbidden("Repository checkout unavailable".into())) })
+    }
+    fn repository_checkout_branches(
+        &self,
+        _query: crate::repository_checkout::CheckoutBranchesQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            crate::repository_checkout::CheckoutResult<
+                crate::repository_checkout::CheckoutBranches,
+            >,
+        >,
+    > {
+        Box::pin(async { Err(Error::Forbidden("Repository checkout unavailable".into())) })
+    }
+    fn repository_checkout_warm(
+        &self,
+        _query: crate::repository_checkout::CheckoutSelection,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            crate::repository_checkout::CheckoutResult<crate::repository_checkout::CheckoutWarm>,
+        >,
+    > {
+        Box::pin(async { Err(Error::Forbidden("Repository checkout unavailable".into())) })
+    }
+    fn repository_checkout_release(
+        &self,
+        _query: crate::repository_checkout::CheckoutBinding,
+    ) -> BoxFuture<'_, Result<crate::repository_checkout::CheckoutReleased>> {
+        Box::pin(async { Err(Error::Forbidden("Repository checkout unavailable".into())) })
+    }
     /// Capture a transport-owned repository read connection under its original
     /// caller/credential binding. This carrier alone grants no read authority.
     #[doc(hidden)]
@@ -2274,6 +2341,33 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Queue a prepared submission with a caller identity. Legacy implementors
+    /// continue to support requests which omit the optional identity.
+    fn agent_queue_submission(
+        &self,
+        agent_id: AgentId,
+        message_id: Option<String>,
+        content: String,
+        image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        if message_id.is_some() {
+            return Box::pin(async {
+                Err(Error::Unsupported(
+                    "submission correlation is unavailable".into(),
+                ))
+            });
+        }
+        self.agent_queue_message(
+            agent_id,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+        )
+    }
+
     /// `agent.editQueuedMessage`: edit a queued message's content (PROTOCOL §5.5).
     /// `editing` (optional) toggles the entry's under-edit state — when `Some(true)`
     /// the entry is excluded from the ready-to-send queue (drain skips it); when
@@ -4068,6 +4162,20 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Automatic `pr.refresh` calls share daemon admission with the sweep.
+    /// Kept separate from explicit refresh to preserve existing callers.
+    fn pr_refresh_automatic(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "automatic PR refresh not implemented".into(),
+            ))
+        })
+    }
+
     /// `ws.pr.snapshot` engine (MCP-only surface, not in the FE router
     /// catalog): a compact, diff-friendly snapshot of PR `pr_number` — state,
     /// mergeability + blocked reason, check-run tally, review decision, and
@@ -4128,6 +4236,56 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_pulls_get not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Read-only explicitly addressed PR checks (PROTOCOL §5.27).
+    fn github_pulls_checks(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_checks not implemented".into(),
+            ))
+        })
+    }
+
+    /// Read-only explicitly addressed PR reviews (PROTOCOL §5.27).
+    fn github_pulls_reviews(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number, limit, next_token);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_reviews not implemented".into(),
+            ))
+        })
+    }
+
+    /// Read-only explicitly addressed PR files (PROTOCOL §5.27).
+    fn github_pulls_files(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+        next_token: Option<String>,
+        expected_head_sha: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, number, limit, next_token, expected_head_sha);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_pulls_files not implemented".into(),
             ))
         })
     }
@@ -4196,6 +4354,24 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_pulls_search not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Owner-wide form of `github.pulls.search` (organization or personal account).
+    fn github_org_pulls_search(
+        &self,
+        org: String,
+        filter: Option<String>,
+        state: Option<String>,
+        query: Option<String>,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (org, filter, state, query, limit, next_token);
+        Box::pin(async {
+            Err(Error::InvalidParams(
+                "organization PR search is not supported".into(),
             ))
         })
     }
@@ -4765,6 +4941,22 @@ pub trait WorkspaceApi: Send + Sync {
     /// shape plus additive `provider`, `host`, `method`
     /// (`"device" | "pat" | "env" | null`), `user?` (iff `isConfigured`) and
     /// `deviceGrantSupported`.
+    fn source_control_auth_status_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        if instance_base_url.is_some() {
+            return Box::pin(async {
+                Err(Error::InvalidParams(
+                    "full GitLab instance target is unsupported".into(),
+                ))
+            });
+        }
+        self.source_control_auth_status(provider, host)
+    }
+
     fn source_control_auth_status(
         &self,
         provider: String,
@@ -4786,6 +4978,24 @@ pub trait WorkspaceApi: Send + Sync {
     /// A provider holds one credential for one bound host, so a connect that
     /// binds `host` — device or PAT — supersedes a device flow still pending
     /// for any host (its late completion is discarded: no write, no event).
+    fn source_control_connect_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        method: Option<String>,
+        token: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        if instance_base_url.is_some() {
+            return Box::pin(async {
+                Err(Error::InvalidParams(
+                    "full GitLab instance target is unsupported".into(),
+                ))
+            });
+        }
+        self.source_control_connect(provider, host, method, token)
+    }
+
     fn source_control_connect(
         &self,
         provider: String,
@@ -4803,6 +5013,22 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `sourceControl.cancelAuth { provider, host? }`: abort the pending device
     /// grant for `(provider, host)` → `{ ok: true, cancelled }`.
+    fn source_control_cancel_auth_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        if instance_base_url.is_some() {
+            return Box::pin(async {
+                Err(Error::InvalidParams(
+                    "full GitLab instance target is unsupported".into(),
+                ))
+            });
+        }
+        self.source_control_cancel_auth(provider, host)
+    }
+
     fn source_control_cancel_auth(
         &self,
         provider: String,
@@ -4819,6 +5045,22 @@ pub trait WorkspaceApi: Send + Sync {
     /// `sourceControl.revoke { provider, host? }`: delete the stored
     /// `sourceControl.<provider>.token`, abort any in-flight grant and emit
     /// `sourceControl:auth-changed { status: "revoked" }` → `{ ok: true }`.
+    fn source_control_revoke_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        if instance_base_url.is_some() {
+            return Box::pin(async {
+                Err(Error::InvalidParams(
+                    "full GitLab instance target is unsupported".into(),
+                ))
+            });
+        }
+        self.source_control_revoke(provider, host)
+    }
+
     fn source_control_revoke(
         &self,
         provider: String,
@@ -4835,6 +5077,22 @@ pub trait WorkspaceApi: Send + Sync {
     /// `sourceControl.getUser { provider, host? }`: the authenticated identity
     /// from the host's user probe → `{ user: SourceControlUser | null }`; a
     /// rejected credential → `source-control-unauthorized`.
+    fn source_control_get_user_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        if instance_base_url.is_some() {
+            return Box::pin(async {
+                Err(Error::InvalidParams(
+                    "full GitLab instance target is unsupported".into(),
+                ))
+            });
+        }
+        self.source_control_get_user(provider, host)
+    }
+
     fn source_control_get_user(
         &self,
         provider: String,
@@ -5958,6 +6216,11 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::settings_reset not implemented".to_string(),
             ))
         })
+    }
+
+    /// Best-effort bounded host adapter preparation admission; never waits for probes or downloads.
+    fn prepare_provider_adapters(&self, provider_ids: Vec<String>) {
+        let _ = provider_ids;
     }
 
     /// Default-provider self-heal (monorepo#3044), invoked by the transport

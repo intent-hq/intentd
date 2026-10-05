@@ -2,6 +2,141 @@ use super::*;
 use crate::{CollaboratorAddOutcome, HostInviteJoinOutcome, HostJoinCredential, InviteJoinOutcome};
 use intent_core::{now_iso, HostInvite, WorkspaceInvite};
 
+#[tokio::test]
+async fn preworkspace_host_snapshot_tracks_original_credential_and_host_aba_without_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("checkout-authority.db"))
+        .await
+        .unwrap();
+    // Store initialization seeds Chief. This fixture deliberately has no workspace.
+    sqlx::query("DELETE FROM workspace")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let person = PrincipalId::new();
+    insert_person(&store, &person).await;
+    store
+        .insert_principal_credential(&person, "checkout-original")
+        .await
+        .unwrap();
+    let absent = store
+        .repository_host_authority_snapshot(&person, Some("checkout-original"))
+        .await
+        .unwrap();
+    assert!(absent.host_member.value.is_none());
+    assert_eq!(
+        absent
+            .credential
+            .as_ref()
+            .unwrap()
+            .value
+            .as_ref()
+            .unwrap()
+            .principal_id,
+        person
+    );
+    sqlx::query("INSERT INTO host_member(principal_id,added_at) VALUES(?,'same-time')")
+        .bind(person.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let admitted = store
+        .repository_host_authority_snapshot(&person, Some("checkout-original"))
+        .await
+        .unwrap();
+    assert!(admitted.host_member.value.is_some());
+    store.remove_host_member(&person).await.unwrap();
+    sqlx::query("INSERT INTO host_member(principal_id,added_at) VALUES(?,'same-time')")
+        .bind(person.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let returned = store
+        .repository_host_authority_snapshot(&person, Some("checkout-original"))
+        .await
+        .unwrap();
+    assert_eq!(returned.host_member.value, admitted.host_member.value);
+    assert!(
+        returned.host_member.revision.unwrap().get() > admitted.host_member.revision.unwrap().get()
+    );
+    assert_ne!(returned, admitted);
+    let missing = store
+        .repository_host_authority_snapshot(&person, Some("replacement-not-the-original"))
+        .await
+        .unwrap();
+    assert!(missing.credential.unwrap().value.is_none());
+    let workspaces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspace")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(workspaces, 0);
+}
+
+#[tokio::test]
+async fn preworkspace_insert_compares_original_host_grant_before_consuming_admission() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("checkout-insert.db"))
+        .await
+        .unwrap();
+    let person = PrincipalId::new();
+    insert_person(&store, &person).await;
+    store
+        .insert_principal_credential(&person, "original")
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO host_member(principal_id,added_at) VALUES(?,'original')")
+        .bind(person.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let original = store
+        .repository_host_authority_snapshot(&person, Some("original"))
+        .await
+        .unwrap();
+    store.remove_host_member(&person).await.unwrap();
+    let mut workspace = intent_core::chief_workspace();
+    workspace.id = WorkspaceId::new();
+    let called = AtomicBool::new(false);
+    let result = store
+        .insert_workspace_with_host_admission(
+            &workspace,
+            Some(false),
+            &original,
+            Some("original"),
+            || {
+                called.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+    assert!(matches!(result, Err(Error::Forbidden(_))));
+    assert!(!called.load(Ordering::SeqCst));
+    assert!(matches!(
+        store.get_workspace(&workspace.id).await,
+        Err(Error::NotFound(_))
+    ));
+    // Even unchanged durable facts never bypass the original transport/source fence.
+    let current = store
+        .repository_host_authority_snapshot(&person, Some("original"))
+        .await
+        .unwrap();
+    let refused = store
+        .insert_workspace_with_host_admission(
+            &workspace,
+            Some(false),
+            &current,
+            Some("original"),
+            || Err(Error::Forbidden("original request retired".into())),
+        )
+        .await;
+    assert!(matches!(refused, Err(Error::Forbidden(_))));
+    assert!(matches!(
+        store.get_workspace(&workspace.id).await,
+        Err(Error::NotFound(_))
+    ));
+}
+
 struct Fixture {
     store: Store,
     workspace: WorkspaceId,

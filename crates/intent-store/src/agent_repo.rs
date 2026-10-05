@@ -8042,6 +8042,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -8167,6 +8168,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -8941,6 +8943,7 @@ mod tests {
             created_at: ts.to_string(),
             updated_at: ts.to_string(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -12625,20 +12628,22 @@ mod tests {
 
     /// `update_workspace_token_usage` (monorepo#738): the closure sees the
     /// in-transaction usage rows and stored usage; a `Some` return performs a
-    /// SCOPED `token_usage` + `updated_at` write (a title changed between
-    /// reads survives — no full-row replace); `None` skips the write; a
-    /// missing workspace maps to `NotFound`.
+    /// SCOPED `token_usage` write (a title changed between reads survives,
+    /// activity timestamps are preserved); `None` skips the write; a missing
+    /// workspace maps to `NotFound`.
     #[tokio::test]
     async fn update_workspace_token_usage_scoped_write_and_decline() {
-        use intent_core::{now_iso, TokenUsage};
+        use intent_core::TokenUsage;
 
         use uuid::Uuid;
         let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
-        let ts = now_iso();
+        let ts = "2026-01-01T00:00:00Z".to_string();
         let ws_id = WorkspaceId("ws-scoped".to_string());
+        let mut original = baseline_test_workspace(&ws_id, &ts);
+        original.last_activity = Some("2026-01-02T00:00:00Z".to_string());
         store
-            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .insert_workspace(&original)
             .await
             .expect("insert workspace");
         let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
@@ -12688,6 +12693,12 @@ mod tests {
         );
         let ws = store.get_workspace(&ws_id).await.expect("get");
         assert_eq!(ws.title, "Renamed by user", "scoped write keeps the title");
+        assert_eq!(ws.created_at, original.created_at);
+        assert_eq!(
+            ws.updated_at, original.updated_at,
+            "usage bookkeeping must not look like workspace activity"
+        );
+        assert_eq!(ws.last_activity, original.last_activity);
         assert_eq!(
             ws.token_usage.as_ref().map(|u| &u.totals),
             Some(&snap),
@@ -12707,6 +12718,13 @@ mod tests {
             .await
             .expect("decline ok");
         assert!(declined.is_none(), "None return skips the write");
+        let unchanged = store
+            .get_workspace(&ws_id)
+            .await
+            .expect("get after decline");
+        assert_eq!(unchanged.updated_at, original.updated_at);
+        assert_eq!(unchanged.last_activity, original.last_activity);
+        assert_eq!(unchanged.token_usage, ws.token_usage);
 
         // Missing workspace → NotFound.
         let missing = WorkspaceId("ws-missing".to_string());
@@ -12744,6 +12762,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -12878,6 +12897,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -12964,6 +12984,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -13164,6 +13185,7 @@ mod tests {
                 created_at: ts.clone(),
                 updated_at: ts.clone(),
                 last_activity: None,
+                last_content_activity: None,
                 tags: vec![],
                 path: None,
                 repository_path: None,
@@ -13708,6 +13730,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -18223,6 +18246,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,

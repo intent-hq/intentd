@@ -119,7 +119,10 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     .expect("seed config.toml with server.tunnel.enabled");
     common::enable_ws_api(data_dir);
     let mut cmd = common::serve_command();
-    cmd.env("INTENTD_DATA_DIR", data_dir)
+    // Model an ambient installation with the local protocol fake. Individual
+    // fixtures must override this when their oracle requires no tunnel.
+    cmd.env("INTENTD_TAILCAT_BIN", write_fake_tailcat(data_dir))
+        .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         // Keep heartbeat-reaper evidence in retained failure logs: a provider
@@ -1809,13 +1812,21 @@ async fn members_list_attaches_the_owner_identity_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let secrets_s = data_dir.join("secrets.json").to_string_lossy().to_string();
-    let env: [(&str, &str); 6] = [
+    // A nonempty override bypasses bundled, sibling and PATH discovery even
+    // when the path is absent. Never let this negative fixture start Tailcat.
+    let no_tailcat = data_dir
+        .join("absent-tailcat")
+        .to_string_lossy()
+        .to_string();
+    assert!(!Path::new(&no_tailcat).exists());
+    let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_SECRETS_FILE", &secrets_s),
         ("INTENTD_GITHUB_LOGIN_BASE_URI", &mock.base_uri),
         ("INTENTD_GITHUB_API_BASE_URI", &mock.base_uri),
         ("GITHUB_TOKEN", OWNER_TOKEN),
+        ("INTENTD_TAILCAT_BIN", &no_tailcat),
     ];
     let child = spawn_serve(&data_dir, &env);
     let _daemon = Daemon { child };
@@ -1844,7 +1855,28 @@ async fn members_list_attaches_the_owner_identity_over_wss() {
         .expect("workspace id")
         .to_string();
 
-    // This daemon has no tunnel sidecar (no INTENTD_TAILCAT_BIN), so an
+    // UDS/WSS readiness alone does not establish completion of tunnel startup.
+    // Wait for either terminal boot outcome before testing the same refusal.
+    timeout(common::daemon_startup_timeout(), async {
+        loop {
+            let log = std::fs::read_to_string(data_dir.join("daemon.log"))
+                .expect("read tunnel startup receipt");
+            if log.contains("tailcat tunnel auto-started at boot") {
+                eprintln!("fixture tunnel startup: ready");
+                break;
+            }
+            if log.contains("INTENTD_TAILCAT_BIN override points at a missing binary") {
+                eprintln!("fixture tunnel startup: absent override");
+                break;
+            }
+            // timing-guard: poll the daemon's terminal tunnel startup receipt
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("tunnel startup did not settle");
+
+    // This daemon explicitly selects an absent tunnel sidecar, so an
     // invite link is not mintable: `workspace.invite.create` is refused with
     // the dedicated `tunnel-down` error and nothing is stored. This is NOT
     // the listener-down error (the listener IS up — we are talking to it).
@@ -1857,7 +1889,10 @@ async fn members_list_attaches_the_owner_identity_over_wss() {
     .await;
     assert_eq!(v["jsonrpc"], json!("2.0"));
     assert_eq!(v["id"], json!(20));
-    assert!(v.get("result").is_none(), "invite.create must fail: {v}");
+    assert!(
+        v.get("result").is_none(),
+        "invite.create must fail (response payload withheld)"
+    );
     assert_eq!(v["error"]["code"], json!(-32603), "{v}");
     assert_eq!(v["error"]["data"]["code"], json!("tunnel-down"), "{v}");
     let msg = v["error"]["message"].as_str().expect("error message");

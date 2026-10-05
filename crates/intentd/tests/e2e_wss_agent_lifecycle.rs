@@ -16,6 +16,9 @@ mod common;
 #[path = "e2e_wss_agent_lifecycle/creation_preferences.rs"]
 mod creation_preferences;
 
+#[path = "e2e_wss_agent_lifecycle/structured_notices.rs"]
+mod structured_notices;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -7078,6 +7081,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -8723,6 +8727,7 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     let me = wss_rpc(&mut rpc, 15, "principal.me", json!({})).await;
     let mut stamped = metadata.clone();
     stamped["fromPrincipalId"] = me["id"].clone();
+    stamped["submissionIds"] = json!([send2["queuedMessage"]["id"]]);
     assert_eq!(
         send2["queuedMessage"]["messageMetadata"], stamped,
         "queued entry must carry messageMetadata: {send2}"
@@ -8793,9 +8798,10 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     // Both direct-delivery placements are covered: the row-level `metadata`
     // column (direct `agent.sendMessage` parity) and the in-block fold
     // (`deliver_wake_message` parity) — the fold carries queueInfo too, but
-    // the `fromPrincipalId` stamp stays row-level only.
+    // principal and submission-correlation stamps stay row-level only.
     let mut folded = tagged["metadata"].clone();
     folded.as_object_mut().unwrap().remove("fromPrincipalId");
+    folded.as_object_mut().unwrap().remove("submissionIds");
     assert_eq!(
         tagged["contentBlocks"][0]["messageMetadata"], folded,
         "drained user block must fold the same messageMetadata: {tagged}"
@@ -14536,6 +14542,7 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
             "type": "agent_message",
             "fromAgentId": sender_id,
             "fromAgentName": "SenderA",
+            "submissionIds": [tagged["id"]],
         }),
         "agent-originated send must carry sender attribution: {tagged}"
     );
@@ -14790,7 +14797,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         "explicit-metadata child turn completed: {done:?}"
     );
 
-    let expected_tag = json!({
+    let mut expected_tag = json!({
         "type": "agent_message",
         "fromAgentId": sender_id,
         "fromAgentName": "SenderA",
@@ -14821,6 +14828,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     )
     .await;
     let row = user_row(&conv, "task hello");
+    expected_tag["submissionIds"] = json!([row["id"]]);
     assert_eq!(
         row["metadata"], expected_tag,
         "sendToTask must carry sender attribution: {row}"
@@ -14835,6 +14843,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     )
     .await;
     let row = user_row(&conv, "kickoff hello");
+    expected_tag["submissionIds"] = json!([row["id"]]);
     assert_eq!(
         row["metadata"], expected_tag,
         "create kickoff must carry sender attribution: {row}"
@@ -14856,6 +14865,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         json!({
             "type": "custom_tag",
             "note": "explicit wins",
+            "submissionIds": [row["id"]],
             "fromAgentId": sender_id,
             "fromAgentName": "SenderA",
         }),
@@ -15223,13 +15233,14 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         md["fromPrincipalId"].is_string(),
         "a human row carries the principal stamp: {lean}"
     );
+    assert_eq!(md["submissionIds"], human["submissionIds"]);
     let extra: Vec<&String> = md
         .keys()
-        .filter(|k| *k != "fromPrincipalId" && *k != "queueInfo")
+        .filter(|k| *k != "fromPrincipalId" && *k != "queueInfo" && *k != "submissionIds")
         .collect();
     assert!(
         extra.is_empty(),
-        "a human row carries at most the principal + queueInfo stamps: {lean}"
+        "a human row carries only principal, queueInfo and correlation stamps: {lean}"
     );
 
     // Contrast: a parentless BYSTANDER sending to the CHILD — a created

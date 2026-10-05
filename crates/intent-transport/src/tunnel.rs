@@ -817,18 +817,42 @@ async fn run_stream(
     stream_id: u32,
     generation: Arc<()>,
     port: u16,
-    mut msg_rx: mpsc::Receiver<StreamMsg>,
+    msg_rx: mpsc::Receiver<StreamMsg>,
     queued_bytes: Arc<AtomicUsize>,
     credit: Arc<CreditWindow>,
     out_tx: mpsc::Sender<OutboundFrame>,
     limits: TunnelLimits,
 ) {
     // Connect targets are hard-limited to the daemon loopback by construction.
-    let connect = tokio::time::timeout(
-        limits.connect_timeout,
+    run_stream_with_connect(
+        stream_id,
+        generation,
+        port,
+        msg_rx,
+        queued_bytes,
+        credit,
+        out_tx,
+        limits,
         TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
     )
     .await;
+}
+
+// Keep connect timing controllable in tests without changing public options,
+// connection dispatch, or the timeout/result/relay behavior below.
+#[expect(clippy::too_many_arguments)]
+async fn run_stream_with_connect(
+    stream_id: u32,
+    generation: Arc<()>,
+    port: u16,
+    mut msg_rx: mpsc::Receiver<StreamMsg>,
+    queued_bytes: Arc<AtomicUsize>,
+    credit: Arc<CreditWindow>,
+    out_tx: mpsc::Sender<OutboundFrame>,
+    limits: TunnelLimits,
+    connect: impl std::future::Future<Output = std::io::Result<TcpStream>>,
+) {
+    let connect = tokio::time::timeout(limits.connect_timeout, connect).await;
     let tcp = match connect {
         Ok(Ok(tcp)) => tcp,
         Ok(Err(e)) => {

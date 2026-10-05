@@ -261,6 +261,7 @@ fn context_key(
         .or_else(|| nonempty(env, "USERPROFILE"))
         .map(PathBuf::from);
     let mut files = Vec::new();
+    let mut claude_state = Vec::new();
     match cli {
         InstalledCli::Codex => {
             let root = nonempty(env, "CODEX_HOME")
@@ -276,15 +277,12 @@ fn context_key(
                 .map(PathBuf::from)
                 .or_else(|| home.as_ref().map(|p| p.join(".claude")));
             if let Some(root) = root {
-                files.extend([
-                    root.join(".credentials.json"),
-                    root.join("settings.json"),
-                    root.join(".claude.json"),
-                ]);
+                files.extend([root.join(".credentials.json"), root.join("settings.json")]);
+                claude_state.push(root.join(".claude.json"));
             }
             if let Some(home) = home {
+                claude_state.push(home.join(".claude.json"));
                 files.extend([
-                    home.join(".claude.json"),
                     home.join(".aws/credentials"),
                     home.join(".aws/config"),
                     home.join(".config/gcloud/application_default_credentials.json"),
@@ -309,11 +307,62 @@ fn context_key(
         }
     }
     let mut contents = Vec::new();
+    for path in claude_state {
+        let data = bounded_config(&path)?.map(|bytes| claude_state_projection(&bytes));
+        contents.push((path, data));
+    }
     for path in files {
-        contents.push((path.clone(), bounded_config(&path)?));
+        let data = bounded_config(&path)?;
+        contents.push((path, data));
     }
     // Process-private hash: cache files never contain reusable auth fingerprints.
     Ok(private_hash(&(env, contents)))
+}
+
+/// Top-level `.claude.json` keys that select the account or API key. The file
+/// is also Claude Code's state store, which it rewrites with cache timestamps
+/// and counters during ordinary runs, including model discovery itself.
+const CLAUDE_STATE_IDENTITY_KEYS: [&str; 3] =
+    ["oauthAccount", "primaryApiKey", "customApiKeyResponses"];
+
+/// Unparseable state keeps its raw bytes, so any change still invalidates.
+fn claude_state_projection(bytes: &[u8]) -> Vec<u8> {
+    let Ok(serde_json::Value::Object(state)) = serde_json::from_slice(bytes) else {
+        return bytes.to_owned();
+    };
+    let mut projection = serde_json::Map::new();
+    for key in CLAUDE_STATE_IDENTITY_KEYS {
+        let Some(value) = state.get(key) else {
+            continue;
+        };
+        let mut value = value.clone();
+        if let serde_json::Value::Object(account) = &mut value {
+            account.retain(|k, _| !k.ends_with("FetchedAt"));
+        }
+        projection.insert(key.to_owned(), canonical_json(value));
+    }
+    let mut out = b"claude-state-v1:".to_vec();
+    out.extend(serde_json::to_vec(&projection).unwrap_or_default());
+    out
+}
+
+fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k, canonical_json(v)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(canonical_json).collect())
+        }
+        other => other,
+    }
 }
 
 fn bounded_config(path: &Path) -> Result<Option<Vec<u8>>, String> {

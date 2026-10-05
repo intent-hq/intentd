@@ -1654,3 +1654,144 @@ async fn http_admission_redirect_never_releases_credentials_to_another_endpoint(
         assert!(destination.requests().is_empty());
     }
 }
+
+#[tokio::test]
+async fn checkout_branch_beyond_first_page_and_scoped_cursor_restore() {
+    let fixture = Fixture::new(|request| {
+        let second = request.path.contains("page=2");
+        let mut response = reply(200, if second {
+            json!([{"name":"feature/beyond-page-one","commit":{"id":"2222222222222222222222222222222222222222"}}])
+        } else {
+            json!([{"name":"main","commit":{"id":"1111111111111111111111111111111111111111"}}])
+        });
+        response.headers.push(("x-next-page".into(), if second { "" } else { "2" }.into()));
+        response
+    }).await;
+    let provider = fixture
+        .provider()
+        .with_pagination_scope("original-a".into());
+    let first = provider
+        .list_remote_branches("Group/Sub", "Project", None, PageParams::first(1))
+        .await
+        .unwrap();
+    let cursor = first.next_cursor.unwrap();
+    let page = || PageParams {
+        limit: 1,
+        cursor: Some(cursor.clone()),
+    };
+    assert!(provider
+        .list_remote_branches("Group/Sub", "Other", None, page())
+        .await
+        .is_err());
+    assert!(provider
+        .list_remote_branches("Group/Sub", "Project", Some("feature/"), page())
+        .await
+        .is_err());
+    let replaced = fixture
+        .provider()
+        .with_pagination_scope("replacement-b".into());
+    assert!(replaced
+        .list_remote_branches("Group/Sub", "Project", None, page())
+        .await
+        .is_err());
+    assert_eq!(fixture.requests().len(), 1, "mismatches do not dispatch");
+    let restored = provider
+        .list_remote_branches("Group/Sub", "Project", None, page())
+        .await
+        .unwrap();
+    assert_eq!(restored.items[0].name, "feature/beyond-page-one");
+    assert_eq!(
+        restored.items[0].commit_sha.as_deref(),
+        Some("2222222222222222222222222222222222222222")
+    );
+    assert!(restored.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn checkout_project_pagination_and_server_branch_search_preserve_missing_default() {
+    let fixture = Fixture::new(|request| {
+        if request.path.contains("repository/branches") {
+            assert!(request.path.contains("search=%5Efeature%2Ffar"));
+            reply(200, json!([{"name":"feature/far-away","commit":{"id":"3333333333333333333333333333333333333333"}}]))
+        } else {
+            let second = request.path.contains("page=2");
+            let mut response = reply(200, json!([{
+                "path_with_namespace": if second { "Group/Sub/Second" } else { "Group/Sub/First" },
+                "web_url": format!("{INSTANCE}/Group/Sub/Project"),
+                "default_branch": null
+            }]));
+            response.headers.push(("x-next-page".into(), if second { "" } else { "2" }.into()));
+            response
+        }
+    }).await;
+    let provider = fixture
+        .provider()
+        .with_pagination_scope("connection".into());
+    let first = provider
+        .search_repos("Group/Sub", PageParams::first(1))
+        .await
+        .unwrap();
+    assert!(first.items[0].default_branch.is_none());
+    let second = provider
+        .search_repos(
+            "Group/Sub",
+            PageParams {
+                limit: 1,
+                cursor: first.next_cursor,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.items[0].owner, "Group/Sub");
+    assert_eq!(second.items[0].name, "Second");
+    assert!(second.items[0].default_branch.is_none());
+    let selected = provider
+        .list_remote_branches(
+            "Group/Sub",
+            "Second",
+            Some("feature/far"),
+            PageParams::first(20),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.items[0].name, "feature/far-away");
+}
+
+#[test]
+fn checkout_callback_classifies_only_the_exact_read_picker_endpoints() {
+    use intent_sourcecontrol::gitlab::GitlabCredentialRequest;
+    let descriptor = GitlabDescriptor::new(GitlabInstance::parse(INSTANCE).unwrap());
+    assert_eq!(
+        GitlabCredentialRequest::direct(&descriptor, "projects", false)
+            .checkout_project()
+            .unwrap(),
+        None
+    );
+    for path in [
+        "projects/Group%2FSub%2FProject",
+        "projects/Group%2FSub%2FProject/repository/branches",
+    ] {
+        assert_eq!(
+            GitlabCredentialRequest::direct(&descriptor, path, false)
+                .checkout_project()
+                .unwrap()
+                .as_deref(),
+            Some("Group/Sub/Project")
+        );
+    }
+    for path in [
+        "user",
+        "projects/123",
+        "projects/Group%2FSub%2FProject/repository/files/x",
+        "projects/Group%2F..%2FProject",
+    ] {
+        assert!(GitlabCredentialRequest::direct(&descriptor, path, false)
+            .checkout_project()
+            .is_err());
+    }
+    assert!(
+        GitlabCredentialRequest::direct(&descriptor, "projects", true)
+            .checkout_project()
+            .is_err()
+    );
+}

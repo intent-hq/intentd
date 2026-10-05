@@ -181,22 +181,24 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
 /// Direct user retirement (protocol 10.10): +1 router method (`agent.retire`).
+/// Explicit PR detail reads (protocol 13.2): +3 router methods.
 /// Explicit queued batch sending (protocol 13.1): +1 router method.
 /// Reversible script history (protocol 10.11): +2 router methods
 /// (`script.archive`, `script.restore`).
 /// Durable script monitors (protocol 12.1): +3 router methods.
 /// Protocol 13.0 removes the deprecated git.commit router method.
-// GitLab repository reads and actions (13.3), plus owner-only invitation account search.
-const EXPECTED_TOTAL_METHODS: usize = 418;
+// GitLab pre-workspace checkout (13.5): +6 router methods.
+// Provider adapter preparation (13.6): +1 fast-path method.
+const EXPECTED_TOTAL_METHODS: usize = 428;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
-const EXPECTED_ROUTER_METHODS: usize = 363;
+const EXPECTED_ROUTER_METHODS: usize = 372;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 55;
+const EXPECTED_FASTPATH_METHODS: usize = 56;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 0;
@@ -647,10 +649,13 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "github.issues.list",
     "github.issues.search",
     "github.listReviewComments",
+    "github.pulls.checks",
     "github.pulls.create",
+    "github.pulls.files",
     "github.pulls.get",
     "github.pulls.list",
     "github.pulls.merge",
+    "github.pulls.reviews",
     "github.pulls.search",
     "github.pulls.updateBranch",
     "github.relatedRepos.list",
@@ -689,6 +694,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "host.members.list",
     "host.members.remove",
     "host.openInEditor",
+    "host.prepareProviderAdapters",
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.providerTestPrompt",
@@ -818,6 +824,12 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "skill.list",
     "sourceControl.authStatus",
     "sourceControl.cancelAuth",
+    "sourceControl.checkout.branches",
+    "sourceControl.checkout.capture",
+    "sourceControl.checkout.project",
+    "sourceControl.checkout.projects",
+    "sourceControl.checkout.release",
+    "sourceControl.checkout.warm",
     "sourceControl.connect",
     "sourceControl.getUser",
     "sourceControl.identityProof.create",
@@ -1169,7 +1181,7 @@ fn client_callable_universe() -> BTreeSet<String> {
 /// `voice.*`, `settings.*`, `repo.*` / `repoConfig.*`, `mcp.*`, `server.*`,
 /// `pairing.*`, `providers.setup.*`, `system.*` (but `system.capabilities`
 /// and `system.status`),
-/// `rules.*`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
+/// `rules.list` / `rules.update`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
 /// export / import / setup / browser-client pinning, `git.clone`,
 /// `git.agentCommit` (agent-only), agent creation / delegation (decided
 /// 2026-09-19: guests steer existing agents only — `agent.create`,
@@ -1227,10 +1239,13 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "github.issues.list",
     "github.issues.search",
     "github.listReviewComments",
+    "github.pulls.checks",
     "github.pulls.create",
+    "github.pulls.files",
     "github.pulls.get",
     "github.pulls.list",
     "github.pulls.merge",
+    "github.pulls.reviews",
     "github.pulls.search",
     "github.pulls.updateBranch",
     "github.relatedRepos.list",
@@ -1268,6 +1283,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "host.members.list",
     "host.members.remove",
     "host.openInEditor",
+    "host.prepareProviderAdapters",
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.providerTestPrompt",
@@ -1319,7 +1335,6 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "repoConfig.get",
     "repoConfig.has",
     "repoConfig.save",
-    "rules.get",
     "rules.list",
     "rules.update",
     "sandbox.cow.discard",
@@ -1857,6 +1872,9 @@ mod unbound_owner_only_methods {
                 "github.pulls.create",
                 json!({ "owner": "o", "repo": "r", "title": "t", "body": "b", "head": "h", "base": "b" }),
             ),
+            ("github.pulls.checks", gh_n.clone()),
+            ("github.pulls.files", gh_n.clone()),
+            ("github.pulls.reviews", gh_n.clone()),
             ("github.pulls.get", gh_n.clone()),
             ("github.pulls.list", gh.clone()),
             ("github.pulls.merge", gh_n.clone()),
@@ -1945,10 +1963,6 @@ mod unbound_owner_only_methods {
             (
                 "repoConfig.save",
                 json!({ "workspaceId": ws, "config": {} }),
-            ),
-            (
-                "rules.get",
-                json!({ "workspaceId": ws, "ruleType": "agents" }),
             ),
             ("rules.list", json!({})),
             (
@@ -2502,6 +2516,7 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "host.members.list",
         "host.members.remove",
         "host.openInEditor",
+        "host.prepareProviderAdapters",
         "host.providerTestPrompt",
         "identity.authStatus",
         "identity.cancelAuth",

@@ -34,6 +34,7 @@ struct AttestedSource {
 pub(super) struct SourceEvidence {
     nonce: uuid::Uuid,
     published: Mutex<Option<Arc<AttestedSource>>>,
+    checkout_denials: Mutex<std::collections::HashMap<String, RepositorySecretRequest>>,
     #[cfg(test)]
     read_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -43,6 +44,7 @@ impl SourceEvidence {
         Self {
             nonce: uuid::Uuid::new_v4(),
             published: Mutex::new(None),
+            checkout_denials: Mutex::new(std::collections::HashMap::new()),
             #[cfg(test)]
             read_probe: Mutex::new(None),
         }
@@ -799,6 +801,108 @@ pub(crate) struct RepositorySettledConnection {
 }
 
 impl RepositorySettledConnection {
+    /// Caller owns its original pre-workspace fence. Keep the original ranked
+    /// metadata guards through one non-I/O transfer; no target or permission is
+    /// inferred from this connection. Dispatch includes the existing quota gate.
+    pub(crate) fn with_checkout_current<T>(
+        &self,
+        expected: Option<&RepositorySecretRequest>,
+        projects: &[&str],
+        dispatch: bool,
+        action: impl FnOnce(
+            &RepositorySecretRequest,
+            crate::repository_credentials::RepositoryDispatchStamp,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
+        let config = settings.config.lock().map_err(|_| Error::Indeterminate)?;
+        let descriptor = self
+            .owner
+            .descriptor
+            .lock()
+            .map_err(|_| Error::Indeterminate)?;
+        self.owner.directory.with_checkout_metadata(
+            &self.selected.binding,
+            expected,
+            dispatch,
+            |actual, selected, stamp| {
+                let proof = self
+                    .owner
+                    .evidence
+                    .published
+                    .lock()
+                    .map_err(|_| Error::Indeterminate)?;
+                if settings.source.is_none()
+                    || settings.store.is_none()
+                    || selected.source != RepositoryCredentialSource::GitlabSecretSlot
+                {
+                    return Err(Error::Unverified);
+                }
+                let proof = proof.as_ref().ok_or(Error::Unverified)?;
+                if proof.request != *selected {
+                    return Err(Error::SecretMismatch);
+                }
+                if descriptor.as_ref() != Some(actual)
+                    || proof.descriptor != *actual
+                    || super::adoption::approved_descriptor(&config, &settings.fixtures).as_ref()
+                        != Some(actual)
+                    || self.descriptor != *actual
+                    || self.selected.source != selected.source
+                {
+                    return Err(Error::BoundaryMismatch);
+                }
+                let denials = self
+                    .owner
+                    .evidence
+                    .checkout_denials
+                    .lock()
+                    .map_err(|_| Error::Indeterminate)?;
+                if projects.iter().any(|p| denials.get(*p) == Some(selected)) {
+                    return Err(Error::AuthorityDenied);
+                }
+                action(selected, stamp)
+            },
+        )
+    }
+
+    /// A denial from the actual original response quarantines this source
+    /// revision for the project across captures. Refresh/replacement cannot be
+    /// rejected by an old response, and cached data never clears a known denial.
+    pub(crate) fn reject_checkout_project(
+        &self,
+        selected: &RepositorySecretRequest,
+        project: &str,
+    ) {
+        let _ =
+            self.owner
+                .directory
+                .with_settled_metadata(Some(&selected.binding), |_, current| {
+                    if current != selected {
+                        return Err(Error::SecretMismatch);
+                    }
+                    self.owner
+                        .evidence
+                        .checkout_denials
+                        .lock()
+                        .map_err(|_| Error::Indeterminate)?
+                        .insert(project.into(), current.clone());
+                    Ok(())
+                });
+    }
+
+    pub(crate) fn observe_checkout_response(
+        &self,
+        stamp: &crate::repository_credentials::RepositoryDispatchStamp,
+        response: intent_sourcecontrol::gitlab::GitlabResponseObservation,
+    ) {
+        if let Some(until) = response.backoff_until {
+            let _ = self.owner.directory.record_backoff(stamp, until);
+        }
+        if response.status == 401 {
+            let _ = self.owner.directory.reject_current_credential(stamp);
+        }
+    }
+
     pub(crate) fn descriptor(&self) -> &GitlabDescriptor {
         &self.descriptor
     }

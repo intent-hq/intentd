@@ -275,6 +275,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -319,6 +320,29 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 /// resume (child torn down, reloaded fresh).
 #[tokio::test]
 async fn suspend_interrupted_turn_enrolls_and_resumes_over_wss() {
+    assert_suspend_interrupted_turn_resumes(json!({
+        "code": -32603, "message": "Connection reset by peer"
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn timeout_interrupted_turn_enrolls_and_resumes_over_wss() {
+    assert_suspend_interrupted_turn_resumes(json!({
+        "code": -32603, "message": "The operation was aborted due to timeout"
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn terminated_interrupted_turn_enrolls_and_resumes_over_wss() {
+    assert_suspend_interrupted_turn_resumes(json!({
+        "code": -32603, "message": "Internal error", "data": { "details": "terminated" }
+    }))
+    .await;
+}
+
+async fn assert_suspend_interrupted_turn_resumes(prompt_error: Value) {
     let Some(script) = gate("WSS wake-resume E2E") else {
         return;
     };
@@ -329,13 +353,13 @@ async fn suspend_interrupted_turn_enrolls_and_resumes_over_wss() {
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
     let session_log = data_dir.join("sessions.log");
     let session_log_s = session_log.to_string_lossy().into_owned();
-    // First prompt attempt fails with a transient (connection-class) RPC error
+    // First prompt attempt fails with a transient provider RPC error
     // after streaming a warning chunk; the retry (attempt 2, on the reloaded
     // session) succeeds. `loadSession: true` makes the resume's `session/load`
     // reachable.
     let behavior = json!({
         "loadSession": true,
-        "promptRpcError": { "code": -32603, "message": "Connection reset by peer" },
+        "promptRpcError": prompt_error,
         "promptRpcErrorAttempts": 1,
         "streamBeforeErrorText": "partial ",
         "response": "resumed after suspend",
@@ -408,11 +432,18 @@ async fn suspend_interrupted_turn_enrolls_and_resumes_over_wss() {
     // resume drives the agent back to idle on a successful turn.
     let mut saw_suspend_end = false;
     let mut resumed_to_idle = false;
+    let mut saw_resumed_output = false;
     for _ in 0..400 {
         let frame = wss_event(&mut sub, 30).await;
         let event = &frame["params"]["event"];
         if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
             continue;
+        }
+        if saw_suspend_end
+            && event["type"].as_str() == Some("agent:last-message")
+            && event["data"]["lastAgentResponse"].as_str() == Some("resumed after suspend")
+        {
+            saw_resumed_output = true;
         }
         match event["type"].as_str() {
             Some("agent:failed") => {
@@ -446,6 +477,11 @@ async fn suspend_interrupted_turn_enrolls_and_resumes_over_wss() {
     assert!(
         resumed_to_idle,
         "the enrolled turn self-healed to a successful resumed completion (agent:idle)"
+    );
+
+    assert!(
+        saw_resumed_output,
+        "the resumed provider produced its continuation output"
     );
 
     // The interrupted list drains: the enrolled row was claimed and resolved by

@@ -117,6 +117,55 @@ impl GitlabCredentialRequest<'_> {
             .allows(project_path, self.path, self.writing)
     }
 
+    /// Exact checkout browsing project, or no project for project discovery.
+    /// This is endpoint classification, never permission.
+    ///
+    /// # Errors
+    /// Refuses other endpoints, malformed project paths and all writes.
+    pub fn checkout_project(self) -> Result<Option<String>> {
+        if self.writing {
+            return Err(Error::AdmissionRetired);
+        }
+        if self.path == "projects" {
+            return Ok(None);
+        }
+        let rest = self
+            .path
+            .strip_prefix("projects/")
+            .ok_or(Error::AdmissionRetired)?;
+        let (encoded, suffix) = rest.split_once('/').unwrap_or((rest, ""));
+        if !matches!(suffix, "" | "repository/branches") {
+            return Err(Error::AdmissionRetired);
+        }
+        let mut decoded = Vec::with_capacity(encoded.len());
+        let mut bytes = encoded.as_bytes().iter().copied();
+        while let Some(byte) = bytes.next() {
+            decoded.push(if byte == b'%' {
+                let high = bytes
+                    .next()
+                    .and_then(|b| char::from(b).to_digit(16))
+                    .ok_or(Error::AdmissionRetired)?;
+                let low = bytes
+                    .next()
+                    .and_then(|b| char::from(b).to_digit(16))
+                    .ok_or(Error::AdmissionRetired)?;
+                u8::try_from(high * 16 + low).map_err(|_| Error::AdmissionRetired)?
+            } else {
+                byte
+            });
+        }
+        let project = String::from_utf8(decoded).map_err(|_| Error::AdmissionRetired)?;
+        if !project.contains('/')
+            || project
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            || !self.is_for_project(&project)
+        {
+            return Err(Error::AdmissionRetired);
+        }
+        Ok(Some(project))
+    }
+
     /// The single native API write admitted by the current GitLab implementation.
     #[must_use]
     pub fn is_review_create(self, project_path: &str) -> bool {
@@ -134,6 +183,7 @@ pub struct GitLabSourceControl {
     descriptor: GitlabDescriptor,
     credentials: Arc<dyn GitlabRequestCredentials>,
     rate_limit: RwLock<RateLimitStatus>,
+    pagination_scope: String,
 }
 
 impl GitLabSourceControl {
@@ -159,7 +209,16 @@ impl GitLabSourceControl {
             client,
             credentials,
             rate_limit: RwLock::default(),
+            pagination_scope: String::new(),
         })
+    }
+
+    /// Bind cursors to an original connection/caller capture. Correlation only;
+    /// credentials still authorize every request.
+    #[must_use]
+    pub fn with_pagination_scope(mut self, scope: String) -> Self {
+        self.pagination_scope = scope;
+        self
     }
 
     /// Legacy aggregates cannot carry per-field availability; any consumed quota
@@ -241,8 +300,13 @@ impl GitLabSourceControl {
         request_scope: RequestScope<'_>,
     ) -> Result<Page<Value>> {
         let limit = page.limit.clamp(1, 100);
-        let scope =
-            serde_json::to_string(&(self.descriptor.instance().as_str(), path, &query, limit))?;
+        let scope = serde_json::to_string(&(
+            self.descriptor.instance().as_str(),
+            &self.pagination_scope,
+            path,
+            &query,
+            limit,
+        ))?;
         let current = match page.cursor {
             None => 1,
             Some(cursor) => {

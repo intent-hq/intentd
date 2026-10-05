@@ -88,6 +88,7 @@ fn sample_ws() -> Workspace {
         created_at: "t0".to_string(),
         updated_at: "t0".to_string(),
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -2167,6 +2168,17 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn pr_refresh_automatic(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".into()));
+            }
+            Ok(
+                serde_json::json!({"outcome": "skipped", "prNumber": 300, "prUrl": null, "prStatus": "Open", "pullRequests": [{"number": 300}]}),
+            )
+        })
+    }
+
     fn pr_refresh(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             if id.as_str() == "missing" {
@@ -4037,7 +4049,11 @@ async fn agent_list_scope_params_are_validated() {
     ] {
         let v = call(frame).await.unwrap();
         assert_eq!(err_code(&v), -32602, "{frame}: {v}");
-        assert_eq!(v["error"]["message"], serde_json::json!(expected), "{frame}");
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!(expected),
+            "{frame}"
+        );
     }
     // `orphanedOnly: false` reads as absent on any scope: the frame passes
     // param validation into the trait default (`Internal` → `-32603`),
@@ -7309,6 +7325,20 @@ async fn pr_refresh_dispatches_and_returns_service_result() {
     assert_eq!(v["result"]["prUrl"], "https://github.com/o/r/pull/300");
     assert_eq!(v["result"]["prStatus"], "Open");
     assert_eq!(v["result"]["pullRequests"][0]["number"], 300);
+}
+
+#[tokio::test]
+async fn pr_refresh_routes_automatic_and_validates_provenance() {
+    for (value, expected) in [("true", "skipped"), ("false", "linked")] {
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"pr.refresh","params":{{"workspaceId":"ws-1","automatic":{value}}}}}"#
+        );
+        let result = call(&request).await.unwrap();
+        assert_eq!(result["result"]["outcome"], expected);
+        assert_eq!(result["result"]["prNumber"], 300);
+    }
+    let result = call(r#"{"jsonrpc":"2.0","id":1,"method":"pr.refresh","params":{"workspaceId":"ws-1","automatic":"true"}}"#).await.unwrap();
+    assert_eq!(result["error"]["code"], -32602);
 }
 
 #[tokio::test]

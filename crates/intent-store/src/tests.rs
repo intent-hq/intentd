@@ -29,6 +29,40 @@ mod note_line_attribution;
 mod note_pages;
 mod note_search;
 
+#[tokio::test]
+async fn workspace_content_clocks_project_only_requested_timestamps_in_batches() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.unwrap();
+    assert!(store
+        .workspace_content_clocks(&[])
+        .await
+        .unwrap()
+        .is_empty());
+    let included = WorkspaceId::from("included");
+    let excluded = WorkspaceId::from("excluded");
+    let mut ws = sample_workspace(&included, "included", false);
+    ws.created_at = "2026-01-01T00:00:00Z".into();
+    ws.last_content_activity = Some("2026-01-02T00:00:00Z".into());
+    store.insert_workspace(&ws).await.unwrap();
+    store
+        .insert_workspace(&sample_workspace(&excluded, "excluded", false))
+        .await
+        .unwrap();
+    // More than one SQL batch, including repeated IDs and missing rows.
+    let mut ids: Vec<_> = (0..405)
+        .map(|i| WorkspaceId::from(format!("missing-{i}")))
+        .collect();
+    ids.extend([included.clone(), included.clone()]);
+    let clocks = store.workspace_content_clocks(&ids).await.unwrap();
+    assert_eq!(clocks.len(), 1);
+    assert_eq!(clocks[&included].created_at, ws.created_at);
+    assert_eq!(
+        clocks[&included].last_content_activity,
+        ws.last_content_activity
+    );
+    assert!(!clocks.contains_key(&excluded));
+}
+
 /// A unique temp DB path inside an RAII temp dir: the dir (and with it the
 /// `.db`/`-wal`/`-shm` files) is removed on drop, including on panic; set
 /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
@@ -71,6 +105,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         created_at: ts.clone(),
         updated_at: ts.clone(),
         last_activity: Some(ts),
+        last_content_activity: None,
         tags: vec!["alpha".to_string(), "beta".to_string()],
         path: Some("/tmp/ws-meta".to_string()),
         repository_path: Some("/tmp/repo".to_string()),
@@ -6451,6 +6486,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     created_at: ts.clone(),
                     updated_at: ts.clone(),
                     last_activity: None,
+                    last_content_activity: None,
                     tags: vec![],
                     path: Some(format!("/tmp/ws-{i}")),
                     repository_path: None,

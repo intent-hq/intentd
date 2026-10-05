@@ -384,7 +384,7 @@ async fn indexed_note_pages_migrate_existing_notes_and_preserve_legacy_text() {
         migrations: std::borrow::Cow::Owned(
             crate::MIGRATOR
                 .iter()
-                .filter(|m| m.version < 147)
+                .filter(|m| m.version < 148)
                 .cloned()
                 .collect(),
         ),

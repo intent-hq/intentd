@@ -13,7 +13,7 @@ set -euo pipefail
 # BASE=HEAD or DRY_RUN=1 exported would change every expected argv).
 unset BASE DRY_RUN BUILD_JOBS TEST_THREADS NEXTEST_SHOW_PROGRESS CARGO_TERM_PROGRESS_WHEN
 unset NEXTEST_RUNNER INTENTD_TEST_TIMEOUT_MULTIPLIER
-unset RUN_STDIN
+unset RUN_STDIN INTENTD_ASSERT_BOUND_CALLER
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 script="$here/changed-tests.sh"
@@ -28,6 +28,9 @@ bin_dir="$temp_dir/bin"
 repo="$temp_dir/repo"
 mkdir -p "$bin_dir" "$repo/scripts"
 cp "$script" "$repo/scripts/changed-tests.sh"
+if [[ -f "$here/with-test-policy.sh" ]]; then
+  cp "$here/with-test-policy.sh" "$repo/scripts/"
+fi
 script="$repo/scripts/changed-tests.sh"
 trap 'rm -rf "$temp_dir"' EXIT
 
@@ -59,6 +62,7 @@ chmod +x "$bin_dir/git"
 # could, so the script must not feed it the remaining plans.
 cat >"$bin_dir/cargo" <<'SH'
 #!/usr/bin/env bash
+[[ "${INTENTD_ASSERT_BOUND_CALLER-}" == 1 ]] || { echo "cargo: caller policy is not armed" >&2; exit 91; }
 printf '%s: %s%s\n' "$PWD" "${INTENTD_TEST_TIMEOUT_MULTIPLIER:+INTENTD_TEST_TIMEOUT_MULTIPLIER=$INTENTD_TEST_TIMEOUT_MULTIPLIER }" "$*" >>"$CARGO_TEST_LOG"
 while IFS= read -r line; do printf '%s\n' "$line" >>"$CARGO_STDIN_LOG"; done
 exit "${CARGO_STUB_EXIT:-0}"
@@ -69,6 +73,7 @@ chmod +x "$bin_dir/cargo"
 # its cwd to RUNNER_CWD_LOG, and exits with RUNNER_STUB_EXIT (default 0).
 cat >"$bin_dir/runner" <<'SH'
 #!/usr/bin/env bash
+[[ "${INTENTD_ASSERT_BOUND_CALLER-}" == 1 ]] || { echo "runner: caller policy is not armed" >&2; exit 91; }
 { echo "call:"; printf '%s\n' "$@"; } >>"$RUNNER_TEST_LOG"
 printf '%s\n' "$PWD" >>"$RUNNER_CWD_LOG"
 exit "${RUNNER_STUB_EXIT:-0}"
@@ -451,6 +456,27 @@ expect_runner() {
   [[ -z "$cargo_log" ]] || fail "$case_name invoked cargo alongside the runner: $cargo_log"
 }
 
+# Canonical execution overrides any inherited disabling value at the child
+# boundary, including the custom runner that owns resumed test execution.
+for inherited_policy in '' 0 false 1; do
+  case_name="child policy overrides inherited '$inherited_policy'"
+  reset_repo
+  edit crates/alpha/tests/one.rs
+  INTENTD_ASSERT_BOUND_CALLER="$inherited_policy" run_script
+  expect_ok
+  expect_cargo "-p alpha --test one"
+  reset_repo
+  edit crates/alpha/tests/one.rs
+  INTENTD_ASSERT_BOUND_CALLER="$inherited_policy" run_script --instrumented
+  expect_ok
+  expect_cov "-p alpha --test one"
+  reset_repo
+  edit crates/alpha/tests/one.rs
+  INTENTD_ASSERT_BOUND_CALLER="$inherited_policy" NEXTEST_RUNNER="$bin_dir/runner" run_script
+  expect_ok
+  expect_runner --plan "-p alpha --test one" --base origin/main --label test-changed
+done
+
 case_name="runner receives every plan in one invocation"
 reset_repo
 edit crates/alpha/tests/one.rs
@@ -742,6 +768,7 @@ echo "changed-tests tests passed under $("$script_bash" -c 'echo "bash $BASH_VER
 # runs this script there. `bash -n` alone accepts Bash 4+ builtins and
 # expansions, so reject them by pattern too, then rerun the fixtures under a
 # real Bash 3 when one can be found.
+bash -n "$here/with-test-policy.sh" || fail "with-test-policy.sh does not parse"
 bash -n "$script" || fail "changed-tests.sh does not parse"
 bash -n "${BASH_SOURCE[0]}" || fail "test-changed-tests.sh does not parse"
 bash4_constructs='(^|[^A-Za-z0-9_])(declare|local|typeset)([[:blank:]]+-[A-Za-z]+)*[[:blank:]]+-[A-Za-z]*[An][A-Za-z]*([^A-Za-z]|$)|(^|[^A-Za-z0-9_])(mapfile|readarray|coproc)([^A-Za-z0-9_]|$)|\$\{([A-Za-z_][A-Za-z_0-9]*|[0-9]+|[@*#?!$-])(\[[^]]*\])?(\^\^?|,,?)[^}]*\}|&>>|\|&|;;?&'
@@ -770,7 +797,7 @@ gate_sample miss 'echo ${rest%%/*}'
 gate_sample miss 'echo ${path##* -> }'
 gate_sample miss 'x) y ;;'
 gate_sample miss '# mapfile is unavailable on Bash 3'
-gate_hits=$(gate_matches "$script" "${BASH_SOURCE[0]}")
+gate_hits=$(gate_matches "$script" "$here/with-test-policy.sh" "${BASH_SOURCE[0]}")
 [[ -z "$gate_hits" ]] || fail "Bash 4+ constructs found (stock macOS bash is 3.2):"$'\n'"$gate_hits"
 
 find_bash3() {

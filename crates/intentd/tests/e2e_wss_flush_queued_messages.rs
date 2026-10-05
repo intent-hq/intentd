@@ -367,6 +367,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -677,6 +678,7 @@ struct DrainObservation {
     processing_frames: Vec<Value>,
     user_row_turn_ids: Vec<String>,
     user_row_queued_message_ids: Vec<Option<String>>,
+    user_frames: Vec<Value>,
 }
 
 async fn observe_drain(
@@ -689,6 +691,7 @@ async fn observe_drain(
     let mut processing_frames = Vec::new();
     let mut user_row_turn_ids = Vec::new();
     let mut user_row_queued_message_ids = Vec::new();
+    let mut user_frames = Vec::new();
     let mut stream_ends = 0usize;
     for _ in 0..400 {
         let frame = wss_event(sub, 30).await;
@@ -712,6 +715,7 @@ async fn observe_drain(
             }
             Some("agent:message") => {
                 if event["data"]["role"] == "user" {
+                    user_frames.push(event["data"].clone());
                     if let Some(tid) = event["data"]["turnId"].as_str() {
                         user_row_turn_ids.push(tid.to_string());
                     }
@@ -741,6 +745,7 @@ async fn observe_drain(
         processing_frames,
         user_row_turn_ids,
         user_row_queued_message_ids,
+        user_frames,
     }
 }
 
@@ -1181,7 +1186,7 @@ async fn two_members_see_shared_queue_and_flush_combines_both_over_wss() {
         &mut rpc,
         12,
         "agent.queueMessage",
-        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": OWNER_QUEUED }),
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": OWNER_QUEUED, "messageId":"owner-original" }),
     )
     .await;
     assert_eq!(owner_q["success"], true, "owner queue: {owner_q}");
@@ -1194,11 +1199,64 @@ async fn two_members_see_shared_queue_and_flush_combines_both_over_wss() {
         &mut rpc,
         120,
         "agent.queueMessage",
-        json!({"agentId":agent_id,"content":"second owner submission"}),
+        json!({"agentId":agent_id,"content":"second owner submission","messageId":"owner-second","messageMetadata":{"submissionIds":["forged"],"recoverySources":[{}]}}),
     )
     .await;
     assert_eq!(appended["queuedMessage"]["id"], owner_id);
     assert_eq!(appended["turnId"], owner_q["turnId"]);
+    assert_eq!(
+        appended["queuedMessage"]["submissionIds"],
+        json!(["owner-second", "owner-original"])
+    );
+    assert!(appended["queuedMessage"]["messageMetadata"]
+        .get("recoverySources")
+        .is_none());
+    assert!(appended["queuedMessage"]["messageMetadata"]
+        .get("submissionIds")
+        .is_none());
+    let hello = wss_rpc(
+        &mut rpc,
+        900,
+        "client.hello",
+        json!({"clientId":"correlation-client"}),
+    )
+    .await;
+    assert_eq!(hello["server"]["capabilities"]["submissionCorrelation"], 1);
+    assert_eq!(hello["protocolVersion"], intent_transport::PROTOCOL_VERSION);
+    assert_eq!(
+        hello["server"]["protocolVersion"],
+        intent_transport::PROTOCOL_VERSION
+    );
+    for (index, invalid) in [json!(null), json!(""), json!(123), json!([])]
+        .into_iter()
+        .enumerate()
+    {
+        let result = wss_rpc_envelope(
+            &mut rpc,
+            901 + i64::try_from(index).unwrap(),
+            "agent.queueMessage",
+            json!({"agentId":agent_id,"content":"invalid","messageId":invalid}),
+        )
+        .await;
+        assert_eq!(result["jsonrpc"], "2.0");
+        assert_eq!(result["error"]["code"], -32602);
+    }
+    let foreign = wss_rpc_envelope(
+        &mut guest_rpc,
+        906,
+        "agent.queueMessage",
+        json!({"agentId":agent_id,"content":"forged replay","messageId":"owner-second"}),
+    )
+    .await;
+    assert_eq!(foreign["error"]["code"], -32602);
+    let replay = wss_rpc(
+        &mut rpc,
+        907,
+        "agent.queueMessage",
+        json!({"agentId":agent_id,"content":"must not append","messageId":"owner-second"}),
+    )
+    .await;
+    assert_eq!(replay["queuedMessage"], appended["queuedMessage"]);
     assert_eq!(appended["queuedMessage"]["position"], 0);
     assert_eq!(
         appended["queuedMessage"]["content"],
@@ -1209,6 +1267,10 @@ async fn two_members_see_shared_queue_and_flush_combines_both_over_wss() {
     assert_eq!(busy["queued"], true);
     assert_eq!(busy["queuedMessage"]["id"], owner_id);
     assert_eq!(busy["turnId"], owner_q["turnId"]);
+    assert_eq!(
+        busy["submissionIds"],
+        busy["queuedMessage"]["submissionIds"]
+    );
     let contributions = busy["queuedMessage"]["messageMetadata"]["mergedMessageMetadata"]
         .as_array()
         .unwrap();
@@ -1285,6 +1347,37 @@ async fn two_members_see_shared_queue_and_flush_combines_both_over_wss() {
         .to_string();
     assert_ne!(owner_id, guest_id, "distinct entry ids");
 
+    let after_guest = wss_rpc(
+        &mut rpc,
+        908,
+        "agent.queueMessage",
+        json!({"agentId":agent_id,"content":OWNER_QUEUED,"messageId":"owner-after-guest"}),
+    )
+    .await;
+    assert_ne!(
+        after_guest["queuedMessage"]["id"], owner_id,
+        "foreign arrival splits even identical text"
+    );
+    let split = wss_rpc(&mut rpc, 909, "agent.getQueue", json!({"agentId":agent_id})).await;
+    assert_eq!(
+        queue_ids(&split["queue"]),
+        vec![
+            owner_id.clone(),
+            guest_id.clone(),
+            "owner-after-guest".into()
+        ]
+    );
+    assert_eq!(split["queue"][0]["mergeEligible"], false);
+    assert_eq!(split["queue"][1]["mergeEligible"], false);
+    assert_eq!(split["queue"][2]["mergeEligible"], true);
+    wss_rpc(
+        &mut rpc,
+        910,
+        "agent.removeQueuedMessage",
+        json!({"agentId":agent_id,"messageId":"owner-after-guest"}),
+    )
+    .await;
+
     // (1) agent.getQueue: owner sees both; guest sees only its own.
     let owner_view = wss_rpc(
         &mut rpc,
@@ -1299,6 +1392,8 @@ async fn two_members_see_shared_queue_and_flush_combines_both_over_wss() {
         "owner reads the full queue in order: {owner_view}"
     );
     let entries = owner_view["queue"].as_array().expect("queue array");
+    assert_eq!(entries[0]["mergeEligible"], false);
+    assert_eq!(entries[1]["mergeEligible"], true);
     assert_eq!(entries[0]["position"], json!(0), "{owner_view}");
     assert_eq!(entries[1]["position"], json!(1), "{owner_view}");
     assert_eq!(entries[0]["content"], json!(OWNER_QUEUED), "{owner_view}");
@@ -1389,6 +1484,20 @@ async fn two_members_see_shared_queue_and_flush_combines_both_over_wss() {
         "projected push keeps position 1: {guest_last}"
     );
 
+    // Consume the repeated-text barrier and its removal before observing drain.
+    for sub in [&mut owner_sub, &mut guest_sub] {
+        let split_pushes = await_queue_snapshots(sub, &agent_id, |q| {
+            queue_ids(q).contains(&"owner-after-guest".to_string())
+        })
+        .await;
+        assert_eq!(split_pushes.last().unwrap()[2]["mergeEligible"], true);
+        let restored = await_queue_snapshots(sub, &agent_id, |q| {
+            queue_ids(q) == [owner_id.clone(), guest_id.clone()]
+        })
+        .await;
+        assert_eq!(restored.last().unwrap()[1]["mergeEligible"], true);
+    }
+
     // (3) Ownership refusals — none publishes a snapshot.
     let owner_edit = wss_rpc_envelope(
         &mut rpc,
@@ -1466,18 +1575,17 @@ async fn two_members_see_shared_queue_and_flush_combines_both_over_wss() {
         observe_drain(&mut owner_sub, &agent_id, 2),
         observe_drain(&mut guest_sub, &agent_id, 2),
     );
-    // The enqueue-phase snapshots were consumed above and the refusals
-    // published none, so the only snapshot left is the drain's — one shot,
-    // straight to empty, on both projections.
+    // Each persisted row publishes the full draining overlay before the
+    // guard retires the batch in one step. No partial queue is published.
     assert_eq!(
         owner_obs.queue_lengths,
-        vec![0],
-        "owner: queue empties in one snapshot (2 → 0)"
+        vec![2, 2, 0],
+        "owner: both draining entries remain visible until retirement"
     );
     assert_eq!(
         guest_obs.queue_lengths,
-        vec![0],
-        "guest: projected queue empties in one snapshot (1 → 0)"
+        vec![2, 2, 0],
+        "guest: both draining entries remain visible until retirement"
     );
     assert_eq!(
         owner_obs.processing_turn_ids.len(),
@@ -1493,6 +1601,23 @@ async fn two_members_see_shared_queue_and_flush_combines_both_over_wss() {
     // The drain-start frame is keyed on the batch head — the owner's entry.
     // All participants receive the same content and surviving identity.
     let owner_processing = &owner_obs.processing_frames[0];
+    for (row, original) in owner_processing["queuedMessages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(entries)
+    {
+        assert_eq!(row["submissionIds"], original["submissionIds"]);
+        assert_eq!(row["mergeEligible"], false);
+    }
+    for original in entries {
+        let delivered = owner_obs
+            .user_frames
+            .iter()
+            .find(|frame| frame["queuedMessageId"] == original["id"])
+            .unwrap();
+        assert_eq!(delivered["submissionIds"], original["submissionIds"]);
+    }
     assert_eq!(
         owner_processing["messageId"],
         json!(owner_id),
@@ -1562,6 +1687,14 @@ async fn two_members_see_shared_queue_and_flush_combines_both_over_wss() {
                 .is_some_and(|t| t.starts_with(GUEST_PREAMBLE) && t.contains(GUEST_QUEUED))
         })
         .unwrap_or_else(|| panic!("missing guest user row: {conv}"));
+    assert_eq!(
+        owner_row["metadata"]["submissionIds"],
+        entries[0]["submissionIds"]
+    );
+    assert_eq!(
+        guest_row["metadata"]["submissionIds"],
+        entries[1]["submissionIds"]
+    );
     let batch_id = owner_row["metadata"]["queueInfo"]["batchId"]
         .as_str()
         .expect("flushed row carries queueInfo.batchId");
@@ -2157,4 +2290,186 @@ async fn explicit_batch_over_wss(fail_second_append: bool) {
         "EXPLICIT_BATCH_EVIDENCE {}",
         json!({"partialPersistence":fail_second_append,"response":response,"prompts":prompts,"remainingQueue":remaining,"conversation":conv})
     );
+}
+
+/// An agent reads its own queue through real MCP while humans read it over
+/// WSS, then ends its turn so the original entries drain normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_queue_reads_do_not_reveal_or_consume_pending_messages_over_wss() {
+    let Some(script) = gate("WSS self queue visibility E2E") else {
+        return;
+    };
+    let tmp = temp_data_dir();
+    let data_dir = tmp.path();
+    let (ws_id, _) = seed_workspace_with_guest(data_dir).await;
+    let release = data_dir.join("release-self-read");
+    let code = r"
+        const secret = ['PENDING', 'WSS', 'SECRET'].join('-');
+        const target = (await ws.agent.list(true)).find(a => a.name === 'SELF-QUEUE-READER');
+        const status = await ws.agent.status(target.id);
+        const queue = await ws.agent.getQueue(target.id);
+        const diagnostics = await ws.agent.diagnostics();
+        const filtered = await ws.agent.diagnostics({agentId: target.id});
+        const events = await ws.event.query({eventType: 'agent:queue:*', paginate: true});
+        const activity = await ws.event.agentActivity(target.id);
+        const output = JSON.stringify({status, queue, diagnostics, filtered, events, activity});
+        if (output.includes(secret)) throw new Error('self queue leaked: ' + output);
+        if (status.queueLength !== 2 || status.queue.length !== 0 || queue.queueLength !== 2 || !queue.refused)
+            throw new Error('self counts/refusal wrong: ' + output);
+        const row = diagnostics.diagnostics.queues.find(q => q.agentId === target.id);
+        if (row.queueLength !== 2 || row.entries.length !== 0) throw new Error('diagnostics wrong');
+        if (!status.queueNotice.includes('after the current turn') || !diagnostics.text.includes('contents hidden'))
+            throw new Error('missing visibility explanation');
+        const hook = await ws.hook.schedule({name:'Self queue read probe', delayMs:10000, ttlMs:10000,
+            code: `const q = await ws.agent.getQueue('${target.id}');
+                const d = await ws.agent.diagnostics();
+                const row = d.diagnostics.queues.find(q => q.agentId === '${target.id}');
+                if (row.queueLength !== 2 || row.entries.length !== 0 || !d.text.includes('contents hidden'))
+                    throw new Error('hook diagnostics lost count or visibility notice');
+                if (d.diagnostics.stuckRisks.some(r => r.type === 'stale-queue-entry' && r.agentId === '${target.id}'))
+                    throw new Error('fresh active owner queue incorrectly flagged stale');
+                const e = await ws.event.query({eventType:'agent:queue:*'});
+                if (!q.refused || q.queueLength !== 2 || JSON.stringify({q,d,e}).includes(['PENDING','WSS','SECRET'].join('-')))
+                    throw new Error('hook self queue leaked');
+                return {dispatch:false};`});
+        await ws.hook.cancel(hook.hook.hookId);
+        return {__mcpContentItems:[{type:'text',text:JSON.stringify({proof:'SELF-QUEUE-READS-PASSED'})}]};
+    ";
+    let rule = json!({"ifPromptContains":KICKOFF_MSG,"releaseFile":release,
+        "toolCall":{"name":"workspace_api","arguments":{"code":code,"summary":"Check self queue visibility"}},
+        "responseFromToolResultField":"proof"});
+    let delivered_rule = json!({
+        "ifPromptContains":"PENDING-WSS-SECRET-owner",
+        "toolCall":{"name":"workspace_api","arguments":{
+            "code":"const a=(await ws.agent.list(true)).find(a=>a.name==='SELF-QUEUE-READER'); const c=await ws.agent.readConversation(a.id); if(!JSON.stringify(c).includes('PENDING-WSS-SECRET-owner')) throw new Error('delivered transcript hidden'); return {__mcpContentItems:[{type:'text',text:JSON.stringify({proof:'DELIVERED-TRANSCRIPT-READ-PASSED'})}]};",
+            "summary":"Read the normally delivered message"
+        }},
+        "responseFromToolResultField":"proof"
+    });
+    let Booted {
+        daemon: _daemon,
+        port,
+        cfg,
+        prompt_log,
+    } = boot_daemon(data_dir, &script, 0, None, &[rule, delivered_rule]).await;
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({"workspaceId":ws_id,"eventTypes":["agent:*"]}),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut guest = connect_ws_as(port, cfg, GUEST_TOKEN).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({"workspaceId":ws_id,"name":"SELF-QUEUE-READER","provider":"mock","model":"default"}),
+    )
+    .await;
+    let agent = created["agent"]["id"].as_str().unwrap();
+    let started = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent,"content":KICKOFF_MSG}),
+    )
+    .await;
+    assert_eq!(started["queued"], false, "{started}");
+    await_prompts(&prompt_log, 1).await;
+    for (socket, content) in [
+        (&mut rpc, "PENDING-WSS-SECRET-owner"),
+        (&mut guest, "PENDING-WSS-SECRET-guest"),
+    ] {
+        let q = wss_rpc(
+            socket,
+            4,
+            "agent.queueMessage",
+            json!({"workspaceId":ws_id,"agentId":agent,"content":content}),
+        )
+        .await;
+        assert_eq!(q["success"], true, "{q}");
+    }
+    for socket in [&mut rpc, &mut guest] {
+        let envelope = wss_rpc_envelope(
+            socket,
+            5,
+            "agent.getQueue",
+            json!({"workspaceId":ws_id,"agentId":agent}),
+        )
+        .await;
+        assert_eq!(envelope["jsonrpc"], "2.0");
+        assert_eq!(envelope["id"], 5);
+        let entries = envelope["result"]["queue"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["content"], "PENDING-WSS-SECRET-owner");
+        let guest_content = entries[1]["content"].as_str().unwrap();
+        assert!(
+            guest_content.starts_with(GUEST_PREAMBLE)
+                && guest_content.ends_with("PENDING-WSS-SECRET-guest"),
+            "guest attribution remains intact: {guest_content}"
+        );
+    }
+    std::fs::write(&release, "go").unwrap();
+    let observed = observe_drain(&mut sub, agent, 2).await;
+    assert_eq!(observed.processing_frames.len(), 1, "one batch delivered");
+    assert_eq!(
+        observed.processing_frames[0]["queuedMessages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "both original entries delivered"
+    );
+    let prompts = await_prompts(&prompt_log, 2).await;
+    assert_eq!(prompts.len(), 2, "one initial turn and one queued batch");
+    let batch = &prompts[1];
+    assert!(
+        batch.find("PENDING-WSS-SECRET-owner").unwrap()
+            < batch.find("PENDING-WSS-SECRET-guest").unwrap()
+    );
+    for content in ["PENDING-WSS-SECRET-owner", "PENDING-WSS-SECRET-guest"] {
+        assert_eq!(
+            batch.matches(content).count(),
+            1,
+            "each entry delivered once"
+        );
+    }
+    let conv = wss_rpc(
+        &mut rpc,
+        6,
+        "agent.getConversation",
+        json!({"agentId":agent}),
+    )
+    .await;
+    assert!(
+        conv["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "assistant" && m.to_string().contains("SELF-QUEUE-READS-PASSED")),
+        "MCP assertions completed: {conv}"
+    );
+    assert!(
+        conv["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "assistant"
+                && m.to_string().contains("DELIVERED-TRANSCRIPT-READ-PASSED")),
+        "agent can read its delivered transcript: {conv}"
+    );
+    assert_eq!(user_row(&conv, "PENDING-WSS-SECRET-owner")["role"], "user");
+    assert!(
+        conv["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "user" && m.to_string().contains("PENDING-WSS-SECRET-guest")),
+        "delivered guest transcript remains readable: {conv}"
+    );
+    let queue = wss_rpc(&mut rpc, 7, "agent.getQueue", json!({"agentId":agent})).await;
+    assert_eq!(queue["queue"], json!([]));
 }

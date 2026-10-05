@@ -824,6 +824,9 @@ async fn host_member_list_authority_cost_does_not_grow_per_workspace() {
         .insert_workspace(&workspace(&WorkspaceId::from("first")))
         .await
         .unwrap();
+    // A single list call can leave lazy read connections whose setup PRAGMAs
+    // would otherwise enter a later measured span.
+    crate::test_tracing::warm_sqlx_pool(svc.store.read_pool()).await;
     with_caller(caller(&member), async {
         svc.list_workspaces_lite(true).await.unwrap();
         let (first, small) =
@@ -2173,4 +2176,266 @@ async fn guest_owner_permission_history_tracks_current_management_scope() {
         })
         .await;
     }
+}
+
+#[tokio::test]
+async fn shared_global_rules_read_requires_current_admission() {
+    let tmp = TempDb::new();
+    let (svc, primary, member) = fixture(&tmp).await;
+    let global = WorkspaceId::from("global");
+    let shared = WorkspaceId::new();
+    svc.store
+        .insert_workspace(&workspace(&shared))
+        .await
+        .unwrap();
+    let owner = Caller::Wire {
+        principal_id: primary,
+        host_role: HostRole::Owner,
+    };
+    with_caller(
+        owner,
+        svc.rules_update(
+            global.clone(),
+            "base-system-prompt".into(),
+            "Shared instructions".into(),
+            Some(true),
+        ),
+    )
+    .await
+    .unwrap();
+    let expected = with_caller(
+        Caller::Daemon,
+        svc.rules_get(global.clone(), "base-system-prompt".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(expected["content"], "Shared instructions");
+    for role in [HostRole::Member, HostRole::Guest] {
+        let reader = Caller::Wire {
+            principal_id: member.clone(),
+            host_role: role,
+        };
+        assert_eq!(
+            with_caller(
+                reader,
+                svc.rules_get(global.clone(), "base-system-prompt".into())
+            )
+            .await
+            .unwrap(),
+            expected
+        );
+    }
+    sqlx::query("DELETE FROM host_member WHERE principal_id = ?")
+        .bind(&member.0)
+        .execute(svc.store.write_pool())
+        .await
+        .unwrap();
+    assert!(
+        with_caller(
+            caller(&member),
+            svc.rules_get(global.clone(), "base-system-prompt".into())
+        )
+        .await
+        .is_err(),
+        "removed member cannot reuse admitted role"
+    );
+    svc.store
+        .add_workspace_member(&shared, &member, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let guest = Caller::Wire {
+        principal_id: member.clone(),
+        host_role: HostRole::Guest,
+    };
+    assert_eq!(
+        with_caller(
+            guest.clone(),
+            svc.rules_get(global.clone(), "base-system-prompt".into())
+        )
+        .await
+        .unwrap(),
+        expected
+    );
+    for (ws, key) in [
+        (global.clone(), "workspace"),
+        (shared.clone(), "workspace"),
+        (WorkspaceId::new(), "base-system-prompt"),
+        (WorkspaceId::chief(), "base-system-prompt"),
+    ] {
+        assert!(with_caller(guest.clone(), svc.rules_get(ws, key.into()))
+            .await
+            .is_err());
+    }
+    svc.store
+        .remove_workspace_member(&shared, &member)
+        .await
+        .unwrap();
+    assert!(
+        with_caller(
+            guest,
+            svc.rules_get(global.clone(), "base-system-prompt".into())
+        )
+        .await
+        .is_err(),
+        "last grant removed"
+    );
+    assert!(
+        with_caller(
+            caller(&PrincipalId::new()),
+            svc.rules_get(global, "base-system-prompt".into())
+        )
+        .await
+        .is_err(),
+        "unknown identity"
+    );
+}
+
+#[tokio::test]
+async fn shared_global_rules_update_requires_administrator_directly() {
+    let tmp = TempDb::new();
+    let (svc, _, member) = fixture(&tmp).await;
+    let shared = WorkspaceId::new();
+    svc.store
+        .insert_workspace(&workspace(&shared))
+        .await
+        .unwrap();
+    svc.store
+        .add_workspace_member(&shared, &member, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    for role in [HostRole::Member, HostRole::Guest] {
+        if role == HostRole::Guest {
+            sqlx::query("DELETE FROM host_member WHERE principal_id = ?")
+                .bind(&member.0)
+                .execute(svc.store.write_pool())
+                .await
+                .unwrap();
+        }
+        for ws in [shared.clone(), WorkspaceId::from("global")] {
+            let reader = Caller::Wire {
+                principal_id: member.clone(),
+                host_role: role,
+            };
+            let result = with_caller(
+                reader,
+                svc.rules_update(
+                    ws,
+                    "base-system-prompt".into(),
+                    "Forbidden override".into(),
+                    Some(true),
+                ),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(Error::Forbidden(_))),
+                "{role:?}: {result:?}"
+            );
+        }
+    }
+    let got = with_caller(
+        Caller::Daemon,
+        svc.rules_get(shared, "base-system-prompt".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(got["content"], "");
+}
+
+#[tokio::test]
+async fn shared_specialist_mutations_require_administrator_directly() {
+    let tmp = TempDb::new();
+    let (svc, _, member) = fixture(&tmp).await;
+    for role in [HostRole::Member, HostRole::Guest] {
+        let reader = Caller::Wire {
+            principal_id: member.clone(),
+            host_role: role,
+        };
+        with_caller(reader, async {
+            assert!(matches!(
+                svc.specialist_create("forbidden".into(), json!({}), None, None)
+                    .await,
+                Err(Error::Forbidden(_))
+            ));
+            assert!(matches!(
+                svc.specialist_edit("implementor".into(), json!({}), "user".into(), None)
+                    .await,
+                Err(Error::Forbidden(_))
+            ));
+            assert!(matches!(
+                svc.specialist_delete("implementor".into(), "user".into(), None)
+                    .await,
+                Err(Error::Forbidden(_))
+            ));
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn shared_specialist_reads_fence_guest_project_paths() {
+    let tmp = TempDb::new();
+    let (svc, _, member) = fixture(&tmp).await;
+    sqlx::query("DELETE FROM host_member WHERE principal_id = ?")
+        .bind(&member.0)
+        .execute(svc.store.write_pool())
+        .await
+        .unwrap();
+    let shared = WorkspaceId::new();
+    let tree = crate::tests::test_tempdir("shared-specialist-paths");
+    let allowed = tree.path().join("allowed");
+    let hidden = tree.path().join("hidden");
+    for dir in [&allowed, &hidden] {
+        let specialists = dir.join(".intent/specialists");
+        std::fs::create_dir_all(&specialists).unwrap();
+        std::fs::write(
+            specialists.join("project-only.md"),
+            "---\nname: Project only\ndescription: Project definition\n---\nProject instructions",
+        )
+        .unwrap();
+    }
+    let mut row = workspace(&shared);
+    row.worktree_path = Some(allowed.to_string_lossy().into_owned());
+    svc.store.insert_workspace(&row).await.unwrap();
+    svc.store
+        .add_workspace_member(&shared, &member, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let guest = Caller::Wire {
+        principal_id: member,
+        host_role: HostRole::Guest,
+    };
+    with_caller(guest, async {
+        assert!(svc.specialist_list(None, None).await.is_ok());
+        assert!(svc
+            .specialist_get("implementor".into(), None, None)
+            .await
+            .is_ok());
+        assert!(svc
+            .specialist_get(
+                "project-only".into(),
+                Some(allowed.to_string_lossy().into_owned()),
+                None
+            )
+            .await
+            .is_ok());
+        assert!(svc
+            .specialist_list(Some(allowed.to_string_lossy().into_owned()), None)
+            .await
+            .is_ok());
+        assert!(matches!(
+            svc.specialist_get(
+                "project-only".into(),
+                Some(hidden.to_string_lossy().into_owned()),
+                None
+            )
+            .await,
+            Err(Error::Forbidden(_))
+        ));
+        assert!(matches!(
+            svc.specialist_list(Some(hidden.to_string_lossy().into_owned()), None)
+                .await,
+            Err(Error::Forbidden(_))
+        ));
+    })
+    .await;
 }

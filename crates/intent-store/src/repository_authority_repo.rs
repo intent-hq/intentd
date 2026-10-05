@@ -104,6 +104,19 @@ pub struct RepositoryAuthoritySnapshot {
     pub principal_revocation_generation: Option<u64>,
 }
 
+/// Original host caller continuity before a workspace exists. This snapshot
+/// deliberately has no workspace key, row, role or synthetic workspace grant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryHostAuthoritySnapshot {
+    pub principal_id: PrincipalId,
+    pub principal: VersionedAuthority<RepositoryPrincipalAuthority>,
+    pub primary_principal: VersionedAuthority<RepositoryPrincipalAuthority>,
+    pub host_member: VersionedAuthority<()>,
+    pub credential: Option<VersionedAuthority<RepositoryCredentialAuthority>>,
+    pub host_authorization_generation: u64,
+    pub principal_revocation_generation: Option<u64>,
+}
+
 #[expect(
     clippy::needless_pass_by_value,
     reason = "Result::map_err passes its owned database error"
@@ -175,6 +188,82 @@ async fn principal(
 }
 
 impl Store {
+    /// Read the original caller's durable host and credential authority in one
+    /// consistent transaction. The service supplies permission policy and its
+    /// original transport credential/lifetime; these facts grant nothing alone.
+    ///
+    /// # Errors
+    /// Fails on storage error or missing/invalid continuity of an existing row.
+    pub async fn repository_host_authority_snapshot(
+        &self,
+        principal_id: &PrincipalId,
+        original_token_hash: Option<&str>,
+    ) -> Result<RepositoryHostAuthoritySnapshot> {
+        let mut tx = self.read_pool().begin().await.map_err(db_error)?;
+        let conn = &mut *tx;
+        let person = principal(conn, principal_id).await?;
+        let primary_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM principal WHERE is_primary = 1")
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(db_error)?;
+        let primary_principal = if let Some(id) = primary_id {
+            principal(conn, &PrincipalId(id)).await?
+        } else {
+            VersionedAuthority {
+                revision: None,
+                value: None,
+            }
+        };
+        let host: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM host_member WHERE principal_id = ?")
+                .bind(principal_id.as_str())
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(db_error)?;
+        let host_member = versioned(
+            conn,
+            "host_member",
+            principal_id.as_str(),
+            "",
+            host.map(|_| ()),
+        )
+        .await?;
+        let credential = if let Some(hash) = original_token_hash {
+            let row = sqlx::query("SELECT principal_id, revoked_at IS NOT NULL AS revoked FROM principal_credential WHERE token_hash = ?")
+                .bind(hash).fetch_optional(&mut *conn).await.map_err(db_error)?;
+            let value = row
+                .map(|r| {
+                    Ok(RepositoryCredentialAuthority {
+                        principal_id: PrincipalId(r.try_get("principal_id").map_err(db_error)?),
+                        revoked: r.try_get("revoked").map_err(db_error)?,
+                    })
+                })
+                .transpose()?;
+            Some(versioned(conn, "credential", hash, "", value).await?)
+        } else {
+            None
+        };
+        let host_authorization_generation = host_generation(conn).await?;
+        let revocation: Option<i64> = sqlx::query_scalar(
+            "SELECT generation FROM principal_revocation WHERE principal_id = ?",
+        )
+        .bind(principal_id.as_str())
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_error)?;
+        let result = RepositoryHostAuthoritySnapshot {
+            principal_id: principal_id.clone(),
+            principal: person,
+            primary_principal,
+            host_member,
+            credential,
+            host_authorization_generation,
+            principal_revocation_generation: revocation.map(|n| counter(n, true)).transpose()?,
+        };
+        tx.commit().await.map_err(db_error)?;
+        Ok(result)
+    }
     /// Read common workspace/host facts without supplying or looking up a human
     /// principal or credential. One consistent transaction is closed before
     /// return. Missing workspace remains explicit absence; missing/invalid

@@ -154,7 +154,7 @@ pub enum ContextLinkKind {
     Pr,
 }
 
-/// A GitHub issue/PR context link persisted on a [`Workspace`] as
+/// A repository issue/PR context link persisted on a [`Workspace`] as
 /// `contextLinks` (§5.1). Supplied by clients on `workspace.create` from the
 /// initializer's issue/PR context mentions and returned on the `Workspace`
 /// wire shape so any client opening the workspace can seed its layout from
@@ -261,6 +261,11 @@ pub struct Workspace {
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
+    /// Persisted high-water mark of recorded user/assistant message timestamps
+    /// and note update timestamps. Excludes metadata/usage maintenance. Historical
+    /// backfill uses retained content only; absent when no valid content exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_content_activity: Option<String>,
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -755,6 +760,7 @@ pub fn chief_workspace() -> Workspace {
         created_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
         updated_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
         last_activity: Some(CHIEF_WORKSPACE_TIMESTAMP.to_string()),
+        last_content_activity: None,
         tags: Vec::new(),
         path: None,
         repository_path: None,
@@ -1300,6 +1306,9 @@ pub struct WorkspaceDiffSummary {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceCreate {
+    /// Original native pre-workspace checkout selection. Mutually exclusive
+    /// with caller-supplied repository/clone/worktree paths and legacy URLs.
+    pub repository_checkout: Option<crate::repository_checkout::CheckoutSelection>,
     pub title: Option<String>,
     pub status_message: Option<String>,
     pub branch: Option<String>,
@@ -3770,7 +3779,8 @@ pub fn chief_prompt_version(metadata: &serde_json::Value) -> Option<u32> {
 /// an answer-tagged row, `agent.dismissQuestions`, or a newer question turn,
 /// never by delivery order. `Automatic` is the `Default` so unmarked internal
 /// paths fail closed (never mistaken for a user action).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MessageOrigin {
     /// FE-originated user action: `agent.sendMessage` (typed message or
     /// wizard answers), a drained `agent.queueMessage` entry,
@@ -7267,6 +7277,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,

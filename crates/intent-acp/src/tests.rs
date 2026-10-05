@@ -163,6 +163,76 @@ async fn handshake_completes() {
 }
 
 #[tokio::test]
+async fn structured_notices_are_negotiated_with_and_without_callbacks() {
+    use crate::callback_registration::CallbackOffer;
+    for offer in [CallbackOffer::Disabled, CallbackOffer::V1] {
+        let (conn, responder, _stderr) = connect_mock(ConnectionHooks::default());
+        crate::handshake::handshake_with_callbacks(
+            std::sync::Arc::new(conn),
+            intent_providers::find_provider("codex").unwrap(),
+            offer,
+        )
+        .await
+        .unwrap();
+        let seen = responder.await.unwrap();
+        assert_eq!(
+            seen[0]["params"]["clientCapabilities"]["session"]["notices"],
+            json!({})
+        );
+        assert_eq!(seen[0]["params"]["clientCapabilities"]["terminal"], true);
+        assert_eq!(
+            seen[0]["params"]["clientCapabilities"]["fs"]["readTextFile"],
+            true
+        );
+    }
+}
+
+#[test]
+fn structured_notices_are_consumed_without_becoming_chunks() {
+    for severity in ["info", "warning", "error", "_custom"] {
+        let note = crate::IncomingNotification {
+            method: "session/update".into(),
+            params: json!({"sessionId": "notice-session", "update": {
+                "sessionUpdate": "notice", "severity": severity,
+                "title": "Diagnostic title", "description": "Exact detail\n第二行"
+            }}),
+        };
+        let mapped = crate::session::map_notification(&note).expect("notice must be consumed");
+        let crate::session::MappedUpdate::Notice(notice) = mapped else {
+            panic!("notice must remain a diagnostic");
+        };
+        assert_eq!(serde_json::to_value(notice.severity).unwrap(), severity);
+        assert_eq!(notice.title, "Diagnostic title");
+        assert_eq!(notice.description.as_deref(), Some("Exact detail\n第二行"));
+    }
+}
+
+#[test]
+fn structured_notices_without_description_and_legacy_text_remain_distinct() {
+    let mut note = crate::IncomingNotification {
+        method: "session/update".into(),
+        params: json!({"sessionId": "s", "update": {
+            "sessionUpdate": "notice", "severity": "warning", "title": "Warning: exact text\n\n"
+        }}),
+    };
+    let Some(crate::session::MappedUpdate::Notice(notice)) =
+        crate::session::map_notification(&note)
+    else {
+        panic!("notice without optional description must map");
+    };
+    assert_eq!(notice.description, None);
+    note.params["update"] = json!({"sessionUpdate": "agent_message_chunk",
+        "content": {"type": "text", "text": notice.title}});
+    let Some(crate::session::MappedUpdate::Chunk { text, thought, .. }) =
+        crate::session::map_notification(&note)
+    else {
+        panic!("legacy assistant content must stay text");
+    };
+    assert_eq!(text.as_deref(), Some("Warning: exact text\n\n"));
+    assert!(!thought);
+}
+
+#[tokio::test]
 async fn antigravity_auth_marker_fails_pending_and_future_requests_without_url() {
     let (client_write, mut agent_read) = tokio::io::duplex(4096);
     let (mut agent_write, client_read) = tokio::io::duplex(4096);
@@ -6649,6 +6719,7 @@ mod _dead_workspace_metadata_tool_tests {
                 created_at: now.clone(),
                 updated_at: now,
                 last_activity: None,
+                last_content_activity: None,
                 tags: vec!["demo".to_string()],
                 path: None,
                 repository_path: None,
@@ -6946,6 +7017,7 @@ mod workspace_api_tool_tests {
                 created_at: now.clone(),
                 updated_at: now,
                 last_activity: None,
+                last_content_activity: None,
                 tags: Vec::new(),
                 path: path.map(str::to_string),
                 repository_path: None,
@@ -11061,6 +11133,83 @@ mod wsapi4_bindings_tests {
     }
 
     #[tokio::test]
+    async fn self_queue_reads_keep_counts_without_any_pending_payload() {
+        let (srv, api) = server_with_caller("self-agent");
+        for count in [3_usize, 0] {
+            let entries: Vec<Value> = (0..count).map(|i| json!({
+                "id": format!("entry-{i}"), "content": "PENDING_SECRET",
+                "images": [{"data": "IMAGE_SECRET"}],
+                "messageMetadata": {"fromAgentId": format!("sender-{i}"), "extra": "METADATA_SECRET"},
+                "position": i,
+            })).collect();
+            *api.queue_entries.lock().unwrap() = entries.clone();
+            for method in ["status", "getQueue"] {
+                let resp = call(
+                    &srv,
+                    &format!("return await ws.agent.{method}('self-agent');"),
+                )
+                .await;
+                assert_eq!(resp["result"]["isError"], false, "{resp}");
+                let v = body(&resp);
+                assert_eq!(v["queueLength"], count, "{v}");
+                assert_eq!(v["queue"], json!([]), "self queue payload: {v}");
+                assert!(!v.to_string().contains("SECRET"), "{v}");
+                if method == "status" {
+                    assert!(v["queueNotice"]
+                        .as_str()
+                        .unwrap()
+                        .contains("after the current turn"));
+                }
+                if method == "getQueue" {
+                    assert_eq!(v["refused"], true, "{v}");
+                    assert!(v["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("after the current turn"));
+                }
+            }
+            assert_eq!(
+                *api.queue_entries.lock().unwrap(),
+                entries,
+                "reads never consume"
+            );
+            let other = body(&call(&srv, "return await ws.agent.getQueue('other-agent');").await);
+            assert_eq!(other["queue"].as_array().unwrap().len(), count);
+        }
+    }
+
+    #[tokio::test]
+    async fn self_queue_event_history_hides_all_payload_copies() {
+        let (srv, api) = server_with_caller("self-agent");
+        let rows = json!([
+            {"type":"agent:queue:updated", "actor":{"id":"self-agent"},
+             "data":{"agentId":"self-agent", "queue":[{"content":"SELF_SECRET", "images":["SELF_SECRET"]}]},
+             "metadata":{"copy":"SELF_SECRET"}},
+            {"eventType":"agent:queue:processing", "sessionId":"self-agent",
+             "data":{"agentId":"self-agent", "messageId":"m", "content":"SELF_SECRET", "queuedMessages":[{"content":"SELF_SECRET"}]}},
+            {"eventType":"agent:queue:updated", "data":{"agentId":"other-agent", "queue":[{"content":"OTHER_VISIBLE"}]}}
+        ]);
+        for paginated in [false, true] {
+            *api.event_query_result.lock().unwrap() = Some(if paginated {
+                json!({"items": rows, "nextToken":"next-page"})
+            } else {
+                rows.clone()
+            });
+            for code in [
+                "return await ws.event.query();",
+                "return await ws.event.agentActivity('self-agent');",
+            ] {
+                let result = body(&call(&srv, code).await);
+                assert!(!result.to_string().contains("SELF_SECRET"), "{result}");
+                assert!(result.to_string().contains("OTHER_VISIBLE"), "{result}");
+                if paginated {
+                    assert_eq!(result["nextToken"], "next-page");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn agent_status_forwards_agent_id() {
         let (srv, api) = server();
         let resp = call(&srv, "return await ws.agent.status('a-42');").await;
@@ -13268,6 +13417,7 @@ mod workspace_api_output_limit_tests {
                     created_at: now.clone(),
                     updated_at: now,
                     last_activity: None,
+                    last_content_activity: None,
                     tags: Vec::new(),
                     path: None,
                     repository_path,
@@ -13594,6 +13744,7 @@ mod workspace_apply_proposal_tests {
             created_at: now.clone(),
             updated_at: now,
             last_activity: None,
+            last_content_activity: None,
             tags: Vec::new(),
             path: Some(format!("/checkouts/{id}")),
             repository_path: None,

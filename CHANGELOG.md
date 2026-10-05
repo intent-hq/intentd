@@ -2,6 +2,72 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.15] - 2026-10-05
+
+### 🚀 Features
+
+- Add host-bound GitLab checkout ([#2281](https://github.com/intent-hq/intentd/pull/2281))
+
+### 🐛 Bug Fixes
+
+- Preserve useful adapter failure diagnostics ([#2290](https://github.com/intent-hq/intentd/pull/2290))
+
+
+## [0.10.14] - 2026-10-05
+
+### 🐛 Bug Fixes
+
+- Resume suspend-interrupted turns that fail with provider timeout/terminated errors ([#2288](https://github.com/intent-hq/intentd/pull/2288))
+
+
+## [0.10.13] - 2026-10-04
+
+### 🐛 Bug Fixes
+
+- Avoid transcript reads for chat snapshot activity ([#2282](https://github.com/intent-hq/intentd/pull/2282))
+- Keep structured ACP notices out of assistant replies ([#2285](https://github.com/intent-hq/intentd/pull/2285))
+- Hide agents own pending queue contents ([#2284](https://github.com/intent-hq/intentd/pull/2284))
+
+
+## [0.10.12] - 2026-10-04
+
+### 🐛 Bug Fixes
+
+- Allow admitted guests to read global rules safely ([#6728](https://github.com/intent-hq/intentd/pull/6728)) ([#2286](https://github.com/intent-hq/intentd/pull/2286))
+
+
+## [0.10.11] - 2026-10-04
+
+### 🚀 Features
+
+- Add Home backend prerequisites ([#2256](https://github.com/intent-hq/intentd/pull/2256))
+
+
+## [0.10.10] - 2026-10-04
+
+### 🚀 Features
+
+- Expose authoritative submission correlation for optimistic display ([#2271](https://github.com/intent-hq/intentd/pull/2271))
+
+
+## [0.10.9] - 2026-10-04
+
+### 🚀 Features
+
+- Add guarded GitLab repository workflows ([#2261](https://github.com/intent-hq/intentd/pull/2261))
+
+### 🐛 Bug Fixes
+
+- Ignore Claude state churn in installed CLI catalog fingerprint ([#2275](https://github.com/intent-hq/intentd/pull/2275))
+- Bind daemon callers in retained workspace CoW fixtures ([#2273](https://github.com/intent-hq/intentd/pull/2273))
+
+### 🧪 Testing
+
+- Warm host-member query-cost fixture ([#6694](https://github.com/intent-hq/intentd/pull/6694)) ([#2277](https://github.com/intent-hq/intentd/pull/2277))
+- Isolate Tailcat discovery in no-tunnel invitation fixture ([#2272](https://github.com/intent-hq/intentd/pull/2272))
+- Make tunnel connect deadline coverage deterministic ([#2274](https://github.com/intent-hq/intentd/pull/2274))
+
+
 ## [0.10.8] - 2026-10-03
 
 ### 🚀 Features
