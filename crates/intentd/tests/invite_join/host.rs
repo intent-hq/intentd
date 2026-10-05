@@ -2,6 +2,9 @@
 //! disposable daemon and public forge fixture from the workspace invite suite.
 use super::*;
 
+#[path = "machine_name.rs"]
+mod machine_name;
+
 #[path = "sharing.rs"]
 mod sharing;
 
@@ -144,7 +147,7 @@ async fn exercise_host_join(provider: &str, credentials: &[(&str, &str)]) {
     );
     assert_eq!(
         inspect,
-        json!({"scope":"host","role":"member","pinIdentity":identity,"hostname":inspect["hostname"],"prettyHostname":inspect["prettyHostname"]})
+        json!({"scope":"host","role":"member","pinIdentity":identity,"hostname":inspect["hostname"],"prettyHostname":inspect["prettyHostname"],"collaborationName":null})
     );
     assert!(inspect["hostname"].is_string());
     let challenge = result(

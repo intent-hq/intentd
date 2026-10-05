@@ -543,6 +543,10 @@ async fn handle_status_returns_a_response_frame() {
     // Administrator: the full snapshot, counts included.
     assert_eq!(parsed["result"]["agents"], 1);
     assert_eq!(parsed["result"]["clients"], 2);
+    assert_eq!(
+        parsed["result"].get("collaborationName"),
+        Some(&Value::Null)
+    );
     assert!(!control.shutdown_called.load(Ordering::SeqCst));
 }
 
@@ -558,10 +562,9 @@ async fn handle_status_projects_for_non_administrator() {
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["id"], 8);
     assert_eq!(parsed["jsonrpc"], "2.0");
-    assert_eq!(
-        parsed["result"],
-        collaborator_status_json(&control.status, false)
-    );
+    let mut expected = collaborator_status_json(&control.status, false);
+    expected["collaborationName"] = Value::Null;
+    assert_eq!(parsed["result"], expected);
     assert_eq!(parsed["result"]["running"], true);
     assert_eq!(parsed["result"]["hostname"], "studio.local");
     assert_eq!(parsed["result"]["host"]["locality"], "remote");

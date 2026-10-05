@@ -123,11 +123,13 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    std::fs::write(
-        data_dir.join("config.toml"),
-        "[server.tunnel]\nenabled = true\n",
-    )
-    .expect("seed config.toml with server.tunnel.enabled");
+    let config = data_dir.join("config.toml");
+    let fresh_config = !config.exists();
+    // Restart must retain settings written through the real settings API.
+    if fresh_config {
+        std::fs::write(&config, "[server.tunnel]\nenabled = true\n")
+            .expect("seed config.toml with server.tunnel.enabled");
+    }
     common::enable_ws_api(data_dir);
     // The GitHub resolution chain ends at `gh auth token`; point the CLI at an
     // empty config dir so a developer's own `gh auth login` is never borrowed.
@@ -146,13 +148,14 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
             ("https://gitlab.custom.example:8443", endpoint),
         ])
         .unwrap();
-        let config = data_dir.join("config.toml");
-        let original = std::fs::read_to_string(&config).unwrap();
-        std::fs::write(
-            config,
-            format!("{original}\n[sourceControl.gitlab]\napiBaseUrl = {endpoint:?}\n"),
-        )
-        .unwrap();
+        if fresh_config {
+            let original = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(
+                &config,
+                format!("{original}\n[sourceControl.gitlab]\napiBaseUrl = {endpoint:?}\n"),
+            )
+            .unwrap();
+        }
         cmd.env("INTENTD_REPOSITORY_TEST_TRANSPORTS", transports);
     }
     cmd.env("INTENTD_DISABLE_GH_CREDENTIALS", "1");
@@ -997,7 +1000,7 @@ async fn assert_preview_pin_identity_over_wss(method: &str) {
         let mut expected_result = json!({
             "workspaceId": ws_id, "workspaceTitle": "Preview requirements",
             "scope":"workspace", "role":"collaborator",
-            "hostname": r["hostname"], "prettyHostname": r["prettyHostname"],
+            "hostname": r["hostname"], "prettyHostname": r["prettyHostname"], "collaborationName": null,
             "pinIdentity": expected,
         });
         assert!(r["hostname"].is_string(), "{r}");
