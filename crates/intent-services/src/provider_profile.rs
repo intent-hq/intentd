@@ -13,9 +13,23 @@ use intent_providers::launch_overrides::EnvironmentOverrides;
 use serde_json::{json, Value};
 
 pub mod auth;
+pub mod claude_controls;
+pub mod codex_controls;
 pub mod policy;
 mod storage;
 pub use storage::{ProfileDirectory, ProfileIdentity};
+
+/// Opaque in-memory equality token. No formatting or serialization: inputs may
+/// contain credentials. This detects changes; it never authorizes invocation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConfigurationIdentity([u8; 32]);
+
+impl ConfigurationIdentity {
+    fn from_value(value: &Value) -> Self {
+        use sha2::{Digest, Sha256};
+        Self(Sha256::digest(value.to_string().as_bytes()).into())
+    }
+}
 
 pub type ProfileResult<T> = std::result::Result<T, ProfileError>;
 
@@ -71,7 +85,10 @@ pub struct AuthModelContext {
     pub model: Option<String>,
     pub endpoint: Option<ModelEndpoint>,
     pub credential_environment: BTreeMap<String, String>,
+    /// Replaces the named native credential store. Omitted stores retain refresh state.
     pub credentials: Vec<auth::CredentialFile>,
+    /// Explicit revocation; cannot also replace the same store in this rebuild.
+    pub credential_removals: Vec<auth::CredentialKind>,
     /// Output of `project_codex_config`, validated again before use.
     pub codex_routing_toml: Option<String>,
     /// Native Claude settings; only auth/model fields are projected.
@@ -112,6 +129,9 @@ pub struct ManagedProviderProfile {
     pub session_meta: Value,
     pub model: Option<String>,
     pub capability: CapabilityEvidence,
+    /// Compare with the separate catalog fingerprint, which includes execution
+    /// options absent from normalized transports. Not an authorization token.
+    pub configuration_identity: ConfigurationIdentity,
     provider: String,
 }
 
@@ -159,14 +179,6 @@ pub struct ProfileRequest<'a> {
 pub fn prepare_provider_profile(
     request: ProfileRequest<'_>,
 ) -> ProfileResult<ManagedProviderProfile> {
-    let mut profile = prepare_profile_candidate(
-        request.provider,
-        request.purpose,
-        request.directory,
-        request.approved_servers,
-        request.auth_model,
-        request.policy,
-    )?;
     if request.provider == "pi" {
         if request.runtime.native_version != "0.81.0"
             || request.runtime.os != "linux"
@@ -183,6 +195,21 @@ pub fn prepare_provider_profile(
         if !request.approved_servers.is_empty() {
             return Err(ProfileError::UnsupportedIsolation {provider:"pi".into(), missing:"attach and verify the Intent-owned gateway extension for interactive MCP delivery"});
         }
+    } else if let Some(missing) = capability_evidence(request.provider)?.missing.first() {
+        return Err(ProfileError::UnsupportedIsolation {
+            provider: request.provider.into(),
+            missing,
+        });
+    }
+    let mut profile = prepare_profile_candidate(
+        request.provider,
+        request.purpose,
+        request.directory,
+        request.approved_servers,
+        request.auth_model,
+        request.policy,
+    )?;
+    if request.provider == "pi" {
         profile.capability.source_baseline = "Pi 0.81.0 Linux x86_64 actual resource loader and native RPC CLI startup/resume fixtures";
         profile.capability.missing = &[];
     }
@@ -208,6 +235,7 @@ pub fn prepare_profile_candidate(
     if purpose == ProfilePurpose::Ephemeral && !approved_servers.is_empty() {
         return Err(ProfileError::EphemeralCatalog);
     }
+    policy.validate_provider(provider)?;
     let capability = capability_evidence(provider)?;
     for (name, server) in approved_servers {
         policy.validate_server(name, server)?;
@@ -222,6 +250,7 @@ pub fn prepare_profile_candidate(
         auth_model.sandbox.as_deref(),
         &features,
     )?;
+    let mut files = storage::FilePlan::default();
     let mut environment = EnvironmentOverrides::default();
     // Prevent runtime injection via inherited launch configuration. PATH/runtime
     // executable selection belongs to the caller; ordinary network env survives.
@@ -330,24 +359,21 @@ pub fn prepare_profile_candidate(
             if purpose == ProfilePurpose::Ephemeral {
                 runtime_args.push("--no-tools".into());
             }
-            directory.write_private(
+            files.replace(
                 "settings.json",
                 b"{\"packages\":[],\"extensions\":[],\"skills\":[],\"prompts\":[]}",
             )?;
             if let Some(endpoint) = &auth_model.endpoint {
-                if endpoint.api_key.starts_with('!') || endpoint.base_url.starts_with('!') {
-                    return Err(ProfileError::InvalidAuth(
-                        "Pi command-expanded model routing is not supported",
-                    ));
-                }
                 let models = json!({"providers": {&endpoint.provider_id: {
-                    "baseUrl": endpoint.base_url, "apiKey": endpoint.api_key,
+                    "baseUrl": endpoint.base_url, "apiKey": auth::pi_literal(&endpoint.api_key),
                     "api": "openai-completions", "models": [{"id": endpoint.model_id, "name": endpoint.model_id,
                     "reasoning": false, "input": ["text"], "cost": {"input":0,"output":0,"cacheRead":0,"cacheWrite":0},
                     "contextWindow": endpoint.context_window.unwrap_or(128_000),
                     "maxTokens": endpoint.max_output_tokens.unwrap_or(16_384)}]
                 }}});
-                directory.write_private("models.json", models.to_string().as_bytes())?;
+                files.replace("models.json", models.to_string().as_bytes())?;
+            } else {
+                files.remove("models.json")?;
             }
             // Interactive integration owns the reviewed -e gateway extension.
             // Its MCP credentials and live authorization remain in Intent.
@@ -396,7 +422,7 @@ pub fn prepare_profile_candidate(
         }
         "auggie" => {
             let path = directory.path().join("mcp.json");
-            directory.write_private(
+            files.replace(
                 "mcp.json",
                 intent_acp::to_auggie_mcp_config(approved_servers)
                     .to_string()
@@ -429,11 +455,52 @@ pub fn prepare_profile_candidate(
         }
         let (name, value) = credential.material()?;
         if matches!(provider, "opencode" | "unsloth") {
-            directory.write_private_in("opencode", name, value.to_string().as_bytes())?;
+            files.insert(Some("opencode"), name, Some(value.to_string().into_bytes()))?;
         } else {
-            directory.write_private(name, value.to_string().as_bytes())?;
+            files.replace(name, value.to_string().as_bytes())?;
         }
     }
+    for removal in &auth_model.credential_removals {
+        let (credential_provider, name) = removal.target();
+        if credential_provider != provider
+            && !(provider == "unsloth" && credential_provider == "opencode")
+        {
+            return Err(ProfileError::InvalidAuth(
+                "credential removal belongs to another provider",
+            ));
+        }
+        files.insert(
+            matches!(provider, "opencode" | "unsloth").then_some("opencode"),
+            name,
+            None,
+        )?;
+    }
+    let mut effective_environment = BTreeMap::new();
+    environment.apply_to_map(&mut effective_environment);
+    let transports: BTreeMap<_, _> = approved_servers
+        .iter()
+        .map(|(name, server)| {
+            let value = match server {
+                intent_acp::NormalizedMcpServer::Stdio { command, args, env } => {
+                    json!({"stdio":command,"args":args,"env":env})
+                }
+                intent_acp::NormalizedMcpServer::Http { url, headers } => {
+                    json!({"http":url,"headers":headers})
+                }
+                intent_acp::NormalizedMcpServer::Sse { url, headers } => {
+                    json!({"sse":url,"headers":headers})
+                }
+            };
+            (name, value)
+        })
+        .collect();
+    let configuration_identity = ConfigurationIdentity::from_value(&json!({
+        "provider":provider,"ephemeral":purpose == ProfilePurpose::Ephemeral,
+        "policy":policy.identity_value(),"environment":effective_environment,
+        "transports":transports,"args":runtime_args,"meta":session_meta,
+        "model":auth_model.model,"files":files.effective_identity(&directory)?
+    }));
+    directory.reconcile(files)?;
     Ok(ManagedProviderProfile {
         directory,
         environment,
@@ -441,6 +508,7 @@ pub fn prepare_profile_candidate(
         session_meta,
         model: auth_model.model.clone(),
         capability,
+        configuration_identity,
         provider: provider.into(),
     })
 }

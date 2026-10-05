@@ -863,5 +863,203 @@ fn revision_pi_native_auth_preserves_literal_values() {
             output.status.success(),
             "native fixture must resolve exact synthetic credential; no credential values logged"
         );
+        let rebuilt = prepare_profile_candidate(
+            "pi",
+            ProfilePurpose::Ephemeral,
+            profile.directory.clone(),
+            &BTreeMap::new(),
+            &AuthModelContext::default(),
+            &policy::HostPolicySnapshot::default(),
+        )
+        .unwrap();
+        std::fs::write(&input, json!({"absent":true}).to_string()).unwrap();
+        let output = std::process::Command::new("node")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", root.path())
+            .env("PI_OFFLINE", "1")
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/provider_profile/fixtures/pi-auth.mjs"),
+            )
+            .arg(&runtime)
+            .arg(rebuilt.directory.path())
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "native runtime must not retain withdrawn generated route"
+        );
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn revision_credentials_have_explicit_retain_replace_and_remove_semantics() {
+    let root = scratch();
+    let directory = ProfileDirectory::ephemeral(root.path()).unwrap();
+    let prepare = |context: &AuthModelContext| {
+        prepare_profile_candidate(
+            "pi",
+            ProfilePurpose::Interactive,
+            directory.clone(),
+            &BTreeMap::new(),
+            context,
+            &policy::HostPolicySnapshot::default(),
+        )
+    };
+    let first = AuthModelContext {
+        credentials: vec![auth::CredentialFile::PiAuth(
+            json!({"fixture":{"type":"api_key","key":"first"}}),
+        )],
+        ..Default::default()
+    };
+    prepare(&first).unwrap();
+    let refreshed = b"{\"fixture\":{\"type\":\"api_key\",\"key\":\"refreshed\"}}";
+    directory.write_private("auth.json", refreshed).unwrap();
+    let retained = prepare(&AuthModelContext::default()).unwrap();
+    assert_eq!(
+        std::fs::read(directory.path().join("auth.json")).unwrap(),
+        refreshed
+    );
+    let replaced = prepare(&first).unwrap();
+    assert!(retained.configuration_identity != replaced.configuration_identity);
+    let revoke = AuthModelContext {
+        credential_removals: vec![auth::CredentialKind::Pi],
+        ..Default::default()
+    };
+    prepare(&revoke).unwrap();
+    assert!(!directory.path().join("auth.json").exists());
+    let conflict = AuthModelContext {
+        credential_removals: vec![auth::CredentialKind::Pi],
+        ..first
+    };
+    assert!(prepare(&conflict).is_err());
+    assert!(!directory.path().join("auth.json").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn revision_failed_filesystem_rebuild_preserves_previous_files() {
+    let root = scratch();
+    let directory = ProfileDirectory::ephemeral(root.path()).unwrap();
+    directory
+        .write_private("settings.json", b"old settings")
+        .unwrap();
+    std::fs::create_dir(directory.path().join("models.json")).unwrap();
+    let result = prepare_profile_candidate(
+        "pi",
+        ProfilePurpose::Interactive,
+        directory.clone(),
+        &BTreeMap::new(),
+        &AuthModelContext {
+            endpoint: Some(fixture_endpoint("fixture-only")),
+            ..Default::default()
+        },
+        &policy::HostPolicySnapshot::default(),
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read(directory.path().join("settings.json")).unwrap(),
+        b"old settings"
+    );
+    assert!(directory.path().join("models.json").is_dir());
+}
+
+#[test]
+fn revision_policy_identity_binds_provider_and_effective_restrictions() {
+    use policy::{PolicyFormat, PolicyScope, PolicySource};
+    let snapshot = |provider, text| {
+        policy::read_host_policy(
+            provider,
+            &[PolicySource::inline(
+                PolicyScope::Host,
+                "fixture",
+                PolicyFormat::Intent,
+                text,
+            )],
+        )
+        .unwrap()
+    };
+    let a = snapshot("pi", r#"{"denyMcp":[{"name":"blocked"}]}"#);
+    let b = snapshot("pi", r#"{ "denyMcp" : [ {"name": "blocked"} ] }"#);
+    assert!(a.identity() == b.identity());
+    assert!(a.identity() != snapshot("pi", "{}").identity());
+    assert!(a.identity() != snapshot("codex", r#"{"denyMcp":[{"name":"blocked"}]}"#).identity());
+    assert!(a.validate_provider("codex").is_err());
+    assert!(snapshot("pi", "{}").identity() != snapshot("pi", r#"{"allowMcp":[]}"#).identity());
+}
+
+#[test]
+#[cfg(unix)]
+fn revision_profile_identity_tracks_policy_routing_and_retained_auth_without_history() {
+    use policy::{PolicyFormat, PolicyScope, PolicySource};
+    let root = scratch();
+    let directory = ProfileDirectory::ephemeral(root.path()).unwrap();
+    let prepare = |context: &AuthModelContext, policy: &policy::HostPolicySnapshot| {
+        prepare_profile_candidate(
+            "pi",
+            ProfilePurpose::Interactive,
+            directory.clone(),
+            &BTreeMap::new(),
+            context,
+            policy,
+        )
+        .unwrap()
+    };
+    let context = AuthModelContext::default();
+    let unrestricted = policy::HostPolicySnapshot::default();
+    let a = prepare(&context, &unrestricted);
+    directory
+        .write_private("history.jsonl", b"native history")
+        .unwrap();
+    assert!(a.configuration_identity == prepare(&context, &unrestricted).configuration_identity);
+    let denied = policy::read_host_policy(
+        "pi",
+        &[PolicySource::inline(
+            PolicyScope::Host,
+            "fixture",
+            PolicyFormat::Intent,
+            r#"{"allowSkills":false}"#,
+        )],
+    )
+    .unwrap();
+    assert!(a.configuration_identity != prepare(&context, &denied).configuration_identity);
+    let routed = AuthModelContext {
+        endpoint: Some(fixture_endpoint("fixture")),
+        ..Default::default()
+    };
+    assert!(a.configuration_identity != prepare(&routed, &unrestricted).configuration_identity);
+    directory.write_private("auth.json", b"{}").unwrap();
+    assert!(a.configuration_identity != prepare(&context, &unrestricted).configuration_identity);
+}
+
+#[test]
+#[cfg(unix)]
+fn revision_unsupported_runtime_does_not_mutate_existing_profile() {
+    let root = scratch();
+    let directory = ProfileDirectory::ephemeral(root.path()).unwrap();
+    directory
+        .write_private("settings.json", b"previous settings")
+        .unwrap();
+    let result = prepare_provider_profile(ProfileRequest {
+        provider: "pi",
+        runtime: RuntimeIdentity {
+            native_version: "unsupported",
+            adapter_version: None,
+            os: "linux",
+            arch: "x86_64",
+        },
+        purpose: ProfilePurpose::Interactive,
+        directory: directory.clone(),
+        approved_servers: &BTreeMap::new(),
+        auth_model: &AuthModelContext::default(),
+        policy: &policy::HostPolicySnapshot::default(),
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read(directory.path().join("settings.json")).unwrap(),
+        b"previous settings"
+    );
 }

@@ -76,6 +76,7 @@ impl PolicySource {
 /// matcher contents are exposed through Debug, diagnostics, or serialization.
 #[derive(Clone, Default)]
 pub struct HostPolicySnapshot {
+    selected_provider: Option<String>,
     restrictions: Vec<Restriction>,
 }
 
@@ -104,6 +105,7 @@ enum Identity {
         args: Option<Vec<ValueMatcher>>,
     },
     Url(ValueMatcher),
+    HttpUrl(ValueMatcher),
 }
 
 #[derive(Clone)]
@@ -147,7 +149,13 @@ impl ServerMatcher {
                                 .all(|(matcher, value)| matcher.matches(value))
                     })
             }
-            (Identity::Url(matcher), NormalizedMcpServer::Http { url, .. }) => matcher.matches(url),
+            (
+                Identity::Url(matcher),
+                NormalizedMcpServer::Http { url, .. } | NormalizedMcpServer::Sse { url, .. },
+            )
+            | (Identity::HttpUrl(matcher), NormalizedMcpServer::Http { url, .. }) => {
+                matcher.matches(url)
+            }
             _ => false,
         }
     }
@@ -263,7 +271,10 @@ pub fn read_host_policy(
             "resolve native-layer precedence before ingestion",
         ));
     }
-    let mut snapshot = HostPolicySnapshot::default();
+    let mut snapshot = HostPolicySnapshot {
+        selected_provider: Some(selected_provider.into()),
+        ..Default::default()
+    };
     for source in sources
         .iter()
         .filter(|source| source.scope.applies(selected_provider))
@@ -448,7 +459,10 @@ pub fn parse_codex_requirements(text: &str, source: &str) -> ProfileResult<HostP
             keys(rule, &["identity"], source)?;
             allow.push(ServerMatcher {
                 name: Some(name.clone()),
-                identity: identity(&rule["identity"], source)?,
+                identity: match identity(&rule["identity"], source)? {
+                    Identity::Url(matcher) => Identity::HttpUrl(matcher),
+                    identity => identity,
+                },
             });
         }
         restriction.allow = Some(allow);
@@ -475,6 +489,7 @@ pub fn parse_codex_requirements(text: &str, source: &str) -> ProfileResult<HostP
         }
     }
     Ok(HostPolicySnapshot {
+        selected_provider: Some("codex".into()),
         restrictions: vec![restriction],
     })
 }
@@ -511,6 +526,7 @@ fn parse_intent(text: &str, source: &str) -> ProfileResult<HostPolicySnapshot> {
             .collect()
     };
     Ok(HostPolicySnapshot {
+        selected_provider: None,
         restrictions: vec![Restriction {
             source: source.into(),
             allow: value.get("allowMcp").map(parse_rules).transpose()?,
@@ -584,6 +600,7 @@ fn parse_claude(text: &str, source: &str) -> ProfileResult<HostPolicySnapshot> {
             .collect()
     };
     Ok(HostPolicySnapshot {
+        selected_provider: None,
         restrictions: vec![Restriction {
             source: source.into(),
             allow: value.get("allowedMcpServers").map(rules).transpose()?,
@@ -661,4 +678,67 @@ pub fn read_linux_system_policy(
         snapshot.restrictions.extend(local_policy.restrictions);
     }
     Ok(snapshot)
+}
+
+impl HostPolicySnapshot {
+    /// Reject accidental reuse of a selected-provider snapshot for another provider.
+    /// # Errors
+    /// A snapshot acquired for another provider cannot authorize this launch.
+    pub fn validate_provider(&self, provider: &str) -> ProfileResult<()> {
+        if self
+            .selected_provider
+            .as_ref()
+            .is_some_and(|selected| selected != provider)
+        {
+            return Err(unsupported(
+                "policy snapshot",
+                "reacquire policy for the selected provider",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Opaque change token; excludes input formatting, includes effective parsed
+    /// restrictions and provider applicability. Source/order changes conservatively
+    /// invalidate it. Compare alongside the catalog identity, never as authority.
+    #[must_use]
+    pub fn identity(&self) -> super::ConfigurationIdentity {
+        super::ConfigurationIdentity::from_value(&self.identity_value())
+    }
+
+    pub(super) fn identity_value(&self) -> Value {
+        use serde_json::json;
+        let restrictions: Vec<_> = self.restrictions.iter().map(|rule| json!({
+            "source":rule.source,
+            "allow":rule.allow.as_ref().map(|rules| rules.iter().map(ServerMatcher::identity_value).collect::<Vec<_>>()),
+            "deny":rule.deny.iter().map(ServerMatcher::identity_value).collect::<Vec<_>>(),
+            "skills":rule.skills,"approvals":rule.approvals,"sandbox":rule.sandbox,"features":rule.features
+        })).collect();
+        json!({"provider":self.selected_provider,"restrictions":restrictions})
+    }
+}
+
+impl ServerMatcher {
+    fn identity_value(&self) -> Value {
+        use serde_json::json;
+        let identity = match &self.identity {
+            Identity::Any => json!({"any":true}),
+            Identity::Command { executable, args } => {
+                json!({"command":executable,"args":args.as_ref().map(|args| args.iter().map(ValueMatcher::identity_value).collect::<Vec<_>>())})
+            }
+            Identity::Url(matcher) => json!({"url":matcher.identity_value()}),
+            Identity::HttpUrl(matcher) => json!({"http":matcher.identity_value()}),
+        };
+        json!({"name":self.name,"identity":identity})
+    }
+}
+
+impl ValueMatcher {
+    fn identity_value(&self) -> Value {
+        match self {
+            Self::Exact(value) => serde_json::json!({"exact":value}),
+            Self::Prefix(value) => serde_json::json!({"prefix":value}),
+            Self::Regex(regex) => serde_json::json!({"regex":regex.as_str()}),
+        }
+    }
 }

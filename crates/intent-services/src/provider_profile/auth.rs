@@ -248,3 +248,35 @@ pub(super) fn contains_command(value: &Value) -> bool {
         _ => false,
     }
 }
+
+/// Encode a literal for Pi's native config grammar, without enabling commands
+/// or environment interpolation. This is for typed values, not imported syntax.
+pub(super) fn pi_literal(value: &str) -> String {
+    let escaped = value.replace('$', "$$");
+    escaped
+        .strip_prefix('!')
+        .map_or_else(|| escaped.clone(), |rest| format!("$!{rest}"))
+}
+
+/// Explicit deletion of one known credential store. Omitted updates retain
+/// native refresh state; `credentials` replaces it; this enum revokes it.
+#[derive(Clone, Copy)]
+pub enum CredentialKind {
+    Codex,
+    Claude,
+    Pi,
+    OpenCode,
+    Grok,
+}
+
+impl CredentialKind {
+    pub(super) fn target(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Codex => ("codex", "auth.json"),
+            Self::Claude => ("claude-code", ".credentials.json"),
+            Self::Pi => ("pi", "auth.json"),
+            Self::OpenCode => ("opencode", "auth.json"),
+            Self::Grok => ("grok", "auth.json"),
+        }
+    }
+}
