@@ -154,6 +154,9 @@ CREATE TABLE note_comment_anchor (
     UNIQUE(head_id,comment_id,occurrence_id)
 );
 CREATE INDEX note_comment_anchor_owner ON note_comment_anchor(head_id,comment_id);
+-- Comment deletion and its foreign-key checks know the comment ID, not its
+-- annotation head. Avoid scanning anchors belonging to unrelated notes.
+CREATE INDEX note_comment_anchor_comment ON note_comment_anchor(comment_id);
 -- R-tree bounds are conservative floats. Every overlap read also tests the
 -- exact INTEGER coordinates, so rounding cannot alter endpoint semantics.
 CREATE VIRTUAL TABLE note_comment_anchor_extent USING rtree(id,scope_min,scope_max,start,end);
@@ -229,7 +232,7 @@ CREATE TRIGGER note_annotation_head_state_insert AFTER INSERT ON note_annotation
             attribution_ready=excluded.attribution_ready,comment_revision=excluded.comment_revision
         WHERE note_annotation_state.deleted=0;
 END;
-CREATE TRIGGER note_annotation_head_state_update AFTER UPDATE ON note_annotation_head BEGIN
+CREATE TRIGGER note_annotation_head_state_update AFTER UPDATE OF source_rev,attribution_generation,attribution_rev,comment_revision,workspace_id,note_id ON note_annotation_head BEGIN
     INSERT INTO note_annotation_state(workspace_id,note_id,instance_id,source_revision,attribution_generation,attribution_ready,comment_revision)
         SELECT a.workspace_id,a.note_id,p.instance_id,'r:'||p.current_rev||':'||p.generation,a.attribution_generation,a.attribution_rev=a.source_rev,a.comment_revision
         FROM note_annotation_head a JOIN note_page_head p USING(workspace_id,note_id)

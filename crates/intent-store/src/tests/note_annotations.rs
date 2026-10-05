@@ -1341,3 +1341,130 @@ async fn annotation_dense_range_preparation_is_once_per_lease_bounded_and_invali
         .unwrap();
     assert_eq!(count, 0);
 }
+
+#[tokio::test]
+async fn annotation_cleanup_seeks_comment_anchors_and_preserves_other_workspaces() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let (_db, store, ws, _note) = fixture().await;
+    let keeper = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&keeper, "Keeper", false))
+        .await
+        .unwrap();
+    let kept_note = stray_note(&keeper, "kept", "Keeper");
+    store.insert_note(&kept_note).await.unwrap();
+    store
+        .insert_comment(
+            &keeper,
+            &sample_comment(&kept_note.id, "kept-thread", "kept-comment"),
+        )
+        .await
+        .unwrap();
+    sqlx::query("WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<50) INSERT INTO note(id,workspace_id,title,content,created_at,updated_at) SELECT 'delete-note-'||n,?,'Delete','','t0','t0' FROM rows")
+        .bind(ws.as_str()).execute(store.write_pool()).await.unwrap();
+    sqlx::query("WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<50) INSERT INTO comment(id,thread_id,note_id,workspace_id,kind,content,author,author_type,anchor_json,created_at,updated_at) SELECT 'delete-comment-'||n,'thread','delete-note-'||n,?,'comment','','a','user','{}','t0','t0' FROM rows")
+        .bind(ws.as_str()).execute(store.write_pool()).await.unwrap();
+    sqlx::query("WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<10000) INSERT INTO note_comment_anchor(head_id,comment_id,occurrence_id,thread_id,start,end) SELECT h.id,'kept-comment','occurrence-'||n,'kept-thread',n,n FROM rows,note_annotation_head h WHERE h.workspace_id=?")
+        .bind(keeper.as_str()).execute(store.write_pool()).await.unwrap();
+    let before = store
+        .read_note_page_state(&keeper, &kept_note.id, None)
+        .await
+        .unwrap();
+    let mut conn = store.write_pool().acquire().await.unwrap();
+    let work = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&work);
+    conn.lock_handle()
+        .await
+        .unwrap()
+        .set_progress_handler(100, move || {
+            counter.fetch_add(100, Ordering::Relaxed);
+            true
+        });
+    let deleted = sqlx::query(crate::workspace_repo::DELETE_NOTE_COMMENT_BATCH_SQL)
+        .bind(ws.as_str())
+        .bind(50)
+        .execute(&mut *conn)
+        .await;
+    conn.lock_handle().await.unwrap().remove_progress_handler();
+    let steps = work.load(Ordering::Relaxed);
+    assert_eq!(deleted.unwrap().rows_affected(), 50);
+    assert!(
+        steps < 80_000,
+        "50 small comments must not scan 10k unrelated anchors: {steps} VM steps"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM note_comment_anchor WHERE comment_id='kept-comment'"
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap(),
+        10_000
+    );
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+        .is_empty());
+    drop(conn);
+    assert_eq!(
+        store
+            .read_note_page_state(&keeper, &kept_note.id, None)
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(store.get_comment("kept-comment").await.is_ok());
+}
+
+#[tokio::test]
+async fn annotation_count_updates_skip_state_writes_but_epochs_advance_and_rollback() {
+    let (_db, store, ws, note) = fixture().await;
+    let before = store.read_note_page_state(&ws, &note, None).await.unwrap();
+    // Observe writes, not only values: an unchanged upsert previously passed
+    // generation assertions while repeating work for every thread-count change.
+    sqlx::raw_sql("CREATE TABLE annotation_state_write_probe(value INTEGER); CREATE TRIGGER annotation_state_write_probe AFTER UPDATE ON note_annotation_state BEGIN INSERT INTO annotation_state_write_probe VALUES(1); END;")
+        .execute(store.write_pool()).await.unwrap();
+    let mut tx = store.write_pool().begin().await.unwrap();
+    sqlx::query("UPDATE note_annotation_head SET thread_count=thread_count+1,comment_count=comment_count+1,orphan_thread_count=orphan_thread_count+1,orphan_comment_count=orphan_comment_count+1,anchors_rev=source_rev WHERE workspace_id=? AND note_id=?")
+        .bind(ws.as_str()).bind(note.as_str()).execute(&mut *tx).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM annotation_state_write_probe")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap(),
+        0
+    );
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        store.read_note_page_state(&ws, &note, None).await.unwrap(),
+        before
+    );
+    let mut tx = store.write_pool().begin().await.unwrap();
+    sqlx::query("UPDATE note_annotation_head SET attribution_rev=source_rev WHERE workspace_id=? AND note_id=?")
+        .bind(ws.as_str()).bind(note.as_str()).execute(&mut *tx).await.unwrap();
+    let ready: (i64, String) = sqlx::query_as("SELECT attribution_ready,state_generation FROM note_annotation_state WHERE workspace_id=? AND note_id=?")
+        .bind(ws.as_str()).bind(note.as_str()).fetch_one(&mut *tx).await.unwrap();
+    assert_eq!(ready, (1, "1".into()));
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        store.read_note_page_state(&ws, &note, None).await.unwrap(),
+        before
+    );
+    let epoch = store.note_annotation_epochs(&ws, &note).await.unwrap();
+    store
+        .begin_note_attribution(&ws, &note, epoch.source_revision)
+        .await
+        .unwrap();
+    let after = store.read_note_page_state(&ws, &note, None).await.unwrap();
+    assert_eq!(after["stateGeneration"], "1");
+    assert_ne!(
+        after["attributionGeneration"],
+        before["attributionGeneration"]
+    );
+    assert_eq!(after["commentRevision"], before["commentRevision"]);
+    assert_eq!(after["sourceRevision"], before["sourceRevision"]);
+}
