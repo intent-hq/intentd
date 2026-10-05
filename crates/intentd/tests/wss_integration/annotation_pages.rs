@@ -128,3 +128,80 @@ async fn annotation_wss_page_state_mutation_and_fresh_subscription_are_bounded()
     drop((writer, fresh, reconnected));
     srv.ws.stop().await;
 }
+
+#[tokio::test]
+async fn annotation_wss_attribution_compute_publishes_ready_state_without_changing_other_epochs() {
+    let srv = start(WsOptions::default()).await;
+    let mut writer = Guest::connect(&srv, &"76".repeat(32)).await;
+    let mut subscriber = Guest::connect(&srv, &"77".repeat(32)).await;
+    let ws = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws))
+        .await
+        .unwrap();
+    srv.store
+        .insert_note(&fixture_note(&ws, "spec", "one\ntwo"))
+        .await
+        .unwrap();
+    for principal in [&writer.principal.id, &subscriber.principal.id] {
+        srv.store
+            .add_workspace_member(&ws, principal, WorkspaceRole::Collaborator)
+            .await
+            .unwrap();
+    }
+    let ack = subscriber
+        .call(
+            "comment.subscribe",
+            json!({"workspaceId":ws,"noteId":"spec","projection":"pageState"}),
+        )
+        .await;
+    assert!(ack["result"]["subscriptionId"].is_string(), "{ack}");
+    let initial = next_subscription_push(&mut subscriber.ws).await;
+    bounded_annotation_push(&initial);
+    assert_eq!(initial["snapshot"]["attributionState"], "pending");
+    let compute = writer
+        .call(
+            "note.lineAttribution.computeNow",
+            json!({"workspaceId":ws,"noteId":"spec"}),
+        )
+        .await;
+    assert_eq!(compute["result"]["ok"], true, "{compute}");
+    let ready = srv
+        .store
+        .read_note_page_state(&ws, &NoteId::from("spec"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        ready["attributionState"], "ready",
+        "legacy computation must publish the normalized generation too"
+    );
+    assert_eq!(
+        ready["sourceRevision"],
+        initial["snapshot"]["sourceRevision"]
+    );
+    assert_eq!(
+        ready["commentRevision"],
+        initial["snapshot"]["commentRevision"]
+    );
+    assert_ne!(
+        ready["attributionGeneration"],
+        initial["snapshot"]["attributionGeneration"]
+    );
+    let pushed = next_subscription_push(&mut subscriber.ws).await;
+    bounded_annotation_push(&pushed);
+    assert_eq!(pushed["snapshot"], ready);
+    let mut request = ready["scope"].clone();
+    request["sourceRevision"] = ready["sourceRevision"].clone();
+    request["attributionGeneration"] = ready["attributionGeneration"].clone();
+    request["page"] = json!({"kind":"attribution","ranges":[],"maxWireBytes":4096});
+    let page = writer.call("note.lineAttribution.load", request).await;
+    assert_eq!(page["result"]["kind"], "noteAttributionPage", "{page}");
+    assert_eq!(page["result"]["state"], "ready");
+    assert_eq!(
+        page["result"]["attributionGeneration"],
+        ready["attributionGeneration"]
+    );
+    assert!(page.to_string().len() <= 4096);
+    drop((writer, subscriber));
+    srv.ws.stop().await;
+}
