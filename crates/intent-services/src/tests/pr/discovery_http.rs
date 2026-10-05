@@ -1,4 +1,5 @@
 //! Service regressions count real HTTP attempts through the production adapter.
+use super::automatic_refresh::owner_caller;
 use super::*;
 use intent_sourcecontrol::traffic::{with_traffic, Operation, Traffic};
 use std::sync::{
@@ -1464,4 +1465,158 @@ async fn shared_discovery_explicit_overlap_retries_partial_listing_after_local_d
         }),
     )
     .await;
+}
+
+#[tokio::test]
+async fn automatic_refreshes_share_http_reads_across_workspaces_and_monitor_cache() {
+    let api = Api::new(vec![pull(42, "feature")]).await;
+    let (_db, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let svc = svc.with_source_control(api.sc());
+    let first = consumer(&svc, "feature", "r").await;
+    let second = consumer(&svc, "feature", "r").await;
+    for ws in [&first, &second] {
+        sqlx::query(
+            "UPDATE workspace SET last_content_activity = '2020-01-01T00:00:00Z' WHERE id = ?",
+        )
+        .bind(&ws.id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+        intent_core::with_caller(
+            owner_caller(&svc).await,
+            svc.pr_refresh_automatic(ws.id.clone()),
+        )
+        .await
+        .unwrap();
+    }
+    let initial = api.requests.lock().unwrap().clone();
+    assert_eq!(
+        initial.len(),
+        2,
+        "one shared list and one linked record: {initial:?}"
+    );
+
+    // Populate the exact cache the monitor uses. Automatic refresh can reuse
+    // its record beyond the old three-minute discovery window while idle.
+    api.pulls.lock().unwrap()[0]["title"] = json!("Observed by monitor");
+    let repo = RepoRef::new("o", "r");
+    let (observed, _) = svc.serve_pr(&repo, 42).await.unwrap();
+    assert_eq!(observed.pr.title, "Observed by monitor");
+    svc.backdate_pr_cache(std::time::Duration::from_secs(240));
+    // The discovery record must be stale at the idle tier, so only borrowing
+    // the monitor's four-minute-old observation can avoid another HTTP read.
+    svc.pr_discovery
+        .age_entries(std::time::Duration::from_secs(900));
+    let before = api.requests.lock().unwrap().len();
+    let sc = api.sc();
+    let borrowed = crate::pr_discovery::automatically_refresh(
+        900,
+        svc.shared_pr_record(sc.as_ref(), &repo, 42),
+    )
+    .await
+    .unwrap();
+    assert_eq!(borrowed.title, "Observed by monitor");
+    assert_eq!(api.requests.lock().unwrap().len(), before);
+    intent_core::with_caller(owner_caller(&svc).await, svc.pr_refresh_automatic(first.id))
+        .await
+        .unwrap();
+    intent_core::with_caller(
+        owner_caller(&svc).await,
+        svc.pr_refresh_automatic(second.id),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        api.requests.lock().unwrap().len(),
+        before,
+        "repeated windows spend no quota"
+    );
+}
+
+#[tokio::test]
+async fn automatic_failure_retries_and_shared_idle_targets_spend_no_extra_http_requests() {
+    let api = Api::new(vec![pull(42, "feature")]).await;
+    api.fail_page.store(1, Ordering::SeqCst);
+    let (_db, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let svc = svc.with_source_control(api.sc());
+    let ws = consumer(&svc, "feature", "r").await;
+    sqlx::query("UPDATE workspace SET last_content_activity = '2020-01-01T00:00:00Z' WHERE id = ?")
+        .bind(&ws.id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    let _ = intent_core::with_caller(
+        owner_caller(&svc).await,
+        svc.pr_refresh_automatic(ws.id.clone()),
+    )
+    .await;
+    assert_eq!(api.requests.lock().unwrap().len(), 1);
+    for _ in 0..5 {
+        intent_core::with_caller(
+            owner_caller(&svc).await,
+            svc.pr_refresh_automatic(ws.id.clone()),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(api.requests.lock().unwrap().len(), 1);
+    // Another workspace still shares the provider-scoped negative cache.
+    let second = consumer(&svc, "feature", "r").await;
+    let _ = intent_core::with_caller(
+        owner_caller(&svc).await,
+        svc.pr_refresh_automatic(second.id),
+    )
+    .await;
+    assert_eq!(api.requests.lock().unwrap().len(), 1);
+    // A user-requested retry retains the legacy explicit refresh behavior.
+    api.fail_page.store(0, Ordering::SeqCst);
+    let result = intent_core::with_caller(owner_caller(&svc).await, svc.pr_refresh(ws.id))
+        .await
+        .unwrap();
+    assert_eq!(result["prNumber"], 42);
+    assert_eq!(api.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn automatic_http_admission_and_cache_use_each_workspace_tier() {
+    for (idle, interval) in [(0, 60), (900, 120), (3600, 300), (21600, 600), (86400, 900)] {
+        let api = Api::new(vec![pull(42, "feature")]).await;
+        let (_db, svc, ws) = refresh_setup(StubForge::default(), "feature", None, false).await;
+        let svc = svc
+            .with_source_control(api.sc())
+            .with_pr_monitor_poll_seconds(60);
+        let clock = (time::OffsetDateTime::now_utc() - time::Duration::seconds(idle))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        sqlx::query("UPDATE workspace SET last_content_activity = ? WHERE id = ?")
+            .bind(&clock)
+            .bind(&ws.0)
+            .execute(svc.store().write_pool())
+            .await
+            .unwrap();
+        intent_core::with_caller(
+            owner_caller(&svc).await,
+            svc.pr_refresh_automatic(ws.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.requests.lock().unwrap().len(), 2);
+        // Age the cache independently: even an expired cache cannot bypass
+        // admission, and the exact active/idle interval admits fresh HTTP.
+        svc.pr_discovery
+            .age_entries(std::time::Duration::from_secs(interval));
+        svc.age_automatic_pr_refresh(&ws, interval - 10);
+        intent_core::with_caller(
+            owner_caller(&svc).await,
+            svc.pr_refresh_automatic(ws.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.requests.lock().unwrap().len(), 2);
+        svc.age_automatic_pr_refresh(&ws, 10);
+        intent_core::with_caller(owner_caller(&svc).await, svc.pr_refresh_automatic(ws))
+            .await
+            .unwrap();
+        assert_eq!(api.requests.lock().unwrap().len(), 4, "interval {interval}");
+    }
 }

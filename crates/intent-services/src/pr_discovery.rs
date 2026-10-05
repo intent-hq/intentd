@@ -27,6 +27,16 @@ const LIST_RESERVATION: usize = MAX_PAGES * 4;
 const RECORD_RESERVATION: usize = 4;
 
 tokio::task_local! { static FORCE_AFTER: Instant; }
+tokio::task_local! { static AUTOMATIC_MAX_AGE: Duration; }
+
+pub(crate) async fn automatically_refresh<T>(
+    interval_secs: u64,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    AUTOMATIC_MAX_AGE
+        .scope(Duration::from_secs(interval_secs), Box::pin(future))
+        .await
+}
 
 pub(crate) async fn explicitly_refresh<T>(future: impl std::future::Future<Output = T>) -> T {
     FORCE_AFTER.scope(Instant::now(), Box::pin(future)).await
@@ -38,10 +48,17 @@ pub(crate) fn inherit_refresh<T>(
     future: impl std::future::Future<Output = T>,
 ) -> impl std::future::Future<Output = T> {
     let force_after = FORCE_AFTER.try_with(|at| *at).ok();
+    let automatic_max_age = AUTOMATIC_MAX_AGE.try_with(|age| *age).ok();
     async move {
-        match force_after {
-            Some(at) => FORCE_AFTER.scope(at, future).await,
-            None => future.await,
+        let inherited = async move {
+            match force_after {
+                Some(at) => FORCE_AFTER.scope(at, future).await,
+                None => future.await,
+            }
+        };
+        match automatic_max_age {
+            Some(age) => AUTOMATIC_MAX_AGE.scope(age, inherited).await,
+            None => inherited.await,
         }
     }
 }
@@ -259,14 +276,19 @@ impl Discovery {
 
     #[cfg(test)]
     pub(crate) fn expire(&self) {
+        self.age_entries(WINDOW);
+        self.budget.lock().unwrap().started -= WINDOW;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_entries(&self, by: Duration) {
         for (_, slot) in self.slots.lock().unwrap().values() {
             if let Ok(mut entry) = slot.entry.try_lock() {
                 if let Some(entry) = entry.as_mut() {
-                    entry.started -= WINDOW;
+                    entry.started -= by;
                 }
             }
         }
-        self.budget.lock().unwrap().started -= WINDOW;
     }
 
     #[cfg(test)]
@@ -339,6 +361,7 @@ impl Discovery {
         };
         let revision = slot.revision.load(Ordering::SeqCst);
         let force_after = FORCE_AFTER.try_with(|at| *at).ok();
+        let max_age = AUTOMATIC_MAX_AGE.try_with(|age| *age).unwrap_or(WINDOW);
         let merged = matches!(entry.as_ref().map(|e| &e.result), Some(Ok(Value::Record(pr))) if pr.state == PrState::Merged);
         // A monitor/hover may have observed a newer record since our last
         // background fill. Borrow that record before returning our own hit.
@@ -349,7 +372,7 @@ impl Discovery {
                     &key.repo,
                     number,
                     &key.scope,
-                    WINDOW,
+                    max_age,
                 ) {
                     let at = Instant::from_std(at);
                     if (!merged || pr.state == PrState::Merged)
@@ -375,7 +398,7 @@ impl Discovery {
                 && !(force_after.is_some() && cached.background_deferred)
                 && key.scope.is_current()
                 && (merged
-                    || (cached.started.elapsed() < WINDOW
+                    || (cached.started.elapsed() < max_age
                         && !self.newer_listing(&key, cached.started)))
                 && force_after
                     .is_none_or(|at| cached.finished.is_some_and(|finished| finished >= at))

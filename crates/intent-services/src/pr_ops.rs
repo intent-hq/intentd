@@ -91,36 +91,18 @@ pub(crate) fn parse_repo_slug(slug: &str) -> Result<(String, String)> {
     )))
 }
 
-/// Background-sweep activity window (§7.6/§7.7): workspaces whose
-/// `updatedAt`/`lastActivity` is within this many minutes are refreshed on
-/// every sweep tick; colder workspaces only refresh on every
-/// [`SWEEP_IDLE_TICK_MULTIPLE`]-th tick, trimming steady forge load.
-pub(crate) const SWEEP_ACTIVE_WINDOW_MINUTES: i64 = 30;
-
-/// Idle workspaces refresh on every Nth sweep tick (~30 minutes at the 180s
-/// base interval wired in `intentd/src/main.rs`).
-pub(crate) const SWEEP_IDLE_TICK_MULTIPLE: u64 = 10;
-
-/// Whether the background sweep should refresh `ws` on this `tick` (§7.6 with
-/// the §7.7 "defer non-urgent refreshes" trimming): every
-/// [`SWEEP_IDLE_TICK_MULTIPLE`]-th tick (including tick 0, the first sweep
-/// after startup) refreshes every workspace; ticks in between refresh only
-/// workspaces active since `active_cutoff` (parsed once per sweep by the
-/// caller). A sweep that persists a PR delta bumps `updatedAt`, so workspaces
-/// with churning PRs stay on the every-tick cadence while quiet ones cool
-/// down. Malformed workspace timestamps — and a `None` cutoff — fail open
-/// (count as active) so a bad record never slows its own refreshes.
-pub(crate) fn sweep_due(ws: &Workspace, active_cutoff: Option<OffsetDateTime>, tick: u64) -> bool {
-    if tick.is_multiple_of(SWEEP_IDLE_TICK_MULTIPLE) {
+/// Keep local checkout scans on their existing three-minute active and
+/// thirty-minute idle cadence, independently of forge admission. `tick` now
+/// advances once a minute. These metadata clocks schedule local work only.
+pub(crate) fn local_root_maintenance_due(ws: &Workspace, tick: u64, now: OffsetDateTime) -> bool {
+    if tick.is_multiple_of(30) {
         return true;
     }
-    let Some(cutoff) = active_cutoff else {
-        return true;
-    };
-    let active = |ts: &str| match parse_iso(ts) {
-        Some(t) => t >= cutoff,
-        None => true,
-    };
+    if !tick.is_multiple_of(3) {
+        return false;
+    }
+    let cutoff = now - time::Duration::minutes(30);
+    let active = |ts: &str| parse_iso(ts).is_none_or(|at| at >= cutoff);
     active(&ws.updated_at) || ws.last_activity.as_deref().is_some_and(active)
 }
 
@@ -145,7 +127,8 @@ pub(crate) fn active_pr_number(ws: &Workspace) -> Result<u64> {
 /// (if any) the caller emitted; `Skipped`/`Unchanged` emit nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrRefreshOutcome {
-    /// Not eligible (remote/archived workspace, no repo, or no branch).
+    /// Not eligible (remote/archived workspace, no repo, or no branch),
+    /// or an automatic refresh deferred by idle/quota admission.
     /// Git-root refreshes still run the repo-scoped stale-pool heal on a
     /// branchless root ([`refresh_stale_pool_entries`]), upgrading to
     /// `Updated` when it changed the pool.
