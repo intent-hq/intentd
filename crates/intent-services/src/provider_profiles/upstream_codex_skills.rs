@@ -267,6 +267,7 @@ async fn upstream_codex_personal_skills_reach_fresh_and_persisted_context() {
             .await;
         assert_catalog_request(&model.capture().await, &skills);
         adapter.stop().await;
+        drop(profile);
 
         if skill_home == &home {
             write(&home.join(".agents/skills/find-skills/SKILL.md"), &format!("---\nname: find-skills\ndescription: Refreshed personal skill for {identity}\n---\nUse this fixture skill.\n"));

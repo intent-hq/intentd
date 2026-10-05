@@ -202,6 +202,7 @@ fn codex_resume_preserves_bundled_skills_without_exempting_native_roots() {
     for path in [&bundled, &personal, &native_system, &profile_user] {
         write(path, "---\nname: fixture\ndescription: fixture\n---\n");
     }
+    drop(profile);
     let mut req = request(dir.path(), "codex", &empty);
     req.resume = true;
     let resumed = prepare_provider_profile(req).unwrap();
