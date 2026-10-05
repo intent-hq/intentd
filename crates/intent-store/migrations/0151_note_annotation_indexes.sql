@@ -9,6 +9,10 @@ CREATE TABLE note_annotation_head (
     comment_revision TEXT NOT NULL DEFAULT (lower(hex(randomblob(16)))),
     attribution_rev INTEGER NOT NULL DEFAULT -1,
     anchors_rev INTEGER NOT NULL DEFAULT -1,
+    thread_count INTEGER NOT NULL DEFAULT 0,
+    comment_count INTEGER NOT NULL DEFAULT 0,
+    orphan_thread_count INTEGER NOT NULL DEFAULT 0,
+    orphan_comment_count INTEGER NOT NULL DEFAULT 0,
     UNIQUE (workspace_id, note_id),
     FOREIGN KEY (note_id, workspace_id) REFERENCES note(id, workspace_id) ON DELETE CASCADE ON UPDATE CASCADE
 );
@@ -57,12 +61,32 @@ CREATE TRIGGER note_annotation_legacy_update AFTER UPDATE ON note_line_attributi
         WHERE workspace_id=new.workspace_id AND note_id=new.note_id;
 END;
 
+CREATE TABLE note_comment_root (
+    head_id INTEGER NOT NULL REFERENCES note_annotation_head(id) ON DELETE CASCADE,
+    thread_id TEXT NOT NULL,root_comment_id TEXT NOT NULL,root_present INTEGER NOT NULL,
+    PRIMARY KEY(head_id,thread_id)
+);
 CREATE TABLE note_comment_thread (
     head_id INTEGER NOT NULL REFERENCES note_annotation_head(id) ON DELETE CASCADE,
     thread_id TEXT NOT NULL,
     total_comments INTEGER NOT NULL CHECK(total_comments >= 0),
+    anchor_count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (head_id,thread_id)
 );
+CREATE INDEX note_comment_orphan_order ON note_comment_thread(head_id,thread_id) WHERE anchor_count=0;
+CREATE TRIGGER note_comment_thread_count_insert AFTER INSERT ON note_comment_thread BEGIN
+    UPDATE note_annotation_head SET thread_count=thread_count+1,comment_count=comment_count+new.total_comments,
+        orphan_thread_count=orphan_thread_count+(new.anchor_count=0),orphan_comment_count=orphan_comment_count+CASE WHEN new.anchor_count=0 THEN new.total_comments ELSE 0 END WHERE id=new.head_id;
+END;
+CREATE TRIGGER note_comment_thread_count_update AFTER UPDATE ON note_comment_thread BEGIN
+    UPDATE note_annotation_head SET comment_count=comment_count+new.total_comments-old.total_comments,
+        orphan_thread_count=orphan_thread_count+(new.anchor_count=0)-(old.anchor_count=0),
+        orphan_comment_count=orphan_comment_count+CASE WHEN new.anchor_count=0 THEN new.total_comments ELSE 0 END-CASE WHEN old.anchor_count=0 THEN old.total_comments ELSE 0 END WHERE id=new.head_id;
+END;
+CREATE TRIGGER note_comment_thread_count_delete AFTER DELETE ON note_comment_thread BEGIN
+    UPDATE note_annotation_head SET thread_count=thread_count-1,comment_count=comment_count-old.total_comments,
+        orphan_thread_count=orphan_thread_count-(old.anchor_count=0),orphan_comment_count=orphan_comment_count-CASE WHEN old.anchor_count=0 THEN old.total_comments ELSE 0 END WHERE id=old.head_id;
+END;
 CREATE TABLE note_comment_projection (
     comment_id TEXT PRIMARY KEY REFERENCES comment(id) ON DELETE CASCADE,
     head_id INTEGER NOT NULL REFERENCES note_annotation_head(id) ON DELETE CASCADE,
@@ -76,10 +100,16 @@ CREATE TABLE note_comment_projection (
 CREATE INDEX note_comment_reply_order ON note_comment_projection(head_id,thread_id,created_at,comment_id);
 CREATE INDEX note_comment_root_order ON note_comment_projection(head_id,thread_id,created_at,comment_id) WHERE parent_id IS NULL;
 CREATE TRIGGER note_comment_projection_insert AFTER INSERT ON note_comment_projection BEGIN
+    INSERT INTO note_comment_root(head_id,thread_id,root_comment_id,root_present)
+        VALUES(new.head_id,new.thread_id,COALESCE(new.parent_id,new.comment_id),new.parent_id IS NULL)
+        ON CONFLICT(head_id,thread_id) DO UPDATE SET
+            root_comment_id=CASE WHEN new.parent_id IS NULL THEN new.comment_id ELSE root_comment_id END,
+            root_present=CASE WHEN new.parent_id IS NULL THEN 1 ELSE root_present END;
     INSERT INTO note_comment_thread(head_id,thread_id,total_comments) VALUES(new.head_id,new.thread_id,1)
         ON CONFLICT(head_id,thread_id) DO UPDATE SET total_comments=total_comments+1;
 END;
 CREATE TRIGGER note_comment_projection_delete AFTER DELETE ON note_comment_projection BEGIN
+    UPDATE note_comment_root SET root_present=0 WHERE head_id=old.head_id AND thread_id=old.thread_id AND root_comment_id=old.comment_id;
     UPDATE note_comment_thread SET total_comments=total_comments-1 WHERE head_id=old.head_id AND thread_id=old.thread_id;
     DELETE FROM note_comment_thread WHERE head_id=old.head_id AND thread_id=old.thread_id AND total_comments=0;
 END;
@@ -96,6 +126,7 @@ CREATE TRIGGER note_comment_insert AFTER INSERT ON comment BEGIN
         WHERE workspace_id=new.workspace_id AND note_id=new.note_id;
 END;
 CREATE TRIGGER note_comment_update AFTER UPDATE ON comment BEGIN
+    DELETE FROM note_comment_anchor WHERE comment_id=old.id;
     DELETE FROM note_comment_projection WHERE comment_id=old.id;
     INSERT INTO note_comment_projection
         SELECT new.id,h.id,new.thread_id,new.parent_id,new.status,new.created_at,substr(new.content,1,256),length(CAST(new.content AS BLOB))>length(CAST(substr(new.content,1,256) AS BLOB))
@@ -117,6 +148,7 @@ CREATE TABLE note_comment_anchor (
     head_id INTEGER NOT NULL REFERENCES note_annotation_head(id) ON DELETE CASCADE,
     comment_id TEXT NOT NULL REFERENCES comment(id) ON DELETE CASCADE,
     occurrence_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
     start INTEGER NOT NULL CHECK(start >= 0),
     end INTEGER NOT NULL CHECK(end >= start),
     UNIQUE(head_id,comment_id,occurrence_id)
@@ -126,12 +158,16 @@ CREATE INDEX note_comment_anchor_owner ON note_comment_anchor(head_id,comment_id
 -- exact INTEGER coordinates, so rounding cannot alter endpoint semantics.
 CREATE VIRTUAL TABLE note_comment_anchor_extent USING rtree(id,scope_min,scope_max,start,end);
 CREATE TRIGGER note_comment_anchor_insert AFTER INSERT ON note_comment_anchor BEGIN
+    UPDATE note_comment_thread SET anchor_count=anchor_count+1 WHERE head_id=new.head_id AND thread_id=new.thread_id;
     INSERT INTO note_comment_anchor_extent VALUES(new.id,new.head_id,new.head_id,new.start,new.end);
 END;
 CREATE TRIGGER note_comment_anchor_delete AFTER DELETE ON note_comment_anchor BEGIN
+    UPDATE note_comment_thread SET anchor_count=anchor_count-1 WHERE head_id=old.head_id AND thread_id=old.thread_id;
     DELETE FROM note_comment_anchor_extent WHERE id=old.id;
 END;
 CREATE TRIGGER note_comment_anchor_update AFTER UPDATE ON note_comment_anchor BEGIN
+    UPDATE note_comment_thread SET anchor_count=anchor_count-1 WHERE head_id=old.head_id AND thread_id=old.thread_id;
+    UPDATE note_comment_thread SET anchor_count=anchor_count+1 WHERE head_id=new.head_id AND thread_id=new.thread_id;
     DELETE FROM note_comment_anchor_extent WHERE id=old.id;
     INSERT INTO note_comment_anchor_extent VALUES(new.id,new.head_id,new.head_id,new.start,new.end);
 END;
@@ -174,6 +210,10 @@ BEGIN
             + CASE WHEN CAST(substr(old.state_generation,-9) AS INTEGER)=999999999 THEN 1 ELSE 0 END)
         ||printf('%09d',(CAST(substr(old.state_generation,-9) AS INTEGER)+1)%1000000000),'0')
     WHERE workspace_id=new.workspace_id AND note_id=new.note_id AND instance_id=new.instance_id;
+END;
+CREATE TRIGGER note_annotation_state_move BEFORE UPDATE OF id,workspace_id ON note
+WHEN new.id<>old.id OR new.workspace_id<>old.workspace_id BEGIN
+    UPDATE note_annotation_state SET deleted=1 WHERE workspace_id=old.workspace_id AND note_id=old.id AND deleted=0;
 END;
 CREATE TRIGGER note_annotation_state_delete BEFORE DELETE ON note BEGIN
     UPDATE note_annotation_state SET deleted=1
@@ -239,10 +279,10 @@ CREATE TABLE note_comment_detail_piece (
     FOREIGN KEY(comment_id,field) REFERENCES note_comment_detail(comment_id,field) ON DELETE CASCADE
 );
     INSERT INTO note_comment_detail
-        WITH input AS MATERIALIZED (SELECT c.id AS comment_id,'body' AS field,CAST(COALESCE(c.content,'') AS BLOB) AS data,c.content IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'author' AS field,CAST(COALESCE(c.author,'') AS BLOB) AS data,c.author IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'anchor' AS field,CAST(COALESCE(c.anchor_json,'') AS BLOB) AS data,c.anchor_json IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'anchorText' AS field,CAST(COALESCE(c.anchor_text,'') AS BLOB) AS data,c.anchor_text IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'extra' AS field,CAST(COALESCE(c.extra_json,'') AS BLOB) AS data,c.extra_json IS NULL AS is_null FROM comment c)
+        WITH input AS MATERIALIZED (SELECT c.id AS comment_id,'body' AS field,CAST(COALESCE(c.content,'') AS BLOB) AS data,c.content IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'author' AS field,CAST(COALESCE(c.author,'') AS BLOB) AS data,c.author IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'anchor' AS field,CAST(COALESCE(c.anchor_json,'') AS BLOB) AS data,c.anchor_json IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'anchorText' AS field,CAST(COALESCE(c.anchor_text,'') AS BLOB) AS data,c.anchor_text IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'startId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(c.anchor_json) THEN c.anchor_json ELSE '{}' END,'$.startId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(c.anchor_json) THEN c.anchor_json ELSE '{}' END,'$.startId') IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'endId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(c.anchor_json) THEN c.anchor_json ELSE '{}' END,'$.endId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(c.anchor_json) THEN c.anchor_json ELSE '{}' END,'$.endId') IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'pointId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(c.anchor_json) THEN c.anchor_json ELSE '{}' END,'$.pointId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(c.anchor_json) THEN c.anchor_json ELSE '{}' END,'$.pointId') IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'extra' AS field,CAST(COALESCE(c.extra_json,'') AS BLOB) AS data,c.extra_json IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'authorPrincipalId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorPrincipalId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorPrincipalId') IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'provider' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorIdentity.provider'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorIdentity.provider') IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'host' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorIdentity.host'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorIdentity.host') IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'externalUserId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorIdentity.externalUserId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorIdentity.externalUserId') IS NULL AS is_null FROM comment c)
         SELECT comment_id,field,length(data),is_null FROM input;
     INSERT INTO note_comment_detail_piece
-        WITH RECURSIVE input AS MATERIALIZED (SELECT c.id AS comment_id,'body' AS field,CAST(COALESCE(c.content,'') AS BLOB) AS data,c.content IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'author' AS field,CAST(COALESCE(c.author,'') AS BLOB) AS data,c.author IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'anchor' AS field,CAST(COALESCE(c.anchor_json,'') AS BLOB) AS data,c.anchor_json IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'anchorText' AS field,CAST(COALESCE(c.anchor_text,'') AS BLOB) AS data,c.anchor_text IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'extra' AS field,CAST(COALESCE(c.extra_json,'') AS BLOB) AS data,c.extra_json IS NULL AS is_null FROM comment c),
+        WITH RECURSIVE input AS MATERIALIZED (SELECT c.id AS comment_id,'body' AS field,CAST(COALESCE(c.content,'') AS BLOB) AS data,c.content IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'author' AS field,CAST(COALESCE(c.author,'') AS BLOB) AS data,c.author IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'anchor' AS field,CAST(COALESCE(c.anchor_json,'') AS BLOB) AS data,c.anchor_json IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'anchorText' AS field,CAST(COALESCE(c.anchor_text,'') AS BLOB) AS data,c.anchor_text IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'startId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(c.anchor_json) THEN c.anchor_json ELSE '{}' END,'$.startId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(c.anchor_json) THEN c.anchor_json ELSE '{}' END,'$.startId') IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'endId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(c.anchor_json) THEN c.anchor_json ELSE '{}' END,'$.endId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(c.anchor_json) THEN c.anchor_json ELSE '{}' END,'$.endId') IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'pointId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(c.anchor_json) THEN c.anchor_json ELSE '{}' END,'$.pointId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(c.anchor_json) THEN c.anchor_json ELSE '{}' END,'$.pointId') IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'extra' AS field,CAST(COALESCE(c.extra_json,'') AS BLOB) AS data,c.extra_json IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'authorPrincipalId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorPrincipalId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorPrincipalId') IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'provider' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorIdentity.provider'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorIdentity.provider') IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'host' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorIdentity.host'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorIdentity.host') IS NULL AS is_null FROM comment c UNION ALL SELECT c.id AS comment_id,'externalUserId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorIdentity.externalUserId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(c.extra_json) THEN c.extra_json ELSE '{}' END,'$.authorIdentity.externalUserId') IS NULL AS is_null FROM comment c),
         offsets(comment_id,field,position,byte_length) AS (
             SELECT comment_id,field,0,length(data) FROM input WHERE length(data)>0
             UNION ALL SELECT comment_id,field,position+1024,byte_length FROM offsets WHERE position+1024<byte_length
@@ -251,10 +291,10 @@ CREATE TABLE note_comment_detail_piece (
         FROM offsets o JOIN input i ON i.comment_id=o.comment_id AND i.field=o.field;
 CREATE TRIGGER note_comment_detail_insert AFTER INSERT ON comment BEGIN
     INSERT INTO note_comment_detail
-        WITH input AS MATERIALIZED (SELECT new.id AS comment_id,'body' AS field,CAST(COALESCE(new.content,'') AS BLOB) AS data,new.content IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'author' AS field,CAST(COALESCE(new.author,'') AS BLOB) AS data,new.author IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchor' AS field,CAST(COALESCE(new.anchor_json,'') AS BLOB) AS data,new.anchor_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchorText' AS field,CAST(COALESCE(new.anchor_text,'') AS BLOB) AS data,new.anchor_text IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'extra' AS field,CAST(COALESCE(new.extra_json,'') AS BLOB) AS data,new.extra_json IS NULL AS is_null)
+        WITH input AS MATERIALIZED (SELECT new.id AS comment_id,'body' AS field,CAST(COALESCE(new.content,'') AS BLOB) AS data,new.content IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'author' AS field,CAST(COALESCE(new.author,'') AS BLOB) AS data,new.author IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchor' AS field,CAST(COALESCE(new.anchor_json,'') AS BLOB) AS data,new.anchor_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchorText' AS field,CAST(COALESCE(new.anchor_text,'') AS BLOB) AS data,new.anchor_text IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'startId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.startId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.startId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'endId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.endId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.endId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'pointId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.pointId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.pointId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'extra' AS field,CAST(COALESCE(new.extra_json,'') AS BLOB) AS data,new.extra_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'authorPrincipalId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorPrincipalId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorPrincipalId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'provider' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.provider'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.provider') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'host' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.host'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.host') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'externalUserId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.externalUserId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.externalUserId') IS NULL AS is_null)
         SELECT comment_id,field,length(data),is_null FROM input;
     INSERT INTO note_comment_detail_piece
-        WITH RECURSIVE input AS MATERIALIZED (SELECT new.id AS comment_id,'body' AS field,CAST(COALESCE(new.content,'') AS BLOB) AS data,new.content IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'author' AS field,CAST(COALESCE(new.author,'') AS BLOB) AS data,new.author IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchor' AS field,CAST(COALESCE(new.anchor_json,'') AS BLOB) AS data,new.anchor_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchorText' AS field,CAST(COALESCE(new.anchor_text,'') AS BLOB) AS data,new.anchor_text IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'extra' AS field,CAST(COALESCE(new.extra_json,'') AS BLOB) AS data,new.extra_json IS NULL AS is_null),
+        WITH RECURSIVE input AS MATERIALIZED (SELECT new.id AS comment_id,'body' AS field,CAST(COALESCE(new.content,'') AS BLOB) AS data,new.content IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'author' AS field,CAST(COALESCE(new.author,'') AS BLOB) AS data,new.author IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchor' AS field,CAST(COALESCE(new.anchor_json,'') AS BLOB) AS data,new.anchor_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchorText' AS field,CAST(COALESCE(new.anchor_text,'') AS BLOB) AS data,new.anchor_text IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'startId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.startId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.startId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'endId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.endId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.endId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'pointId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.pointId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.pointId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'extra' AS field,CAST(COALESCE(new.extra_json,'') AS BLOB) AS data,new.extra_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'authorPrincipalId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorPrincipalId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorPrincipalId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'provider' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.provider'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.provider') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'host' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.host'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.host') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'externalUserId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.externalUserId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.externalUserId') IS NULL AS is_null),
         offsets(comment_id,field,position,byte_length) AS (
             SELECT comment_id,field,0,length(data) FROM input WHERE length(data)>0
             UNION ALL SELECT comment_id,field,position+1024,byte_length FROM offsets WHERE position+1024<byte_length
@@ -267,10 +307,10 @@ WHEN new.content IS NOT old.content OR new.author IS NOT old.author OR new.ancho
 BEGIN
     DELETE FROM note_comment_detail WHERE comment_id=old.id;
     INSERT INTO note_comment_detail
-        WITH input AS MATERIALIZED (SELECT new.id AS comment_id,'body' AS field,CAST(COALESCE(new.content,'') AS BLOB) AS data,new.content IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'author' AS field,CAST(COALESCE(new.author,'') AS BLOB) AS data,new.author IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchor' AS field,CAST(COALESCE(new.anchor_json,'') AS BLOB) AS data,new.anchor_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchorText' AS field,CAST(COALESCE(new.anchor_text,'') AS BLOB) AS data,new.anchor_text IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'extra' AS field,CAST(COALESCE(new.extra_json,'') AS BLOB) AS data,new.extra_json IS NULL AS is_null)
+        WITH input AS MATERIALIZED (SELECT new.id AS comment_id,'body' AS field,CAST(COALESCE(new.content,'') AS BLOB) AS data,new.content IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'author' AS field,CAST(COALESCE(new.author,'') AS BLOB) AS data,new.author IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchor' AS field,CAST(COALESCE(new.anchor_json,'') AS BLOB) AS data,new.anchor_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchorText' AS field,CAST(COALESCE(new.anchor_text,'') AS BLOB) AS data,new.anchor_text IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'startId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.startId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.startId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'endId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.endId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.endId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'pointId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.pointId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.pointId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'extra' AS field,CAST(COALESCE(new.extra_json,'') AS BLOB) AS data,new.extra_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'authorPrincipalId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorPrincipalId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorPrincipalId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'provider' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.provider'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.provider') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'host' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.host'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.host') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'externalUserId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.externalUserId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.externalUserId') IS NULL AS is_null)
         SELECT comment_id,field,length(data),is_null FROM input;
     INSERT INTO note_comment_detail_piece
-        WITH RECURSIVE input AS MATERIALIZED (SELECT new.id AS comment_id,'body' AS field,CAST(COALESCE(new.content,'') AS BLOB) AS data,new.content IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'author' AS field,CAST(COALESCE(new.author,'') AS BLOB) AS data,new.author IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchor' AS field,CAST(COALESCE(new.anchor_json,'') AS BLOB) AS data,new.anchor_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchorText' AS field,CAST(COALESCE(new.anchor_text,'') AS BLOB) AS data,new.anchor_text IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'extra' AS field,CAST(COALESCE(new.extra_json,'') AS BLOB) AS data,new.extra_json IS NULL AS is_null),
+        WITH RECURSIVE input AS MATERIALIZED (SELECT new.id AS comment_id,'body' AS field,CAST(COALESCE(new.content,'') AS BLOB) AS data,new.content IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'author' AS field,CAST(COALESCE(new.author,'') AS BLOB) AS data,new.author IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchor' AS field,CAST(COALESCE(new.anchor_json,'') AS BLOB) AS data,new.anchor_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'anchorText' AS field,CAST(COALESCE(new.anchor_text,'') AS BLOB) AS data,new.anchor_text IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'startId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.startId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.startId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'endId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.endId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.endId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'pointId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.pointId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.anchor_json) THEN new.anchor_json ELSE '{}' END,'$.pointId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'extra' AS field,CAST(COALESCE(new.extra_json,'') AS BLOB) AS data,new.extra_json IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'authorPrincipalId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorPrincipalId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorPrincipalId') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'provider' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.provider'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.provider') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'host' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.host'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.host') IS NULL AS is_null UNION ALL SELECT new.id AS comment_id,'externalUserId' AS field,CAST(COALESCE(json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.externalUserId'),'') AS BLOB) AS data,json_extract(CASE WHEN json_valid(new.extra_json) THEN new.extra_json ELSE '{}' END,'$.authorIdentity.externalUserId') IS NULL AS is_null),
         offsets(comment_id,field,position,byte_length) AS (
             SELECT comment_id,field,0,length(data) FROM input WHERE length(data)>0
             UNION ALL SELECT comment_id,field,position+1024,byte_length FROM offsets WHERE position+1024<byte_length
@@ -294,3 +334,26 @@ CREATE TRIGGER note_attribution_author_fragment AFTER INSERT ON note_attribution
         )
         SELECT new.head_id,new.line,position,substr(CAST(new.author_json AS BLOB),position+1,1024) FROM offsets;
 END;
+
+CREATE TABLE note_annotation_snapshot (id TEXT PRIMARY KEY,expires_ms INTEGER NOT NULL,payload TEXT NOT NULL);
+CREATE INDEX note_annotation_snapshot_expiry ON note_annotation_snapshot(expires_ms,id);
+
+-- At most four live prepared range queries are admitted by the store. Their
+-- narrow rows retain at most one entry per current scoped thread per lease.
+-- Storage grows at most four times the source index; no result-cardinality cap.
+CREATE TABLE note_annotation_match_head (
+    snapshot_id TEXT PRIMARY KEY REFERENCES note_annotation_snapshot(id) ON DELETE CASCADE,
+    total_threads INTEGER NOT NULL,total_comments INTEGER NOT NULL,prepare_steps INTEGER NOT NULL,
+    head_id INTEGER NOT NULL REFERENCES note_annotation_head(id) ON DELETE CASCADE
+);
+CREATE TABLE note_annotation_match (
+    snapshot_id TEXT NOT NULL REFERENCES note_annotation_match_head(snapshot_id) ON DELETE CASCADE,
+    thread_id TEXT NOT NULL CHECK(length(CAST(thread_id AS BLOB))<=256),position INTEGER NOT NULL,
+    PRIMARY KEY(snapshot_id,position,thread_id)
+);
+
+CREATE TRIGGER note_annotation_match_invalidate AFTER UPDATE OF source_rev,comment_revision ON note_annotation_head
+WHEN new.source_rev<>old.source_rev OR new.comment_revision<>old.comment_revision BEGIN
+    DELETE FROM note_annotation_match_head WHERE head_id=new.id;
+END;
+CREATE INDEX note_annotation_match_owner ON note_annotation_match_head(head_id);

@@ -653,3 +653,683 @@ async fn huge_comment_fields_reconstruct_from_bounded_scalar_safe_fragments() {
         .await
         .is_err());
 }
+
+async fn annotation_scope(
+    store: &Store,
+    ws: &WorkspaceId,
+    note: &NoteId,
+) -> (intent_core::note_page::NoteScope, String) {
+    let state = store.read_note_page_state(ws, note, None).await.unwrap();
+    (
+        serde_json::from_value(state["scope"].clone()).unwrap(),
+        state["sourceRevision"].as_str().unwrap().into(),
+    )
+}
+
+#[tokio::test]
+async fn annotation_page_cursors_bind_query_principal_epochs_budget_and_expiry() {
+    use serde_json::json;
+    let (_db, store, ws, note) = fixture().await;
+    let epochs = store.note_annotation_epochs(&ws, &note).await.unwrap();
+    let job = store
+        .begin_note_attribution(&ws, &note, epochs.source_revision)
+        .await
+        .unwrap();
+    store
+        .publish_note_attribution(&job, "one\n😀 two\nthree", &attribution(&ws, &note, 2))
+        .await
+        .unwrap();
+    let (scope, source) = annotation_scope(&store, &ws, &note).await;
+    let mut request:AnnotationPageRequest=serde_json::from_value(json!({"kind":"attribution","ranges":[{"start":0,"end":17}],"maxItems":1,"maxWireBytes":4096})).unwrap();
+    let first = store
+        .read_note_annotation_page("alice", &scope, &source, None, None, &request, &json!(3))
+        .await
+        .unwrap();
+    assert_eq!(first["items"][0]["startLine"], 1);
+    let generation = first["attributionGeneration"].as_str().unwrap();
+    request.cursor = Some(first["nextCursor"].as_str().unwrap().into());
+    store
+        .insert_comment(&ws, &sample_comment(&note, "thread", "root"))
+        .await
+        .unwrap();
+    let second = store
+        .read_note_annotation_page(
+            "alice",
+            &scope,
+            &source,
+            Some(generation),
+            None,
+            &request,
+            &json!(4),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["items"][0]["startLine"], 2);
+    assert!(store
+        .read_note_annotation_page(
+            "bob",
+            &scope,
+            &source,
+            Some(generation),
+            None,
+            &request,
+            &json!(4)
+        )
+        .await
+        .is_err());
+    request.max_items = Some(2);
+    assert!(store
+        .read_note_annotation_page(
+            "alice",
+            &scope,
+            &source,
+            Some(generation),
+            None,
+            &request,
+            &json!(4)
+        )
+        .await
+        .is_err());
+    request.max_items = Some(1);
+    request.ranges = Some(vec![AnnotationRange { start: 0, end: 4 }]);
+    assert!(store
+        .read_note_annotation_page(
+            "alice",
+            &scope,
+            &source,
+            Some(generation),
+            None,
+            &request,
+            &json!(4)
+        )
+        .await
+        .is_err());
+    request.ranges = Some(vec![AnnotationRange { start: 0, end: 17 }]);
+    sqlx::query("UPDATE note_annotation_snapshot SET expires_ms=0")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert!(store
+        .read_note_annotation_page(
+            "alice",
+            &scope,
+            &source,
+            Some(generation),
+            None,
+            &request,
+            &json!(4)
+        )
+        .await
+        .is_err());
+    request.cursor = None;
+    let fresh = store
+        .read_note_annotation_page("alice", &scope, &source, None, None, &request, &json!(4))
+        .await
+        .unwrap();
+    request.cursor = Some(fresh["nextCursor"].as_str().unwrap().into());
+    store
+        .begin_note_attribution(&ws, &note, epochs.source_revision)
+        .await
+        .unwrap();
+    assert!(store
+        .read_note_annotation_page(
+            "alice",
+            &scope,
+            &source,
+            Some(generation),
+            None,
+            &request,
+            &json!(4)
+        )
+        .await
+        .is_err());
+    request.cursor = None;
+    let pending = store
+        .read_note_annotation_page("alice", &scope, &source, None, None, &request, &json!(4))
+        .await
+        .unwrap();
+    assert_eq!(pending["state"], "pending");
+    assert_eq!(pending["items"], json!([]));
+    assert!(pending["nextCursor"].is_null());
+}
+
+#[tokio::test]
+async fn annotation_reply_pages_and_context_reconstruct_escaped_bodies_with_exact_frame_bounds() {
+    use serde_json::json;
+    let (_db, store, ws, note) = fixture().await;
+    let text = "\"\\\n\u{0000}😀".repeat(5000);
+    for index in 0..20 {
+        let mut c = sample_comment(&note, "huge", &format!("comment{index:02}"));
+        c.content = text.clone();
+        if index > 0 {
+            c.parent_id = Some("comment00".into());
+        }
+        store.insert_comment(&ws, &c).await.unwrap();
+    }
+    let (scope, source) = annotation_scope(&store, &ws, &note).await;
+    let mut request: AnnotationPageRequest =
+        serde_json::from_value(json!({"kind":"replies","maxItems":64,"maxWireBytes":4096}))
+            .unwrap();
+    let first = store
+        .read_note_annotation_page(
+            "alice",
+            &scope,
+            &source,
+            None,
+            Some("huge"),
+            &request,
+            &json!("request"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["totalComments"], 20);
+    assert!(first["items"].as_array().unwrap().len() < 20);
+    let epoch = first["commentRevision"].as_str().unwrap();
+    let mut ids = Vec::new();
+    let mut current = first.clone();
+    loop {
+        assert!(
+            json!({"jsonrpc":"2.0","id":"request","result":current})
+                .to_string()
+                .len()
+                <= 4096
+        );
+        for item in current["items"].as_array().unwrap() {
+            assert!(item["preview"].as_str().unwrap().len() <= 512);
+            ids.push(item["commentId"].as_str().unwrap().to_owned());
+        }
+        let Some(cursor) = current["nextCursor"].as_str() else {
+            break;
+        };
+        request.cursor = Some(cursor.to_owned());
+        current = store
+            .read_note_annotation_page(
+                "alice",
+                &scope,
+                &source,
+                Some(epoch),
+                Some("huge"),
+                &request,
+                &json!("request"),
+            )
+            .await
+            .unwrap();
+    }
+    ids.sort();
+    assert_eq!(
+        ids,
+        (0..20)
+            .map(|i| format!("comment{i:02}"))
+            .collect::<Vec<_>>()
+    );
+    let mut detail = AnnotationContextRequest {
+        kind: "context".into(),
+        context_ref: first["items"][0]["bodyRef"].as_str().unwrap().into(),
+        cursor: None,
+        max_items: Some(1),
+        max_wire_bytes: Some(4096),
+    };
+    let mut reconstructed = String::new();
+    loop {
+        let part = store
+            .read_note_annotation_context(
+                "alice",
+                &scope,
+                &source,
+                epoch,
+                &detail,
+                &json!("request"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            json!({"jsonrpc":"2.0","id":"request","result":part})
+                .to_string()
+                .len()
+                <= 4096
+        );
+        let fragment = &part["items"][0];
+        assert_eq!(
+            usize::try_from(fragment["offset"].as_u64().unwrap()).unwrap(),
+            reconstructed.encode_utf16().count()
+        );
+        reconstructed.push_str(fragment["text"].as_str().unwrap());
+        let Some(cursor) = part["nextCursor"].as_str() else {
+            break;
+        };
+        detail.cursor = Some(cursor.into());
+    }
+    assert_eq!(reconstructed, text);
+    assert!(store
+        .read_note_annotation_context("bob", &scope, &source, epoch, &detail, &json!("request"))
+        .await
+        .is_err());
+    sqlx::query("UPDATE comment SET status='resolved' WHERE id='comment00'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert!(store
+        .read_note_annotation_context("alice", &scope, &source, epoch, &detail, &json!("request"))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn annotation_identity_directory_preserves_absent_empty_and_oversized_fields() {
+    use serde_json::json;
+    let (_db, store, ws, note) = fixture().await;
+    store
+        .insert_comment(&ws, &sample_comment(&note, "thread", "root"))
+        .await
+        .unwrap();
+    let host = "é😀".repeat(1200);
+    sqlx::query("UPDATE comment SET extra_json=? WHERE id='root'").bind(json!({"authorPrincipalId":"","authorIdentity":{"provider":"github","host":host,"externalUserId":""}}).to_string()).execute(store.write_pool()).await.unwrap();
+    let (scope, source) = annotation_scope(&store, &ws, &note).await;
+    let request: AnnotationPageRequest =
+        serde_json::from_value(json!({"kind":"replies","maxWireBytes":4096})).unwrap();
+    let reply = store
+        .read_note_annotation_page(
+            "alice",
+            &scope,
+            &source,
+            None,
+            Some("thread"),
+            &request,
+            &json!(1),
+        )
+        .await
+        .unwrap();
+    let item = &reply["items"][0];
+    assert!(item.get("authorPrincipalId").is_none());
+    assert!(item.get("authorIdentity").is_none());
+    let epoch = reply["commentRevision"].as_str().unwrap();
+    let mut detail = AnnotationContextRequest {
+        kind: "context".into(),
+        context_ref: item["authorPrincipalIdRef"].as_str().unwrap().into(),
+        cursor: None,
+        max_items: Some(1),
+        max_wire_bytes: Some(4096),
+    };
+    let principal = store
+        .read_note_annotation_context("alice", &scope, &source, epoch, &detail, &json!(1))
+        .await
+        .unwrap();
+    assert_eq!(principal["items"][0]["text"], "");
+    assert!(principal["items"][0].get("isNull").is_none());
+    detail.context_ref = item["authorIdentityRef"].as_str().unwrap().into();
+    let mut fields = Vec::new();
+    let mut host_ref = None;
+    loop {
+        let page = store
+            .read_note_annotation_context("alice", &scope, &source, epoch, &detail, &json!(1))
+            .await
+            .unwrap();
+        let field = &page["items"][0];
+        fields.push(field["field"].as_str().unwrap().to_owned());
+        if field["field"] == "host" {
+            host_ref = Some((
+                field["text"].as_str().unwrap().to_owned(),
+                field["nextRef"].as_str().unwrap().to_owned(),
+            ));
+        }
+        let Some(cursor) = page["nextCursor"].as_str() else {
+            break;
+        };
+        detail.cursor = Some(cursor.into());
+    }
+    assert_eq!(fields, ["provider", "host", "externalUserId"]);
+    let (mut recovered, next) = host_ref.unwrap();
+    detail.context_ref = next;
+    detail.cursor = None;
+    loop {
+        let page = store
+            .read_note_annotation_context("alice", &scope, &source, epoch, &detail, &json!(1))
+            .await
+            .unwrap();
+        recovered.push_str(page["items"][0]["text"].as_str().unwrap());
+        let Some(next) = page["nextCursor"].as_str() else {
+            break;
+        };
+        detail.cursor = Some(next.into());
+    }
+    assert_eq!(recovered, host);
+}
+
+#[tokio::test]
+async fn annotation_anchor_context_pages_canonical_occurrences_and_explicit_orphans() {
+    use serde_json::json;
+    let (_db, store, ws, note) = fixture().await;
+    for id in ["root", "orphan"] {
+        store
+            .insert_comment(&ws, &sample_comment(&note, id, id))
+            .await
+            .unwrap();
+    }
+    let epochs = store.note_annotation_epochs(&ws, &note).await.unwrap();
+    store
+        .publish_comment_anchors(
+            &ws,
+            &note,
+            &epochs,
+            &[AnchorOccurrence {
+                comment_id: "root".into(),
+                occurrence_id: "derived".into(),
+                source_range: SourceRange { start: 1, end: 3 },
+            }],
+        )
+        .await
+        .unwrap();
+    let (scope, source) = annotation_scope(&store, &ws, &note).await;
+    let request: AnnotationPageRequest = serde_json::from_value(
+        json!({"kind":"comments","ranges":[],"anchorState":"all","maxWireBytes":4096}),
+    )
+    .unwrap();
+    let page = store
+        .read_note_annotation_page("alice", &scope, &source, None, None, &request, &json!(1))
+        .await
+        .unwrap();
+    assert_eq!(page["totalThreads"], 2);
+    let epoch = page["commentRevision"].as_str().unwrap();
+    for item in page["items"].as_array().unwrap() {
+        let mut detail = AnnotationContextRequest {
+            kind: "context".into(),
+            context_ref: item["anchorRef"].as_str().unwrap().into(),
+            cursor: None,
+            max_items: Some(1),
+            max_wire_bytes: Some(4096),
+        };
+        let mut anchor_json = String::new();
+        let mut occurrences = Vec::new();
+        let mut orphan = false;
+        loop {
+            let context = store
+                .read_note_annotation_context("alice", &scope, &source, epoch, &detail, &json!(1))
+                .await
+                .unwrap();
+            for fragment in context["items"].as_array().unwrap() {
+                if fragment["field"] == "anchor" {
+                    anchor_json.push_str(fragment["text"].as_str().unwrap());
+                }
+                if fragment["kind"] == "span" {
+                    occurrences.push(fragment.clone());
+                }
+            }
+            orphan |= context["orphaned"] == true;
+            let Some(cursor) = context["nextCursor"].as_str() else {
+                break;
+            };
+            detail.cursor = Some(cursor.into());
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&anchor_json).unwrap()["startId"],
+            "a1"
+        );
+        if item["threadId"] == "root" {
+            assert_eq!(occurrences.len(), 1);
+            assert_eq!(occurrences[0]["canonicalId"], "a1");
+            assert_ne!(occurrences[0]["occurrenceId"], "a1");
+            assert!(!orphan);
+        } else {
+            assert!(occurrences.is_empty());
+            assert!(orphan);
+        }
+    }
+}
+
+#[tokio::test]
+async fn annotation_root_identity_survives_root_deletion_and_exhausted_reply_pages() {
+    let (_db, store, ws, note) = fixture().await;
+    let root = sample_comment(&note, "thread-not-root-id", "canonical-root");
+    store.insert_comment(&ws, &root).await.unwrap();
+    let mut reply = sample_comment(&note, "thread-not-root-id", "survivor");
+    reply.parent_id = Some(root.id.clone());
+    store.insert_comment(&ws, &reply).await.unwrap();
+    sqlx::query("DELETE FROM comment WHERE id='canonical-root'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let epochs = store.note_annotation_epochs(&ws, &note).await.unwrap();
+    for after in [None, Some(("zzzz", "zzzz"))] {
+        let result = store
+            .read_comment_rows(&ws, &note, &epochs, "thread-not-root-id", after, 1)
+            .await
+            .unwrap();
+        assert_eq!(result.root_comment_id.as_deref(), Some("canonical-root"));
+        assert!(!result.root_present);
+        assert_eq!(result.total_comments, 1);
+        assert_eq!(result.page.items.len(), usize::from(after.is_none()));
+    }
+    sqlx::query("DELETE FROM comment WHERE id='survivor'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let epochs = store.note_annotation_epochs(&ws, &note).await.unwrap();
+    assert!(store
+        .read_comment_rows(&ws, &note, &epochs, "thread-not-root-id", None, 1)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn annotation_adopt_stray_spec_retires_old_scope_atomically_and_rolls_back_at_exhaustion() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.unwrap();
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .unwrap();
+    let note = stray_note(&ws, "old-id", "Spec");
+    store.insert_note(&note).await.unwrap();
+    let before = store
+        .read_note_page_state(&ws, &note.id, None)
+        .await
+        .unwrap();
+    let instance = before["scope"]["noteInstanceId"].as_str().unwrap();
+    sqlx::query("UPDATE note_annotation_state SET state_generation='18446744073709551615' WHERE note_id='old-id'").execute(store.write_pool()).await.unwrap();
+    assert!(store.adopt_stray_spec_note(&ws).await.is_err());
+    let preserved = store
+        .read_note_page_state(&ws, &note.id, Some(instance))
+        .await
+        .unwrap();
+    assert_eq!(preserved["deleted"], false);
+    sqlx::query("UPDATE note_annotation_state SET state_generation='10' WHERE note_id='old-id'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert!(store.adopt_stray_spec_note(&ws).await.unwrap().is_some());
+    let retired = store
+        .read_note_page_state(&ws, &note.id, Some(instance))
+        .await
+        .unwrap();
+    assert_eq!(retired["deleted"], true);
+    assert_eq!(retired["stateGeneration"], "11");
+    for field in ["sourceRevision", "attributionGeneration", "commentRevision"] {
+        assert_eq!(retired[field], before[field]);
+    }
+    let current = store
+        .read_note_page_state(&ws, &NoteId::from("spec"), None)
+        .await
+        .unwrap();
+    assert_eq!(current["deleted"], false);
+    assert_eq!(current["scope"]["noteId"], "spec");
+}
+
+#[tokio::test]
+async fn annotation_maintained_all_orphan_counts_follow_reply_updates_anchor_rebuilds_and_deletion()
+{
+    let (_db, store, ws, note) = fixture().await;
+    for id in ["root", "orphan"] {
+        store
+            .insert_comment(&ws, &sample_comment(&note, id, id))
+            .await
+            .unwrap();
+    }
+    let mut reply = sample_comment(&note, "root", "reply");
+    reply.parent_id = Some("root".into());
+    store.insert_comment(&ws, &reply).await.unwrap();
+    for round in 0..2 {
+        let epochs = store.note_annotation_epochs(&ws, &note).await.unwrap();
+        store
+            .publish_comment_anchors(
+                &ws,
+                &note,
+                &epochs,
+                &[
+                    AnchorOccurrence {
+                        comment_id: "root".into(),
+                        occurrence_id: "first".into(),
+                        source_range: SourceRange { start: 1, end: 3 },
+                    },
+                    AnchorOccurrence {
+                        comment_id: "root".into(),
+                        occurrence_id: "second".into(),
+                        source_range: SourceRange { start: 3, end: 4 },
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let epoch = store.note_annotation_epochs(&ws, &note).await.unwrap();
+        let all = store
+            .read_comment_threads(&ws, &note, &epoch, &[], CommentFilter::All, None, 1)
+            .await
+            .unwrap();
+        assert_eq!((all.total_threads, all.total_comments), (2, 3));
+        let orphan = store
+            .read_comment_threads(&ws, &note, &epoch, &[], CommentFilter::Orphaned, None, 1)
+            .await
+            .unwrap();
+        assert_eq!((orphan.total_threads, orphan.total_comments), (1, 1));
+        assert_eq!(orphan.page.items[0].thread_id, "orphan");
+        if round == 0 {
+            sqlx::query("UPDATE comment SET status='resolved' WHERE id='root'")
+                .execute(store.write_pool())
+                .await
+                .unwrap();
+        }
+    }
+    sqlx::query("DELETE FROM comment WHERE id='root'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let epoch = store.note_annotation_epochs(&ws, &note).await.unwrap();
+    store
+        .publish_comment_anchors(&ws, &note, &epoch, &[])
+        .await
+        .unwrap();
+    let epoch = store.note_annotation_epochs(&ws, &note).await.unwrap();
+    let orphan = store
+        .read_comment_threads(&ws, &note, &epoch, &[], CommentFilter::Orphaned, None, 10)
+        .await
+        .unwrap();
+    assert_eq!((orphan.total_threads, orphan.total_comments), (2, 2));
+    let root = orphan
+        .page
+        .items
+        .iter()
+        .find(|r| r.thread_id == "root")
+        .unwrap();
+    assert_eq!(root.root_comment_id.as_deref(), Some("root"));
+    assert!(!root.root_present);
+}
+
+#[tokio::test]
+async fn annotation_dense_range_preparation_is_once_per_lease_bounded_and_invalidated() {
+    use serde_json::json;
+    use sqlx::Row;
+    let (_db, store, ws, note) = fixture().await;
+    let mut tx = store.write_pool().begin().await.unwrap();
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000) INSERT INTO comment(id,workspace_id,note_id,thread_id,kind,content,author,author_type,status,anchor_json,created_at,updated_at) SELECT printf('dense%04d',x),?,?,printf('dense%04d',x),'comment','body','author','user','open','null','date','date' FROM n")
+        .bind(ws.as_str()).bind(note.as_str()).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let epoch = store.note_annotation_epochs(&ws, &note).await.unwrap();
+    let occurrences = (1..=1000)
+        .map(|x| AnchorOccurrence {
+            comment_id: format!("dense{x:04}"),
+            occurrence_id: "occurrence".into(),
+            source_range: SourceRange { start: 0, end: 10 },
+        })
+        .collect::<Vec<_>>();
+    store
+        .publish_comment_anchors(&ws, &note, &epoch, &occurrences)
+        .await
+        .unwrap();
+    let (scope, source) = annotation_scope(&store, &ws, &note).await;
+    let mut request: AnnotationPageRequest = serde_json::from_value(
+        json!({"kind":"comments","ranges":[{"start":1,"end":2}],"maxItems":2,"maxWireBytes":4096}),
+    )
+    .unwrap();
+    let first = store
+        .read_note_annotation_page("alice", &scope, &source, None, None, &request, &json!(1))
+        .await
+        .unwrap();
+    assert_eq!(first["totalThreads"], 1000);
+    assert_eq!(first["items"].as_array().unwrap().len(), 2);
+    let sid = first["snapshotId"].as_str().unwrap();
+    let before = sqlx::query(
+        "SELECT total_threads,prepare_steps FROM note_annotation_match_head WHERE snapshot_id=?",
+    )
+    .bind(sid)
+    .fetch_one(store.read_pool())
+    .await
+    .unwrap();
+    assert!(before.get::<i64, _>("prepare_steps") > 1000);
+    request.cursor = Some(first["nextCursor"].as_str().unwrap().into());
+    let epoch = first["commentRevision"].as_str().unwrap();
+    let next = store
+        .read_note_annotation_page(
+            "alice",
+            &scope,
+            &source,
+            Some(epoch),
+            None,
+            &request,
+            &json!(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next["items"][0]["threadId"], "dense0003");
+    let after: i64 = sqlx::query_scalar(
+        "SELECT prepare_steps FROM note_annotation_match_head WHERE snapshot_id=?",
+    )
+    .bind(sid)
+    .fetch_one(store.read_pool())
+    .await
+    .unwrap();
+    assert_eq!(before.get::<i64, _>("prepare_steps"), after);
+    request.cursor = None;
+    for _ in 0..4 {
+        store
+            .read_note_annotation_page("alice", &scope, &source, None, None, &request, &json!(1))
+            .await
+            .unwrap();
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_annotation_match_head")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 4);
+    request.cursor = Some(first["nextCursor"].as_str().unwrap().into());
+    assert!(store
+        .read_note_annotation_page(
+            "alice",
+            &scope,
+            &source,
+            Some(epoch),
+            None,
+            &request,
+            &json!(1)
+        )
+        .await
+        .is_err());
+    sqlx::query("UPDATE comment SET status='resolved' WHERE id='dense0001'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_annotation_match")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}

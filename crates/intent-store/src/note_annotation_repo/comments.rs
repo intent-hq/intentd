@@ -38,6 +38,7 @@ pub struct ThreadRow {
     pub status: String,
     pub total_comments: i64,
     pub root_comment_id: Option<String>,
+    pub root_present: bool,
     pub latest_comment_id: String,
     pub latest_comment_preview: String,
     pub truncated: bool,
@@ -49,6 +50,7 @@ pub struct ReplyRows {
     pub page: AnnotationPage<CommentRow>,
     pub total_comments: i64,
     pub root_comment_id: Option<String>,
+    pub root_present: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +127,64 @@ pub(super) fn matching_threads<'args>(
     query
 }
 
+pub(super) fn thread_summary_query(
+    id: i64,
+    ranges: &[SourceRange],
+    filter: CommentFilter,
+    after: Option<(i64, &str)>,
+    take: i64,
+) -> QueryBuilder<'static, sqlx::Sqlite> {
+    let mut query = if filter == CommentFilter::Anchored {
+        let mut query = matching_threads(id, ranges, filter);
+        query.push(", selected AS MATERIALIZED (SELECT thread_id,position FROM matched WHERE 1");
+        query
+    } else {
+        let mut query=QueryBuilder::new("WITH selected AS MATERIALIZED (SELECT thread_id,0 AS position FROM note_comment_thread WHERE head_id=");
+        query.push_bind(id);
+        if filter == CommentFilter::Orphaned {
+            query.push(" AND anchor_count=0");
+        }
+        query
+    };
+    if let Some((position, thread_id)) = after {
+        if filter == CommentFilter::Anchored {
+            query
+                .push(" AND (position,thread_id)>(")
+                .push_bind(position)
+                .push(",")
+                .push_bind(thread_id.to_owned())
+                .push(")");
+        } else {
+            query
+                .push(" AND thread_id>")
+                .push_bind(thread_id.to_owned());
+        }
+    }
+    query
+        .push(if filter == CommentFilter::Anchored {
+            " ORDER BY position,thread_id LIMIT "
+        } else {
+            " ORDER BY thread_id LIMIT "
+        })
+        .push_bind(take)
+        .push(") ");
+    finish_thread_summary(query, id)
+}
+
+pub(super) fn finish_thread_summary(
+    mut query: QueryBuilder<'static, sqlx::Sqlite>,
+    id: i64,
+) -> QueryBuilder<'static, sqlx::Sqlite> {
+    query.push("SELECT t.thread_id,t.total_comments,m.position,identity.root_comment_id AS root_id,identity.root_present,COALESCE(root.status,latest.status) AS status,latest.comment_id AS latest_id,latest.preview,latest.truncated \
+            FROM selected m CROSS JOIN note_comment_thread t ON t.thread_id=m.thread_id \
+            JOIN note_comment_root identity ON identity.head_id=t.head_id AND identity.thread_id=t.thread_id \
+            LEFT JOIN note_comment_projection root ON root.comment_id=(SELECT comment_id FROM note_comment_projection WHERE head_id=t.head_id AND thread_id=t.thread_id AND parent_id IS NULL ORDER BY created_at,comment_id LIMIT 1) \
+            JOIN note_comment_projection latest ON latest.comment_id=(SELECT comment_id FROM note_comment_projection WHERE head_id=t.head_id AND thread_id=t.thread_id ORDER BY created_at DESC,comment_id DESC LIMIT 1) \
+            WHERE t.head_id=").push_bind(id);
+    query.push(" ORDER BY m.position,t.thread_id");
+    query
+}
+
 /// Replace a derived anchor index inside the caller's source/comment transaction.
 /// The caller must roll its transaction back on error and must have completed
 /// canonical marker repair plus source page indexing before calling this.
@@ -157,8 +217,8 @@ pub(crate) async fn publish_anchors_in_transaction(
         {
             return Err(invalid());
         }
-        let result = sqlx::query("INSERT INTO note_comment_anchor(head_id,comment_id,occurrence_id,start,end) \
-            SELECT head_id,comment_id,?,?,? FROM note_comment_projection WHERE head_id=? AND comment_id=? AND parent_id IS NULL")
+        let result = sqlx::query("INSERT INTO note_comment_anchor(head_id,comment_id,occurrence_id,start,end,thread_id) \
+            SELECT head_id,comment_id,?,?,?,thread_id FROM note_comment_projection WHERE head_id=? AND comment_id=? AND parent_id IS NULL")
             .bind(&occurrence.occurrence_id).bind(range.start).bind(range.end).bind(id).bind(&occurrence.comment_id)
             .execute(&mut *conn).await.map_err(db_error)?;
         if result.rows_affected() != 1 {
@@ -223,17 +283,11 @@ impl Store {
         let mut tx = self.read_pool().begin().await.map_err(db_error)?;
         let (id, epochs) = head(&mut tx, workspace_id, note_id).await?;
         check_epoch(&epochs, expected)?;
-        let total_comments = sqlx::query_scalar(
-            "SELECT total_comments FROM note_comment_thread WHERE head_id=? AND thread_id=?",
-        )
-        .bind(id)
-        .bind(thread_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| Error::NotFound("comment thread".into()))?;
-        let root_comment_id = sqlx::query_scalar("SELECT comment_id FROM note_comment_projection WHERE head_id=? AND thread_id=? AND parent_id IS NULL ORDER BY created_at,comment_id LIMIT 1")
-            .bind(id).bind(thread_id).fetch_optional(&mut *tx).await.map_err(db_error)?;
+        let root=sqlx::query("SELECT r.root_comment_id,r.root_present,COALESCE(t.total_comments,0) AS total_comments FROM note_comment_root r LEFT JOIN note_comment_thread t USING(head_id,thread_id) WHERE r.head_id=? AND r.thread_id=? AND t.total_comments>0")
+            .bind(id).bind(thread_id).fetch_optional(&mut *tx).await.map_err(db_error)?.ok_or_else(||Error::NotFound("comment thread".into()))?;
+        let total_comments = root.get("total_comments");
+        let root_comment_id = root.get("root_comment_id");
+        let root_present = root.get("root_present");
         let mut query = QueryBuilder::new("SELECT comment_id,status,created_at,preview,truncated FROM note_comment_projection WHERE head_id=");
         query
             .push_bind(id)
@@ -272,6 +326,7 @@ impl Store {
             },
             total_comments,
             root_comment_id,
+            root_present,
         })
     }
 
@@ -303,29 +358,15 @@ impl Store {
         if !epochs.anchors_ready && filter != CommentFilter::All {
             return Err(stale());
         }
-        let mut counts = matching_threads(id, ranges, filter);
-        counts.push("SELECT COUNT(*) AS threads,COALESCE(SUM(t.total_comments),0) AS comments FROM matched m JOIN note_comment_thread t ON t.thread_id=m.thread_id WHERE t.head_id=").push_bind(id);
-        let totals = counts.build().fetch_one(&mut *tx).await.map_err(db_error)?;
-        let mut query = matching_threads(id, ranges, filter);
-        query.push(", selected AS MATERIALIZED (SELECT thread_id,position FROM matched WHERE 1");
-        if let Some((position, thread_id)) = after {
-            query
-                .push(" AND (position,thread_id)>(")
-                .push_bind(position)
-                .push(",")
-                .push_bind(thread_id)
-                .push(")");
-        }
-        query
-            .push(" ORDER BY position,thread_id LIMIT ")
-            .push_bind(take)
-            .push(") ");
-        query.push("SELECT t.thread_id,t.total_comments,m.position,root.comment_id AS root_id,COALESCE(root.status,latest.status) AS status,latest.comment_id AS latest_id,latest.preview,latest.truncated \
-            FROM selected m JOIN note_comment_thread t ON t.thread_id=m.thread_id \
-            LEFT JOIN note_comment_projection root ON root.comment_id=(SELECT comment_id FROM note_comment_projection WHERE head_id=t.head_id AND thread_id=t.thread_id AND parent_id IS NULL ORDER BY created_at,comment_id LIMIT 1) \
-            JOIN note_comment_projection latest ON latest.comment_id=(SELECT comment_id FROM note_comment_projection WHERE head_id=t.head_id AND thread_id=t.thread_id ORDER BY created_at DESC,comment_id DESC LIMIT 1) \
-            WHERE t.head_id=").push_bind(id);
-        query.push(" ORDER BY m.position,t.thread_id");
+        let totals = if filter == CommentFilter::Anchored {
+            let mut counts = matching_threads(id, ranges, filter);
+            counts.push("SELECT COUNT(*) AS threads,COALESCE(SUM(t.total_comments),0) AS comments FROM matched m JOIN note_comment_thread t ON t.thread_id=m.thread_id WHERE t.head_id=").push_bind(id);
+            counts.build().fetch_one(&mut *tx).await.map_err(db_error)?
+        } else {
+            sqlx::query(if filter==CommentFilter::All {"SELECT thread_count AS threads,comment_count AS comments FROM note_annotation_head WHERE id=?"}else{"SELECT orphan_thread_count AS threads,orphan_comment_count AS comments FROM note_annotation_head WHERE id=?"})
+                .bind(id).fetch_one(&mut *tx).await.map_err(db_error)?
+        };
+        let mut query = thread_summary_query(id, ranges, filter, after, take);
         let rows = query.build().fetch_all(&mut *tx).await.map_err(db_error)?;
         let has_more = rows.len() > limit;
         let items = rows
@@ -337,6 +378,7 @@ impl Store {
                 position: row.get("position"),
                 status: row.get("status"),
                 root_comment_id: row.get("root_id"),
+                root_present: row.get("root_present"),
                 latest_comment_id: row.get("latest_id"),
                 latest_comment_preview: row.get("preview"),
                 truncated: row.get("truncated"),

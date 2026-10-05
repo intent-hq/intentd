@@ -11,6 +11,13 @@ pub enum CommentDetailField {
     Anchor,
     AnchorText,
     Extra,
+    AuthorPrincipalId,
+    Provider,
+    Host,
+    ExternalUserId,
+    StartId,
+    EndId,
+    PointId,
 }
 
 impl CommentDetailField {
@@ -21,6 +28,13 @@ impl CommentDetailField {
             Self::Anchor => "anchor",
             Self::AnchorText => "anchorText",
             Self::Extra => "extra",
+            Self::AuthorPrincipalId => "authorPrincipalId",
+            Self::Provider => "provider",
+            Self::Host => "host",
+            Self::ExternalUserId => "externalUserId",
+            Self::StartId => "startId",
+            Self::EndId => "endId",
+            Self::PointId => "pointId",
         }
     }
 }

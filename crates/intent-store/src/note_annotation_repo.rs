@@ -12,7 +12,12 @@ use crate::Store;
 mod attribution;
 mod comments;
 mod detail;
+mod page;
+mod token;
 pub(crate) use comments::publish_anchors_in_transaction;
+pub use page::{
+    AnchorFilter, AnnotationContextRequest, AnnotationKind, AnnotationPageRequest, AnnotationRange,
+};
 
 pub use attribution::{AttributionJob, AttributionRow};
 pub use comments::{AnchorOccurrence, CommentFilter, CommentRow, ReplyRows, ThreadRow, ThreadRows};
