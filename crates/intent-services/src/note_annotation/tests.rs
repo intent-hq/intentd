@@ -198,3 +198,85 @@ async fn annotation_service_pending_attribution_and_strict_shapes_do_not_fall_ba
         Err(Error::NotePage(NotePageError::Stale))
     ));
 }
+
+struct ReadBoundary {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+static READ_BOUNDARIES: std::sync::Mutex<Vec<(WorkspaceId, std::sync::Arc<ReadBoundary>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub(super) async fn pause_after_read(workspace: &WorkspaceId) {
+    let boundary = {
+        let mut boundaries = READ_BOUNDARIES.lock().unwrap();
+        boundaries
+            .iter()
+            .position(|(id, _)| id == workspace)
+            .map(|index| boundaries.swap_remove(index).1)
+    };
+    if let Some(boundary) = boundary {
+        boundary.reached.notify_one();
+        boundary.release.notified().await;
+    }
+}
+
+#[tokio::test]
+async fn annotation_service_revocation_after_store_result_withholds_success_and_errors() {
+    let (_tmp, service, workspace, note) = setup("source").await;
+    let caller = guest(&service, &workspace).await;
+    let Caller::Wire { principal_id, .. } = &caller else {
+        panic!("wire fixture")
+    };
+    let state = service
+        .store
+        .read_note_page_state(&workspace, &note, None)
+        .await
+        .unwrap();
+    let mut params = state["scope"].clone();
+    params["sourceRevision"] = state["sourceRevision"].clone();
+    params["page"] = json!({"kind":"attribution","ranges":[],"maxWireBytes":4096});
+    for stale in [false, true] {
+        if stale {
+            service
+                .store
+                .add_workspace_member(&workspace, principal_id, WorkspaceRole::Collaborator)
+                .await
+                .unwrap();
+            params["sourceRevision"] = json!("stale-source");
+        }
+        let boundary = std::sync::Arc::new(ReadBoundary {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        READ_BOUNDARIES
+            .lock()
+            .unwrap()
+            .push((workspace.clone(), std::sync::Arc::clone(&boundary)));
+        let read = with_caller(
+            caller.clone(),
+            service.read_annotation_page(
+                AnnotationMethod::Attribution,
+                serde_json::from_value(params.clone()).unwrap(),
+                json!(1),
+            ),
+        );
+        let revoke = async {
+            boundary.reached.notified().await;
+            service
+                .store
+                .remove_workspace_member(&workspace, principal_id)
+                .await
+                .unwrap();
+            boundary.release.notify_one();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(read, revoke)
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(Error::NotFound(_))),
+            "post-read revocation must override stored success/stale result: {result:?}"
+        );
+    }
+}
