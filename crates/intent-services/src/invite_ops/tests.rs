@@ -1686,9 +1686,10 @@ async fn assert_preview_pin_identity(challenge: bool) {
         );
         assert_eq!(result["workspaceId"], json!(f.ws));
         assert_eq!(result["workspaceTitle"], json!("WS"));
+        assert_eq!(result.get("collaborationName"), Some(&Value::Null));
         assert_eq!(
             result.as_object().unwrap().len(),
-            if challenge { 7 } else { 5 }
+            if challenge { 8 } else { 6 }
         );
         if challenge {
             assert!(result["nonce"].is_string());
