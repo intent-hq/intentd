@@ -193,7 +193,7 @@ fn start_project_watch(
         .iter()
         .map(|root| root.root.to_string_lossy())
         .collect();
-    let subpaths: Vec<_> = subpaths.iter().map(|path| path.as_ref()).collect();
+    let subpaths: Vec<_> = subpaths.iter().map(AsRef::as_ref).collect();
     watch_tiers(hub, workspace_path, &subpaths, is_skill_md, move || {
         let _ = tx.send(SkillsMsg::Change(Some(ws_id.clone())));
     })
