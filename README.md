@@ -466,11 +466,12 @@ includes or import personal CLI MCP files.
 The skill catalog includes these workspace roots, from lowest to highest precedence:
 `.agent/skills`, `.agents/skills`, `.codex/skills`, `.factory/skills`, `.grok/skills`,
 `.opencode/skill`, `.opencode/skills`, `.pi/skills`, `.cortex/skills`, `.claude/skills`,
-`.augment/skills`, and `.intent/skills`. Project skills override the sole implicit
-personal source, `~/.intent/skills`. To share a personal skill with Intent, place it
-there or explicitly link it from an approved root; personal third-party CLI skill
-directories are no longer automatically imported. Explicit links retain bounded,
-canonical deduplication, including links outside the workspace. This compatibility
+`.augment/skills`, and `.intent/skills`. Project skills override both implicit
+personal sources: `~/.agents/skills` and the higher-priority `~/.intent/skills`.
+To share a personal skill with Intent, place it in either directory or explicitly
+link it from an approved root; provider-specific home skill directories are not
+automatically imported. Explicit links retain bounded, canonical deduplication,
+including links outside the workspace. This compatibility
 does not make skill discovery a filesystem sandbox. Discovery and watchers use the
 same roots, including roots created after the first scan.
 
