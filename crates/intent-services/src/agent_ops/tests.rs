@@ -5,6 +5,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod pending_completion;
+
 use intent_acp::WorkspaceMcpServer;
 use intent_core::{
     now_iso, AgentDelegateInput, AgentId, AgentStatus, Error, MessageOrigin, NoteCreate,
