@@ -118,6 +118,11 @@ fn reconstruct(context: &Context, entry: &Value, seen: &mut BTreeSet<String>) ->
             }
         }
         "string" => {
+            if let Some(value) = entry.get("value") {
+                assert!(entry.get("valueRef").is_none());
+                assert!(value.as_str().unwrap().len() <= 1024);
+                return value.clone();
+            }
             assert!(entry.get("value").is_none());
             let mut reference = entry["valueRef"].as_str().unwrap().to_owned();
             let mut output = String::new();
@@ -183,6 +188,20 @@ fn rendered_detail_reconstructs_exact_logical_context_and_whole_leaf() {
     });
     assert_eq!(actual, expected);
     let all = entries(&context, &reference);
+    // Match the FE fixed-context consumer: every non-leaf string is inline,
+    // while the one whole rendered native leaf always has a valueRef.
+    let mut rendered_fields = 0;
+    for entry in all.values().filter(|entry| entry["type"] == "string") {
+        if entry["key"] == "renderedText" {
+            rendered_fields += 1;
+            assert!(entry.get("value").is_none());
+            assert!(entry["valueRef"].is_string());
+        } else {
+            assert!(entry["value"].is_string());
+            assert!(entry.get("valueRef").is_none());
+        }
+    }
+    assert_eq!(rendered_fields, 1);
     let empty: Vec<_> = all.values().filter(|e| e["key"] == "attributes").collect();
     assert_eq!(empty.len(), 2);
     for entry in empty {
@@ -311,4 +330,36 @@ fn full_escaped_frame_fitting_preserves_first_scalar_and_terminal_ref_removal() 
     let page = checked(&small, &query(scalar["valueRef"].as_str().unwrap()), &rpc);
     assert_eq!(page["items"][0]["text"], "😀");
     assert!(page["items"][0]["nextRef"].is_null());
+}
+
+#[test]
+fn metadata_strings_use_utf8_inline_threshold_except_exact_rendered_leaf_path() {
+    // Encoding-only control, not a claim that oversized descriptor IDs are an
+    // admitted native capture. This verifies the shared metadata convention.
+    let context = fixture("x");
+    let value = json!({"leaf":{"renderedText":"x","descriptor":{"renderedText":"data"}},
+        "atLimit":"é".repeat(512),"overLimit":format!("{}x","é".repeat(512))});
+    let mut nodes = Vec::new();
+    tree(&value, &mut nodes, None, None, None, 0).unwrap();
+    let resources = Resources {
+        context: &context,
+        start: 12,
+        end: 13,
+        identity: hit_id(&context.binding, 12, 13),
+    };
+    let mut external = 0;
+    for (id, node) in nodes.iter().enumerate() {
+        if let Some(text) = node.value.as_str() {
+            let entry = resources.entry(&nodes, id).unwrap();
+            if text == "x" || text.len() == 1025 {
+                assert!(entry["valueRef"].is_string());
+                assert!(entry.get("value").is_none());
+                external += 1;
+            } else {
+                assert_eq!(entry["value"], text);
+                assert!(entry.get("valueRef").is_none());
+            }
+        }
+    }
+    assert_eq!(external, 2);
 }

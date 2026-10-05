@@ -126,6 +126,21 @@ fn tree<'a>(
     }
     Ok(id)
 }
+// The native rendered leaf is always externally addressed, including tiny text.
+// Other strings retain the existing canonical metadata inline threshold. Checking
+// the full fixed path avoids treating descriptor data as field authority.
+fn scalar_resource(nodes: &[Node<'_>], id: usize) -> bool {
+    let node = &nodes[id];
+    let Some(text) = node.value.as_str() else {
+        return false;
+    };
+    text.len() > 1024
+        || (node.key == Some("renderedText")
+            && node.parent.is_some_and(|parent| {
+                nodes[parent].key == Some("leaf") && nodes[parent].parent == Some(0)
+            }))
+}
+
 struct Resources<'a> {
     context: &'a Context,
     start: u64,
@@ -172,7 +187,9 @@ impl Resources<'_> {
             Value::Object(_) | Value::Array(_) => {
                 entry["childrenRef"] = json!(self.reference(id, 1, 0)?)
             }
-            Value::String(_) => entry["valueRef"] = json!(self.reference(id, 2, 0)?),
+            Value::String(_) if scalar_resource(nodes, id) => {
+                entry["valueRef"] = json!(self.reference(id, 2, 0)?);
+            }
             value => entry["value"] = value.clone(),
         }
         Ok(entry)
@@ -246,7 +263,7 @@ pub(super) fn read(context: &Context, query: &ReceiptDetailQuery, rpc_id: &Value
     };
     let mut page = envelope(context, query);
     if kind == 2 {
-        if query.cursor.is_some() {
+        if query.cursor.is_some() || !scalar_resource(&nodes, index) {
             return Err(invalid());
         }
         let text = item.value.as_str().ok_or_else(invalid)?;
