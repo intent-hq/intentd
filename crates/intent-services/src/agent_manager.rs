@@ -3444,7 +3444,9 @@ impl AgentManager {
                 Some(&session),
                 workspace_api_docs.as_deref(),
                 owned_skills.as_deref(),
-                managed_plan.as_ref().map(managed_profiles::Plan::instructions),
+                managed_plan
+                    .as_ref()
+                    .map(managed_profiles::Plan::instructions),
             )
             .await
             {

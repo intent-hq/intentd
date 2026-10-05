@@ -12,8 +12,8 @@ use intent_acp::NormalizedMcpServers;
 use intent_providers::launch_overrides::EnvironmentOverrides;
 use serde_json::{json, Value};
 
-pub mod acquisition;
 pub mod acp;
+pub mod acquisition;
 pub mod auth;
 pub mod claude_controls;
 pub mod codex_controls;
