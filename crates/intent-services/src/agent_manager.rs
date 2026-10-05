@@ -3519,6 +3519,11 @@ impl AgentManager {
                 "info",
             )
             .await;
+        let _preparation_guard = if spawn_opts.via_npx() {
+            crate::provider_preparation::before_launch(spawn_opts.provider.id).await
+        } else {
+            None
+        };
         let spawned = if let Some(cli) =
             intent_providers::installed_cli::InstalledCli::for_provider(spawn_opts.provider.id)
         {

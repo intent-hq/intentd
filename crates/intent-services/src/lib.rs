@@ -221,6 +221,7 @@ mod principal_ops;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
 pub mod provider_models;
+mod provider_preparation;
 pub mod provider_test_prompt;
 mod rate_limit;
 pub mod repo_config;
@@ -683,6 +684,7 @@ pub struct Services {
     terminal_tasks: Arc<delivery_tasks::DeliveryTasks>,
     pending_delete_tasks: Arc<delivery_tasks::DeliveryTasks>,
     host_exec_runtime: Arc<host_exec::HostExecRuntime>,
+    provider_preparation: Arc<provider_preparation::Preparation>,
     /// Child agent ids with an active terminal-delivery retry task, mapped
     /// to pending attempts and a schedule generation. Ownership is coalesced per CHILD, not per
     /// watch (intent-hq/intent#3728): one delivery pass processes ALL of the
@@ -1618,6 +1620,7 @@ impl Services {
             terminal_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             pending_delete_tasks,
             host_exec_runtime: Arc::default(),
+            provider_preparation: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
@@ -6667,6 +6670,7 @@ impl Services {
     }
 
     pub async fn shutdown_store_writers(&self) {
+        self.provider_preparation.shutdown().await;
         self.shutdown_settings().await;
         // Called after RPC/agent admission is fenced, root schedulers joined,
         // and PtyHost::kill_all has refused/reaped every late PTY spawn.
@@ -18013,6 +18017,11 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn prepare_provider_adapters(&self, provider_ids: Vec<String>) {
+        self.provider_preparation
+            .enqueue(provider_ids, self.effective_settings());
+    }
+
     fn repository_read_connection(
         &self,
         entry: intent_core::repository_request::RepositoryWireEntry,

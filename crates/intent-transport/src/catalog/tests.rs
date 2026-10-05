@@ -188,7 +188,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Durable script monitors (protocol 12.1): +3 router methods.
 /// Protocol 13.0 removes the deprecated git.commit router method.
 // GitLab repository reads and actions (13.3), plus owner-only invitation account search.
-const EXPECTED_TOTAL_METHODS: usize = 421;
+const EXPECTED_TOTAL_METHODS: usize = 422;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
@@ -197,7 +197,7 @@ const EXPECTED_TOTAL_METHODS: usize = 421;
 const EXPECTED_ROUTER_METHODS: usize = 366;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 55;
+const EXPECTED_FASTPATH_METHODS: usize = 56;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 0;
@@ -693,6 +693,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "host.members.list",
     "host.members.remove",
     "host.openInEditor",
+    "host.prepareProviderAdapters",
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.providerTestPrompt",
@@ -1275,6 +1276,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "host.members.list",
     "host.members.remove",
     "host.openInEditor",
+    "host.prepareProviderAdapters",
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.providerTestPrompt",
@@ -2507,6 +2509,7 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "host.members.list",
         "host.members.remove",
         "host.openInEditor",
+        "host.prepareProviderAdapters",
         "host.providerTestPrompt",
         "identity.authStatus",
         "identity.cancelAuth",
