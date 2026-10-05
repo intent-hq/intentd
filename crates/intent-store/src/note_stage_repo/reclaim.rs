@@ -1,6 +1,6 @@
 //! Bounded logical reclamation; no VACUUM or physical-size promise.
 //!
-//! The queue and live-pin triggers in 0153 are part of this implementation.
+//! The queue and live-pin triggers in 0154 are part of this implementation.
 //! BEGIN IMMEDIATE serializes each tick with begin/seal/commit and cancellation.
 //! A tick drains one indexed child batch per operation/root. Parents are deleted
 //! only after every child phase is exhausted; queue progress commits atomically.

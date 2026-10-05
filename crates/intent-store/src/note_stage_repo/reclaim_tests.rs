@@ -8,9 +8,9 @@ use std::sync::{
 // The final include is the proposed migration supplied separately for the
 // integration owner. No test-local replacement for reclamation schema/triggers.
 const MIGRATIONS: [&str; 3] = [
-    include_str!("../../migrations/0150_note_operations.sql"),
-    include_str!("../../migrations/0152_note_stages.sql"),
-    include_str!("../../migrations/0153_note_operation_reclaim.sql"),
+    include_str!("../../migrations/0151_note_operations.sql"),
+    include_str!("../../migrations/0153_note_stages.sql"),
+    include_str!("../../migrations/0154_note_operation_reclaim.sql"),
 ];
 async fn connection(url: &str) -> SqliteConnection {
     let mut conn = SqliteConnection::connect(url).await.unwrap();
