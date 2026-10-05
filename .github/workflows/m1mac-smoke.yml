@@ -1,81 +1,33 @@
 name: m1mac smoke test
-
 on:
   workflow_dispatch:
-
 permissions: {}
-
+concurrency:
+  group: macos-ci-disk-maintenance
+  cancel-in-progress: false
 jobs:
   smoke:
-    name: Machine inventory (m1mac)
+    name: Read-only disk inventory (m1mac)
     runs-on: [self-hosted, macOS, ARM64, m1mac]
     timeout-minutes: 10
     steps:
-      - name: OS and hardware
+      - name: Inspect disk and build ownership
+        shell: bash
         run: |
-          echo "== sw_vers =="
-          sw_vers
-          echo "== uname -m =="
-          uname -m
-          echo "== CPU / RAM =="
-          sysctl hw.ncpu hw.memsize
-          echo "== Free disk =="
-          df -h /
-
-      - name: Xcode Command Line Tools
-        run: |
-          if xcode-select -p >/dev/null 2>&1; then
-            echo "Xcode CLT: present ($(xcode-select -p))"
-          else
-            echo "Xcode CLT: absent"
-          fi
-
-      - name: Toolchain inventory
-        run: |
-          report() {
-            local name="$1"; shift
-            if command -v "$name" >/dev/null 2>&1; then
-              echo "$name: $("$name" --version 2>/dev/null | head -n 1)"
-            else
-              echo "$name: absent"
-            fi
-          }
-          report rustup
-          report cargo
-          report node
-          report pnpm
-          report brew
-          report gh
-          if command -v cargo >/dev/null 2>&1; then
-            cargo llvm-cov --version >/dev/null 2>&1 \
-              && echo "cargo-llvm-cov: $(cargo llvm-cov --version | head -n 1)" \
-              || echo "cargo-llvm-cov: absent"
-            cargo nextest --version >/dev/null 2>&1 \
-              && echo "cargo-nextest: $(cargo nextest --version | head -n 1)" \
-              || echo "cargo-nextest: absent"
-          else
-            echo "cargo-llvm-cov: absent (no cargo)"
-            echo "cargo-nextest: absent (no cargo)"
-          fi
-
-      - name: Xcode and iOS simulators
-        run: |
-          if xcodebuild -version >/dev/null 2>&1; then
-            echo "== xcodebuild -version =="
-            xcodebuild -version
-          else
-            echo "xcodebuild: absent (full Xcode not installed)"
-          fi
-          if xcrun simctl help >/dev/null 2>&1; then
-            echo "== iOS runtimes (xcrun simctl list runtimes) =="
-            xcrun simctl list runtimes
-            if xcrun simctl list runtimes 2>/dev/null | grep "^iOS " >/dev/null; then
-              echo "iOS platform runtime: present"
-            else
-              echo "iOS platform runtime: absent"
-            fi
-            iphone_count=$(xcrun simctl list devices available 2>/dev/null | grep -c "iPhone" || true)
-            echo "Available iPhone simulators: $iphone_count"
-          else
-            echo "simctl: absent"
-          fi
+          df -k "$HOME"
+          ps -axo pid=,ppid=,comm=
+          python3 -I -B -S - <<'PYTHON'
+          import json, os, pathlib, shutil, subprocess
+          home = pathlib.Path.home()
+          print(json.dumps({'home': str(home), 'disk': shutil.disk_usage(home)._asdict(), 'runner_name': os.environ.get('RUNNER_NAME'), 'runner_workspace': os.environ.get('RUNNER_WORKSPACE')}))
+          root = home / 'ci-target'
+          if root.is_dir() and not root.is_symlink():
+              for repo in sorted(root.iterdir()):
+                  print('ROOT_ENTRY', repo, 'symlink', repo.is_symlink())
+                  if repo.is_dir() and not repo.is_symlink():
+                      for child in sorted(repo.iterdir()):
+                          print('CANDIDATE', child, 'symlink', child.is_symlink())
+                          if child.is_dir() and not child.is_symlink():
+                              subprocess.run(['du', '-sk', str(child)], check=True)
+                              print('CHILDREN', [p.name for p in child.iterdir()])
+          PYTHON
