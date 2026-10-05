@@ -164,3 +164,77 @@ async fn stage_seal_manifest_accepts_empty_dirty_prefix_and_rejects_incomplete_s
         .await
         .is_err());
 }
+
+async fn append_text(conn: &mut SqliteConnection, id: &str, text: &str) {
+    let mut request = chunk(0, None, 9);
+    request.stream = NoteStageStream::Text;
+    request.records = vec![json!({"kind":"text","id":id,"offset":0,"text":text})];
+    request.chunk_digest = request.computed_digest().unwrap();
+    append(conn, &request).await;
+}
+
+#[tokio::test]
+async fn stage_seal_text_hashes_raw_unicode_bytes_across_bounded_pieces() {
+    let mut conn = fixture().await;
+    let text = "é😀\"\n".repeat(1500);
+    append_text(&mut conn, "unicode", &text).await;
+    let actual = verify_text(&mut conn, "op", "unicode").await.unwrap();
+    let expected_hash: String = Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        actual,
+        VerifiedText {
+            length: u64::try_from(text.encode_utf16().count()).unwrap(),
+            utf8_bytes: u64::try_from(text.len()).unwrap(),
+            sha256: expected_hash
+        }
+    );
+    let pieces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_text_piece")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert!(pieces > 1);
+    assert!(verify_text(&mut conn, "other-operation", "unicode")
+        .await
+        .is_err());
+    assert!(verify_text(&mut conn, "op", "missing").await.is_err());
+}
+
+#[tokio::test]
+async fn stage_seal_text_accepts_owned_empty_and_rejects_gaps_overlaps_and_wrong_extents() {
+    let mut conn = fixture().await;
+    append_text(&mut conn, "empty", "").await;
+    let actual = verify_text(&mut conn, "op", "empty").await.unwrap();
+    assert_eq!(actual.length, 0);
+    assert_eq!(actual.utf8_bytes, 0);
+    assert_eq!(
+        actual.sha256,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    sqlx::query("INSERT INTO note_stage_text VALUES('op','value',4,6)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO note_stage_text_piece VALUES('op','value',0,2,'😀'),('op','value',2,4,'ab')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    verify_text(&mut conn, "op", "value").await.unwrap();
+    for mutation in [
+        "DELETE FROM note_stage_text_piece WHERE text_id='value' AND start=0",
+        "UPDATE note_stage_text_piece SET start=1 WHERE text_id='value' AND start=2",
+        "UPDATE note_stage_text_piece SET end=1 WHERE text_id='value' AND start=0",
+        "UPDATE note_stage_text SET utf8_bytes=7 WHERE text_id='value'",
+        "UPDATE note_stage_text_piece SET text=printf('%05000d',0) WHERE text_id='value' AND start=0",
+    ] {
+        let mut tx=conn.begin().await.unwrap();
+        sqlx::query(mutation).execute(&mut *tx).await.unwrap();
+        assert!(verify_text(&mut tx,"op","value").await.is_err(),"{mutation}");
+        tx.rollback().await.unwrap();
+        verify_text(&mut conn,"op","value").await.unwrap();
+    }
+}

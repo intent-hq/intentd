@@ -10,6 +10,7 @@ use intent_core::{
     Error, Result,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection};
 
 fn db(error: impl std::fmt::Display) -> Error {
@@ -154,6 +155,83 @@ async fn read_chunk(
         return Err(mismatch());
     }
     Ok(records)
+}
+
+/// Verified raw UTF-8 digest and scalar extents for one operation-owned text ID.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct VerifiedText {
+    pub(super) length: u64,
+    pub(super) utf8_bytes: u64,
+    pub(super) sha256: String,
+}
+
+/// Stream one text ID through its indexed pieces, without reconstructing it.
+/// Work is O(text bytes + pieces), retaining only one <=4096-byte source piece.
+/// The owner may cache this result transactionally during seal; callers must not
+/// repeat this whole-text verification for each page or each referencing record.
+pub(super) async fn verify_text(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    text_id: &str,
+) -> Result<VerifiedText> {
+    let row = sqlx::query(
+        "SELECT length,utf8_bytes FROM note_stage_text WHERE operation_key=? AND text_id=?",
+    )
+    .bind(operation)
+    .bind(text_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db)?
+    .ok_or_else(invalid)?;
+    let length = u64::try_from(row.get::<i64, _>("length")).map_err(|_| invalid())?;
+    let utf8_bytes = u64::try_from(row.get::<i64, _>("utf8_bytes")).map_err(|_| invalid())?;
+    if length > 9_007_199_254_740_991 || utf8_bytes > 9_007_199_254_740_991 {
+        return Err(invalid());
+    }
+    let mut last_start = -1_i64;
+    let mut position = 0_u64;
+    let mut bytes = 0_u64;
+    let mut hash = Sha256::new();
+    loop {
+        let row = sqlx::query("SELECT start,end,CASE WHEN length(CAST(text AS BLOB))<=4096 THEN text END AS text FROM note_stage_text_piece WHERE operation_key=? AND text_id=? AND start>? ORDER BY start LIMIT 1")
+            .bind(operation).bind(text_id).bind(last_start).fetch_optional(&mut *conn).await.map_err(db)?;
+        let Some(row) = row else {
+            break;
+        };
+        let start = row.get::<i64, _>("start");
+        let end = u64::try_from(row.get::<i64, _>("end")).map_err(|_| invalid())?;
+        let text = row.get::<Option<&str>, _>("text").ok_or_else(invalid)?;
+        let piece_length = u64::try_from(text.encode_utf16().count()).map_err(db)?;
+        if u64::try_from(start).map_err(|_| invalid())? != position
+            || text.is_empty()
+            || end != position.checked_add(piece_length).ok_or_else(invalid)?
+            || end > length
+        {
+            return Err(invalid());
+        }
+        bytes = bytes
+            .checked_add(u64::try_from(text.len()).map_err(db)?)
+            .ok_or_else(invalid)?;
+        if bytes > utf8_bytes {
+            return Err(invalid());
+        }
+        hash.update(text.as_bytes());
+        position = end;
+        last_start = start;
+    }
+    if position != length || bytes != utf8_bytes {
+        return Err(invalid());
+    }
+    let sha256 = hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(VerifiedText {
+        length,
+        utf8_bytes,
+        sha256,
+    })
 }
 
 #[cfg(test)]
