@@ -201,6 +201,25 @@ impl NoteStageSearch {
         }
     }
 
+    /// Original-source interval sufficient to rebuild this matcher at its scan
+    /// frontier. The Store may bind these two offsets into its short authenticated
+    /// cursor instead of serializing the carry. Read this range from the SAME
+    /// frozen view, feed it into a new matcher with the SAME query, suppress all
+    /// replay hits, then resume at `end`. Replay work/bytes still require admission.
+    /// At most m original scalars (<=2m UTF-16 units, <=4m UTF-8 bytes) are needed.
+    ///
+    /// None means no initial position was set; an empty range means a gap reset.
+    /// Pending hit emission/count/identity is owned by the Store, not this range.
+    #[must_use]
+    pub fn replay_range(&self) -> Option<NoteStageSearchRange> {
+        let end = self.next_offset?;
+        let units: u64 = self.source.iter().map(|c| c.len_utf16() as u64).sum();
+        Some(NoteStageSearchRange {
+            start: end - units,
+            end,
+        })
+    }
+
     /// Validate bounded carry and recompute KMP/boundary state from its original
     /// scalar tail. Past hits are discarded, so resuming after a hit emits it
     /// exactly once. At most m original scalars suffice to rebuild all future

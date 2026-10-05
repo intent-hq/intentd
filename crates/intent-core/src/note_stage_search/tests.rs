@@ -480,3 +480,44 @@ fn every_generated_mapping_matches_the_pinned_input_digest() {
         "b41eea2dea84d468d8c4330d4acb90d94f97c848a1448af150574ae8397913a3"
     );
 }
+
+#[test]
+fn original_source_replay_range_restores_every_page_frontier() {
+    for vector in VECTORS.iter().filter(|vector| vector.ranges.is_none()) {
+        let mut search = NoteStageSearch::new(vector.query).unwrap();
+        assert_eq!(search.replay_range(), None);
+        let mut hits = Vec::new();
+        let mut offset = 23;
+        for scalar in vector.source.chars() {
+            if let Some(hit) = search.push_scalar(scalar, offset).unwrap() {
+                hits.push((hit.start - 23, hit.end - 23));
+            }
+            offset += scalar.len_utf16() as u64;
+            let range = search.replay_range().unwrap();
+            assert_eq!(range.end, offset);
+            assert!(range.end - range.start <= 2 * search.pattern.len() as u64);
+            let mut restored = NoteStageSearch::new(vector.query).unwrap();
+            restored.reset_at_gap(range.start).unwrap();
+            // Test-only source oracle. A production Store reads this bounded
+            // interval through its retained immutable source index.
+            let mut at = 23;
+            for prior in vector.source.chars() {
+                if range.start <= at && at < range.end {
+                    let _past_hit = restored.push_scalar(prior, at).unwrap();
+                }
+                at += prior.len_utf16() as u64;
+            }
+            assert_eq!(restored.snapshot(), search.snapshot(), "{}", vector.name);
+            search = restored;
+        }
+        assert_eq!(hits, vector.expected, "{}", vector.name);
+        search.reset_at_gap(offset + 10).unwrap();
+        assert_eq!(
+            search.replay_range(),
+            Some(NoteStageSearchRange {
+                start: offset + 10,
+                end: offset + 10
+            })
+        );
+    }
+}
