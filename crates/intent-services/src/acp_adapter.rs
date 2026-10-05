@@ -545,6 +545,7 @@ struct HeldWhileLive {
     npx_launch_dir: Option<Arc<NpxLaunchDir>>,
     slot: OwnedSemaphorePermit,
     installed: Option<Arc<PreparedInstalled>>,
+    preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
 }
 
 /// The adapter process plus [`HeldWhileLive`], dereferencing to the
@@ -594,6 +595,7 @@ impl AdapterChild {
             npx_launch_dir,
             slot,
             installed,
+            preparation_guard,
         } = held;
         let launch_dir = RetainUnlessSwept(npx_launch_dir, installed);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -607,6 +609,7 @@ impl AdapterChild {
             launch_dir.remove();
             drop(child);
             drop(slot);
+            drop(preparation_guard);
         }))
     }
 }
@@ -713,6 +716,20 @@ pub(crate) async fn spawn_adapter_in(
             limit: slots.limit(),
         });
     };
+    let preparation_guard = if cmd.via_npx {
+        let provider = intent_providers::ACP_PROVIDERS.iter().find(|provider| {
+            provider
+                .npx_only_package
+                .is_some_and(|package| cmd.args.iter().any(|arg| arg == package))
+        });
+        if let Some(provider) = provider {
+            crate::provider_preparation::before_launch(provider.id).await
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let prepared;
     let cmd = if cmd.installed_cli.is_some() && cmd.installed.is_none() {
         prepared = cmd
@@ -748,7 +765,7 @@ pub(crate) async fn spawn_adapter_in(
         }
         cmd
     };
-    spawn_admitted_adapter(cmd, slot).map_err(SpawnError::Spawn)
+    spawn_admitted_adapter(cmd, slot, preparation_guard).map_err(SpawnError::Spawn)
 }
 
 /// The spawn itself, once a slot is held. Split out so the bound and the
@@ -757,6 +774,7 @@ pub(crate) async fn spawn_adapter_in(
 fn spawn_admitted_adapter(
     cmd: &AcpAdapterCommand,
     slot: OwnedSemaphorePermit,
+    preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
 ) -> Result<SpawnedAdapter, String> {
     let npx_launch_dir = if let Some(installed) = &cmd.installed {
         installed.npx_dir.clone()
@@ -812,6 +830,7 @@ fn spawn_admitted_adapter(
                 npx_launch_dir,
                 slot,
                 installed: cmd.installed.clone(),
+                preparation_guard,
             }),
         },
         conn,

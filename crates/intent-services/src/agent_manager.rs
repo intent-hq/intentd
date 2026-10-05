@@ -3519,6 +3519,11 @@ impl AgentManager {
                 "info",
             )
             .await;
+        let preparation_guard = if spawn_opts.via_npx() {
+            crate::provider_preparation::before_launch(spawn_opts.provider.id).await
+        } else {
+            None
+        };
         let spawned = if let Some(cli) =
             intent_providers::installed_cli::InstalledCli::for_provider(spawn_opts.provider.id)
         {
@@ -3595,6 +3600,7 @@ impl AgentManager {
                 _rules_config: rules_config,
                 _pi_extension: pi_extension,
                 npx_launch_dir,
+                preparation_guard,
                 cleanup_lease: Some(cleanup_lease),
                 #[cfg(test)]
                 cleanup_services: Some(self.services.clone()),
@@ -17914,6 +17920,7 @@ mod dead_child_respawn_tests {
                 _rules_config: None,
                 _pi_extension: None,
                 npx_launch_dir,
+                preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),

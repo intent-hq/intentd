@@ -6192,6 +6192,11 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Best-effort bounded host adapter preparation admission; never waits for probes or downloads.
+    fn prepare_provider_adapters(&self, provider_ids: Vec<String>) {
+        let _ = provider_ids;
+    }
+
     /// Default-provider self-heal (monorepo#3044), invoked by the transport
     /// after a `host.providerDiscovery` pass with the registry-ordered ids of
     /// the providers discovery reported as installed. When no default

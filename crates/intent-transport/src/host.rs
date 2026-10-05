@@ -56,6 +56,7 @@ pub(crate) enum HostMethod {
     FindApp,
     ListInstalledEditors,
     ProviderDiscovery,
+    PrepareProviderAdapters,
     /// Daemon-owned provider auth probes (`host.providerAuthStatus`, §5.14):
     /// `{ providerId?, force? }` → `{ providers: [{ id, authenticated,
     /// identity? }] }` with `authenticated: true | false | null` and the
@@ -130,6 +131,7 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
         "host.findApp" => HostMethod::FindApp,
         "host.listInstalledEditors" => HostMethod::ListInstalledEditors,
         "host.providerDiscovery" => HostMethod::ProviderDiscovery,
+        "host.prepareProviderAdapters" => HostMethod::PrepareProviderAdapters,
         "host.providerAuthStatus" => HostMethod::ProviderAuthStatus,
         "host.providerTestPrompt" => HostMethod::ProviderTestPrompt,
         "host.openInEditor" => HostMethod::OpenInEditor,
@@ -426,6 +428,28 @@ pub(crate) async fn handle_with_host_environment(
                 .await
                 .unwrap_or_else(|_| json!({ "tools": {} }));
             success_frame(&id_echo, &result)
+        }
+        HostMethod::PrepareProviderAdapters => {
+            let ids = params.get("providerIds").and_then(Value::as_array);
+            let valid = params.len() == 1
+                && ids.is_some_and(|ids| {
+                    ids.len() <= 32
+                        && ids.iter().all(|id| {
+                            id.as_str()
+                                .is_some_and(|id| !id.is_empty() && id.len() <= 64)
+                        })
+                });
+            if !valid {
+                return id_present.then(|| error_frame(&id_echo, -32602, "Expected only providerIds: at most 32 non-empty strings of at most 64 bytes"));
+            }
+            api.prepare_provider_adapters(
+                ids.unwrap()
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            );
+            success_frame(&id_echo, &json!({"accepted": true}))
         }
         HostMethod::ProviderDiscovery => {
             // `providers.paths` overrides live in settings, above the
