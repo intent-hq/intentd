@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.20] - 2026-10-05
+
+### 🐛 Bug Fixes
+
+- Restore personal skills in new and resumed sessions ([#2317](https://github.com/intent-hq/intentd/pull/2317))
+
+
 ## [0.10.19] - 2026-10-05
 
 ### 🐛 Bug Fixes
