@@ -304,7 +304,17 @@ const EVENT_ROW_TRIM_FIELDS: [&str; 6] = [
 pub(crate) fn serialize_event_rows(
     events: Vec<Event>,
 ) -> std::result::Result<Vec<Value>, serde_json::Error> {
-    events.into_iter().map(serde_json::to_value).collect()
+    let caller = intent_core::current_caller();
+    events
+        .into_iter()
+        .map(|event| {
+            let mut row = serde_json::to_value(event)?;
+            if let Some(Caller::Agent { agent_id }) = &caller {
+                intent_core::redact_self_queue_events(&mut row, agent_id);
+            }
+            Ok(row)
+        })
+        .collect()
 }
 
 /// Bound the serialized size of an `event.query` row set (monorepo#3347).

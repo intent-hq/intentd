@@ -4,7 +4,12 @@
 //! and transport contract harnesses and the queue-entry egress lint read a
 //! single source of truth and fail by cell name.
 //!
-//! Read surfaces share all entries among admitted workspace participants.
+//! Read surfaces share all entries among admitted human workspace participants.
+//! The table's Agent caller inspects another agent. Recipient reads have an
+//! additional target-aware restriction (`queue_contents_visible_to`): status
+//! and diagnostics retain counts with empty entries, explicit getQueue refuses
+//! contents, and queue event history drops payloads. Hook reads use their owner
+//! agent identity. Delivery and the human mutation policy are unchanged.
 //! Mutation cells are intentionally independent: editing is author-only and
 //! the existing guest send-now/delete restrictions remain. Workspace-owner
 //! delete moderation has an additional services regression fixture.
@@ -33,7 +38,7 @@ pub enum CallerClass {
     AuthorGuest,
     /// Wire guest looking at someone else's entry.
     ForeignGuest,
-    /// [`Caller::Agent`] calling back through `workspace_api`.
+    /// [`Caller::Agent`] inspecting a different agent through `workspace_api`.
     Agent,
     /// [`Caller::Daemon`] (hook runs, background work).
     Daemon,
@@ -382,7 +387,7 @@ pub const QUEUE_VISIBILITY_CONTRACT: &[Cell] = &[
     cell(C::ForeignGuest, T::Unattributed, S::RemoveQueuedMessage, E::Allowed),
     cell(C::ForeignGuest, T::Unattributed, S::SendQueuedMessageNow, E::Allowed),
     cell(C::ForeignGuest, T::Unattributed, S::Diagnostics, E::Visible),
-    // Agent: acts on its own authority; sees and may mutate everything.
+    // Agent: inspecting a different recipient; existing read/mutation behavior.
     cell(C::Agent, T::PrincipalStamped, S::GetQueue, E::Visible),
     cell(C::Agent, T::PrincipalStamped, S::QueueUpdatedEvent, E::Visible),
     cell(C::Agent, T::PrincipalStamped, S::QueueProcessingEvent, E::Visible),
@@ -456,6 +461,21 @@ mod tests {
     use super::*;
     use crate::{project_queue_for_caller, queue_attribution_visible_to};
     use std::collections::HashSet;
+
+    #[test]
+    fn recipient_read_restriction_is_independent_of_sender_attribution() {
+        let recipient = AgentId::from(AGENT_CALLER);
+        for class in CallerClass::ALL {
+            assert_eq!(
+                crate::queue_contents_visible_to(class.caller().as_ref(), &recipient),
+                *class != CallerClass::Agent,
+            );
+            assert!(crate::queue_contents_visible_to(
+                class.caller().as_ref(),
+                &AgentId::from("other")
+            ));
+        }
+    }
 
     #[test]
     fn contract_is_complete_and_unique() {

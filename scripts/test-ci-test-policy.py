@@ -90,7 +90,7 @@ def violations(workflow, policy):
 REQUIRED_TEST_STEPS = {
     ("check", "Real import and public session contract"): 1,
     ("check", "Source lints"): 1,
-    ("check", "GitLab auth and invitations over real sockets with explicit test transports"): 1,
+    ("check", "GitLab auth, invitations and checkout over real sockets with explicit test transports"): 1,
     ("check", "Coverage-skipped tests (STAB-40/43)"): 2,
     ("check", "Installer guard tests (install_ps1_owner)"): 1,
     # None: indirect Python/Bash-array routes are executed with a stub below.

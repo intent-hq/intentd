@@ -75,6 +75,7 @@ pub const REFRESH_LEEWAY: Duration = Duration::from_secs(5 * 60);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitlabHost {
     host: String,
+    logical_base_url: String,
     base_url: String,
 }
 
@@ -137,6 +138,7 @@ impl GitlabHost {
         let base_url = url.as_str().trim_end_matches('/').to_string();
         Ok(Self {
             host: authority,
+            logical_base_url: base_url.clone(),
             base_url,
         })
     }
@@ -155,6 +157,12 @@ impl GitlabHost {
         &self.base_url
     }
 
+    /// Logical identity before any explicit fixture transport override.
+    #[must_use]
+    pub fn logical_base_url(&self) -> &str {
+        &self.logical_base_url
+    }
+
     /// REST v4 base (`<base_url>/api/v4`).
     #[must_use]
     pub fn api_base(&self) -> String {
@@ -164,7 +172,7 @@ impl GitlabHost {
     /// True for the hosted instance, where [`GITLAB_COM_OAUTH_CLIENT_ID`] applies.
     #[must_use]
     pub fn is_gitlab_com(&self) -> bool {
-        self.host == GITLAB_COM_HOST
+        self.logical_base_url == "https://gitlab.com"
     }
 
     /// The same canonical host, but with every `/oauth/*` and `/api/v4/*`
@@ -2382,5 +2390,31 @@ mod persisted_credential_tests {
         .await
         .is_err());
         assert_eq!(*observer.events.lock().unwrap(), ["before", "uncertain"]);
+    }
+}
+
+#[cfg(test)]
+mod checkout_instance_tests {
+    use super::*;
+    #[test]
+    fn checkout_logical_root_survives_transport_override() {
+        let host = GitlabHost::parse("https://GitLab.Example:8443/Forge").unwrap();
+        let mapped = host
+            .clone()
+            .with_api_origin("http://127.0.0.1:43210")
+            .unwrap();
+        assert_eq!(
+            mapped.logical_base_url(),
+            "https://gitlab.example:8443/Forge"
+        );
+        assert_eq!(mapped.host(), "gitlab.example:8443");
+        assert_eq!(mapped.base_url(), "http://127.0.0.1:43210");
+        assert!(!GitlabHost::parse("https://gitlab.com/prefix")
+            .unwrap()
+            .is_gitlab_com());
+        assert!(!GitlabHost::parse("https://gitlab.com:8443")
+            .unwrap()
+            .is_gitlab_com());
+        assert!(GitlabHost::parse("gitlab.com").unwrap().is_gitlab_com());
     }
 }

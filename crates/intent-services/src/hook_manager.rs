@@ -2621,6 +2621,57 @@ mod tests {
         (tmp, root, services, ws, owner)
     }
 
+    #[tokio::test]
+    async fn self_queue_owner_hook_retains_stale_warning_without_payloads() {
+        let (_db, _root, svc, ws, owner) = setup().await;
+        let mut session = svc.store().get_agent_session(&owner).await.unwrap();
+        session.status = AgentStatus::Idle;
+        svc.store()
+            .update_agent_session(&ws, &session)
+            .await
+            .unwrap();
+        svc.enqueue_message(
+            &owner,
+            "PENDING-SECRET-content".into(),
+            Some(json!([{"type":"image", "data":"PENDING-SECRET-image"}])),
+            Some(json!([{"type":"resource", "uri":"PENDING-SECRET-file"}])),
+            Some(json!({"extra":"PENDING-SECRET-metadata"})),
+            None,
+            false,
+            intent_core::MessageOrigin::Automatic,
+        );
+        {
+            let mut queues = svc.agent_queues.lock().unwrap();
+            queues.get_mut(&owner).unwrap()[0].queued_at = "2020-01-01T00:00:00Z".into();
+        }
+        let before = svc.queue_snapshot(&owner);
+        let out = svc.hook_schedule_op(&ws, &owner, &json!({
+            "name":"stale self queue", "delayMs":600_000,
+            "code": r"
+                for (const opts of [{}, {agentId:'agent-hooks'}]) {
+                    const d = await ws.agent.diagnostics(opts);
+                    const q = d.diagnostics.queues.find(q => q.agentId === 'agent-hooks');
+                    if (q.queueLength !== 1 || q.entries.length !== 0 || JSON.stringify(d).includes('PENDING-SECRET'))
+                        throw new Error('owner hook exposed pending payloads or lost count');
+                    const risk = d.diagnostics.stuckRisks.find(r => r.type === 'stale-queue-entry');
+                    if (!risk || risk.count !== 1 || risk.ageMs <= 300000 || !d.text.includes('stale-queue-entry'))
+                        throw new Error('owner hook lost stale warning');
+                    if (!d.text.includes('contents hidden')) throw new Error('owner hook lost delivery notice');
+                }
+                return {dispatch:false};
+            "
+        })).await.expect("owner hook validation preserves stale warning");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.queue_snapshot(&owner),
+            before,
+            "hook reads never consume"
+        );
+    }
+
     /// Fixed deadline for the polling helpers below. Generous on purpose:
     /// under a loaded host (e.g. a parallel `cargo build`) persistence can
     /// lag far behind the happy path, and a short deadline fails

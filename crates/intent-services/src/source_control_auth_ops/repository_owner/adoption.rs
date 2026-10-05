@@ -137,17 +137,20 @@ impl GitlabCredentialGate {
         {
             return Err(unavailable());
         }
+        let requested =
+            GitlabInstance::parse(host.logical_base_url()).map_err(|_| unavailable())?;
         let mut changes = Vec::new();
         if super::super::parse_gitlab_host(&original.host)?.host() != host.host() {
             changes.push((
                 "sourceControl.gitlab.host".into(),
                 Value::String(host.host().into()),
             ));
-            // The public host parameter is a bare authority. It cannot move a
-            // configured relative root silently to another instance.
-            if original.instance_base_url.is_some() {
-                return Err(unavailable());
-            }
+        }
+        if logical_instance(&original).ok().as_ref() != Some(&requested) {
+            changes.push((
+                "sourceControl.gitlab.instanceBaseUrl".into(),
+                Value::String(requested.as_str().into()),
+            ));
         }
         let desired = registry
             .preview(&changes)?

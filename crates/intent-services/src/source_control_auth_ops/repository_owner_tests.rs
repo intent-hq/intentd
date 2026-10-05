@@ -22,6 +22,7 @@ pub(crate) struct Control {
     pub(crate) requests: Mutex<Vec<String>>,
     pub(crate) exchanges: AtomicUsize,
     pub(crate) expected_project_token: Mutex<Option<&'static str>>,
+    pub(crate) project_status: Mutex<Option<u16>>,
     pub(super) directory: Mutex<Option<Arc<RepositoryConnectionDirectory>>>,
 }
 pub(crate) struct Server {
@@ -39,7 +40,7 @@ impl Server {
     pub(crate) async fn new() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
-        let host = GitlabHost::parse("gitlab.test")
+        let host = GitlabHost::parse("https://gitlab.test/forge")
             .unwrap()
             .with_api_origin(&origin)
             .unwrap();
@@ -157,6 +158,13 @@ impl Server {
                             };
                             (200, json!({"id":id,"username":"fixture", "name":"Fixture"}))
                         }
+                    } else if path.starts_with("/api/v4/projects/")
+                        && control.project_status.lock().unwrap().is_some()
+                    {
+                        (
+                            control.project_status.lock().unwrap().unwrap(),
+                            json!({"message":"fixture project response"}),
+                        )
                     } else if path == "/api/v4/projects/group%2Fproject" {
                         let expected = *control.expected_project_token.lock().unwrap();
                         if expected.is_some_and(|token| {
@@ -175,7 +183,12 @@ impl Server {
                         (404, json!({}))
                     };
                     let body = body.to_string();
-                    let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                    let retry = if status == 429 {
+                        "Retry-After: 60\r\n"
+                    } else {
+                        ""
+                    };
+                    let response = format!("HTTP/1.1 {status} Test\r\n{retry}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
                     let _ = socket.write_all(response.as_bytes()).await;
                 });
             }
@@ -1040,8 +1053,12 @@ async fn administrator_checked_revoke_route_clears_the_pair_and_pending_startup(
     let f = Fixture::new(&server, true).await;
     f.pat(&server, "pat-first").await;
     f.device_expiry("9999999999");
+    let Target::Gitlab { host } = f.svc.resolve_source_control_target("gitlab", None).unwrap()
+    else {
+        panic!("expected the public GitLab revoke target");
+    };
     f.svc.gitlab_auth.lock().await.starting = Some(GitlabStartupIntent {
-        host: server.host.host().into(),
+        host: host.logical_base_url().into(),
         id: github_auth_ops::next_flow_id(),
     });
     assert_eq!(
