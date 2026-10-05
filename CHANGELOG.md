@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.18] - 2026-10-05
+
+### 🚀 Features
+
+- Add collaborator-facing machine names ([#2304](https://github.com/intent-hq/intentd/pull/2304))
+
+### 🐛 Bug Fixes
+
+- Preserve repository context on unchanged config reload ([#2303](https://github.com/intent-hq/intentd/pull/2303))
+
+
 ## [0.10.17] - 2026-10-05
 
 ### 🐛 Bug Fixes
