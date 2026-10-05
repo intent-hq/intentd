@@ -177,8 +177,9 @@ pub(crate) const PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX: &str =
 pub(crate) const PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX: &str = "[turn streamed output]";
 
 /// Prefix marking a `session/prompt` failure that was recognized as
-/// sleep-induced (Task C): the turn died with a transient upstream disconnect
-/// (per [`intent_acp::is_transient_upstream_disconnect`]) whose active window
+/// sleep-induced: the turn died with a transient upstream disconnect or provider
+/// fetch failure (per [`intent_acp::is_transient_upstream_disconnect`] /
+/// [`intent_acp::is_transient_provider_fetch_failure`]) whose active window
 /// overlapped a detected host suspend (per the injected [`SuspendOverlapQuery`]).
 /// [`Services::run_prompt_turn`] enrolls such a turn as interrupted (persisting
 /// the partial with [`InterruptReason::SystemSuspend`] + an `interrupted_agent`
@@ -3719,9 +3720,9 @@ impl Services {
         // append consumes `blocks`, used for the pending-proposals recording
         // below (PROTOCOL §5.5).
         let proposal_ids = crate::tool_block::proposal_ids_in(&blocks);
-        // Sleep-induced turn failure (Task C): the turn died with a transient
-        // upstream disconnect AND a detected host suspend overlapped its active
-        // window `[turn_started, now]`. Enroll it as interrupted (so the wake
+        // Sleep-induced turn failure: the turn died with a transient upstream
+        // disconnect or provider-fetch failure AND a host suspend overlapped
+        // its active window `[turn_started, now]`. Enroll it as interrupted (so the wake
         // orchestrator in Task D can resume it via `session/load`) instead of
         // surfacing a hard terminal failure. Gated on an injected
         // [`SuspendOverlapQuery`]: absent (read-only / unit wiring, or
@@ -3732,7 +3733,9 @@ impl Services {
         // resume preserves the partial turn, which a fresh-child redrive would
         // not. `PromptIdleTimeout` is classified non-transient, so an idle
         // timeout never routes here.
-        let suspend_interrupt = matches!(&result, Err(e) if intent_acp::is_transient_upstream_disconnect(e))
+        let suspend_interrupt = matches!(&result, Err(e)
+            if intent_acp::is_transient_upstream_disconnect(e)
+                || intent_acp::is_transient_provider_fetch_failure(e))
             && self
                 .suspend_tracker
                 .as_ref()
@@ -4557,8 +4560,8 @@ impl Services {
             .is_some()
     }
 
-    /// Enroll a sleep-induced turn failure (Task C): a transient upstream
-    /// disconnect whose active window overlapped a detected host suspend. The
+    /// Enroll a sleep-induced turn failure: a transient upstream disconnect or
+    /// provider-fetch failure whose active window overlapped a host suspend. The
     /// partial turn is persisted tagged [`InterruptReason::SystemSuspend`]
     /// (empty blocks still record a row — every interruption is durably
     /// anchored), an `interrupted_agent` row is written with `prev_status` = the
