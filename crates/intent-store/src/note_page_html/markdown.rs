@@ -310,10 +310,7 @@ pub(crate) fn append_codes(
     descriptors: &mut Vec<(usize, usize, String, Value)>,
 ) {
     // The existing entry path interprets raw HTML separately from Markdown.
-    if source.trim().starts_with('<')
-        && !source.trim().starts_with("<!--anchor:")
-        && !source.contains("```ws-block")
-    {
+    if super::uses_html_entry(source) {
         return;
     }
     let prepared = super::markdown_source::Prepared::new(source);

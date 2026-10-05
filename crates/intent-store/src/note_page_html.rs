@@ -2,10 +2,12 @@
 //!
 //! Token source coordinates and repaired DOM ownership are separate: foster
 //! parenting must never turn a DOM ancestor into a fabricated literal range.
+mod entry;
 mod index;
 mod markdown;
 mod markdown_source;
 mod primitive;
+pub(crate) use entry::uses_html_entry;
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, Tracer, TreeSink};
 use html5ever::tendril::StrTendril;
 use html5ever::tokenizer::{states::RawKind, Tag, TagKind, Token, TokenSink, TokenSinkResult};

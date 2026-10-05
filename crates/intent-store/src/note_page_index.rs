@@ -20,6 +20,7 @@ pub(crate) fn profile_revision() -> &'static str {
             "canonicalNote:1:preserveAnchors:workspace:notePrimitives:mentions",
             include_str!("note_page_index.rs"),
             include_str!("note_page_html.rs"),
+            include_str!("note_page_html/entry.rs"),
             include_str!("note_page_html/index.rs"),
             include_str!("note_page_html/markdown.rs"),
             include_str!("note_page_html/markdown_source.rs"),
@@ -324,6 +325,11 @@ fn context_entries(text: &str, parts: &[Piece], entries: &mut Entries) {
         alignments: Vec<Alignment>,
     }
 
+    let entry_path = if crate::note_page_html::uses_html_entry(text) {
+        "html"
+    } else {
+        "markdown"
+    };
     let mut units = vec![0; text.len() + 1];
     let mut count = 0;
     for (byte, ch) in text.char_indices() {
@@ -384,6 +390,9 @@ fn context_entries(text: &str, parts: &[Piece], entries: &mut Entries) {
                 }})
             }
         };
+        if matches!(&event, Event::Start(Tag::Paragraph)) {
+            descriptor["entryPath"] = json!(entry_path);
+        }
         match &event {
             Event::Start(Tag::Table(alignments)) => tables.push(TablePosition {
                 reference: format!("d:{id}"),

@@ -75,11 +75,7 @@ pub(crate) fn append(
     entries: &mut Entries,
     descriptors: &mut Vec<Descriptor>,
 ) {
-    let trimmed = source.trim();
-    if !trimmed.starts_with('<')
-        || trimmed.starts_with("<!--anchor:")
-        || source.contains("```ws-block")
-    {
+    if !super::uses_html_entry(source) {
         return;
     }
     // The lexical Markdown scanner can find backticks in an HTML-entry tail,
