@@ -4150,6 +4150,20 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Automatic `pr.refresh` calls share daemon admission with the sweep.
+    /// Kept separate from explicit refresh to preserve existing callers.
+    fn pr_refresh_automatic(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "automatic PR refresh not implemented".into(),
+            ))
+        })
+    }
+
     /// `ws.pr.snapshot` engine (MCP-only surface, not in the FE router
     /// catalog): a compact, diff-friendly snapshot of PR `pr_number` — state,
     /// mergeability + blocked reason, check-run tally, review decision, and

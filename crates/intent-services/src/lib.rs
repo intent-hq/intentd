@@ -184,6 +184,7 @@ mod repository_read_policy;
 mod repository_read_source;
 
 mod agent_list_cache;
+mod automatic_pr_refresh;
 pub mod checkpoint;
 mod direct_secret_ops;
 mod fast_mode;
@@ -256,6 +257,7 @@ mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
 mod workspace_branch;
+mod workspace_check_cadence;
 mod workspace_status;
 pub mod workspace_vocabulary;
 
@@ -1362,6 +1364,7 @@ pub struct Services {
     /// read within `prCache.maxAgeSeconds` (see [`pr_monitor::PrCache`]).
     /// In-memory only; shared across clones.
     pr_cache: pr_monitor::PrCache,
+    automatic_pr_refresh: Arc<Mutex<automatic_pr_refresh::Admission>>,
     pr_discovery: pr_discovery::Discovery,
     /// The issue cache behind `github.issues.get`: each issue's last forge
     /// read, served within `prCache.maxAgeSeconds` like the PR cache and
@@ -1760,6 +1763,7 @@ impl Services {
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
             pr_cache: Arc::new(Mutex::new(HashMap::new())),
+            automatic_pr_refresh: Arc::new(Mutex::new(automatic_pr_refresh::Admission::default())),
             pr_discovery: pr_discovery::Discovery::default(),
             issue_cache: Arc::new(Mutex::new(HashMap::new())),
             pr_cache_max_age_seconds: None,
@@ -4955,11 +4959,13 @@ impl Services {
         &self,
         ws: &Workspace,
         sc: Option<&Arc<dyn intent_sourcecontrol::SourceControl>>,
+        interval_secs: u64,
+        local_maintenance: bool,
     ) {
         if ws.is_remote || ws.archived {
             return;
         }
-        if let Some(worktree) = git_ops::worktree_path(ws) {
+        if let Some(worktree) = git_ops::worktree_path(ws).filter(|_| local_maintenance) {
             let gitmodules = tokio::fs::read_to_string(worktree.join(".gitmodules"))
                 .await
                 .unwrap_or_default();
@@ -5048,6 +5054,16 @@ impl Services {
             }
         };
         for root in roots {
+            let admitted = sc.filter(|_| !self.sweeps_rate_limited()).and_then(|sc| {
+                let permit =
+                    self.admit_automatic_pr_refresh(&ws.id, Some(root.id.as_str()), interval_secs)?;
+                Some((sc, permit))
+            });
+            // Cached rows are cheap to list; avoid filesystem work on idle
+            // checkouts unless maintenance or their forge refresh is due.
+            if !local_maintenance && admitted.is_none() {
+                continue;
+            }
             // Auto-prune only on a genuine path-gone (`NotFound`, or a parent
             // component that is no longer a directory). Roots may live
             // anywhere on the host (network/FUSE mounts included), so a
@@ -5118,11 +5134,15 @@ impl Services {
             // local steps above have already done their work. A forge whose
             // quota is exhausted is treated the same for the remaining roots
             // — the local steps 1–3 above still ran (monorepo#2961).
-            let Some(sc) = sc.filter(|_| !self.sweeps_rate_limited()) else {
+            let Some((sc, _permit)) = admitted else {
                 continue;
             };
             let root_id = root.id.clone();
-            let refreshed = self.refresh_git_root_pr(root, sc).await;
+            let refreshed = pr_discovery::automatically_refresh(
+                interval_secs,
+                self.refresh_git_root_pr(root, sc),
+            )
+            .await;
             match refreshed {
                 Err(Error::RateLimited(detail)) => {
                     intent_sourcecontrol::traffic::with_caller(
@@ -6133,11 +6153,9 @@ impl Services {
     /// those lacking repo/branch info are skipped. Errors are logged per
     /// workspace and never abort the sweep.
     ///
-    /// To trim steady forge load (§7.7), the sweep is tiered by recency via
-    /// [`pr_ops::sweep_due`]: every [`pr_ops::SWEEP_IDLE_TICK_MULTIPLE`]-th
-    /// `tick` (including tick 0) refreshes every workspace; ticks in between
-    /// refresh only workspaces active within
-    /// [`pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES`].
+    /// Forge admission follows the shared meaningful-work idle cadence and
+    /// remembers failed attempts. Frontend automatic commands use the same
+    /// reservation; local git-root maintenance keeps its separate scan cadence.
     ///
     /// The sweep operates on the workspace snapshot taken at sweep start
     /// (`list_workspaces`); each workspace is passed into the refresh path
@@ -6163,22 +6181,32 @@ impl Services {
     }
 
     async fn refresh_all_workspace_prs_owned(&self, tick: u64) {
-        let mut workspaces = match self.store.list_workspaces(false).await {
+        let workspaces = match self.store.list_workspaces(false).await {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!(error = %e, "pr refresh: listing workspaces failed");
                 return;
             }
         };
-        // Parse the cutoff once per sweep; `sweep_due` fails open on `None`.
-        let cutoff = intent_core::parse_iso(&intent_core::iso_minutes_ago(
-            pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES,
-        ));
-        workspaces.retain(|ws| pr_ops::sweep_due(ws, cutoff, tick));
+        let ids: Vec<_> = workspaces.iter().map(|ws| ws.id.clone()).collect();
+        self.automatic_pr_refresh
+            .lock()
+            .unwrap()
+            .retain_workspaces(&ids);
+        let intervals = match self
+            .workspace_automatic_check_intervals(&ids, time::OffsetDateTime::now_utc())
+            .await
+        {
+            Ok(intervals) => intervals,
+            Err(error) => {
+                tracing::warn!(%error, "PR refresh: activity projection failed");
+                return;
+            }
+        };
         // Resolve the SourceControl provider once per sweep to avoid spamming
         // warnings when unconfigured and hitting keychain/gh on the blocking pool
-        // once per workspace (Copilot review comment on PR #131). Resolved after
-        // the due filter so an all-idle tick performs no keychain/`gh` work.
+        // once per workspace (Copilot review comment on PR #131). Forge work
+        // is admitted per workspace/root below; local root maintenance still runs.
         if workspaces.is_empty() {
             return;
         }
@@ -6209,6 +6237,7 @@ impl Services {
             // those already linked. `refresh_workspace_pr_with_sc` skips
             // ineligible workspaces internally.
             let ws_id = ws.id.clone();
+            let interval = intervals.get(&ws_id).copied().unwrap_or(60);
             // Forge reads share a deadline inside the refresh. Its admitted
             // store/event continuation remains owned after that deadline.
             //
@@ -6216,8 +6245,19 @@ impl Services {
             // sweep) so a limit hit mid-sweep stops the remaining forge
             // calls immediately instead of burning them into the exhausted
             // quota (monorepo#2961).
-            if let Some(sc) = sc.as_ref().filter(|_| !self.sweeps_rate_limited()) {
-                let refreshed = self.refresh_workspace_pr_with_sc(ws.clone(), sc).await;
+            let admitted = sc
+                .as_ref()
+                .filter(|_| !self.sweeps_rate_limited())
+                .and_then(|sc| {
+                    let permit = self.admit_automatic_pr_refresh(&ws_id, None, interval)?;
+                    Some((sc, permit))
+                });
+            if let Some((sc, _permit)) = admitted {
+                let refreshed = pr_discovery::automatically_refresh(
+                    interval,
+                    self.refresh_workspace_pr_with_sc(ws.clone(), sc),
+                )
+                .await;
                 match refreshed {
                     Err(Error::RateLimited(detail)) => {
                         intent_sourcecontrol::traffic::with_caller(
@@ -6239,27 +6279,30 @@ impl Services {
             // After the workspace's own refresh, sweep its tracked git roots
             // (submodule auto-detect, auto-prune, per-root PR refresh;
             // monorepo#2053). Fail-soft internally, per-root timeouts inside.
-            self.sweep_workspace_git_roots(&ws, sc.as_ref()).await;
+            self.sweep_workspace_git_roots(
+                &ws,
+                sc.as_ref(),
+                interval,
+                pr_ops::local_root_maintenance_due(&ws, tick, time::OffsetDateTime::now_utc()),
+            )
+            .await;
             // Release the SQLite pool slot between workspaces so queued
             // interactive acquires win it (intent-hq/monorepo#703).
             tokio::time::sleep(SWEEP_INTER_WORKSPACE_PAUSE).await;
         }
     }
 
-    /// Spawn the background PR refresh loop (§7.6): every `interval` (180 s at
+    /// Spawn the background PR refresh loop (§7.6): every `interval` (60 s at
     /// the composition root) it sweeps active workspaces — discovering open PRs
     /// by head-ref or baseRef match for unlinked workspaces (emitting
     /// `pr:linked`) and updating linked PRs (emitting
     /// `pr:updated`/`pr:unlinked`). The first sweep runs after one `interval`
-    /// and refreshes every workspace (tick 0); thereafter the sweep is tiered
-    /// by recency (see [`Services::refresh_all_workspace_prs`]) so idle
-    /// workspaces only refresh every [`pr_ops::SWEEP_IDLE_TICK_MULTIPLE`]-th
-    /// tick (~30 min). Each sweep pauses [`SWEEP_INTER_WORKSPACE_PAUSE`]
+    /// and admits each workspace immediately after restart; thereafter the
+    /// shared idle cadence gates forge work. Each sweep pauses [`SWEEP_INTER_WORKSPACE_PAUSE`]
     /// between workspaces so it never monopolizes `SQLite` pool slots. Missed
     /// ticks are skipped (no pile-up). No-op-safe when source control is
-    /// unconfigured (a sweep with due workspaces logs a single warning and
-    /// returns; an all-idle tick returns silently before resolving the
-    /// provider). Returns the task handle so the composition root can
+    /// unconfigured: local maintenance still runs and forge reads are skipped.
+    /// Returns the task handle so the composition root can
     /// hold/abort it.
     #[must_use]
     pub fn spawn_pr_refresh_loop(
@@ -31698,6 +31741,26 @@ impl WorkspaceApi for Services {
                 "prStatus": ws.pr_status,
                 // Always an array on the wire — never null — matching the
                 // `pr:*` event payloads (§6.5).
+                "pullRequests": ws.pull_requests.as_deref().unwrap_or_default(),
+            }))
+        })
+    }
+
+    fn pr_refresh_automatic(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.execution_call(async move {
+            self.require_member(&workspace_id).await?;
+            let outcome = self
+                .refresh_workspace_pr_automatically(&workspace_id)
+                .await?;
+            let ws = self.store.get_workspace(&workspace_id).await?;
+            Ok(serde_json::json!({
+                "outcome": outcome.as_wire_str(),
+                "prNumber": ws.pr_number,
+                "prUrl": ws.pr_url,
+                "prStatus": ws.pr_status,
                 "pullRequests": ws.pull_requests.as_deref().unwrap_or_default(),
             }))
         })

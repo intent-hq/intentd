@@ -3106,7 +3106,13 @@ async fn dispatch(
         }
         "pr.refresh" => {
             let ws = require_ws_note(params)?;
-            let r = api.pr_refresh(ws).await.map_err(workspace_err)?;
+            let automatic = opt_bool_strict(params, "automatic")?.unwrap_or(false);
+            let r = if automatic {
+                api.pr_refresh_automatic(ws).await
+            } else {
+                api.pr_refresh(ws).await
+            }
+            .map_err(workspace_err)?;
             Ok(r)
         }
         // `github.*` explicit-addressing surface (PROTOCOL §5.27): every data

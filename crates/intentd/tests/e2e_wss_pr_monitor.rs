@@ -11,6 +11,8 @@
 
 #![cfg(unix)]
 
+#[path = "e2e_wss_pr_monitor/adaptive.rs"]
+mod adaptive;
 #[path = "e2e_wss_pr_monitor/ancestry.rs"]
 mod ancestry;
 mod common;

@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.16] - 2026-10-05
+
+### 🚀 Features
+
+- Prepare detected provider adapters before first launch ([#2292](https://github.com/intent-hq/intentd/pull/2292))
+- Back off GitHub checks for idle workspaces ([#2294](https://github.com/intent-hq/intentd/pull/2294))
+
+### 🐛 Bug Fixes
+
+- Resolve transfer consumer fixtures by physical path ([#2296](https://github.com/intent-hq/intentd/pull/2296))
+- Retain native driver startup failure evidence ([#2295](https://github.com/intent-hq/intentd/pull/2295))
+
+
 ## [0.10.15] - 2026-10-05
 
 ### 🚀 Features
