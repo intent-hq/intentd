@@ -73,11 +73,36 @@ async fn desktop_lifecycle_executor_revocation_exposes_reason_without_claiming_u
 async fn desktop_lifecycle_pending_invalidation_reports_cause_and_request() {
     let h = Harness::new().await;
     let pending = h.agent("startControl", json!({})).await.unwrap();
+    let mut events = h
+        .services
+        .event_bus
+        .as_ref()
+        .unwrap()
+        .subscribe(SubscriptionFilter {
+            workspace_id: Some(h.workspace.0.clone()),
+            event_types: vec![DESKTOP_PERMISSION_RESOLVED.into()],
+            ..Default::default()
+        });
     h.executor.connection.lock().unwrap().connection_epoch = "new-executor-incarnation".into();
     assert_eq!(
         intent_core::with_caller(Caller::Daemon, h.services.desktop_current_state(&h.agent)).await,
         DesktopState::Inactive
     );
+    // A concurrent watcher may remove authority before committing the outcome.
+    // The correlated resolution event is emitted after that durable commit.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let batch = events.recv().await.unwrap();
+            if batch.iter().any(|event| {
+                event.data["requestId"] == pending["requestId"]
+                    && event.data["outcome"] == "invalidated"
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("pending invalidation must durably resolve this request");
     let message = outcome(&h, "requestId", pending["requestId"].as_str().unwrap()).await;
     assert_eq!(message["metadata"]["outcome"], "invalidated");
     assert_eq!(message["metadata"]["reason"], "primary_changed");
