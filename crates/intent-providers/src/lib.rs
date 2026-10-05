@@ -28,6 +28,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod discover;
 pub mod installed_cli;
+pub mod launch_overrides;
 pub mod models;
 pub mod version_gate;
 
