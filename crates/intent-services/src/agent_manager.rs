@@ -6400,8 +6400,10 @@ impl AgentManager {
             .unwrap()
             .get(agent_id)
             .cloned()
-            .map(prepend_from_groups)
-            .unwrap_or_else(|| extract_user_prepend(&messages[last_user_idx].content));
+            .map_or_else(
+                || extract_user_prepend(&messages[last_user_idx].content),
+                prepend_from_groups,
+            );
         if payload.content.is_none()
             && payload.image_blocks.is_none()
             && payload.file_blocks.is_none()
@@ -9064,10 +9066,10 @@ impl AgentManager {
                         // Extract the preempted message's text + attachments
                         // (shared with the zero-output user-stop redelivery
                         // arm, intent-hq/monorepo#1757).
-                        let payload = active_groups
-                            .clone()
-                            .map(prepend_from_groups)
-                            .unwrap_or_else(|| extract_user_prepend(&last_user_msg.content));
+                        let payload = active_groups.clone().map_or_else(
+                            || extract_user_prepend(&last_user_msg.content),
+                            prepend_from_groups,
+                        );
 
                         // Prompt-only prepend: both user rows are
                         // already persisted, so nothing is appended to
