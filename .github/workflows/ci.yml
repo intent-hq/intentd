@@ -1636,8 +1636,19 @@ jobs:
         run: |
           set -euo pipefail
           filter=$(printf '%s\n' "$CALLBACK_FIXTURE_TESTS" | sed '/^$/d;s/^/test(=/;s/$/)/' | paste -sd '|' -)
-          cargo nextest list -p intent-acp -p intent-services --lib \
-            -E "$filter" --message-format json > "$RUNNER_TEMP/callback-fixture-tests.json"
+          # Discover the exact inventory using the execution build's coverage
+          # settings and target directory. A plain list rebuilds both crates
+          # without instrumentation and can exhaust the job before execution.
+          # Keep the exported wrapper/flags local so llvm-cov below receives
+          # the original environment rather than instrumenting it twice.
+          (
+            target_dir=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+            export CARGO_TARGET_DIR="${CARGO_LLVM_COV_TARGET_DIR:-$target_dir/llvm-cov-target}"
+            coverage_env=$(cargo llvm-cov show-env --sh)
+            eval "$coverage_env"
+            cargo nextest list -p intent-acp -p intent-services --lib \
+              -E "$filter" --message-format json > "$RUNNER_TEMP/callback-fixture-tests.json"
+          )
           python3 -I -B -S - "$RUNNER_TEMP/callback-fixture-tests.json" <<'PYTHON'
           import json, os, sys
           expected = os.environ["CALLBACK_FIXTURE_TESTS"].split()

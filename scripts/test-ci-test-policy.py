@@ -153,6 +153,82 @@ class CiPolicyTests(unittest.TestCase):
                 step['run'] = 'unset INTENTD_ASSERT_BOUND_CALLER\n' + step['run']
                 self.assertIn(f"build: {step_name} must arm INTENTD_ASSERT_BOUND_CALLER=1", violations(workflow, "1"))
 
+    def test_callback_inventory_shares_coverage_environment_and_fails_closed(self):
+        job = self.workflow["jobs"]["coverage-changed"]
+        step = next(s for s in job["steps"] if s.get("name") == "Run callback fixture composition under llvm-cov")
+        self.assertEqual(job["timeout-minutes"], 30)
+        names = job["env"]["CALLBACK_FIXTURE_TESTS"].split()
+        self.assertEqual(len(names), 6)
+        for mode in ("valid", "missing", "extra", "duplicate", "env-failure", "metadata-failure", "list-failure", "run-failure"):
+            for override in (False, True):
+                with self.subTest(mode=mode, override=override), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    stub = root / "cargo"
+                    stub.write_text(
+                        f"#!{sys.executable} -S\n" + r'''
+import json, os, shlex, sys
+args = sys.argv[1:]
+mode = os.environ["INVENTORY_TEST_MODE"]
+with open(os.environ["INVENTORY_TEST_LOG"], "a") as log:
+    log.write(json.dumps({"args": args, "target": os.environ.get("CARGO_TARGET_DIR"),
+                         "cov_target": os.environ.get("CARGO_LLVM_COV_TARGET_DIR"),
+                         "instrumented": os.environ.get("INVENTORY_TEST_INSTRUMENTED"),
+                         "caller": os.environ.get("INTENTD_ASSERT_BOUND_CALLER")}) + "\n")
+if args[0] == "metadata":
+    if mode == "metadata-failure": sys.exit(41)
+    print(json.dumps({"target_directory": os.environ["INVENTORY_TEST_TARGET"]}))
+elif args[:2] == ["llvm-cov", "show-env"]:
+    if mode == "env-failure": sys.exit(42)
+    print("export INVENTORY_TEST_INSTRUMENTED=1")
+    print("export CARGO_LLVM_COV_TARGET_DIR=" + shlex.quote(os.environ["CARGO_TARGET_DIR"]))
+elif args[:2] == ["nextest", "list"]:
+    if mode == "list-failure": sys.exit(43)
+    names = os.environ["CALLBACK_FIXTURE_TESTS"].split()
+    if mode == "missing": names.pop()
+    if mode == "extra": names.append("unexpected::test")
+    cases = {name: {"filter-match": {"status": "matches"}} for name in names}
+    suites = {"first": {"testcases": cases}}
+    if mode == "duplicate": suites["second"] = {"testcases": {names[0]: cases[names[0]]}}
+    print(json.dumps({"rust-suites": suites}))
+elif args[:3] == ["llvm-cov", "--no-report", "nextest"]:
+    if mode == "run-failure": sys.exit(44)
+else:
+    sys.exit("unexpected cargo call: " + repr(args))
+'''
+                    )
+                    stub.chmod(0o755)
+                    env = {**os.environ, **{k: str(v) for k, v in job["env"].items()}, **step["env"],
+                           "PATH": str(root) + os.pathsep + os.environ["PATH"], "RUNNER_TEMP": str(root),
+                           "CARGO_TARGET_DIR": str(root / "slot with spaces"),
+                           "INVENTORY_TEST_TARGET": str(root / "slot with spaces"),
+                           "INVENTORY_TEST_MODE": mode, "INVENTORY_TEST_LOG": str(root / "calls.jsonl")}
+                    env.pop("CARGO_LLVM_COV_TARGET_DIR", None)
+                    env.pop("INVENTORY_TEST_INSTRUMENTED", None)
+                    if override:
+                        env["CARGO_LLVM_COV_TARGET_DIR"] = str(root / "explicit coverage")
+                    result = subprocess.run(["bash", "-c", step["run"]], env=env,
+                                            capture_output=True, text=True, timeout=10)
+                    calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+                    executions = [c for c in calls if c["args"][:3] == ["llvm-cov", "--no-report", "nextest"]]
+                    self.assertEqual(result.returncode == 0, mode == "valid", result.stderr)
+                    if mode not in ("valid", "run-failure"):
+                        self.assertEqual(executions, [])
+                        continue
+                    self.assertEqual(len(executions), 1)
+                    inventory = next(c for c in calls if c["args"][:2] == ["nextest", "list"])
+                    expected_target = env.get("CARGO_LLVM_COV_TARGET_DIR", env["CARGO_TARGET_DIR"] + "/llvm-cov-target")
+                    self.assertEqual(inventory["target"], expected_target)
+                    self.assertEqual(inventory["cov_target"], expected_target)
+                    self.assertEqual(inventory["instrumented"], "1")
+                    execution = executions[0]
+                    self.assertIsNone(execution["instrumented"])
+                    self.assertEqual(execution["target"], env["CARGO_TARGET_DIR"])
+                    self.assertEqual(execution["cov_target"], env.get("CARGO_LLVM_COV_TARGET_DIR"))
+                    self.assertEqual(inventory["caller"], "1")
+                    self.assertEqual(execution["caller"], "1")
+                    self.assertEqual(inventory["args"][2:9], execution["args"][3:10])
+                    self.assertEqual(execution["args"][10:], ["--no-fail-fast", "--retries", "0", "--show-progress", "none", "--status-level", "pass", "--final-status-level", "fail"])
+
     def test_indirect_workflow_child_environments(self):
         for step_name, expected_tests in (
             ("Tunnel deadline and TLS controls (macOS runtime)", 8),
