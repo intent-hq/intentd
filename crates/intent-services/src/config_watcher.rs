@@ -549,6 +549,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_watcher_unchanged_startup_catchup_preserves_original_snapshot() {
+        let (_dir, registry) = temp_registry(Some("[git]\nautoCommit = true\n"));
+        let original = registry.snapshot();
+        let notices = registry.subscribe();
+        let revision = tokio::sync::RwLock::new(());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let finished = Arc::new(Mutex::new(Some(tx)));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reload: PreparedReload = Arc::new({
+            let registry = registry.clone();
+            let calls = calls.clone();
+            move |text, expected, admission| {
+                let registry = registry.clone();
+                let finished = finished.clone();
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    let candidate = registry.prepare_repository_reload_at(&text, expected)?;
+                    let notice = admission
+                        .publish(|| registry.publish_repository_reload(candidate, None))?;
+                    assert!(notice.changed.is_empty());
+                    drop(finished.lock().unwrap().take());
+                    Ok(notice)
+                })
+            }
+        });
+        let (_stopping, mut stopped) = tokio::sync::watch::channel(false);
+        let mut legacy = |_| async { panic!("prepared reload owns its callback") };
+        // No file event is sent: exercise the actual startup catch-up deadline.
+        tokio::time::timeout(
+            crate::events::LIVENESS,
+            debounce(
+                &registry,
+                &revision,
+                std::ffi::OsStr::new("config.toml"),
+                &mut rx,
+                &mut legacy,
+                &mut stopped,
+                Some(&reload),
+            ),
+        )
+        .await
+        .expect("startup catch-up finishes and closes its event source");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(registry.with_original_snapshot(&original, |current| current));
+        assert!(!notices.has_changed().unwrap());
+    }
+
+    #[tokio::test]
     async fn prepared_watcher_callback_owns_revision_and_publication() {
         let (_dir, registry) = temp_registry(Some("[git]\nautoCommit = true\n"));
         let revision = Arc::new(tokio::sync::RwLock::new(()));
