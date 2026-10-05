@@ -7,7 +7,7 @@ use crate::Store;
 use intent_core::{
     note_mutation::NoteMutationError,
     note_stage::{NoteStageHeader, NoteStageSeal},
-    Error, Result,
+    Result,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -93,14 +93,7 @@ impl Store {
         let root: String = row.get("root_key");
         let view = seal::prepare_frozen_view(&mut tx, &key, &header, request, &root).await?;
         seal::validate_live_descriptors(&mut tx, &key, &view).await?;
-        // Marker occurrence provenance needs its actual canonical adapter. Until
-        // that adapter is registered this case fails closed, never treats an
-        // arbitrary canonicalId or native range as persisted source authority.
-        let marker:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM note_stage_validation WHERE operation_key=? AND kind='live' AND json_extract(value,'$.role')='marker-occurrence')")
-            .bind(&key).fetch_one(&mut *tx).await.map_err(db)?;
-        if marker {
-            return Err(Error::Unsupported("staged canonical marker adapter".into()));
-        }
+        super::markers::validate(&mut tx, &key, &root, &view).await?;
         if header.output == intent_core::note_stage::NoteStageOutput::Search
             && header.query.as_ref().is_some_and(|query| {
                 query.mode == intent_core::note_stage::NoteStageSearchMode::Source

@@ -1,11 +1,11 @@
 //! Actual uploads exercise provenance admission, never a seeded verified ledger.
 use super::{count, request, seal_request, setup};
-use crate::{Store, tests::sample_comment};
+use crate::{tests::sample_comment, Store};
 use intent_core::{
-    Error,
     note_stage::{NoteStageAppend, NoteStageBegin},
+    Error,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
@@ -407,7 +407,7 @@ async fn final_marker_witness_failure_rolls_back_entire_seal_and_retry_uses_same
 
 #[tokio::test]
 async fn dropping_seal_after_witness_writes_rolls_back_before_writer_retry() {
-    use crate::note_stage_repo::{MARKER_SEAL_PAUSE, MarkerSealPause};
+    use crate::note_stage_repo::{MarkerSealPause, MARKER_SEAL_PAUSE};
     use std::{sync::Arc, time::Duration};
     use tokio::sync::Notify;
 

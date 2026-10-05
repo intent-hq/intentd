@@ -8,6 +8,7 @@ use intent_core::{
 use serde_json::json;
 
 mod marker_admission;
+mod marker_provenance;
 
 async fn request(store: &Store) -> NoteStageBegin {
     let first = page(store, json!({"kind":"source","maxSourceBytes":128})).await;
