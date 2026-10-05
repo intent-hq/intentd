@@ -47,7 +47,7 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue((self.profile / 'deps/old.rmeta').exists())
 
     def test_apply_removes_only_profile_and_stops_at_headroom(self):
-        other = self.root / 'release'
+        other = self.root / 'debug'
         (other / 'deps').mkdir(parents=True)
         (other / '.cargo-lock').touch()
         os.utime(self.profile, (1, 1))
@@ -71,6 +71,30 @@ class CleanupTests(unittest.TestCase):
     def test_insufficient_space_fails_after_safe_candidates_exhausted(self):
         with self.assertRaisesRegex(cleanup.Refusal, 'headroom'):
             self.run_cleanup()
+
+    def test_release_profiles_never_selected_or_deleted(self):
+        releases = [self.root / 'release', self.root / 'aarch64-apple-darwin/release']
+        for path in releases:
+            (path / 'deps').mkdir(parents=True)
+            (path / '.cargo-lock').touch()
+            (path / 'deps/preserve.rmeta').write_text('release cache')
+            os.utime(path, (1, 1))
+        preview = self.run_cleanup(False)
+        self.assertEqual(preview['candidates'], [str(self.profile)])
+        self.free.side_effect = [0, 0, 200]
+        result = self.run_cleanup()
+        self.assertEqual(result['candidates'], [str(self.profile)])
+        for path in releases:
+            self.assertEqual((path / 'deps/preserve.rmeta').read_text(), 'release cache')
+            self.assertFalse(any(deleted.startswith(str(path) + '/') for deleted in result['deleted']))
+
+    def test_low_disk_never_falls_back_to_release(self):
+        release = self.root / 'release'
+        self.profile.rename(release)
+        self.assertEqual(self.run_cleanup(False)['candidates'], [])
+        with self.assertRaisesRegex(cleanup.Refusal, 'headroom'):
+            self.run_cleanup()
+        self.assertTrue((release / 'deps/old.rmeta').exists())
 
     def test_no_unrecognized_directories_deleted(self):
         unknown = self.root / 'source'

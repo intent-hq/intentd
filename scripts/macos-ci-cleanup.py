@@ -7,8 +7,9 @@ cleaners. Hold Cargo profile locks and preserve their inodes and parent director
 so newly scheduled builds must wait, even with multiple runner listeners. No age-based expiry or force
 flag: unknown ownership fails closed. This is not a general developer cleaner.
 
-Only four exact profile paths below the account's CI target are eligible. No
-sources, registry, toolchains, credentials, checkout or other repo are pruned.
+Only two exact debug profile paths below the account's CI target are eligible. No
+release profiles, sources, registry, toolchains, credentials, checkout or other
+repo are pruned.
 Internal symlinks are unlinked by fd-safe rmtree, never traversed. All containing
 paths and locks must be real owned directories/files. Reports use bytes; free
 space changes are observed filesystem deltas, not summed apparent file sizes.
@@ -27,7 +28,7 @@ import subprocess
 
 GIB = 1024 ** 3
 CARGO_LOCKS = ('.cargo-lock', '.cargo-artifact-lock', '.cargo-build-lock')
-PROFILES = ('debug', 'release', 'aarch64-apple-darwin/debug', 'aarch64-apple-darwin/release')
+PROFILES = ('debug', 'aarch64-apple-darwin/debug')
 
 
 class Refusal(RuntimeError):
