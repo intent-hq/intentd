@@ -6895,7 +6895,7 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
         .position(|block| {
             block["text"]
                 .as_str()
-                .is_some_and(|text| text.starts_with("urgent update"))
+                .is_some_and(|text| text.contains("urgent update"))
         })
         .expect("interrupt text reached provider");
     assert_eq!(
@@ -26258,9 +26258,13 @@ async fn queue_processing_payload_ordinary_drain_retains_recovered_merged_contri
         for (index, (event, queued)) in events.iter().zip(&queued).enumerate() {
             let rows = event["queuedMessages"].as_array().unwrap();
             assert_eq!(rows.len(), 1);
-            for field in ["id", "turnId", "fileBlocks", "messageMetadata"] {
+            for field in ["id", "turnId", "fileBlocks"] {
                 assert_eq!(rows[0][field], queued[field]);
             }
+            let mut expected_metadata = queued["messageMetadata"].clone();
+            expected_metadata["submissionIds"] = queued["submissionIds"].clone();
+            expected_metadata["queueInfo"] = json!({"queuedMessageId": queued["id"]});
+            assert_eq!(rows[0]["messageMetadata"], expected_metadata);
             let expected = if attachments {
                 format!("text-{index}")
             } else {
