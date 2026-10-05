@@ -1,3 +1,5 @@
+//! Installed Codex model-context regressions.
+
 use super::*;
 use tokio::io::{AsyncReadExt, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};

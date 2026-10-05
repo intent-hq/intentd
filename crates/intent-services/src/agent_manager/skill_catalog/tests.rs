@@ -5,14 +5,18 @@ use intent_core::now_iso;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
-async fn seed_catalog_session(mgr: &AgentManager, agent: &AgentId, repo: &Path) {
+async fn seed_catalog_session(mgr: &AgentManager, agent: &AgentId, repo: &Path, provider: &str) {
     let mut session = mgr.services.store.get_agent_session(agent).await.unwrap();
-    session.provider = Some("codex".into());
-    session.acp_session_id = Some("retained-codex-session".into());
+    session.provider = Some(provider.into());
     session.metadata = Some(json!({"unrelatedPreference": "keep"}));
     mgr.services
         .store
         .update_agent_session(&session.workspace_id, &session)
+        .await
+        .unwrap();
+    mgr.services
+        .store
+        .set_acp_session_id(&session.workspace_id, agent, "retained-codex-session")
         .await
         .unwrap();
     let mut workspace = mgr
@@ -66,7 +70,7 @@ async fn fresh_catalog_is_sent_once_and_recreated_session_keeps_full_prompt() {
     let repo = crate::tests::test_tempdir("intentd-catalog-");
     let skill_path = write_skill(repo.path(), "Original description");
     let (mgr, agent, _db) = manager_with(None, None).await;
-    seed_catalog_session(&mgr, &agent, repo.path()).await;
+    seed_catalog_session(&mgr, &agent, repo.path(), "codex").await;
     let workspace = mgr
         .services
         .store
@@ -101,7 +105,7 @@ async fn fresh_catalog_is_sent_once_and_recreated_session_keeps_full_prompt() {
 async fn retained_catalog_refreshes_changed_missing_and_removed_skills_without_history_replay() {
     let repo = crate::tests::test_tempdir("intentd-catalog-");
     let (mgr, agent, _db) = manager_with(None, None).await;
-    seed_catalog_session(&mgr, &agent, repo.path()).await;
+    seed_catalog_session(&mgr, &agent, repo.path(), "codex").await;
     mgr.services
         .store
         .set_agent_session_system_prompt(
@@ -179,7 +183,7 @@ async fn catalog_delivery_survives_manager_restart_but_unacknowledged_updates_re
     let repo = crate::tests::test_tempdir("intentd-catalog-");
     write_skill(repo.path(), "Before restart");
     let (mgr, agent, _db) = manager_with(None, None).await;
-    seed_catalog_session(&mgr, &agent, repo.path()).await;
+    seed_catalog_session(&mgr, &agent, repo.path(), "codex").await;
     let first = prompt(&mgr, &agent).await;
     assert!(first.contains("Intent skill catalog update"));
     // A failed/cancelled prompt never acknowledges its staged fingerprint.
@@ -198,14 +202,7 @@ async fn native_prompt_providers_do_not_receive_catalog_updates() {
     let repo = crate::tests::test_tempdir("intentd-catalog-");
     write_skill(repo.path(), "Must use native prompt");
     let (mgr, agent, _db) = manager_with(None, None).await;
-    seed_catalog_session(&mgr, &agent, repo.path()).await;
-    let mut session = mgr.services.store.get_agent_session(&agent).await.unwrap();
-    session.provider = Some("claude-code".into());
-    mgr.services
-        .store
-        .update_agent_session(&session.workspace_id, &session)
-        .await
-        .unwrap();
+    seed_catalog_session(&mgr, &agent, repo.path(), "claude-code").await;
     assert_eq!(prompt(&mgr, &agent).await, "normal turn");
     assert!(mgr.skill_catalog_pending.lock().unwrap().is_empty());
 }

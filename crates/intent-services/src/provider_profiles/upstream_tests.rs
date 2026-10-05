@@ -7,7 +7,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[cfg(unix)]
-#[path = "upstream_codex_skills.rs"]
+#[path = "upstream_codex_skills_tests.rs"]
 mod codex_skills;
 
 fn write(path: &Path, text: &str) {
