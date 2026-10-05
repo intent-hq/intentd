@@ -396,6 +396,91 @@ fn opencode_implicit_oauth_and_tool_policy_cannot_be_silently_dropped() {
 }
 
 #[test]
+fn opencode_restrictions_apply_across_layers_even_without_a_server_map() {
+    for restriction in ["tools", "permission", "permissions", "$ref"] {
+        for other_server in [false, true] {
+            for (server_source, restriction_source) in [
+                ("opencode.json", ".opencode/opencode.jsonc"),
+                (".opencode/opencode.jsonc", "opencode.json"),
+                ("opencode.json", "nested/opencode.json"),
+            ] {
+                let tmp = test_tempdir("project-mcp-layer-policy-");
+                put(
+                    tmp.path(),
+                    server_source,
+                    &json!({"mcp":{"server":{"type":"local","command":["node"]}}}).to_string(),
+                );
+                let mut layer = json!({restriction: {"server_*":false}});
+                if other_server {
+                    layer["mcp"] = json!({"other":{"type":"local","command":["node"]}});
+                }
+                put(tmp.path(), restriction_source, &layer.to_string());
+                std::fs::create_dir_all(tmp.path().join("nested")).unwrap();
+                let found = discover_project_mcp(tmp.path(), &tmp.path().join("nested"));
+                assert!(
+                    found.servers.is_empty(),
+                    "{restriction} in {restriction_source}, servers in {server_source}"
+                );
+                assert!(found
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code == "unsupported"
+                        && d.source == tmp.path().join(restriction_source)));
+                // Unsupported project policy is not an authoritative Intent deny.
+                let merged = merge_project_mcp(
+                    found,
+                    BTreeMap::from([("server".into(), stdio("intent"))]),
+                    &BTreeSet::new(),
+                    None,
+                );
+                assert_eq!(merged.servers["server"], stdio("intent"));
+            }
+        }
+    }
+}
+
+#[test]
+fn opencode_layer_rejection_keeps_other_source_winners_and_disabled_preferences() {
+    let tmp = test_tempdir("project-mcp-layer-winners-");
+    put(
+        tmp.path(),
+        "opencode.json",
+        &json!({"mcp":{
+            "common":{"type":"local","command":["node"]},
+            "off":{"enabled":false},
+            "rejected":{"type":"local","command":["node"]}
+        }})
+        .to_string(),
+    );
+    put(
+        tmp.path(),
+        ".opencode/opencode.jsonc",
+        r#"{"tools":{"*":false}}"#,
+    );
+    put(
+        tmp.path(),
+        ".mcp.json",
+        r#"{"mcpServers":{"common":{"command":"common"},"independent":{"command":"common"}}}"#,
+    );
+    put(
+        tmp.path(),
+        ".factory/mcp.json",
+        r#"{"mcpServers":{"rejected":{"command":"lower"}}}"#,
+    );
+    let found = discover_project_mcp(tmp.path(), tmp.path());
+    assert_eq!(
+        found.servers,
+        BTreeMap::from([
+            ("common".into(), stdio("common")),
+            ("independent".into(), stdio("common"))
+        ])
+    );
+    assert!(found.disabled_names.contains("off"));
+    assert!(!found.disabled_names.contains("rejected"));
+    assert!(found.sources["rejected"].ends_with("opencode.json"));
+}
+
+#[test]
 fn file_size_and_depth_limits_are_explicit() {
     let tmp = test_tempdir("project-mcp-limits-");
     put(

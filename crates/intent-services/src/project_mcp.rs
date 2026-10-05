@@ -30,6 +30,12 @@ enum Format {
     Auggie,
 }
 
+#[derive(Default)]
+struct OpenCodeLayers {
+    sources: BTreeSet<PathBuf>,
+    unsupported_restrictions: bool,
+}
+
 // Increasing priority at a given directory; .jsonc wins .json, Auggie local
 // wins shared. Common .mcp.json is handled after every provider-specific file.
 const SOURCES: &[(&str, Format)] = &[
@@ -125,9 +131,17 @@ pub fn discover_project_mcp(workspace_root: &Path, launch_cwd: &Path) -> Project
         }
     }
     dirs.reverse();
+    let mut opencode = OpenCodeLayers::default();
     for dir in &dirs {
         for (relative, format) in SOURCES {
-            read_source(&root, &cwd, &dir.join(relative), *format, &mut out);
+            read_source(
+                &root,
+                &cwd,
+                &dir.join(relative),
+                *format,
+                &mut out,
+                &mut opencode,
+            );
         }
         // This is an unsupported extension convention, NOT a Pi parser.
         if dir.join(".pi/mcp.json").symlink_metadata().is_ok() {
@@ -146,7 +160,26 @@ pub fn discover_project_mcp(workspace_root: &Path, launch_cwd: &Path) -> Project
             &dir.join(".mcp.json"),
             Format::Common,
             &mut out,
+            &mut opencode,
         );
+    }
+    if opencode.unsupported_restrictions {
+        // OpenCode composes project layers, including files containing only
+        // restrictions. Reject all winning OpenCode imports rather than lose
+        // restrictions from a sibling/ancestor/later file. Other format winners
+        // and explicit Intent settings keep their documented precedence.
+        let rejected: Vec<_> = out
+            .sources
+            .iter()
+            .filter(|(name, source)| {
+                opencode.sources.contains(*source) && out.servers.contains_key(*name)
+            })
+            .map(|(name, source)| (name.clone(), source.clone()))
+            .collect();
+        for (name, source) in rejected {
+            out.servers.remove(&name);
+            out.diagnostic("unsupported", &source, Some(&name), "An applicable OpenCode layer has unsupported restrictions or includes; configure this server and its policy in Intent.");
+        }
     }
     out
 }
@@ -157,6 +190,7 @@ fn read_source(
     source: &Path,
     format: Format,
     out: &mut ProjectMcpDiscovery,
+    opencode: &mut OpenCodeLayers,
 ) {
     let canonical = match source.canonicalize() {
         Ok(path) => path,
@@ -221,6 +255,16 @@ fn read_source(
         );
         return;
     };
+    if matches!(format, Format::OpenCode) {
+        opencode.sources.insert(source.to_owned());
+        if ["tools", "permission", "permissions", "$ref"]
+            .iter()
+            .any(|key| value.get(*key).is_some())
+        {
+            opencode.unsupported_restrictions = true;
+            out.diagnostic("unsupported", source, None, "OpenCode source-level restrictions or includes cannot be represented; all project OpenCode imports are rejected.");
+        }
+    }
     let key = match format {
         Format::Toml => "mcp_servers",
         Format::OpenCode => "mcp",
@@ -238,10 +282,6 @@ fn read_source(
         );
         return;
     };
-    let unsupported_source = matches!(format, Format::OpenCode)
-        && ["tools", "permission", "permissions", "$ref"]
-            .iter()
-            .any(|key| value.get(*key).is_some());
     for (name, raw) in servers {
         if name.trim().is_empty() || name.trim() != name || name.chars().any(char::is_control) {
             out.diagnostic("invalid-name", source, None, "MCP server names must be nonempty without surrounding whitespace or control characters.");
@@ -272,9 +312,12 @@ fn read_source(
         out.disabled_names.remove(name);
         // A rejected higher-priority definition must not resurrect a lower one.
         match parse_entry(raw, format, root, cwd) {
-            Ok(None) => { out.disabled_names.insert(name.clone()); }
-            Ok(Some(server)) if !unsupported_source => { out.servers.insert(name.clone(), server); }
-            Ok(Some(_)) => out.diagnostic("unsupported", source, Some(name), "Source-level tool restrictions or includes cannot be represented; configure this server and its policy in Intent."),
+            Ok(None) => {
+                out.disabled_names.insert(name.clone());
+            }
+            Ok(Some(server)) => {
+                out.servers.insert(name.clone(), server);
+            }
             Err(message) => out.diagnostic("unsupported", source, Some(name), message),
         }
     }
