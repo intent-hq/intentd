@@ -263,13 +263,25 @@ async fn replay_actual_frontend_marker_selection_upload_and_capture_output_lifec
         assert_eq!(response["sourceLength"], 2116);
         assert_eq!(response["outputKind"], "selectionMarkdown");
         assert!(response["items"].as_array().unwrap().len() <= 64);
+        let mut page_bytes = 0;
         for item in response["items"].as_array().unwrap() {
             assert_eq!(item["offset"], output.encode_utf16().count());
             let text = item["text"].as_str().unwrap();
             assert!(!text.is_empty() && text.len() <= 1024);
-            lengths.push(text.len());
+            page_bytes += text.len();
             output.push_str(text);
         }
+        assert!(
+            page_bytes > 0 && page_bytes <= 1024,
+            "aggregate response source budget"
+        );
+        lengths.push(page_bytes);
+        assert!(lengths.len() <= 3);
+        assert_eq!(
+            response["nextCursor"].is_null(),
+            lengths.len() == 3,
+            "exact two continuations then terminal third response"
+        );
         assert!(
             json!({"jsonrpc":"2.0","id":1,"result":response})
                 .to_string()
