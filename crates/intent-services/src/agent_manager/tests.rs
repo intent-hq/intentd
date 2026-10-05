@@ -18677,6 +18677,189 @@ mod merge_user_mcp_servers_tests {
     }
 
     #[tokio::test]
+    async fn master_mcp_switch_denies_saved_project_identities_and_restores_precedence() {
+        assert_master_mcp_switch_policy(false).await;
+    }
+
+    #[tokio::test]
+    async fn master_mcp_switch_preserves_bridge_despite_saved_alias() {
+        assert_master_mcp_switch_policy(true).await;
+    }
+
+    async fn assert_master_mcp_switch_policy(bridge_alias: bool) {
+        let (_tmp, mgr, secrets, cfg) = manager_with_secrets().await;
+        let mut saved = json!({
+                "saved-id": {"id":"saved-id", "name":"saved-name", "transport":"stdio", "command":"saved-command", "enabled":true},
+                "old-id": {"id":"old-id", "name":"old-name", "transport":"stdio", "command":"old-command", "enabled":false},
+                "old-name": {"id":"old-name", "name":"renamed", "transport":"stdio", "command":"renamed-command", "enabled":true},
+                "bridge-id": {"id":"bridge-id", "name":"workspace-mcp", "transport":"stdio", "command":"untrusted-bridge", "enabled":false}
+        });
+        if bridge_alias {
+            saved["workspace-mcp"] = json!({"id":"workspace-mcp", "name":"bridge-id", "transport":"stdio", "command":"false", "enabled":true});
+        } else {
+            saved.as_object_mut().unwrap().remove("bridge-id");
+        }
+        write_servers(&secrets, &saved);
+        let mut project = json!({});
+        for name in [
+            "saved-id",
+            "saved-name",
+            "old-id",
+            "old-name",
+            "renamed",
+            "bridge-id",
+            "workspace-mcp",
+            "project-only",
+        ] {
+            if name != "bridge-id" || bridge_alias {
+                project[name] = json!({"command":"project-command"});
+            }
+        }
+        std::fs::write(
+            cfg.path().join(".mcp.json"),
+            json!({"mcpServers":project}).to_string(),
+        )
+        .unwrap();
+        for enabled in [false, true] {
+            mgr.services
+                .settings_registry()
+                .unwrap()
+                .apply(&[("mcp.enableUserServers".to_string(), json!(enabled))])
+                .unwrap();
+            let servers = mgr
+                .effective_launch_mcp(
+                    &intent_core::WorkspaceId::from("project-policy"),
+                    cfg.path(),
+                    "bridge-address".into(),
+                )
+                .await
+                .unwrap();
+            assert!(servers.contains_key("project-only"));
+            match &servers["workspace-mcp"] {
+                NormalizedMcpServer::Stdio { command, args, .. } => {
+                    assert_ne!(command, "untrusted-bridge");
+                    assert_ne!(command, "project-command");
+                    assert!(args.contains(&"mcp-bridge".to_owned()));
+                    assert!(args.contains(&"bridge-address".to_owned()));
+                }
+                other => panic!("expected trusted stdio bridge, got {other:?}"),
+            }
+            for name in ["old-id", "old-name", "renamed", "bridge-id"] {
+                assert!(!servers.contains_key(name), "disabled identity {name}");
+            }
+            if enabled {
+                assert!(
+                    matches!(&servers["saved-name"], NormalizedMcpServer::Stdio {command, ..} if command == "saved-command")
+                );
+            } else {
+                assert!(
+                    !servers.contains_key("saved-name"),
+                    "master switch must deny saved name from project"
+                );
+                assert!(
+                    !servers.contains_key("saved-id"),
+                    "master switch must deny saved ID from project"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_delivery_respects_global_bridge_disable() {
+        assert_pi_bridge_disable(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_delivery_respects_workspace_bridge_disable() {
+        assert_pi_bridge_disable(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_pi_bridge_disable(workspace_disable: bool) {
+        let (_tmp, mgr, _secrets, cfg) = manager_with_secrets().await;
+        let ws = intent_core::WorkspaceId::from("pi-bridge-policy");
+        super::seed_agent(&mgr, &ws, &intent_core::AgentId::from("pi-bridge-agent")).await;
+        std::fs::write(
+            cfg.path().join(".mcp.json"),
+            r#"{"mcpServers":{"external":{"command":"echo"}}}"#,
+        )
+        .unwrap();
+        for enabled in [false, true] {
+            for disabled in [true, false] {
+                mgr.services
+                    .settings_registry()
+                    .unwrap()
+                    .apply(&[
+                        ("mcp.enableUserServers".into(), json!(enabled)),
+                        (
+                            "mcp.disabledServers".into(),
+                            if disabled && !workspace_disable {
+                                json!(["workspace-mcp"])
+                            } else {
+                                json!([])
+                            },
+                        ),
+                    ])
+                    .unwrap();
+                mgr.services
+                    .store
+                    .set_workspace_mcp_server_disabled(
+                        &ws,
+                        "workspace-mcp",
+                        disabled && workspace_disable,
+                    )
+                    .await
+                    .unwrap();
+                let servers = mgr
+                    .effective_launch_mcp(&ws, cfg.path(), "127.0.0.1:9999".into())
+                    .await
+                    .unwrap();
+                assert_eq!(servers.contains_key("workspace-mcp"), !disabled);
+                let mut command = tokio::process::Command::new("unused-test-command");
+                command
+                    .env("HOME", cfg.path())
+                    .env(super::super::INTENTD_MCP_BRIDGE_ADDR_ENV, "poison:1");
+                let mut profile = crate::provider_launch::prepare(
+                    "pi",
+                    crate::provider_profiles::LaunchPurpose::Persistent,
+                    &command,
+                    cfg.path(),
+                    cfg.path(),
+                    cfg.path(),
+                    Some("pi-policy"),
+                    &servers,
+                    &[],
+                )
+                .unwrap();
+                let delivery = super::super::PiExtensionDelivery::write(
+                    "pi",
+                    profile.path(),
+                    &profile.native_args,
+                )
+                .unwrap();
+                delivery.apply_spawn_env(&mut profile, "127.0.0.1:9999".into());
+                profile.apply_to_command(&mut command);
+                assert_eq!(
+                    crate::provider_launch::command_env(
+                        &command,
+                        super::super::INTENTD_MCP_BRIDGE_ADDR_ENV
+                    ),
+                    (!disabled).then(|| "127.0.0.1:9999".to_owned()),
+                    "direct bridge disable must clear inherited delivery address"
+                );
+                let external: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(&profile.env["INTENTD_PI_MCP_CONFIG"]).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(external["mcpServers"]["external"]["command"], "echo");
+                assert!(external["mcpServers"].get("workspace-mcp").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn merges_enabled_stdio_server_by_name() {
         let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(

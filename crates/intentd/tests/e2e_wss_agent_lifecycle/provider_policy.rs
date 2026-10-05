@@ -2,6 +2,27 @@ use super::*;
 
 #[intent_test_macros::daemon_test]
 async fn provider_profile_project_mcp_and_authenticated_tools_over_wss() {
+    assert_project_mcp_launch(None, false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn master_mcp_switch_blocks_saved_project_aliases_over_wss() {
+    assert_project_mcp_launch(Some(false), false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn master_mcp_switch_enabled_restores_saved_server_over_wss() {
+    assert_project_mcp_launch(Some(true), false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn master_mcp_switch_preserves_bridge_despite_saved_alias_over_wss() {
+    for enabled in [false, true] {
+        assert_project_mcp_launch(Some(enabled), true).await;
+    }
+}
+
+async fn assert_project_mcp_launch(enable_user_servers: Option<bool>, bridge_alias: bool) {
     let Some(script) = gate("WSS session-mcpServers E2E") else {
         return;
     };
@@ -17,6 +38,45 @@ async fn provider_profile_project_mcp_and_authenticated_tools_over_wss() {
         "[mcp]\ndisabledServers = [\"blocked\"]\n",
     )
     .unwrap();
+    if let Some(enabled) = enable_user_servers {
+        std::fs::write(
+            data_dir.join("config.toml"),
+            format!("[mcp]\ndisabledServers = [\"blocked\"]\nenableUserServers = {enabled}\n"),
+        )
+        .unwrap();
+        let mut saved = json!({
+            "saved-id": {"id":"saved-id", "name":"saved-name", "transport":"stdio", "command":"echo", "enabled":true},
+            "old-id": {"id":"old-id", "name":"old-name", "transport":"stdio", "command":"echo", "enabled":false},
+            "old-name": {"id":"old-name", "name":"renamed", "transport":"stdio", "command":"echo", "enabled":true},
+            "bridge-id": {"id":"bridge-id", "name":"workspace-mcp", "transport":"stdio", "command":"false", "enabled":false}
+        });
+        if bridge_alias {
+            saved["workspace-mcp"] = json!({"id":"workspace-mcp", "name":"bridge-id", "transport":"stdio", "command":"false", "enabled":true});
+        } else {
+            saved.as_object_mut().unwrap().remove("bridge-id");
+        }
+        intent_core::FileSecretStore::with_path(data_dir.join("secrets.json"))
+            .store("mcp.servers", &saved.to_string())
+            .unwrap();
+        let mut project_servers = json!({"selected":{"command":"echo"}, "blocked":{"command":"false"}, "workspace-mcp":{"command":"false"}});
+        for name in [
+            "saved-id",
+            "saved-name",
+            "old-id",
+            "old-name",
+            "renamed",
+            "bridge-id",
+        ] {
+            if name != "bridge-id" || bridge_alias {
+                project_servers[name] = json!({"command":"false"});
+            }
+        }
+        std::fs::write(
+            project.join(".mcp.json"),
+            json!({"mcpServers":project_servers}).to_string(),
+        )
+        .unwrap();
+    }
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
         .await
         .unwrap();
@@ -29,8 +89,13 @@ async fn provider_profile_project_mcp_and_authenticated_tools_over_wss() {
     store.update_workspace(&workspace).await.unwrap();
     store.close().await;
     let session_log = data_dir.join("profile-sessions.jsonl");
+    let catalog_check = if enable_user_servers == Some(false) {
+        ""
+    } else {
+        "const listed = await ws.mcp.listServers(); if (!Array.isArray(listed.servers)) throw new Error('missing MCP catalog'); "
+    };
     let js = format!(
-        "const listed = await ws.mcp.listServers(); if (!Array.isArray(listed.servers)) throw new Error('missing MCP catalog'); return await ws.note.add({}, {{ content: {} }});",
+        "{catalog_check}return await ws.note.add({}, {{ content: {} }});",
         json!(note_id),
         json!(MARKER),
     );
@@ -150,4 +215,19 @@ async fn provider_profile_project_mcp_and_authenticated_tools_over_wss() {
         "project server: {names:?}"
     );
     assert!(!names.contains(&json!("blocked")), "global deny: {names:?}");
+    if let Some(enabled) = enable_user_servers {
+        for name in ["old-id", "old-name", "renamed", "bridge-id"] {
+            assert!(
+                !names.contains(&json!(name)),
+                "disabled identity {name}: {names:?}"
+            );
+        }
+        for name in ["saved-id", "saved-name"] {
+            assert_eq!(
+                names.contains(&json!(name)),
+                enabled,
+                "master switch {enabled}, identity {name}: {names:?}"
+            );
+        }
+    }
 }

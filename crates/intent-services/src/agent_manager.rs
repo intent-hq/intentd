@@ -28,7 +28,7 @@
 //! in the sender's checkout with a `workspace_api` bridge scoped to the
 //! sender's workspace.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, Weak};
@@ -2381,18 +2381,27 @@ impl PiExtensionDelivery {
         ))
     }
 
-    /// Insert the two spawn env vars: route pi-acp's pi spawn through the
-    /// wrapper, and hand the extension the bridge's TCP address.
+    /// Route pi-acp through the wrapper; deliver the bridge address only when
+    /// the final profile approves it. An absent bridge also clears inherited
+    /// addresses without affecting the separate external MCP configuration.
     fn apply_spawn_env(
         &self,
-        extra_env: &mut BTreeMap<String, String>,
+        profile: &mut crate::provider_profiles::ProviderLaunchProfile,
         bridge_connect_addr: String,
     ) {
-        extra_env.insert(
+        profile.env.insert(
             PI_ACP_PI_COMMAND_ENV.to_string(),
             self.wrapper.path.to_string_lossy().into_owned(),
         );
-        extra_env.insert(INTENTD_MCP_BRIDGE_ADDR_ENV.to_string(), bridge_connect_addr);
+        profile
+            .remove_env
+            .insert(INTENTD_MCP_BRIDGE_ADDR_ENV.to_string());
+        profile.env.remove(INTENTD_MCP_BRIDGE_ADDR_ENV);
+        if profile.approved_mcp.contains_key("workspace-mcp") {
+            profile
+                .env
+                .insert(INTENTD_MCP_BRIDGE_ADDR_ENV.to_string(), bridge_connect_addr);
+        }
     }
 }
 
@@ -3176,19 +3185,29 @@ impl AgentManager {
         let bridge = explicit.remove("workspace-mcp");
         let configs = crate::mcp_servers::read_configs_for_policy(&self.services.secrets).await?;
         let settings = self.services.effective_settings();
-        let global = settings.mcp.disabled_servers.iter().cloned().collect();
-        let workspace = self
+        let mut global: BTreeSet<String> = settings.mcp.disabled_servers.iter().cloned().collect();
+        let workspace: BTreeSet<String> = self
             .services
             .store
             .workspace_mcp_disabled_servers(ws)
             .await?
             .into_iter()
             .collect();
-        let disabled = crate::project_mcp::intent_mcp_disabled_names(
+        // Only the original trusted disable lists may revoke the reserved bridge;
+        // saved record IDs/names must not acquire that authority through aliases.
+        let bridge_disabled =
+            global.contains("workspace-mcp") || workspace.contains("workspace-mcp");
+        if !crate::mcp_servers::enable_user_servers(&settings) {
+            global.extend(configs.keys().cloned());
+        }
+        let mut disabled = crate::project_mcp::intent_mcp_disabled_names(
             &Value::Object(configs),
             &global,
             &workspace,
         );
+        if !bridge_disabled {
+            disabled.remove("workspace-mcp");
+        }
         let root = self
             .services
             .store
@@ -3598,7 +3617,7 @@ impl AgentManager {
         let pi_extension =
             pi_extension_delivery(opts.provider, profile.path(), &profile.native_args)?;
         if let Some(delivery) = &pi_extension {
-            delivery.apply_spawn_env(&mut profile.env, bridge.connect_addr());
+            delivery.apply_spawn_env(&mut profile, bridge.connect_addr());
         }
         if opts.provider.id == "mock" && opts.provider.supports_mcp_config {
             profile.write_mcp_file()?;
@@ -19948,8 +19967,31 @@ mod pi_extension_delivery_tests {
     #[test]
     fn apply_spawn_env_sets_wrapper_and_bridge_addr() {
         let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir(), &[]).unwrap();
-        let mut extra_env = BTreeMap::new();
-        delivery.apply_spawn_env(&mut extra_env, "127.0.0.1:9999".to_string());
+        let dir = crate::test_support::test_tempdir("pi-delivery-env");
+        let mut command = tokio::process::Command::new("unused-test-command");
+        command.env("HOME", dir.path());
+        let mcp = BTreeMap::from([(
+            "workspace-mcp".into(),
+            NormalizedMcpServer::Stdio {
+                command: "bridge".into(),
+                args: vec![],
+                env: BTreeMap::new(),
+            },
+        )]);
+        let mut profile = crate::provider_launch::prepare(
+            "pi",
+            crate::provider_profiles::LaunchPurpose::Persistent,
+            &command,
+            dir.path(),
+            dir.path(),
+            dir.path(),
+            Some("pi-env"),
+            &mcp,
+            &[],
+        )
+        .unwrap();
+        delivery.apply_spawn_env(&mut profile, "127.0.0.1:9999".to_string());
+        let extra_env = &profile.env;
         assert_eq!(
             extra_env.get(PI_ACP_PI_COMMAND_ENV),
             Some(&delivery.wrapper.path.to_string_lossy().into_owned())

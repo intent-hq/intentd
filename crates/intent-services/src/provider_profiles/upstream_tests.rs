@@ -2,7 +2,9 @@
 //! No real HOME, credentials, model prompts or adapter rewriting.
 use super::*;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
+#[cfg(unix)]
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 fn write(path: &Path, text: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();

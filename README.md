@@ -453,7 +453,11 @@ nearer directories win; the order above breaks ties, with JSONC above JSON and A
 local above shared settings. Common `.mcp.json` entries override that tier. Same-name
 entries replace whole entries, not individual fields. Explicit Intent settings take
 precedence over project preferences; global/workspace disables apply after merging.
-`workspace-mcp` is reserved. Unsupported semantics, including OpenCode restrictions
+Turning off `mcp.enableUserServers` also blocks saved server IDs and name aliases
+from project imports, while unrelated project-only entries remain available.
+`workspace-mcp` is reserved and cannot be disabled by saved user-server aliases.
+An explicit global or workspace disable of `workspace-mcp` remains authoritative.
+Unsupported semantics, including OpenCode restrictions
 that cannot be preserved and the unaudited `.pi/mcp.json` convention, are diagnosed
 instead of silently translated. Configure these servers and their restrictions in
 Intent. Discovery does not run credential helpers, expand shell commands, fetch remote
