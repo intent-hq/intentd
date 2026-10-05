@@ -10,7 +10,9 @@
 //! directly.
 
 use intent_core::{Error, NoteTaskRow, Result, TaskStatus};
-use std::fmt::Write as _;
+
+pub mod canonical;
+use canonical::{CanonicalSourceChange, SourceEditBuilder};
 
 /// JS `\s` (ASCII subset): space, tab, the line terminators, FF and VT.
 fn is_js_space_char(c: char) -> bool {
@@ -1162,10 +1164,14 @@ pub(crate) fn context_after(content: &str, pos: usize) -> String {
 
 /// Remove every `{id}:start` / `{id}:end` marker occurrence from `markdown`
 /// (reference `removeAnchors`; used to scrub broken/degenerate anchors).
-pub(crate) fn remove_anchor_markers(markdown: &str, comment_id: &str) -> String {
+pub(crate) fn remove_anchor_markers(markdown: &str, comment_id: &str) -> CanonicalSourceChange {
     let start_pat = start_marker(comment_id);
     let end_pat = end_marker(comment_id);
-    markdown.replace(&start_pat, "").replace(&end_pat, "")
+    let mut changed = canonical::replace_all(markdown, &start_pat, "");
+    let ends = canonical::replace_all(&changed.content, &end_pat, "");
+    changed.content = ends.content;
+    changed.phases.extend(ends.phases);
+    changed
 }
 
 const ANCHOR_MARKER_PREFIX: &str = "<!--anchor:";
@@ -1247,33 +1253,28 @@ pub(crate) fn strip_anchor_marker_text(s: &str) -> String {
 pub(crate) fn scrub_phantom_anchor_markers(
     content: &str,
     live_ids: &std::collections::HashSet<String>,
-) -> String {
-    let mut out = String::with_capacity(content.len());
+) -> CanonicalSourceChange {
+    let mut edits = SourceEditBuilder::new(content);
     let mut i = 0;
     while let Some(rel) = content[i..].find(ANCHOR_MARKER_PREFIX) {
         let pos = i + rel;
-        out.push_str(&content[i..pos]);
         match parse_uuid_anchor_marker(&content[pos..]) {
-            Some((id, len)) if !live_ids.contains(id) => i = pos + len,
-            Some((_, len)) => {
-                out.push_str(&content[pos..pos + len]);
+            Some((id, len)) if !live_ids.contains(id) => {
+                edits.replace(pos, pos + len, "");
                 i = pos + len;
             }
-            None => {
-                out.push_str(ANCHOR_MARKER_PREFIX);
-                i = pos + ANCHOR_MARKER_PREFIX.len();
-            }
+            Some((_, len)) => i = pos + len,
+            None => i = pos + ANCHOR_MARKER_PREFIX.len(),
         }
     }
-    out.push_str(&content[i..]);
-    out
+    edits.finish()
 }
 
 /// Outcome of an anchor recovery attempt (reference `RecoveryResult`).
 #[derive(Debug, Clone)]
 pub(crate) enum RecoveryOutcome {
     /// Markers restored — caller should adopt the returned markdown.
-    Recovered(String),
+    Recovered(CanonicalSourceChange),
     /// Recovery failed — caller should scrub any stray markers and mark the
     /// comment orphaned. The reason mirrors the reference log messages and is
     /// logged by the re-anchor pass for diagnostics.
@@ -1350,11 +1351,9 @@ fn recover_missing_end(
             _ => break,
         }
     }
-    let mut out = String::with_capacity(markdown.len() + end_pat.len());
-    out.push_str(&markdown[..insertion]);
-    out.push_str(&end_pat);
-    out.push_str(&markdown[insertion..]);
-    RecoveryOutcome::Recovered(out)
+    let mut edits = SourceEditBuilder::new(markdown);
+    edits.replace(insertion, insertion, &end_pat);
+    RecoveryOutcome::Recovered(edits.finish())
 }
 
 /// Have `{id}:end`; need to restore `{id}:start` before the original anchored
@@ -1386,11 +1385,9 @@ fn recover_missing_start(
             _ => break,
         }
     }
-    let mut out = String::with_capacity(markdown.len() + start_pat.len());
-    out.push_str(&markdown[..insertion]);
-    out.push_str(&start_pat);
-    out.push_str(&markdown[insertion..]);
-    RecoveryOutcome::Recovered(out)
+    let mut edits = SourceEditBuilder::new(markdown);
+    edits.replace(insertion, insertion, &start_pat);
+    RecoveryOutcome::Recovered(edits.finish())
 }
 
 fn leading_word(s: &str) -> String {
@@ -1436,7 +1433,7 @@ pub(crate) struct ParsedTaskBlock {
 /// Result of [`extract_task_blocks`].
 pub(crate) struct TaskBlocksResult {
     pub tasks: Vec<ParsedTaskBlock>,
-    pub content_without_blocks: String,
+    pub source_change: CanonicalSourceChange,
 }
 
 /// `^#\s+(.+)$` — single-`#` heading; returns the trimmed title if non-empty.
@@ -1660,14 +1657,12 @@ fn scan_blocks(content: &str) -> Vec<ScannedBlock> {
 pub(crate) fn extract_task_blocks(content: &str) -> TaskBlocksResult {
     let blocks = scan_blocks(content);
     let mut tasks = Vec::new();
-    let mut out = String::new();
-    let mut cursor = 0;
+    let mut edits = SourceEditBuilder::new(content);
     let mut valid_index = 0;
     for block in blocks {
-        out.push_str(&content[cursor..block.start]);
-        match parse_task_block_content(&block.body) {
+        let replacement = match parse_task_block_content(&block.body) {
             Some(mut task) => {
-                let _ = write!(out, "<!-- task-block-placeholder-{valid_index} -->");
+                let placeholder = format!("<!-- task-block-placeholder-{valid_index} -->");
                 task.key = block.header.key;
                 task.depends_on = block.header.depends_on;
                 task.conflicts_with = block.header.conflicts_with;
@@ -1675,15 +1670,15 @@ pub(crate) fn extract_task_blocks(content: &str) -> TaskBlocksResult {
                 task.issues = block.header.issues;
                 tasks.push(task);
                 valid_index += 1;
+                placeholder
             }
-            None => out.push_str("<!-- invalid-task-block-removed -->"),
-        }
-        cursor = block.end;
+            None => "<!-- invalid-task-block-removed -->".to_owned(),
+        };
+        edits.replace(block.start, block.end, &replacement);
     }
-    out.push_str(&content[cursor..]);
     TaskBlocksResult {
         tasks,
-        content_without_blocks: out,
+        source_change: edits.finish(),
     }
 }
 
@@ -2589,10 +2584,12 @@ mod tests {
         assert_eq!(result.tasks[0].title, "First");
         assert_eq!(result.tasks[0].content, "body one");
         assert!(result
-            .content_without_blocks
+            .source_change
+            .content
             .contains("<!-- task-block-placeholder-0 -->"));
         assert!(result
-            .content_without_blocks
+            .source_change
+            .content
             .contains("<!-- invalid-task-block-removed -->"));
         assert!(has_task_blocks(content));
         assert!(!has_task_blocks("no blocks here"));
@@ -2623,7 +2620,8 @@ mod tests {
         assert_eq!(t.title, "T");
         assert_eq!(t.content, "body");
         assert!(result
-            .content_without_blocks
+            .source_change
+            .content
             .contains("<!-- task-block-placeholder-0 -->"));
     }
 
@@ -2790,7 +2788,7 @@ mod tests {
         assert!(!has_task_blocks("@@@taskkey=a\n# T\n@@@"));
         let result = extract_task_blocks("@@@task something\n# T\n@@@");
         assert!(result.tasks.is_empty());
-        assert_eq!(result.content_without_blocks, "@@@task something\n# T\n@@@");
+        assert_eq!(result.source_change.content, "@@@task something\n# T\n@@@");
     }
 
     #[test]
@@ -2915,7 +2913,7 @@ mod tests {
         let markdown = "pre <!--anchor:c1:start-->target post";
         let out = recover_partial_anchor(markdown, "c1", Some("pre "), Some(" post"));
         let recovered = match out {
-            RecoveryOutcome::Recovered(m) => m,
+            RecoveryOutcome::Recovered(m) => m.content,
             other @ RecoveryOutcome::Failed(_) => panic!("expected Recovered, got {other:?}"),
         };
         assert!(
@@ -2935,7 +2933,7 @@ mod tests {
         let markdown = "pre target<!--anchor:c1:end--> post";
         let out = recover_partial_anchor(markdown, "c1", Some("pre "), Some(" post"));
         let recovered = match out {
-            RecoveryOutcome::Recovered(m) => m,
+            RecoveryOutcome::Recovered(m) => m.content,
             other @ RecoveryOutcome::Failed(_) => panic!("expected Recovered, got {other:?}"),
         };
         assert!(
@@ -2975,10 +2973,10 @@ mod tests {
     #[test]
     fn remove_anchor_markers_strips_both_ends() {
         let markdown = wrap("c1", "pre ", "target", " post");
-        let stripped = remove_anchor_markers(&markdown, "c1");
+        let stripped = remove_anchor_markers(&markdown, "c1").content;
         assert_eq!(stripped, "pre target post");
         // No-op when nothing to strip.
-        assert_eq!(remove_anchor_markers("plain", "c1"), "plain");
+        assert_eq!(remove_anchor_markers("plain", "c1").content, "plain");
     }
 
     // -----------------------------------------------------------------------
@@ -2999,7 +2997,7 @@ mod tests {
              c <!--anchor:{PHANTOM_ID}:start-->d<!--anchor:{PHANTOM_ID}:end--> \
              e <!--anchor:{PHANTOM_ID}:point--> f"
         );
-        let out = scrub_phantom_anchor_markers(&content, &live_set(&[LIVE_ID]));
+        let out = scrub_phantom_anchor_markers(&content, &live_set(&[LIVE_ID])).content;
         assert_eq!(
             out,
             format!("a <!--anchor:{LIVE_ID}:start-->b<!--anchor:{LIVE_ID}:end--> c d e  f")
@@ -3013,14 +3011,14 @@ mod tests {
         let content = "see `<!--anchor:{id}:start-->` and <!--anchor:c1:end--> \
                        and <!--anchor:11111111-2222-3333-4444-555555555555:middle--> \
                        and <!--anchor:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:start";
-        let out = scrub_phantom_anchor_markers(content, &live_set(&[]));
+        let out = scrub_phantom_anchor_markers(content, &live_set(&[])).content;
         assert_eq!(out, content);
     }
 
     #[test]
     fn scrub_empty_live_set_removes_all_uuid_markers() {
         let content = format!("x<!--anchor:{PHANTOM_ID}:start-->y<!--anchor:{PHANTOM_ID}:end-->z");
-        let out = scrub_phantom_anchor_markers(&content, &live_set(&[]));
+        let out = scrub_phantom_anchor_markers(&content, &live_set(&[])).content;
         assert_eq!(out, "xyz");
     }
 
@@ -3028,7 +3026,7 @@ mod tests {
     fn scrub_is_noop_without_markers() {
         let content = "plain text, no markers";
         assert_eq!(
-            scrub_phantom_anchor_markers(content, &live_set(&[LIVE_ID])),
+            scrub_phantom_anchor_markers(content, &live_set(&[LIVE_ID])).content,
             content
         );
     }

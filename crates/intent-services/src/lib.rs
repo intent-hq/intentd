@@ -10955,75 +10955,21 @@ async fn reanchor_note_comments(
     let comments = store
         .list_comments_in_workspace(workspace_id, note_id)
         .await?;
-    // Ids that legitimately own markers after this pass; comments flipped to
-    // orphaned below are removed so the final scrub treats their markers as
-    // debris too.
-    let mut live_ids = live_comment_ids(&comments);
-    let mut current = content;
-    let mut orphaned: Vec<Comment> = Vec::new();
-    for comment in &comments {
-        // Only root-level anchored comments carry markers; replies inherit the
-        // parent's anchor and never inject their own into the note body.
-        if comment.parent_id.is_some() {
-            continue;
-        }
-        if comment.is_orphaned == Some(true) {
-            continue;
-        }
-        let state = note_ops::classify_anchor_state(&current, &comment.id);
-        match state {
-            note_ops::AnchorState::Healthy => {}
-            note_ops::AnchorState::Missing => {
-                live_ids.remove(&comment.id);
-                let mut updated = comment.clone();
-                updated.is_orphaned = Some(true);
-                updated.updated_at = now_iso();
-                orphaned.push(updated);
+    let plan = note_ops::canonical::plan_anchor_changes(&content, &comments);
+    let orphan_ids: HashSet<_> = plan.orphaned.into_iter().collect();
+    let orphaned = comments
+        .into_iter()
+        .filter_map(|mut comment| {
+            if !orphan_ids.contains(&comment.id) {
+                return None;
             }
-            note_ops::AnchorState::Degenerate => {
-                live_ids.remove(&comment.id);
-                current = note_ops::remove_anchor_markers(&current, &comment.id);
-                let mut updated = comment.clone();
-                updated.is_orphaned = Some(true);
-                updated.updated_at = now_iso();
-                orphaned.push(updated);
-            }
-            note_ops::AnchorState::PartialStartOnly | note_ops::AnchorState::PartialEndOnly => {
-                let outcome = note_ops::recover_partial_anchor(
-                    &current,
-                    &comment.id,
-                    comment.anchor_before.as_deref(),
-                    comment.anchor_after.as_deref(),
-                );
-                match outcome {
-                    note_ops::RecoveryOutcome::Recovered(new_md) => {
-                        current = new_md;
-                    }
-                    note_ops::RecoveryOutcome::Failed(reason) => {
-                        tracing::debug!(
-                            comment_id = %comment.id,
-                            reason,
-                            "partial-anchor recovery failed; orphaning comment"
-                        );
-                        live_ids.remove(&comment.id);
-                        current = note_ops::remove_anchor_markers(&current, &comment.id);
-                        let mut updated = comment.clone();
-                        updated.is_orphaned = Some(true);
-                        updated.updated_at = now_iso();
-                        orphaned.push(updated);
-                    }
-                }
-            }
-        }
-    }
-    // Phantom scrub (Round 15): UUID-format markers whose id has no live
-    // comment row — an id with no row at all, or markers left behind by a
-    // row already flagged orphaned — are debris and would otherwise survive
-    // every mutation. Non-UUID marker-lookalikes (documentation literals)
-    // are user content and are never touched.
-    current = note_ops::scrub_phantom_anchor_markers(&current, &live_ids);
+            comment.is_orphaned = Some(true);
+            comment.updated_at = now_iso();
+            Some(comment)
+        })
+        .collect();
     Ok(ReanchorPlan {
-        content: current,
+        content: plan.content,
         orphaned,
     })
 }
@@ -16304,7 +16250,9 @@ impl Services {
             } else {
                 note_ops::TaskBlocksResult {
                     tasks: Vec::new(),
-                    content_without_blocks: note.content.clone(),
+                    source_change: note_ops::canonical::CanonicalSourceChange::unchanged(
+                        note.content.clone(),
+                    ),
                 }
             };
             // Idempotency: map existing child note titles (normalized) → id.
@@ -16319,7 +16267,7 @@ impl Services {
             // block is `<!-- task-block-placeholder-{i} -->` to be replaced
             // below. New children are built here and persisted with the
             // parent rewrite.
-            let mut working = parsed.content_without_blocks.clone();
+            let mut working = parsed.source_change.content.clone();
             let mut warnings: Vec<String> = Vec::new();
             let mut created: Vec<(Note, CreatedTaskEntry)> = Vec::new();
             let mut block_note_ids: Vec<NoteId> = Vec::with_capacity(parsed.tasks.len());
@@ -16371,7 +16319,7 @@ impl Services {
                     "- [ ] [{}](intent://local/task/{})",
                     task.title, task_note_id.0
                 );
-                working = working.replace(&placeholder, &linked);
+                working = note_ops::canonical::replace_all(&working, &placeholder, &linked).content;
                 block_note_ids.push(task_note_id);
                 peer_order += 100;
             }
@@ -27183,7 +27131,7 @@ impl WorkspaceApi for Services {
                     note.content = note_ops::scrub_phantom_anchor_markers(
                         &note.content,
                         &live_comment_ids(&peers),
-                    );
+                    ).content;
                     let (from, to, line) = note_ops::find_and_anchor_text(
                         &note.content,
                         &search_context,
