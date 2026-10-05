@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 import subprocess
 import selectors
-import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -143,7 +142,8 @@ class CleanupTests(unittest.TestCase):
     def test_relative_and_parent_traversal_paths_rejected(self):
         for path in [Path('relative'), self.home / '..' / self.home.name]:
             with self.subTest(path=path), self.assertRaises(cleanup.Refusal):
-                cleanup.validate_directory(path, self.home)
+                with cleanup.ExitStack() as stack:
+                    cleanup.open_home(path, stack)
 
     def test_group_writable_profile_rejected(self):
         self.profile.chmod(0o775)
@@ -168,6 +168,134 @@ class CleanupTests(unittest.TestCase):
             self.assertTrue(self.profile.exists())
         finally:
             proc.communicate(timeout=5)
+
+    def assert_substitution_safe(self, substitute):
+        source = self.home / 'source'
+        (source / 'deps').mkdir(parents=True)
+        (source / 'README').write_text('source README')
+        (source / 'deps/source.txt').write_text('source code')
+        def race(**event):
+            if event.get('event') == 'deleting':
+                substitute(source)
+        self.free.side_effect = [0, 0, 200]
+        with patch.object(cleanup, 'emit', side_effect=race):
+            with self.assertRaises((cleanup.Refusal, OSError)):
+                self.run_cleanup()
+        self.assertEqual((source / 'README').read_text(), 'source README')
+        self.assertEqual((source / 'deps/source.txt').read_text(), 'source code')
+
+    def test_profile_symlink_substitution_after_validation_refused(self):
+        def substitute(source):
+            self.profile.rename(self.profile.with_name('original-debug'))
+            self.profile.symlink_to(source, target_is_directory=True)
+        self.assert_substitution_safe(substitute)
+
+    def test_ancestor_symlink_substitution_after_validation_refused(self):
+        def substitute(source):
+            self.root.rename(self.root.with_name('original-target'))
+            (source / 'aarch64-apple-darwin').mkdir()
+            (source / 'aarch64-apple-darwin/debug').symlink_to(source, target_is_directory=True)
+            self.root.symlink_to(source, target_is_directory=True)
+        self.assert_substitution_safe(substitute)
+
+    def test_profile_directory_substitution_after_validation_refused(self):
+        def substitute(source):
+            self.profile.rename(self.profile.with_name('original-debug'))
+            source.rename(self.profile)
+        self.free.side_effect = [0, 0, 200]
+        source = self.home / 'source'
+        (source / 'deps').mkdir(parents=True)
+        (source / 'deps/source.txt').write_text('source code')
+        def race(**event):
+            if event.get('event') == 'deleting':
+                substitute(source)
+        with patch.object(cleanup, 'emit', side_effect=race):
+            with self.assertRaises((cleanup.Refusal, OSError)):
+                self.run_cleanup()
+        self.assertEqual((self.profile / 'deps/source.txt').read_text(), 'source code')
+
+    def assert_real_cargo_replacement_preserved(self, replace_locks):
+        project = self.home / 'project'
+        (project / 'src').mkdir(parents=True)
+        (project / 'Cargo.toml').write_text('[package]\nname="cleanup-replacement-proof"\nversion="0.0.0"\nedition="2021"\n')
+        (project / 'src/lib.rs').write_text('pub fn value() -> u8 { 42 }\n')
+        # Native Cargo uses host/debug, independent of the test host platform.
+        profile = self.root / 'debug'
+        self.profile.rename(profile)
+        def cargo(command):
+            result = subprocess.run(['cargo', command, '--offline', '--manifest-path', str(project / 'Cargo.toml'), '--target-dir', str(self.root)], cwd=project, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        def race(**event):
+            if event.get('event') != 'deleting':
+                return
+            if replace_locks:
+                for name in cleanup.CARGO_LOCKS:
+                    (profile / name).unlink()
+                    (profile / name).touch()
+            else:
+                cargo('clean')
+            cargo('check')
+            self.assertTrue(list((profile / 'deps').glob('*.rmeta')))
+        with patch.object(cleanup, 'emit', side_effect=race):
+            with self.assertRaises((cleanup.Refusal, OSError)):
+                self.run_cleanup()
+        self.assertTrue(list((profile / 'deps').glob('*.rmeta')))
+
+    def test_real_cargo_clean_recreation_preserves_new_build(self):
+        self.assert_real_cargo_replacement_preserved(False)
+
+    def test_real_cargo_replaced_lock_inodes_preserve_new_build(self):
+        self.assert_real_cargo_replacement_preserved(True)
+
+    def test_lock_replacement_after_acquisition_refused(self):
+        lock = self.profile / '.cargo-lock'
+        def race(**event):
+            if event.get('event') == 'deleting':
+                lock.rename(self.profile / 'old-lock')
+                lock.touch()
+        with patch.object(cleanup, 'emit', side_effect=race):
+            with self.assertRaisesRegex(cleanup.Refusal, 'Lock identity changed'):
+                self.run_cleanup()
+        self.assertTrue((self.profile / 'deps/old.rmeta').exists())
+
+    def test_nested_directory_swap_during_open_never_follows_symlink(self):
+        source = self.home / 'source'
+        source.mkdir()
+        (source / 'keep').write_text('source code')
+        original_open = os.open
+        deleting = False
+        def phase(**event):
+            nonlocal deleting
+            deleting = event.get('event') == 'deleting'
+        def race(path, flags, *args, **kwargs):
+            fd = original_open(path, flags, *args, **kwargs)
+            if deleting and path == 'deps':
+                (self.profile / 'deps').rename(self.profile / 'original-deps')
+                (self.profile / 'deps').symlink_to(source, target_is_directory=True)
+            return fd
+        with patch.object(cleanup, 'emit', side_effect=phase), patch.object(cleanup.os, 'open', side_effect=race):
+            with self.assertRaises(cleanup.Refusal):
+                self.run_cleanup()
+        self.assertEqual((source / 'keep').read_text(), 'source code')
+
+    def test_ancestor_swap_during_lock_open_does_not_redirect_creation(self):
+        source = self.home / 'source'
+        (source / 'aarch64-apple-darwin/debug').mkdir(parents=True)
+        (source / 'keep').write_text('source code')
+        original_open = os.open
+        changed = False
+        def race(path, flags, *args, **kwargs):
+            nonlocal changed
+            if path == '.cargo-artifact-lock' and not changed:
+                changed = True
+                self.root.rename(self.root.with_name('original-target'))
+                self.root.symlink_to(source, target_is_directory=True)
+            return original_open(path, flags, *args, **kwargs)
+        with patch.object(cleanup.os, 'open', side_effect=race):
+            with self.assertRaises(cleanup.Refusal):
+                self.run_cleanup()
+        self.assertEqual((source / 'keep').read_text(), 'source code')
+        self.assertEqual(list((source / 'aarch64-apple-darwin/debug').iterdir()), [])
 
     def test_lock_symlink_rejected(self):
         victim = self.home / 'keep'
@@ -223,8 +351,8 @@ class CleanupTests(unittest.TestCase):
         inode = lock.stat().st_ino
         os.utime(profile, (1, 1))
         proc = None
-        original_remove = shutil.rmtree
-        def remove(path):
+        original_remove = cleanup.remove_entry
+        def remove(parent_fd, name):
             nonlocal proc
             if proc is None:
                 proc = subprocess.Popen(['cargo', 'check', '--offline', '--manifest-path', str(project / 'Cargo.toml'), '--target-dir', str(self.root)], cwd=project, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -233,10 +361,10 @@ class CleanupTests(unittest.TestCase):
                     self.assertTrue(selector.select(timeout=30), 'cargo never reported waiting for the lock')
                     self.assertIn('Blocking waiting for file lock on', proc.stderr.readline())
                 self.assertIsNone(proc.poll())
-            original_remove(path)
+            original_remove(parent_fd, name)
         self.free.side_effect = [0, 0, 200, 200]
         try:
-            with patch.object(cleanup.shutil, 'rmtree', side_effect=remove):
+            with patch.object(cleanup, 'remove_entry', side_effect=remove):
                 self.run_cleanup()
             self.assertEqual(lock.stat().st_ino, inode)
             out, err = proc.communicate(timeout=60)
@@ -254,7 +382,7 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue(self.profile.exists())
 
     def test_delete_error_fails_and_keeps_failure_visible(self):
-        with patch.object(cleanup.shutil, 'rmtree', side_effect=OSError('denied')):
+        with patch.object(cleanup, 'remove_entry', side_effect=OSError('denied')):
             with self.assertRaisesRegex(OSError, 'denied'):
                 self.run_cleanup()
 
