@@ -28,6 +28,16 @@ async fn replay_actual_frontend_marker_upload_and_capture_source_lifecycle() {
     let database = tmp.path().join("replay.db");
     std::fs::copy(source["retainedDatabase"].as_str().unwrap(), &database).unwrap();
     let store = Store::open(&database).await.unwrap();
+    let original_root = store
+        .get_comment(source["commentId"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&original_root).unwrap(),
+        source["originalRoot"],
+        "reopened root must match the independent phase-one ownership capture"
+    );
+
     let mut calls = Vec::new();
     let mut begin = None;
     let mut seal = None;
@@ -119,6 +129,22 @@ async fn replay_actual_frontend_marker_upload_and_capture_source_lifecycle() {
         witness["admission"],
         serde_json::from_str::<Value>(&pin).unwrap()
     );
+    for field in [
+        "headId",
+        "sourceRev",
+        "commentRevision",
+        "stateGeneration",
+        "sourceRevision",
+    ] {
+        let captured_field = source["internalStoreOracle"]["annotation"]
+            .get(field)
+            .expect("phase-one annotation field is required");
+        assert_eq!(
+            &witness["admission"][field], captured_field,
+            "retained witness must bind original phase-one {field}"
+        );
+    }
+
     let mut request = initial.clone();
     let mut output = String::new();
     let mut cursors = BTreeSet::new();
