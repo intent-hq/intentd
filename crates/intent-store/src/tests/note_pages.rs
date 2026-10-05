@@ -16,6 +16,7 @@ mod artifact_pins;
 mod artifact_response;
 mod canonical_source;
 mod mutation;
+mod plain_far_capture;
 mod plain_source_capture;
 mod primitive_source_capture;
 
