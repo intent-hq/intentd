@@ -410,7 +410,22 @@ impl Store {
             .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("note update transaction: {e}")))?;
-        let result = exec_update_note(&mut conn, note, expected_version, scope).await;
+        let result = async {
+            let revision = exec_update_note(&mut conn, note, expected_version, scope).await?;
+            if revision.is_some() && scope == NoteUpdateScope::Metadata {
+                // Metadata inputs may deliberately omit the body. Resolve the
+                // persisted source on this same writer, after the final update.
+                crate::note_annotation_repo::rebuild_note_anchors(
+                    &mut conn,
+                    &note.workspace_id,
+                    &note.id,
+                    None,
+                )
+                .await?;
+            }
+            Ok(revision)
+        }
+        .await;
         match crate::commit_with_rollback_guard(conn, result, "commit note update").await? {
             Some(rev) => Ok(rev),
             None => Err(self.note_update_miss(note).await),

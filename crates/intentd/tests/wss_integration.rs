@@ -11,6 +11,8 @@
 mod annotation_pages;
 #[path = "wss_integration/annotation_reads.rs"]
 mod annotation_reads;
+#[path = "wss_integration/annotation_writer_anchors.rs"]
+mod annotation_writer_anchors;
 #[path = "wss_integration/comment_deletion.rs"]
 mod comment_deletion;
 mod common;

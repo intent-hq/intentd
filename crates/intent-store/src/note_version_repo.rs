@@ -113,6 +113,13 @@ impl Store {
                 return Ok(None);
             };
             let v = insert_note_version(&mut conn, note, author, date, rev).await?;
+            crate::note_annotation_repo::rebuild_note_anchors(
+                &mut conn,
+                &note.workspace_id,
+                &note.id,
+                Some(&note.content),
+            )
+            .await?;
             Ok(Some((rev, v)))
         }
         .await;
@@ -171,9 +178,23 @@ impl Store {
                 return Ok(None);
             };
             let v = insert_note_version(&mut conn, note, author, date, rev).await?;
+            crate::note_annotation_repo::rebuild_note_anchors(
+                &mut conn,
+                &note.workspace_id,
+                &note.id,
+                Some(&note.content),
+            )
+            .await?;
             for child in children {
                 crate::note_repo::exec_insert_note(&mut conn, child).await?;
                 insert_note_version(&mut conn, child, author, &child.updated_at, child.rev).await?;
+                crate::note_annotation_repo::rebuild_note_anchors(
+                    &mut conn,
+                    &child.workspace_id,
+                    &child.id,
+                    Some(&child.content),
+                )
+                .await?;
             }
             Ok(Some((rev, v)))
         }
@@ -221,7 +242,15 @@ impl Store {
 
         let result = async {
             crate::note_repo::exec_insert_note(&mut conn, note).await?;
-            insert_note_version(&mut conn, note, author, date, note.rev).await
+            let version = insert_note_version(&mut conn, note, author, date, note.rev).await?;
+            crate::note_annotation_repo::rebuild_note_anchors(
+                &mut conn,
+                &note.workspace_id,
+                &note.id,
+                Some(&note.content),
+            )
+            .await?;
+            Ok(version)
         }
         .await;
 

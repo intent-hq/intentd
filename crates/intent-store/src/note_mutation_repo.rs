@@ -381,6 +381,13 @@ impl NoteMutationWrite {
         )
         .await?
         .ok_or_else(|| fail(NoteMutationError::Conflict))?;
+        crate::note_annotation_repo::rebuild_note_anchors(
+            &mut self.transaction,
+            &note.workspace_id,
+            &note.id,
+            None,
+        )
+        .await?;
         Ok(Some(note))
     }
 
@@ -425,6 +432,13 @@ impl NoteMutationWrite {
             author,
             &child.updated_at,
             child.rev,
+        )
+        .await?;
+        crate::note_annotation_repo::rebuild_note_anchors(
+            &mut self.transaction,
+            &child.workspace_id,
+            &child.id,
+            Some(&child.content),
         )
         .await?;
         self.converted_count += 1;

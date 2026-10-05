@@ -453,6 +453,13 @@ async fn note_mutation_relation_updates_preserve_source_and_stamp_each_changed_r
         .get_note(&child.workspace_id, &child.id)
         .await
         .unwrap();
+    assert!(
+        store
+            .note_annotation_epochs(&child.workspace_id, &child.id)
+            .await
+            .unwrap()
+            .anchors_ready
+    );
     assert_eq!(actual.content, child.content);
     assert_eq!(actual.rev, second.rev);
     assert_eq!(actual.updated_at, second.updated_at);

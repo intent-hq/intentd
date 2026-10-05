@@ -20,6 +20,7 @@ mod plain_far_capture;
 mod plain_source_capture;
 mod primitive_source_capture;
 mod staging;
+mod writer_anchors;
 
 fn request(value: Value) -> NotePageRequest {
     serde_json::from_value(value).unwrap()

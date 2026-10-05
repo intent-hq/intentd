@@ -284,6 +284,15 @@ impl Store {
                     }
                 })?;
 
+            // Root insertion invalidates readiness even at the just-written
+            // source revision, so publication belongs after that insertion.
+            crate::note_annotation_repo::rebuild_note_anchors(
+                &mut conn,
+                &note.workspace_id,
+                &note.id,
+                Some(&note.content),
+            )
+            .await?;
             Ok(Some(new_rev))
         }
         .await;
