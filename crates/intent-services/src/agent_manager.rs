@@ -707,6 +707,7 @@ fn legacy_prompt_groups(
         crate::agent_ops::extend_carry_over_groups(&mut groups, current.clone());
     } else {
         groups.push(QueuedDeliveryGroup {
+            source_id: options.turn_id.clone(),
             is_prepend: false,
             content: content.to_string(),
             image_blocks: options.image_blocks.clone(),
@@ -5298,6 +5299,23 @@ impl AgentManager {
                 .lock()
                 .unwrap()
                 .insert(agent_id.clone(), groups.clone());
+        } else if options
+            .image_blocks
+            .as_ref()
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| !blocks.is_empty())
+            || options
+                .file_blocks
+                .as_ref()
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| !blocks.is_empty())
+        {
+            // Capture a direct attachment turn with its minted turn identity.
+            // Keep its existing envelope/assembly path; identity is internal.
+            self.active_delivery_groups
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone(), legacy_prompt_groups(content, options));
         } else {
             self.active_delivery_groups.lock().unwrap().remove(agent_id);
         }
@@ -11796,6 +11814,7 @@ fn merge_prepend_payload(
             &mut groups,
             armed.delivery_groups.clone().unwrap_or_else(|| {
                 vec![crate::agent_ops::QueuedDeliveryGroup {
+                    source_id: None,
                     is_prepend: true,
                     content: armed.content.clone().unwrap_or_default(),
                     image_blocks: armed.image_blocks.clone(),

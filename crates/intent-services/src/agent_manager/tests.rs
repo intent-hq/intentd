@@ -27075,6 +27075,7 @@ async fn grouped_retry_keeps_legacy_prepend_and_cleans_up_on_stop() {
     seed_agent(&mgr, &ws, &id).await;
     let mut entry = flush_entry("legacy", "legacy wrapper".into());
     entry.delivery_groups = Some(vec![crate::agent_ops::QueuedDeliveryGroup {
+        source_id: None,
         is_prepend: false,
         content: "grouped current message".into(),
         image_blocks: Some(json!([{"data":"CURRENT","mimeType":"image/png"}])),
@@ -27126,6 +27127,7 @@ async fn grouped_retry_normalizes_mirrors_and_successive_carry_over() {
     );
     seed_agent(&mgr, &ws, &id).await;
     let group = |text: &str, data: &str, is_prepend| crate::agent_ops::QueuedDeliveryGroup {
+        source_id: Some(format!("fixture-{data}")),
         is_prepend,
         content: text.into(),
         image_blocks: Some(json!([{"data":data,"mimeType":"image/png"}])),
@@ -27135,6 +27137,7 @@ async fn grouped_retry_normalizes_mirrors_and_successive_carry_over() {
     let current = group("retry current", "CURRENT", false);
     let mut retry = flush_entry("successive", "compatibility wrapper".into());
     retry.delivery_groups = Some(vec![older.clone(), current]);
+    retry.prepend_delivery_groups = Some(Vec::new());
     retry.prepend_content = Some(older.content.clone());
     retry.prepend_image_blocks = older.image_blocks.clone();
     assert_eq!(retry.ordered_delivery_groups().len(), 2);
@@ -27145,6 +27148,7 @@ async fn grouped_retry_normalizes_mirrors_and_successive_carry_over() {
     );
     // A genuinely new legacy payload follows the old compatibility mirror.
     retry.prepend_content = Some("older carry-over\n\nnew carry-over".into());
+    retry.prepend_delivery_groups = Some(vec![group("new carry-over", "NEW", true)]);
     retry.prepend_image_blocks = Some(
         json!([{"data":"OLDER","mimeType":"image/png"}, {"data":"NEW","mimeType":"image/png"}]),
     );

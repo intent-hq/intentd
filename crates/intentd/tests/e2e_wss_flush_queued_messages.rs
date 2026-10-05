@@ -3108,6 +3108,252 @@ async fn interrupt_keeps_all_flushed_attachment_groups_over_wss() {
     std::fs::write(&batch_release, "go").unwrap();
 }
 
+/// Failure cases: a matching direct turn hides a retry source, identical queue
+/// submissions collapse, stop carry-over repeats captured sources, or legacy
+/// unknown sources are falsely joined. All delivery goes through real WSS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_carry_over_preserves_source_identity_over_wss() {
+    identity_carry_over_over_wss(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_carry_over_keeps_unknown_legacy_sources_over_wss() {
+    identity_carry_over_over_wss(true).await;
+}
+
+async fn identity_carry_over_over_wss(legacy: bool) {
+    let Some(script) = gate("WSS carry-over identity") else {
+        return;
+    };
+    let tmp = temp_data_dir();
+    let data_dir = tmp.path();
+    let (workspace_id, _) = seed_workspace_with_guest(data_dir).await;
+    let release = data_dir.join("identity-kickoff");
+    let held = data_dir.join("identity-held");
+    let text = "identical accepted image submission";
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let images = json!([{"type":"image","data":png,"mimeType":"image/png"}]);
+    let failure = json!({"ifPromptContains":text,"promptRpcError":{"code":-32603,"message":"identity fixture failure"}});
+    let Booted {
+        daemon,
+        port,
+        cfg,
+        prompt_log,
+    } = boot_daemon(data_dir, &script, 0, Some(&release), &[failure]).await;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({"workspaceId":workspace_id,"eventTypes":["agent:*"]}),
+    )
+    .await;
+    let created = wss_rpc(&mut rpc, 2, "agent.create", json!({"workspaceId":workspace_id,"name":"Identity proof","provider":"mock","model":"default"})).await;
+    let agent = created["agent"]["id"].as_str().unwrap();
+    wss_rpc(
+        &mut rpc,
+        3,
+        "agent.sendMessage",
+        json!({"workspaceId":workspace_id,"agentId":agent,"content":KICKOFF_MSG}),
+    )
+    .await;
+    await_prompts(&prompt_log, 1).await;
+    for id in [4, 5] {
+        wss_rpc(
+            &mut rpc,
+            id,
+            "agent.queueMessage",
+            json!({"workspaceId":workspace_id,"agentId":agent,"content":text,"imageBlocks":images}),
+        )
+        .await;
+    }
+    std::fs::write(&release, "go").unwrap();
+    observe_drain(&mut sub, agent, 2).await;
+    let queue = timeout(common::test_timeout(Duration::from_secs(30)), async {
+        loop {
+            let queue = wss_rpc(&mut rpc, 6, "agent.getQueue", json!({"agentId":agent})).await;
+            if queue["queue"][0]["requeuedAfterFailure"] == true {
+                break queue;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        queue["queue"][0]["deliveryGroups"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    for group in queue["queue"][0]["deliveryGroups"].as_array().unwrap() {
+        assert!(
+            group
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|k| matches!(k.as_str(), "content" | "imageBlocks" | "fileBlocks")),
+            "internal identity must stay off the wire: {group}"
+        );
+    }
+    let retry_id = queue["queue"][0]["id"].clone();
+    drop(rpc);
+    drop(sub);
+    drop(daemon);
+    // Reproduce persisted captured-source overlap. This fixture mutation is
+    // internal-only: clients still consume and deliver the row through WSS.
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    let mut rows = store.load_all_agent_queues().await.unwrap();
+    let row = rows
+        .iter_mut()
+        .find(|row| row.id == retry_id.as_str().unwrap())
+        .unwrap();
+    if legacy {
+        for group in row.payload["deliveryGroups"].as_array_mut().unwrap() {
+            group.as_object_mut().unwrap().remove("sourceId");
+        }
+    }
+    let mut captured = row.payload["deliveryGroups"].clone();
+    for group in captured.as_array_mut().unwrap() {
+        group["isPrepend"] = json!(true);
+    }
+    row.payload["prependDeliveryGroups"] = captured;
+    store
+        .replace_agent_queue(&row.agent_id, std::slice::from_ref(row))
+        .await
+        .unwrap();
+    drop(store);
+    let rules = [json!({"ifPromptContains":text,"releaseFile":held})];
+    let Booted {
+        daemon: _daemon,
+        port,
+        cfg,
+        prompt_log,
+    } = boot_daemon(data_dir, &script, 0, None, &rules).await;
+    let mut rpc = connect_ws(port, cfg).await;
+    // First retry proves true shared captured sources join once, whereas
+    // equal legacy payloads with no identity remain independently readable.
+    wss_rpc(
+        &mut rpc,
+        7,
+        "agent.sendQueuedMessageNow",
+        json!({"workspaceId":workspace_id,"agentId":agent,"messageId":retry_id}),
+    )
+    .await;
+    await_prompts(&prompt_log, 3).await;
+    let records = || -> Vec<Value> {
+        std::fs::read_to_string(&prompt_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let assert_groups = |record: &Value, count: usize| {
+        let blocks = record["blocks"].as_array().unwrap();
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|b| b["type"] == "image" && b["data"] == png)
+                .count(),
+            count,
+            "all accepted images: {record}"
+        );
+        // Recreated-session recap may contain text too; attachment-adjacent
+        // blocks identify the delivered groups rather than the history XML.
+        let adjacent = blocks
+            .windows(2)
+            .filter(|pair| {
+                pair[0]["text"].as_str().is_some_and(|t| t.contains(text))
+                    && pair[1]["type"] == "image"
+            })
+            .count();
+        if legacy {
+            // Legacy recap text can be supplied by recreated-session history;
+            // its unknown source identity must still retain every image.
+            assert!(adjacent >= 2, "original groups remain readable: {record}");
+        } else {
+            assert_eq!(adjacent, count, "each text beside its own image: {record}");
+        }
+    };
+    let base_count = if legacy { 4 } else { 2 };
+    assert_groups(&records()[2], base_count);
+    // Repeated zero-output stops must not multiply the captured source set.
+    wss_rpc(&mut rpc, 8, "agent.stop", json!({"agentId":agent})).await;
+    wss_rpc(&mut rpc, 9, "agent.stop", json!({"agentId":agent})).await;
+    wss_rpc(
+        &mut rpc,
+        10,
+        "agent.sendMessage",
+        json!({"workspaceId":workspace_id,"agentId":agent,"content":text,"imageBlocks":images}),
+    )
+    .await;
+    await_prompts(&prompt_log, 4).await;
+    assert_groups(&records()[3], base_count + 1);
+    // Interrupt a distinct matching live source with a queued durable retry.
+    // Retain its original source set to expose content-based false overlap.
+    wss_rpc(&mut rpc, 11, "agent.stop", json!({"agentId":agent})).await;
+    drop(rpc);
+    drop(_daemon);
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    // Restore the original failed row as a durable retry, not a fresh source.
+    let row = rows
+        .iter_mut()
+        .find(|row| row.id == retry_id.as_str().unwrap())
+        .unwrap();
+    row.payload["prependDeliveryGroups"] = json!([]);
+    // Isolate the direct-source interruption from the stop proof above.
+    // That arm was already consumed and asserted; do not replay it here.
+    store.clear_stop_redelivery(&row.agent_id).await.unwrap();
+    store
+        .replace_agent_queue(&row.agent_id, std::slice::from_ref(row))
+        .await
+        .unwrap();
+    drop(store);
+    let Booted {
+        daemon: _daemon,
+        port,
+        cfg,
+        prompt_log,
+    } = boot_daemon(data_dir, &script, 0, None, &rules).await;
+    let mut rpc = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({"workspaceId":workspace_id,"agentId":agent,"content":text,"imageBlocks":images}),
+    )
+    .await;
+    await_prompts(&prompt_log, 5).await;
+    wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendQueuedMessageNow",
+        json!({"workspaceId":workspace_id,"agentId":agent,"messageId":retry_id}),
+    )
+    .await;
+    await_prompts(&prompt_log, 6).await;
+    let evidence = records();
+    assert_groups(&evidence[5], 3);
+    let name = if legacy {
+        "identity-legacy.json"
+    } else {
+        "identity.json"
+    };
+    let artifact = save_group_artifact(
+        data_dir,
+        name,
+        &json!({"legacy":legacy,"failedQueue":queue,"prompts":evidence}),
+    );
+    eprintln!("ATTACHMENT_GROUPS_IDENTITY_ARTIFACT {}", artifact.display());
+    std::fs::write(&held, "go").unwrap();
+}
+
 /// Keep repeatable evidence outside temporary daemon data when requested.
 fn save_group_artifact(data_dir: &Path, name: &str, evidence: &serde_json::Value) -> PathBuf {
     let directory = std::env::var_os("INTENT_QUEUED_GROUP_ARTIFACT_DIR")

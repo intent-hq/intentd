@@ -1649,6 +1649,7 @@ impl QueuedMessage {
             return groups;
         }
         groups.push(QueuedDeliveryGroup {
+            source_id: Some(self.turn_id.clone()),
             is_prepend: false,
             content: self.content.clone(),
             image_blocks: self.image_blocks.clone(),
@@ -1884,6 +1885,10 @@ pub(crate) struct QueuedPrepend {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedDeliveryGroup {
+    /// Durable source identity, private to queue persistence and carry-over.
+    /// Legacy groups have no identity; equal payloads never supply one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
     /// Internal replay marker; never emitted on the queue wire shape.
     #[serde(default)]
     pub is_prepend: bool,
@@ -1894,15 +1899,15 @@ pub(crate) struct QueuedDeliveryGroup {
     pub file_blocks: Option<Value>,
 }
 
-/// Normalize compatibility prepends against authoritative durable groups.
-/// Only complete text-and-attachment mirrors are removed; new legacy content
-/// remains a separate earlier group, including attachment-only content.
+/// Explicit groups, including Some(empty), are authoritative for modern
+/// retries. A legacy aggregate with unknown provenance stays readable as its
+/// own group; text/attachment equality cannot prove a captured-source mirror.
 pub(crate) fn delivery_prepend_groups(
     explicit: Option<&Vec<QueuedDeliveryGroup>>,
     content: Option<&String>,
     images: Option<&Value>,
     files: Option<&Value>,
-    durable: &[QueuedDeliveryGroup],
+    _durable: &[QueuedDeliveryGroup],
 ) -> Vec<QueuedDeliveryGroup> {
     if let Some(groups) = explicit {
         return groups.clone();
@@ -1910,76 +1915,13 @@ pub(crate) fn delivery_prepend_groups(
     if content.is_none() && images.is_none() && files.is_none() {
         return Vec::new();
     }
-    let mut legacy = QueuedDeliveryGroup {
+    vec![QueuedDeliveryGroup {
+        source_id: None,
         is_prepend: true,
         content: content.cloned().unwrap_or_default(),
         image_blocks: images.cloned(),
         file_blocks: files.cloned(),
-    };
-    let prepends: Vec<_> = durable.iter().filter(|g| g.is_prepend).collect();
-    // A compatibility triple can mirror several original groups. Strip its
-    // longest complete mirrored prefix, retaining any newly appended payload.
-    for start in 0..prepends.len() {
-        for end in (start + 1..=prepends.len()).rev() {
-            let slice = &prepends[start..end];
-            let text = slice
-                .iter()
-                .map(|g| g.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            let strip_blocks = |legacy: &Option<Value>, image: bool| -> Option<Option<Value>> {
-                let expected: Vec<Value> = slice
-                    .iter()
-                    .flat_map(|g| {
-                        let blocks = if image {
-                            &g.image_blocks
-                        } else {
-                            &g.file_blocks
-                        };
-                        blocks
-                            .as_ref()
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                            .cloned()
-                    })
-                    .collect();
-                let actual = legacy.as_ref().and_then(Value::as_array);
-                if expected.is_empty() {
-                    return Some(legacy.clone());
-                }
-                let actual = actual?;
-                if !actual.starts_with(&expected) {
-                    return None;
-                }
-                let remaining = actual[expected.len()..].to_vec();
-                Some((!remaining.is_empty()).then_some(Value::Array(remaining)))
-            };
-            let remaining_text = if legacy.content == text {
-                Some(String::new())
-            } else {
-                legacy
-                    .content
-                    .strip_prefix(&format!("{text}\n\n"))
-                    .map(str::to_owned)
-            };
-            if let (Some(text), Some(images), Some(files)) = (
-                remaining_text,
-                strip_blocks(&legacy.image_blocks, true),
-                strip_blocks(&legacy.file_blocks, false),
-            ) {
-                legacy.content = text;
-                legacy.image_blocks = images;
-                legacy.file_blocks = files;
-                return if legacy.content.is_empty() && !legacy.has_attachments() {
-                    Vec::new()
-                } else {
-                    vec![legacy]
-                };
-            }
-        }
-    }
-    vec![legacy]
+    }]
 }
 
 /// A captured zero-output turn can include the same original prefix already
@@ -1996,12 +1938,19 @@ pub(crate) fn extend_carry_over_groups(
                 .iter()
                 .zip(&newer[..n])
                 .all(|(a, b)| {
-                    a.content == b.content
-                        && a.image_blocks == b.image_blocks
-                        && a.file_blocks == b.file_blocks
+                    a.source_id
+                        .as_ref()
+                        .is_some_and(|id| !id.is_empty() && b.source_id.as_ref() == Some(id))
                 })
         })
         .unwrap_or(0);
+    // A captured source may have been a prepend in the older payload but
+    // is the current retry source here. Keep the current replay marker so
+    // recreated-session history does not suppress its grouped text.
+    let start = older.len() - overlap;
+    for (saved, current) in older[start..].iter_mut().zip(&newer[..overlap]) {
+        saved.is_prepend &= current.is_prepend;
+    }
     older.extend(newer.into_iter().skip(overlap));
 }
 
@@ -17757,6 +17706,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
             TailSegment::Partial(_) => (Vec::new(), Vec::new()),
         };
         segment_groups.push(QueuedDeliveryGroup {
+            source_id: None,
             is_prepend: true,
             content: rendered,
             image_blocks: (!images.is_empty()).then(|| Value::Array(images)),
@@ -17776,6 +17726,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
         let _ = write!(recap, "({elided} older interrupted segment(s) elided.)\n\n");
     }
     let mut groups = vec![QueuedDeliveryGroup {
+        source_id: None,
         is_prepend: true,
         content: recap.clone(),
         image_blocks: None,
@@ -17793,6 +17744,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     suffix.push_str("</supervisor>");
     recap.push_str(&suffix);
     groups.push(QueuedDeliveryGroup {
+        source_id: None,
         is_prepend: true,
         content: suffix,
         image_blocks: None,
