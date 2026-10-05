@@ -2618,6 +2618,22 @@ async fn attachment_groups_over_wss(explicit: bool) {
     let tmp = temp_data_dir();
     let data_dir = tmp.path();
     let (workspace_id, guest) = seed_workspace_with_guest(data_dir).await;
+    {
+        let root = data_dir.join("workspace");
+        std::fs::create_dir_all(&root).expect("create workspace root");
+        let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("open store");
+        let mut workspace = store
+            .get_workspace(&intent_core::WorkspaceId::from(workspace_id.clone()))
+            .await
+            .expect("workspace row");
+        workspace.worktree_path = Some(root.to_string_lossy().into_owned());
+        store
+            .update_workspace(&workspace)
+            .await
+            .expect("set workspace root");
+    }
     let release = data_dir.join("release-group-kickoff");
     let Booted {
         daemon: _daemon,
