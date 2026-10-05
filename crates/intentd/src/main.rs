@@ -4217,6 +4217,15 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
 }
 
 impl SystemControl for DaemonControl {
+    fn collaboration_name(&self) -> Option<String> {
+        self.settings_registry
+            .snapshot()
+            .effective
+            .sharing
+            .collaboration_name()
+            .map(str::to_owned)
+    }
+
     fn status(&self) -> SystemStatus {
         // Read live port/fingerprint/client count/bind set from runtime state
         // (§5.12 fix). Use try_lock to avoid blocking; if locked, report as

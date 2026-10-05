@@ -997,7 +997,7 @@ async fn assert_preview_pin_identity_over_wss(method: &str) {
         let mut expected_result = json!({
             "workspaceId": ws_id, "workspaceTitle": "Preview requirements",
             "scope":"workspace", "role":"collaborator",
-            "hostname": r["hostname"], "prettyHostname": r["prettyHostname"],
+            "hostname": r["hostname"], "prettyHostname": r["prettyHostname"], "collaborationName": null,
             "pinIdentity": expected,
         });
         assert!(r["hostname"].is_string(), "{r}");

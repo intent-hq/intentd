@@ -6506,6 +6506,7 @@ async fn wss_collaborator_system_status_is_projected_to_guest_safe_fields() {
         keys,
         [
             "buildCommit",
+            "collaborationName",
             "fingerprint",
             "host",
             "hostname",

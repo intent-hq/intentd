@@ -45,7 +45,7 @@ async fn host_invitation_owner_administration_and_scope_privacy() {
         .unwrap();
     assert_eq!(
         preview,
-        json!({"scope":"host","role":"member","pinIdentity":PrincipalIdentity::github(4242)})
+        json!({"scope":"host","role":"member","pinIdentity":PrincipalIdentity::github(4242),"collaborationName":null})
     );
     assert_eq!(
         invite_kind(
