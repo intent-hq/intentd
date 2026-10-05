@@ -4,13 +4,28 @@ use sqlx::Connection;
 
 const KEY: &[u8] = &[42; 32];
 
-fn binding(length: u64) -> SearchDetailBinding<'static> {
-    SearchDetailBinding {
-        operation: "op",
+fn binding(length: u64) -> Context {
+    Context {
+        operation: "op".into(),
+        view: "view".into(),
+        payload: "payload".into(),
+        expires: "2030-01-01T00:00:00.123Z".into(),
         generation: 0,
-        view_length: length,
-        digest: [19; 32],
+        length,
+        binding: [19; 32],
+        key: KEY.to_vec(),
+        query: "query".into(),
     }
+}
+
+fn issue(context: &Context, start: u64, end: u64, offset: u64) -> String {
+    sign(
+        "nsh1.",
+        &context.key,
+        &context.binding,
+        &[start, end, offset],
+    )
+    .unwrap()
 }
 
 async fn fixture(text: &str) -> (SqliteConnection, u64) {
@@ -68,63 +83,49 @@ async fn fixture(text: &str) -> (SqliteConnection, u64) {
 #[test]
 fn search_detail_refs_bind_span_position_and_immutable_context() {
     let bound = binding(30);
-    let reference = issue_ref(KEY, &bound, 3, 20).unwrap();
-    assert!(reference.len() < 256);
+    let reference = issue(&bound, 3, 20, 0);
+    assert_eq!(reference.len(), 123);
     assert_eq!(
-        decode_ref(KEY, &bound, &reference).unwrap(),
+        decode_ref(&bound, &reference).unwrap(),
         SearchDetailPosition {
             start: 3,
             end: 20,
             offset: 0
         }
     );
-    for other in [
-        SearchDetailBinding {
-            operation: "other",
-            ..binding(30)
-        },
-        SearchDetailBinding {
-            generation: 1,
-            ..binding(30)
-        },
-        binding(31),
-        SearchDetailBinding {
-            digest: [20; 32],
-            ..binding(30)
-        },
+    // Context::load owns hashing every immutable identity field. This helper
+    // verifies that exact digest and the persisted backend key, not a new hash.
+    let other = Context {
+        binding: [20; 32],
+        ..binding(30)
+    };
+    assert!(decode_ref(&other, &reference).is_err());
+    let other = Context {
+        key: vec![43; 32],
+        ..binding(30)
+    };
+    assert!(decode_ref(&other, &reference).is_err());
+    for invalid in [
+        format!("{reference}="),
+        "nsh1.!".into(),
+        "x".repeat(1000),
+        reference.replacen("nsh1.", "nsd1.", 1),
     ] {
-        assert!(decode_ref(KEY, &other, &reference).is_err());
+        assert!(decode_ref(&bound, &invalid).is_err());
     }
-    assert!(decode_ref(&[43; 32], &bound, &reference).is_err());
-    for invalid in [format!("{reference}="), "nsd1.!".into(), "x".repeat(1000)] {
-        assert!(decode_ref(KEY, &bound, &invalid).is_err());
+    let mut tampered = reference.clone().into_bytes();
+    tampered[10] = if tampered[10] == b'A' { b'B' } else { b'A' };
+    assert!(decode_ref(&bound, &String::from_utf8(tampered).unwrap()).is_err());
+    for values in [
+        [0, 0, 0],
+        [10, 9, 0],
+        [0, 31, 0],
+        [3, 20, 17],
+        [3, 20, 18],
+        [3, 20, u64::MAX],
+    ] {
+        assert!(decode_ref(&bound, &issue(&bound, values[0], values[1], values[2])).is_err());
     }
-    let mut bytes = URL_SAFE_NO_PAD
-        .decode(reference.strip_prefix("nsd1.").unwrap())
-        .unwrap();
-    bytes[0] ^= 1;
-    assert!(decode_ref(
-        KEY,
-        &bound,
-        &format!("nsd1.{}", URL_SAFE_NO_PAD.encode(bytes))
-    )
-    .is_err());
-    for (start, end) in [(0, 0), (10, 9), (0, 31), (u64::MAX, u64::MAX)] {
-        assert!(issue_ref(KEY, &bound, start, end).is_err());
-    }
-    for offset in [17, 18, u64::MAX] {
-        assert!(encode_ref(
-            KEY,
-            &bound,
-            SearchDetailPosition {
-                start: 3,
-                end: 20,
-                offset
-            }
-        )
-        .is_err());
-    }
-    assert!(issue_ref(&[], &bound, 3, 20).is_err());
 }
 
 #[tokio::test]
@@ -136,7 +137,7 @@ async fn search_detail_streams_only_raw_match_and_preserves_relative_offsets() {
     let start = 6;
     let end = start + u64::try_from(raw.encode_utf16().count()).unwrap();
     for budget in [4, 5, 7, 16384] {
-        let mut reference = issue_ref(KEY, &bound, start, end).unwrap();
+        let mut reference = issue(&bound, start, end, 0);
         let mut output = String::new();
         let mut offset = 0;
         let mut id = None;
@@ -144,8 +145,7 @@ async fn search_detail_streams_only_raw_match_and_preserves_relative_offsets() {
             let item = read_fragment(
                 &mut conn,
                 &SearchDetailRead {
-                    key: KEY,
-                    binding: &bound,
+                    context: &bound,
                     reference: &reference,
                     offset: Some(offset),
                     max_source_bytes: budget,
@@ -157,6 +157,7 @@ async fn search_detail_streams_only_raw_match_and_preserves_relative_offsets() {
             assert_eq!(item["kind"], "fragment");
             assert_eq!(item["field"], "source");
             assert_eq!(item["offset"], offset);
+            assert_eq!(item["id"], hit_id(&bound.binding, start, end));
             if let Some(id) = &id {
                 assert_eq!(&item["id"], id);
             } else {
@@ -170,7 +171,7 @@ async fn search_detail_streams_only_raw_match_and_preserves_relative_offsets() {
                 break;
             }
             reference = item["nextRef"].as_str().unwrap().into();
-            assert_eq!(decode_ref(KEY, &bound, &reference).unwrap().offset, offset);
+            assert_eq!(decode_ref(&bound, &reference).unwrap().offset, offset);
         }
         assert_eq!(output, raw);
         assert_eq!(offset, end - start);
@@ -182,12 +183,11 @@ async fn search_detail_rejects_surrogate_endpoints_and_off_position_requests() {
     let (mut conn, length) = fixture("A😀B🙂C").await;
     let bound = binding(length);
     for (start, end) in [(2, 3), (1, 2), (0, 5), (5, 7)] {
-        let reference = issue_ref(KEY, &bound, start, end).unwrap();
+        let reference = issue(&bound, start, end, 0);
         assert!(read_fragment(
             &mut conn,
             &SearchDetailRead {
-                key: KEY,
-                binding: &bound,
+                context: &bound,
                 reference: &reference,
                 offset: None,
                 max_source_bytes: 4,
@@ -197,13 +197,25 @@ async fn search_detail_rejects_surrogate_endpoints_and_off_position_requests() {
         .await
         .is_err());
     }
-    let reference = issue_ref(KEY, &bound, 1, 6).unwrap();
+    let middle = issue(&bound, 1, 6, 1);
+    assert!(read_fragment(
+        &mut conn,
+        &SearchDetailRead {
+            context: &bound,
+            reference: &middle,
+            offset: Some(1),
+            max_source_bytes: 4,
+        },
+        |_| Ok(true),
+    )
+    .await
+    .is_err());
+    let reference = issue(&bound, 1, 6, 0);
     for offset in [1, 2, 5, u64::MAX] {
         assert!(read_fragment(
             &mut conn,
             &SearchDetailRead {
-                key: KEY,
-                binding: &bound,
+                context: &bound,
                 reference: &reference,
                 offset: Some(offset),
                 max_source_bytes: 4,
@@ -219,10 +231,9 @@ async fn search_detail_rejects_surrogate_endpoints_and_off_position_requests() {
 async fn search_detail_fits_complete_escaped_frame_and_never_publishes_empty() {
     let (mut conn, length) = fixture("😀\"\\\n界more").await;
     let bound = binding(length);
-    let reference = issue_ref(KEY, &bound, 0, length).unwrap();
+    let reference = issue(&bound, 0, length, 0);
     let request = SearchDetailRead {
-        key: KEY,
-        binding: &bound,
+        context: &bound,
         reference: &reference,
         offset: None,
         max_source_bytes: 16384,
@@ -274,11 +285,11 @@ async fn search_detail_fits_complete_escaped_frame_and_never_publishes_empty() {
 async fn search_detail_requires_retained_operation_generation_and_exact_extent() {
     let (mut conn, length) = fixture("abc").await;
     for bound in [
-        SearchDetailBinding {
-            operation: "foreign",
+        Context {
+            operation: "foreign".into(),
             ..binding(length)
         },
-        SearchDetailBinding {
+        Context {
             generation: 1,
             ..binding(length)
         },
@@ -286,12 +297,11 @@ async fn search_detail_requires_retained_operation_generation_and_exact_extent()
     ] {
         // Even a correctly signed internal ref cannot turn a missing or wrongly
         // described retained view into a successful detail response.
-        let reference = issue_ref(KEY, &bound, 0, 2).unwrap();
+        let reference = issue(&bound, 0, 2, 0);
         assert!(read_fragment(
             &mut conn,
             &SearchDetailRead {
-                key: KEY,
-                binding: &bound,
+                context: &bound,
                 reference: &reference,
                 offset: None,
                 max_source_bytes: 4,
@@ -302,12 +312,11 @@ async fn search_detail_requires_retained_operation_generation_and_exact_extent()
         .is_err());
     }
     let bound = binding(length);
-    let reference = issue_ref(KEY, &bound, 2, 3).unwrap();
+    let reference = issue(&bound, 2, 3, 0);
     let item = read_fragment(
         &mut conn,
         &SearchDetailRead {
-            key: KEY,
-            binding: &bound,
+            context: &bound,
             reference: &reference,
             offset: None,
             max_source_bytes: 4,
