@@ -145,6 +145,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "updates.checkOnIdle",
     "updates.idleCheckIntervalMinutes",
     "updates.idleGraceSeconds",
+    "sharing.machineName",
     "sharing.maxGuestsPerWorkspace",
     "sharing.maxGuestConnections",
     "sharing.maxConnectionsPerGuest",
