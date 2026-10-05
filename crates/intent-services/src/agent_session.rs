@@ -4952,8 +4952,8 @@ impl Services {
         }
         // Pin-respecting, same as the prompt-turn end above (monorepo#2110).
         self.clear_unpinned_live_turn(agent_id);
-        if let Some(error) = &failure {
-            crate::agent_manager::persist_terminal_error_status_via_services(
+        let persisted_error = if let Some(error) = &failure {
+            let persisted = crate::agent_manager::persist_terminal_error_status_via_services(
                 self,
                 agent_id,
                 workspace_id,
@@ -4968,7 +4968,10 @@ impl Services {
             ).await {
                 tracing::warn!(agent = %agent_id, error = %raise_error, "failed to raise attention for stalled native tool");
             }
-        }
+            Some(persisted)
+        } else {
+            None
+        };
         let mut end_data = json!({ "agentId": agent_id.0 });
         if message_persisted {
             end_data["messageId"] = json!(message_id);
@@ -4997,6 +5000,15 @@ impl Services {
                 agent_id,
                 AGENT_FAILED,
                 json!({ "agentId": agent_id.0, "error": error }),
+            )
+            .await;
+        }
+        if let Some(error) = &persisted_error {
+            crate::agent_manager::publish_terminal_error_status_via_services(
+                self,
+                agent_id,
+                workspace_id,
+                error,
             )
             .await;
         }

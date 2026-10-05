@@ -14376,6 +14376,47 @@ async fn persist_terminal_error_status(
         .await
 }
 
+/// Publish the canonical Error transition only after its store write landed.
+/// Both prompt failures and unsolicited native-tool timeouts call this after
+/// their terminal events; this helper never requeues a synthetic user message.
+pub(crate) async fn publish_terminal_error_status_via_services(
+    services: &Services,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    error: &PersistedTerminalError,
+) {
+    if !error.status_persisted {
+        return;
+    }
+    // Emit agent:status-changed with stopReason + stopReasonTimestamp so live
+    // subscribers get the canonical fields (the timestamp matches the value
+    // persisted alongside stop_reason by `set_agent_session_status`).
+    // `sessionCorrupted: true` is included only when the failure classifies as
+    // corrupted/poisoned (absent otherwise, matching the serialized projections).
+    let mut data = json!({
+        "agentId": agent_id.0,
+        "status": "error",
+        "isActive": false,
+        "stopReason": error.error_text,
+        "stopReasonTimestamp": error.ts,
+    });
+    if error.session_corrupted {
+        data["sessionCorrupted"] = json!(true);
+    }
+    let event = NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: error.ts.clone(),
+        event_type: AGENT_STATUS_CHANGED.to_string(),
+        actor: agent_actor(agent_id),
+        session_id: Some(agent_id.0.clone()),
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    };
+    crate::publish_event(services.event_bus.as_ref(), event).await;
+}
+
 /// Observable half of the terminal-failure path: emit `agent:status-changed`
 /// for the Error persisted by [`persist_terminal_error_status`] and requeue
 /// the failed message to the front of the queue so `agent.retry` — or a
@@ -14405,43 +14446,14 @@ async fn publish_error_status_and_requeue(
     persisted: bool,
     error: PersistedTerminalError,
 ) {
+    publish_terminal_error_status_via_services(&mgr.services, agent_id, workspace_id, &error).await;
     let PersistedTerminalError {
         error_text,
         streak,
-        session_corrupted,
         ts,
-        status_persisted,
+        ..
     } = error;
     let error_text = error_text.as_str();
-    if status_persisted {
-        // Emit agent:status-changed with stopReason + stopReasonTimestamp so live
-        // subscribers get the canonical fields (the timestamp matches the value
-        // persisted alongside stop_reason by `set_agent_session_status`).
-        // `sessionCorrupted: true` is included only when the failure classifies as
-        // corrupted/poisoned (absent otherwise, matching the serialized projections).
-        let mut data = json!({
-            "agentId": agent_id.0,
-            "status": "error",
-            "isActive": false,
-            "stopReason": error_text,
-            "stopReasonTimestamp": ts,
-        });
-        if session_corrupted {
-            data["sessionCorrupted"] = json!(true);
-        }
-        let event = NewEvent {
-            workspace_id: workspace_id.clone(),
-            timestamp: ts.clone(),
-            event_type: AGENT_STATUS_CHANGED.to_string(),
-            actor: agent_actor(agent_id),
-            session_id: Some(agent_id.0.clone()),
-            correlation_id: None,
-            parent_event_id: None,
-            metadata: None,
-            data,
-        };
-        crate::publish_event(mgr.services.event_bus.as_ref(), event).await;
-    }
 
     // Requeue the failed message to the front of the queue. `persisted`
     // carries the CONFIRMED durability of the user row (STAB-51): `true` only

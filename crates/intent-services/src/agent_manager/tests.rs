@@ -21537,7 +21537,8 @@ mod harness_wake_tests {
         note_tx.send(compaction_note("in_progress")).unwrap();
         assert!(mgr.wake_listener_tick(&id, &ws).await);
         let events = collect_until(&mut sub, |seen| {
-            seen.iter().any(|e| e.event_type == "agent:failed")
+            seen.iter()
+                .any(|e| e.event_type == "agent:status-changed" && e.data["status"] == "error")
         })
         .await;
         assert!(
@@ -21547,6 +21548,38 @@ mod harness_wake_tests {
         assert!(!events.iter().any(|e| e.event_type == "agent:idle"));
         let session = mgr.services.store.get_agent_session(&id).await.unwrap();
         assert_eq!(session.status, AgentStatus::Error);
+        let errors: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.event_type == "agent:status-changed" && e.data["status"] == "error")
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "timed-out compaction must publish exactly one Error transition"
+        );
+        let (status_index, status_event) = errors[0];
+        let end_index = events
+            .iter()
+            .position(|e| e.event_type == "agent:stream:end")
+            .unwrap();
+        let failed_index = events
+            .iter()
+            .position(|e| e.event_type == "agent:failed")
+            .unwrap();
+        assert!(
+            end_index < status_index && failed_index < status_index,
+            "Error status follows terminal stream and failure events"
+        );
+        assert_eq!(status_event.data["isActive"], false);
+        assert_eq!(status_event.data["stopReason"], json!(session.stop_reason));
+        assert_eq!(
+            status_event.data["stopReasonTimestamp"],
+            json!(session.stop_reason_timestamp)
+        );
+        assert!(session.stop_reason.is_some());
+        assert!(session.stop_reason_timestamp.is_some());
+        assert!(status_event.data.get("sessionCorrupted").is_none());
         assert_eq!(session.attention_request_kind.as_deref(), Some("blocker"));
         assert!(session
             .attention_request_reason
