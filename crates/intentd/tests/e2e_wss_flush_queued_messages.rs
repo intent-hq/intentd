@@ -2676,10 +2676,10 @@ async fn attachment_groups_over_wss(explicit: bool) {
     for (i, mut params) in submissions.into_iter().enumerate() {
         params["workspaceId"] = json!(workspace_id);
         params["agentId"] = json!(agent);
-        let envelope =
-            wss_rpc_envelope(&mut rpc, 10 + i as i64, "agent.queueMessage", params).await;
+        let request_id = 10 + i64::try_from(i).unwrap();
+        let envelope = wss_rpc_envelope(&mut rpc, request_id, "agent.queueMessage", params).await;
         assert_eq!(envelope["jsonrpc"], "2.0");
-        assert_eq!(envelope["id"], 10 + i as i64);
+        assert_eq!(envelope["id"], request_id);
         assert!(envelope.get("error").is_none(), "{envelope}");
         acknowledgements.push(envelope["result"]["queuedMessage"].clone());
     }
@@ -2840,7 +2840,7 @@ async fn attachment_groups_over_wss(explicit: bool) {
     );
     let evidence = json!({"explicit":explicit,"queue":queue,"providerPrompts":records,"conversation":conversation});
     let artifact = save_group_artifact(
-        &data_dir,
+        data_dir,
         if explicit {
             "explicit.json"
         } else {
@@ -3023,7 +3023,7 @@ async fn failed_attachment_batch_keeps_groups_through_restart_and_retry_over_wss
         );
     }
     let evidence = json!({"beforeRestart":before,"afterRestart":after,"prompts":records,"conversation":conversation});
-    let artifact = save_group_artifact(&data_dir, "restart.json", &evidence);
+    let artifact = save_group_artifact(data_dir, "restart.json", &evidence);
     eprintln!(
         "ATTACHMENT_GROUPS_RESTART_ARTIFACT {}\n{}",
         artifact.display(),
@@ -3066,7 +3066,7 @@ async fn interrupt_keeps_all_flushed_attachment_groups_over_wss() {
         .into_iter()
         .enumerate()
     {
-        wss_rpc(&mut rpc, 3 + i as i64, "agent.queueMessage", json!({"workspaceId":workspace_id,"agentId":agent,"content":text,"imageBlocks":[{"type":"image","data":png,"mimeType":"image/png"}]})).await;
+        wss_rpc(&mut rpc, 3 + i64::try_from(i).unwrap(), "agent.queueMessage", json!({"workspaceId":workspace_id,"agentId":agent,"content":text,"imageBlocks":[{"type":"image","data":png,"mimeType":"image/png"}]})).await;
     }
     std::fs::write(&release, "go").unwrap();
     await_prompts(&prompt_log, 2).await;
@@ -3099,7 +3099,7 @@ async fn interrupt_keeps_all_flushed_attachment_groups_over_wss() {
         previous = Some(index);
     }
     assert_eq!(blocks.iter().filter(|b| b["type"] == "image").count(), 3);
-    let artifact = save_group_artifact(&data_dir, "interrupt.json", &json!({"prompts":records}));
+    let artifact = save_group_artifact(data_dir, "interrupt.json", &json!({"prompts":records}));
     eprintln!(
         "ATTACHMENT_GROUPS_INTERRUPT_ARTIFACT {}\n{}",
         artifact.display(),
@@ -3229,7 +3229,7 @@ async fn identity_carry_over_over_wss(legacy: bool) {
     drop(store);
     let rules = [json!({"ifPromptContains":text,"releaseFile":held})];
     let Booted {
-        daemon: _daemon,
+        daemon,
         port,
         cfg,
         prompt_log,
@@ -3297,7 +3297,7 @@ async fn identity_carry_over_over_wss(legacy: bool) {
     // Retain its original source set to expose content-based false overlap.
     wss_rpc(&mut rpc, 11, "agent.stop", json!({"agentId":agent})).await;
     drop(rpc);
-    drop(_daemon);
+    drop(daemon);
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
         .await
         .unwrap();
@@ -3357,8 +3357,7 @@ async fn identity_carry_over_over_wss(legacy: bool) {
 /// Keep repeatable evidence outside temporary daemon data when requested.
 fn save_group_artifact(data_dir: &Path, name: &str, evidence: &serde_json::Value) -> PathBuf {
     let directory = std::env::var_os("INTENT_QUEUED_GROUP_ARTIFACT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| data_dir.to_path_buf());
+        .map_or_else(|| data_dir.to_path_buf(), PathBuf::from);
     std::fs::create_dir_all(&directory).unwrap();
     let artifact = directory.join(name);
     std::fs::write(&artifact, serde_json::to_vec_pretty(evidence).unwrap()).unwrap();
