@@ -281,3 +281,81 @@ fn stage_required_null_chain_and_optional_omission_are_distinct() {
     b["header"]["query"] = Value::Null;
     assert!(serde_json::from_value::<NoteStageBegin>(b).is_err());
 }
+
+#[test]
+fn stage_max_density_chunks_fit_published_request_limits() {
+    let header = begin().header;
+    for stream in [
+        NoteStageStream::Dirty,
+        NoteStageStream::Mutation,
+        NoteStageStream::Live,
+    ] {
+        let records=(0..128).map(|i|match stream {
+            NoteStageStream::Dirty=>splice(9,i,i*2,i*2+1),
+            NoteStageStream::Mutation=>json!({"kind":"splice","ordinal":i,"start":i*2,"end":i*2+1,"replacement":text_ref()}),
+            _=>json!({"kind":"projection","ordinal":i,"sourceRange":{"start":i*2,"end":i*2+1},"role":"marker-occurrence","canonicalId":format!("marker-{i}"),"detail":text_ref()}),
+        }).collect();
+        let request = append(stream, records);
+        let frame =
+            json!({"jsonrpc":"2.0","id":"dense","method":"note.operation.append","params":request});
+        assert!(frame.to_string().len() < 65536);
+        assert_eq!(request.validate(&header).unwrap().len(), 128);
+        let mut too_many = request.clone();
+        too_many.records.push(request.records[0].clone());
+        assert_eq!(
+            too_many.validate(&header).unwrap_err(),
+            NoteMutationError::Budget
+        );
+    }
+}
+
+#[test]
+fn stage_canonical_hash_matches_shared_jcs_vectors_and_preserves_artifact_limits() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/native_artifact_canonicalization.json"
+    ))
+    .unwrap();
+    let fixture = &fixture["canonicalization"];
+    for vector in fixture["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(fixture["numbers"].as_array().unwrap())
+        .chain(std::iter::once(&fixture["header"]))
+        .chain(fixture["append"].as_array().unwrap())
+    {
+        let value: Value = serde_json::from_str(vector["rawJson"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            canonical::bytes(&value).unwrap(),
+            vector["canonical"],
+            "{}",
+            vector["id"]
+        );
+        assert_eq!(
+            digest(&value).unwrap(),
+            vector["sha256"],
+            "{}",
+            vector["id"]
+        );
+    }
+    let value = json!({"stream":"dirty","sequence":0,"previousDigest":null,"records":(0..128).map(|i|splice(9,i,i*2,i*2+1)).collect::<Vec<_>>()});
+    assert!(crate::note_artifact::canonical::digest(&value.to_string()).is_err());
+    assert!(digest(&value).is_ok());
+    assert_eq!(
+        canonical::bytes(&json!("x".repeat(65534))).unwrap().len(),
+        65536
+    );
+    assert_eq!(
+        digest(&json!("x".repeat(65535))),
+        Err(NoteMutationError::Budget)
+    );
+    assert_eq!(
+        digest(&json!("\n".repeat(32768))),
+        Err(NoteMutationError::Budget)
+    );
+    let mut deep = Value::Null;
+    for _ in 0..34 {
+        deep = json!([deep]);
+    }
+    assert_eq!(digest(&deep), Err(NoteMutationError::Budget));
+}

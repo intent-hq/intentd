@@ -8,6 +8,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 
+mod canonical;
+
 const SAFE: u64 = 9_007_199_254_740_991;
 type Result<T> = std::result::Result<T, NoteMutationError>;
 fn token(s: &str) -> bool {
@@ -19,8 +21,7 @@ fn hash(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 fn digest(value: &Value) -> Result<String> {
-    crate::note_artifact::canonical::digest(&value.to_string())
-        .map_err(|_| NoteMutationError::Budget)
+    canonical::digest(value)
 }
 fn require(ok: bool) -> Result<()> {
     if ok {
