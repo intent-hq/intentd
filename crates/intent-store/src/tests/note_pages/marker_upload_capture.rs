@@ -138,7 +138,7 @@ async fn replay_actual_frontend_marker_upload_and_capture_source_lifecycle() {
     assert_eq!(witness["canonicalId"], source["commentId"]);
     assert_eq!(witness["type"], "point");
     assert_eq!(
-        witness["threadId"],
+        &witness["threadId"],
         source["originalRoot"]
             .get("threadId")
             .expect("captured root thread")
