@@ -564,6 +564,10 @@ pub(crate) fn rebuild<'a>(
         sqlx::query("DELETE FROM note_page_entry WHERE workspace_id=? AND note_id=? AND (collection LIKE 'm:%' OR collection >= 'f:0000010000000000' AND collection < 'g:')")
         .bind(ws).bind(id).execute(&mut *conn).await.map_err(db_error)?;
         if content_changed {
+            let content_generation = uuid::Uuid::new_v4().simple().to_string();
+            // Deleting the old generation retains only pieces pinned by active
+            // staged views/receipts. The new generation is published atomically
+            // with this writer's new pieces and head metadata.
             sqlx::query("DELETE FROM note_page_piece WHERE workspace_id=? AND note_id=?")
                 .bind(ws)
                 .bind(id)
@@ -573,7 +577,7 @@ pub(crate) fn rebuild<'a>(
             sqlx::query("DELETE FROM note_page_entry WHERE workspace_id=? AND note_id=? AND (collection LIKE 'c:%' OR collection LIKE 'd:%' OR collection LIKE 't:%' OR collection LIKE 'h:%' OR collection < 'f:0000010000000000')").bind(ws).bind(id).execute(&mut *conn).await.map_err(db_error)?;
             let parts = pieces(&note.content);
             for part in &parts {
-                sqlx::query("INSERT INTO note_page_piece VALUES (?,?,?,?,?,?,?,?)")
+                sqlx::query("INSERT INTO note_page_piece(workspace_id,note_id,start,end,text,byte_start,scalar_start,lf_start,content_generation) VALUES (?,?,?,?,?,?,?,?,?)")
                     .bind(ws)
                     .bind(id)
                     .bind(sql_offset(part.start)?)
@@ -582,6 +586,7 @@ pub(crate) fn rebuild<'a>(
                     .bind(sql_offset(part.byte_start)?)
                     .bind(sql_offset(part.scalar_start)?)
                     .bind(sql_offset(part.lf_start)?)
+                    .bind(&content_generation)
                     .execute(&mut *conn)
                     .await
                     .map_err(db_error)?;
@@ -589,8 +594,8 @@ pub(crate) fn rebuild<'a>(
             entries.serial = 0;
             context_entries(&note.content, &parts, &mut entries);
             let task_count = task_entries(&note.content, &mut entries);
-            sqlx::query("UPDATE note_page_head SET task_count=?,source_length=?,source_bytes=?,scalar_count=?,lf_count=? WHERE workspace_id=? AND note_id=?")
-            .bind(sql_offset(task_count)?).bind(sql_offset(note.content.encode_utf16().count())?).bind(sql_offset(note.content.len())?).bind(sql_offset(note.content.chars().count())?).bind(sql_offset(note.content.bytes().filter(|b|*b==b'\n').count())?).bind(ws).bind(id).execute(&mut *conn).await.map_err(db_error)?;
+            sqlx::query("UPDATE note_page_head SET task_count=?,source_length=?,source_bytes=?,scalar_count=?,lf_count=?,content_generation=? WHERE workspace_id=? AND note_id=?")
+            .bind(sql_offset(task_count)?).bind(sql_offset(note.content.encode_utf16().count())?).bind(sql_offset(note.content.len())?).bind(sql_offset(note.content.chars().count())?).bind(sql_offset(note.content.bytes().filter(|b|*b==b'\n').count())?).bind(&content_generation).bind(ws).bind(id).execute(&mut *conn).await.map_err(db_error)?;
         }
         for (collection, position, mut value) in entries.rows {
             let admission = value

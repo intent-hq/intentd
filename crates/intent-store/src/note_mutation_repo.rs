@@ -244,10 +244,13 @@ async fn lookup(
     scope: &NoteScope,
     operation_id: &str,
 ) -> Result<Option<(String, Value)>> {
-    let row = sqlx::query("SELECT payload_digest,outcome FROM note_operation WHERE principal=? AND backend_id=? AND workspace_id=? AND note_id=? AND instance_id=? AND operation_id=?")
+    let row = sqlx::query("SELECT payload_digest,outcome,method_kind FROM note_operation WHERE principal=? AND backend_id=? AND workspace_id=? AND note_id=? AND instance_id=? AND operation_id=?")
         .bind(principal).bind(&scope.backend_id).bind(&scope.workspace_id).bind(&scope.note_id)
         .bind(&scope.note_instance_id).bind(operation_id).fetch_optional(&mut **tx).await.map_err(db)?;
     row.map(|row| {
+        if row.try_get::<String, _>("method_kind").map_err(db)? != "inline" {
+            return Err(fail(NoteMutationError::Mismatch));
+        }
         Ok((
             row.try_get("payload_digest").map_err(db)?,
             serde_json::from_str(row.try_get("outcome").map_err(db)?).map_err(db)?,

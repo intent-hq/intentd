@@ -50,6 +50,7 @@ mod note_page_repo;
 mod note_receipt_detail_repo;
 mod note_repo;
 mod note_search_repo;
+mod note_stage_repo;
 mod note_version_repo;
 mod pr_monitor_repo;
 mod presence_focus_repo;
