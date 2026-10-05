@@ -200,6 +200,10 @@ pub(crate) async fn run_auggie_print(
     timeout_ms: u64,
     timeout_op: &str,
 ) -> Result<String> {
+    crate::acp_adapter::log_ephemeral_profile_deferred(
+        "auggie",
+        crate::provider_profile::staged::DeferredReason::ProviderControls,
+    );
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("--print")
         .arg("--mcp-config")

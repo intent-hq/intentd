@@ -128,6 +128,10 @@ where
             extract,
             &cmd,
             accept_notifications,
+            crate::acp_adapter::managed_session_meta(
+                cmd.probe_session_meta(),
+                adapter.profile_meta.take(),
+            ),
         ),
     )
     .await
@@ -188,6 +192,7 @@ async fn drive_probe<F>(
     extract: F,
     command: &AcpProbeCommand,
     accept_notifications: bool,
+    session_meta: Option<Value>,
 ) -> Result<Vec<Value>, ProbeError>
 where
     F: Fn(&Value) -> Vec<Value>,
@@ -204,7 +209,7 @@ where
         "cwd": command.working_dir().to_string_lossy(),
         "mcpServers": [],
     });
-    if let Some(meta) = command.probe_session_meta() {
+    if let Some(meta) = session_meta {
         session_params["_meta"] = meta;
     }
 

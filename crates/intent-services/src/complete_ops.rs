@@ -311,7 +311,7 @@ pub(crate) fn one_shot_launch(
             cmd = cmd.env(key, value);
         }
     }
-    Some(apply_one_shot_launch_policy(provider, cmd))
+    Some(apply_one_shot_launch_policy(provider, cmd).profile_provider(provider.id))
 }
 
 /// Apply daemon-owned launch policy after caller-specific environment merges.

@@ -28,6 +28,11 @@ use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+mod managed;
+pub(crate) use managed::{
+    log_deferred as log_ephemeral_profile_deferred, session_meta as managed_session_meta,
+};
+
 use intent_acp::spawn::{npm_workspace_selector_env_keys, NPX_NO_WORKSPACES_ARG};
 #[cfg(unix)]
 use intent_acp::{descendant_pids, sweep_escaped_descendants};
@@ -182,6 +187,7 @@ pub fn live_adapters() -> usize {
 /// How to launch an ephemeral ACP adapter.
 #[derive(Clone)]
 pub(crate) struct AcpAdapterCommand {
+    profile_provider: Option<&'static str>,
     installed_cli: Option<intent_providers::installed_cli::InstalledCli>,
     installed: Option<Arc<PreparedInstalled>>,
     program: PathBuf,
@@ -366,6 +372,12 @@ impl AcpAdapterCommand {
     /// it to the adapter).
     pub(crate) fn npx(npx: PathBuf, package: &str) -> Self {
         Self {
+            profile_provider: match package {
+                intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE => Some("claude-code"),
+                intent_providers::CODEX_ACP_NPX_PACKAGE => Some("codex"),
+                intent_providers::PI_ACP_NPX_PACKAGE => Some("pi"),
+                _ => None,
+            },
             installed_cli: match package {
                 intent_providers::CODEX_ACP_NPX_PACKAGE => {
                     Some(intent_providers::installed_cli::InstalledCli::Codex)
@@ -394,6 +406,7 @@ impl AcpAdapterCommand {
     /// Run a resolved adapter binary with the given args.
     pub(crate) fn binary(bin: PathBuf, args: Vec<String>) -> Self {
         Self {
+            profile_provider: None,
             installed_cli: None,
             installed: None,
             program: bin,
@@ -425,6 +438,11 @@ impl AcpAdapterCommand {
     /// get the system temp dir.
     pub(crate) fn cwd(mut self, dir: PathBuf) -> Self {
         self.cwd = Some(dir);
+        self
+    }
+
+    pub(crate) fn profile_provider(mut self, provider: &'static str) -> Self {
+        self.profile_provider = Some(provider);
         self
     }
 
@@ -524,6 +542,8 @@ impl PreparedInstalled {
 /// A spawned adapter: the child, its ACP connection, and the inbound
 /// notification/request streams the caller drives.
 pub(crate) struct SpawnedAdapter {
+    /// Authoritative ephemeral controls selected at the actual spawn boundary.
+    pub(crate) profile_meta: Option<Value>,
     /// The adapter process (reap with [`AdapterChild::reap`]).
     pub(crate) child: AdapterChild,
     /// The JSON-RPC connection over the child's piped stdio.
@@ -545,6 +565,7 @@ struct HeldWhileLive {
     npx_launch_dir: Option<Arc<NpxLaunchDir>>,
     slot: OwnedSemaphorePermit,
     installed: Option<Arc<PreparedInstalled>>,
+    managed: Option<managed::ProfileGuard>,
 }
 
 /// The adapter process plus [`HeldWhileLive`], dereferencing to the
@@ -594,8 +615,9 @@ impl AdapterChild {
             npx_launch_dir,
             slot,
             installed,
+            managed,
         } = held;
-        let launch_dir = RetainUnlessSwept(npx_launch_dir, installed);
+        let launch_dir = RetainUnlessSwept(npx_launch_dir, installed, managed);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             drop(launch_dir);
             drop(child);
@@ -604,7 +626,8 @@ impl AdapterChild {
         };
         Some(handle.spawn(async move {
             reap_child(&mut child, spawn_pid).await;
-            launch_dir.remove();
+            let reaped = child.try_wait().is_ok_and(|status| status.is_some());
+            launch_dir.remove(reaped);
             drop(child);
             drop(slot);
         }))
@@ -639,12 +662,19 @@ impl Drop for AdapterChild {
 /// deletes it once the tree has been reaped; dropping the wrapper any other
 /// way (the cleanup future dropped unpolled on a shutting-down runtime, or
 /// never scheduled at all) retains the directory instead of deleting it.
-struct RetainUnlessSwept(Option<Arc<NpxLaunchDir>>, Option<Arc<PreparedInstalled>>);
+struct RetainUnlessSwept(
+    Option<Arc<NpxLaunchDir>>,
+    Option<Arc<PreparedInstalled>>,
+    Option<managed::ProfileGuard>,
+);
 
 impl RetainUnlessSwept {
-    fn remove(mut self) {
+    fn remove(mut self, reaped: bool) {
         drop(self.0.take());
         drop(self.1.take());
+        if reaped {
+            drop(self.2.take());
+        }
     }
 }
 
@@ -660,6 +690,9 @@ impl Drop for RetainUnlessSwept {
         if let Some(installed) = self.1.take() {
             // Its isolated auth profile must also survive an unfinished sweep.
             std::mem::forget(installed);
+        }
+        if let Some(profile) = self.2.take() {
+            std::mem::forget(profile);
         }
     }
 }
@@ -748,6 +781,9 @@ pub(crate) async fn spawn_adapter_in(
         }
         cmd
     };
+    if let Some(launch) = managed::prepare(cmd).await.map_err(SpawnError::Spawn)? {
+        return managed::spawn(cmd, launch, slot).map_err(SpawnError::Spawn);
+    }
     spawn_admitted_adapter(cmd, slot).map_err(SpawnError::Spawn)
 }
 
@@ -805,6 +841,7 @@ fn spawn_admitted_adapter(
     };
     let conn = Connection::new(stdin, stdout, stderr, hooks);
     Ok(SpawnedAdapter {
+        profile_meta: None,
         child: AdapterChild {
             child: Some(child),
             spawn_pid,
@@ -812,6 +849,7 @@ fn spawn_admitted_adapter(
                 npx_launch_dir,
                 slot,
                 installed: cmd.installed.clone(),
+                managed: None,
             }),
         },
         conn,

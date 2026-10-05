@@ -182,6 +182,8 @@ pub(crate) async fn run_one_shot_acp_in(
             SpawnError::Spawn(detail) => OneShotError::Spawn(detail),
         })?;
 
+    let session_meta =
+        crate::acp_adapter::managed_session_meta(session_meta, adapter.profile_meta.take());
     let result = drive_one_shot(
         fast_mode,
         &adapter.conn,

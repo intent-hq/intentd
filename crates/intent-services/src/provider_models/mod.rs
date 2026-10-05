@@ -186,6 +186,7 @@ where
     let profile = crate::antigravity::probe_profile(&helper)
         .map_err(|err| ProbeError::Spawn(format!("isolated Antigravity configuration: {err}")))?;
     let mut cmd = AcpProbeCommand::binary(bin, Vec::new())
+        .profile_provider("antigravity")
         .cwd(profile.path().to_path_buf())
         .auth_required_marker(crate::antigravity::AUTH_REQUIRED_MARKER);
     for (key, value) in crate::antigravity::unattended_env(profile.path(), &helper)
@@ -421,9 +422,10 @@ pub(crate) async fn fetch_droid_models() -> ProviderModelsFetch {
         "--output-format".to_string(),
         "acp".to_string(),
     ];
-    let outcome = run_acp_probe(AcpProbeCommand::binary(bin, args), |v| {
-        parse::parse_acp_models(v, "droid")
-    })
+    let outcome = run_acp_probe(
+        AcpProbeCommand::binary(bin, args).profile_provider("droid"),
+        |v| parse::parse_acp_models(v, "droid"),
+    )
     .await;
     match outcome {
         Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
@@ -445,9 +447,10 @@ pub(crate) async fn probe_droid_auth(bin: PathBuf) -> Option<bool> {
         "--output-format".to_string(),
         "acp".to_string(),
     ];
-    let outcome = run_acp_probe(AcpProbeCommand::binary(bin, args), |v| {
-        parse::parse_acp_models(v, "droid")
-    })
+    let outcome = run_acp_probe(
+        AcpProbeCommand::binary(bin, args).profile_provider("droid"),
+        |v| parse::parse_acp_models(v, "droid"),
+    )
     .await;
     match outcome {
         Ok(models) if !models.is_empty() => Some(true),
@@ -557,6 +560,10 @@ pub(crate) async fn fetch_opencode_models() -> ProviderModelsFetch {
 /// matching the ACP probe spawns) so anything the opencode CLI shells out to
 /// resolves in a packaged-app (minimal PATH) environment.
 async fn run_opencode_models_cli(bin: PathBuf, timeout: Duration) -> Result<String, String> {
+    crate::acp_adapter::log_ephemeral_profile_deferred(
+        "opencode",
+        crate::provider_profile::staged::DeferredReason::ProviderControls,
+    );
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.arg("models")
         .env("PATH", intent_providers::enhanced_path(Some(&bin)))
@@ -645,6 +652,10 @@ async fn run_grok_models_cli(
     bin: PathBuf,
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
+    crate::acp_adapter::log_ephemeral_profile_deferred(
+        "grok",
+        crate::provider_profile::staged::DeferredReason::ProviderControls,
+    );
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.arg("models")
         .env("PATH", intent_providers::enhanced_path(Some(&bin)))
