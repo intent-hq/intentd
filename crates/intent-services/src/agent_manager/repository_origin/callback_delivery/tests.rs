@@ -2317,7 +2317,10 @@ impl NativeHarness {
                 )
                 .await
                 .unwrap();
-            assert_eq!(created["agent"]["harnessVersion"], "3.0");
+            assert_eq!(
+                created["agent"]["harnessVersion"],
+                intent_core::CURRENT_HARNESS_VERSION
+            );
             let id = intent_core::AgentId::from(created["agent"]["id"].as_str().unwrap());
             let row = original.store.get_agent_session(&id).await.unwrap();
             assert_eq!(
