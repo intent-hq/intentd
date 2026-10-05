@@ -699,7 +699,7 @@ pub fn mock_github_token(cmd: &mut std::process::Command, data_dir: &Path, token
 
 /// The PTY driver execs the daemon through bash. Copy the supported constructor's
 /// complete environment, including explicit removals, into its wrapper command.
-/// portable_pty snapshots the environment at construction; env_remove deletes
+/// `portable_pty` snapshots the environment at construction; `env_remove` deletes
 /// inherited entries from that snapshot as well as explicit overrides.
 pub fn hermetic_pty_fixture_identity(cmd: &mut portable_pty::CommandBuilder, data_dir: &Path) {
     let isolated = hermetic_serve_command(data_dir);
