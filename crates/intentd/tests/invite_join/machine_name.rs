@@ -133,6 +133,14 @@ async fn collaboration_machine_name_live_both_scopes_owner_only_and_restart() {
         .await,
         958,
     );
+    let persisted = std::fs::read_to_string(host.dir.path().join("config.toml")).unwrap();
+    assert_eq!(
+        intent_core::SettingsFile::parse_str(&persisted)
+            .unwrap()
+            .sharing
+            .machine_name,
+        "Persistent name"
+    );
     drop((owner, member, guest, join));
     restart(&mut host, &mock, &[]).await;
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
