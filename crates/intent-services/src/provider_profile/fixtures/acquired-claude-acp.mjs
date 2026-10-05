@@ -57,6 +57,11 @@ await write(path.join(cwd, 'docs/instructions.md'), 'IMPORTED-INSTRUCTIONS-SENTI
 await write(path.join(cwd, 'docs/nested.md'), 'NESTED-INSTRUCTIONS-SENTINEL\n@instructions.md');
 await write(path.join(cwd, 'docs/ignored.md'), 'CODE-IMPORT-MUST-NOT-LOAD');
 await write(path.join(cwd, '.claude/rules/tests.md'), 'RULES-INSTRUCTIONS-SENTINEL');
+await fs.appendFile(path.join(cwd, '.claude/CLAUDE.md'), '\n@../docs/anchored.md#policy\n\n    @../docs/indented.md\n\n@../docs/depth-1.md\n');
+await write(path.join(cwd, 'docs/anchored.md'), 'FRAGMENT-IMPORT-SENTINEL');
+await write(path.join(cwd, 'docs/indented.md'), 'INDENTED-CODE-IMPORT-SENTINEL');
+for (let depth=1; depth<=5; depth++) await write(path.join(cwd, `docs/depth-${depth}.md`), `DEPTH-${depth}-IMPORT-SENTINEL`+(depth<5?`\n@depth-${depth+1}.md`:''));
+const importExpectations = [['FRAGMENT',true], ['INDENTED-CODE',false], ['DEPTH-4',true], ['DEPTH-5',false]];
 const instructionMarkers = ['ANCESTOR','ROOT','PROJECT-CLAUDE','LOCAL','IMPORTED','NESTED','RULES'].map(s=>s+'-INSTRUCTIONS-SENTINEL');
 await write(path.join(cwd, 'approved.json'), JSON.stringify({ approved: mcp('approved'), 'workspace-mcp': mcp('bridge') }));
 const seen = [];
@@ -178,6 +183,7 @@ async function managerFixture() {
       assert(JSON.stringify(body.system).includes('AMBIENT-SKILL-MARKER'));
       for (const marker of instructionMarkers) assert.equal(JSON.stringify(body.system).split(marker).length-1, 1, `managed new/load must preserve ${marker} once`);
       assert(!JSON.stringify(body.system).includes('CODE-IMPORT-MUST-NOT-LOAD'));
+      for (const [name, expected] of importExpectations) assert.equal(JSON.stringify(body.system).includes(name+'-IMPORT-SENTINEL'), expected, `managed new/load ${name}`);
     }
   }
   assert.equal(turns.length,2,'both actual conversation turns must reach the model');
@@ -241,6 +247,7 @@ try {
   const nativeInput = JSON.stringify(seen.slice(beforeNative));
   for (const marker of instructionMarkers) assert(nativeInput.includes(marker), `native baseline must load ${marker}`);
   assert(!nativeInput.includes('CODE-IMPORT-MUST-NOT-LOAD'));
+  for (const [name, expected] of importExpectations) assert.equal(nativeInput.includes(name+'-IMPORT-SENTINEL'), expected, `native ${name}`);
   await active.stop(); active = null;
   await held.release(); held = null;
   console.log('PASS managed new/load instruction sources match pinned native baseline');

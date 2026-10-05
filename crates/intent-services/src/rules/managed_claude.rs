@@ -109,7 +109,8 @@ impl Loader {
         if rule && content.trim_start().starts_with("---") {
             return Err(());
         }
-        if depth < 5 {
+        // Pinned native Claude includes four imported hops (root is zero).
+        if depth < 4 {
             for import in imports(&content) {
                 if import.starts_with('~') {
                     // Expanding HOME here would bypass the sealed environment
@@ -157,11 +158,12 @@ impl Loader {
     }
 }
 
-/// Claude imports are outside Markdown code spans/fences. Paths end at
-/// whitespace, with backslash-escaped spaces supported; quoted paths stay text.
+/// Claude imports exclude code spans, fences and indented code. Paths end at
+/// whitespace; escaped spaces work, fragments are not filenames, and quoted
+/// paths stay text.
 fn imports(content: &str) -> Vec<String> {
     static CODE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r"(?ms)^\s*```.*?^\s*```[^\n]*|^\s*~~~.*?^\s*~~~[^\n]*|`+[^`]*`+|<!--.*?-->")
+        Regex::new(r"(?ms)^\s*```.*?^\s*```[^\n]*|^\s*~~~.*?^\s*~~~[^\n]*|`+[^`]*`+|<!--.*?-->|^(?: {4}| {0,3}\t)[^\n]*")
             .unwrap()
     });
     static IMPORT: std::sync::LazyLock<Regex> =
@@ -169,7 +171,13 @@ fn imports(content: &str) -> Vec<String> {
     let text = CODE.replace_all(content, " ");
     IMPORT
         .captures_iter(&text)
-        .map(|c| c[1].replace("\\ ", " "))
+        .map(|c| {
+            c[1].split('#')
+                .next()
+                .unwrap_or_default()
+                .replace("\\ ", " ")
+        })
+        .filter(|path| !path.is_empty())
         .collect()
 }
 
@@ -226,6 +234,36 @@ mod tests {
     #[test]
     fn imports_skip_code_and_comments_and_support_escaped_spaces() {
         assert_eq!(imports("@one.md\n- see @dir/a\\ b.md\n`@inline`\n```md\n@fenced\n```\n<!-- @comment -->\n@\"quoted\"\nemail@example.org"), vec!["one.md", "dir/a b.md"]);
+    }
+
+    #[test]
+    fn fragments_and_indented_code_match_native_imports() {
+        assert_eq!(
+            imports("@docs/policy.md#section\n\n    @indented.md\n\t@tabbed.md\n\n@other.md"),
+            vec!["docs/policy.md", "other.md"]
+        );
+    }
+
+    #[test]
+    fn native_import_depth_stops_after_four_hops() {
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), "CLAUDE.md", "@depth-1.md");
+        for depth in 1..=5 {
+            write(
+                root.path(),
+                &format!("depth-{depth}.md"),
+                &format!("SENTINEL-{depth}\n@depth-{}.md", depth + 1),
+            );
+        }
+        let snapshot = WorkspaceInstructions::capture(root.path()).unwrap();
+        let all = snapshot
+            .files
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("SENTINEL-4"));
+        assert!(!all.contains("SENTINEL-5"));
     }
 
     #[test]
