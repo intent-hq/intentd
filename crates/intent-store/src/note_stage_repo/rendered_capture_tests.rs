@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::fmt::Write as _;
 
-const START: u64 = 6; // "pre😀 " in UTF16
+const START: u64 = 7; // "pre😀\n\n" in UTF16
 struct Fixture {
     store: Store,
     _tmp: tempfile::TempDir,
@@ -114,7 +114,7 @@ async fn fixture(
         id: NoteId::from("note"),
         workspace_id: WorkspaceId::from("ws"),
         title: "Rendered".into(),
-        content: format!("pre😀 {source}\npost"),
+        content: format!("pre😀\n\n{source}\n\npost"),
         content_type: ContentType::Markdown,
         tags: vec![],
         is_pinned: false,
@@ -352,11 +352,11 @@ async fn rendered_capture_publication_failure_rolls_back_then_exact_retry_commit
 #[tokio::test]
 async fn rendered_capture_search_clips_scalar_domain_preserves_spaces_and_frozen_source() {
     for (source, query, selection, expected) in [
-        ("Straße😀", "STRASSE", (0, 8), vec![(6, 12)]),
+        ("Straße😀", "STRASSE", (0, 8), vec![(7, 13)]),
         ("Straße😀", "STRASSE", (0, 5), vec![]),
-        ("Straße😀", "😀", (6, 8), vec![(12, 14)]),
+        ("Straße😀", "😀", (6, 8), vec![(13, 15)]),
         ("Straße😀", "S", (6, 6), vec![]),
-        (" Straße😀 ", " ", (0, 10), vec![(6, 7), (15, 16)]),
+        (" Straße😀 ", " ", (0, 10), vec![(7, 8), (16, 17)]),
     ] {
         let mut f = fixture(source, source, query, selection, Defect::None).await;
         f.store
@@ -377,7 +377,7 @@ async fn rendered_capture_search_clips_scalar_domain_preserves_spaces_and_frozen
         );
         assert_eq!(
             page["sourceLength"],
-            START + u64::try_from(source.encode_utf16().count()).unwrap() + 5
+            START + u64::try_from(source.encode_utf16().count()).unwrap() + 6
         );
         assert!(hits
             .iter()
@@ -403,6 +403,9 @@ async fn rendered_capture_nonidentity_bytes_cannot_produce_search_success() {
 }
 
 #[tokio::test]
+// This control proves raw-text reachability, binding and bounded publication.
+// It does not compare every reconstructed metadata-tree field. Full logical
+// stagedRenderedHit schema fidelity requires the dedicated detail adapter oracle.
 async fn rendered_capture_hit_detail_retains_whole_raw_leaf_not_only_match() {
     use std::collections::{HashSet, VecDeque};
     let source = " Straße😀 ";
@@ -413,7 +416,7 @@ async fn rendered_capture_hit_detail_retains_whole_raw_leaf_not_only_match() {
         .unwrap();
     let (hits, search_page) = collect(&f).await;
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0]["sourceRange"], json!({"start":7,"end":13}));
+    assert_eq!(hits[0]["sourceRange"], json!({"start":8,"end":14}));
     f.note.content = "new current note".into();
     f.store.update_note(&f.note).await.unwrap();
     let mut raw = serde_json::to_value(read_request(&f)).unwrap();
@@ -486,6 +489,22 @@ async fn rendered_capture_hit_detail_retains_whole_raw_leaf_not_only_match() {
             .read_note_stage_search_detail("alice", &query, &json!(1))
             .await
             .unwrap();
+        for field in [
+            "scope",
+            "headerDigest",
+            "payloadDigest",
+            "viewId",
+            "expiresAt",
+            "sourceLength",
+        ] {
+            assert_eq!(page[field], search_page[field], "{field}");
+        }
+        assert!(
+            json!({"jsonrpc":"2.0","id":1,"result":page})
+                .to_string()
+                .len()
+                <= 4096
+        );
         assert!(page["nextCursor"].is_null());
         let items = page["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
