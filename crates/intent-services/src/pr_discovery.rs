@@ -782,7 +782,7 @@ mod tests {
             tokio::time::advance(WINDOW).await;
             let active = key(&scope, 3, None);
             assert!(Budget::reserve(&budget, &active, WINDOW).is_err());
-            tokio::time::advance(WINDOW * 9 - Duration::from_secs(1)).await;
+            tokio::time::advance((WINDOW * 9).checked_sub(Duration::from_secs(1)).unwrap()).await;
             assert!(Budget::reserve(&budget, &active, WINDOW).is_err());
             assert_eq!(
                 budget.lock().unwrap().grants.len(),
@@ -856,7 +856,12 @@ mod tests {
                 }
                 // Freeze an exhausted window so we can observe the pending
                 // deadline too, without implicitly promoting the waiter.
-                tokio::time::advance(interval * 2 - WINDOW - Duration::from_secs(1)).await;
+                tokio::time::advance(
+                    (interval * 2)
+                        .checked_sub(WINDOW + Duration::from_secs(1))
+                        .unwrap(),
+                )
+                .await;
                 {
                     let mut state = budget.lock().unwrap();
                     state.started = Instant::now();
