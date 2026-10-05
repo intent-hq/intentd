@@ -224,19 +224,27 @@ async fn rejects_mismatched_groups_missing_ordinals_and_bad_final_length_without
 #[tokio::test]
 async fn one_thousand_records_stream_with_indexed_bounds_and_transaction_rollback() {
     let mut conn = connection().await;
-    view(&mut conn, 0, None, 0).await;
+    view(&mut conn, 0, None, 1000).await;
     view(&mut conn, 1, Some("42"), 1000).await;
     sqlx::query("BEGIN").execute(&mut conn).await.unwrap();
+    let mut tail = intent_core::note_stage::NoteStageTail::default();
     for i in 0..1000 {
         splice(
             &mut conn,
             (i / 128, i % 128),
             42,
             u64::try_from(i).unwrap(),
-            (0, 0, 1),
+            (u64::try_from(i).unwrap(), u64::try_from(i + 1).unwrap(), 1),
         )
         .await;
+        let encoded: String = sqlx::query_scalar("SELECT value FROM note_stage_record WHERE operation_key='op' AND stream='dirty' AND chunk_sequence=? AND ordinal=?")
+            .bind(i/128).bind(i%128).fetch_one(&mut conn).await.unwrap();
+        let admitted: NoteStageRecord = serde_json::from_str(&encoded).unwrap();
+        tail = tail
+            .advance(intent_core::note_stage::NoteStageStream::Dirty, &[admitted])
+            .unwrap();
     }
+    assert_eq!(tail.next_ordinal, 1000);
     for query in [PREVIOUS_RECORD, NEXT_RECORD] {
         let sql = format!("EXPLAIN QUERY PLAN {query}");
         let mut q = sqlx::query(&sql).bind("op").bind(0_i64).bind(0_i64);
@@ -416,4 +424,145 @@ async fn removed_spans_are_retained_sparsely_with_scalar_boundaries_and_bounded_
     assert!(retain_input_span(&mut conn, "op", &group, &invalid_end)
         .await
         .is_err());
+}
+
+#[test]
+fn adjacent_deletions_and_replacement_boundaries_undo_through_actual_batch_admission() {
+    use intent_core::note_mutation::apply_note_splices;
+    for (base, edits) in [
+        (
+            "ab",
+            vec![
+                NoteSplice {
+                    start: 0,
+                    end: 1,
+                    text: String::new(),
+                },
+                NoteSplice {
+                    start: 1,
+                    end: 2,
+                    text: String::new(),
+                },
+            ],
+        ),
+        (
+            "ab",
+            vec![
+                NoteSplice {
+                    start: 0,
+                    end: 1,
+                    text: String::new(),
+                },
+                NoteSplice {
+                    start: 1,
+                    end: 2,
+                    text: "😀".into(),
+                },
+            ],
+        ),
+        (
+            "ab",
+            vec![
+                NoteSplice {
+                    start: 0,
+                    end: 1,
+                    text: "😀".into(),
+                },
+                NoteSplice {
+                    start: 1,
+                    end: 2,
+                    text: String::new(),
+                },
+            ],
+        ),
+        (
+            "a😀z",
+            vec![
+                NoteSplice {
+                    start: 0,
+                    end: 1,
+                    text: String::new(),
+                },
+                NoteSplice {
+                    start: 1,
+                    end: 3,
+                    text: String::new(),
+                },
+            ],
+        ),
+        (
+            "axb",
+            vec![
+                NoteSplice {
+                    start: 0,
+                    end: 1,
+                    text: String::new(),
+                },
+                NoteSplice {
+                    start: 2,
+                    end: 3,
+                    text: String::new(),
+                },
+            ],
+        ),
+    ] {
+        let changed = apply_note_splices(base, &edits).unwrap();
+        let mut mapping =
+            MappingCursor::new(u64::try_from(base.encode_utf16().count()).unwrap()).unwrap();
+        let mut coalescer = InverseCoalescer::default();
+        let mut raw = Vec::new();
+        let mut merged = Vec::new();
+        for edit in &edits {
+            let range = mapping
+                .push(&NoteSpliceMapping {
+                    start: edit.start,
+                    end: edit.end,
+                    inserted_length: u64::try_from(edit.text.encode_utf16().count()).unwrap(),
+                })
+                .unwrap();
+            raw.push(NoteSplice {
+                start: range.start,
+                end: range.end,
+                text: base[byte(base, range.replacement_start)..byte(base, range.replacement_end)]
+                    .into(),
+            });
+            if let Some(range) = coalescer.push(range).unwrap() {
+                merged.push(range);
+            }
+        }
+        if let Some(range) = coalescer.finish().unwrap() {
+            merged.push(range);
+        }
+        assert_eq!(merged.len(), if base == "axb" { 2 } else { 1 });
+        assert_eq!(merged[0].ordinal, 0);
+        let inverse: Vec<_> = merged
+            .iter()
+            .map(|range| NoteSplice {
+                start: range.start,
+                end: range.end,
+                text: base[byte(base, range.replacement_start)..byte(base, range.replacement_end)]
+                    .into(),
+            })
+            .collect();
+        let restored = apply_note_splices(&changed.source, &inverse).unwrap();
+        assert_eq!(restored.source, base);
+        if raw[0].start == raw[1].start {
+            assert!(apply_note_splices(&changed.source, &raw).is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn base_byte_comparison_distinguishes_identity_edits_from_source_changes() {
+    let mut conn = connection().await;
+    sqlx::raw_sql("CREATE TABLE note_operation_source(operation_key TEXT,phase TEXT,start INTEGER,end INTEGER,text TEXT,PRIMARY KEY(operation_key,phase,start)); INSERT INTO note_operation_source VALUES('op','base',0,3,'A😀'),('op','base',3,4,'B');").execute(&mut conn).await.unwrap();
+    assert!(source_matches_base(&mut conn, "op", "A😀B").await.unwrap());
+    for changed in ["A😀", "A😀BB", "A😀C", "A😃B"] {
+        assert!(!source_matches_base(&mut conn, "op", changed).await.unwrap());
+    }
+    sqlx::query("UPDATE note_operation_source SET start=4 WHERE start=3")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert!(source_matches_base(&mut conn, "op", "A😀B").await.is_err());
 }

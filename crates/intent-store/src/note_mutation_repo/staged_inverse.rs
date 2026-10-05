@@ -300,6 +300,76 @@ pub(super) async fn next_inverse(
     Ok(Some(inverse))
 }
 
+/// One pending range per history group. Touching output ranges with contiguous
+/// original input are one exact inverse splice, including adjacent deletions
+/// which otherwise produce inadmissible equal-start insertions. Never crosses
+/// history/state boundaries; replacement remains a retained contiguous span.
+#[derive(Default)]
+struct InverseCoalescer {
+    pending: Option<InverseRange>,
+    ordinal: u64,
+}
+impl InverseCoalescer {
+    fn push(&mut self, range: InverseRange) -> Result<Option<InverseRange>> {
+        if let Some(previous) = self.pending.as_mut() {
+            if range.start < previous.end || range.replacement_start < previous.replacement_end {
+                return Err(invalid());
+            }
+            if previous.end == range.start && previous.replacement_end == range.replacement_start {
+                previous.end = range.end;
+                previous.replacement_end = range.replacement_end;
+                return Ok(None);
+            }
+            if range.start == previous.start {
+                return Err(invalid());
+            }
+        }
+        let emitted = self.finish()?;
+        self.pending = Some(range);
+        Ok(emitted)
+    }
+    fn finish(&mut self) -> Result<Option<InverseRange>> {
+        let Some(mut range) = self.pending.take() else {
+            return Ok(None);
+        };
+        range.ordinal = self.ordinal;
+        self.ordinal = add(self.ordinal, 1)?;
+        Ok(Some(range))
+    }
+}
+
+// Zero-user operations must distinguish identity provenance mappings from actual
+// source changes. Compare the retained base bytes incrementally, without a second
+// whole-source String. This is write work, not public page-read latency.
+async fn source_matches_base(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    source: &str,
+) -> Result<bool> {
+    let mut position = 0_i64;
+    let mut byte = 0_usize;
+    loop {
+        let row:Option<(i64,i64,Option<String>)> = sqlx::query_as("SELECT start,end,CASE WHEN length(CAST(text AS BLOB))<=4096 THEN text ELSE NULL END FROM note_operation_source WHERE operation_key=? AND phase='base' AND start>=? ORDER BY start LIMIT 1")
+            .bind(operation).bind(position).fetch_optional(&mut *conn).await.map_err(db)?;
+        let Some((start, end, text)) = row else {
+            return Ok(byte == source.len());
+        };
+        let text = text.ok_or_else(invalid)?;
+        if start != position
+            || end <= start
+            || end - start != i64::try_from(text.encode_utf16().count()).map_err(db)?
+        {
+            return Err(invalid());
+        }
+        let next = byte.checked_add(text.len()).ok_or_else(invalid)?;
+        if source.get(byte..next) != Some(text.as_str()) {
+            return Ok(false);
+        }
+        byte = next;
+        position = end;
+    }
+}
+
 struct ReceiptGroup {
     history_group: String,
     input_state: String,
@@ -375,6 +445,17 @@ impl super::NoteMutationWrite {
         let staged = self.staged.as_ref().ok_or_else(invalid)?;
         let generation = staged.view_generation;
         let mutation_present = staged.mutation_present;
+        if generation == 0
+            && !mutation_present
+            && source_matches_base(
+                &mut self.transaction,
+                &self.operation_key,
+                self.history.source(),
+            )
+            .await?
+        {
+            return Ok(());
+        }
         // One group's numeric provenance only, never a cloned source/context or
         // a collection of source snapshots from all chronological groups.
         let newest = staged
@@ -418,17 +499,23 @@ impl super::NoteMutationWrite {
                 input_length,
             };
             let mut cursor = MappingCursor::new(input_length)?;
+            let mut normalized = InverseCoalescer::default();
             for item in &mapping {
-                let range = cursor.push(item)?;
-                self.write_staged_inverse_range(&group, &range, &mut sequence)
-                    .await?;
+                if let Some(range) = normalized.push(cursor.push(item)?)? {
+                    self.write_staged_inverse_range(&group, &range, &mut sequence)
+                        .await?;
+                }
             }
             cursor
                 .finish(u64::try_from(self.history.source().encode_utf16().count()).map_err(db)?)?;
+            if let Some(range) = normalized.finish()? {
+                self.write_staged_inverse_range(&group, &range, &mut sequence)
+                    .await?;
+            }
             if !mapping.is_empty() {
                 state = output_state;
             }
-        } else if mutation_present || generation != 0 {
+        } else {
             return Err(invalid());
         }
         loop {
@@ -448,6 +535,7 @@ impl super::NoteMutationWrite {
                 input_length: captured.input_length,
             };
             let mut cursor = captured.cursor()?;
+            let mut normalized = InverseCoalescer::default();
             while let Some(range) = next_inverse(
                 &mut self.transaction,
                 &self.operation_key,
@@ -456,6 +544,12 @@ impl super::NoteMutationWrite {
             )
             .await?
             {
+                if let Some(range) = normalized.push(range)? {
+                    self.write_staged_inverse_range(&group, &range, &mut sequence)
+                        .await?;
+                }
+            }
+            if let Some(range) = normalized.finish()? {
                 self.write_staged_inverse_range(&group, &range, &mut sequence)
                     .await?;
             }
