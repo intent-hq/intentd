@@ -51,6 +51,12 @@ pub(super) fn envelope(lease: &Lease, id: Uuid, kind: &str) -> Value {
     out
 }
 
+// `empty_frame_bytes` includes an empty items array and a null cursor. Item
+// encodings and commas fill that array; replace only the four-byte null value.
+fn summary_frame_len(empty_frame_bytes: usize, item_bytes: usize, cursor: &Value) -> usize {
+    empty_frame_bytes - 4 + item_bytes + cursor.to_string().len()
+}
+
 impl Store {
     /// Read an authenticated, bounded annotation page after service authorization.
     /// The service supplies the actual JSON-RPC ID for complete-frame budgeting.
@@ -138,11 +144,14 @@ impl Store {
         let (mut out, rows, more) = self
             .annotation_summary_rows(&lease, id, &epochs, cursor.as_ref(), &key)
             .await?;
+        // The empty envelope already accounts for brackets and separators.
+        // Serialize each item once, instead of cloning and serializing every
+        // growing prefix. Keep the final complete-frame check below.
+        let empty_frame_bytes = wire_len(&out, rpc_id);
+        let mut item_bytes = 0;
         let mut admitted = Vec::new();
         for (index, (item, owner, position)) in rows.iter().enumerate() {
-            admitted.push(item.clone());
-            out["items"] = json!(admitted);
-            out["nextCursor"] = if index + 1 < rows.len() || more {
+            let next_cursor = if index + 1 < rows.len() || more {
                 json!(Token {
                     snapshot: id,
                     kind: lease.query.kind_tag(),
@@ -157,27 +166,20 @@ impl Store {
             } else {
                 Value::Null
             };
-            if wire_len(&out, rpc_id) > lease.query.wire {
-                admitted.pop();
+            let candidate_bytes = item_bytes + item.to_string().len() + usize::from(index > 0);
+            if summary_frame_len(empty_frame_bytes, candidate_bytes, &next_cursor)
+                > lease.query.wire
+            {
                 if admitted.is_empty() {
                     return Err(budget());
                 }
-                let (_, owner, position) = &rows[index - 1];
-                out["items"] = json!(admitted);
-                out["nextCursor"] = json!(Token {
-                    snapshot: id,
-                    kind: lease.query.kind_tag(),
-                    owner: *owner,
-                    position: *position,
-                    utf16: 0,
-                    items: u16::try_from(lease.query.items).map_err(|_| invalid())?,
-                    wire: u32::try_from(lease.query.wire).map_err(|_| invalid())?,
-                    binding: [0; 16]
-                }
-                .encode(&key)?);
                 break;
             }
+            item_bytes = candidate_bytes;
+            admitted.push(item.clone());
+            out["nextCursor"] = next_cursor;
         }
+        out["items"] = json!(admitted);
         if wire_len(&out, rpc_id) > lease.query.wire {
             return Err(budget());
         }
@@ -287,22 +289,8 @@ impl Store {
                 out["totalThreads"] = json!(rows.total_threads);
                 out["totalComments"] = json!(rows.total_comments);
                 for row in rows.page.items {
-                    let owner: i64 = sqlx::query_scalar(
-                        "SELECT rowid FROM note_comment_thread WHERE head_id=? AND thread_id=?",
-                    )
-                    .bind(head)
-                    .bind(&row.thread_id)
-                    .fetch_one(self.read_pool())
-                    .await
-                    .map_err(db_error)?;
-                    let root = if row.root_present {
-                        row.root_comment_id
-                            .as_deref()
-                            .unwrap_or(&row.latest_comment_id)
-                    } else {
-                        &row.latest_comment_id
-                    };
-                    let detail:i64=sqlx::query_scalar("SELECT rowid FROM note_comment_projection WHERE head_id=? AND comment_id=?").bind(head).bind(root).fetch_one(self.read_pool()).await.map_err(db_error)?;
+                    let owner = row.owner_rowid;
+                    let detail = row.detail_rowid;
                     let preview = trim(&row.latest_comment_preview, 512);
                     items.push((json!({"threadId":row.thread_id,"rootCommentId":row.root_comment_id,"rootState":if row.root_present{"present"}else{"deleted"},"status":row.status,"totalComments":row.total_comments,"latestCommentId":row.latest_comment_id,"latestCommentPreview":preview,"truncated":row.truncated||preview.len()<row.latest_comment_preview.len(),"anchorRef":if row.root_present{Some(reference(id,30,number(detail)?,key)?)}else{None},"detailRef":reference(id,31,number(detail)?,key)?}),number(owner)?,number(row.position)?));
                 }
@@ -356,6 +344,33 @@ impl Store {
                     items.push((item, owner, 0));
                 }
                 Ok((out, items, rows.page.has_more))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn annotation_incremental_frame_budget_matches_complete_escaped_json() {
+        for rpc_id in [json!(1), json!("\"\\\n😀")] {
+            let empty = json!({"items":[],"nextCursor":null,"scope":{"noteId":"\"\\\u{0000}😀"}});
+            let empty_bytes = wire_len(&empty, &rpc_id);
+            let mut items = Vec::new();
+            let mut item_bytes = 0;
+            for n in 0..64 {
+                let item = json!({"preview":"\"\\\n\t\u{0000}😀".repeat(n),"missing":null,"nested":[n,true]});
+                item_bytes += item.to_string().len() + usize::from(n > 0);
+                items.push(item);
+                for cursor in [Value::Null, json!("na1.\"\\\n😀")] {
+                    let mut complete = empty.clone();
+                    complete["items"] = json!(items);
+                    complete["nextCursor"] = cursor.clone();
+                    let measured = summary_frame_len(empty_bytes, item_bytes, &cursor);
+                    assert_eq!(measured, wire_len(&complete, &rpc_id));
+                }
             }
         }
     }

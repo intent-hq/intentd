@@ -209,6 +209,8 @@ impl Store {
             .iter()
             .take(lease.query.items)
             .map(|r| ThreadRow {
+                owner_rowid: r.get("owner_rowid"),
+                detail_rowid: r.get("detail_rowid"),
                 thread_id: r.get("thread_id"),
                 status: r.get("status"),
                 total_comments: r.get("total_comments"),

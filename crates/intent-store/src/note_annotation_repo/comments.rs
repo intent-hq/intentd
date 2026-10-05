@@ -34,6 +34,8 @@ pub struct CommentRow {
 
 #[derive(Clone, Debug)]
 pub struct ThreadRow {
+    pub(super) owner_rowid: i64,
+    pub(super) detail_rowid: i64,
     pub thread_id: String,
     pub status: String,
     pub total_comments: i64,
@@ -175,11 +177,12 @@ pub(super) fn finish_thread_summary(
     mut query: QueryBuilder<'static, sqlx::Sqlite>,
     id: i64,
 ) -> QueryBuilder<'static, sqlx::Sqlite> {
-    query.push("SELECT t.thread_id,t.total_comments,m.position,identity.root_comment_id AS root_id,identity.root_present,COALESCE(root.status,latest.status) AS status,latest.comment_id AS latest_id,latest.preview,latest.truncated \
+    query.push("SELECT t.rowid AS owner_rowid,detail.rowid AS detail_rowid,t.thread_id,t.total_comments,m.position,identity.root_comment_id AS root_id,identity.root_present,COALESCE(root.status,latest.status) AS status,latest.comment_id AS latest_id,latest.preview,latest.truncated \
             FROM selected m CROSS JOIN note_comment_thread t ON t.thread_id=m.thread_id \
             JOIN note_comment_root identity ON identity.head_id=t.head_id AND identity.thread_id=t.thread_id \
             LEFT JOIN note_comment_projection root ON root.comment_id=(SELECT comment_id FROM note_comment_projection WHERE head_id=t.head_id AND thread_id=t.thread_id AND parent_id IS NULL ORDER BY created_at,comment_id LIMIT 1) \
             JOIN note_comment_projection latest ON latest.comment_id=(SELECT comment_id FROM note_comment_projection WHERE head_id=t.head_id AND thread_id=t.thread_id ORDER BY created_at DESC,comment_id DESC LIMIT 1) \
+            JOIN note_comment_projection detail ON detail.head_id=t.head_id AND detail.comment_id=CASE WHEN identity.root_present THEN COALESCE(identity.root_comment_id,latest.comment_id) ELSE latest.comment_id END \
             WHERE t.head_id=").push_bind(id);
     query.push(" ORDER BY m.position,t.thread_id");
     query
@@ -373,6 +376,8 @@ impl Store {
             .iter()
             .take(limit)
             .map(|row| ThreadRow {
+                owner_rowid: row.get("owner_rowid"),
+                detail_rowid: row.get("detail_rowid"),
                 thread_id: row.get("thread_id"),
                 total_comments: row.get("total_comments"),
                 position: row.get("position"),

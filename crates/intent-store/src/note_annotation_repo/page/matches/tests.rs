@@ -177,6 +177,7 @@ async fn annotation_actual_dense_first_page_and_complete_continuation() {
         .unwrap()
         .len();
     let wal_bytes = std::fs::metadata(dir.path().join("store.db-wal")).map_or(0, |m| m.len());
+    eprintln!("dense first page completed: elapsed={prepare_time:?}, preparationVMsteps={steps}");
     let continuation = Instant::now();
     let mut seen = 0;
     loop {
@@ -188,6 +189,12 @@ async fn annotation_actual_dense_first_page_and_complete_continuation() {
             assert_eq!(item["threadId"], format!("dense{seen:06}"));
             assert_eq!(item["rootCommentId"], item["threadId"]);
             assert_eq!(item["rootState"], "present");
+        }
+        if seen % 16_384 == 0 {
+            eprintln!(
+                "dense continuation progress: seen={seen}, elapsed={:?}",
+                continuation.elapsed()
+            );
         }
         let Some(cursor) = page["nextCursor"].as_str() else {
             break;
@@ -474,4 +481,59 @@ async fn annotation_setup_failure_closes_detached_worker_and_preserves_cleanup_e
     .unwrap_err()
     .to_string();
     assert!(result.contains("primary setup error") && result.contains("close error"));
+}
+
+#[tokio::test]
+async fn annotation_summary_projects_scoped_cursor_and_root_or_survivor_detail_owners() {
+    let (_dir, store, lease, _) = fixture(2).await;
+    sqlx::query("INSERT INTO comment(id,workspace_id,note_id,thread_id,parent_id,kind,content,author,author_type,status,anchor_json,created_at,updated_at) VALUES('reply','ws','spec','dense000001','dense000001','comment','survivor body','author','user','open','null','later','later')")
+        .execute(store.write_pool()).await.unwrap();
+    let request: AnnotationPageRequest = serde_json::from_value(json!({
+        "kind":"comments","ranges":[],"anchorState":"all","maxItems":1,"maxWireBytes":4096
+    }))
+    .unwrap();
+    let key = store.annotation_key().await.unwrap();
+    for (deleted, expected_detail) in [(false, "dense000001"), (true, "reply")] {
+        if deleted {
+            sqlx::query("DELETE FROM comment WHERE id='dense000001'")
+                .execute(store.write_pool())
+                .await
+                .unwrap();
+        }
+        let page = store
+            .read_note_annotation_page(
+                "alice",
+                &lease.scope,
+                &lease.source_revision,
+                None,
+                None,
+                &request,
+                &json!(1),
+            )
+            .await
+            .unwrap();
+        let item = &page["items"][0];
+        assert_eq!(item["threadId"], "dense000001");
+        assert_eq!(item["rootCommentId"], "dense000001");
+        assert_eq!(
+            item["rootState"],
+            if deleted { "deleted" } else { "present" }
+        );
+        assert_eq!(item["anchorRef"].is_null(), deleted);
+        let detail =
+            super::super::Token::decode(item["detailRef"].as_str().unwrap(), &key).unwrap();
+        let actual_detail: String = sqlx::query_scalar("SELECT p.comment_id FROM note_comment_projection p JOIN note_annotation_head h ON h.id=p.head_id WHERE h.workspace_id=? AND h.note_id=? AND p.rowid=?")
+            .bind(&lease.scope.workspace_id).bind(&lease.scope.note_id)
+            .bind(i64::try_from(detail.owner).unwrap()).fetch_one(store.read_pool()).await.unwrap();
+        assert_eq!(actual_detail, expected_detail);
+        let cursor =
+            super::super::Token::decode(page["nextCursor"].as_str().unwrap(), &key).unwrap();
+        let thread: String =
+            sqlx::query_scalar("SELECT thread_id FROM note_comment_thread WHERE rowid=?")
+                .bind(i64::try_from(cursor.owner).unwrap())
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap();
+        assert_eq!(thread, "dense000001");
+    }
 }
