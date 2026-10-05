@@ -748,6 +748,529 @@ pub(super) async fn prepare_frozen_view(
     })
 }
 
+const METADATA_BYTES: u64 = 16_384;
+
+fn token_value(value: &Value) -> Result<&str> {
+    value
+        .as_str()
+        .filter(|s| !s.is_empty() && s.len() <= 256 && !s.contains('\0'))
+        .ok_or_else(invalid)
+}
+fn optional_token<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>> {
+    object.get(key).map(token_value).transpose()
+}
+async fn cached_text(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    id: &str,
+) -> Result<VerifiedText> {
+    let row = sqlx::query(
+        "SELECT length,utf8_bytes,sha256 FROM note_stage_text WHERE operation_key=? AND text_id=?",
+    )
+    .bind(operation)
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db)?
+    .ok_or_else(invalid)?;
+    Ok(VerifiedText {
+        length: extent(row.get("length"))?,
+        utf8_bytes: extent(row.get("utf8_bytes"))?,
+        sha256: row.get::<Option<String>, _>("sha256").ok_or_else(invalid)?,
+    })
+}
+
+// Only a specifically referenced entry/directory is reconstructed, and only
+// after its verified byte count passes the logical resource budget. Raw scalar
+// resources are never parsed as JSON or loaded wholesale by this function.
+async fn metadata_resource(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    id: &str,
+) -> Result<Value> {
+    let metadata = cached_text(conn, operation, id).await?;
+    if metadata.utf8_bytes > METADATA_BYTES {
+        return Err(Error::NoteMutation(NoteMutationError::Budget));
+    }
+    let mut raw = String::with_capacity(usize::try_from(metadata.utf8_bytes).map_err(db)?);
+    let mut offset = 0;
+    while offset < metadata.length {
+        let (end,text):(i64,String)=sqlx::query_as("SELECT end,text FROM note_stage_text_piece WHERE operation_key=? AND text_id=? AND start=?")
+            .bind(operation).bind(id).bind(integer(offset)?).fetch_optional(&mut *conn).await.map_err(db)?.ok_or_else(invalid)?;
+        let end = extent(end)?;
+        if end <= offset
+            || end > metadata.length
+            || text.len() > 4096
+            || u64::try_from(text.encode_utf16().count()).map_err(db)? != end - offset
+        {
+            return Err(invalid());
+        }
+        if raw.len().saturating_add(text.len()) > usize::try_from(METADATA_BYTES).map_err(db)? {
+            return Err(Error::NoteMutation(NoteMutationError::Budget));
+        }
+        raw.push_str(&text);
+        offset = end;
+    }
+    if u64::try_from(raw.len()).map_err(db)? != metadata.utf8_bytes
+        || hex_digest(Sha256::digest(raw.as_bytes()).as_ref()) != metadata.sha256
+    {
+        return Err(invalid());
+    }
+    // Supported entry/directory shapes have <=64 child IDs and fixed shallow
+    // fields, safely below this canonicalizer's structural limits. This is not
+    // reused for the separate 128-record staged integrity envelope.
+    let canonical =
+        intent_core::note_artifact::canonical::canonical_json(&raw).map_err(|_| invalid())?;
+    if canonical != raw {
+        return Err(invalid());
+    }
+    serde_json::from_str(&raw).map_err(|_| invalid())
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+enum MetadataKey {
+    Inline(String),
+    Text(String),
+}
+struct MetadataEntry {
+    id: String,
+    kind: String,
+    key: Option<MetadataKey>,
+    index: Option<u64>,
+    children: Option<String>,
+}
+async fn metadata_entry(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    value: &Value,
+    parent: Option<&str>,
+    parent_kind: Option<&str>,
+) -> Result<MetadataEntry> {
+    let object = value.as_object().ok_or_else(invalid)?;
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "id" | "parentId"
+                | "key"
+                | "keyRef"
+                | "index"
+                | "type"
+                | "value"
+                | "valueRef"
+                | "childrenRef"
+        )
+    }) {
+        return Err(invalid());
+    }
+    let id = token_value(object.get("id").ok_or_else(invalid)?)?.to_owned();
+    let parent_id = match object.get("parentId") {
+        Some(Value::Null) => None,
+        Some(value) => Some(token_value(value)?),
+        None => return Err(invalid()),
+    };
+    if parent_id != parent {
+        return Err(invalid());
+    }
+    let key = match (object.get("key"), optional_token(object, "keyRef")?) {
+        (None, None) => None,
+        (Some(Value::String(key)), None) if key.len() <= 1024 => {
+            Some(MetadataKey::Inline(key.clone()))
+        }
+        (None, Some(id)) => {
+            cached_text(conn, operation, id).await?;
+            Some(MetadataKey::Text(id.to_owned()))
+        }
+        _ => return Err(invalid()),
+    };
+    let index = object
+        .get("index")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|n| *n <= SAFE_LENGTH)
+                .ok_or_else(invalid)
+        })
+        .transpose()?;
+    match parent_kind {
+        None if key.is_none() && index.is_none() => (),
+        Some("object") if key.is_some() && index.is_none() => (),
+        Some("array") if key.is_none() && index.is_some() => (),
+        _ => return Err(invalid()),
+    }
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let children = optional_token(object, "childrenRef")?;
+    let value_ref = optional_token(object, "valueRef")?;
+    let scalar = object.get("value");
+    match kind {
+        "object" | "array" if children.is_some() && value_ref.is_none() && scalar.is_none() => (),
+        "string" if children.is_none() && scalar.is_none() => {
+            cached_text(conn, operation, value_ref.ok_or_else(invalid)?).await?;
+        }
+        "number"
+            if children.is_none()
+                && value_ref.is_none()
+                && scalar.is_some_and(Value::is_number) => {}
+        "boolean"
+            if children.is_none()
+                && value_ref.is_none()
+                && scalar.is_some_and(Value::is_boolean) => {}
+        "null" if children.is_none() && value_ref.is_none() && scalar == Some(&Value::Null) => (),
+        _ => return Err(invalid()),
+    }
+    Ok(MetadataEntry {
+        id,
+        kind: kind.to_owned(),
+        key,
+        index,
+        children: children.map(str::to_owned),
+    })
+}
+
+async fn claim_metadata(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    kind: &str,
+    id: &str,
+    owner: Option<&str>,
+    position: Option<u64>,
+    value: &Value,
+) -> Result<()> {
+    let value = serde_json::to_string(value).map_err(db)?;
+    if value.len() > 32768 {
+        return Err(Error::NoteMutation(NoteMutationError::Budget));
+    }
+    let inserted=sqlx::query("INSERT INTO note_stage_validation(operation_key,kind,id,owner,position,state,value) VALUES(?,?,?,?,?,'active',?) ON CONFLICT(operation_key,kind,id) DO NOTHING")
+        .bind(operation).bind(kind).bind(id).bind(owner).bind(position.map(integer).transpose()?).bind(value).execute(&mut *conn).await.map_err(db)?;
+    if inserted.rows_affected() != 1 {
+        return Err(invalid());
+    }
+    Ok(())
+}
+async fn finish_metadata(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    text_id: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE note_stage_validation SET state='done' WHERE operation_key=? AND kind='entry' AND id=?")
+        .bind(operation).bind(text_id).execute(&mut *conn).await.map_err(db)?;
+    Ok(())
+}
+async fn admit_metadata(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    text_id: &str,
+    parent: Option<&str>,
+    parent_kind: Option<&str>,
+) -> Result<MetadataEntry> {
+    let value = metadata_resource(conn, operation, text_id).await?;
+    let entry = metadata_entry(conn, operation, &value, parent, parent_kind).await?;
+    claim_metadata(conn, operation, "entry", text_id, parent, None, &value).await?;
+    claim_metadata(
+        conn,
+        operation,
+        "entryId",
+        &entry.id,
+        Some(text_id),
+        None,
+        &Value::Null,
+    )
+    .await?;
+    Ok(entry)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MetadataFrame {
+    text_id: String,
+    entry_id: String,
+    kind: String,
+    directory: Option<String>,
+    next_directory: Option<String>,
+    has_directory: bool,
+    item: usize,
+    previous_key: Option<MetadataKey>,
+    next_index: u64,
+}
+async fn push_metadata(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    depth: u64,
+    text_id: &str,
+    entry: MetadataEntry,
+) -> Result<()> {
+    let frame = MetadataFrame {
+        text_id: text_id.to_owned(),
+        entry_id: entry.id,
+        kind: entry.kind,
+        directory: None,
+        next_directory: entry.children,
+        has_directory: false,
+        item: 0,
+        previous_key: None,
+        next_index: 0,
+    };
+    claim_metadata(
+        conn,
+        operation,
+        "stack",
+        &depth.to_string(),
+        Some(text_id),
+        Some(depth),
+        &serde_json::to_value(frame).map_err(db)?,
+    )
+    .await
+}
+async fn save_metadata_frame(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    depth: u64,
+    frame: &MetadataFrame,
+) -> Result<()> {
+    let value = serde_json::to_string(frame).map_err(db)?;
+    if value.len() > 32768 {
+        return Err(Error::NoteMutation(NoteMutationError::Budget));
+    }
+    sqlx::query(
+        "UPDATE note_stage_validation SET value=? WHERE operation_key=? AND kind='stack' AND id=?",
+    )
+    .bind(value)
+    .bind(operation)
+    .bind(depth.to_string())
+    .execute(&mut *conn)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
+struct MetadataDirectory {
+    items: Vec<String>,
+    next: Option<String>,
+}
+fn metadata_directory(value: &Value, first: bool) -> Result<MetadataDirectory> {
+    let object = value.as_object().ok_or_else(invalid)?;
+    if object.len() != 3 || object.get("kind").and_then(Value::as_str) != Some("metadataChildren") {
+        return Err(invalid());
+    }
+    let items = object
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(invalid)?;
+    if items.len() > 64 {
+        return Err(Error::NoteMutation(NoteMutationError::Budget));
+    }
+    let items = items
+        .iter()
+        .map(|value| token_value(value).map(str::to_owned))
+        .collect::<Result<Vec<_>>>()?;
+    let next = match object.get("nextRef") {
+        Some(Value::Null) => None,
+        Some(value) => Some(token_value(value)?.to_owned()),
+        None => return Err(invalid()),
+    };
+    if items.is_empty() && (!first || next.is_some()) {
+        return Err(invalid());
+    }
+    Ok(MetadataDirectory { items, next })
+}
+
+struct MetadataKeyReader {
+    text_id: Option<String>,
+    length: u64,
+    next_offset: u64,
+    bytes: Vec<u8>,
+    byte: usize,
+}
+impl MetadataKeyReader {
+    async fn new(conn: &mut SqliteConnection, operation: &str, key: &MetadataKey) -> Result<Self> {
+        match key {
+            MetadataKey::Inline(key) => Ok(Self {
+                text_id: None,
+                length: 0,
+                next_offset: 0,
+                bytes: key.as_bytes().to_vec(),
+                byte: 0,
+            }),
+            MetadataKey::Text(id) => Ok(Self {
+                text_id: Some(id.clone()),
+                length: cached_text(conn, operation, id).await?.length,
+                next_offset: 0,
+                bytes: vec![],
+                byte: 0,
+            }),
+        }
+    }
+    async fn next(&mut self, conn: &mut SqliteConnection, operation: &str) -> Result<Option<u8>> {
+        if self.byte == self.bytes.len() {
+            let Some(id) = &self.text_id else {
+                return Ok(None);
+            };
+            if self.next_offset == self.length {
+                return Ok(None);
+            }
+            let (end,text):(i64,String)=sqlx::query_as("SELECT end,text FROM note_stage_text_piece WHERE operation_key=? AND text_id=? AND start=?")
+                .bind(operation).bind(id).bind(integer(self.next_offset)?).fetch_optional(&mut *conn).await.map_err(db)?.ok_or_else(invalid)?;
+            let end = extent(end)?;
+            if end <= self.next_offset
+                || end > self.length
+                || text.len() > 4096
+                || u64::try_from(text.encode_utf16().count()).map_err(db)? != end - self.next_offset
+            {
+                return Err(invalid());
+            }
+            self.next_offset = end;
+            self.bytes = text.into_bytes();
+            self.byte = 0;
+        }
+        let byte = *self.bytes.get(self.byte).ok_or_else(invalid)?;
+        self.byte += 1;
+        Ok(Some(byte))
+    }
+}
+async fn metadata_key_order(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    a: &MetadataKey,
+    b: &MetadataKey,
+) -> Result<std::cmp::Ordering> {
+    let mut a = MetadataKeyReader::new(conn, operation, a).await?;
+    let mut b = MetadataKeyReader::new(conn, operation, b).await?;
+    loop {
+        match (
+            a.next(conn, operation).await?,
+            b.next(conn, operation).await?,
+        ) {
+            (None, None) => return Ok(std::cmp::Ordering::Equal),
+            (None, Some(_)) => return Ok(std::cmp::Ordering::Less),
+            (Some(_), None) => return Ok(std::cmp::Ordering::Greater),
+            (Some(a), Some(b)) if a != b => return Ok(a.cmp(&b)),
+            _ => (),
+        }
+    }
+}
+
+/// Resolve only explicit uploaded metadata edges, using an external indexed DFS
+/// stack and ownership ledger. Resident state is bounded by individual <=16KiB
+/// resources, <=64 directory IDs and two <=4096-byte long-key pieces, independent
+/// of graph depth/size. Each directory can be decoded once per child (<=64 times);
+/// key comparisons stream common prefixes. Work/storage are graph-dependent.
+///
+/// Requires the caller's exact operation binding and immutable text digest cache
+/// from `prepare_frozen_view`, inside the SAME writer transaction. All errors must
+/// roll back. Completed exact roots can be shared; child/directory reuse, cycles
+/// and identity aliases reject. This is structural, not editor role/provenance
+/// authority, and must not itself publish a sealed operation.
+pub(super) async fn validate_attribute_graph(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    root: &str,
+) -> Result<()> {
+    let pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM note_stage_validation WHERE operation_key=? AND kind='stack')",
+    )
+    .bind(operation)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(db)?;
+    if pending {
+        return Err(invalid());
+    }
+    let prior=sqlx::query("SELECT owner,state FROM note_stage_validation WHERE operation_key=? AND kind='entry' AND id=?")
+        .bind(operation).bind(root).fetch_optional(&mut *conn).await.map_err(db)?;
+    if let Some(prior) = prior {
+        if prior.get::<Option<String>, _>("owner").is_none()
+            && prior.get::<&str, _>("state") == "done"
+        {
+            return Ok(());
+        }
+        return Err(invalid());
+    }
+    let entry = admit_metadata(conn, operation, root, None, None).await?;
+    if entry.children.is_some() {
+        push_metadata(conn, operation, 0, root, entry).await?;
+    } else {
+        finish_metadata(conn, operation, root).await?;
+        return Ok(());
+    }
+    loop {
+        let top=sqlx::query("SELECT position,value FROM note_stage_validation WHERE operation_key=? AND kind='stack' ORDER BY position DESC LIMIT 1")
+            .bind(operation).fetch_optional(&mut *conn).await.map_err(db)?;
+        let Some(top) = top else { return Ok(()) };
+        let depth = extent(top.get("position"))?;
+        let mut frame: MetadataFrame = serde_json::from_str(top.get("value")).map_err(db)?;
+        if frame.directory.is_none() {
+            let Some(next) = frame.next_directory.take() else {
+                finish_metadata(conn, operation, &frame.text_id).await?;
+                sqlx::query("DELETE FROM note_stage_validation WHERE operation_key=? AND kind='stack' AND position=?")
+                    .bind(operation).bind(integer(depth)?).execute(&mut *conn).await.map_err(db)?;
+                continue;
+            };
+            let value = metadata_resource(conn, operation, &next).await?;
+            let directory = metadata_directory(&value, !frame.has_directory)?;
+            claim_metadata(
+                conn,
+                operation,
+                "directory",
+                &next,
+                Some(&frame.entry_id),
+                None,
+                &value,
+            )
+            .await?;
+            frame.directory = Some(next);
+            frame.next_directory = directory.next;
+            frame.item = 0;
+            frame.has_directory = true;
+            save_metadata_frame(conn, operation, depth, &frame).await?;
+        }
+        let raw:String=sqlx::query_scalar("SELECT value FROM note_stage_validation WHERE operation_key=? AND kind='directory' AND id=? AND owner=?")
+            .bind(operation).bind(frame.directory.as_deref()).bind(&frame.entry_id).fetch_one(&mut *conn).await.map_err(db)?;
+        let directory: Value = serde_json::from_str(&raw).map_err(db)?;
+        let items = directory["items"].as_array().ok_or_else(invalid)?;
+        if frame.item == items.len() {
+            frame.directory = None;
+            save_metadata_frame(conn, operation, depth, &frame).await?;
+            continue;
+        }
+        let child_id = token_value(items.get(frame.item).ok_or_else(invalid)?)?.to_owned();
+        let child = admit_metadata(
+            conn,
+            operation,
+            &child_id,
+            Some(&frame.entry_id),
+            Some(&frame.kind),
+        )
+        .await?;
+        if frame.kind == "object" {
+            let key = child.key.as_ref().ok_or_else(invalid)?;
+            if let Some(prior) = &frame.previous_key {
+                if metadata_key_order(conn, operation, prior, key).await?
+                    != std::cmp::Ordering::Less
+                {
+                    return Err(invalid());
+                }
+            }
+            frame.previous_key = Some(key.clone());
+        } else {
+            if child.index != Some(frame.next_index) {
+                return Err(invalid());
+            }
+            frame.next_index = sum(frame.next_index, 1)?;
+        }
+        frame.item += 1;
+        save_metadata_frame(conn, operation, depth, &frame).await?;
+        if child.children.is_some() {
+            push_metadata(conn, operation, sum(depth, 1)?, &child_id, child).await?;
+        } else {
+            finish_metadata(conn, operation, &child_id).await?;
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "seal_tests.rs"]
 mod tests;

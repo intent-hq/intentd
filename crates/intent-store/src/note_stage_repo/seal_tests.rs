@@ -707,3 +707,477 @@ async fn stage_seal_current_store_migrations_keep_pinned_source_and_cascade_view
         .unwrap();
     assert_eq!(pieces, 0);
 }
+
+const GRAPH_SCHEMA:&str="CREATE TABLE note_stage_validation(operation_key TEXT,kind TEXT,id TEXT,owner TEXT,position INTEGER,state TEXT,value TEXT CHECK(length(CAST(value AS BLOB))<=32768),PRIMARY KEY(operation_key,kind,id));CREATE INDEX note_stage_validation_stack ON note_stage_validation(operation_key,kind,position);";
+fn resource(value: &Value) -> String {
+    intent_core::note_artifact::canonical::canonical_json(&value.to_string()).unwrap()
+}
+async fn upload_resource(conn: &mut SqliteConnection, id: &str, text: &str) {
+    let mut byte = 0;
+    let mut offset = 0_u64;
+    if text.is_empty() {
+        text_upload(conn, id, "").await;
+        return;
+    }
+    while byte < text.len() {
+        let mut end = (byte + 8192).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let part = &text[byte..end];
+        upload(
+            conn,
+            NoteStageStream::Text,
+            vec![json!({"kind":"text","id":id,"offset":offset,"text":part})],
+        )
+        .await;
+        offset += u64::try_from(part.encode_utf16().count()).unwrap();
+        byte = end;
+    }
+}
+async fn graph_fixture(resources: Vec<(String, String)>) -> SqliteConnection {
+    let mut conn = view_fixture("").await;
+    for sql in GRAPH_SCHEMA.split(';').filter(|s| !s.is_empty()) {
+        sqlx::query(sql).execute(&mut conn).await.unwrap();
+    }
+    for (id, text) in resources {
+        upload_resource(&mut conn, &id, &text).await;
+    }
+    cache_text_digests(&mut conn, "op").await.unwrap();
+    conn
+}
+fn directory(items: Vec<String>, next: Option<&str>) -> String {
+    resource(
+        &json!({"kind":"metadataChildren","items":Value::Array(items.into_iter().map(Value::String).collect()),"nextRef":next}),
+    )
+}
+fn object_root(children: &str) -> String {
+    resource(&json!({"id":"entry-root","parentId":null,"type":"object","childrenRef":children}))
+}
+fn member(id: &str, key: Value) -> String {
+    let mut value = json!({"id":id,"parentId":"entry-root","type":"number","value":1});
+    let Value::Object(key) = key else {
+        panic!("fixture key must be an object")
+    };
+    for (field, value_key) in key {
+        value[field] = value_key;
+    }
+    resource(&value)
+}
+#[tokio::test]
+async fn stage_seal_metadata_nested_directories_share_raw_scalars_and_exact_root() {
+    let resources = vec![
+        ("root".into(), object_root("first-dir")),
+        (
+            "first-dir".into(),
+            directory(vec!["array-text".into()], Some("last-dir")),
+        ),
+        (
+            "last-dir".into(),
+            directory(vec!["scalar-text".into()], None),
+        ),
+        (
+            "array-text".into(),
+            resource(
+                &json!({"id":"array-entry","parentId":"entry-root","key":"a","type":"array","childrenRef":"array-dir"}),
+            ),
+        ),
+        (
+            "array-dir".into(),
+            directory(vec!["element".into(), "empty-object".into()], None),
+        ),
+        (
+            "element".into(),
+            resource(
+                &json!({"id":"element-entry","parentId":"array-entry","index":0,"type":"string","valueRef":"raw"}),
+            ),
+        ),
+        (
+            "empty-object".into(),
+            resource(
+                &json!({"id":"empty-entry","parentId":"array-entry","index":1,"type":"object","childrenRef":"empty-dir"}),
+            ),
+        ),
+        ("empty-dir".into(), directory(vec![], None)),
+        (
+            "scalar-text".into(),
+            resource(
+                &json!({"id":"scalar-entry","parentId":"entry-root","keyRef":"raw-key","type":"string","valueRef":"raw"}),
+            ),
+        ),
+        ("raw".into(), "literal {not JSON} 😀".repeat(900)),
+        ("raw-key".into(), "z".repeat(6000)),
+        ("unrelated".into(), "{unrelated malformed JSON".into()),
+    ];
+    let mut conn = graph_fixture(resources).await;
+    validate_attribute_graph(&mut conn, "op", "root")
+        .await
+        .unwrap();
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    validate_attribute_graph(&mut conn, "op", "root")
+        .await
+        .unwrap();
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(before, after);
+    let entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM note_stage_validation WHERE kind='entry' AND state='done'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(entries, 5);
+    let stack: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation WHERE kind='stack'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(stack, 0);
+    assert!(
+        validate_attribute_graph(&mut conn, "op", "scalar-text")
+            .await
+            .is_err(),
+        "a child cannot be reused as a new root"
+    );
+}
+#[tokio::test]
+async fn stage_seal_metadata_orders_decoded_scalar_keys_and_streams_long_prefixes() {
+    let resources = vec![
+        ("root".into(), object_root("dir")),
+        (
+            "dir".into(),
+            directory(
+                vec!["empty".into(), "bmp".into(), "astral".into(), "long".into()],
+                None,
+            ),
+        ),
+        ("empty".into(), member("empty", json!({"key":""}))),
+        ("bmp".into(), member("bmp", json!({"key":"\u{e000}"}))),
+        (
+            "astral".into(),
+            member("astral", json!({"keyRef":"astral-key"})),
+        ),
+        ("long".into(), member("long", json!({"keyRef":"long-key"}))),
+        ("astral-key".into(), "\u{10000}".into()),
+        ("long-key".into(), format!("𐀀{}", "x".repeat(9000))),
+    ];
+    let mut conn = graph_fixture(resources).await;
+    validate_attribute_graph(&mut conn, "op", "root")
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata_key_order(
+            &mut conn,
+            "op",
+            &MetadataKey::Inline("\u{10000}".into()),
+            &MetadataKey::Text("astral-key".into())
+        )
+        .await
+        .unwrap(),
+        std::cmp::Ordering::Equal
+    );
+    assert_eq!(
+        metadata_key_order(
+            &mut conn,
+            "op",
+            &MetadataKey::Text("astral-key".into()),
+            &MetadataKey::Text("long-key".into())
+        )
+        .await
+        .unwrap(),
+        std::cmp::Ordering::Less
+    );
+}
+#[tokio::test]
+async fn stage_seal_metadata_rejects_duplicate_order_ownership_cycles_and_empty_continuations() {
+    let good_a = member("a", json!({"key":"a"}));
+    let cases = vec![
+        vec![
+            ("dir", directory(vec!["a".into(), "a".into()], None)),
+            ("a", good_a.clone()),
+        ],
+        vec![
+            ("dir", directory(vec!["a".into(), "b".into()], None)),
+            ("a", good_a.clone()),
+            ("b", member("a", json!({"key":"b"}))),
+        ],
+        vec![
+            ("dir", directory(vec!["a".into(), "b".into()], None)),
+            ("a", good_a.clone()),
+            ("b", member("b", json!({"keyRef":"key"}))),
+            ("key", "a".into()),
+        ],
+        vec![
+            ("dir", directory(vec!["b".into(), "a".into()], None)),
+            ("a", good_a.clone()),
+            ("b", member("b", json!({"key":"b"}))),
+        ],
+        vec![
+            ("dir", directory(vec!["a".into()], Some("dir"))),
+            ("a", good_a.clone()),
+        ],
+        vec![
+            ("dir", directory(vec![], Some("next"))),
+            ("next", directory(vec![], None)),
+        ],
+        vec![
+            ("dir", directory(vec!["a".into()], Some("next"))),
+            ("a", good_a.clone()),
+            ("next", directory(vec![], None)),
+        ],
+        vec![("dir", directory(vec!["missing".into()], None))],
+        vec![
+            ("dir", directory(vec!["a".into()], None)),
+            (
+                "a",
+                resource(
+                    &json!({"id":"a","parentId":"wrong","key":"a","type":"null","value":null}),
+                ),
+            ),
+        ],
+        vec![
+            ("dir", directory(vec!["a".into(), "b".into()], None)),
+            (
+                "a",
+                resource(
+                    &json!({"id":"a","parentId":"entry-root","key":"a","type":"array","childrenRef":"shared-empty"}),
+                ),
+            ),
+            (
+                "b",
+                resource(
+                    &json!({"id":"b","parentId":"entry-root","key":"b","type":"array","childrenRef":"shared-empty"}),
+                ),
+            ),
+            ("shared-empty", directory(vec![], None)),
+        ],
+        vec![("dir", directory(vec!["root".into()], None))],
+        vec![],
+    ];
+    for extras in cases {
+        let mut resources = vec![("root".into(), object_root("dir"))];
+        resources.extend(extras.into_iter().map(|(id, text)| (id.into(), text)));
+        let mut conn = graph_fixture(resources).await;
+        let mut tx = conn.begin().await.unwrap();
+        assert!(validate_attribute_graph(&mut tx, "op", "root")
+            .await
+            .is_err());
+        tx.rollback().await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+}
+#[tokio::test]
+async fn stage_seal_metadata_exact_canonical_resources_and_directory_byte_item_bounds() {
+    let mut ids = vec!["x".repeat(255); 64];
+    let raw = directory(ids.clone(), None);
+    let excess = raw.len() - 16_384;
+    ids.last_mut().unwrap().truncate(255 - excess);
+    let exact = directory(ids.clone(), None);
+    assert_eq!(exact.len(), 16_384);
+    ids.last_mut().unwrap().push('x');
+    let over = directory(ids, None);
+    assert_eq!(over.len(), 16_385);
+    let mut conn = graph_fixture(vec![("exact".into(), exact), ("over".into(), over)]).await;
+    let value = metadata_resource(&mut conn, "op", "exact").await.unwrap();
+    assert_eq!(metadata_directory(&value, true).unwrap().items.len(), 64);
+    assert!(matches!(
+        metadata_resource(&mut conn, "op", "over").await,
+        Err(Error::NoteMutation(NoteMutationError::Budget))
+    ));
+    assert!(metadata_directory(
+        &json!({"kind":"metadataChildren","items":vec!["x";65],"nextRef":null}),
+        true
+    )
+    .is_err());
+    for raw in [
+        "{\"id\":\"x\",\"id\":\"x\",\"parentId\":null,\"type\":\"null\",\"value\":null}".to_owned(),
+        format!(
+            " {}",
+            resource(&json!({"id":"x","parentId":null,"type":"number","value":1}))
+        ),
+        "{\"id\":\"x\",\"parentId\":null,\"type\":\"number\",\"value\":1.0}".to_owned(),
+        "{\"id\":\"x\",\"key\":\"\\ud800\",\"parentId\":null,\"type\":\"null\",\"value\":null}"
+            .to_owned(),
+    ] {
+        let mut conn = graph_fixture(vec![("bad".into(), raw)]).await;
+        assert!(metadata_resource(&mut conn, "op", "bad").await.is_err());
+    }
+}
+#[tokio::test]
+async fn stage_seal_metadata_external_stack_accepts_deep_graph_and_indexed_traversal() {
+    let mut resources = vec![];
+    for depth in 0..80 {
+        let mut entry = json!({"id":format!("entry-{depth}"),"parentId":if depth==0 {None}else{Some(format!("entry-{}",depth-1))},"type":"object","childrenRef":format!("dir-{depth}")});
+        if depth > 0 {
+            entry["key"] = json!("child");
+        }
+        resources.push((format!("text-{depth}"), resource(&entry)));
+        resources.push((
+            format!("dir-{depth}"),
+            directory(vec![format!("text-{}", depth + 1)], None),
+        ));
+    }
+    resources.push(("text-80".into(),resource(&json!({"id":"entry-80","parentId":"entry-79","key":"child","type":"boolean","value":true}))));
+    let mut conn = graph_fixture(resources).await;
+    validate_attribute_graph(&mut conn, "op", "text-0")
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM note_stage_validation WHERE kind='entry' AND state='done'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(count, 81);
+    let rows=sqlx::query("EXPLAIN QUERY PLAN SELECT position,value FROM note_stage_validation WHERE operation_key='op' AND kind='stack' ORDER BY position DESC LIMIT 1").fetch_all(&mut conn).await.unwrap();
+    let plan = rows
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(plan.contains("SEARCH"), "{plan}");
+    assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+}
+
+#[tokio::test]
+async fn stage_seal_metadata_array_complete_directory_and_empty_root() {
+    let mut resources = vec![
+        (
+            "root".into(),
+            resource(&json!({"id":"array","parentId":null,"type":"array","childrenRef":"dir"})),
+        ),
+        (
+            "dir".into(),
+            directory((0..64).map(|i| format!("child-{i}")).collect(), None),
+        ),
+    ];
+    for index in 0..64 {
+        resources.push((format!("child-{index}"), resource(&json!({"id":format!("entry-{index}"),"parentId":"array","index":index,"type":"null","value":null}))));
+    }
+    let mut conn = graph_fixture(resources).await;
+    validate_attribute_graph(&mut conn, "op", "root")
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM note_stage_validation WHERE kind='entry' AND state='done'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(count, 65);
+    let mut empty = graph_fixture(vec![
+        (
+            "root".into(),
+            resource(&json!({"id":"array","parentId":null,"type":"array","childrenRef":"dir"})),
+        ),
+        ("dir".into(), directory(vec![], None)),
+    ])
+    .await;
+    validate_attribute_graph(&mut empty, "op", "root")
+        .await
+        .unwrap();
+    for index in [1, 2] {
+        let mut conn=graph_fixture(vec![("root".into(),resource(&json!({"id":"array","parentId":null,"type":"array","childrenRef":"dir"}))),("dir".into(),directory(vec!["child".into()],None)),("child".into(),resource(&json!({"id":"child","parentId":"array","index":index,"type":"null","value":null})))]).await;
+        assert!(validate_attribute_graph(&mut conn, "op", "root")
+            .await
+            .is_err());
+    }
+    for directory in [
+        json!({"kind":"metadataChildren","items":[]}),
+        json!({"kind":"metadataChildren","items":[],"nextRef":null,"extra":0}),
+        json!({"kind":"other","items":[],"nextRef":null}),
+    ] {
+        assert!(metadata_directory(&directory, true).is_err());
+    }
+}
+
+#[tokio::test]
+async fn stage_seal_metadata_foreign_and_unowned_empty_scalar_rejected() {
+    let mut conn = graph_fixture(vec![
+        (
+            "root".into(),
+            resource(&json!({"id":"root","parentId":null,"type":"string","valueRef":"empty"})),
+        ),
+        ("empty".into(), String::new()),
+    ])
+    .await;
+    validate_attribute_graph(&mut conn, "op", "root")
+        .await
+        .unwrap();
+    assert!(
+        validate_attribute_graph(&mut conn, "other-operation", "root")
+            .await
+            .is_err()
+    );
+    sqlx::query("DELETE FROM note_stage_validation")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE note_stage_text SET operation_key='other-operation' WHERE text_id='empty'")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert!(validate_attribute_graph(&mut conn, "op", "root")
+        .await
+        .is_err());
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn stage_seal_metadata_late_sql_failure_rolls_back_and_retries() {
+    let mut conn = graph_fixture(vec![
+        ("root".into(), object_root("dir")),
+        ("dir".into(), directory(vec!["child".into()], None)),
+        ("child".into(), member("child", json!({"key":"child"}))),
+    ])
+    .await;
+    sqlx::query("CREATE TEMP TRIGGER fail_child BEFORE INSERT ON note_stage_validation WHEN NEW.kind='entryId' AND NEW.id='child' BEGIN SELECT RAISE(ABORT,'injected metadata failure'); END").execute(&mut conn).await.unwrap();
+    let mut tx = conn.begin().await.unwrap();
+    let error = validate_attribute_graph(&mut tx, "op", "root")
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("injected metadata failure"),
+        "{error}"
+    );
+    let partial: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert!(partial > 0, "error is after actual ownership/stack writes");
+    tx.rollback().await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_stage_validation")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    sqlx::query("DROP TRIGGER fail_child")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let mut tx = conn.begin().await.unwrap();
+    validate_attribute_graph(&mut tx, "op", "root")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM note_stage_validation WHERE kind='entry' AND state='done'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(count, 2);
+}
