@@ -210,6 +210,7 @@ async fn replay_actual_frontend_rendered_upload_and_capture_search_details() {
     let mut deadline = None;
     let mut begin = None;
     let mut payload_digest = None;
+    let mut sealed_view = None;
     for call in captured["requests"].as_array().unwrap() {
         let params = call["params"].clone();
         let response = match call["method"].as_str().unwrap() {
@@ -237,7 +238,13 @@ async fn replay_actual_frontend_rendered_upload_and_capture_search_details() {
                 assert!(payload_digest
                     .replace(typed.payload_digest.clone())
                     .is_none());
-                store.seal_note_stage("alice", &typed).await.unwrap()
+                let response = store.seal_note_stage("alice", &typed).await.unwrap();
+                let view = response["viewId"]
+                    .as_str()
+                    .expect("seal returns the immutable view");
+                assert!(!view.is_empty());
+                assert!(sealed_view.replace(view.to_owned()).is_none());
+                response
             }
             "note.operation.read" => {
                 // Preserve the exact initial FE read. Controlled response refs and
@@ -290,7 +297,7 @@ async fn replay_actual_frontend_rendered_upload_and_capture_search_details() {
                 payload_digest.as_ref().unwrap().as_str()
             );
             assert_eq!(response["expiresAt"], begin.expires_at);
-            assert!(response["viewId"].as_str().is_some_and(|id| !id.is_empty()));
+            assert_eq!(response["viewId"], sealed_view.as_ref().unwrap().as_str());
             identity = Some(response.clone());
         }
         checked_page(&response, identity.as_ref().unwrap());
