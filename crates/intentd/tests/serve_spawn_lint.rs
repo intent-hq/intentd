@@ -1,6 +1,6 @@
 //! Source guard for the complete daemon fixture constructor and port seam.
 //!
-//! Scans all intentd test Rust sources except common/mod.rs (the implementation)
+//! Scans all intentd test Rust sources except `common/mod.rs` (the implementation)
 //! and this lint. Shared lexing excludes comments/quoted examples and decodes
 //! literals. Shared statement splitting handles multiline/chained calls with
 //! no line cap. Calls to retired partial builders are always rejected.
@@ -8,9 +8,9 @@
 //! The bounded command analysis follows simple `let [mut] name = constructor`
 //! bindings and subsequent `name.method(...)` statements, in source order until
 //! the next function or rebinding. It recognizes direct intentd binary commands,
-//! both hermetic builders, and wrappers setting INTENTD_BIN. Each raw serve
+//! both hermetic builders, and wrappers setting `INTENTD_BIN`. Each raw serve
 //! command needs the port marker; each daemon command independently needs complete
-//! identity. Identity env writes/removals, env_clear and dynamic env/envs invalidate
+//! identity. Identity env writes/removals, `env_clear` and dynamic env/envs invalidate
 //! identity until an explicit reset on that same variable, before spawn or return.
 //! Removing either token is harmless. Named mock helpers require a local reason.
 //!
