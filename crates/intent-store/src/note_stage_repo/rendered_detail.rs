@@ -250,10 +250,14 @@ pub(super) fn read(context: &Context, query: &ReceiptDetailQuery, rpc_id: &Value
             return Err(invalid());
         }
         let text = item.value.as_str().ok_or_else(invalid)?;
-        let offset = query.offset.unwrap_or(position);
-        if position != 0 && offset != position {
+        // A continuation ref identifies the same whole scalar field and carries
+        // its default next position. An explicit seek may override that position;
+        // unlike source-hit fragments it is not a position-restricted resource.
+        byte_at(text, position)?;
+        if position >= units(text) && !text.is_empty() {
             return Err(invalid());
         }
+        let offset = query.offset.unwrap_or(position);
         let byte = byte_at(text, offset)?;
         if offset >= units(text) && !text.is_empty() {
             return Err(invalid());

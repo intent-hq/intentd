@@ -261,8 +261,20 @@ fn directory_cursor_binds_ref_and_budgets_separately_from_scalar_seek() {
     q.offset = None;
     let first = checked(&context, &q, &json!(1));
     let mut next = query(first["items"][0]["nextRef"].as_str().unwrap());
+    let continued = checked(&context, &next, &json!(1));
+    assert_eq!(continued["items"][0]["offset"], 4);
     next.offset = Some(0);
-    assert!(read(&context, &next, &json!(1)).is_err());
+    let rewound = checked(&context, &next, &json!(1));
+    assert_eq!(rewound, first);
+    next.offset = Some(6);
+    let sought = checked(&context, &next, &json!(1));
+    assert_eq!(sought["items"][0]["text"], "😀");
+    assert_eq!(sought["items"][0]["id"], first["items"][0]["id"]);
+    assert!(sought["items"][0]["nextRef"].is_null());
+    for offset in [7, 8, 9] {
+        next.offset = Some(offset);
+        assert!(read(&context, &next, &json!(1)).is_err());
+    }
     next.offset = None;
     next.cursor = Some(page["items"][0]["id"].as_str().unwrap().into());
     assert!(read(&context, &next, &json!(1)).is_err());
