@@ -1,7 +1,7 @@
 //! Partial annotation retirement must remain unavailable and resumable.
 use super::{seed_heavy_workspace_children, seed_workspace, TempDb};
 use crate::{workspace_annotation_cleanup, Store};
-use intent_core::{note_page::NoteScope, NoteId};
+use intent_core::{note_page::NoteScope, Error, NoteId};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +38,9 @@ async fn workspace_annotation_retirement_rejects_reads_and_regeneration_after_ca
             source["sourceRevision"].as_str().unwrap(), None, Some("thread"), &request, &json!(1))
             .await.unwrap();
         let context = serde_json::from_value(json!({"kind":"context","contextRef":page["items"][0]["bodyRef"],"maxWireBytes":4096})).unwrap();
+        let initial_pieces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_comment_detail_piece WHERE comment_id='doomed-comment-1'")
+            .fetch_one(store.read_pool()).await.unwrap();
+        assert!(initial_pieces > 500, "fixture must span multiple committed deletion batches");
 
         let started = Arc::new(tokio::sync::Notify::new());
         let observed = started.clone();
@@ -65,23 +68,34 @@ async fn workspace_annotation_retirement_rejects_reads_and_regeneration_after_ca
         let mut connection = store.write_pool().acquire().await.unwrap();
         connection.lock_handle().await.unwrap().remove_update_hook();
         drop(connection);
-        assert!(store.read_note_annotation_context("alice", &scope,
+        let remaining_pieces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_comment_detail_piece WHERE comment_id='doomed-comment-1'")
+            .fetch_one(store.read_pool()).await.unwrap();
+        assert!(remaining_pieces > 0 && remaining_pieces < initial_pieces,
+            "cancellation must leave committed partial detail removal: {remaining_pieces}/{initial_pieces}");
+        let admission_retired: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM note_annotation_workspace_retirement WHERE workspace_id='doomed')")
+            .fetch_one(store.read_pool()).await.unwrap();
+        assert!(admission_retired, "durable admission fence must outlive the canceled cleanup");
+        assert!(matches!(store.read_note_annotation_context("alice", &scope,
             source["sourceRevision"].as_str().unwrap(),page["commentRevision"].as_str().unwrap(),
-            &context, &json!(1)).await.is_err());
-        assert!(store.read_note_annotation_page("alice", &scope,
-            source["sourceRevision"].as_str().unwrap(),None,Some("thread"),&request,&json!(1)).await.is_err());
+            &context, &json!(1)).await, Err(Error::NotFound(resource)) if resource == "note annotations"));
+        assert!(matches!(store.read_note_annotation_page("alice", &scope,
+            source["sourceRevision"].as_str().unwrap(),None,Some("thread"),&request,&json!(1)).await,
+            Err(Error::NotFound(resource)) if resource == "note annotations"));
         for statement in [
             "UPDATE note SET content='new source' WHERE workspace_id='doomed' AND id='note-1'",
             "UPDATE comment SET content='new body' WHERE id='doomed-comment-1'",
             "UPDATE note_line_attribution SET attributions_json='{}' WHERE workspace_id='doomed'",
             "INSERT INTO note_line_attribution(workspace_id,note_id,computed_at,attributions_json) VALUES('doomed','note-1','later','{}') ON CONFLICT(workspace_id,note_id) DO UPDATE SET attributions_json=excluded.attributions_json",
         ] {
-            assert!(sqlx::query(statement).execute(store.write_pool()).await.is_err());
+            let error = sqlx::query(statement).execute(store.write_pool()).await.unwrap_err();
+            assert!(matches!(error, sqlx::Error::Database(ref database)
+                if database.message() == "workspace note retirement in progress"), "{error}");
         }
         assert!(store.note_annotation_epochs(&keeper, &NoteId::from("note-1")).await.is_ok());
         store.close().await;
         let store = Store::open(&temporary.path).await.unwrap();
-        assert!(store.note_annotation_epochs(&doomed, &NoteId::from("note-1")).await.is_err());
+        assert!(matches!(store.note_annotation_epochs(&doomed, &NoteId::from("note-1")).await,
+            Err(Error::NotFound(resource)) if resource == "note annotations"));
         store.delete_workspace(&doomed).await.unwrap();
         let fences: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_annotation_workspace_retirement")
             .fetch_one(store.read_pool()).await.unwrap();

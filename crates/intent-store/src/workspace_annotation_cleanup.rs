@@ -116,7 +116,9 @@ async fn drain_comment(store: &Store, comment_id: &str) -> Result<()> {
             sqlx::query_scalar("SELECT id FROM note_comment_anchor WHERE comment_id=? LIMIT ?")
                 .bind(comment_id)
                 .bind(COMMENT_BATCH)
-                .fetch_all(store.read_pool())
+                // Keep candidate lookup on the same measured connection as
+                // child and parent deletion; cost controls cover the full batch.
+                .fetch_all(store.write_pool())
                 .await
                 .map_err(|error| database_error(&error))?;
         if anchors.is_empty() {
