@@ -6737,21 +6737,16 @@ async fn busy_queue_fallback_preserves_prepend_fields() {
 #[tokio::test]
 async fn append_failure_queue_fallback_preserves_prepend_fields() {
     let script = mock_agent_script();
-    // The rule keys on the exact "original\n\nnew" adjacency that
-    // `build_turn_prompt` renders, so the assistant response below proves the
-    // redriven drain delivered ONE combined prompt, original first.
-    let behavior = json!({
-        "rules": [{
-            "ifPromptContains": "original ask\n\nurgent update",
-            "response": "combined-original-first",
-        }],
-        "response": "prepend missing from prompt",
-    })
-    .to_string();
+    // Original attachments separate the text groups; inspect full provider blocks.
+    let scratch = test_tempdir("append-prepend-prompt-");
+    let prompt_log = scratch.path().join("prompts.jsonl");
+    let prompt_log_s = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({"response": "combined-original-first"}).to_string();
     let _env = EnvGuard::set_all(&[
         ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
         ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
         ("INTENTD_PERSIST_RETRY_BACKOFF_MS", "10,10"),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log_s.as_str()),
     ]);
     let (_tmp, mgr) = manager().await;
     let mgr = Arc::new(mgr);
@@ -6778,7 +6773,7 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
         prepend_content: Some("original ask".to_string()),
         prepend_image_blocks: Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}])),
         prepend_file_blocks: Some(json!([
-            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+            {"attachmentId": "att-orig", "data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
         ])),
         ..super::TurnOptions::default()
     };
@@ -6839,7 +6834,7 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
     assert_eq!(
         queued.prepend_file_blocks,
         Some(json!([
-            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+            {"attachmentId": "att-orig", "data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
         ]))
     );
     assert!(!queued.persisted, "user row never reached the transcript");
@@ -6851,8 +6846,7 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
     mgr.services.requeue_front(&id, queued);
 
     // Restore the store and redrive: the drain must deliver ONE combined
-    // prompt with the preempted text first (block ordering itself is covered
-    // by `build_turn_prompt_prepends_preempted_content_and_attachments_first`).
+    // prompt with the original text and attachment notice before the interrupt.
     sqlx::query("DROP VIEW agent_message")
         .execute(mgr.services.store.write_pool())
         .await
@@ -6880,6 +6874,63 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
     })
     .await
     .expect("retry turn completes and the agent goes idle");
+
+    let prompts: Vec<Value> = std::fs::read_to_string(&prompt_log)
+        .expect("provider prompt log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("prompt log line"))
+        .collect();
+    assert_eq!(prompts.len(), 1, "one redelivered provider turn");
+    let blocks = prompts[0]["blocks"].as_array().expect("provider blocks");
+    let original = blocks
+        .iter()
+        .position(|block| {
+            block["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("original ask"))
+        })
+        .expect("original prepend text reached provider");
+    let urgent = blocks
+        .iter()
+        .position(|block| {
+            block["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("urgent update"))
+        })
+        .expect("interrupt text reached provider");
+    assert_eq!(
+        urgent,
+        original + 3,
+        "original text, image and file precede interrupt: {blocks:?}"
+    );
+    assert_eq!(blocks[original + 1]["type"], "image");
+    assert_eq!(blocks[original + 1]["data"], "ORIG_IMG");
+    assert_eq!(blocks[original + 1]["mimeType"], "image/png");
+    let file = blocks[original + 2]["text"]
+        .as_str()
+        .expect("file fallback text");
+    assert!(
+        file.contains("orig.txt") && file.contains("att-orig") && file.contains("text/plain"),
+        "{file:?}"
+    );
+    for needle in ["original ask", "urgent update"] {
+        assert_eq!(
+            blocks
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .map(|text| text.matches(needle).count())
+                .sum::<usize>(),
+            1,
+            "source text delivered once: {blocks:?}"
+        );
+    }
+    assert_eq!(
+        blocks
+            .iter()
+            .filter(|block| block["data"] == "ORIG_IMG")
+            .count(),
+        1
+    );
 
     let messages = mgr
         .services
@@ -7565,8 +7616,10 @@ struct StopRedeliveryFlush413 {
     restored: Vec<crate::agent_ops::QueuedMessage>,
     /// The failed flush turn's outbound prompt text.
     first_text: String,
+    first_content: Vec<Value>,
     /// The retry turn's outbound prompt text + block types.
     retry_text: String,
+    retry_content: Vec<Value>,
     retry_blocks: Vec<String>,
     messages: Vec<intent_core::AgentMessage>,
 }
@@ -7738,7 +7791,15 @@ async fn stop_redelivery_flush_413_retry(
     StopRedeliveryFlush413 {
         restored,
         first_text,
+        first_content: prompts[0]["blocks"]
+            .as_array()
+            .expect("first blocks")
+            .clone(),
         retry_text,
+        retry_content: prompts[1]["blocks"]
+            .as_array()
+            .expect("retry blocks")
+            .clone(),
         retry_blocks,
         messages,
     }
@@ -7929,7 +7990,9 @@ async fn context_size_flush_requeue_keeps_stop_redelivery_prepend_order() {
     let StopRedeliveryFlush413 {
         restored,
         first_text,
+        first_content,
         retry_text,
+        retry_content,
         ..
     } = stop_redelivery_flush_413_retry(
         "stop-order",
@@ -7953,26 +8016,50 @@ async fn context_size_flush_requeue_keeps_stop_redelivery_prepend_order() {
         "the redelivery follows the last entry's own prepend"
     );
 
-    let expected = "first own prepend\n\nsecond own prepend\n\nstopped before output";
-    assert!(
-        first_text.contains(expected),
-        "failed flush aggregate order: {first_text:?}"
-    );
-    assert!(
-        retry_text.contains(expected),
-        "retry preserves the aggregate order: {retry_text:?}"
-    );
-    let prepend_section = |text: &str| -> String {
-        let start = text.find("first own prepend").expect("prepend start");
-        let end = text.find("first body").expect("batch start");
-        assert!(start < end, "prepends precede the batch: {text:?}");
-        text[start..end].to_string()
+    // The mock joins separate provider blocks with spaces. Assert the
+    // original prepend blocks and image rather than flattened adjacency.
+    let prepend_section = |blocks: &[Value]| -> Vec<Value> {
+        let start = blocks
+            .iter()
+            .position(|block| block["text"] == "first own prepend")
+            .expect("first prepend block");
+        let end = blocks
+            .iter()
+            .position(|block| {
+                block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Message #1:") && text.contains("first body"))
+            })
+            .expect("first batch block");
+        assert!(start < end, "prepends precede the batch: {blocks:?}");
+        blocks[start..end].to_vec()
     };
+    let first_prepends = prepend_section(&first_content);
+    assert_eq!(first_prepends.len(), 3, "{first_prepends:?}");
+    assert_eq!(first_prepends[0]["text"], "first own prepend");
     assert_eq!(
-        prepend_section(&retry_text),
-        prepend_section(&first_text),
-        "retry prepend section matches the first attempt"
+        first_prepends[1]["text"],
+        "second own prepend\n\nstopped before output"
     );
+    assert_eq!(first_prepends[2]["type"], "image");
+    assert_eq!(first_prepends[2]["data"], "aGVsbG8=");
+    assert_eq!(first_prepends[2]["mimeType"], "image/png");
+    assert_eq!(
+        prepend_section(&retry_content),
+        first_prepends,
+        "retry preserves every prepend text and attachment in order"
+    );
+    for text in [&first_text, &retry_text] {
+        for needle in [
+            "first own prepend",
+            "second own prepend",
+            "stopped before output",
+            "first body",
+            "second body",
+        ] {
+            assert_eq!(text.matches(needle).count(), 1, "{text:?}");
+        }
+    }
     assert_eq!(
         retry_text.matches("stopped before output").count(),
         1,
@@ -26046,7 +26133,7 @@ async fn queue_processing_payloads(mgr: &AgentManager, id: &AgentId) -> Vec<Valu
 
 #[tokio::test]
 async fn queue_processing_payload_carries_exact_consumed_batch_and_merged_rows() {
-    for batch in [false, true] {
+    for (batch, attachments) in [(false, false), (true, false), (false, true), (true, true)] {
         let (_tmp, mgr) = manager().await;
         let ws = WorkspaceId::new();
         let id = AgentId::new();
@@ -26064,8 +26151,8 @@ async fn queue_processing_payload_carries_exact_consumed_batch_and_merged_rows()
             let author = if batch && n == 1 { &guest.0 } else { &owner.0 };
             mgr.services.enqueue_message_with_id(&id, Some(format!("part-{n}")),
                 format!("text-{n}"),
-                Some(json!([{"type":"image","data":format!("image-{n}"),"mimeType":"image/png"}])),
-                Some(json!([{"type":"resource_link","uri":format!("file:///part-{n}"),"name":format!("part-{n}")}])),
+                attachments.then(|| json!([{"type":"image","data":format!("image-{n}"),"mimeType":"image/png"}])),
+                attachments.then(|| json!([{"type":"resource_link","uri":format!("file:///part-{n}"),"name":format!("part-{n}")}])),
                 Some(json!({"fromPrincipalId":author,"type":"question_answers","answeredQuestionsMessageId":format!("question-{n}")})),
                 None, false, MessageOrigin::User);
         }
@@ -26073,7 +26160,7 @@ async fn queue_processing_payload_carries_exact_consumed_batch_and_merged_rows()
         while let Some(entry) = mgr.services.dequeue_message(&id) {
             consumed.push(entry);
         }
-        assert_eq!(consumed.len(), if batch { 2 } else { 1 });
+        assert_eq!(consumed.len(), if batch || attachments { 2 } else { 1 });
         // A later live row must never replace the already-consumed payload.
         mgr.services.enqueue_message_with_id(
             &id,
@@ -26104,8 +26191,16 @@ async fn queue_processing_payload_carries_exact_consumed_batch_and_merged_rows()
             assert_eq!(row["id"], consumed[index].id);
             assert_eq!(row["turnId"], consumed[index].turn_id);
             assert_eq!(row["content"], entry.content);
-            assert_eq!(row["imageBlocks"], *entry.image_blocks.as_ref().unwrap());
-            assert_eq!(row["fileBlocks"], *entry.file_blocks.as_ref().unwrap());
+            assert_eq!(row.get("imageBlocks"), entry.image_blocks.as_ref());
+            assert_eq!(row.get("fileBlocks"), entry.file_blocks.as_ref());
+            if attachments {
+                assert_eq!(row["imageBlocks"][0]["data"], format!("image-{index}"));
+                assert_eq!(row["fileBlocks"][0]["uri"], format!("file:///part-{index}"));
+                assert!(row["content"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("text-{index}")));
+            }
             assert_eq!(
                 row["messageMetadata"],
                 *entry.message_metadata.as_ref().unwrap()
@@ -26119,9 +26214,11 @@ async fn queue_processing_payload_carries_exact_consumed_batch_and_merged_rows()
                 }
             );
         }
-        if !batch {
-            assert_eq!(rows[0]["imageBlocks"].as_array().unwrap().len(), 2);
-            assert_eq!(rows[0]["fileBlocks"].as_array().unwrap().len(), 2);
+        if !batch && !attachments {
+            assert!(rows[0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("text-0\n\ntext-1"));
             assert_eq!(
                 rows[0]["messageMetadata"]["mergedMessageMetadata"]
                     .as_array()
@@ -26136,40 +26233,57 @@ async fn queue_processing_payload_carries_exact_consumed_batch_and_merged_rows()
 
 #[tokio::test]
 async fn queue_processing_payload_ordinary_drain_retains_recovered_merged_contributions() {
-    let (_tmp, mgr) = manager().await;
-    let mgr = Arc::new(mgr);
-    let ws = WorkspaceId::new();
-    let id = AgentId::new();
-    seed_agent(&mgr, &ws, &id).await;
-    let _agent = track_mock_agent(&mgr, &id, false);
-    let owner = mgr.services.store.get_primary_principal().await.unwrap().id;
-    for n in 0..2 {
-        mgr.services.enqueue_message_with_id(&id, Some(format!("part-{n}")),
-            format!("text-{n}"), None, Some(json!([{"type":"resource_link","uri":format!("file:///part-{n}"),"name":format!("part-{n}")}])),
+    for attachments in [false, true] {
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let ws = WorkspaceId::new();
+        let id = AgentId::new();
+        seed_agent(&mgr, &ws, &id).await;
+        let _agent = track_mock_agent(&mgr, &id, false);
+        let owner = mgr.services.store.get_primary_principal().await.unwrap().id;
+        for n in 0..2 {
+            mgr.services.enqueue_message_with_id(&id, Some(format!("part-{n}")),
+            format!("text-{n}"), None, attachments.then(|| json!([{"type":"resource_link","uri":format!("file:///part-{n}"),"name":format!("part-{n}")}])),
             Some(json!({"fromPrincipalId":owner.0,"type":"question_answers","answeredQuestionsMessageId":format!("question-{n}")})),
             None, false, MessageOrigin::User);
+        }
+        mgr.services.persist_queue_snapshot(&id).await;
+        mgr.services.agent_queues.lock().unwrap().clear();
+        assert_eq!(mgr.services.rehydrate_agent_queues().await.unwrap(), 1);
+        let queued = mgr.services.queue_snapshot(&id);
+        assert_eq!(queued.len(), if attachments { 2 } else { 1 });
+        mgr.clone().try_drain_queue(id.clone(), ws).await;
+        let events = queue_processing_payloads(&mgr, &id).await;
+        assert_eq!(events.len(), queued.len());
+        for (index, (event, queued)) in events.iter().zip(&queued).enumerate() {
+            let rows = event["queuedMessages"].as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            for field in ["id", "turnId", "fileBlocks", "messageMetadata"] {
+                assert_eq!(rows[0][field], queued[field]);
+            }
+            let expected = if attachments {
+                format!("text-{index}")
+            } else {
+                "text-0\n\ntext-1".into()
+            };
+            assert!(rows[0]["content"].as_str().unwrap().starts_with(&expected));
+            if attachments {
+                assert_eq!(
+                    rows[0]["fileBlocks"][0]["uri"],
+                    format!("file:///part-{index}")
+                );
+            } else {
+                assert_eq!(
+                    rows[0]["messageMetadata"]["mergedMessageMetadata"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    2
+                );
+            }
+            assert_eq!(rows[0]["author"]["principalId"], owner.0);
+        }
     }
-    mgr.services.persist_queue_snapshot(&id).await;
-    mgr.services.agent_queues.lock().unwrap().clear();
-    assert_eq!(mgr.services.rehydrate_agent_queues().await.unwrap(), 1);
-    let queued = mgr.services.queue_snapshot(&id)[0].clone();
-    mgr.clone().try_drain_queue(id.clone(), ws).await;
-    let events = queue_processing_payloads(&mgr, &id).await;
-    assert_eq!(events.len(), 1);
-    let rows = events[0]["queuedMessages"].as_array().unwrap();
-    assert_eq!(rows.len(), 1);
-    for field in ["id", "turnId", "fileBlocks"] {
-        assert_eq!(rows[0][field], queued[field]);
-    }
-    assert!(rows[0]["content"]
-        .as_str()
-        .unwrap()
-        .starts_with("text-0\n\ntext-1"));
-    assert_eq!(
-        rows[0]["messageMetadata"]["mergedMessageMetadata"],
-        queued["messageMetadata"]["mergedMessageMetadata"]
-    );
-    assert_eq!(rows[0]["author"]["principalId"], owner.0);
 }
 
 #[tokio::test]

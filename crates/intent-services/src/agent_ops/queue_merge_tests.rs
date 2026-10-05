@@ -405,7 +405,7 @@ async fn queue_merge_interrupt_retains_position_and_carryover() {
 
 #[tokio::test]
 async fn queue_merge_provisional_handback_coalesces_newer_held_input() {
-    for batch in [false, true] {
+    for (batch, attachments) in [(false, false), (true, false), (false, true), (true, true)] {
         let (_tmp, svc, ws) = setup().await;
         let agent = create_agent(&svc, &ws, "Handback").await;
         let first = enqueue(&svc, &agent, "first", "a", "one");
@@ -418,12 +418,12 @@ async fn queue_merge_provisional_handback_coalesces_newer_held_input() {
             .get(&agent)
             .unwrap()
             .is_empty());
-        popped.image_blocks = Some(json!([{"imageRef":"first"}]));
+        popped.image_blocks = attachments.then(|| json!([{"imageRef":"first"}]));
         let (newer, _) = svc.enqueue_message_with_id(
             &agent,
             Some("second".into()),
             "two".into(),
-            Some(json!([{"imageRef":"second"}])),
+            attachments.then(|| json!([{"imageRef":"second"}])),
             None,
             Some(json!({"fromPrincipalId":"a"})),
             None,
@@ -441,15 +441,22 @@ async fn queue_merge_provisional_handback_coalesces_newer_held_input() {
         }
         drop(draining);
         let queue = svc.queue_snapshot(&agent);
-        assert_eq!(queue.len(), 1, "undelivered handback must coalesce");
+        assert_eq!(queue.len(), if attachments { 2 } else { 1 });
         assert_eq!(queue[0]["id"], first.id);
-        assert_eq!(queue[0]["content"], "one\n\ntwo");
-        assert_eq!(queue[0]["editing"], true);
-        assert_eq!(queue[0]["editingMessageId"], newer.id);
-        assert_eq!(
-            queue[0]["imageBlocks"],
-            json!([{"imageRef":"first"},{"imageRef":"second"}])
-        );
+        let held_index = usize::from(attachments);
+        if attachments {
+            assert_eq!(queue[0]["content"], "one");
+            assert_eq!(queue[0]["imageBlocks"], json!([{"imageRef":"first"}]));
+            assert_eq!(queue[1]["id"], newer.id);
+            assert_eq!(queue[1]["content"], "two");
+            assert_eq!(queue[1]["imageBlocks"], json!([{"imageRef":"second"}]));
+            assert_eq!(queue[1]["editingMessageId"], newer.id);
+        } else {
+            assert_eq!(queue[0]["content"], "one\n\ntwo");
+            assert_eq!(queue[0]["editingMessageId"], newer.id);
+            assert!(queue[0].get("imageBlocks").is_none());
+        }
+        assert_eq!(queue[held_index]["editing"], true);
         assert!(matches!(
             svc.claim_parked_recovery_send(&agent),
             RecoverySendClaim::Deferred
@@ -458,25 +465,46 @@ async fn queue_merge_provisional_handback_coalesces_newer_held_input() {
             .agent_edit_queued_message_op(agent.clone(), newer.id, "edited two".into(), Some(false))
             .await
             .unwrap();
-        assert_eq!(saved["queuedMessage"]["content"], "one\n\nedited two");
-        assert!(saved["queuedMessage"].get("editingMessageId").is_none());
-        assert!(svc
-            .agent_edit_queued_message_op(
-                agent.clone(),
-                "second".into(),
-                "stale".into(),
-                Some(false)
-            )
-            .await
-            .is_err());
-        assert_eq!(
-            enqueue(&svc, &agent, "second", "a", "two").content,
+        let edited = if attachments {
+            "edited two"
+        } else {
             "one\n\nedited two"
-        );
-        let RecoverySendClaim::Drained(pair) = svc.claim_parked_recovery_send(&agent) else {
-            panic!("absorbed recovery id must still authorize the survivor")
         };
-        assert_eq!(pair.0.id, first.id);
+        assert_eq!(saved["queuedMessage"]["content"], edited);
+        if attachments {
+            assert_eq!(
+                saved["queuedMessage"]["imageBlocks"],
+                json!([{"imageRef":"second"}])
+            );
+            let first_row = svc.queue_snapshot(&agent)[0].clone();
+            assert_eq!(first_row["content"], "one");
+            assert_eq!(first_row["imageBlocks"], json!([{"imageRef":"first"}]));
+        }
+        assert!(saved["queuedMessage"].get("editingMessageId").is_none());
+        if !attachments {
+            assert!(svc
+                .agent_edit_queued_message_op(
+                    agent.clone(),
+                    "second".into(),
+                    "stale".into(),
+                    Some(false)
+                )
+                .await
+                .is_err());
+        }
+        assert_eq!(enqueue(&svc, &agent, "second", "a", "two").content, edited);
+        let RecoverySendClaim::Drained(pair) = svc.claim_parked_recovery_send(&agent) else {
+            panic!("held recovery id must still authorize its queue row")
+        };
+        assert_eq!(
+            pair.0.id,
+            if attachments {
+                "second".into()
+            } else {
+                first.id
+            }
+        );
+        assert_eq!(pair.0.content, edited);
     }
 }
 
