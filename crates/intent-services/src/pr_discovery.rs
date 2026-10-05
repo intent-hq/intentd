@@ -129,7 +129,7 @@ struct Budget {
     started: Instant,
     available: usize,
     pending: VecDeque<(Key, usize, Instant)>,
-    grants: HashMap<Key, usize>,
+    grants: HashMap<Key, (usize, Instant)>,
 }
 
 impl Default for Budget {
@@ -161,36 +161,56 @@ impl Drop for Lease {
 }
 
 impl Budget {
-    fn reserve(shared: &Arc<Mutex<Self>>, key: &Key) -> Result<Arc<Lease>> {
+    fn reserve(
+        shared: &Arc<Mutex<Self>>,
+        key: &Key,
+        retry_interval: Duration,
+    ) -> Result<Arc<Lease>> {
         let now = Instant::now();
+        // Allow at least one scheduled retry even with a slower user setting.
+        // Default cadence retains the existing thirty-minute abandonment limit.
+        let expires_at = now + (WINDOW * 10).max(retry_interval.saturating_mul(2));
         let cost = if key.number.is_none() {
             LIST_RESERVATION
         } else {
             RECORD_RESERVATION
         };
         let mut state = shared.lock().unwrap();
+        // A slow automatic caller may not return for several budget windows.
+        // Keep its reserved turn until real demand expires, just like pending
+        // work. Promotion itself must not renew that demand deadline.
+        let mut released = 0;
+        state.grants.retain(|key, (cost, deadline)| {
+            let live = key.scope.is_current() && now < *deadline;
+            if !live {
+                released += *cost;
+            }
+            live
+        });
+        state.available += released;
         if now.duration_since(state.started) >= WINDOW {
             state.started = now;
-            state.available = ATTEMPTS;
-            state.grants.clear();
+            // Carried grants reserve capacity in the NEW window, not credits
+            // in addition to its cap. Claimed leases still expire per window.
+            state.available = ATTEMPTS - state.grants.values().map(|(cost, _)| cost).sum::<usize>();
         }
         state
             .pending
-            .retain(|(key, _, at)| key.scope.is_current() && now.duration_since(*at) < WINDOW * 10);
-        // Queue position is FIFO age; this timestamp is last activity.
+            .retain(|(key, _, deadline)| key.scope.is_current() && now < *deadline);
+        // Queue position is FIFO age; this deadline follows actual retries.
         // Retrying active work must not expire behind a sustained backlog.
-        if let Some((_, _, last_active)) = state.pending.iter_mut().find(|(k, _, _)| k == key) {
-            *last_active = now;
+        if let Some((_, _, deadline)) = state.pending.iter_mut().find(|(k, _, _)| k == key) {
+            *deadline = expires_at;
         }
         // Reserve older denied work first, even when the sweep visits a busy
-        // workspace first again. Unclaimed reservations expire next window.
+        // workspace first again, preserving grants for slower callers.
         while let Some((_, cost, _)) = state.pending.front() {
             if *cost > state.available {
                 break;
             }
-            let (key, cost, _) = state.pending.pop_front().unwrap();
+            let (key, cost, deadline) = state.pending.pop_front().unwrap();
             state.available -= cost;
-            state.grants.insert(key, cost);
+            state.grants.insert(key, (cost, deadline));
         }
         let admitted = state.grants.remove(key).is_some();
         if !admitted {
@@ -200,7 +220,7 @@ impl Budget {
                 if state.pending.len() < REPOSITORIES + RECORDS
                     && !state.pending.iter().any(|(k, _, _)| k == key)
                 {
-                    state.pending.push_back((key.clone(), cost, now));
+                    state.pending.push_back((key.clone(), cost, expires_at));
                 }
                 return Err(unknown("background PR refresh deferred by request budget"));
             }
@@ -428,7 +448,8 @@ impl Discovery {
             let lease = force_after
                 .is_none()
                 .then(|| {
-                    Budget::reserve(&self.budget, &key).inspect_err(|_| background_deferred = true)
+                    Budget::reserve(&self.budget, &key, max_age)
+                        .inspect_err(|_| background_deferred = true)
                 })
                 .transpose()?;
             let _permit = self
@@ -673,7 +694,7 @@ mod tests {
     fn shared_discovery_budget_refunds_unused_and_prioritizes_deferred_work() {
         let budget = Arc::new(Mutex::new(Budget::default()));
         let scope = scope();
-        let first = Budget::reserve(&budget, &key(&scope, 0, None)).unwrap();
+        let first = Budget::reserve(&budget, &key(&scope, 0, None), WINDOW).unwrap();
         first.remaining.fetch_sub(3, Ordering::SeqCst);
         drop(first);
         assert_eq!(budget.lock().unwrap().available, ATTEMPTS - 3);
@@ -681,16 +702,16 @@ mod tests {
         // order. Next window must reserve it before the first workspace again.
         budget.lock().unwrap().available = 0;
         for i in 1..=4 {
-            assert!(Budget::reserve(&budget, &key(&scope, i, None)).is_err());
+            assert!(Budget::reserve(&budget, &key(&scope, i, None), WINDOW).is_err());
         }
         budget.lock().unwrap().started -= WINDOW;
-        assert!(Budget::reserve(&budget, &key(&scope, 0, None)).is_err());
+        assert!(Budget::reserve(&budget, &key(&scope, 0, None), WINDOW).is_err());
         for i in 1..=3 {
-            let lease = Budget::reserve(&budget, &key(&scope, i, None)).unwrap();
+            let lease = Budget::reserve(&budget, &key(&scope, i, None), WINDOW).unwrap();
             lease.remaining.store(0, Ordering::SeqCst);
         }
         budget.lock().unwrap().started -= WINDOW;
-        let fourth = Budget::reserve(&budget, &key(&scope, 4, None)).unwrap();
+        let fourth = Budget::reserve(&budget, &key(&scope, 4, None), WINDOW).unwrap();
         assert_eq!(fourth.remaining.load(Ordering::SeqCst), LIST_RESERVATION);
     }
 
@@ -698,15 +719,166 @@ mod tests {
     fn shared_discovery_old_leases_cannot_refill_a_new_window() {
         let budget = Arc::new(Mutex::new(Budget::default()));
         let scope = scope();
-        let lease = Budget::reserve(&budget, &key(&scope, 0, None)).unwrap();
+        let lease = Budget::reserve(&budget, &key(&scope, 0, None), WINDOW).unwrap();
         budget.lock().unwrap().started -= WINDOW;
-        let current = Budget::reserve(&budget, &key(&scope, 1, None)).unwrap();
+        let current = Budget::reserve(&budget, &key(&scope, 1, None), WINDOW).unwrap();
         let available = budget.lock().unwrap().available;
         drop(lease);
         assert_eq!(budget.lock().unwrap().available, available);
         drop(current);
         assert_eq!(budget.lock().unwrap().available, ATTEMPTS);
     }
+    #[tokio::test(start_paused = true)]
+    async fn shared_discovery_carried_grants_share_the_current_window_cap() {
+        let budget = Arc::new(Mutex::new(Budget::default()));
+        let scope = scope();
+        budget.lock().unwrap().available = 0;
+        for repo in 0..3 {
+            assert!(Budget::reserve(&budget, &key(&scope, repo, None), WINDOW).is_err());
+        }
+        tokio::time::advance(WINDOW).await;
+        let old = Budget::reserve(&budget, &key(&scope, 0, None), WINDOW).unwrap();
+        // Two unclaimed grants outlive four windows before their idle callers
+        // return. New work must share capacity with them, never add to it.
+        tokio::time::advance(WINDOW * 4).await;
+        let current = Budget::reserve(&budget, &key(&scope, 3, Some(1)), WINDOW).unwrap();
+        let mut leases = vec![current];
+        for repo in 1..3 {
+            leases.push(Budget::reserve(&budget, &key(&scope, repo, None), WINDOW).unwrap());
+        }
+        leases.push(Budget::reserve(&budget, &key(&scope, 4, None), WINDOW).unwrap());
+        leases.push(Budget::reserve(&budget, &key(&scope, 3, Some(2)), WINDOW).unwrap());
+        assert_eq!(budget.lock().unwrap().available, 0);
+        assert_eq!(
+            leases
+                .iter()
+                .map(|l| l.remaining.load(Ordering::SeqCst))
+                .sum::<usize>(),
+            ATTEMPTS
+        );
+        assert!(leases.iter().all(|l| l.window == Instant::now()));
+        drop(old);
+        assert_eq!(
+            budget.lock().unwrap().available,
+            0,
+            "old leases cannot refund carried grants"
+        );
+        for lease in leases {
+            lease.remaining.store(0, Ordering::SeqCst);
+        }
+        assert!(Budget::reserve(&budget, &key(&scope, 3, Some(3)), WINDOW).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_discovery_abandoned_grants_expire_at_original_demand_deadline() {
+        // Exercise pruning both during and at the reset of a budget window.
+        for reset_at_expiry in [false, true] {
+            let budget = Arc::new(Mutex::new(Budget::default()));
+            let scope = scope();
+            budget.lock().unwrap().available = 0;
+            for repo in 0..3 {
+                assert!(Budget::reserve(&budget, &key(&scope, repo, None), WINDOW).is_err());
+            }
+            tokio::time::advance(WINDOW).await;
+            let active = key(&scope, 3, None);
+            assert!(Budget::reserve(&budget, &active, WINDOW).is_err());
+            tokio::time::advance(WINDOW * 9 - Duration::from_secs(1)).await;
+            assert!(Budget::reserve(&budget, &active, WINDOW).is_err());
+            assert_eq!(
+                budget.lock().unwrap().grants.len(),
+                3,
+                "live until exactly 1800s"
+            );
+            if reset_at_expiry {
+                budget.lock().unwrap().started -= WINDOW;
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let lease = Budget::reserve(&budget, &active, WINDOW).unwrap();
+            assert!(budget.lock().unwrap().grants.is_empty());
+            assert_eq!(
+                budget.lock().unwrap().available,
+                ATTEMPTS - LIST_RESERVATION
+            );
+            drop(lease);
+            assert_eq!(
+                budget.lock().unwrap().available,
+                ATTEMPTS,
+                "refund exactly once"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_discovery_revoked_grants_refund_once_with_or_without_window_reset() {
+        for reset in [false, true] {
+            let budget = Arc::new(Mutex::new(Budget::default()));
+            let revoked = scope();
+            budget.lock().unwrap().available = 0;
+            for repo in 0..3 {
+                assert!(Budget::reserve(&budget, &key(&revoked, repo, None), WINDOW).is_err());
+            }
+            tokio::time::advance(WINDOW).await;
+            assert!(Budget::reserve(&budget, &key(&revoked, 3, None), WINDOW).is_err());
+            assert_eq!(budget.lock().unwrap().grants.len(), 3);
+            intent_sourcecontrol::cache_scope::invalidate_authorization();
+            if reset {
+                tokio::time::advance(WINDOW).await;
+            }
+            let current = scope();
+            for _ in 0..2 {
+                let lease = Budget::reserve(&budget, &key(&current, 4, None), WINDOW).unwrap();
+                assert!(budget.lock().unwrap().grants.is_empty());
+                assert!(budget.lock().unwrap().pending.is_empty());
+                assert_eq!(
+                    budget.lock().unwrap().available,
+                    ATTEMPTS - LIST_RESERVATION
+                );
+                drop(lease);
+                assert_eq!(budget.lock().unwrap().available, ATTEMPTS);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_discovery_slow_abandoned_demand_expires_without_promotion_renewal() {
+        for seconds in [1800, 3600] {
+            for promote in [false, true] {
+                let budget = Arc::new(Mutex::new(Budget::default()));
+                let scope = scope();
+                let abandoned = key(&scope, 0, None);
+                let active = key(&scope, 1, None);
+                let interval = Duration::from_secs(seconds);
+                budget.lock().unwrap().available = 0;
+                assert!(Budget::reserve(&budget, &abandoned, interval).is_err());
+                tokio::time::advance(WINDOW).await;
+                if promote {
+                    drop(Budget::reserve(&budget, &active, WINDOW).unwrap());
+                }
+                // Freeze an exhausted window so we can observe the pending
+                // deadline too, without implicitly promoting the waiter.
+                tokio::time::advance(interval * 2 - WINDOW - Duration::from_secs(1)).await;
+                {
+                    let mut state = budget.lock().unwrap();
+                    state.started = Instant::now();
+                    state.available = 0;
+                }
+                assert!(Budget::reserve(&budget, &active, WINDOW).is_err());
+                {
+                    let state = budget.lock().unwrap();
+                    assert!(
+                        state.grants.contains_key(&abandoned)
+                            || state.pending.iter().any(|(k, _, _)| k == &abandoned)
+                    );
+                }
+                tokio::time::advance(Duration::from_secs(1)).await;
+                let _ = Budget::reserve(&budget, &active, WINDOW);
+                let state = budget.lock().unwrap();
+                assert!(!state.grants.contains_key(&abandoned));
+                assert!(state.pending.iter().all(|(k, _, _)| k != &abandoned));
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn shared_discovery_repair_active_fifo_survives_sixty_windows() {
         let budget = Arc::new(Mutex::new(Budget::default()));
@@ -719,7 +891,7 @@ mod tests {
         for _ in 0..60 {
             let mut attempts = 0;
             for (i, key) in keys.iter().enumerate() {
-                if let Ok(lease) = Budget::reserve(&budget, key) {
+                if let Ok(lease) = Budget::reserve(&budget, key, WINDOW) {
                     // A complete ten-page list, or one targeted PR read.
                     let cost = if key.number.is_none() { 10 } else { 1 };
                     lease.remaining.fetch_sub(cost, Ordering::SeqCst);
@@ -743,13 +915,13 @@ mod tests {
         let active = key(&scope, 0, None);
         let abandoned = key(&scope, 1, None);
         budget.lock().unwrap().available = 0;
-        assert!(Budget::reserve(&budget, &active).is_err());
-        assert!(Budget::reserve(&budget, &abandoned).is_err());
+        assert!(Budget::reserve(&budget, &active, WINDOW).is_err());
+        assert!(Budget::reserve(&budget, &abandoned, WINDOW).is_err());
         for _ in 0..11 {
             tokio::time::advance(WINDOW).await;
             // Keep this window exhausted, so only liveness/retention runs.
             budget.lock().unwrap().started = Instant::now();
-            assert!(Budget::reserve(&budget, &active).is_err());
+            assert!(Budget::reserve(&budget, &active, WINDOW).is_err());
         }
         let state = budget.lock().unwrap();
         assert_eq!(state.pending.len(), 1);

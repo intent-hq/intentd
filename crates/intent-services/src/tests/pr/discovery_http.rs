@@ -1620,3 +1620,92 @@ async fn automatic_http_admission_and_cache_use_each_workspace_tier() {
         assert_eq!(api.requests.lock().unwrap().len(), 4, "interval {interval}");
     }
 }
+
+#[tokio::test]
+async fn automatic_idle_discovery_progresses_under_active_repository_saturation() {
+    automatic_discovery_saturation(60).await;
+}
+
+#[tokio::test]
+async fn automatic_discovery_progresses_with_thirty_minute_setting() {
+    automatic_discovery_saturation(1800).await;
+}
+
+#[tokio::test]
+async fn automatic_discovery_progresses_with_hourly_setting() {
+    automatic_discovery_saturation(3600).await;
+}
+
+async fn automatic_discovery_saturation(poll_seconds: u64) {
+    // Real sockets and SQLite must not make paused time jump to I/O deadlines.
+    struct Clock(tokio::task::JoinHandle<()>);
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            self.0.abort();
+            tokio::time::resume();
+        }
+    }
+    tokio::time::pause();
+    let _clock = Clock(tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    }));
+    // Ten HTTP pages per successful repository listing, with no matching PR.
+    let api = Api::new((1..=900).map(|n| pull(n, "unrelated")).collect()).await;
+    let (_db, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let svc = svc
+        .with_source_control(api.sc())
+        .with_pr_monitor_poll_seconds(poll_seconds);
+    let mut workspaces = Vec::new();
+    for n in 0..12 {
+        workspaces.push(consumer(&svc, "absent", &format!("active-{n}")).await);
+    }
+    let idle = consumer(&svc, "absent", "idle").await;
+    let yesterday = (time::OffsetDateTime::now_utc() - time::Duration::days(2))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    sqlx::query("UPDATE workspace SET last_content_activity = ? WHERE id = ?")
+        .bind(yesterday)
+        .bind(&idle.id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    workspaces.push(idle);
+    let caller = owner_caller(&svc).await;
+    let mut window_start = 0;
+    let ticks = 2 * poll_seconds.max(900) / poll_seconds;
+    for tick in 0..=ticks {
+        let elapsed = tick * poll_seconds;
+        if elapsed.is_multiple_of(180) {
+            window_start = api.requests.lock().unwrap().len();
+        }
+        // Visit busy repositories first. Admission and failure caching enforce
+        // the configured floor as well as the longer idle interval.
+        for ws in &workspaces {
+            let _ =
+                intent_core::with_caller(caller.clone(), svc.pr_refresh_automatic(ws.id.clone()))
+                    .await;
+        }
+        {
+            let requests = api.requests.lock().unwrap();
+            assert!(
+                requests.len() - window_start <= 128,
+                "window at second {elapsed}, configured {poll_seconds}s"
+            );
+            if elapsed < poll_seconds.max(900) {
+                assert!(requests
+                    .iter()
+                    .all(|path| !path.starts_with("/repos/o/idle/")));
+            }
+        }
+        tokio::time::advance(std::time::Duration::from_secs(poll_seconds)).await;
+    }
+    let requests = api.requests.lock().unwrap();
+    let idle_requests = requests
+        .iter()
+        .filter(|path| path.starts_with("/repos/o/idle/"))
+        .count();
+    assert!(idle_requests >= 10, "idle repository must complete a listing within two retry intervals despite active demand: {idle_requests} HTTP requests, configured {poll_seconds}s");
+    assert_eq!(idle_requests % 10, 0, "every admitted listing completes");
+}
