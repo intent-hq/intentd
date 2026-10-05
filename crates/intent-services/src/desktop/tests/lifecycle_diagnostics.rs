@@ -138,7 +138,8 @@ async fn desktop_lifecycle_terminal_failure_before_grant_delivery_keeps_actual_r
     );
     drop(outbox_guard);
     let gate = h.services.desktop.gate(&h.agent);
-    let _guard = gate.lock().await;
+    let guard = gate.lock().await;
+    drop(guard);
     let message = outcome(&h, "requestId", pending["requestId"].as_str().unwrap()).await;
     assert_eq!(message["metadata"]["outcome"], "invalidated");
     assert_eq!(message["metadata"]["reason"], "agent_terminated");
@@ -149,4 +150,71 @@ async fn desktop_lifecycle_terminal_failure_before_grant_delivery_keeps_actual_r
         h.agent("listDisplay", json!({})).await.unwrap_err().code,
         "desktop-not-active"
     );
+}
+
+#[tokio::test]
+async fn desktop_lifecycle_startup_revocation_keeps_one_terminal_reason_without_grant() {
+    let h = Harness::new().await;
+    h.executor
+        .hold_start
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let pending = h.agent("startControl", json!({})).await.unwrap();
+    h.client(
+        "respondPermission",
+        json!({"requestId":pending["requestId"],"decision":"allow_once"}),
+    )
+    .await
+    .unwrap();
+    h.executor.start_seen.notified().await;
+    let start = h
+        .executor
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|p| p["operation"] == "startControl")
+        .unwrap()
+        .clone();
+    // Real executor ordering: local cleanup/revoke completes before the start error reply.
+    h.client(
+        "revoke",
+        json!({"sessionId":start["sessionId"],"reason":"executor_failed"}),
+    )
+    .await
+    .unwrap();
+    *h.executor.fail.lock().unwrap() = Some("startControl".into());
+    *h.executor.failure.lock().unwrap() = Some(error(
+        "desktop-execution-failed",
+        "Local desktop readiness failed.",
+    ));
+    h.executor.release_start.notify_one();
+    let gate = h.services.desktop.gate(&h.agent);
+    let guard = gate.lock().await;
+    drop(guard);
+    assert_eq!(h.services.desktop.state(&h.agent), DesktopState::Inactive);
+    let outcomes: Vec<String> = sqlx::query_scalar("SELECT json_extract(value,'$.payload') FROM settings WHERE key GLOB 'desktop.v1/outbox/*' AND json_extract(value,'$.payload.requestId')=?")
+        .bind(pending["requestId"].as_str().unwrap()).fetch_all(h.services.store.read_pool()).await.unwrap();
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "late readiness failure must not duplicate or replace terminal outcome"
+    );
+    let payload: Value = serde_json::from_str(&outcomes[0]).unwrap();
+    assert_eq!(payload["outcome"], "revoked");
+    assert!(!h
+        .executor
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| p["operation"] == "prepareCommand" || p["operation"] == "execute"));
+    assert_eq!(
+        h.agent("listDisplay", json!({})).await.unwrap_err().code,
+        "desktop-not-active"
+    );
+    let message = outcome(&h, "requestId", pending["requestId"].as_str().unwrap()).await;
+    assert_eq!(message["metadata"]["reason"], "executor_failed");
+    assert!(visible_text(&message).contains("executor_failed"));
+    assert!(!visible_text(&message).contains("rescinded by the user"));
+    assert!(message["metadata"].get("reportId").is_none());
 }

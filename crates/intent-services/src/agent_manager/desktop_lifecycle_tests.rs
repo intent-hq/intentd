@@ -50,10 +50,36 @@ async fn desktop_lifecycle_normal_turn_and_mcp_transport_recreation_keep_control
             line.contains(active["sessionId"].as_str().unwrap()),
             "{line}"
         );
+        eprintln!(
+            "before drop state {:?}, session {:?}",
+            h.services.desktop.state(&h.agent),
+            h.services
+                .store
+                .get_agent_session_summary(&h.agent)
+                .await
+                .unwrap()
+                .status
+        );
         drop(write);
         drop(reader);
         drop(bridge);
         manager.kill_child_only(&h.agent).await;
+        eprintln!(
+            "after child kill state {:?}, session {:?}, terminal {:?}",
+            h.services.desktop.state(&h.agent),
+            h.services
+                .store
+                .get_agent_session_summary(&h.agent)
+                .await
+                .unwrap()
+                .status,
+            h.services
+                .store
+                .desktop_terminal(active["sessionId"].as_str().unwrap())
+                .await
+                .unwrap()
+                .map(|r| r["reason"].clone())
+        );
         assert!(
             matches!(h.services.desktop_current_state(&h.agent).await,DesktopState::Active{session_id,..} if session_id==active["sessionId"].as_str().unwrap())
         );

@@ -67,6 +67,12 @@ impl AgentReverseDispatch for Executor {
                 return Err(error("desktop-offline", "Connection changed"));
             }
             self.calls.lock().unwrap().push(params.clone());
+            if params["operation"] == "startControl"
+                && self.hold_start.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.start_seen.notify_one();
+                self.release_start.notified().await;
+            }
             if self.fail.lock().unwrap().as_deref() == params["operation"].as_str() {
                 return Err(self
                     .failure
@@ -74,12 +80,6 @@ impl AgentReverseDispatch for Executor {
                     .unwrap()
                     .clone()
                     .unwrap_or_else(|| error("desktop-execution-failed", "Native failure")));
-            }
-            if params["operation"] == "startControl"
-                && self.hold_start.load(std::sync::atomic::Ordering::Relaxed)
-            {
-                self.start_seen.notify_one();
-                self.release_start.notified().await;
             }
             Ok(match params["operation"].as_str().unwrap() {
                 "prepare" => {
