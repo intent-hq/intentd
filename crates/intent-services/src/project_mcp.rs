@@ -584,21 +584,20 @@ fn parse_jsonc(text: &str) -> Option<Value> {
                 continue;
             }
             b'"' => quoted = !quoted,
-            b',' if !quoted => {
-                if bytes[i + 1..]
+            b',' if !quoted
+                && bytes[i + 1..]
                     .iter()
                     .find(|c| !c.is_ascii_whitespace())
-                    .is_some_and(|c| matches!(c, b'}' | b']'))
+                    .is_some_and(|c| matches!(c, b'}' | b']')) =>
+            {
+                if bytes[..i]
+                    .iter()
+                    .rfind(|c| !c.is_ascii_whitespace())
+                    .is_none_or(|c| matches!(c, b'{' | b'[' | b',' | b':'))
                 {
-                    if bytes[..i]
-                        .iter()
-                        .rfind(|c| !c.is_ascii_whitespace())
-                        .is_none_or(|c| matches!(c, b'{' | b'[' | b',' | b':'))
-                    {
-                        return None;
-                    }
-                    bytes[i] = b' ';
+                    return None;
                 }
+                bytes[i] = b' ';
             }
             _ => (),
         }
