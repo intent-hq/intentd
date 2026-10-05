@@ -865,13 +865,9 @@ pub(crate) async fn observe_exit_status(
     status
 }
 
-/// How many trailing stderr lines to include in an exit attribution. npm's
-/// final line is typically just "A complete log of this run can be found
-/// in: …" with the actual cause a few lines earlier, so a single line is
-/// not enough.
-const STDERR_TAIL_LINES: usize = 3;
-/// Character bound on the joined stderr tail (kept from the end).
-const STDERR_TAIL_MAX_CHARS: usize = 300;
+/// Character budget for captured stderr in an exit diagnostic. Large enough
+/// for npm's cause/path plus boilerplate, while keeping warning strings bounded.
+const STDERR_EXCERPT_MAX_CHARS: usize = 4_096;
 
 /// The "adapter died" detail for an observed exit: `Some("<status>; stderr:
 /// …")` when the child exited unsuccessfully, `None` when it is still running
@@ -885,33 +881,125 @@ pub(crate) fn exited_detail(
     if status.success() {
         return None;
     }
-    let tail = match stderr_tail(stderr) {
+    let excerpt = match stderr_excerpt(stderr) {
         Some(t) => format!("; stderr: {t}"),
         None => String::new(),
     };
-    Some(format!("{status}{tail}"))
+    Some(format!("{status}{excerpt}"))
 }
 
-/// Join the last [`STDERR_TAIL_LINES`] non-empty stderr lines, bounded to
-/// [`STDERR_TAIL_MAX_CHARS`] characters kept from the end.
-fn stderr_tail(stderr: &[String]) -> Option<String> {
-    let non_empty: Vec<&str> = stderr
+/// Preserve captured lines in order, retaining both the beginning (often the
+/// cause) and end (often a final error or log path) if they exceed the budget.
+/// This is an excerpt of the connection's recent stderr, not a diagnosis: npm
+/// ENOENT can mean a missing shell, package file, or many other things.
+fn stderr_excerpt(stderr: &[String]) -> Option<String> {
+    const TRUNCATED: &str = "\n[stderr truncated]\n";
+    let joined = stderr
         .iter()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
-    let start = non_empty.len().saturating_sub(STDERR_TAIL_LINES);
-    let joined = non_empty[start..].join(" | ");
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     if joined.is_empty() {
         return None;
     }
     let count = joined.chars().count();
-    Some(
-        joined
-            .chars()
-            .skip(count.saturating_sub(STDERR_TAIL_MAX_CHARS))
-            .collect(),
-    )
+    if count <= STDERR_EXCERPT_MAX_CHARS {
+        return Some(joined);
+    }
+    let available = STDERR_EXCERPT_MAX_CHARS - TRUNCATED.chars().count();
+    let head_chars = available / 2;
+    let tail_chars = available - head_chars;
+    // Count Unicode scalar values, not bytes, so every cut remains valid UTF-8.
+    let mut excerpt: String = joined.chars().take(head_chars).collect();
+    excerpt.push_str(TRUNCATED);
+    excerpt.extend(joined.chars().skip(count - tail_chars));
+    Some(excerpt)
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_other_startup_errors_without_interpreting_them() {
+        for cause in [
+            "npm error syscall spawn /missing/custom-shell ENOENT",
+            "Error: Cannot find module '@example/adapter'",
+            "Error: EACCES: permission denied, open '/opt/adapter/config.json'",
+            "Authentication failed: API key is missing",
+            "adapter failed for an unknown reason",
+        ] {
+            let lines =
+                [cause, "context one", "context two", "context three", "done"].map(str::to_owned);
+            let excerpt = stderr_excerpt(&lines).unwrap();
+            assert!(excerpt.contains(cause), "{excerpt}");
+            assert!(excerpt.contains("done"), "{excerpt}");
+            assert!(
+                !excerpt.contains("cache"),
+                "must not infer a cause: {excerpt}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_unicode_diagnostics_keep_both_ends_with_explicit_truncation() {
+        // A single long line must obey the same budget as many lines, without
+        // cutting UTF-8 code points or silently dropping the beginning.
+        for stderr in [
+            vec![format!(
+                "startup cause {} final detail",
+                "🦀é".repeat(5_000)
+            )],
+            std::iter::once("startup cause".to_owned())
+                .chain((0..100).map(|_| "🦀é".repeat(100)))
+                .chain(std::iter::once("final detail".to_owned()))
+                .collect(),
+        ] {
+            let excerpt = stderr_excerpt(&stderr).unwrap();
+            assert!(excerpt.starts_with("startup cause"), "beginning lost");
+            assert!(excerpt.ends_with("final detail"), "end lost");
+            assert!(excerpt.contains("[stderr truncated]"));
+            assert!(excerpt.chars().count() <= 4_096);
+            assert!(excerpt.contains("🦀é"));
+        }
+    }
+
+    #[test]
+    fn empty_stderr_has_no_excerpt() {
+        assert_eq!(stderr_excerpt(&[]), None);
+        assert_eq!(stderr_excerpt(&[" \t".into(), "\n".into()]), None);
+        assert_eq!(stderr_excerpt(&["  boom  ".into()]), Some("boom".into()));
+    }
+
+    #[test]
+    fn excerpts_within_budget_preserve_all_lines_and_unicode() {
+        assert_eq!(
+            stderr_excerpt(&["  first  ".into(), String::new(), "最後 🦀".into()]),
+            Some("first\n最後 🦀".into())
+        );
+        for length in [4_095, 4_096] {
+            let text = "🦀".repeat(length);
+            assert_eq!(stderr_excerpt(std::slice::from_ref(&text)), Some(text));
+        }
+        let excerpt = stderr_excerpt(&["🦀".repeat(4_097)]).unwrap();
+        assert_eq!(excerpt.chars().count(), 4_096);
+        assert!(excerpt.contains("[stderr truncated]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_stderr_keeps_exit_status_and_clean_exit_has_no_diagnostic() {
+        use std::os::unix::process::ExitStatusExt;
+        let failure = std::process::ExitStatus::from_raw(7 << 8);
+        assert_eq!(exited_detail(Some(failure), &[]), Some(failure.to_string()));
+        let stderr = ["startup warning".into()];
+        assert_eq!(
+            exited_detail(Some(std::process::ExitStatus::from_raw(0)), &stderr),
+            None
+        );
+        assert_eq!(exited_detail(None, &stderr), None);
+    }
 }
 
 /// Grace window between SIGTERM and SIGKILL when reaping an adapter child

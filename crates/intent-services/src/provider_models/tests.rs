@@ -2084,6 +2084,36 @@ fn exit_attribution_rewrites_generic_errors_on_unsuccessful_exit() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn probe_preserves_npm_missing_package_cause_before_boilerplate() {
+    use super::probe::{run_acp_probe, AcpProbeCommand};
+    // Reproduce the captured npm output without invoking npm or touching a cache.
+    let script = r"cat >&2 <<'STDERR'
+npm error code ENOENT
+npm error syscall open
+npm error path /Users/clement/.npm/_npx/39d488c67d3fe4d0/package.json
+npm error errno -2
+npm error enoent Could not read package.json: Error: ENOENT: no such file or directory, open '/Users/clement/.npm/_npx/39d488c67d3fe4d0/package.json'
+npm error enoent This is related to npm not being able to find a file.
+npm error enoent
+npm error A complete log of this run can be found in: /Users/clement/.npm/_logs/2026-10-04T23_21_43_314Z-debug-0.log
+STDERR
+exit 254";
+    let cmd = AcpProbeCommand::binary("/bin/sh".into(), vec!["-c".into(), script.into()]);
+    let fetch = finish("codex", run_acp_probe(cmd, |_| Vec::new()).await);
+    assert!(fetch.models.is_none());
+    let warning = fetch.warning.expect("failed probe must have a warning");
+    assert!(warning.starts_with("codex: adapter exited before reporting models"));
+    assert!(warning.contains("254"), "{warning}");
+    assert!(warning.contains("ENOENT"), "{warning}");
+    assert!(warning.contains("open"), "{warning}");
+    assert!(
+        warning.contains("/Users/clement/.npm/_npx/39d488c67d3fe4d0/package.json"),
+        "{warning}"
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn exit_attribution_passes_through_spawn_rpc_clean_exit_and_live_child() {
     // Rpc must survive a dead child: auth detection keys off it.
