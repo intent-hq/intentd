@@ -2443,6 +2443,11 @@ async fn shared_specialist_reads_fence_guest_project_paths() {
 #[tokio::test]
 async fn note_operation_status_rechecks_membership_and_requires_a_caller() {
     use intent_core::note_mutation::NoteOperationStatusQuery;
+    if super::tests::reran_unarmed(
+        "capability::host_role_tests::note_operation_status_rechecks_membership_and_requires_a_caller",
+    ) {
+        return;
+    }
     let tmp = TempDb::new();
     let (svc, _primary, member) = fixture(&tmp).await;
     let scope = WorkspaceId::new();

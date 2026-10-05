@@ -7929,7 +7929,7 @@ async fn note_operation_status_bounds_admission_and_all_reply_shapes() {
     assert_eq!(api.calls.load(Ordering::Relaxed), 1);
     for id in [
         serde_json::json!("x".repeat(65)),
-        serde_json::json!(9007199254740992u64),
+        serde_json::json!(9_007_199_254_740_992_u64),
         Value::Null,
     ] {
         let mut bad = request.clone();
