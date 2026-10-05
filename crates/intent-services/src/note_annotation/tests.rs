@@ -200,13 +200,22 @@ async fn annotation_service_pending_attribution_and_strict_shapes_do_not_fall_ba
 }
 
 struct ReadBoundary {
+    outcome: std::sync::atomic::AtomicU8,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
 static READ_BOUNDARIES: std::sync::Mutex<Vec<(WorkspaceId, std::sync::Arc<ReadBoundary>)>> =
     std::sync::Mutex::new(Vec::new());
 
-pub(super) async fn pause_after_read(workspace: &WorkspaceId) {
+pub(super) fn read_outcome(result: &Result<Value>) -> u8 {
+    match result {
+        Ok(_) => 1,
+        Err(Error::NotePage(NotePageError::Stale)) => 2,
+        Err(_) => 3,
+    }
+}
+
+pub(super) async fn pause_after_read(workspace: &WorkspaceId, outcome: u8) {
     let boundary = {
         let mut boundaries = READ_BOUNDARIES.lock().unwrap();
         boundaries
@@ -215,6 +224,9 @@ pub(super) async fn pause_after_read(workspace: &WorkspaceId) {
             .map(|index| boundaries.swap_remove(index).1)
     };
     if let Some(boundary) = boundary {
+        boundary
+            .outcome
+            .store(outcome, std::sync::atomic::Ordering::SeqCst);
         boundary.reached.notify_one();
         boundary.release.notified().await;
     }
@@ -245,6 +257,7 @@ async fn annotation_service_revocation_after_store_result_withholds_success_and_
             params["sourceRevision"] = json!("stale-source");
         }
         let boundary = std::sync::Arc::new(ReadBoundary {
+            outcome: std::sync::atomic::AtomicU8::new(0),
             reached: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         });
@@ -262,6 +275,11 @@ async fn annotation_service_revocation_after_store_result_withholds_success_and_
         );
         let revoke = async {
             boundary.reached.notified().await;
+            assert_eq!(
+                boundary.outcome.load(std::sync::atomic::Ordering::SeqCst),
+                if stale { 2 } else { 1 },
+                "observe exact Store result before authorization changes"
+            );
             service
                 .store
                 .remove_workspace_member(&workspace, principal_id)

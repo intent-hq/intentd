@@ -69,7 +69,7 @@ impl Services {
             }
         };
         #[cfg(test)]
-        tests::pause_after_read(&workspace).await;
+        tests::pause_after_read(&workspace, tests::read_outcome(&result)).await;
         // Prefer current authorization failure even when storage found a stale
         // or expired token; do not expose persisted state to a revoked caller.
         self.require_member(&workspace).await?;
