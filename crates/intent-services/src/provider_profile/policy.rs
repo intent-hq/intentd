@@ -84,11 +84,45 @@ pub struct HostPolicySnapshot {
 struct Restriction {
     source: String,
     allow: Option<Vec<ServerMatcher>>,
+    allow_semantics: AllowSemantics,
     deny: Vec<ServerMatcher>,
     skills: Option<bool>,
     approvals: Option<Vec<String>>,
     sandbox: Option<Vec<String>>,
     features: BTreeMap<String, bool>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum AllowSemantics {
+    #[default]
+    Any,
+    ClaudeTransportSelectors,
+}
+
+impl Restriction {
+    fn allows(&self, name: &str, server: &NormalizedMcpServer) -> bool {
+        let Some(allow) = &self.allow else {
+            return true;
+        };
+        // Claude 2.1.280 selects the transport's identity rules before matching.
+        // A name cannot bypass a command/URL allowlist. Other-transport rules do
+        // not suppress name fallback. Denials remain OR across all selectors.
+        let transport_selector = |matcher: &ServerMatcher| {
+            matches!(
+                (&matcher.identity, server),
+                (Identity::Command { .. }, NormalizedMcpServer::Stdio { .. })
+                    | (
+                        Identity::Url(_),
+                        NormalizedMcpServer::Http { .. } | NormalizedMcpServer::Sse { .. }
+                    )
+            )
+        };
+        let prefer_identity = self.allow_semantics == AllowSemantics::ClaudeTransportSelectors
+            && allow.iter().any(transport_selector);
+        allow.iter().any(|matcher| {
+            (!prefer_identity || transport_selector(matcher)) && matcher.matches(name, server)
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -171,10 +205,7 @@ impl HostPolicySnapshot {
                 .deny
                 .iter()
                 .any(|matcher| matcher.matches(name, server))
-                || restriction
-                    .allow
-                    .as_ref()
-                    .is_some_and(|allow| !allow.iter().any(|matcher| matcher.matches(name, server)))
+                || !restriction.allows(name, server)
             {
                 return Err(ProfileError::PolicyDenied {
                     source: restriction.source.clone(),
@@ -604,6 +635,7 @@ fn parse_claude(text: &str, source: &str) -> ProfileResult<HostPolicySnapshot> {
         restrictions: vec![Restriction {
             source: source.into(),
             allow: value.get("allowedMcpServers").map(rules).transpose()?,
+            allow_semantics: AllowSemantics::ClaudeTransportSelectors,
             deny: value
                 .get("deniedMcpServers")
                 .map(rules)
@@ -710,6 +742,7 @@ impl HostPolicySnapshot {
         use serde_json::json;
         let restrictions: Vec<_> = self.restrictions.iter().map(|rule| json!({
             "source":rule.source,
+            "claudeTransportSelectors":rule.allow_semantics == AllowSemantics::ClaudeTransportSelectors,
             "allow":rule.allow.as_ref().map(|rules| rules.iter().map(ServerMatcher::identity_value).collect::<Vec<_>>()),
             "deny":rule.deny.iter().map(ServerMatcher::identity_value).collect::<Vec<_>>(),
             "skills":rule.skills,"approvals":rule.approvals,"sandbox":rule.sandbox,"features":rule.features
