@@ -36,7 +36,11 @@ fn integer(value: u64) -> Result<i64> {
 // The graph validator has already checked ordering, duplicate keys and ownership.
 // This subset additionally requires one explicit three-string object directory;
 // no defaults, generic graph coercion or unbounded resource reconstruction.
-async fn attributes(conn: &mut SqliteConnection, operation: &str, id: &str) -> Result<Value> {
+pub(super) async fn attributes(
+    conn: &mut SqliteConnection,
+    operation: &str,
+    id: &str,
+) -> Result<Value> {
     let root = seal::metadata_resource(conn, operation, id).await?;
     if root.as_object().is_none_or(|o| o.len() != 4)
         || root["type"] != "object"
@@ -107,7 +111,7 @@ async fn attributes(conn: &mut SqliteConnection, operation: &str, id: &str) -> R
     Ok(Value::Object(attrs))
 }
 
-async fn original_range(
+pub(super) async fn original_range(
     conn: &mut SqliteConnection,
     operation: &str,
     root: &str,

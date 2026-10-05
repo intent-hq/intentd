@@ -9,6 +9,7 @@ use serde_json::json;
 
 mod marker_admission;
 mod marker_provenance;
+mod marker_selection;
 
 async fn request(store: &Store) -> NoteStageBegin {
     let first = page(store, json!({"kind":"source","maxSourceBytes":128})).await;

@@ -2125,5 +2125,7 @@ mod staged_selection;
 #[path = "wss_integration/staged_rendered.rs"]
 mod staged_rendered;
 
+#[path = "wss_integration/marker_selection.rs"]
+mod marker_selection;
 #[path = "wss_integration/staged_markers.rs"]
 mod staged_markers;

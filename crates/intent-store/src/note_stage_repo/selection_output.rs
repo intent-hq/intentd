@@ -166,6 +166,23 @@ pub(super) async fn prepare(
     {
         return Err(invalid());
     }
+    let live_count: Option<i64> = sqlx::query_scalar(
+        "SELECT records FROM note_stage_stream WHERE operation_key=? AND stream='live'",
+    )
+    .bind(operation)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db)?;
+    if live_count == Some(4) {
+        return super::marker_selection_output::prepare(
+            conn,
+            operation,
+            header,
+            generation,
+            view_length,
+        )
+        .await;
+    }
     let selection = records(conn, operation, "selection", 1).await?;
     let live = records(conn, operation, "live", 2).await?;
     let (paragraph, paragraph_attrs) = descriptor(conn, operation, generation, &live[0]).await?;

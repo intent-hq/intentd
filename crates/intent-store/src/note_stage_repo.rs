@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 mod append;
 mod freeze;
+mod marker_selection_output;
 mod markers;
 #[cfg(test)]
 pub(crate) use markers::{MarkerSealPause, MARKER_SEAL_PAUSE};
