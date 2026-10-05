@@ -239,11 +239,18 @@ async fn replay_actual_frontend_rendered_upload_and_capture_search_details() {
                     .replace(typed.payload_digest.clone())
                     .is_none());
                 let response = store.seal_note_stage("alice", &typed).await.unwrap();
-                let view = response["viewId"]
-                    .as_str()
-                    .expect("seal returns the immutable view");
+                assert_eq!(response["phase"], "sealed");
+                assert_eq!(response["payloadDigest"], typed.payload_digest);
+                assert_eq!(response["viewLength"], 138);
+                // Seal's wire response has no viewId. Compare the first read
+                // with the exact scoped view published by the seal transaction.
+                let scope = typed.scope();
+                let view: String = sqlx::query_scalar("SELECT s.view_id FROM note_stage s JOIN note_operation o USING(operation_key) WHERE o.principal=? AND o.backend_id=? AND o.workspace_id=? AND o.note_id=? AND o.instance_id=? AND o.operation_id=? AND s.phase='sealed'")
+                    .bind("alice").bind(&scope.backend_id).bind(&scope.workspace_id)
+                    .bind(&scope.note_id).bind(&scope.note_instance_id).bind(&typed.operation_id)
+                    .fetch_one(store.read_pool()).await.unwrap();
                 assert!(!view.is_empty());
-                assert!(sealed_view.replace(view.to_owned()).is_none());
+                assert!(sealed_view.replace(view).is_none());
                 response
             }
             "note.operation.read" => {

@@ -20,6 +20,8 @@ mod mutation;
 mod plain_far_capture;
 mod plain_source_capture;
 mod primitive_source_capture;
+mod rendered_source_capture;
+mod rendered_upload_capture;
 mod selection_upload_capture;
 mod staging;
 mod writer_anchors;
