@@ -493,17 +493,17 @@ async fn staged_receipt_noncontiguous_groups_reconstruct_complete_provenance() {
     let request = capture(
         &store,
         3,
-        &[("upper-b", "B"), ("upper-c", "C"), ("bang", "!")],
+        &[("upper-b", "BBB"), ("upper-c", "C"), ("bang", "!")],
         vec![
-            dirty(1, 0, 1, 2, &reference("upper-b", "B")),
-            dirty(3, 0, 4, 5, &reference("upper-c", "C")),
-            dirty(3, 1, 6, 6, &reference("bang", "!")),
+            dirty(1, 0, 1, 2, &reference("upper-b", "BBB")),
+            dirty(3, 0, 6, 7, &reference("upper-c", "C")),
+            dirty(3, 1, 8, 8, &reference("bang", "!")),
         ],
         vec![],
     )
     .await;
     let mut write = writer(&store, &request).await;
-    assert_eq!(write.source(), "aB😀Cd!");
+    assert_eq!(write.source(), "aBBB😀Cd!");
     write
         .persist_source(
             &NoteVersionAuthor {
@@ -517,13 +517,13 @@ async fn staged_receipt_noncontiguous_groups_reconstruct_complete_provenance() {
         .unwrap();
     write.publish_annotation_anchors(&[]).await.unwrap();
     let receipt = write.commit().await.unwrap();
-    let rows = undo_groups(&store, &receipt, "aB😀Cd!", &["aB😀cd", "ab😀cd"]).await;
+    let rows = undo_groups(&store, &receipt, "aBBB😀Cd!", &["aBBB😀cd", "ab😀cd"]).await;
     assert_eq!(rows.len(), 3);
     let mut transcripts = Vec::new();
     for (index, (group, ordinal, start, end, prior_start, prior_end, text)) in [
-        ("3", 0, 4, 5, 4, 5, "c"),
-        ("3", 1, 6, 7, 6, 6, ""),
-        ("1", 0, 1, 2, 1, 2, "b"),
+        ("3", 0, 6, 7, 6, 7, "c"),
+        ("3", 1, 8, 9, 8, 8, ""),
+        ("1", 0, 1, 4, 1, 2, "b"),
     ]
     .into_iter()
     .enumerate()
@@ -560,6 +560,6 @@ async fn staged_receipt_noncontiguous_groups_reconstruct_complete_provenance() {
     assert_eq!(effects["items"][0]["kind"], "annotationInvalidation");
     eprintln!(
         "STAGED_RECEIPT_PRODUCER_CAPTURE={}",
-        json!({"base":"ab😀cd","capturedGroups":[1,3],"final":"aB😀Cd!","receipt":receipt,"effects":effects,"transcripts":transcripts})
+        json!({"base":"ab😀cd","capturedGroups":[1,3],"final":"aBBB😀Cd!","receipt":receipt,"effects":effects,"transcripts":transcripts})
     );
 }
