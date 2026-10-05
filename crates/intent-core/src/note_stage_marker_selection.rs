@@ -214,9 +214,10 @@ pub fn marker_selection_markdown(
     let literal = &input.frozen_paragraph[a..b];
     let right_text = &input.frozen_paragraph[b..];
     for text in [left_text, right_text] {
-        if !text
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b' ')
+        if text.contains("  ")
+            || !text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b' ')
         {
             return Err(Unsupported);
         }

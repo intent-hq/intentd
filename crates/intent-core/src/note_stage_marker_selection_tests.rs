@@ -98,8 +98,12 @@ fn native_oracle_spacing_partial_and_both_directions() {
     for backward in [false, true] {
         assert_eq!(f.check(1, f.length - 1, backward), Ok(Some("b  c".into())));
     }
-    let f = Fixture::new("A  ", "  B", "root");
-    assert_eq!(f.check(0, f.length, false), Ok(Some("A    B".into())));
+    // Repeated spaces within a leaf are outside the captured grammar. Only
+    // the two independent single spaces at the omitted-atom seam are admitted.
+    for (left, right) in [("A  ", " B"), ("A ", "  B"), ("A  ", "  B")] {
+        let f = Fixture::new(left, right, "root");
+        assert_eq!(f.check(0, f.length, false), Err(Unsupported));
+    }
 }
 #[test]
 fn collapsed_atom_only_and_trim_empty_are_no_copy() {
