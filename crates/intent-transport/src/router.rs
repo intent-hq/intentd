@@ -468,7 +468,13 @@ pub(crate) async fn prepare_message(
             ));
     if matches!(
         value.get("method").and_then(Value::as_str),
-        Some("note.operationStatus" | "note.applySplices")
+        Some(
+            "note.operationStatus"
+                | "note.applySplices"
+                | "note.operation.begin"
+                | "note.operation.append"
+                | "note.operation.cancel"
+        )
     ) || annotation.is_some()
         || receipt_read
     {
@@ -590,7 +596,14 @@ pub(crate) async fn prepare_message(
             method,
             is_notification,
             result,
-            if matches!(method, "note.operationStatus" | "note.applySplices") {
+            if matches!(
+                method,
+                "note.operationStatus"
+                    | "note.applySplices"
+                    | "note.operation.begin"
+                    | "note.operation.append"
+                    | "note.operation.cancel"
+            ) {
                 4096
             } else if method == "note.operation.read" {
                 params
@@ -676,7 +689,14 @@ fn encode_dispatch_result(
     };
     let response_bytes = encoded.frame.len();
     if response_bytes > max_response_bytes {
-        let replacement = if matches!(method, "note.operationStatus" | "note.applySplices") {
+        let replacement = if matches!(
+            method,
+            "note.operationStatus"
+                | "note.applySplices"
+                | "note.operation.begin"
+                | "note.operation.append"
+                | "note.operation.cancel"
+        ) {
             error_frame(
                 id,
                 INVALID_PARAMS,
@@ -836,16 +856,20 @@ async fn dispatch_note_receipt(
             .await
             .map_err(bounded_note_operation_error);
     }
-    let query = if method == "note.operation.read" {
-        let request: intent_core::note_receipt_detail::NoteOperationReceiptRead =
-            serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|_| invalid_params("Invalid receipt detail request"))?;
-        request.query()
-    } else {
-        let request: intent_core::note_receipt_detail::NoteGetReceiptRequest =
-            serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|_| invalid_params("Invalid receipt detail request"))?;
-        request.query()
+    let query = match method {
+        "note.operation.read" => {
+            let request: intent_core::note_receipt_detail::NoteOperationReceiptRead =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid receipt detail request"))?;
+            request.query()
+        }
+        "note.get" => {
+            let request: intent_core::note_receipt_detail::NoteGetReceiptRequest =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid receipt detail request"))?;
+            request.query()
+        }
+        _ => return Err(invalid_params("Invalid receipt detail method")),
     }
     .map_err(|e| domain_to_rpc(Error::NoteMutation(e)))?;
     api.get_note_receipt_detail(query, id.clone())
@@ -1507,6 +1531,41 @@ async fn dispatch_other(
                 .validate()
                 .map_err(|e| domain_to_rpc(Error::NoteMutation(e)))?;
             api.note_apply_splices(request)
+                .await
+                .map_err(bounded_note_operation_error)
+        }
+        "note.operation.begin" => {
+            let request: intent_core::note_stage::NoteStageBegin =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid note stage begin"))?;
+            request
+                .validate()
+                .map_err(|e| domain_to_rpc(Error::NoteMutation(e)))?;
+            api.note_operation_begin(request)
+                .await
+                .map_err(bounded_note_operation_error)
+        }
+        "note.operation.append" => {
+            let request: intent_core::note_stage::NoteStageAppend =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid note stage append"))?;
+            if request.records.len() > 128 {
+                return Err(bounded_note_operation_error(Error::NoteMutation(
+                    intent_core::note_mutation::NoteMutationError::Budget,
+                )));
+            }
+            api.note_operation_append(request)
+                .await
+                .map_err(bounded_note_operation_error)
+        }
+        "note.operation.cancel" => {
+            let request: intent_core::note_stage::NoteStageCancel =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid note stage cancel"))?;
+            request
+                .validate()
+                .map_err(|e| domain_to_rpc(Error::NoteMutation(e)))?;
+            api.note_operation_cancel(request)
                 .await
                 .map_err(bounded_note_operation_error)
         }

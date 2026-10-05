@@ -10,6 +10,7 @@ use sqlx::Row;
 mod append;
 mod read;
 mod source;
+mod status;
 mod write;
 fn db(error: impl std::fmt::Display) -> Error {
     Error::Internal(format!("note stage storage: {error}"))

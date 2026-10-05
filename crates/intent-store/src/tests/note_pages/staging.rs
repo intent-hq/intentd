@@ -248,3 +248,165 @@ async fn stage_copy_on_write_rolls_back_with_source_and_retains_committed_roots(
     store.update_note(&note).await.unwrap();
     assert!(count(&store, "note_stage_base_piece").await > 1);
 }
+
+fn status_query(request: &NoteStageBegin) -> intent_core::note_mutation::NoteOperationStatusQuery {
+    intent_core::note_mutation::NoteOperationStatusQuery {
+        backend_id: request.backend_id.clone(),
+        workspace_id: request.workspace_id.clone(),
+        note_id: request.note_id.clone(),
+        note_instance_id: request.note_instance_id.clone(),
+        operation_id: request.operation_id.clone(),
+        header_digest: Some(request.header_digest.clone()),
+        payload_digest: None,
+    }
+}
+fn cancel_request(request: &NoteStageBegin) -> intent_core::note_stage::NoteStageCancel {
+    intent_core::note_stage::NoteStageCancel {
+        backend_id: request.backend_id.clone(),
+        workspace_id: request.workspace_id.clone(),
+        note_id: request.note_id.clone(),
+        note_instance_id: request.note_instance_id.clone(),
+        operation_id: request.operation_id.clone(),
+        header_digest: request.header_digest.clone(),
+    }
+}
+
+#[tokio::test]
+async fn stage_status_cancel_are_owned_durable_and_do_not_delete_unbounded_payloads() {
+    let (store, tmp, _note) = setup("base😀").await;
+    let request = request(&store).await;
+    let state = store.begin_note_stage("alice", &request).await.unwrap();
+    let query = status_query(&request);
+    assert_eq!(
+        store.note_stage_status("alice", &query).await.unwrap(),
+        state
+    );
+    assert_eq!(
+        store.note_stage_status("bob", &query).await.unwrap()["outcome"],
+        "unknown"
+    );
+    assert_eq!(
+        store
+            .cancel_note_stage("bob", &cancel_request(&request))
+            .await
+            .unwrap()["outcome"],
+        "unknown"
+    );
+    let chunk = append(&request, "uploaded");
+    store.append_note_stage("alice", &chunk).await.unwrap();
+    let mut wrong = query.clone();
+    wrong.header_digest = Some("f".repeat(64));
+    assert!(matches!(
+        store.note_stage_status("alice", &wrong).await,
+        Err(Error::NoteMutation(NoteMutationError::Mismatch))
+    ));
+    wrong = query.clone();
+    wrong.payload_digest = Some("f".repeat(64));
+    assert!(matches!(
+        store.note_stage_status("alice", &wrong).await,
+        Err(Error::NoteMutation(NoteMutationError::Mismatch))
+    ));
+    let cancelled = store
+        .cancel_note_stage("alice", &cancel_request(&request))
+        .await
+        .unwrap();
+    assert_eq!(cancelled["kind"], "noteStageState");
+    assert_eq!(cancelled["phase"], "cancelled");
+    assert_eq!(cancelled["streams"][0]["nextSequence"], 1);
+    assert_eq!(
+        count(&store, "note_stage_chunk").await,
+        1,
+        "cancel only closes admission; bounded background cleanup is separate"
+    );
+    assert_eq!(
+        store.begin_note_stage("alice", &request).await.unwrap(),
+        cancelled
+    );
+    assert_eq!(
+        store
+            .cancel_note_stage("alice", &cancel_request(&request))
+            .await
+            .unwrap(),
+        cancelled
+    );
+    assert!(matches!(
+        store.append_note_stage("alice", &chunk).await,
+        Err(Error::NoteMutation(NoteMutationError::Invalid))
+    ));
+    assert!(matches!(
+        store.read_note_stage_base_piece("alice", &query, 0).await,
+        Err(Error::NoteMutation(NoteMutationError::Expired))
+    ));
+    drop(store);
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    assert_eq!(
+        reopened.note_stage_status("alice", &query).await.unwrap(),
+        cancelled
+    );
+    assert_eq!(
+        reopened.begin_note_stage("alice", &request).await.unwrap(),
+        cancelled
+    );
+}
+
+#[tokio::test]
+async fn stage_cancel_failure_rolls_back_phase_and_committed_outcome_is_never_cancelled() {
+    let (store, _tmp, _note) = setup("base").await;
+    let request = request(&store).await;
+    let state = store.begin_note_stage("alice", &request).await.unwrap();
+    sqlx::query("CREATE TRIGGER injected_stage_cancel_failure BEFORE UPDATE ON note_operation BEGIN SELECT RAISE(ABORT,'cancel failure'); END").execute(store.write_pool()).await.unwrap();
+    assert!(matches!(
+        store
+            .cancel_note_stage("alice", &cancel_request(&request))
+            .await,
+        Err(Error::Internal(_))
+    ));
+    assert_eq!(
+        store
+            .note_stage_status("alice", &status_query(&request))
+            .await
+            .unwrap(),
+        state
+    );
+    let phase: String = sqlx::query_scalar("SELECT phase FROM note_stage")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(phase, "staging");
+    sqlx::query("DROP TRIGGER injected_stage_cancel_failure")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    // Exercise cancellation's committed branch with a seeded retained outcome;
+    // this does not claim a staged commit was executed.
+    let receipt = json!({"kind":"noteCommitReceipt","outcome":"committed","scope":request.scope(),"operationId":request.operation_id,"headerDigest":request.header_digest,"payloadDigest":"f".repeat(64)});
+    sqlx::query("UPDATE note_operation SET outcome=?")
+        .bind(receipt.to_string())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE note_stage SET phase='committed',payload_digest=?")
+        .bind("f".repeat(64))
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .cancel_note_stage("alice", &cancel_request(&request))
+            .await
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        store
+            .note_stage_status("alice", &status_query(&request))
+            .await
+            .unwrap(),
+        receipt
+    );
+    let phase: String = sqlx::query_scalar("SELECT phase FROM note_stage")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(phase, "committed");
+}

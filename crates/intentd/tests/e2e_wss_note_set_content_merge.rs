@@ -1684,3 +1684,101 @@ async fn bounded_public_splices_commit_replay_and_status_over_wss() {
     rpc.close(None).await.unwrap();
     fx.ws.stop().await;
 }
+
+#[tokio::test]
+async fn bounded_staged_upload_cancel_and_status_over_wss() {
+    use intent_core::note_stage::{NoteStageAppend, NoteStageBegin};
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"title":"stage upload","path":"."}),
+    )
+    .await;
+    let ws = workspace["workspace"]["id"].as_str().unwrap();
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({"workspaceId":ws,"title":"staged","content":"unchanged😀\r\n"}),
+    )
+    .await;
+    let note = created["note"]["id"].as_str().unwrap();
+    let page = wss_rpc(
+        &mut rpc,
+        3,
+        "note.get",
+        json!({"workspaceId":ws,"noteId":note,"page":{"kind":"source"}}),
+    )
+    .await;
+    let mut begin = page["scope"].clone();
+    begin["operationId"] = json!(uuid::Uuid::new_v4().to_string());
+    begin["expiresAt"] = json!(format!(
+        "{}.000Z",
+        &intent_core::iso_ms_from_now(60_000)[..19]
+    ));
+    begin["headerDigest"] = json!("0".repeat(64));
+    begin["header"] = json!({"baseRevision":page["sourceRevision"],"editorSessionId":"wss-stage","localEditSequence":0,"liveGeneration":0,"selectionGeneration":0,"action":"mutate","output":"source","selection":"all"});
+    let mut typed: NoteStageBegin = serde_json::from_value(begin).unwrap();
+    typed.header_digest = typed.computed_digest().unwrap();
+    let begin = serde_json::to_value(&typed).unwrap();
+    let state = wss_rpc_raw(&mut rpc, 4, "note.operation.begin", begin.clone()).await;
+    assert!(state.to_string().len() <= 4096);
+    assert_eq!(state["result"]["kind"], "noteStageState");
+    assert_eq!(state["result"]["phase"], "staging");
+    assert_eq!(state["result"]["streams"].as_array().unwrap().len(), 5);
+    let mut identity = page["scope"].clone();
+    identity["operationId"] = json!(typed.operation_id);
+    identity["headerDigest"] = json!(typed.header_digest);
+    let mut chunk = identity.clone();
+    chunk["stream"] = json!("text");
+    chunk["sequence"] = json!(0);
+    chunk["previousDigest"] = Value::Null;
+    chunk["records"] = json!([{"kind":"text","id":"insert","offset":0,"text":"uploaded😀\r\n"}]);
+    chunk["chunkDigest"] = json!("0".repeat(64));
+    let mut typed: NoteStageAppend = serde_json::from_value(chunk).unwrap();
+    typed.chunk_digest = typed.computed_digest().unwrap();
+    let chunk = serde_json::to_value(&typed).unwrap();
+    let ack = wss_rpc_raw(&mut rpc, 5, "note.operation.append", chunk.clone()).await;
+    assert!(ack.to_string().len() <= 4096);
+    assert_eq!(ack["result"]["kind"], "noteStageAck");
+    assert_eq!(ack["result"]["nextSequence"], 1);
+    assert_eq!(
+        wss_rpc(&mut rpc, 6, "note.operation.append", chunk.clone()).await,
+        ack["result"]
+    );
+    let status = wss_rpc(&mut rpc, 7, "note.operationStatus", identity.clone()).await;
+    assert_eq!(status["phase"], "staging");
+    assert_eq!(status["streams"][0]["nextSequence"], 1);
+    let cancelled = wss_rpc_raw(&mut rpc, 8, "note.operation.cancel", identity.clone()).await;
+    assert!(cancelled.to_string().len() <= 4096);
+    assert_eq!(cancelled["result"]["phase"], "cancelled");
+    assert_eq!(
+        wss_rpc(&mut rpc, 9, "note.operationStatus", identity.clone()).await,
+        cancelled["result"]
+    );
+    assert_eq!(
+        wss_rpc(&mut rpc, 10, "note.operation.begin", begin).await,
+        cancelled["result"]
+    );
+    assert_eq!(
+        wss_rpc(&mut rpc, 11, "note.operation.cancel", identity).await,
+        cancelled["result"]
+    );
+    let late = wss_rpc_raw(&mut rpc, 12, "note.operation.append", chunk).await;
+    assert_eq!(late["error"]["code"], -32602);
+    assert!(late.to_string().len() <= 4096);
+    let after = wss_rpc(
+        &mut rpc,
+        13,
+        "note.get",
+        json!({"workspaceId":ws,"noteId":note,"page":{"kind":"source"}}),
+    )
+    .await;
+    assert_eq!(after["text"], page["text"]);
+    assert_eq!(after["sourceRevision"], page["sourceRevision"]);
+    rpc.close(None).await.unwrap();
+    fx.ws.stop().await;
+}

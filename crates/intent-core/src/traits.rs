@@ -1101,6 +1101,31 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { Err(crate::Error::Unsupported("note apply splices".into())) })
     }
 
+    /// Admit an immutable staged source view without mutating the live note.
+    fn note_operation_begin(
+        &self,
+        request: crate::note_stage::NoteStageBegin,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = request;
+        Box::pin(async { Err(crate::Error::Unsupported("note operation begin".into())) })
+    }
+    /// Accept one contiguous bounded staged stream chunk.
+    fn note_operation_append(
+        &self,
+        request: crate::note_stage::NoteStageAppend,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = request;
+        Box::pin(async { Err(crate::Error::Unsupported("note operation append".into())) })
+    }
+    /// Close uncommitted staging or return its retained committed receipt.
+    fn note_operation_cancel(
+        &self,
+        request: crate::note_stage::NoteStageCancel,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = request;
+        Box::pin(async { Err(crate::Error::Unsupported("note operation cancel".into())) })
+    }
+
     /// Resolve a retained operation under current authorization, without live text.
     fn note_operation_status(
         &self,

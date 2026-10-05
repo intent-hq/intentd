@@ -8165,3 +8165,113 @@ async fn note_splice_transport_rejects_full_escaped_budget_before_dispatch_and_b
     );
     assert_eq!(api.calls.load(Ordering::Relaxed), 2);
 }
+
+#[tokio::test]
+async fn staged_upload_transport_bounds_escaped_requests_ids_and_error_frames() {
+    use intent_core::note_stage::NoteStageAppend;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct StageApi {
+        calls: AtomicUsize,
+    }
+    impl WorkspaceApi for StageApi {
+        fn note_operation_append(&self, _request: NoteStageAppend) -> BoxFuture<'_, Result<Value>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Err(Error::Internal("private staged bytes".repeat(8192))) })
+        }
+    }
+    let api = StageApi {
+        calls: AtomicUsize::new(0),
+    };
+    let mut params = serde_json::json!({"backendId":"b","workspaceId":"w","noteId":"n","noteInstanceId":"i","operationId":"11111111-1111-4111-8111-111111111111","headerDigest":"a".repeat(64),"stream":"text","sequence":0,"previousDigest":null,"records":[{"kind":"text","id":"x","offset":0,"text":"\u{1}".repeat(16384)}],"chunkDigest":"b".repeat(64)});
+    let frame=serde_json::json!({"jsonrpc":"2.0","id":1,"method":"note.operation.append","params":params}).to_string();
+    assert!(frame.len() > 65536);
+    let response = handle_message(&api, &frame).await.unwrap();
+    assert!(response.len() <= 4096);
+    assert!(response.contains("note-page-budget"));
+    assert_eq!(api.calls.load(Ordering::Relaxed), 0);
+    params["records"][0]["text"] = serde_json::json!("valid");
+    for method in [
+        "note.operation.begin",
+        "note.operation.append",
+        "note.operation.cancel",
+    ] {
+        let frame=serde_json::json!({"jsonrpc":"2.0","id":"x".repeat(65),"method":method,"params":params}).to_string();
+        let response = handle_message(&api, &frame).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["id"],
+            Value::Null
+        );
+        assert_eq!(api.calls.load(Ordering::Relaxed), 0);
+    }
+    let frame=serde_json::json!({"jsonrpc":"2.0","id":"\u{1}".repeat(64),"method":"note.operation.append","params":params}).to_string();
+    let response = handle_message(&api, &frame).await.unwrap();
+    assert!(response.len() <= 4096);
+    assert!(!response.contains("private staged"));
+    assert_eq!(api.calls.load(Ordering::Relaxed), 1);
+    params.as_object_mut().unwrap().remove("previousDigest");
+    let frame=serde_json::json!({"jsonrpc":"2.0","id":2,"method":"note.operation.append","params":params}).to_string();
+    let response = handle_message(&api, &frame).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap()["error"]["code"],
+        -32602
+    );
+    assert_eq!(api.calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn note_receipt_dispatch_preserves_both_typed_envelopes_and_rejects_malformed() {
+    use intent_core::note_receipt_detail::ReceiptDetailQuery;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct ReceiptApi(AtomicUsize);
+    impl WorkspaceApi for ReceiptApi {
+        fn get_note_receipt_detail(
+            &self,
+            query: ReceiptDetailQuery,
+            id: Value,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(
+                    serde_json::json!({"operationEnvelope":query.operation_envelope,"ref":query.reference,"digest":query.payload_digest,"id":id}),
+                )
+            })
+        }
+    }
+    let api = ReceiptApi(AtomicUsize::new(0));
+    let scope =
+        serde_json::json!({"backendId":"b","workspaceId":"w","noteId":"n","noteInstanceId":"i"});
+    for operation in [false, true] {
+        let mut params = scope.clone();
+        let operation_id = "11111111-1111-4111-8111-111111111111";
+        if operation {
+            params["operationId"] = serde_json::json!(operation_id);
+            params["payloadDigest"] = serde_json::json!("a".repeat(64));
+            params["kind"] = serde_json::json!("mapping");
+            params["ref"] = serde_json::json!("owned:map");
+            params["maxWireBytes"] = serde_json::json!(4096);
+        } else {
+            params["page"] = serde_json::json!({"kind":"mapping","operationId":operation_id,"ref":"owned:map","maxWireBytes":4096});
+        }
+        let mut request = serde_json::json!({"jsonrpc":"2.0","id":7,"method":if operation{"note.operation.read"}else{"note.get"},"params":params});
+        let raw = handle_message(&api, &request.to_string()).await.unwrap();
+        assert!(raw.len() <= 4096);
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["result"]["operationEnvelope"], operation);
+        assert_eq!(value["result"]["ref"], "owned:map");
+        assert_eq!(value["result"]["id"], 7);
+        assert_eq!(
+            value["result"]["digest"],
+            if operation {
+                serde_json::json!("a".repeat(64))
+            } else {
+                Value::Null
+            }
+        );
+        let before = api.0.load(Ordering::SeqCst);
+        request["params"]["unexpected"] = serde_json::json!(true);
+        let invalid = handle_message(&api, &request.to_string()).await.unwrap();
+        assert_eq!(err_code(&serde_json::from_str(&invalid).unwrap()), -32602);
+        assert_eq!(api.0.load(Ordering::SeqCst), before);
+    }
+    assert_eq!(api.0.load(Ordering::SeqCst), 2);
+}

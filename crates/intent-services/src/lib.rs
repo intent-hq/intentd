@@ -210,6 +210,7 @@ pub mod note_ops;
 mod note_page_state;
 mod note_receipt;
 mod note_splice;
+mod note_stage;
 mod npx_cli;
 #[expect(
     dead_code,
@@ -1460,6 +1461,7 @@ pub struct Services {
     /// front door observes one set.
     pending_workspace_deletes: delete_grace::OwnedPendingDeletes,
     workspace_mutations: workspace_mutations::WorkspaceMutations,
+    stage_request_admission: Arc<note_stage::Admission>,
     startup_resume_candidates: Arc<Mutex<HashSet<AgentId>>>,
     #[cfg(test)]
     interrupted_list_park: Option<Arc<script_ops::SupervisePark>>,
@@ -1802,6 +1804,7 @@ impl Services {
             sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),
             pending_workspace_deletes: pending_deletes.clone(),
             workspace_mutations: workspace_mutations::WorkspaceMutations::default(),
+            stage_request_admission: Arc::new(note_stage::Admission::default()),
             startup_resume_candidates: Arc::default(),
             #[cfg(test)]
             interrupted_list_park: None,
@@ -25056,10 +25059,32 @@ impl WorkspaceApi for Services {
         Box::pin(self.apply_note_splices(request))
     }
 
+    fn note_operation_begin(
+        &self,
+        request: intent_core::note_stage::NoteStageBegin,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.begin_note_stage(request))
+    }
+    fn note_operation_append(
+        &self,
+        request: intent_core::note_stage::NoteStageAppend,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.append_note_stage(request))
+    }
+    fn note_operation_cancel(
+        &self,
+        request: intent_core::note_stage::NoteStageCancel,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.cancel_note_stage(request))
+    }
+
     fn note_operation_status(
         &self,
         request: intent_core::note_mutation::NoteOperationStatusQuery,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        if request.header_digest.is_some() {
+            return Box::pin(self.read_note_stage_status(request));
+        }
         Box::pin(async move {
             request.validate().map_err(Error::NoteMutation)?;
             self.require_member(&WorkspaceId(request.workspace_id.clone()))
