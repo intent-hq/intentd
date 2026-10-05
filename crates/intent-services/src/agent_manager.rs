@@ -14014,7 +14014,10 @@ async fn retry_spawn_owned(
     let mut last_error: Option<Error> = None;
 
     for attempt in 1..=MAX_SPAWN_ATTEMPTS {
-        match mgr.ensure_started_owned(agent_id, workspace_id).await {
+        // Keep launch/session state out of the enclosing worker and task-local
+        // futures: their combined polling frames can exhaust the default stack.
+        // Pinning here preserves caller scope and cancellation of this attempt.
+        match Box::pin(mgr.ensure_started_owned(agent_id, workspace_id)).await {
             Ok(session_id) => return Ok(session_id),
             Err(e) => {
                 let retryable = is_retryable_spawn_error(&e);
