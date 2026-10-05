@@ -52,6 +52,8 @@ async fn attribution_event(sub: &mut Subscription) -> Value {
 async fn attribution_retry_persists_and_emits_without_another_edit() {
     let (_tmp, services, bus, ws, _other_ws, id) = setup().await;
     let mut sub = bus.subscribe(SubscriptionFilter {
+        // Pending note invalidations are separate from the legacy ready result.
+        event_types: vec![LINE_ATTRIBUTION_UPDATED.into()],
         workspace_id: Some(ws.to_string()),
         ..Default::default()
     });
@@ -92,10 +94,14 @@ async fn attribution_retry_persists_and_emits_without_another_edit() {
 async fn newer_attribution_schedule_cancels_retry_without_cross_workspace_cancellation() {
     let (_tmp, services, bus, ws, other_ws, id) = setup().await;
     let mut sub = bus.subscribe(SubscriptionFilter {
+        // Pending note invalidations are separate from the legacy ready result.
+        event_types: vec![LINE_ATTRIBUTION_UPDATED.into()],
         workspace_id: Some(ws.to_string()),
         ..Default::default()
     });
     let mut other_sub = bus.subscribe(SubscriptionFilter {
+        // Pending note invalidations are separate from the legacy ready result.
+        event_types: vec![LINE_ATTRIBUTION_UPDATED.into()],
         workspace_id: Some(other_ws.to_string()),
         ..Default::default()
     });

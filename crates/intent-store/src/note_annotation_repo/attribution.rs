@@ -61,6 +61,20 @@ impl Store {
         note_id: &NoteId,
         source_revision: i64,
     ) -> Result<AttributionJob> {
+        // Preserve the ordinary attribution writer's bounded contention policy.
+        // Retrying stays in this future, so a superseding scheduler can cancel it.
+        crate::with_write_txn_retry(|| {
+            self.begin_note_attribution_once(workspace_id, note_id, source_revision)
+        })
+        .await
+    }
+
+    async fn begin_note_attribution_once(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        source_revision: i64,
+    ) -> Result<AttributionJob> {
         let mut tx = self
             .write_pool()
             .begin_with("BEGIN IMMEDIATE")
@@ -89,6 +103,17 @@ impl Store {
     /// Returns stale on a superseded ticket, invalid params on inconsistent
     /// computation input, or an encoding/database error. Failure rolls back.
     pub async fn publish_note_attribution(
+        &self,
+        job: &AttributionJob,
+        source: &str,
+        data: &LineAttributionData,
+    ) -> Result<()> {
+        // Only transient database contention is retried. Every new transaction
+        // revalidates the same ticket and source; stale/permanent errors escape.
+        crate::with_write_txn_retry(|| self.publish_note_attribution_once(job, source, data)).await
+    }
+
+    async fn publish_note_attribution_once(
         &self,
         job: &AttributionJob,
         source: &str,

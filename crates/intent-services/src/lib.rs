@@ -206,6 +206,7 @@ mod nested_repos;
 mod note_annotation;
 mod note_merge;
 pub mod note_ops;
+mod note_page_state;
 mod npx_cli;
 #[expect(
     dead_code,
@@ -337,8 +338,8 @@ pub use agent_subscriptions::StartupCompletionRecovery;
 // (created by the composition root; intent-hq/intent#4953), and the
 // bus/refresher surface leave the crate.
 pub use events::{
-    Delivery, EventBus, GitStatusRefresher, SharedWatchHub, Subscription, SubscriptionFilter,
-    WatchHealth, WatchHealthSnapshot, WatcherRegistry,
+    Delivery, EventBus, GitStatusRefresher, InvalidationSubscription, SharedWatchHub, Subscription,
+    SubscriptionFilter, WatchHealth, WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
@@ -11129,14 +11130,25 @@ impl Services {
     /// Run `attribute_lines` over the note's current content + full version
     /// history, persist the result, and emit `line-attribution:updated` as a
     /// broadcast-only (transient, never persisted) event to live subscribers.
-    /// The write is idempotent (upsert), so a race between two computes leaves
-    /// the store consistent with the *latest* one to complete.
+    /// A generation ticket binds the computation to its original source and
+    /// prevents an older or superseded job from publishing over newer state.
+    /// Indexed attribution and the compatible legacy snapshot commit together.
     async fn compute_and_persist_line_attribution(
         &self,
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
     ) -> Result<LineAttributionData> {
         let note = fetch_note(&self.store, workspace_id, note_id).await?;
+        let job = self
+            .store
+            .begin_note_attribution(workspace_id, note_id, note.rev)
+            .await?;
+        // Publish the committed pending invalidation without fabricating an
+        // empty legacy attribution result. Existing note listeners can re-read.
+        publish_event_transient(
+            self.event_bus.as_ref(),
+            &note_change_event(workspace_id, note_id, &note.title, NOTE_UPDATED, "update"),
+        );
         let summaries = self.store.list_note_versions(workspace_id, note_id).await?;
         let mut versions: Vec<NoteVersion> = Vec::with_capacity(summaries.len());
         for summary in &summaries {
@@ -11175,7 +11187,9 @@ impl Services {
             computed_at: now_iso(),
             attributions: map,
         };
-        self.store.upsert_note_line_attribution(&data).await?;
+        self.store
+            .publish_note_attribution(&job, &note.content, &data)
+            .await?;
         publish_event_transient(
             self.event_bus.as_ref(),
             &line_attribution_updated_event(&data),
@@ -25005,6 +25019,15 @@ impl WorkspaceApi for Services {
         rpc_id: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(self.read_annotation_page(method, request, rpc_id))
+    }
+
+    fn get_note_page_state(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        incarnation: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.read_page_state(workspace_id, note_id, incarnation))
     }
 
     fn note_operation_status(

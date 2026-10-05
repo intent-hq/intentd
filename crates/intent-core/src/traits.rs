@@ -1060,6 +1060,18 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { Err(crate::Error::Unsupported("annotation pages".into())) })
     }
 
+    /// Read one bounded persisted subscription tuple under current authorization.
+    /// An incarnation pins a running subscription to its deletion tombstone.
+    fn get_note_page_state(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        incarnation: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, note_id, incarnation);
+        Box::pin(async { Err(crate::Error::Unsupported("note page state".into())) })
+    }
+
     /// Resolve a retained operation under current authorization, without live text.
     fn note_operation_status(
         &self,
