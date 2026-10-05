@@ -11,6 +11,9 @@ use intent_core::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+#[path = "staged_receipt_fe_capture.rs"]
+mod fe_capture;
+
 fn reference(id: &str, text: &str) -> Value {
     json!({"textId":id,"length":text.encode_utf16().count(),"utf8Bytes":text.len(),"sha256":format!("{:x}",Sha256::digest(text.as_bytes()))})
 }
