@@ -418,16 +418,97 @@ async fn original_child(instance: &str, sha: &str) {
         assert_eq!(workspace["contextLinks"], links);
         created.push((workspace["id"].clone(), path.to_path_buf()));
         let identity = workspace["id"].clone();
-        git(
-            path,
-            &["commit", "--allow-empty", "-m", "native push control"],
-        );
+        for first in [true, false] {
+            git(
+                path,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    if first {
+                        "native push control"
+                    } else {
+                        "subsequent native push control"
+                    },
+                ],
+            );
+            let pushed = git(path, &["rev-parse", "HEAD"]);
+            let before_status = creator
+                .rpc(
+                    "git.status",
+                    json!({"workspaceId":identity,"forceRefresh":true}),
+                )
+                .await;
+            assert_eq!(success(&before_status)["hasUpstream"], !first);
+            if !first {
+                assert_eq!(success(&before_status)["ahead"], 1);
+                assert_eq!(success(&before_status)["unpushedCount"], 1);
+            }
+            let before_events = creator
+                .rpc(
+                    "event.query",
+                    json!({"workspaceId":identity,"eventType":"changes:git-status"}),
+                )
+                .await;
+            let prior: Vec<_> = success(&before_events)
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["id"].clone())
+                .collect();
+            let push = creator
+                .rpc("git.push", json!({"workspaceId": identity, "force":false}))
+                .await;
+            assert_eq!(success(&push)["pushedSha"], pushed);
+            assert_eq!(success(&push)["branch"], format!("workspace/{mode}"));
+            assert_eq!(
+                git(
+                    path,
+                    &[
+                        "rev-parse",
+                        &format!("refs/remotes/origin/workspace/{mode}")
+                    ]
+                ),
+                pushed
+            );
+            let status = creator
+                .rpc("git.status", json!({"workspaceId":identity}))
+                .await;
+            assert_eq!(success(&status)["hasUpstream"], true);
+            assert_eq!(success(&status)["ahead"], 0);
+            assert_eq!(success(&status)["behind"], 0);
+            assert_eq!(success(&status)["unpushedCount"], 0);
+            let history = creator
+                .rpc(
+                    "file-tracking.loadCommits",
+                    json!({"workspaceId":identity,"limit":1}),
+                )
+                .await;
+            assert_eq!(success(&history)["commits"][0]["hash"], pushed);
+            assert_eq!(success(&history)["commits"][0]["isPushed"], true);
+            let events = creator
+                .rpc(
+                    "event.query",
+                    json!({"workspaceId":identity,"eventType":"changes:git-status"}),
+                )
+                .await;
+            assert!(
+                success(&events)
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| !prior.contains(&event["id"]))
+                    .any(|event| {
+                        let status = &event["data"]["status"];
+                        status["branch"] == format!("workspace/{mode}")
+                            && status["hasUpstream"] == true
+                            && status["ahead"] == 0
+                            && status["unpushedCount"] == 0
+                    }),
+                "this push must emit its updated tracking status before any fetch: {events}"
+            );
+        }
         let pushed = git(path, &["rev-parse", "HEAD"]);
-        let push = creator
-            .rpc("git.push", json!({"workspaceId": identity, "force":false}))
-            .await;
-        assert_eq!(success(&push)["pushedSha"], pushed);
-        assert_eq!(success(&push)["branch"], format!("workspace/{mode}"));
         success(
             &creator
                 .rpc("git.fetch", json!({"workspaceId":identity}))
@@ -921,6 +1002,8 @@ async fn late_completion_controls(
     );
     let pushed = git(&workspace.1, &["rev-parse", "HEAD"]);
     let branch = git(&workspace.1, &["branch", "--show-current"]);
+    let tracking = format!("refs/remotes/origin/{branch}");
+    let previous_tracking = git(&workspace.1, &["rev-parse", &tracking]);
     std::fs::write(root.join("hold-receive"), []).unwrap();
     let mut push_client = h.wss(TOKEN).await;
     let id = workspace.0.clone();
@@ -951,6 +1034,11 @@ async fn late_completion_controls(
         "retired push private reply: {result}"
     );
     assert!(!result.to_string().contains(&pushed));
+    assert_eq!(
+        git(&workspace.1, &["rev-parse", &tracking]),
+        previous_tracking,
+        "retirement before acknowledgment refuses local publication, not the confirmed remote outcome"
+    );
     assert_eq!(
         git(&bare, &["rev-parse", &format!("refs/heads/{branch}")]),
         pushed

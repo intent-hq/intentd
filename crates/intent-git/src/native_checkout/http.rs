@@ -356,6 +356,12 @@ pub(super) fn push(
 ) -> Result<NativeCheckoutSelection> {
     let new = local_head(repo, branch)?;
     let selection = NativeCheckoutSelection::new(branch, &new.to_string())?;
+    let tracking_ref = format!("refs/remotes/origin/{branch}");
+    let previous_tracking = match repo.find_reference(&tracking_ref) {
+        Ok(reference) => reference.target().map(Some),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Some(None),
+        Err(_) => None,
+    };
     let client = client()?;
     let advertised = discover(&client, source, "git-receive-pack", credential)?;
     if !advertised.capabilities.contains("report-status") {
@@ -439,12 +445,23 @@ pub(super) fn push(
             Ok(())
         });
         if current.is_ok() && admitted {
-            let _ = repo.reference(
-                &format!("refs/remotes/origin/{branch}"),
-                new,
-                true,
-                "confirmed native push",
-            );
+            // Other worktrees share this ref. Publish only if it still has the
+            // value captured before the push, including an initially absent ref.
+            match previous_tracking {
+                Some(Some(previous)) => {
+                    let _ = repo.reference_matching(
+                        &tracking_ref,
+                        new,
+                        true,
+                        previous,
+                        "confirmed native push",
+                    );
+                }
+                Some(None) => {
+                    let _ = repo.reference(&tracking_ref, new, false, "confirmed native push");
+                }
+                None => (),
+            }
         }
     }
     Ok(selection)

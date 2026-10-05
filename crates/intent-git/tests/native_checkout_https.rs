@@ -31,6 +31,9 @@ struct Credential {
     url: String,
     mode: String,
     responses: std::cell::Cell<u32>,
+    after_response: Option<Box<dyn Fn() + Send>>,
+    after_transfer: Option<Box<dyn Fn() + Send>>,
+    publication_calls: std::cell::Cell<u32>,
 }
 impl NativeCheckoutCredentials for Credential {
     fn with_current(
@@ -42,7 +45,12 @@ impl NativeCheckoutCredentials for Credential {
                 "original fixture retired".into(),
             ));
         }
-        transfer()
+        transfer()?;
+        if let Some(after_transfer) = &self.after_transfer {
+            self.publication_calls.set(self.publication_calls.get() + 1);
+            after_transfer();
+        }
+        Ok(())
     }
     fn credential(&mut self, url: &str) -> Result<git2::Cred, git2::Error> {
         assert_eq!(url, self.url);
@@ -63,6 +71,12 @@ impl NativeCheckoutCredentials for Credential {
     }
     fn observe(&self, status: u16, _: Option<std::time::Instant>) {
         self.responses.set(self.responses.get() + 1);
+        if self.responses.get() == 2 {
+            if let Some(after_response) = &self.after_response {
+                assert_eq!(status, 200);
+                after_response();
+            }
+        }
         if matches!(status, 401 | 403 | 404) {
             self.rejected();
         }
@@ -114,6 +128,9 @@ fn child(mode: &str) {
         url,
         mode: mode.into(),
         responses: std::cell::Cell::new(0),
+        after_response: None,
+        after_transfer: None,
+        publication_calls: std::cell::Cell::new(0),
     };
     let result = clone_exact(&source, &directory, &selection, &mut credential);
     match mode {
@@ -123,6 +140,11 @@ fn child(mode: &str) {
         | "push_retire_before_refs"
         | "push_first_retire_before_refs"
         | "push_ref_locked"
+        | "push_newer_tracking"
+        | "push_first_newer_tracking"
+        | "push_source_changed"
+        | "push_head_advanced"
+        | "push_branch_changed"
         | "push_lost_response"
         | "fetch_redirect"
         | "push_redirect"
@@ -191,8 +213,99 @@ fn child(mode: &str) {
                     std::fs::write(repo.path().join(format!("{tracking_ref}.lock")), "held")
                         .unwrap();
                 }
-                let pushed = push_original(&directory, &source, branch, false, &mut credential);
                 if matches!(
+                    mode,
+                    "push_source_changed" | "push_head_advanced" | "push_branch_changed"
+                ) {
+                    let path = directory.clone();
+                    let mutation = mode.to_owned();
+                    credential.responses.set(0);
+                    credential.after_response = Some(Box::new(move || {
+                        let repo = git2::Repository::open(&path).unwrap();
+                        match mutation.as_str() {
+                            "push_source_changed" => repo
+                                .remote_set_url("origin", "https://changed.invalid/other.git")
+                                .unwrap(),
+                            "push_head_advanced" => {
+                                commit(&repo, false);
+                            }
+                            "push_branch_changed" => {
+                                repo.branch(
+                                    "local/other",
+                                    &repo.head().unwrap().peel_to_commit().unwrap(),
+                                    false,
+                                )
+                                .unwrap();
+                                repo.set_head("refs/heads/local/other").unwrap();
+                                commit(&repo, false);
+                            }
+                            _ => unreachable!(),
+                        }
+                    }));
+                }
+                let newer_tracking = if mode.ends_with("newer_tracking") {
+                    let newer = commit(&repo, false);
+                    repo.reference(
+                        &format!("refs/heads/{branch}"),
+                        head,
+                        true,
+                        "restore the original push HEAD",
+                    )
+                    .unwrap();
+                    let path = directory.clone();
+                    let name = tracking_ref.clone();
+                    credential.after_transfer = Some(Box::new(move || {
+                        let repo = git2::Repository::open(&path).unwrap();
+                        assert_eq!(repo.refname_to_id(&name).ok(), previous);
+                        repo.reference(&name, newer, true, "concurrent tracking publication")
+                            .unwrap();
+                    }));
+                    Some(newer)
+                } else {
+                    None
+                };
+                let pushed = push_original(&directory, &source, branch, false, &mut credential);
+                if let Some(newer) = newer_tracking {
+                    let acknowledged = pushed.unwrap();
+                    assert_eq!(acknowledged.branch, branch);
+                    assert_eq!(acknowledged.commit_sha, head.to_string());
+                    assert_eq!(credential.publication_calls.get(), 1);
+                    assert_eq!(repo.head().unwrap().target(), Some(head));
+                    assert_eq!(
+                        repo.refname_to_id(&tracking_ref).unwrap(),
+                        newer,
+                        "an acknowledged push must not replace a competing tracking publication"
+                    );
+                } else if matches!(
+                    mode,
+                    "push_source_changed" | "push_head_advanced" | "push_branch_changed"
+                ) {
+                    let acknowledged = pushed.unwrap();
+                    assert_eq!(acknowledged.branch, branch);
+                    assert_eq!(acknowledged.commit_sha, head.to_string());
+                    if mode == "push_source_changed" {
+                        assert_eq!(repo.refname_to_id(&tracking_ref).ok(), previous);
+                        assert_eq!(repo.head().unwrap().target(), Some(head));
+                        assert_eq!(
+                            repo.find_remote("origin").unwrap().url().unwrap(),
+                            "https://changed.invalid/other.git"
+                        );
+                    } else {
+                        assert_eq!(repo.refname_to_id(&tracking_ref).unwrap(), head);
+                        assert_ne!(repo.head().unwrap().target(), Some(head));
+                        if mode == "push_branch_changed" {
+                            assert_eq!(
+                                repo.head().unwrap().name().unwrap(),
+                                "refs/heads/local/other"
+                            );
+                            assert!(repo
+                                .find_reference("refs/remotes/origin/local/other")
+                                .is_err());
+                        } else {
+                            assert_eq!(intent_git::status::status(&directory).unwrap().ahead, 1);
+                        }
+                    }
+                } else if matches!(
                     mode,
                     "push_first"
                         | "push_retire_before_refs"
@@ -252,10 +365,12 @@ fn child(mode: &str) {
                 }
             }
             assert!(!REJECTED.with(std::cell::Cell::get));
-            assert_eq!(
-                repo.find_remote("origin").unwrap().url().unwrap(),
-                source.url()
-            );
+            if mode != "push_source_changed" {
+                assert_eq!(
+                    repo.find_remote("origin").unwrap().url().unwrap(),
+                    source.url()
+                );
+            }
         }
         "bad" => {
             assert!(
@@ -608,6 +723,11 @@ async fn run(name: &str, mode: &str) {
             | "push_retire_before_refs"
             | "push_first_retire_before_refs"
             | "push_ref_locked"
+            | "push_newer_tracking"
+            | "push_first_newer_tracking"
+            | "push_source_changed"
+            | "push_head_advanced"
+            | "push_branch_changed"
             | "push_lost_response"
     ) {
         let repo =
@@ -623,6 +743,20 @@ async fn run(name: &str, mode: &str) {
             sha,
             "the actual remote effect is retained"
         );
+        if mode.ends_with("newer_tracking") {
+            let local = git2::Repository::open(scratch.path().join("checkout")).unwrap();
+            assert_eq!(Some(remote), local.head().unwrap().target());
+        }
+        if mode != "push" {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|(path, _)| path.ends_with("/git-receive-pack"))
+                    .count(),
+                1,
+                "ref publication refusal must not retry the confirmed push"
+            );
+        }
     }
     if matches!(
         mode,
@@ -632,6 +766,11 @@ async fn run(name: &str, mode: &str) {
             | "push_retire_before_refs"
             | "push_first_retire_before_refs"
             | "push_ref_locked"
+            | "push_newer_tracking"
+            | "push_first_newer_tracking"
+            | "push_source_changed"
+            | "push_head_advanced"
+            | "push_branch_changed"
             | "push_lost_response"
             | "fetch_redirect"
             | "push_redirect"
@@ -870,6 +1009,51 @@ async fn confirmed_native_push_survives_locked_tracking_ref() {
     run(
         "confirmed_native_push_survives_locked_tracking_ref",
         "push_ref_locked",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_push_preserves_newer_tracking_publication() {
+    run(
+        "native_push_preserves_newer_tracking_publication",
+        "push_newer_tracking",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_first_push_preserves_newer_tracking_publication() {
+    run(
+        "native_first_push_preserves_newer_tracking_publication",
+        "push_first_newer_tracking",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirmed_native_push_preserves_changed_source_without_tracking_publication() {
+    run(
+        "confirmed_native_push_preserves_changed_source_without_tracking_publication",
+        "push_source_changed",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirmed_native_push_tracks_acknowledged_sha_after_head_advances() {
+    run(
+        "confirmed_native_push_tracks_acknowledged_sha_after_head_advances",
+        "push_head_advanced",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirmed_native_push_tracks_original_branch_after_branch_switch() {
+    run(
+        "confirmed_native_push_tracks_original_branch_after_branch_switch",
+        "push_branch_changed",
     )
     .await;
 }
