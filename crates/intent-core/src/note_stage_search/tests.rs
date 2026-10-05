@@ -98,14 +98,14 @@ const VECTORS: &[Vector] = &[
     },
     Vector {
         name: "no-normalization",
-        source: "é",
+        source: "e\u{301}",
         query: "é",
         ranges: None,
         expected: &[],
     },
     Vector {
         name: "combining-literal",
-        source: "é",
+        source: "e\u{301}",
         query: "́",
         ranges: None,
         expected: &[(1, 2)],
