@@ -513,9 +513,9 @@ async fn actual_store_wrapper_cancellation_rolls_back_fence_progress_and_reopens
         store.read_note_stage_base_piece("p", &query, 0).await,
         Err(Error::NoteMutation(NoteMutationError::Expired))
     ));
-    let status = store.note_stage_status("p", &query).await.unwrap();
-    assert_eq!(status["phase"], "expired");
-    assert_eq!(status["expiresAt"], deadline);
+    let response = store.note_stage_status("p", &query).await.unwrap();
+    assert_eq!(response["phase"], "expired");
+    assert_eq!(response["expiresAt"], deadline);
     let partial = {
         let mut conn = store.write_pool().acquire().await.unwrap();
         snapshot(&mut conn).await
@@ -552,7 +552,10 @@ async fn actual_store_wrapper_cancellation_rolls_back_fence_progress_and_reopens
         assert_eq!(done["note_operation"], 1);
         assert_eq!(done["note_stage_root"], 1);
     }
-    assert_eq!(store.note_stage_status("p", &query).await.unwrap(), status);
+    assert_eq!(
+        store.note_stage_status("p", &query).await.unwrap(),
+        response
+    );
     assert!(matches!(
         store.read_note_stage_base_piece("p", &query, 0).await,
         Err(Error::NoteMutation(NoteMutationError::Expired))

@@ -11,6 +11,8 @@ mod append;
 mod freeze;
 mod output;
 mod read;
+mod reclaim;
+pub use reclaim::NoteOperationReclaimStats;
 mod seal;
 mod source;
 mod status;

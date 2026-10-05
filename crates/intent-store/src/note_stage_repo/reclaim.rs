@@ -58,7 +58,7 @@ fn db(error: impl std::fmt::Display) -> Error {
 
 impl Store {
     /// Drain at most 64 operation children and 64 unpinned root pieces.
-    /// Retained receipt/replay identity is not removed before retain_until.
+    /// Retained receipt/replay identity is not removed before `retain_until`.
     /// # Errors
     /// Invalid timestamps, corrupt queue state or database errors roll back the
     /// entire batch. Dropping the future also drops the writer transaction.
@@ -79,9 +79,9 @@ impl Store {
         let stats = reclaim_batch(&mut tx, now).await?;
         #[cfg(test)]
         if let Ok(observer) = BEFORE_RECLAIM_COMMIT.try_with(Clone::clone) {
-            let state = tests::snapshot(&mut tx).await;
+            let snapshot = tests::snapshot(&mut tx).await;
             observer
-                .send((stats, state))
+                .send((stats, snapshot))
                 .expect("cleanup observer alive");
             // The test must drop the actual public wrapper future here. No
             // alternative success/commit path exists in this test seam.
@@ -136,9 +136,9 @@ async fn reclaim_operation(
             .as_deref()
         {
             Some("staging" | "sealed") => {
-                let state: serde_json::Value =
+                let outcome: serde_json::Value =
                     serde_json::from_str(row.try_get("outcome").map_err(db)?).map_err(db)?;
-                let deadline = state["expiresAt"]
+                let deadline = outcome["expiresAt"]
                     .as_str()
                     .and_then(intent_core::parse_iso)
                     .ok_or_else(|| db("invalid original deadline"))?;
