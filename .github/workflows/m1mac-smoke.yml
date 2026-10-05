@@ -1,33 +1,27 @@
 name: m1mac smoke test
 on:
   workflow_dispatch:
-permissions: {}
+    inputs:
+      apply:
+        description: Apply tested CI profile cleanup after dry-run
+        type: boolean
+        default: false
+permissions:
+  contents: read
 concurrency:
   group: macos-ci-disk-maintenance
   cancel-in-progress: false
 jobs:
   smoke:
-    name: Read-only disk inventory (m1mac)
+    name: Recover CI disk (m1mac)
     runs-on: [self-hosted, macOS, ARM64, m1mac]
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
-      - name: Inspect disk and build ownership
-        shell: bash
-        run: |
-          df -k "$HOME"
-          ps -axo pid=,ppid=,comm=
-          python3 -I -B -S - <<'PYTHON'
-          import json, os, pathlib, shutil, subprocess
-          home = pathlib.Path.home()
-          print(json.dumps({'home': str(home), 'disk': shutil.disk_usage(home)._asdict(), 'runner_name': os.environ.get('RUNNER_NAME'), 'runner_workspace': os.environ.get('RUNNER_WORKSPACE')}))
-          root = home / 'ci-target'
-          if root.is_dir() and not root.is_symlink():
-              for repo in sorted(root.iterdir()):
-                  print('ROOT_ENTRY', repo, 'symlink', repo.is_symlink())
-                  if repo.is_dir() and not repo.is_symlink():
-                      for child in sorted(repo.iterdir()):
-                          print('CANDIDATE', child, 'symlink', child.is_symlink())
-                          if child.is_dir() and not child.is_symlink():
-                              subprocess.run(['du', '-sk', str(child)], check=True)
-                              print('CHILDREN', [p.name for p in child.iterdir()])
-          PYTHON
+      - uses: actions/checkout@v7
+      - name: Test safety including actual Cargo lock behavior
+        run: python3 -I -B scripts/test-macos-ci-cleanup.py
+      - name: Dry-run eligible build profiles
+        run: python3 -I -B scripts/macos-ci-cleanup.py
+      - name: Recover disk
+        if: inputs.apply
+        run: python3 -I -B scripts/macos-ci-cleanup.py --apply
