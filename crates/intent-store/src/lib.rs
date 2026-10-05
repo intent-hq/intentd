@@ -495,12 +495,21 @@ impl Store {
     }
 
     /// Borrow the write pool (single connection, for INSERT/UPDATE/DELETE/BEGIN).
+    ///
+    /// For owned stores, pool acquisition, same-database option replacement and
+    /// detached connections retain the startup lease. Unmodified clones of
+    /// `pool.options()` also retain it when used for the same database. Do not
+    /// retarget owned pools or replace their connection hooks.
+    /// `pool.connect_options()` exports configuration, not an ownership token:
+    /// standalone connections created from it bypass the pool and are not
+    /// supported as owned handles. Acquire through the pool instead.
     #[must_use]
     pub fn write_pool(&self) -> &SqlitePool {
         &self.write_pool
     }
 
     /// Borrow the read pool (32 connections, intended for read/SELECT queries).
+    /// The ownership and exported-options boundary is the same as [`Self::write_pool`].
     #[must_use]
     pub fn read_pool(&self) -> &SqlitePool {
         &self.read_pool
@@ -812,7 +821,7 @@ async fn connect_write_owned(
         .busy_timeout(Duration::from_secs(5))
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
-    SqlitePoolOptions::new()
+    retain_pool_owner(SqlitePoolOptions::new(), owner.clone())
         .max_connections(1)
         .acquire_timeout(acquire_timeout)
         .connect_with(retain_owner(opts, owner))
@@ -869,7 +878,7 @@ async fn connect_read_owned(
         .busy_timeout(Duration::from_secs(5))
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
-    SqlitePoolOptions::new()
+    retain_pool_owner(SqlitePoolOptions::new(), owner.clone())
         .max_connections(32)
         .acquire_timeout(Duration::from_secs(10))
         .connect_with(retain_owner(opts, owner))
@@ -880,6 +889,32 @@ async fn connect_read_owned(
             }
             _ => Error::Internal(format!("failed to open read pool: {e}")),
         })
+}
+
+/// Unlike connection options, the live pool's hooks cannot be replaced by
+/// `set_connect_options`. Keep ownership in that hook and install a separate
+/// `SQLite`-owned capture on every new connection before handing it to a caller.
+/// The hook capture retains the lease for the pool; the installed callback also covers
+/// detached handles and work still executing after async task cancellation.
+fn retain_pool_owner(
+    options: SqlitePoolOptions,
+    owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+) -> SqlitePoolOptions {
+    match owner {
+        Some(owner) => options.after_connect(move |connection, _metadata| {
+            let owner = owner.clone();
+            Box::pin(async move {
+                connection.lock_handle().await?.create_collation(
+                    "intent_daemon_ownership",
+                    move |left, right| {
+                        let _keep_alive = &owner;
+                        left.cmp(right)
+                    },
+                )
+            })
+        }),
+        None => options,
+    }
 }
 
 /// Attach the lease to both future connection creation and the actual `SQLite`
