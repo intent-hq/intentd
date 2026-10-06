@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.24] - 2026-10-06
+
+### 🧪 Testing
+
+- Make detached CLI identity and publication observations reliable ([#2326](https://github.com/intent-hq/intentd/pull/2326))
+
+
 ## [0.10.23] - 2026-10-06
 
 ### 🐛 Bug Fixes
