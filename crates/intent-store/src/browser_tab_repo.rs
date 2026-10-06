@@ -36,7 +36,7 @@ use intent_core::{
     BrowserTabUpsertOutcome, BrowserTabVisibility, ClientId, Error, Result, WorkspaceId,
 };
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Row, SqliteConnection, SqlitePool, Transaction};
+use sqlx::{Row, SqliteConnection, Transaction};
 
 use crate::Store;
 
@@ -539,7 +539,7 @@ impl Store {
     }
 }
 
-async fn begin<'a>(pool: &SqlitePool, what: &str) -> Result<WriteTxn<'a>> {
+async fn begin<'a>(pool: &crate::StorePool, what: &str) -> Result<WriteTxn<'a>> {
     pool.begin()
         .await
         .map_err(|e| Error::Internal(format!("{what} begin failed: {e}")))

@@ -42,7 +42,8 @@ async fn shorten_acquire_timeout(store: &mut Store, tmp: &TempDb) {
     store.write_pool.close().await;
     store.write_pool = crate::connect_write_with_acquire_timeout(&tmp.path, ACQUIRE_TIMEOUT)
         .await
-        .expect("open short-timeout writer");
+        .expect("open short-timeout writer")
+        .into();
 }
 
 async fn wait_for_timeout(observed: &AtomicUsize) {
