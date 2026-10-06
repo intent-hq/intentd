@@ -211,7 +211,7 @@ const EXPECTED_TOTAL_METHODS: usize = 436;
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
-/// Prepared 13.7 adds applySplices, receipt read and three staged upload methods.
+/// Prepared 13.8 adds applySplices, receipt read and three staged upload methods.
 const EXPECTED_ROUTER_METHODS: usize = 380;
 
 /// Golden count: fast-path methods (intercepted before router).

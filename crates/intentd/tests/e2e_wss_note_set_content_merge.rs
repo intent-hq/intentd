@@ -1404,7 +1404,7 @@ async fn bounded_note_operation_status_reads_committed_receipt_after_wss_reconne
     let fx = boot().await;
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
     let hello = wss_rpc(&mut rpc, 0, "client.hello", json!({})).await;
-    assert_eq!(hello["protocolVersion"], "13.7");
+    assert_eq!(hello["protocolVersion"], "13.8");
     assert!(hello["server"]["capabilities"].get("notePaging").is_none());
     let workspace = wss_rpc(
         &mut rpc,
