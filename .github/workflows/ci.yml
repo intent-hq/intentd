@@ -466,6 +466,24 @@ jobs:
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: cargo test --workspace --test '*_lint'
+      # The native auth bridge uses experimental external-token login and legacy
+      # token export. Exercise the supported runtime on every PR and merge tree,
+      # including adapter pin changes; an ignored local test alone is insufficient.
+      # Update the version and independently verified release digest together.
+      - name: Pinned Codex native authentication contract
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          fixture=$(mktemp -d "$RUNNER_TEMP/codex-auth-contract.XXXXXX")
+          trap 'rm -rf "$fixture"' EXIT
+          curl --fail --location --retry 2 --max-time 120 \
+            https://github.com/openai/codex/releases/download/rust-v0.160.0/codex-x86_64-unknown-linux-musl.tar.gz \
+            --output "$fixture/codex.tar.gz"
+          printf '%s  %s\n' 306865417d4ee7a927785852910a527f41e1e159add390ac5ae3accb67d44a13 "$fixture/codex.tar.gz" | sha256sum --check --status
+          tar -xzf "$fixture/codex.tar.gz" -C "$fixture" codex-x86_64-unknown-linux-musl
+          export INTENTD_PROFILE_CODEX_BIN="$fixture/codex-x86_64-unknown-linux-musl"
+          cargo test --locked -p intentd --test codex_auth_bridge \
+            installed_codex_native_auth_contract_and_bridge -- --ignored --exact
       # This target requires explicit cold mock authority. Ordinary/default
       # daemon builds never register these transports; keep the feature lane
       # mandatory so default target selection cannot hide auth coverage.

@@ -344,7 +344,64 @@ async fn worker_refresh_receives_only_access_token_and_persists_native_rotation(
     assert_eq!(f.authority().read(None).await.unwrap().unwrap().token, b);
 }
 #[tokio::test]
-async fn account_switch_blocks_new_steering_before_worker_receives_it() {
+async fn account_switch_blocks_all_adapter_requests_and_unknown_future_methods() {
+    // Complete ACP2.1.1 request inventory except explicit startup/auth/cleanup paths.
+    for method in [
+        "account/rateLimits/read",
+        "account/read",
+        "config/read",
+        "mcpServer/oauth/login",
+        "mcpServerStatus/list",
+        "model/list",
+        "review/start",
+        "skills/extraRoots/set",
+        "skills/list",
+        "thread/archive",
+        "thread/backgroundTerminals/list",
+        "thread/compact/start",
+        "thread/fork",
+        "thread/goal/get",
+        "thread/goal/set",
+        "thread/items/list",
+        "thread/list",
+        "thread/loaded/list",
+        "thread/name/set",
+        "thread/read",
+        "thread/resume",
+        "thread/settings/update",
+        "thread/start",
+        "thread/turns/list",
+        "turn/start",
+        "turn/steer",
+        "future/authenticated/request",
+    ] {
+        let f = Fixture::new();
+        f.login(&token("account", "user", 1, false), None);
+        let mut server = f.server();
+        let mut bridge = f.bridge();
+        bridge
+            .synchronize(&mut server, &mut Vec::new())
+            .await
+            .unwrap();
+        f.login(&token("other", "user", 2, false), None);
+        let input = format!("{}\n", json!({"id":2,"method":method}));
+        let mut output = Vec::new();
+        bridge
+            .proxy(&mut server, &mut Frames::new(input.as_bytes()), &mut output)
+            .await
+            .unwrap();
+        server.stop().await;
+        assert!(
+            String::from_utf8(output).unwrap().contains(ACCOUNT_ERROR),
+            "{method}"
+        );
+        assert!(!std::fs::read_to_string(f.profile.join("requests"))
+            .unwrap()
+            .contains(method));
+    }
+}
+#[tokio::test]
+async fn startup_cleanup_responses_and_notifications_remain_usable_after_logout() {
     let f = Fixture::new();
     f.login(&token("account", "user", 1, false), None);
     let mut server = f.server();
@@ -353,19 +410,71 @@ async fn account_switch_blocks_new_steering_before_worker_receives_it() {
         .synchronize(&mut server, &mut Vec::new())
         .await
         .unwrap();
-    f.login(&token("other", "user", 2, false), None);
-    let input = b"{\"id\":2,\"method\":\"turn/steer\"}\n";
-    let mut output = Vec::new();
-    bridge
-        .proxy(&mut server, &mut Frames::new(&input[..]), &mut output)
+    std::fs::remove_file(f.native.join("auth.json")).unwrap();
+    let native_requests = std::fs::read(f.native.join("requests")).unwrap();
+    let (mut client, input) = tokio::io::duplex(4096);
+    let (mut output, client_output) = tokio::io::duplex(4096);
+    let mut input = Frames::new(BufReader::new(input));
+    let exchange = async {
+        let mut responses = Frames::new(BufReader::new(client_output));
+        // Notifications and responses finish protocol work without starting a
+        // new authenticated operation. A subsequent reply is a delivery barrier.
+        write_frame(&mut client, &json!({"method":"initialized"}))
+            .await
+            .unwrap();
+        write_frame(
+            &mut client,
+            &json!({"method":"$/cancelRequest","params":{"id":"pending"}}),
+        )
         .await
         .unwrap();
+        for (id, method) in [
+            "initialize",
+            "turn/interrupt",
+            "thread/unsubscribe",
+            "thread/backgroundTerminals/terminate",
+            "thread/goal/clear",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write_frame(
+                &mut client,
+                &json!({"id":id,"method":method,"params":{"capabilities":{}}}),
+            )
+            .await
+            .unwrap();
+            let response = responses.next().await.unwrap().unwrap();
+            assert_eq!(response, json!({"id":id,"result":{}}));
+        }
+        // The fixture acknowledges incoming approval/elicitation responses so
+        // the test can prove they reached the child without an auth lookup.
+        for frame in [
+            json!({"id":"approval","result":{"decision":"decline"}}),
+            json!({"id":"elicitation","error":{"code":-1,"message":"cancelled"}}),
+        ] {
+            write_frame(&mut client, &frame).await.unwrap();
+            assert_eq!(responses.next().await.unwrap().unwrap()["id"], frame["id"]);
+        }
+        drop(client);
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (proxy, ()) =
+            tokio::join!(bridge.proxy(&mut server, &mut input, &mut output), exchange);
+        proxy.unwrap();
+    })
+    .await
+    .unwrap();
     server.stop().await;
-    assert!(String::from_utf8(output).unwrap().contains(ACCOUNT_ERROR));
-    assert!(!std::fs::read_to_string(f.profile.join("requests"))
-        .unwrap()
-        .contains("turn/steer"));
+    assert_eq!(
+        std::fs::read(f.native.join("requests")).unwrap(),
+        native_requests
+    );
+    let worker_requests = std::fs::read_to_string(f.profile.join("requests")).unwrap();
+    assert!(worker_requests.contains("initialized"));
+    assert!(worker_requests.contains("$/cancelRequest"));
 }
+
 #[tokio::test]
 async fn lock_contention_is_bounded_and_cancellation_releases_authority() {
     let f = Fixture::new();

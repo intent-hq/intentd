@@ -561,7 +561,14 @@ impl Bridge {
                         write_frame(output, &json!({"id":frame["id"],"error":{"code":-32000,"message":"Use native codex login on this daemon host, then Retry."}})).await?;
                         continue;
                     }
-                    if matches!(method, "account/read" | "thread/start" | "thread/resume" | "turn/start" | "turn/steer") {
+                    // Synchronize requests by default, including future methods:
+                    // new upstream model operations must not silently bypass identity.
+                    // Initialize precedes external login; cancellation/cleanup must
+                    // remain usable after native logout. Responses and notifications
+                    // finish existing work and retain their original protocol flow.
+                    if frame.get("id").is_some() && !method.is_empty() && !matches!(method,
+                        "initialize" | "turn/interrupt" | "thread/unsubscribe"
+                        | "thread/backgroundTerminals/terminate" | "thread/goal/clear") {
                         if let Err(error) = self.synchronize(server, output).await {
                             write_frame(output, &json!({"id":frame["id"],"error":{"code":-32000,"message":error}})).await?;
                             return Ok(());
