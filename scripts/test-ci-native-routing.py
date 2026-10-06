@@ -29,6 +29,7 @@ REQUIRED = {
 }
 PR_METADATA = {"pr-title", "conflict-markers"}
 NATIVE_STEPS = {
+    "Check (native production configuration)": {"macOS", "Windows"},
     "Clippy (target-gated code)": {"macOS", "Windows"},
     "Tunnel deadline and TLS controls (macOS runtime)": {"macOS"},
     "Codex diagnostic process ownership (Windows runtime)": {"Windows"},
@@ -163,7 +164,7 @@ def native_errors(workflow):
                     errors.append(f"{name}: wrong selection for {event}/{platform}")
     clippy = steps.get("Clippy (target-gated code)", {})
     if clippy.get("run") != "cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings":
-        errors.append("native Clippy must compile all workspace targets with default features")
+        errors.append("native Clippy must lint all workspace targets")
     if clippy.get("env") or clippy.get("working-directory"):
         errors.append("native Clippy must inherit the job compilation configuration")
     for name, command in (("Build (release)", "cargo build --workspace --release --target ${{ matrix.target }}"),
@@ -173,9 +174,13 @@ def native_errors(workflow):
             errors.append(f"{name}: missing push compilation")
         elif any(condition(step.get("if", True), context(event)) != (event == "push") for event in REQUIRED):
             errors.append(f"{name}: must be push-only")
-    for step in build["steps"]:
-        if "cargo check " in step.get("run", "") and condition(step.get("if", True), context("merge_group")):
-            errors.append("redundant queue cargo check")
+    # --all-targets unifies dev-dependency fixture features into intent-services
+    # and omits some feature-off production arms. Keep the non-test check too.
+    check = steps.get("Check (native production configuration)", {})
+    if check.get("run") != "cargo check --workspace --target ${{ matrix.target }}":
+        errors.append("native check must compile the non-test production configuration")
+    if check.get("env") or check.get("working-directory"):
+        errors.append("native check must inherit the job compilation configuration")
     tests = workflow["jobs"]["release-scripts"]
     if tests.get("continue-on-error") or not any(
         re.search(r"^python3 (?:-[IB] )*scripts/test-ci-native-routing.py$", step.get("run", ""), re.M)
@@ -287,6 +292,15 @@ class NativeRoutingTests(unittest.TestCase):
                 workflow = copy.deepcopy(self.workflow)
                 workflow["jobs"]["build"]["if"] = expression
                 self.assertTrue(any("wrong jobs" in error for error in routing_errors(workflow)))
+
+    def test_mutations_cannot_replace_production_check_with_fixture_configuration(self):
+        for arguments in ("--all-targets", "--tests", "--features intent-services/repository-test-fixtures"):
+            with self.subTest(arguments=arguments):
+                workflow = copy.deepcopy(self.workflow)
+                step = next(s for s in workflow["jobs"]["build"]["steps"]
+                            if s.get("name") == "Check (native production configuration)")
+                step["run"] += " " + arguments
+                self.assertIn("native check must compile the non-test production configuration", native_errors(workflow))
 
     def test_mutation_cannot_accept_skipped_queue_build(self):
         workflow = copy.deepcopy(self.workflow)

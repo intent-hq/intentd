@@ -31,7 +31,7 @@ on:
   # jobs outright on merge_group and accepts their skip on pull_request /
   # push, and the reverse for coverage-changed. The native matrix is skipped
   # at job level on PRs, so it allocates no macOS / Windows Rust runners.
-  # CI Gate requires its target-gated Clippy and runtime proofs on merge_group,
+  # CI Gate requires native check, Clippy and runtime proofs on merge_group,
   # and its release builds on push. CI Gate is the sole required status check.
   # Merge groups are created by the repo's own ruleset from already-filed
   # PRs, so they need no same-repo fork guard. pr-title / conflict-markers
@@ -763,11 +763,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: gh-build-${{ matrix.target }}
-      # All-target Clippy supplies the native compilation proof: same
-      # workspace, target, default features, pinned toolchain and dev profile
-      # as the former cargo check, plus test/example/bench targets. A separate
-      # queue cargo check is redundant. Release builds stay push-only; the
-      # final check warms their persistent target dir for the next queue run.
+      # Keep the production configuration check separate from all-target
+      # Clippy: intentd's dev-dependency enables repository-test-fixtures in
+      # intent-services under --all-targets, excluding feature-off production
+      # arms. Native --lib tests use cfg(test), so they cannot replace this
+      # non-test check either. Release builds stay push-only; the final check
+      # warms their persistent target dir for the next queue run.
+      - name: Check (native production configuration)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group'
+        run: cargo check --workspace --target ${{ matrix.target }}
       # Clippy over target-gated code (intent-hq/monorepo#3285 for macOS,
       # intent-hq/intentd#1813 for Windows): the `check` job lints on Linux,
       # where `#[cfg(target_os = "macos")]` / `#[cfg(windows)]` /
@@ -1983,7 +1987,7 @@ jobs:
 
   # CI Gate is the sole required status check. Every failed/cancelled result
   # fails it; skips are accepted only for jobs intentionally absent by event.
-  # build is required on merge_group (native Clippy + runtime proofs) and push
+  # build is required on merge_group (native check, Clippy and runtime proofs) and push
   # (release compilation); only pull_request accepts its job-level skip.
   # check / monorepo-consumer-checks must succeed on PRs and merge_group.
   # Full coverage is required on merge_group, changed coverage on PRs.
