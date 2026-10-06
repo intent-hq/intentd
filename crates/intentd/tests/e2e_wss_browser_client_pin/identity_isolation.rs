@@ -76,7 +76,9 @@ impl LocalForge {
 async fn browser_fixture_ignores_ambient_gitlab_during_both_forge_refresh() {
     let root = scratch_dir();
     let forge = LocalForge::start().await;
-    let mut command = common::serve_command();
+    let data = root.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let mut command = common::hermetic_serve_command(&data);
     // Supply the token BEFORE the fixture applies its isolation, as if it were
     // inherited. Setting it afterwards would intentionally bypass the boundary.
     command

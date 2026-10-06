@@ -230,7 +230,7 @@ fn spawn_daemon(
     // the explicit `agent.resolveInterrupted` call (the `auto` default resumes
     // on headless hosts, which would race the assertions below).
     common::disable_resume_on_start(data_dir);
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)

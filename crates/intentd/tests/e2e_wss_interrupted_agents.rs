@@ -327,7 +327,7 @@ async fn interrupted_agents_persisted_across_restart() {
     // Pin resumeInterruptedOnStart=off: this suite asserts pending rows
     // survive a restart, but the `auto` default resumes on headless hosts.
     common::disable_resume_on_start(&data_dir);
-    let mut cmd1 = common::serve_command();
+    let mut cmd1 = common::hermetic_serve_command(&data_dir);
     cmd1.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -425,7 +425,7 @@ async fn interrupted_agents_persisted_across_restart() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd2 = common::serve_command();
+    let mut cmd2 = common::hermetic_serve_command(&data_dir);
     cmd2.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -476,7 +476,7 @@ async fn interrupted_agents_persisted_across_restart() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd3 = common::serve_command();
+    let mut cmd3 = common::hermetic_serve_command(&data_dir);
     cmd3.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -557,13 +557,12 @@ async fn assert_blocked_exec_stream_shutdown(eof: bool) {
     let log_path = data.join("daemon.log");
     let pid_path = data.join("stream.pid");
     common::enable_ws_api(data);
-    let mut command = common::serve_command();
+    let mut command = common::hermetic_serve_command(data);
     command
         .env("INTENTD_DATA_DIR", data)
         .env("INTENTD_WORKSPACES_DIR", data.join("workspaces"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_SECRETS_FILE", data.join("secrets.json"))
         .env("INTENTD_TEST_EXEC_STREAM_WRITE_PENDING", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&log_path).unwrap()));
@@ -720,7 +719,7 @@ async fn cancelled_settings_hook_joins_before_main_listener_teardown() {
     let responses = tokio::net::UnixListener::bind(&response_path).unwrap();
     let starts = tokio::net::UnixListener::bind(&start_path).unwrap();
     let log_path = data.join("daemon.log");
-    let mut command = common::serve_command();
+    let mut command = common::hermetic_serve_command(data);
     command
         .env("INTENTD_DATA_DIR", data)
         .env("INTENTD_WORKSPACES_DIR", data.join("workspaces"))
@@ -848,10 +847,9 @@ await import({});
     .unwrap();
     let config = json!({"id":"shutdown-held","transport":"stdio","command":"node","args":[wrapper],"env":{"MOCK_MCP_START_GATE":start_path,"INTENTD_SECRETS_FILE":data.join("secrets.json")},"enabled":false});
     let log_path = data.join("daemon.log");
-    let mut command = common::serve_command();
+    let mut command = common::hermetic_serve_command(data);
     command
         .env("INTENTD_DATA_DIR", data)
-        .env("INTENTD_SECRETS_FILE", data.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", data.join("workspaces"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -989,7 +987,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     // Pin resumeInterruptedOnStart=off: this suite asserts the captured row
     // is still pending after restart, but `auto` resumes on headless hosts.
     common::disable_resume_on_start(&data_dir);
-    let mut cmd1 = common::serve_command();
+    let mut cmd1 = common::hermetic_serve_command(&data_dir);
     cmd1.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
@@ -1221,7 +1219,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd2 = common::serve_command();
+    let mut cmd2 = common::hermetic_serve_command(&data_dir);
     cmd2.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")

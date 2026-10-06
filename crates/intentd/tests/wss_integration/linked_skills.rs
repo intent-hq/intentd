@@ -500,8 +500,8 @@ async fn wss_linked_skills_include_shared_personal_but_ignore_native_home_and_co
         common::enable_ws_api(&data);
         let log_path = data.join("daemon.log");
         let log = std::fs::File::create(&log_path).unwrap();
-        let mut command = common::serve_command();
-        common::hermetic_github_identity(&mut command, &data);
+        let mut command = common::hermetic_serve_command(&data);
+
         command
             .env("HOME", &home)
             .env(
@@ -516,7 +516,6 @@ async fn wss_linked_skills_include_shared_personal_but_ignore_native_home_and_co
             .env("INTENTD_WORKSPACES_DIR", data.join("workspaces"))
             .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
             .env("INTENTD_AUTH_TOKEN", TOKEN)
-            .env("INTENTD_SECRETS_FILE", data.join("secrets.json"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));

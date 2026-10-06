@@ -1128,7 +1128,7 @@ async fn monitor_storage_failure_retries_reserved_trigger_without_duplicate_or_t
 async fn monitor_restore_failure_keeps_legacy_marker_and_compact_failure() {
     let h = harness_with_worktree(true).await;
     let owner = monitor_owner(&h, "restore owner").await;
-    let id = create(
+    let id = hydrate_legacy_script(
         &h,
         ScriptCreateParams {
             name: "restore failure".into(),

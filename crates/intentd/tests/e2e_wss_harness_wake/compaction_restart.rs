@@ -29,9 +29,8 @@ impl RestartFixture {
         std::fs::create_dir_all(&workspaces).unwrap();
         let log =
             std::fs::File::create(root.join(format!("daemon-{}.log", self.generation))).unwrap();
-        let mut cmd = common::serve_command();
-        cmd.env("INTENTD_DATA_DIR", root)
-            .env("INTENTD_WORKSPACES_DIR", workspaces)
+        let mut cmd = common::hermetic_serve_command(root);
+        cmd.env("INTENTD_WORKSPACES_DIR", workspaces)
             .env("INTENTD_AUTH_TOKEN", TOKEN)
             .env("MOCK_AGENT_SCRIPT_PATH", &self.script)
             .env(

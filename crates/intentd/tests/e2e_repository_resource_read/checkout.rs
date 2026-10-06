@@ -499,6 +499,9 @@ async fn checkout_private_reply_after_host_revocation_is_denied_on_original_sock
 #[path = "checkout/native.rs"]
 mod native;
 
+#[path = "checkout/avatars.rs"]
+mod avatars;
+
 #[intent_test_macros::daemon_test]
 async fn checkout_public_tls_auth_settings_transition_and_cancel_preserve_full_prefix() {
     let server = Server::new().await;

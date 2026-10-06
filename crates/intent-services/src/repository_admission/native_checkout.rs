@@ -125,6 +125,7 @@ struct Lease {
     _subscription: RepositorySubscription,
     _permit: OwnedSemaphorePermit,
     provider: OnceLock<Arc<GitlabCheckoutConnection>>,
+    include_owner_avatar: bool,
     projects: Mutex<HashMap<String, Project>>,
     branches: Mutex<HashMap<(String, String), CheckoutBranch>>,
     cursors: Mutex<HashMap<String, Cursor>>,
@@ -645,6 +646,10 @@ async fn admit_lease(
         _subscription: subscription,
         _permit: permit,
         provider: OnceLock::new(),
+        include_owner_avatar: matches!(
+            &r.frame,
+            CheckoutFrame::Capture(q) if q.include_owner_avatar == Some(true)
+        ),
         projects: Mutex::default(),
         branches: Mutex::default(),
         cursors: Mutex::default(),
@@ -824,7 +829,11 @@ fn split_project(path: &str) -> Result<(&str, &str)> {
     path.rsplit_once('/')
         .ok_or_else(|| Error::InvalidParams("GitLab project needs a namespace".into()))
 }
-fn project_wire(instance: &str, repo: intent_sourcecontrol::Repo) -> Result<Project> {
+fn project_wire(
+    instance: &str,
+    repo: intent_sourcecontrol::Repo,
+    include_owner_avatar: bool,
+) -> Result<Project> {
     let project_path = format!("{}/{}", repo.owner, repo.name);
     split_project(&project_path)?;
     let web_url = format!("{}/{project_path}", instance.trim_end_matches('/'));
@@ -844,6 +853,7 @@ fn project_wire(instance: &str, repo: intent_sourcecontrol::Repo) -> Result<Proj
             clone_url: format!("{web_url}.git"),
             web_url,
             default_branch,
+            owner_avatar_url: repo.owner_avatar_url.filter(|_| include_owner_avatar),
         },
     })
 }
@@ -949,7 +959,13 @@ pub(crate) fn projects(
             let items = page
                 .items
                 .into_iter()
-                .map(|repo| project_wire(connection.instance_base_url(), repo))
+                .map(|repo| {
+                    project_wire(
+                        connection.instance_base_url(),
+                        repo,
+                        lease.include_owner_avatar,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?;
             r.private_projects(items.iter().map(|p| p.wire.project_path.clone()).collect())?;
             for project in &items {
@@ -990,7 +1006,11 @@ async fn load_project(
             )))
         }
     };
-    let project = project_wire(connection.instance_base_url(), repo)?;
+    let project = project_wire(
+        connection.instance_base_url(),
+        repo,
+        lease.include_owner_avatar,
+    )?;
     if project.wire.project_path != path {
         return Err(unavailable());
     }

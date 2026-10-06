@@ -87,8 +87,6 @@ async fn permission_recovery(routed: bool) {
     )
     .unwrap();
     std::fs::write(dir.path().join("secrets.json"), "{}").unwrap();
-    let gh = dir.path().join("empty-gh");
-    std::fs::create_dir(&gh).unwrap();
     let behavior = json!({"clientCalls":[{"method":"session/request_permission","params":{
         "sessionId":"mock-session","toolCall":{"toolCallId":"write","title":"Scoped approval"},
         "options":[{"optionId":"allow_once","name":"Allow","kind":"allow_once"}]},
@@ -100,9 +98,6 @@ async fn permission_recovery(routed: bool) {
         ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
         ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
         ("INTENTD_PERMISSION_POLICY", "interactive"),
-        ("GH_CONFIG_DIR", gh.to_str().unwrap()),
-        ("GITHUB_TOKEN", ""),
-        ("GH_TOKEN", ""),
         ("GITLAB_TOKEN", ""),
     ];
     let _daemon = Daemon {

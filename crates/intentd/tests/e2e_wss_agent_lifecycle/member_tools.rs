@@ -115,8 +115,6 @@ async fn member_provider_enablement_commits_safe_snapshots_over_wss_and_restart(
     .unwrap();
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("GITHUB_TOKEN", ""),
-        ("GH_TOKEN", ""),
         ("GITLAB_TOKEN", ""),
         ("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:9"),
     ];
@@ -335,8 +333,6 @@ async fn member_ai_rejection_emits_safe_diagnostic_and_context_invalidation_over
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
         ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
-        ("GITHUB_TOKEN", ""),
-        ("GH_TOKEN", ""),
         ("GITLAB_TOKEN", ""),
     ];
     let daemon = Daemon {
@@ -471,8 +467,6 @@ async fn member_prompt_survives_sender_disconnect_and_safe_context_events_over_w
     let dir = temp_data_dir();
     let ws = WorkspaceId::new();
     let member_id = seed_member(dir.path(), &ws).await;
-    let gh_dir = dir.path().join("empty-gh");
-    std::fs::create_dir_all(&gh_dir).unwrap();
     std::fs::write(
         dir.path().join("config.toml"),
         "[sourceControl.github]\ntokenSource = 'explicit'\nexposeGitCredentialToChildren = false\n",
@@ -484,15 +478,11 @@ async fn member_prompt_survives_sender_disconnect_and_safe_context_events_over_w
         "assertResult":{"outcome":{"outcome":"selected","optionId":"allow_once"}}}],
         "response":"Member-approved background work completed."})
     .to_string();
-    let gh = gh_dir.to_string_lossy();
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
         ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
         ("INTENTD_PERMISSION_POLICY", "interactive"),
-        ("GH_CONFIG_DIR", gh.as_ref()),
-        ("GITHUB_TOKEN", ""),
-        ("GH_TOKEN", ""),
         ("GITLAB_TOKEN", ""),
     ];
     let _daemon = Daemon {
@@ -679,8 +669,6 @@ async fn member_scripts_respect_managed_helper_policy_and_keep_alternative_helpe
         .status()
         .unwrap()
         .success());
-    let gh_dir = dir.path().join("empty-gh");
-    std::fs::create_dir_all(&gh_dir).unwrap();
     let git_config = dir.path().join("empty-gitconfig");
     std::fs::write(&git_config, "").unwrap();
     // Disposable credentials only; even incidental readiness cannot contact
@@ -693,14 +681,10 @@ async fn member_scripts_respect_managed_helper_policy_and_keep_alternative_helpe
     .unwrap();
     let secrets_file = dir.path().join("secrets.json");
     let secrets_file = secrets_file.to_string_lossy();
-    let gh = gh_dir.to_string_lossy();
     let git_config = git_config.to_string_lossy();
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_SECRETS_FILE", secrets_file.as_ref()),
-        ("GH_CONFIG_DIR", gh.as_ref()),
-        ("GITHUB_TOKEN", ""),
-        ("GH_TOKEN", ""),
         ("GITLAB_TOKEN", ""),
         ("GIT_CONFIG_GLOBAL", git_config.as_ref()),
         ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -828,8 +812,6 @@ async fn member_provider_safe_reads_use_host_cache_and_preserve_administration_o
     let dir = temp_data_dir();
     let ws = WorkspaceId::new();
     let member = seed_member(dir.path(), &ws).await;
-    let gh = dir.path().join("empty-gh");
-    std::fs::create_dir_all(&gh).unwrap();
     let probe = dir.path().join("fake-auggie");
     let calls = dir.path().join("probe-calls");
     let authorized = dir.path().join("authorized");
@@ -843,18 +825,11 @@ async fn member_provider_safe_reads_use_host_cache_and_preserve_administration_o
         ),
     )
     .unwrap();
-    let gh = gh.to_string_lossy();
     let _daemon = Daemon {
         child: spawn_serve(
             dir.path(),
             "both",
-            &[
-                ("INTENTD_AUTH_TOKEN", TOKEN),
-                ("GH_CONFIG_DIR", gh.as_ref()),
-                ("GITHUB_TOKEN", ""),
-                ("GH_TOKEN", ""),
-                ("GITLAB_TOKEN", ""),
-            ],
+            &[("INTENTD_AUTH_TOKEN", TOKEN), ("GITLAB_TOKEN", "")],
         ),
     };
     let socket = dir.path().join("intentd.sock");
@@ -1036,8 +1011,6 @@ async fn member_pr_read_missing_auth_does_not_consume_collaboration_credentials_
     let dir = temp_data_dir();
     let ws = WorkspaceId::new();
     seed_linked_member_pr(dir.path(), &ws).await;
-    let gh = dir.path().join("empty-gh");
-    std::fs::create_dir_all(&gh).unwrap();
     std::fs::write(
         dir.path().join("secrets.json"),
         json!({"collaboration.github.token":"private-identity-only-token"}).to_string(),
@@ -1048,18 +1021,11 @@ async fn member_pr_read_missing_auth_does_not_consume_collaboration_credentials_
         "[sourceControl.github]\ntokenSource = 'explicit'\nexposeGitCredentialToChildren = false\n",
     )
     .unwrap();
-    let gh = gh.to_string_lossy();
     let _daemon = Daemon {
         child: spawn_serve(
             dir.path(),
             "both",
-            &[
-                ("INTENTD_AUTH_TOKEN", TOKEN),
-                ("GH_CONFIG_DIR", gh.as_ref()),
-                ("GITHUB_TOKEN", ""),
-                ("GH_TOKEN", ""),
-                ("GITLAB_TOKEN", ""),
-            ],
+            &[("INTENTD_AUTH_TOKEN", TOKEN), ("GITLAB_TOKEN", "")],
         ),
     };
     let socket = dir.path().join("intentd.sock");
