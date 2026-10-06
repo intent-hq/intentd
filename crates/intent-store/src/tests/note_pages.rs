@@ -12,6 +12,7 @@ use std::sync::{
 };
 
 mod anchor_lifecycle;
+mod plain_markdown;
 mod writer_anchors;
 
 fn request(value: Value) -> NotePageRequest {

@@ -34,7 +34,7 @@ struct Code {
     generated: Range<usize>,
     // HTML scalar/escape receipts. Long identity runs use bounded chunks.
     atoms: Vec<(Range<usize>, Range<usize>)>,
-    block: Option<usize>,
+    ordinary: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -210,7 +210,7 @@ fn code_receipts(
         body,
         generated,
         atoms,
-        block: None,
+        ordinary: false,
     }
 }
 
@@ -219,7 +219,6 @@ fn text_receipts(
     input: Range<usize>,
     text: &str,
     generated: Range<usize>,
-    block: usize,
 ) -> Code {
     let raw = prepared.original(&input);
     let mut atoms: Vec<(Range<usize>, Range<usize>)> = Vec::new();
@@ -275,7 +274,7 @@ fn text_receipts(
         raw,
         generated,
         atoms,
-        block: Some(block),
+        ordinary: true,
     }
 }
 
@@ -321,29 +320,9 @@ pub(crate) fn append_codes(
         .iter()
         .map(|(event, range)| (event.clone(), prepared.original(range)))
         .collect();
-    let blocks: Vec<_> = events
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (event, raw))| {
-            (matches!(event, Event::Start(Tag::Paragraph))
-                && prepared
-                    .escaped
-                    .get(prepared.escaped.partition_point(|tag| tag.end <= raw.start))
-                    .is_some_and(|tag| tag.start < raw.end))
-            .then_some((index, raw.clone()))
-        })
-        .collect();
     let primitive_starts: BTreeSet<_> = events.iter().enumerate().filter_map(|(index, (event, _))| {
         matches!(event, Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) if format!("language-{info}").split_ascii_whitespace().any(|class| matches!(class, "language-diff" | "language-mermaid"))).then_some(index)
     }).collect();
-    if blocks.is_empty()
-        && primitive_starts.is_empty()
-        && !descriptors
-            .iter()
-            .any(|(_, _, _, value)| value["role"] == "code")
-    {
-        return;
-    }
     let current = Cell::new(0);
     let mut output = Output {
         html: String::new(),
@@ -395,14 +374,13 @@ pub(crate) fn append_codes(
     let mut stack = Vec::new();
     let mut containers = Vec::new();
     let mut tables = 0;
+    let mut code_block = false;
     for (event_index, ((event, raw), generated)) in events.iter().zip(&output.ranges).enumerate() {
-        let candidate = blocks.partition_point(|(_, range)| range.end <= raw.start);
-        let block = blocks
-            .get(candidate)
-            .filter(|(_, range)| raw.start >= range.start && raw.end <= range.end)
-            .map(|_| candidate);
         match event {
             Event::Start(tag) => {
+                if matches!(tag, Tag::CodeBlock(_)) {
+                    code_block = true;
+                }
                 let container = match tag {
                     Tag::BlockQuote(_) => Some(Container::Quote),
                     Tag::Item | Tag::DefinitionListDefinition => {
@@ -420,7 +398,10 @@ pub(crate) fn append_codes(
                     tables += 1;
                 }
             }
-            Event::End(_) => {
+            Event::End(end) => {
+                if matches!(end, TagEnd::CodeBlock) {
+                    code_block = false;
+                }
                 if let Some((container, table)) = stack.pop() {
                     if container {
                         containers.pop();
@@ -447,19 +428,18 @@ pub(crate) fn append_codes(
                             && *end == units[raw.end]
                             && value["role"] == "code"
                     }) {
-                        code.block = block;
+                        code.ordinary = true;
                     }
                     codes.push(code);
                 }
             }
-            Event::Text(text) => {
-                if let (Some(block), Some(generated)) = (block, generated) {
+            Event::Text(text) if !code_block => {
+                if let Some(generated) = generated {
                     codes.push(text_receipts(
                         &prepared,
                         input_events[event_index].1.clone(),
                         text,
                         generated.clone(),
-                        block,
                     ));
                 }
             }
@@ -542,43 +522,95 @@ pub(crate) fn append_codes(
             }
         }
     }
-    let mut retained = BTreeSet::new();
-    let block_nodes: Vec<_> = blocks
+    // Native ancestry supplies ownership even when Markdown emits no paragraph
+    // tag (tight lists and table cells). Active nodes are visited parent first.
+    let mut text_owner = vec![None; tree.nodes.len()];
+    for &id in &active {
+        text_owner[id] = if matches!(tree.nodes[id].kind, "paragraph" | "heading") {
+            Some(id)
+        } else {
+            tree.nodes[id].parent.and_then(|parent| text_owner[parent])
+        };
+    }
+    let generated_ranges: Vec<_> = output
+        .ranges
         .iter()
-        .map(|(event, _)| {
-            let generated = output.ranges[*event].as_ref().expect("paragraph output");
-            active
-                .iter()
-                .copied()
-                .find(|id| {
-                    tree.nodes[*id].kind == "paragraph"
-                        && tree.nodes[*id]
-                            .source
-                            .as_ref()
-                            .and_then(|source| source.opening.as_ref())
-                            .is_some_and(|opening| {
-                                opening.start >= generated.start && opening.start < generated.end
-                            })
-                })
-                .expect("canonical paragraph")
-        })
+        .enumerate()
+        .filter_map(|(event, range)| range.as_ref().filter(|r| !r.is_empty()).map(|r| (r, event)))
         .collect();
-    for &paragraph in &block_nodes {
-        let mut pending = vec![paragraph];
+    let original_at = |opening: &Range<usize>| {
+        let index = generated_ranges.partition_point(|(range, _)| range.end <= opening.start);
+        generated_ranges
+            .get(index)
+            .filter(|(range, _)| range.start <= opening.start)
+            .map(|(_, event)| events[*event].1.clone())
+    };
+    let mut owner_ranges = BTreeMap::<usize, Range<usize>>::new();
+    let mut explicit = BTreeSet::new();
+    for &id in &active {
+        if text_owner[id] == Some(id) {
+            if let Some(raw) = tree.nodes[id]
+                .source
+                .as_ref()
+                .and_then(|source| source.opening.as_ref())
+                .and_then(original_at)
+            {
+                owner_ranges.insert(id, raw);
+                explicit.insert(id);
+            }
+        }
+    }
+    let mut extend_owner = |owner: usize, raw: &Range<usize>| {
+        if !explicit.contains(&owner) {
+            owner_ranges
+                .entry(owner)
+                .and_modify(|range| {
+                    range.start = range.start.min(raw.start);
+                    range.end = range.end.max(raw.end);
+                })
+                .or_insert_with(|| raw.clone());
+        }
+    };
+    for (leaf, map) in maps.iter().flatten() {
+        if let Some(owner) = leaf.and_then(|id| text_owner[id]) {
+            extend_owner(owner, &map.raw);
+        }
+    }
+    let mut atom_ranges = Vec::new();
+    for &id in &active {
+        if matches!(tree.nodes[id].kind, "hardBreak" | "image") {
+            if let Some(raw) = tree.nodes[id]
+                .source
+                .as_ref()
+                .and_then(|source| source.opening.as_ref())
+                .and_then(original_at)
+            {
+                if let Some(owner) = text_owner[id] {
+                    extend_owner(owner, &raw);
+                    atom_ranges.push((owner, raw));
+                }
+            }
+        }
+    }
+    let mut retained = BTreeSet::new();
+    for &owner in owner_ranges.keys() {
+        let mut pending = vec![owner];
         while let Some(id) = pending.pop() {
             retained.insert(id);
             pending.extend(tree.nodes[id].children.iter().copied());
         }
-        let mut parent = tree.nodes[paragraph].parent;
+        let mut parent = tree.nodes[owner].parent;
         while let Some(id) = parent {
-            retained.insert(id);
+            if !retained.insert(id) {
+                break;
+            }
             parent = tree.nodes[id].parent;
         }
     }
     for id in active
         .iter()
         .copied()
-        .filter(|id| matches!(tree.nodes[*id].kind, "diffBlock" | "mermaidBlock"))
+        .filter(|id| matches!(tree.nodes[*id].kind, "diffBlock" | "mermaidBlock" | "image"))
     {
         let mut next = Some(id);
         while let Some(id) = next {
@@ -611,17 +643,6 @@ pub(crate) fn append_codes(
                 .push(map.raw.clone());
         }
     }
-    let generated_ranges: Vec<_> = output
-        .ranges
-        .iter()
-        .enumerate()
-        .filter_map(|(event, range)| {
-            range
-                .as_ref()
-                .filter(|r| !r.is_empty())
-                .map(|range| (range, event))
-        })
-        .collect();
     let code_descriptors: BTreeMap<_, _> = descriptors
         .iter()
         .enumerate()
@@ -650,6 +671,7 @@ pub(crate) fn append_codes(
     let ids: BTreeMap<_, _> = retained.iter().map(|id| (*id, entries.id())).collect();
     let range_value =
         |range: &Range<usize>| json!({"start":units[range.start],"end":units[range.end]});
+    let mut native_attributes = BTreeMap::new();
     for &id in &retained {
         let node = &tree.nodes[id];
         let pieces = pieces_by_leaf.remove(&id).unwrap_or_default();
@@ -672,6 +694,7 @@ pub(crate) fn append_codes(
         } else {
             node.attributes.clone()
         });
+        native_attributes.insert(id, attrs.clone());
         let primitive = match node.kind {
             "diffBlock" => Some("diff"),
             "mermaidBlock" => Some("mermaid"),
@@ -693,7 +716,7 @@ pub(crate) fn append_codes(
         }
         let child_index = child_indices[id];
         let mut native = json!({"kind":"nativeNode","id":ids[&id],"profile":"canonicalNote","profileVersion":1,
-            "nodeType":node.kind,"nodeClass":if node.kind=="text" {"text"} else if primitive.is_some() || node.kind=="hardBreak" {"atom"} else {"container"},
+            "nodeType":node.kind,"nodeClass":if node.kind=="text" {"text"} else if primitive.is_some() || matches!(node.kind,"hardBreak" | "image") {"atom"} else {"container"},
             "parentRef":node.parent.map(|parent|format!("d:{}",ids[&parent])),"childIndex":child_index,
             "sourceRange":range_value(&range),"provenance":if range.is_empty(){"implicit"}else{"explicit"},"attributesRef":attrs});
         if !node.marks.is_empty() {
@@ -726,7 +749,7 @@ pub(crate) fn append_codes(
                 native.clone(),
             ));
         }
-        if node.kind == "hardBreak" {
+        if matches!(node.kind, "hardBreak" | "image") {
             descriptors.push((
                 units[range.start],
                 units[range.end],
@@ -736,36 +759,33 @@ pub(crate) fn append_codes(
         }
         entries.rows.push((format!("d:{}", ids[&id]), 0, native));
     }
-    let mut block_maps: Vec<Vec<(Option<usize>, TextMapping)>> =
-        (0..blocks.len()).map(|_| Vec::new()).collect();
-    let mut block_excluded: Vec<Vec<Range<usize>>> =
-        (0..blocks.len()).map(|_| Vec::new()).collect();
-    for (event, range) in &events {
-        if matches!(event, Event::SoftBreak | Event::HardBreak) {
-            let block = blocks.partition_point(|(_, raw)| raw.end <= range.start);
-            if blocks
-                .get(block)
-                .is_some_and(|(_, raw)| range.start >= raw.start && range.end <= raw.end)
-            {
-                block_excluded[block].push(range.clone());
-            }
-        }
+    let mut block_maps = BTreeMap::<usize, Vec<(Option<usize>, TextMapping)>>::new();
+    let mut block_excluded = BTreeMap::<usize, Vec<Range<usize>>>::new();
+    for (owner, raw) in atom_ranges {
+        block_excluded.entry(owner).or_default().push(raw);
     }
     for (code, mut group) in codes.into_iter().zip(maps) {
-        if let Some(block) = code.block {
-            block_maps[block].extend(group);
+        if code.ordinary {
+            for (leaf, map) in group {
+                if let Some(owner) = leaf.and_then(|id| text_owner[id]) {
+                    block_maps.entry(owner).or_default().push((leaf, map));
+                }
+            }
             continue;
         }
         let Some(index) = code_descriptors.get(&(units[code.raw.start], units[code.raw.end]))
         else {
             continue;
         };
-        let block = blocks.partition_point(|(_, raw)| raw.end <= code.raw.start);
-        if blocks
-            .get(block)
-            .is_some_and(|(_, raw)| code.raw.start >= raw.start && code.raw.end <= raw.end)
+        for owner in group
+            .iter()
+            .filter_map(|(leaf, _)| leaf.and_then(|id| text_owner[id]))
+            .collect::<BTreeSet<_>>()
         {
-            block_excluded[block].push(code.raw.clone());
+            block_excluded
+                .entry(owner)
+                .or_default()
+                .push(code.raw.clone());
         }
         let (_, _, owner, descriptor) = &mut descriptors[*index];
         let native = group
@@ -820,12 +840,9 @@ pub(crate) fn append_codes(
                 "sourceRange":range_value(&map.raw),"renderedRange":{"start":map.rendered.start,"end":map.rendered.end},"mapping":map.mapping,"textRef":text_ref})));
         }
     }
-    for ((((_, raw), node), mut group), mut covered) in blocks
-        .into_iter()
-        .zip(block_nodes)
-        .zip(block_maps)
-        .zip(block_excluded)
-    {
+    for (node, raw) in owner_ranges {
+        let mut group = block_maps.remove(&node).unwrap_or_default();
+        let mut covered = block_excluded.remove(&node).unwrap_or_default();
         covered.extend(group.iter().map(|(_, map)| map.raw.clone()));
         covered.sort_by_key(|range| (range.start, range.end));
         let mut at = raw.start;
@@ -844,14 +861,8 @@ pub(crate) fn append_codes(
             at = at.max(range.end);
         }
         let owner = entries.id();
-        let native = entries
-            .rows
-            .iter()
-            .find(|(collection, _, _)| *collection == format!("d:{}", ids[&node]))
-            .expect("native paragraph")
-            .2
-            .clone();
-        let mut descriptor = json!({"kind":"boundary","id":owner,"construct":"markdownBlock","profile":"canonicalNote","profileVersion":1,"entryPath":"markdown","sourceRange":range_value(&raw),"nativeRef":format!("d:{}",ids[&node]),"attributesRef":native["attributesRef"]});
+        let attributes = &native_attributes[&node];
+        let mut descriptor = json!({"kind":"boundary","id":owner,"construct":"markdownBlock","profile":"canonicalNote","profileVersion":1,"entryPath":"markdown","sourceRange":range_value(&raw),"nativeRef":format!("d:{}",ids[&node]),"attributesRef":attributes});
         entries
             .rows
             .push((format!("d:{owner}"), 0, descriptor.clone()));
