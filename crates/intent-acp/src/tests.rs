@@ -14596,3 +14596,169 @@ mod workspace_apply_proposal_tests {
         assert!(api.create_calls.lock().unwrap().is_empty());
     }
 }
+
+/// Navigation attribution through the real workspace_api JS/MCP binding path.
+mod app_navigation_sender_tests {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{
+        AgentId, BoxFuture, PublishEvent, Result, Workspace, WorkspaceApi, WorkspaceId,
+    };
+    use serde_json::{json, Value};
+
+    use crate::WorkspaceMcpServer;
+
+    #[derive(Default)]
+    struct FakeApi {
+        events: Mutex<Vec<PublishEvent>>,
+    }
+
+    impl WorkspaceApi for FakeApi {
+        fn settings_get(&self, path: String) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                let value = match path.as_str() {
+                    "workspaceApi.toonOutput" => json!(false),
+                    "workspaceApi.maxOutputChars" => json!(0),
+                    _ => Value::Null,
+                };
+                Ok(json!({ "path": path, "value": value }))
+            })
+        }
+
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            Box::pin(async move {
+                // Ensure attribution survives an asynchronous workspace lookup.
+                tokio::task::yield_now().await;
+                Ok(serde_json::from_value(json!({
+                    "id": id.as_str(), "title": "Target", "branch": "main",
+                    "status": "Active", "activity": "idle", "attention": "none",
+                    "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+                    "tags": [], "skipWorktree": false, "isRemote": false, "archived": false,
+                    "waiting": false,
+                }))
+                .unwrap())
+            })
+        }
+
+        fn publish_event(&self, event: PublishEvent) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                self.events.lock().unwrap().push(event);
+                Ok(())
+            })
+        }
+    }
+
+    fn server(
+        workspace_id: WorkspaceId,
+        caller: Option<&str>,
+    ) -> (WorkspaceMcpServer, Arc<FakeApi>) {
+        let api = Arc::new(FakeApi::default());
+        let server = WorkspaceMcpServer::new(api.clone(), workspace_id)
+            .with_caller_agent_id(caller.map(AgentId::from));
+        (server, api)
+    }
+
+    async fn call(server: &WorkspaceMcpServer, code: &str) -> Value {
+        server
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "workspace_api", "arguments": {
+                    "code": code, "summary": "navigation sender regression"
+                }}
+            }))
+            .await
+            .expect("MCP response")
+    }
+
+    #[tokio::test]
+    async fn navigation_uses_trusted_caller_and_keeps_highlight_shape() {
+        let (server, api) = server(WorkspaceId::chief(), Some("trusted-agent"));
+        let response = call(&server, "const navigation = await ws.app.ui.navigate('/settings#agents', {agentId: 'spoofed', durationMs: 123}); const highlight = await ws.app.ui.highlight('agents', {agentId: 'spoofed', durationMs: 123}); return {navigation, highlight};").await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let result: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            result["navigation"],
+            json!({"ok": true, "route": "/settings#agents", "workspaceId": "__chief__", "agentId": "trusted-agent", "highlightId": "agents", "durationMs": 123})
+        );
+        assert_eq!(
+            result["highlight"],
+            json!({"ok": true, "id": "agents", "workspaceId": "__chief__", "durationMs": 123})
+        );
+        let events = api.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, intent_core::events::APP_UI_NAVIGATE);
+        assert_eq!(events[0].workspace_id, WorkspaceId::chief());
+        let mut expected = result["navigation"].clone();
+        expected.as_object_mut().unwrap().remove("ok");
+        assert_eq!(events[0].data, expected);
+        assert!(events[1].data.get("agentId").is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_open_preserves_sender_across_await_and_window_option() {
+        let (server, api) = server(WorkspaceId::chief(), Some("trusted-agent"));
+        let response = call(&server, "await ws.app.workspaces.open('target', {agentId: 'spoofed', openInNewWindow: true}); return await ws.app.workspaces.open('target');").await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let result: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(result, json!({"ok": true, "queued": true}));
+        let events = api.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        for (event, new_window) in events.iter().zip([true, false]) {
+            assert_eq!(event.event_type, intent_core::events::APP_WORKSPACE_OPEN);
+            assert_eq!(event.workspace_id, WorkspaceId::chief());
+            assert_eq!(
+                event.data,
+                json!({"workspaceId": "target", "openInNewWindow": new_window, "agentId": "trusted-agent"})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_caller_omits_sender_even_with_spoofed_arguments() {
+        let (server, api) = server(WorkspaceId::chief(), None);
+        let response = call(&server, "const navigation = await ws.app.ui.navigate('/', {agentId: 'spoofed'}); await ws.app.workspaces.open('target', {agentId: 'spoofed'}); return navigation;").await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let result: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            result,
+            json!({"ok": true, "route": "/", "workspaceId": "__chief__"})
+        );
+        let events = api.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].data,
+            json!({"route": "/", "workspaceId": "__chief__"})
+        );
+        assert_eq!(
+            events[1].data,
+            json!({"workspaceId": "target", "openInNewWindow": false})
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_context_does_not_bypass_chief_gate() {
+        let (server, api) = server(
+            WorkspaceId::from("ordinary-workspace"),
+            Some("trusted-agent"),
+        );
+        for code in [
+            "return await ws.app.ui.navigate('/');",
+            "return await ws.app.workspaces.open('target');",
+        ] {
+            let response = call(&server, code).await;
+            assert_eq!(response["result"]["isError"], true, "{response}");
+            assert!(response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("only available in the Assistant workspace"));
+        }
+        assert!(api.events.lock().unwrap().is_empty());
+    }
+}
