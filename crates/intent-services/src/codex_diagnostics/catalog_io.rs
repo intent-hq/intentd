@@ -191,6 +191,7 @@ impl Authentication {
         Ok(home)
     }
 
+    #[cfg(unix)]
     pub(super) fn owner_context(&self, helper: &Path) -> Command {
         let mut context = Command::new(helper);
         context.env_clear();

@@ -28,6 +28,7 @@ pub(crate) const NATIVE_ENV: &[(&str, &str)] = &[
     ),
 ];
 
+#[cfg(unix)]
 const AUTH_FRAME_LIMIT: usize = 8 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(7);
 const AUTH_ERROR: &str =
@@ -35,7 +36,10 @@ const AUTH_ERROR: &str =
 const BUSY_ERROR: &str =
     "Native Codex authentication is busy. Retry shortly; your native login is unchanged.";
 const CONTRACT_ERROR: &str = "The installed Codex does not support Intent's native authentication bridge. Update Codex on this daemon host.";
+#[cfg(unix)]
 const POLICY_ERROR: &str = "Managed Codex credential storage cannot safely be used by an isolated Intent worker. Ask your administrator for a supported configuration.";
+#[cfg(not(unix))]
+const UNSUPPORTED_HOST: &str = "Native Codex authentication bridge requires a Unix daemon host.";
 const ACCOUNT_ERROR: &str = "Native Codex is signed in to a different account. Restore this agent's original account or start a new agent.";
 type Result<T> = std::result::Result<T, &'static str>;
 
@@ -54,6 +58,7 @@ struct Credentials {
     identity: String,
 }
 impl Credentials {
+    #[cfg(unix)]
     fn from_status(status: &Value) -> Result<Option<Self>> {
         if status["requiresOpenaiAuth"] == false {
             return Ok(None);
@@ -208,6 +213,7 @@ impl Server {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
     }
+    #[cfg(unix)]
     async fn native_call(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
         // Only authority responses have an auth-sized cap. Worker traffic must
         // preserve ACP's inline images, tool output and session history sizes.
@@ -234,6 +240,7 @@ impl Server {
     }
 }
 
+#[cfg(unix)]
 #[derive(Clone)]
 struct Authority {
     runtime: PathBuf,
@@ -241,9 +248,17 @@ struct Authority {
     user_home: PathBuf,
     socket: Option<PathBuf>,
 }
+#[cfg(not(unix))]
+struct Authority;
+
 impl Authority {
+    #[cfg(not(unix))]
+    fn read(&self, _previous: Option<&str>) -> std::future::Ready<Result<Option<Credentials>>> {
+        std::future::ready(Err(UNSUPPORTED_HOST))
+    }
+
+    #[cfg(unix)]
     async fn read(&self, previous: Option<&str>) -> Result<Option<Credentials>> {
-        #[cfg(unix)]
         if let Some(socket) = &self.socket {
             return broker::read(socket, previous).await;
         }
@@ -262,6 +277,7 @@ impl Authority {
         #[cfg(not(test))]
         Err(CONTRACT_ERROR)
     }
+    #[cfg(unix)]
     async fn read_inner(&self, previous: Option<&str>) -> Result<Option<Credentials>> {
         std::fs::create_dir_all(&self.home).map_err(|_| AUTH_ERROR)?;
         let home = self.home.canonicalize().map_err(|_| AUTH_ERROR)?;
@@ -322,6 +338,7 @@ impl Authority {
         result
     }
 }
+#[cfg(unix)]
 fn worker_policy(requirements: &Value, config: &Value) -> Result<()> {
     let required = requirements.get("requirements").ok_or(CONTRACT_ERROR)?;
     if !required.is_null() {
@@ -355,6 +372,7 @@ fn worker_policy(requirements: &Value, config: &Value) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 async fn auth_lock(home: &Path) -> Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -663,11 +681,18 @@ pub async fn run(
         return Err(CONTRACT_ERROR.into());
     }
     migrate_credentials(&profile, &native_home).map_err(str::to_owned)?;
+    #[cfg(unix)]
     let authority = Authority {
         runtime: runtime.clone(),
         home: native_home,
         user_home,
         socket: Some(authority_socket),
+    };
+    #[cfg(not(unix))]
+    let authority = {
+        // Unsupported hosts have no native owner context or refresh backend.
+        drop((user_home, authority_socket));
+        Authority
     };
     // Native policy can override session flags. Inspect its resolved requirements
     // before a worker can touch any persisted profile/keyring credential.
@@ -758,7 +783,27 @@ pub fn install_wrapper(
     _: &Path,
     _: &Path,
 ) -> std::result::Result<PathBuf, String> {
-    Err("Native Codex authentication bridge requires a Unix daemon host.".into())
+    Err(UNSUPPORTED_HOST.into())
+}
+
+#[cfg(all(test, not(unix)))]
+mod unsupported_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unsupported_host_never_attempts_native_authentication() {
+        assert!(matches!(
+            Authority.read(Some("synthetic-access")).await,
+            Err(UNSUPPORTED_HOST)
+        ));
+        let root = crate::test_support::test_tempdir("unsupported-native-auth");
+        let path = root.path();
+        assert_eq!(
+            install_wrapper(path, path, path, path, path),
+            Err(UNSUPPORTED_HOST.into())
+        );
+        assert_eq!(std::fs::read_dir(path).unwrap().count(), 0);
+    }
 }
 
 #[cfg(all(test, unix))]
