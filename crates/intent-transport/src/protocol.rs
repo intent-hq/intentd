@@ -736,10 +736,11 @@ use std::time::{Duration, Instant};
 // promises admission only; clients tolerate -32601 on older daemons.
 // Version 13.7 adds capability-gated checkout owner-avatar opt-in.
 // Numeric versions do not replace the original connection capability.
-// Version 13.8 reserves revision-safe note operations. The numeric version
-// does not advertise completeness: clients still require notePaging: 1, which
-// remains absent until writes, staged operations and bounded subscriptions pass.
-pub const PROTOCOL_VERSION: &str = "13.8";
+// Version 13.9 reserves revision-safe note viewing and annotations. Clients
+// require notePagingRead: 1 plus the persisted notePagingBackendId; complete
+// annotations additionally require noteAnnotations: 1. The numeric version
+// does not activate paginated editing, and the old notePaging stays absent.
+pub const PROTOCOL_VERSION: &str = "13.9";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
