@@ -436,7 +436,7 @@ fn migrate_credentials(profile: &Path, native: &Path) -> Result<()> {
         for (path, bytes) in sources {
             match read_record(&path)? {
                 Some(current) if current == bytes => {
-                    std::fs::remove_file(path).map_err(|_| AUTH_ERROR)?
+                    std::fs::remove_file(path).map_err(|_| AUTH_ERROR)?;
                 }
                 None => {}
                 Some(_) => return Err(ACCOUNT_ERROR),
