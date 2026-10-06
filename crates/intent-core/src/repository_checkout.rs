@@ -52,6 +52,27 @@ pub struct CheckoutBranchesQuery {
     pub cached: Option<bool>,
 }
 
+/// Fixed repository configuration at a previously observed branch and immutable SHA.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckoutRepoConfigQuery {
+    pub checkout_id: String,
+    pub revision: String,
+    pub project_path: String,
+    pub branch: String,
+    pub commit_sha: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutRepoConfig {
+    pub project_path: String,
+    pub branch: String,
+    pub commit_sha: String,
+    pub config: Option<crate::RepoConfig>,
+    pub exists: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckoutMode {
@@ -72,6 +93,7 @@ pub struct CheckoutSelection {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckoutFrame {
+    RepoConfig(CheckoutRepoConfigQuery),
     Capture(CheckoutCaptureQuery),
     Projects(CheckoutProjectsQuery),
     Project(CheckoutProjectQuery),

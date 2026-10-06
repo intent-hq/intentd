@@ -666,3 +666,6 @@ async fn checkout_empty_missing_default_and_provider_failures_are_distinct() {
     client.close().await;
     h.finish().await;
 }
+
+#[path = "checkout/config.rs"]
+mod config;

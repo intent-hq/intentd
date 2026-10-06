@@ -736,6 +736,8 @@ use std::time::{Duration, Instant};
 // promises admission only; clients tolerate -32601 on older daemons.
 // Version 13.7 adds capability-gated checkout owner-avatar opt-in.
 // Numeric versions do not replace the original connection capability.
+// Version 13.8 adds fixed GitLab checkout configuration reads, gated by
+// gitlabCheckoutRepoConfig: 1 as well as the original checkout capability.
 // Version 13.9 reserves revision-safe note viewing and annotations. Clients
 // require notePagingRead: 1 plus the persisted notePagingBackendId; complete
 // annotations additionally require noteAnnotations: 1. The numeric version

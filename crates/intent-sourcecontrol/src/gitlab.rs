@@ -135,7 +135,11 @@ impl GitlabCredentialRequest<'_> {
             .strip_prefix("projects/")
             .ok_or(Error::AdmissionRetired)?;
         let (encoded, suffix) = rest.split_once('/').unwrap_or((rest, ""));
-        if !matches!(suffix, "" | "repository/branches") {
+        if !matches!(
+            suffix,
+            "" | "repository/branches" | "repository/files/.intent%2Fconfig.json"
+        ) && !is_checkout_branch_endpoint(suffix)
+        {
             return Err(Error::AdmissionRetired);
         }
         let mut decoded = Vec::with_capacity(encoded.len());
@@ -220,6 +224,84 @@ impl GitLabSourceControl {
     pub fn with_pagination_scope(mut self, scope: String) -> Self {
         self.pagination_scope = scope;
         self
+    }
+
+    /// Read only the checkout configuration at an immutable commit.
+    /// # Errors
+    /// Preserves provider/auth failures and rejects malformed file envelopes.
+    pub async fn checkout_repo_config(&self, repo: &RepoRef, sha: &str) -> Result<Option<String>> {
+        if sha.len() != 40 || !sha.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::Config(
+                "checkout config requires an immutable SHA".into(),
+            ));
+        }
+        let (value, _) = self
+            .request_for(
+                Method::GET,
+                &format!("{}/repository/files/.intent%2Fconfig.json", project(repo)),
+                &[("ref".into(), sha.into())],
+                None,
+                Purpose::CheckoutConfig,
+            )
+            .await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        if value["file_path"] != ".intent/config.json" || value["commit_id"] != sha {
+            return Err(Error::AdmissionRetired);
+        }
+        if value["encoding"] != "base64" {
+            return Err(Error::Decode("unsupported GitLab file encoding".into()));
+        }
+        let encoded = string(&value, "content")?.replace(['\n', '\r'], "");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| Error::Decode("invalid GitLab file content".into()))?;
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| Error::Decode("GitLab file is not UTF-8".into()))
+    }
+
+    /// Read an exact branch without interpreting literal ref bytes as search operators.
+    /// # Errors
+    /// Preserves provider failures and rejects a different or malformed branch identity.
+    pub async fn checkout_branch(&self, repo: &RepoRef, branch: &str) -> Result<Option<Branch>> {
+        let path = format!("{}/repository/branches/{}", project(repo), encode(branch));
+        if !is_checkout_branch_endpoint(&format!("repository/branches/{}", encode(branch))) {
+            return Err(Error::Config("invalid checkout branch".into()));
+        }
+        let (value, _) = self
+            .request_for(Method::GET, &path, &[], None, Purpose::CheckoutBranch)
+            .await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        if value["name"] != branch {
+            return Err(Error::AdmissionRetired);
+        }
+        let sha = string(&value["commit"], "id")?;
+        if sha.len() != 40 || !sha.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::Decode("invalid GitLab branch commit".into()));
+        }
+        Ok(Some(Branch {
+            name: branch.into(),
+            commit_sha: Some(sha),
+            protected: value["protected"].as_bool().unwrap_or(false),
+        }))
+    }
+
+    /// Numeric identity used to detect project replacement around a checkout read.
+    /// # Errors
+    /// Rejects provider failures and a different or malformed project response.
+    pub async fn checkout_project_identity(&self, repo: &RepoRef) -> Result<u64> {
+        let value = self.get_project(repo).await?;
+        if value["path_with_namespace"] != format!("{}/{}", repo.owner, repo.name) {
+            return Err(Error::AdmissionRetired);
+        }
+        value["id"]
+            .as_u64()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| Error::Decode("GitLab project identity missing".into()))
     }
 
     /// Legacy aggregates cannot carry per-field availability; any consumed quota
@@ -434,6 +516,41 @@ impl GitLabSourceControl {
     async fn all(&self, path: &str, query: Vec<(String, String)>) -> Result<Vec<Value>> {
         self.all_for(path, query, Purpose::Primary).await
     }
+}
+
+// Only one canonical encoded branch component, with no query or sub-resource.
+// This classifies a GET endpoint; original checkout authority still admits it.
+fn is_checkout_branch_endpoint(suffix: &str) -> bool {
+    let Some(branch) = suffix.strip_prefix("repository/branches/") else {
+        return false;
+    };
+    if matches!(branch, "" | "." | "..") {
+        return false;
+    }
+    let mut bytes = branch.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            continue;
+        }
+        if byte != b'%' {
+            return false;
+        }
+        let (Some(high), Some(low)) = (bytes.next(), bytes.next()) else {
+            return false;
+        };
+        let (Some(high), Some(low)) = (char::from(high).to_digit(16), char::from(low).to_digit(16))
+        else {
+            return false;
+        };
+        let Ok(decoded) = u8::try_from(high * 16 + low) else {
+            return false;
+        };
+        // Do not accept percent-encoded dot segments or alternative spellings.
+        if decoded.is_ascii_alphanumeric() || matches!(decoded, b'-' | b'_' | b'.' | b'~') {
+            return false;
+        }
+    }
+    true
 }
 
 fn encode(value: &str) -> String {

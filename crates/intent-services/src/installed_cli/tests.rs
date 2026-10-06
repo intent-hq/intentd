@@ -502,18 +502,19 @@ async fn installed_cli_prepared_catalog_rechecks_wrapper_before_launch() {
 
 #[cfg(target_os = "linux")]
 const DETACHED_VERSION_FIXTURE: &str = r"#!/usr/bin/python3
-import subprocess,os,pathlib,time
+import subprocess,os,pathlib,time,json
 child=subprocess.Popen(['/bin/sleep','120'],start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 root=pathlib.Path(os.environ['HOME'])
-controlled=(root/'hold-publication').exists()
+controlled=(root/'observe-publication').exists()
 staging=root/'detached-pid.staging'
 with staging.open('w') as output:
     if controlled:
-        (root/'publication-entered').touch()
-        deadline=time.monotonic()+2
-        while not (root/'publication-release').exists():
-            if time.monotonic()>=deadline: raise RuntimeError('publication barrier expired')
-            time.sleep(0.005)
+        try:
+            (root/'detached-pid').stat()
+            published=True
+        except FileNotFoundError:
+            published=False
+        (root/'publication-observed').write_text(json.dumps(dict(home=str(root),pid=child.pid,published=published)))
     output.write(str(child.pid))
 os.replace(staging,root/'detached-pid')
 if controlled: (root/'publication-finished').touch()
@@ -529,6 +530,16 @@ struct DetachedCleanup(Option<std::os::fd::OwnedFd>);
 #[cfg(target_os = "linux")]
 impl DetachedCleanup {
     fn capture(pid: i32, root: &Path) -> Result<Self, String> {
+        Self::capture_with(pid, root, |pid| {
+            std::fs::read(format!("/proc/{pid}/environ"))
+        })
+    }
+
+    fn capture_with(
+        pid: i32,
+        root: &Path,
+        read_identity: impl FnOnce(i32) -> std::io::Result<Vec<u8>>,
+    ) -> Result<Self, String> {
         use std::os::fd::FromRawFd;
         use std::os::unix::ffi::OsStrExt;
         if pid <= 1 {
@@ -549,9 +560,23 @@ impl DetachedCleanup {
         let fd = i32::try_from(fd).map_err(|error| format!("invalid detached pidfd: {error}"))?;
         // SAFETY: a successful pidfd_open returned a new descriptor.
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-        let identity = std::fs::read(format!("/proc/{pid}/environ"));
+        let identity = read_identity(pid);
+        // An unreaped zombie can deny environ access even though it is ours.
+        // Only the pinned process's terminal state proves there is no target;
+        // EACCES, ENOENT and an empty environment alone prove nothing. Check
+        // after reading so an exit/PID reuse during that read cannot grant
+        // signal authority from another process's environment.
+        let retired = Self::pidfd_retired(&fd)?;
         match identity {
-            Ok(bytes) if bytes.is_empty() => Ok(Self(None)), // Already a zombie.
+            Err(error)
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                Err(format!("inspect detached child identity: {error}"))
+            }
+            _ if retired => Ok(Self(None)),
             Ok(bytes) => {
                 let mut home = b"HOME=".to_vec();
                 home.extend_from_slice(root.as_os_str().as_bytes());
@@ -564,9 +589,36 @@ impl DetachedCleanup {
                     ))
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self(None)),
             Err(error) => Err(format!("inspect detached child identity: {error}")),
         }
+    }
+
+    fn pidfd_retired(fd: &std::os::fd::OwnedFd) -> Result<bool, String> {
+        use std::os::fd::AsRawFd;
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll points to one initialized descriptor and never blocks.
+        let result = if unsafe { libc::poll(&raw mut poll, 1, 0) } < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(poll.revents)
+        };
+        Self::polled_retirement(result)
+    }
+
+    fn polled_retirement(result: std::io::Result<i16>) -> Result<bool, String> {
+        let events = result.map_err(|error| format!("poll detached pidfd: {error}"))?;
+        if events & !(libc::POLLIN | libc::POLLHUP) != 0 {
+            return Err(format!("unexpected detached pidfd events: {events}"));
+        }
+        Ok(events & (libc::POLLIN | libc::POLLHUP) != 0)
+    }
+
+    fn retired(&self) -> Result<bool, String> {
+        self.0.as_ref().map_or(Ok(true), Self::pidfd_retired)
     }
 }
 
@@ -591,10 +643,294 @@ impl Drop for DetachedCleanup {
 }
 
 #[cfg(target_os = "linux")]
+fn wait_detached_identity_ready(
+    root: &Path,
+    timeout: Duration,
+    mut observe: impl FnMut() -> Result<Option<Vec<u8>>, String>,
+) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut home = b"HOME=".to_vec();
+    home.extend_from_slice(root.as_os_str().as_bytes());
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let bytes = observe()?.ok_or("owned fixture child exited before identity readiness")?;
+        if bytes.split(|byte| *byte == 0).any(|entry| entry == home) {
+            return Ok(());
+        }
+        if !bytes.is_empty() {
+            return Err("owned fixture child has an unexpected HOME".into());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("owned fixture child identity readiness timed out".into());
+        }
+        // timing-guard: bounded fixture readiness polling, not capture retries.
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detached_identity_child(root: &Path) -> intentd_test_support::GuardedChild {
+    let mut child = intentd_test_support::GuardedChild::spawn(
+        std::process::Command::new("/bin/sleep")
+            .arg("120")
+            .env("HOME", root),
+    )
+    .unwrap();
+    // A live, newly spawned fixture can transiently expose an empty environ.
+    // Establish fixture readiness before testing the strict capture operation.
+    let ready = wait_detached_identity_ready(root, Duration::from_secs(3), || {
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(format!("/proc/{}/environ", child.id()))
+            .map_err(|e| format!("read owned fixture identity: {e}"))?;
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            Ok(None)
+        } else {
+            Ok(Some(bytes))
+        }
+    });
+    if let Err(error) = ready {
+        let kill = child.kill();
+        let wait = child.wait();
+        panic!("fixture identity not ready: {error}; cleanup kill={kill:?}, wait={wait:?}");
+    }
+    child
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_readiness_accepts_only_settled_home() {
+    let root = Path::new("/owned-fixture");
+    let mut observations = [Some(Vec::new()), Some(b"HOME=/owned-fixture\0".to_vec())].into_iter();
+    wait_detached_identity_ready(root, Duration::from_secs(3), || {
+        Ok(observations.next().unwrap())
+    })
+    .unwrap();
+    assert!(observations.next().is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_readiness_times_out_when_empty() {
+    let mut calls = 0;
+    let error = wait_detached_identity_ready(Path::new("/owned-fixture"), Duration::ZERO, || {
+        calls += 1;
+        Ok(Some(Vec::new()))
+    })
+    .unwrap_err();
+    assert!(error.contains("timed out"));
+    assert_eq!(calls, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_readiness_rejects_exit_wrong_home_and_errors() {
+    for observation in [
+        Ok(None),
+        Ok(Some(b"HOME=/other-fixture\0".to_vec())),
+        Ok(Some(b"NOT_HOME=/owned-fixture\0".to_vec())),
+        Err("permission denied".to_owned()),
+    ] {
+        let mut calls = 0;
+        assert!(
+            wait_detached_identity_ready(Path::new("/owned-fixture"), Duration::ZERO, || {
+                calls += 1;
+                observation.clone()
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detached_identity_zombie(child: &mut intentd_test_support::GuardedChild) {
+    child.kill().unwrap();
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+    // SAFETY: info is writable; WNOWAIT leaves our owned child unreaped so
+    // its PID cannot be reused while the regression inspects the zombie.
+    assert_eq!(
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        },
+        0
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_observes_unreaped_child_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let live = DetachedCleanup::capture(pid, root.path()).unwrap();
+    assert!(live.0.is_some());
+    detached_identity_zombie(&mut child);
+    let identity_errno = std::fs::read(format!("/proc/{pid}/environ"))
+        .err()
+        .and_then(|error| error.raw_os_error());
+    let retired = DetachedCleanup::capture(pid, root.path());
+    child.wait().unwrap();
+    drop(live);
+    eprintln!("owned zombie identity errno: {identity_errno:?}");
+    assert!(
+        retired
+            .unwrap_or_else(|error| panic!("confirmed exited child: {error}"))
+            .0
+            .is_none(),
+        "a retired child must never become a signal target"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_observes_exit_during_inspection() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let retired = DetachedCleanup::capture_with(pid, root.path(), |pid| {
+        detached_identity_zombie(&mut child);
+        std::fs::read(format!("/proc/{pid}/environ"))
+    });
+    child.wait().unwrap();
+    assert!(retired.unwrap().0.is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_rejects_live_unverified_children() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    for identity in [
+        Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+        Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+        Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        Ok(Vec::new()),
+        Ok(b"HOME=/unrelated-fixture\0".to_vec()),
+    ] {
+        let captured = DetachedCleanup::capture_with(pid, root.path(), |_| identity);
+        assert!(captured.is_err(), "unverified live child accepted");
+        drop(captured);
+        assert!(child.try_wait().unwrap().is_none());
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_preserves_unknown_errors_after_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let captured = DetachedCleanup::capture_with(pid, root.path(), |_| {
+        detached_identity_zombie(&mut child);
+        Err(std::io::Error::from_raw_os_error(libc::EIO))
+    });
+    child.wait().unwrap();
+    assert!(
+        captured.is_err(),
+        "exit must not hide an unknown read error"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_requires_positive_terminal_evidence() {
+    assert_eq!(DetachedCleanup::polled_retirement(Ok(0)), Ok(false));
+    for events in [libc::POLLIN, libc::POLLHUP, libc::POLLIN | libc::POLLHUP] {
+        assert_eq!(DetachedCleanup::polled_retirement(Ok(events)), Ok(true));
+    }
+    for events in [libc::POLLERR, libc::POLLNVAL, libc::POLLIN | libc::POLLERR] {
+        assert!(DetachedCleanup::polled_retirement(Ok(events)).is_err());
+    }
+    for errno in [libc::EINTR, libc::EIO] {
+        assert!(
+            DetachedCleanup::polled_retirement(Err(std::io::Error::from_raw_os_error(errno)))
+                .is_err()
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_cleanup_signals_only_verified_child() {
+    let root = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let mut unrelated = detached_identity_child(other.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let guard = DetachedCleanup::capture(pid, root.path()).unwrap();
+    assert!(!guard.retired().unwrap());
+    drop(guard);
+    let retired = child.wait_with_timeout(Duration::from_secs(3)).unwrap();
+    let unrelated_alive = unrelated.try_wait().unwrap().is_none();
+    unrelated.kill().unwrap();
+    unrelated.wait().unwrap();
+    assert!(
+        retired.is_some(),
+        "verified child survived emergency cleanup"
+    );
+    assert!(unrelated_alive, "unrelated child was killed");
+}
+
+#[cfg(target_os = "linux")]
+fn read_detached_publication(root: &Path, pid: i32) -> Result<bool, String> {
+    let bytes = std::fs::read(root.join("publication-observed")).map_err(|e| e.to_string())?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let published = value["published"]
+        .as_bool()
+        .ok_or("publication observation has no boolean result")?;
+    if value != serde_json::json!({"home": root, "pid": pid, "published": published}) {
+        return Err("publication observation does not match this fixture invocation".into());
+    }
+    Ok(published)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_publication_requires_complete_owned_observation() {
+    let root = tempfile::tempdir().unwrap();
+    let pid = 123;
+    assert!(read_detached_publication(root.path(), pid).is_err());
+    for invalid in [
+        "not json".to_owned(),
+        "{}".to_owned(),
+        serde_json::json!({"home": "/other", "pid": pid, "published": false}).to_string(),
+        serde_json::json!({"home": root.path(), "pid": pid + 1, "published": false}).to_string(),
+        serde_json::json!({"home": root.path(), "pid": pid, "published": "false"}).to_string(),
+    ] {
+        std::fs::write(root.path().join("publication-observed"), invalid).unwrap();
+        assert!(read_detached_publication(root.path(), pid).is_err());
+    }
+    for published in [false, true] {
+        std::fs::write(
+            root.path().join("publication-observed"),
+            serde_json::json!({"home": root.path(), "pid": pid, "published": published})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(read_detached_publication(root.path(), pid), Ok(published));
+    }
+}
+
+#[cfg(target_os = "linux")]
 async fn detached_version_children(mode: &str, controlled: bool) {
-    let (root, context) = fixture(InstalledCli::Claude, DETACHED_VERSION_FIXTURE);
+    detached_version_children_from(mode, controlled, DETACHED_VERSION_FIXTURE).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn detached_version_children_from(mode: &str, controlled: bool, body: &str) {
+    let (root, context) = fixture(InstalledCli::Claude, body);
     if controlled {
-        std::fs::write(root.path().join("hold-publication"), "").unwrap();
+        std::fs::write(root.path().join("observe-publication"), "").unwrap();
     }
     let mut unrelated = Command::new("/bin/sleep")
         .arg("120")
@@ -605,33 +941,7 @@ async fn detached_version_children(mode: &str, controlled: bool) {
     command.env("VERSION_MODE", mode);
     let mut operation = tokio::spawn(async move { context.observe(&command).await.map(|_| ()) });
     let file = root.path().join("detached-pid");
-    // Save failures until the barrier is released and the process owner joined.
-    // In particular, the deliberately failing baseline must not panic while held.
-    let publication = if controlled {
-        let entered = tokio::time::timeout(Duration::from_secs(2), async {
-            while !root.path().join("publication-entered").exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-        let observed =
-            entered
-                .map_err(|e| e.to_string())
-                .and_then(|()| match std::fs::read(&file) {
-                    Ok(bytes) => Ok(Some(bytes)),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(error) => Err(error.to_string()),
-                });
-        // Unconditional, including failed arrival/read. Python also has a
-        // bounded hold, below the unchanged production three-second timeout.
-        let released = std::fs::write(root.path().join("publication-release"), "");
-        Some(released.map_err(|e| e.to_string()).and(observed))
-    } else {
-        None
-    };
     let ready = tokio::time::timeout(Duration::from_secs(5), async {
-        // The control waits for close after releasing, so the baseline fails
-        // on the held-state oracle rather than racing a second empty read.
         while !file.exists() || (controlled && !root.path().join("publication-finished").exists()) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -651,19 +961,28 @@ async fn detached_version_children(mode: &str, controlled: bool) {
         operation.abort();
     }
     let result = (&mut operation).await;
-    let cleaned = if let Ok((pid, _)) = &child {
+    // Observe at the open-before-write point inside the fixture, then read the
+    // retained result after joining its owner. No scheduler-dependent hold has
+    // to fit inside the production version deadline. Opening the final file
+    // instead of staging still deterministically records published=true and fails.
+    let publication = controlled.then(|| {
+        child
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|(pid, _)| read_detached_publication(root.path(), *pid))
+    });
+    let cleaned = if let Ok((_, guard)) = &child {
         tokio::time::timeout(Duration::from_secs(7), async {
-            while std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
-                !s.rsplit_once(") ")
-                    .is_some_and(|(_, rest)| rest.starts_with('Z'))
-            }) {
+            while !guard.retired()? {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            Ok::<_, String>(())
         })
         .await
-        .is_ok()
+        .map_err(|error| error.to_string())
+        .and_then(|result| result)
     } else {
-        false
+        Err("child identity was not captured; retirement not observed".into())
     };
     let unrelated_alive = unrelated.try_wait().map(|status| status.is_none());
     let unrelated_reaped = unrelated.kill().await;
@@ -672,9 +991,9 @@ async fn detached_version_children(mode: &str, controlled: bool) {
         pid
     });
     eprintln!(
-        "detached fixture: mode={mode} controlled={controlled} pid={identity:?} held={publication:?} owner={result:?} retired={cleaned} unrelated_alive={unrelated_alive:?} unrelated_reaped={unrelated_reaped:?}"
+        "detached fixture: mode={mode} controlled={controlled} pid={identity:?} publication={publication:?} owner={result:?} retired={cleaned:?} unrelated_alive={unrelated_alive:?} unrelated_reaped={unrelated_reaped:?}"
     );
-    // All assertions are after release, owner completion, emergency cleanup,
+    // All assertions are after owner completion, emergency cleanup,
     // and unrelated kill/reap, including the original pre-parse failure path.
     let _pid = identity.expect("detached child PID readiness and identity");
     if cancelled {
@@ -689,12 +1008,10 @@ async fn detached_version_children(mode: &str, controlled: bool) {
     }
     assert!(unrelated_alive.unwrap(), "unrelated process was killed");
     unrelated_reaped.unwrap();
-    assert!(cleaned, "{mode} left detached version child alive");
+    cleaned.unwrap_or_else(|error| panic!("{mode} detached child retirement: {error}"));
     if let Some(publication) = publication {
         assert!(
-            publication
-                .expect("publication barrier/read/release")
-                .is_none(),
+            !publication.expect("publication observation"),
             "detached PID was published before its contents were complete"
         );
     }
@@ -719,6 +1036,17 @@ async fn installed_cli_cancelled_version_reaps_detached_children() {
 #[tokio::test]
 async fn installed_cli_detached_pid_is_published_only_when_complete() {
     detached_version_children("success", true).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[should_panic(expected = "detached PID was published before its contents were complete")]
+async fn installed_cli_detached_publication_observer_rejects_early_exposure() {
+    let early = DETACHED_VERSION_FIXTURE.replace(
+        "staging=root/'detached-pid.staging'",
+        "staging=root/'detached-pid'",
+    );
+    detached_version_children_from("success", true, &early).await;
 }
 
 // Exercise the macOS fallback on Unix CI too. This only promises ownership of

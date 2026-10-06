@@ -18288,6 +18288,20 @@ impl WorkspaceApi for Services {
         repository_native_wire::checkout::branches(self, query)
     }
 
+    fn repository_checkout_repo_config(
+        &self,
+        query: intent_core::repository_checkout::CheckoutRepoConfigQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutRepoConfig,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::repo_config(self, query)
+    }
+
     fn repository_checkout_warm(
         &self,
         query: intent_core::repository_checkout::CheckoutSelection,
