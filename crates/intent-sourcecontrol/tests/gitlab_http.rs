@@ -1771,6 +1771,8 @@ fn checkout_callback_classifies_only_the_exact_read_picker_endpoints() {
         "projects/Group%2FSub%2FProject",
         "projects/Group%2FSub%2FProject/repository/branches",
         "projects/Group%2FSub%2FProject/repository/files/.intent%2Fconfig.json",
+        "projects/Group%2FSub%2FProject/repository/branches/release%2Fcost%24usd",
+        "projects/Group%2FSub%2FProject/repository/branches/main",
     ] {
         assert_eq!(
             GitlabCredentialRequest::direct(&descriptor, path, false)
@@ -1779,11 +1781,22 @@ fn checkout_callback_classifies_only_the_exact_read_picker_endpoints() {
                 .as_deref(),
             Some("Group/Sub/Project")
         );
+        assert!(GitlabCredentialRequest::direct(&descriptor, path, true)
+            .checkout_project()
+            .is_err());
     }
     for path in [
         "user",
         "projects/123",
         "projects/Group%2FSub%2FProject/repository/files/x",
+        "projects/Group%2FSub%2FProject/repository/branches/",
+        "projects/Group%2FSub%2FProject/repository/branches/..",
+        "projects/Group%2FSub%2FProject/repository/branches/%2E%2E",
+        "projects/Group%2FSub%2FProject/repository/branches/main/protect",
+        "projects/Group%2FSub%2FProject/repository/branches/main?ref=x",
+        "projects/Group%2FSub%2FProject/repository/branches/main#x",
+        "projects/Group%2FSub%2FProject/repository/branches/%",
+        "projects/Group%2FSub%2FProject/repository/branches/%GG",
         "projects/Group%2FSub%2FProject/repository/files/.intent%2Fconfig.json/raw",
         "projects/Group%2FSub%2FProject/repository/files/.intent%252Fconfig.json",
         "projects/Group%2FSub%2FProject/repository/files/.intent%2Fconfig.json?ref=main",
@@ -1996,5 +2009,74 @@ async fn checkout_config_malformed_transport_json_is_not_tolerant_content_decode
         // Services tolerates Decode only after file/SHA identity was verified.
         // A corrupt HTTP envelope must remain a provider failure instead.
         assert!(matches!(error, Error::Provider(_)), "{error:?}");
+    }
+}
+
+#[tokio::test]
+async fn checkout_branch_reads_literal_ref_bytes_and_only_confirms_exact_absence() {
+    const SHA: &str = "0123456789012345678901234567890123456789";
+    const NAME: &str = "release/cost$usd%2F#part+é";
+    for (status, body, expected) in [
+        (200, json!({"name":NAME,"commit":{"id":SHA}}), Some(true)),
+        (404, json!({"message":"404 Branch Not Found"}), Some(false)),
+        (404, json!({"message":"404 Project Not Found"}), None),
+        (404, json!({"message":"404 File Not Found"}), None),
+        (404, json!({"message":"404 Not Found"}), None),
+        (403, json!({"message":"404 Branch Not Found"}), None),
+        (401, json!({}), None),
+        (429, json!({}), None),
+        (500, json!({}), None),
+        (200, Value::Null, None),
+        (200, json!({"name":"other","commit":{"id":SHA}}), None),
+        (200, json!({"name":NAME}), None),
+        (200, json!({"name":NAME,"commit":{"id":"wrong"}}), None),
+    ] {
+        let f = Fixture::new(move |r| {
+            assert_eq!(r.method, "GET");
+            assert_eq!(r.path, "/fixture/api/v4/projects/Team%2FSub%2FProject/repository/branches/release%2Fcost%24usd%252F%23part%2B%C3%A9");
+            reply(status, body.clone())
+        }).await;
+        let result = f
+            .provider()
+            .checkout_branch(&RepoRef::new("Team/Sub", "Project"), NAME)
+            .await;
+        match expected {
+            Some(true) => {
+                let branch = result.unwrap().unwrap();
+                assert_eq!(branch.name, NAME);
+                assert_eq!(branch.commit_sha.as_deref(), Some(SHA));
+            }
+            Some(false) => assert!(result.unwrap().is_none()),
+            None => assert!(result.is_err(), "status {status}: {result:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn checkout_branch_rejects_corrupt_or_oversized_missing_responses() {
+    for (status, body) in [
+        (200, "{bad".into()),
+        (404, "{bad".into()),
+        (
+            404,
+            format!(
+                "{{\"message\":\"404 Branch Not Found\"}}{}",
+                " ".repeat(1024)
+            ),
+        ),
+    ] {
+        let f = Fixture::new(move |_| Reply {
+            status,
+            headers: vec![],
+            body: body.clone(),
+        })
+        .await;
+        assert!(matches!(
+            f.provider()
+                .checkout_branch(&repo(), "main")
+                .await
+                .unwrap_err(),
+            Error::Provider(_)
+        ));
     }
 }

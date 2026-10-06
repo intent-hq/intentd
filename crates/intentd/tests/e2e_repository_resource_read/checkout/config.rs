@@ -3,6 +3,8 @@ use super::*;
 use base64::Engine as _;
 
 const FILE: &str = "/api/v4/projects/Team%2FSub%2FProject/repository/files/.intent%2Fconfig.json";
+const EXACT_BRANCH: &str =
+    "/api/v4/projects/Team%2FSub%2FProject/repository/branches/release%2Fconfig";
 const PROJECT_ROUTE: &str = "/api/v4/projects/Team%2FSub%2FProject";
 
 fn file(text: &str) -> Value {
@@ -13,6 +15,7 @@ async fn selected(h: &Harness, client: &mut Client) -> Value {
     let server = h.server.as_ref().unwrap();
     set(server, PROJECT_ROUTE, repo(), None);
     set(server, BRANCHES, json!([branch("release/config")]), None);
+    set(server, EXACT_BRANCH, branch("release/config"), None);
     let original = capture(client).await;
     ready(
         &client
@@ -219,7 +222,7 @@ async fn checkout_config_rejects_branch_project_and_authority_changes_during_rea
             "branch" => {
                 let mut b = branch("release/config");
                 b["commit"]["id"] = json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-                set(server, BRANCHES, json!([b]), None);
+                set(server, EXACT_BRANCH, b, None);
             }
             "project" => {
                 let mut replacement = repo();
@@ -278,11 +281,19 @@ async fn checkout_config_changed_or_deleted_branch_prevents_file_request() {
     let server = h.server.as_ref().unwrap();
     let mut client = h.wss(TOKEN).await;
     let q = selected(&h, &mut client).await;
-    for items in [
-        json!([]),
-        json!([{"name":"release/config","commit":{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]),
+    for (status, body) in [
+        (404, json!({"message":"404 Branch Not Found"})),
+        (
+            200,
+            json!({"name":"release/config","commit":{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}),
+        ),
     ] {
-        set(server, BRANCHES, items, None);
+        server
+            .state
+            .replies
+            .lock()
+            .unwrap()
+            .insert(EXACT_BRANCH.into(), (status, body));
         let response = client
             .rpc("sourceControl.checkout.repoConfig", q.clone())
             .await;
@@ -298,6 +309,90 @@ async fn checkout_config_changed_or_deleted_branch_prevents_file_request() {
             .iter()
             .any(|(_, path)| path.starts_with(FILE)));
     }
+    set(server, EXACT_BRANCH, branch("release/config"), None);
+    set(server, FILE, file("{}"), None);
+    assert_eq!(
+        ready(&client.rpc("sourceControl.checkout.repoConfig", q).await)["exists"],
+        true
+    );
     client.close().await;
     h.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn checkout_config_literal_dollar_branch_remains_ready() {
+    const SHA: &str = "0123456789012345678901234567890123456789";
+    const NAME: &str = "release/cost$usd";
+    const BRANCHES: &str = "/api/v4/projects/Team%2FSub%2FProject/repository/branches";
+    const FILE: &str =
+        "/api/v4/projects/Team%2FSub%2FProject/repository/files/.intent%2Fconfig.json";
+    intent_git::native_checkout::NativeCheckoutSelection::new(NAME, SHA).unwrap();
+    let h = Harness::with_workspace(false).await;
+    let server = h.server.as_ref().unwrap();
+    let observed = json!({"name": NAME, "commit": {"id": SHA}, "protected": false});
+    server.state.replies.lock().unwrap().insert(
+        "/api/v4/projects/Team%2FSub%2FProject".into(),
+        (200, json!({"id":42,"path_with_namespace":PROJECT,"web_url":format!("{INSTANCE}/{PROJECT}"),"default_branch":NAME})),
+    );
+    server
+        .state
+        .replies
+        .lock()
+        .unwrap()
+        .insert(BRANCHES.into(), (200, json!([observed])));
+    server.state.replies.lock().unwrap().insert(FILE.into(), (200, json!({"file_path":".intent/config.json","commit_id":SHA,"encoding":"base64","content":"e30="})));
+    let mut client = h.wss(TOKEN).await;
+    let capture = client
+        .rpc(
+            "sourceControl.checkout.capture",
+            json!({"provider":"gitlab","instanceBaseUrl":INSTANCE}),
+        )
+        .await;
+    let original = &success(&capture)["value"];
+    let mut q = json!({"checkoutId":original["checkoutId"],"revision":original["revision"],"projectPath":PROJECT});
+    let branches = client
+        .rpc("sourceControl.checkout.branches", q.clone())
+        .await;
+    assert_eq!(success(&branches)["value"]["items"][0]["name"], NAME);
+    q["branch"] = json!(NAME);
+    q["commitSha"] = json!(SHA);
+    // GitLab GitRefsFinder escapes the term, then unescapes the FIRST dollar.
+    // ^release/cost$usd$ becomes ^release/cost$usd\$ and cannot match this ref.
+    // Exact route matching keeps ordinary branch observations unchanged.
+    let search_route = format!("{BRANCHES}?search=%5Erelease%2Fcost%24usd%24&page=1&per_page=100");
+    server
+        .state
+        .replies
+        .lock()
+        .unwrap()
+        .insert(search_route.clone(), (200, json!([])));
+    let exact_route = format!("{BRANCHES}/release%2Fcost%24usd");
+    set(
+        server,
+        &exact_route,
+        json!({"name":NAME,"commit":{"id":SHA}}),
+        None,
+    );
+    let response = client.rpc("sourceControl.checkout.repoConfig", q).await;
+    let routes = server.state.routes.lock().unwrap().clone();
+
+    client.close().await;
+    h.finish().await;
+    assert_eq!(
+        success(&response)["status"],
+        "ready",
+        "unchanged valid literal-dollar branch: {response}"
+    );
+    assert_eq!(
+        routes
+            .iter()
+            .filter(|(method, path)| method == "GET" && path == &exact_route)
+            .count(),
+        2,
+        "{routes:?}"
+    );
+    assert!(
+        !routes.iter().any(|(_, path)| path == &search_route),
+        "{routes:?}"
+    );
 }

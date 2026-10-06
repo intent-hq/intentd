@@ -138,7 +138,8 @@ impl GitlabCredentialRequest<'_> {
         if !matches!(
             suffix,
             "" | "repository/branches" | "repository/files/.intent%2Fconfig.json"
-        ) {
+        ) && !is_checkout_branch_endpoint(suffix)
+        {
             return Err(Error::AdmissionRetired);
         }
         let mut decoded = Vec::with_capacity(encoded.len());
@@ -259,6 +260,34 @@ impl GitLabSourceControl {
         String::from_utf8(bytes)
             .map(Some)
             .map_err(|_| Error::Decode("GitLab file is not UTF-8".into()))
+    }
+
+    /// Read an exact branch without interpreting literal ref bytes as search operators.
+    /// # Errors
+    /// Preserves provider failures and rejects a different or malformed branch identity.
+    pub async fn checkout_branch(&self, repo: &RepoRef, branch: &str) -> Result<Option<Branch>> {
+        let path = format!("{}/repository/branches/{}", project(repo), encode(branch));
+        if !is_checkout_branch_endpoint(&format!("repository/branches/{}", encode(branch))) {
+            return Err(Error::Config("invalid checkout branch".into()));
+        }
+        let (value, _) = self
+            .request_for(Method::GET, &path, &[], None, Purpose::CheckoutBranch)
+            .await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        if value["name"] != branch {
+            return Err(Error::AdmissionRetired);
+        }
+        let sha = string(&value["commit"], "id")?;
+        if sha.len() != 40 || !sha.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::Decode("invalid GitLab branch commit".into()));
+        }
+        Ok(Some(Branch {
+            name: branch.into(),
+            commit_sha: Some(sha),
+            protected: value["protected"].as_bool().unwrap_or(false),
+        }))
     }
 
     /// Numeric identity used to detect project replacement around a checkout read.
@@ -487,6 +516,41 @@ impl GitLabSourceControl {
     async fn all(&self, path: &str, query: Vec<(String, String)>) -> Result<Vec<Value>> {
         self.all_for(path, query, Purpose::Primary).await
     }
+}
+
+// Only one canonical encoded branch component, with no query or sub-resource.
+// This classifies a GET endpoint; original checkout authority still admits it.
+fn is_checkout_branch_endpoint(suffix: &str) -> bool {
+    let Some(branch) = suffix.strip_prefix("repository/branches/") else {
+        return false;
+    };
+    if matches!(branch, "" | "." | "..") {
+        return false;
+    }
+    let mut bytes = branch.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            continue;
+        }
+        if byte != b'%' {
+            return false;
+        }
+        let (Some(high), Some(low)) = (bytes.next(), bytes.next()) else {
+            return false;
+        };
+        let (Some(high), Some(low)) = (char::from(high).to_digit(16), char::from(low).to_digit(16))
+        else {
+            return false;
+        };
+        let Ok(decoded) = u8::try_from(high * 16 + low) else {
+            return false;
+        };
+        // Do not accept percent-encoded dot segments or alternative spellings.
+        if decoded.is_ascii_alphanumeric() || matches!(decoded, b'-' | b'_' | b'.' | b'~') {
+            return false;
+        }
+    }
+    true
 }
 
 fn encode(value: &str) -> String {

@@ -10,6 +10,7 @@ use super::{
 pub(super) enum Purpose {
     Primary,
     CheckoutConfig,
+    CheckoutBranch,
     /// Only the addressed project resource, not a branch or MR within it.
     Project,
     Optional,
@@ -119,10 +120,15 @@ impl GitLabSourceControl {
         let status = response.status();
         let headers = response.headers().clone();
         self.observe_rate_limit(&headers, status.as_u16() == 429);
-        // GitLab lib/api/files.rb assign_file_vars! authorizes read_code and
-        // resolves the commit before not_found!("File"). Only this exact fixed
-        // endpoint and exact bounded response can establish config absence.
-        if status.as_u16() == 404 && matches!(scope.purpose, Purpose::CheckoutConfig) {
+        // GitLab authorizes read_code before files.rb resolves the commit/file
+        // or branches.rb calls find_branch!. Only each exact bounded not-found
+        // response establishes absence; generic/project denial stays unavailable.
+        let missing_message = match scope.purpose {
+            Purpose::CheckoutConfig => Some("404 File Not Found"),
+            Purpose::CheckoutBranch => Some("404 Branch Not Found"),
+            _ => None,
+        };
+        if let (404, Some(message)) = (status.as_u16(), missing_message) {
             let mut bytes = Vec::new();
             let mut oversized = false;
             while let Some(chunk) = response.chunk().await.map_err(|_| uncertain())? {
@@ -134,10 +140,10 @@ impl GitLabSourceControl {
             }
             let missing = !oversized
                 && serde_json::from_slice::<Value>(&bytes).ok()
-                    == Some(serde_json::json!({"message":"404 File Not Found"}));
+                    == Some(serde_json::json!({"message":message}));
             if missing {
                 if let Some(receipt) = receipt {
-                    receipt.observe_missing_checkout_config(
+                    receipt.observe_missing_checkout_resource(
                         super::GitlabResponseObservation::from_headers(404, &headers),
                     );
                 }
@@ -158,9 +164,10 @@ impl GitLabSourceControl {
                 }
                 (401, _) => ProviderFailureKind::CredentialRejected,
                 (403 | 404, Purpose::Project) => ProviderFailureKind::ProjectDenied,
-                (403 | 404, Purpose::Primary | Purpose::CheckoutConfig) => {
-                    ProviderFailureKind::ResourceDenied
-                }
+                (
+                    403 | 404,
+                    Purpose::Primary | Purpose::CheckoutConfig | Purpose::CheckoutBranch,
+                ) => ProviderFailureKind::ResourceDenied,
                 (403, Purpose::Optional) => ProviderFailureKind::OptionalRestricted,
                 (404 | 405 | 501, Purpose::Optional) => ProviderFailureKind::OptionalUnavailable,
                 (409 | 422 | 400, _) => return Err(Error::Conflict(format!("GitLab HTTP {code}"))),
@@ -198,7 +205,12 @@ impl GitLabSourceControl {
         } else {
             serde_json::from_slice(&bytes).map_err(|_| invalid())?
         };
-        if value.is_null() && matches!(scope.purpose, Purpose::CheckoutConfig) {
+        if value.is_null()
+            && matches!(
+                scope.purpose,
+                Purpose::CheckoutConfig | Purpose::CheckoutBranch
+            )
+        {
             return Err(invalid());
         }
         Ok((value, headers))

@@ -341,7 +341,7 @@ struct CheckoutReceipt {
     project: Option<String>,
 }
 impl GitlabResponseReceipt for CheckoutReceipt {
-    fn observe_missing_checkout_config(&self, response: GitlabResponseObservation) {
+    fn observe_missing_checkout_resource(&self, response: GitlabResponseObservation) {
         self.original
             .observe_checkout_response(&self.stamp, response);
     }

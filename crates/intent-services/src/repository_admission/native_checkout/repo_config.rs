@@ -1,8 +1,7 @@
 //! Fixed pre-workspace configuration under the original checkout authority.
 use super::{
     create, entry, failure, split_project, BoxFuture, CheckoutFrame, CheckoutMode, CheckoutResult,
-    CheckoutSelection, CheckoutUnavailable, PageParams, Result, Services, SourceControl,
-    READ_LIMIT,
+    CheckoutSelection, CheckoutUnavailable, Result, Services, READ_LIMIT,
 };
 use intent_core::repository_checkout::{CheckoutRepoConfig, CheckoutRepoConfigQuery};
 
@@ -31,7 +30,7 @@ pub(crate) fn read(
             let repo = intent_core::RepoRef::new(owner, name);
             let result = tokio::time::timeout(READ_LIMIT, async {
                 let original = provider.checkout_project_identity(&repo).await?;
-                if !branch_matches(&provider, owner, name, &q).await? {
+                if !branch_matches(&provider, &repo, &q).await? {
                     return Ok(None);
                 }
                 let config = match provider.checkout_repo_config(&repo, &q.commit_sha).await {
@@ -44,7 +43,7 @@ pub(crate) fn read(
                 if provider.checkout_project_identity(&repo).await? != original {
                     return Err(intent_sourcecontrol::Error::AdmissionRetired);
                 }
-                if !branch_matches(&provider, owner, name, &q).await? {
+                if !branch_matches(&provider, &repo, &q).await? {
                     return Ok(None);
                 }
                 Ok(Some(config))
@@ -87,20 +86,12 @@ pub(crate) fn read(
 
 async fn branch_matches(
     provider: &intent_sourcecontrol::GitLabSourceControl,
-    owner: &str,
-    name: &str,
+    repo: &intent_core::RepoRef,
     q: &CheckoutRepoConfigQuery,
 ) -> intent_sourcecontrol::Result<bool> {
-    // GitLab search's trailing $ matches the end; verify both name and SHA.
-    let page = provider
-        .list_remote_branches(
-            owner,
-            name,
-            Some(&format!("{}$", q.branch)),
-            PageParams::first(100),
-        )
-        .await?;
-    Ok(page.items.iter().any(|branch| {
-        branch.name == q.branch && branch.commit_sha.as_deref() == Some(&q.commit_sha)
-    }))
+    // Search operators do not preserve literal '$' in a valid ref name.
+    Ok(provider
+        .checkout_branch(repo, &q.branch)
+        .await?
+        .is_some_and(|branch| branch.commit_sha.as_deref() == Some(&q.commit_sha)))
 }
