@@ -31,6 +31,10 @@ for line in sys.stdin:
         log.write(json.dumps({'method': method, 'pid': os.getpid()}) + '\n')
     if 'id' not in request:
         continue
+    if method == 'getAuthStatus' and (home / 'unsupported-method').exists():
+        send({'id': request['id'], 'error': {'code': -32601,
+              'message': 'unsupported method; never-echo-this-secret'}})
+        continue
     result = {}
     if method == 'configRequirements/read':
         result = {'requirements': None}

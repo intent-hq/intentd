@@ -91,6 +91,13 @@ async fn native_relogin_and_logout_are_observed_by_fresh_helpers() {
     assert_eq!(f.authority().read(None).await.unwrap().unwrap().token, b);
     std::fs::remove_file(f.native.join("auth.json")).unwrap();
     assert!(matches!(f.authority().read(None).await, Err(AUTH_ERROR)));
+    // A removed upstream export API requires a compatible runtime, not login;
+    // its untrusted error details must not leak into the user-facing response.
+    std::fs::write(f.native.join("unsupported-method"), "").unwrap();
+    assert!(matches!(
+        f.authority().read(None).await,
+        Err(CONTRACT_ERROR)
+    ));
 }
 #[tokio::test]
 async fn refresh_owner_serializes_rotation_and_persists_it_past_probe_cleanup() {

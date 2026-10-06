@@ -32,6 +32,13 @@ const POLICY_ERROR: &str = "Managed Codex credential storage cannot safely be us
 const ACCOUNT_ERROR: &str = "Native Codex is signed in to a different account. Restore this agent's original account or start a new agent.";
 type Result<T> = std::result::Result<T, &'static str>;
 
+fn response_error(frame: &Value) -> &'static str {
+    match frame["error"]["code"].as_i64() {
+        Some(-32602..=-32600) => CONTRACT_ERROR,
+        _ => AUTH_ERROR,
+    }
+}
+
 // Deliberately no Debug or Serialize: tokens must never become diagnostics.
 struct Credentials {
     token: String,
@@ -199,7 +206,7 @@ impl Server {
             let frame = self.output.next().await?.ok_or(CONTRACT_ERROR)?;
             if frame["id"] == id {
                 if frame.get("error").is_some() {
-                    return Err(AUTH_ERROR);
+                    return Err(response_error(&frame));
                 }
                 return frame.get("result").cloned().ok_or(CONTRACT_ERROR);
             }
@@ -503,7 +510,7 @@ impl Bridge {
             let frame = server.output.next().await?.ok_or(CONTRACT_ERROR)?;
             if frame["id"] == id {
                 return if frame.get("error").is_some() {
-                    Err(AUTH_ERROR)
+                    Err(response_error(&frame))
                 } else {
                     Ok(())
                 };
