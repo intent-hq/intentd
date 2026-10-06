@@ -105,7 +105,6 @@ impl OriginalTurn {
 }
 
 mod repository_origin;
-mod skill_catalog;
 use crate::repository_admission::lifecycle::physical_owner::RepositoryCreationIntent;
 pub(crate) use repository_origin::callback_delivery::RepositoryPromptInput;
 use repository_origin::callback_delivery::{deliver_captured, EndpointBlueprint, ServerBlueprint};
@@ -2770,9 +2769,6 @@ pub struct AgentManager {
     /// prompt). Consumed by [`AgentManager::build_turn_prompt`] so the block
     /// fires exactly once per fresh session and re-fires after a recreate.
     prepend_pending: Arc<Mutex<HashSet<AgentId>>>,
-    /// Catalog fingerprints awaiting successful delivery; never acknowledge a
-    /// cancelled or failed prompt. Persisted fingerprints survive session/load.
-    skill_catalog_pending: Mutex<HashMap<AgentId, String>>,
     /// Most recent interrupt-priority `messageId` delivered per agent
     /// (PROTOCOL §5.5). [`AgentManager::interrupt_send_message`] records the
     /// client-supplied id under this lock BEFORE preempting, so the SAME
@@ -2979,7 +2975,6 @@ impl AgentManager {
             recreated: Arc::new(Mutex::new(HashSet::new())),
             setup_failure_notified: Arc::new(Mutex::new(HashSet::new())),
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
-            skill_catalog_pending: Mutex::new(HashMap::new()),
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
             active_delivery_groups: Arc::new(Mutex::new(HashMap::new())),
             stop_redelivery: Arc::new(Mutex::new(HashMap::new())),
@@ -5474,13 +5469,6 @@ impl AgentManager {
         // `session/new` (brand-new or recreate, never `session/load` resume)
         // and consumed here so it fires exactly once per fresh session.
         let prepend = self.build_first_turn_prepend(agent_id).await;
-        let catalog_update = self
-            .build_skill_catalog_update(agent_id, prepend.as_deref())
-            .await;
-        let prepend = match (prepend, catalog_update) {
-            (Some(initial), Some(update)) => Some(format!("{initial}\n\n{update}")),
-            (initial, update) => initial.or(update),
-        };
         let prompt_text =
             crate::harness::latest().compose_turn_prompt(&crate::harness::TurnEnvelopeParams {
                 first_turn_prepend: prepend.as_deref(),
@@ -5967,7 +5955,6 @@ impl AgentManager {
         self.recreated.lock().unwrap().remove(agent_id);
         self.active_delivery_groups.lock().unwrap().remove(agent_id);
         self.prepend_pending.lock().unwrap().remove(agent_id);
-        self.skill_catalog_pending.lock().unwrap().remove(agent_id);
         // A spawn attempt cancelled by this teardown never reaches the
         // spawn-failure publisher that would consume its provider record.
         self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
@@ -12829,7 +12816,6 @@ async fn run_message_worker(
                         .await;
                     return;
                 }
-                let catalog_delivery = mgr.skill_catalog_pending.lock().unwrap().remove(&agent_id);
                 match mgr
                     .run_turn_owned(
                         &agent_id,
@@ -12841,15 +12827,7 @@ async fn run_message_worker(
                     )
                     .await
                 {
-                    Ok(stop_reason) => {
-                        if stop_reason != StopReason::Cancelled {
-                            mgr.acknowledge_skill_catalog(
-                                &agent_id,
-                                &workspace_id,
-                                catalog_delivery,
-                            )
-                            .await;
-                        }
+                    Ok(_stop_reason) => {
                         // A successful turn resets the identical-failure
                         // streak (monorepo#840): the session is provably not
                         // poisoned.

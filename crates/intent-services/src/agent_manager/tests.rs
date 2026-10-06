@@ -5816,8 +5816,6 @@ async fn antigravity_failed_setup_survives_restart_without_losing_first_turn_con
                 text.matches("Earlier answer").count(),
                 usize::from(prior_session.is_some())
             );
-            let fingerprint = mgr.skill_catalog_pending.lock().unwrap().remove(&id);
-            mgr.acknowledge_skill_catalog(&id, &ws, fingerprint).await;
             let next = mgr
                 .build_turn_prompt(&id, &ws, "Next request", &super::TurnOptions::default())
                 .await;

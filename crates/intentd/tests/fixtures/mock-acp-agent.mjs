@@ -418,8 +418,6 @@ async function handlePrompt(id, params) {
         promptLog,
         JSON.stringify({
           turn: promptCount,
-          sessionId: params && params.sessionId,
-          loaded: sessionFromLoad,
           ...(checkpointFile ? { checkpointContext, sessionFromLoad } : {}),
           ...(effectiveModel !== null ? { effectiveModel, effectiveEffort } : {}),
           text: extractPromptText(params),

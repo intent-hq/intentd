@@ -1,7 +1,7 @@
 //! Skills directory watcher → `skills:changed` events.
 //!
-//! Watches the same personal and project roots used by skill discovery and
-//! emits `skills:changed` events when SKILL.md files are created, modified, or
+//! Watches the same Intent personal and project roots used by skill discovery
+//! and emits `skills:changed` events when SKILL.md files are created, modified, or
 //! deleted — or when a tier directory itself appears or disappears (#612).
 //! User-tier changes affect all workspaces; project-tier changes are scoped
 //! to their workspace. Debounce is 500ms per workspace to coalesce rapid edits.
@@ -31,8 +31,8 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// Holds watchers for all skills directories (user-tier + project-tier).
 /// Dropping this tears down all watchers.
 ///
-/// Each personal tier keeps one [`RootWatch`] shared per daemon, so these
-/// do not scale with the workspace count. Project tiers ride the shared
+/// The Intent personal tier keeps one [`RootWatch`] shared per daemon, so it
+/// does not scale with the workspace count. Project tiers ride the shared
 /// workspace-root stream via [`watch_tiers`].
 pub(crate) struct SkillsWatcher {
     hub: Arc<SharedWatchHub>,
@@ -64,8 +64,11 @@ impl SkillsWatcher {
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<SkillsMsg>();
 
         // Start user-tier watchers (affect all workspaces)
+        let mut user_watchers = Vec::new();
         let home = crate::skills::skill_home_dir();
-        let user_watchers = start_user_watches(hub, home.as_deref(), &raw_tx);
+        for root in crate::skills::skill_roots(None, home.as_deref()) {
+            user_watchers.push(watch_directory(hub, root.root, None, raw_tx.clone()));
+        }
 
         // Start project-tier watchers (per-workspace)
         let mut workspace_watchers: HashMap<WorkspaceId, TierWatch> = HashMap::new();
@@ -173,18 +176,6 @@ impl SkillsWatcher {
             map.insert(workspace_id, watch);
         }
     }
-}
-
-/// Personal watches share discovery's roots and notify every workspace.
-fn start_user_watches(
-    hub: &Arc<SharedWatchHub>,
-    home: Option<&Path>,
-    raw_tx: &mpsc::UnboundedSender<SkillsMsg>,
-) -> Vec<RootWatch> {
-    crate::skills::skill_roots(None, home)
-        .into_iter()
-        .map(|root| watch_directory(hub, root.root, None, raw_tx.clone()))
-        .collect()
 }
 
 /// Watch all project skill roots over one shared workspace-root subscription.
@@ -572,94 +563,6 @@ mod tests {
 
     fn skill_md(name: &str) -> String {
         format!("---\nname: {name}\ndescription: d\n---\n\nbody")
-    }
-
-    /// Await a user-tier invalidation, then drain duplicate backend events so
-    /// the next mutation must produce its own notification.
-    async fn expect_user_change(raw_rx: &mut mpsc::UnboundedReceiver<SkillsMsg>) {
-        let message = timeout(LIVENESS, raw_rx.recv())
-            .await
-            .expect("personal skill change must reach the shared watcher channel")
-            .expect("personal skill watcher channel closed");
-        assert!(matches!(message, SkillsMsg::Change(None)), "{message:?}");
-        while let Ok(Some(message)) = timeout(DEBOUNCE, raw_rx.recv()).await {
-            assert!(matches!(message, SkillsMsg::Change(None)), "{message:?}");
-        }
-    }
-
-    #[tokio::test]
-    #[expect(clippy::await_holding_lock)]
-    async fn shared_personal_root_watches_creation_edit_and_removal() {
-        let _serial = crate::events::WATCHER_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let home = crate::test_support::test_tempdir("skills-personal-watch-");
-        let root = home.path().join(".agents/skills");
-        std::fs::create_dir_all(&root).unwrap();
-        let (raw_tx, mut raw_rx) = mpsc::unbounded_channel();
-        let watches = start_user_watches(&SharedWatchHub::new(), Some(home.path()), &raw_tx);
-        assert_eq!(watches.len(), 2, "shared and Intent personal roots");
-        for watch in &watches {
-            watch.wait_established(LIVENESS).await;
-        }
-        // The existing root sends a registration catch-up before edits start.
-        expect_user_change(&mut raw_rx).await;
-        for name in ["find-skills", "ios-device-build"] {
-            let dir = root.join(name);
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("SKILL.md");
-            std::fs::write(&path, skill_md(name)).unwrap();
-            expect_user_change(&mut raw_rx).await;
-
-            std::fs::write(
-                &path,
-                skill_md(name).replace("description: d", "description: edited"),
-            )
-            .unwrap();
-            expect_user_change(&mut raw_rx).await;
-
-            std::fs::remove_file(&path).unwrap();
-            expect_user_change(&mut raw_rx).await;
-        }
-        std::fs::remove_dir_all(&root).unwrap();
-        expect_user_change(&mut raw_rx).await;
-    }
-
-    #[tokio::test]
-    #[expect(clippy::await_holding_lock)]
-    async fn shared_personal_root_created_after_watching_promotes_from_ancestor() {
-        let _serial = crate::events::WATCHER_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let home = crate::test_support::test_tempdir("skills-personal-late-root-");
-        let root = home.path().join(".agents/skills");
-        let (raw_tx, mut raw_rx) = mpsc::unbounded_channel();
-        let watches = start_user_watches(&SharedWatchHub::new(), Some(home.path()), &raw_tx);
-        assert_eq!(watches.len(), 2);
-        for watch in &watches {
-            watch.wait_established(LIVENESS).await;
-            assert_eq!(watch.watched(), Some((home.path().to_path_buf(), false)));
-        }
-        assert!(!root.exists(), "watching must not create personal roots");
-        assert!(raw_rx.try_recv().is_err());
-
-        let skill_dir = root.join("find-skills");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        let skill_path = skill_dir.join("SKILL.md");
-        std::fs::write(&skill_path, skill_md("find-skills")).unwrap();
-        expect_user_change(&mut raw_rx).await;
-        assert!(watches
-            .iter()
-            .any(|watch| watch.watched() == Some((root.clone(), true))));
-
-        std::fs::write(
-            &skill_path,
-            skill_md("find-skills").replace("description: d", "description: edited"),
-        )
-        .unwrap();
-        expect_user_change(&mut raw_rx).await;
-        std::fs::remove_file(&skill_path).unwrap();
-        expect_user_change(&mut raw_rx).await;
     }
 
     #[tokio::test]

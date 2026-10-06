@@ -19,9 +19,6 @@ mod creation_preferences;
 #[path = "e2e_wss_agent_lifecycle/provider_policy.rs"]
 mod provider_policy;
 
-#[path = "e2e_wss_agent_lifecycle/skill_catalog.rs"]
-mod skill_catalog;
-
 #[path = "e2e_wss_agent_lifecycle/structured_notices.rs"]
 mod structured_notices;
 

@@ -1,10 +1,9 @@
 //! Intent-owned skill discovery for personal and project catalogs.
 //!
-//! Personal sources are `~/.agents/skills` and the higher-priority
-//! `~/.intent/skills`. Provider-specific home roots and config environment
-//! overrides belong to native suppression inventories, never this catalog.
-//! All project roots outrank personal skills; the ordered roots below preserve
-//! `.intent` as the highest project tier.
+//! Only `~/.intent/skills` is an implicit personal source. Third-party home
+//! roots and config environment overrides belong to native suppression
+//! inventories, never this catalog. All project roots outrank personal skills;
+//! the ordered roots below preserve `.intent` as the highest project tier.
 //! Explicit links inside these roots may refer outside the workspace (shared
 //! skill libraries); canonical deduplication and global scan budgets still
 //! apply. Discovery never walks ancestor projects or fetches remote/plugin roots.
@@ -186,10 +185,9 @@ fn normalize_workspace_path(workspace_path: &str) -> Option<String> {
 
 /// Ordered roots, lowest to highest precedence. This is the single source for
 /// synchronous discovery, cached discovery and filesystem watch registration.
-/// `home` is the actual user home; only shared and Intent personal roots are used.
+/// `home` is the actual user home; only its Intent-owned skill directory is used.
 /// Missing roots stay in the list so their later creation invalidates the cache.
 pub(crate) fn skill_roots(workspace: Option<&Path>, home: Option<&Path>) -> Vec<SkillRoot> {
-    const PERSONAL_ROOTS: &[&str] = &[".agents/skills", ".intent/skills"];
     const PROJECT_ROOTS: &[&str] = &[
         ".agent/skills",
         ".agents/skills",
@@ -206,20 +204,17 @@ pub(crate) fn skill_roots(workspace: Option<&Path>, home: Option<&Path>) -> Vec<
     ];
     let mut roots = Vec::new();
     if let Some(home) = home {
-        for (index, relative) in PERSONAL_ROOTS.iter().enumerate() {
-            roots.push(SkillRoot {
-                root: home.join(relative),
-                precedence: u8::try_from(index).expect("bounded personal skill roots"),
-                scope: "user".to_string(),
-            });
-        }
+        roots.push(SkillRoot {
+            root: home.join(".intent/skills"),
+            precedence: 0,
+            scope: "user".to_string(),
+        });
     }
     if let Some(workspace) = workspace {
         for (index, relative) in PROJECT_ROOTS.iter().enumerate() {
             roots.push(SkillRoot {
                 root: workspace.join(relative),
-                precedence: u8::try_from(index + PERSONAL_ROOTS.len())
-                    .expect("bounded project skill roots"),
+                precedence: u8::try_from(index + 1).expect("bounded project skill roots"),
                 scope: "project".to_string(),
             });
         }
@@ -981,7 +976,7 @@ mod tests {
     ];
 
     #[tokio::test]
-    async fn catalog_ownership_excludes_provider_home_skills_from_both_consumers() {
+    async fn catalog_ownership_excludes_native_home_skills_from_both_consumers() {
         let dir = crate::test_support::test_tempdir("skills-ownership-");
         let home = dir.path().join("home");
         let project = dir.path().join("project");
@@ -995,11 +990,7 @@ mod tests {
             )
             .await;
         }
-        let mut expected = vec![
-            "personal-1".to_string(),
-            format!("personal-{}", AUDITED_PROJECT_ROOTS.len() - 1),
-        ];
-        expected.sort();
+        let expected = vec![format!("personal-{}", AUDITED_PROJECT_ROOTS.len() - 1)];
         let asynchronous = discover_skills_test(&project.to_string_lossy(), home.clone()).await;
         let synchronous = discover_skills_sync(Some(&project), Some(home));
         assert_eq!(asynchronous, synchronous);
@@ -1010,134 +1001,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
-        assert!(asynchronous.iter().all(|skill| skill.scope == "user"));
-    }
-
-    #[tokio::test]
-    async fn shared_personal_skills_keep_original_paths_and_collision_precedence() {
-        let dir = crate::test_support::test_tempdir("skills-shared-personal-");
-        let home = dir.path().join("home");
-        let project = dir.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        let project = project.canonicalize().unwrap();
-        let names = ["find-skills", "ios-device-build"];
-        let mut paths = Vec::new();
-        for name in names {
-            paths.push(
-                write_skill(
-                    &home.join(".agents/skills"),
-                    name,
-                    &build_skill_content(
-                        &format!("name: {name}\ndescription: shared personal"),
-                        "Body",
-                    ),
-                )
-                .await,
-            );
-        }
-
-        let personal = discover_skills_test(&project.to_string_lossy(), home.clone()).await;
-        assert_eq!(personal.len(), names.len());
-        for ((skill, name), path) in personal.iter().zip(names).zip(&paths) {
-            assert_eq!(skill.name, name);
-            assert_eq!(skill.scope, "user");
-            assert_eq!(skill.description, "shared personal");
-            assert_eq!(Path::new(&skill.location), path);
-        }
-        assert_eq!(
-            personal,
-            discover_skills_sync(Some(&project), Some(home.clone()))
-        );
-        assert_eq!(personal, discover_skills_sync(None, Some(home.clone())));
-        assert_eq!(
-            personal,
-            scan_skills_with_home(None, Some(home.clone())).await.skills
-        );
-
-        // Both names must retain Intent personal precedence, then yield even
-        // to the lowest project tier. Every higher project tier also wins.
-        for (root, scope, description) in [
-            (home.join(".intent/skills"), "user", "Intent personal"),
-            (project.join(".agent/skills"), "project", "project"),
-        ] {
-            for name in names {
-                write_skill(
-                    &root,
-                    name,
-                    &build_skill_content(
-                        &format!("name: {name}\ndescription: {description}"),
-                        "Body",
-                    ),
-                )
-                .await;
-            }
-            let skills = discover_skills_test(&project.to_string_lossy(), home.clone()).await;
-            assert_eq!(skills.len(), names.len());
-            for (skill, name) in skills.iter().zip(names) {
-                assert_eq!(skill.name, name);
-                assert_eq!(skill.scope, scope);
-                assert_eq!(skill.description, description);
-                assert_eq!(Path::new(&skill.location), root.join(name).join("SKILL.md"));
-            }
-            assert_eq!(
-                skills,
-                discover_skills_sync(Some(&project), Some(home.clone()))
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn shared_personal_root_refreshes_after_creation_edit_and_removal() {
-        let dir = crate::test_support::test_tempdir("skills-personal-refresh-");
-        let home = dir.path().join("home");
-        let project = dir.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        let workspace = project.to_string_lossy();
-        assert!(discover_skills_test(&workspace, home.clone())
-            .await
-            .is_empty());
-        assert!(!home.exists(), "discovery must not create a missing home");
-
-        let path = write_skill(
-            &home.join(".agents/skills"),
-            "find-skills",
-            &build_skill_content("name: find-skills\ndescription: original", "Body"),
-        )
-        .await;
-        let created = discover_skills_test(&workspace, home.clone()).await;
-        assert_eq!(created.len(), 1);
-        assert_eq!(created[0].description, "original");
-        assert_eq!(created[0].scope, "user");
-
-        std::fs::write(
-            &path,
-            build_skill_content("name: find-skills\ndescription: edited description", "Body"),
-        )
-        .unwrap();
-        let edited = discover_skills_test(&workspace, home.clone()).await;
-        assert_eq!(edited.len(), 1);
-        assert_eq!(edited[0].description, "edited description");
-        std::fs::remove_file(&path).unwrap();
-        assert!(discover_skills_test(&workspace, home.clone())
-            .await
-            .is_empty());
-
-        std::fs::remove_dir_all(home.join(".agents")).unwrap();
-        assert!(discover_skills_test(&workspace, home.clone())
-            .await
-            .is_empty());
-        write_skill(
-            &home.join(".agents/skills"),
-            "ios-device-build",
-            &build_skill_content(
-                "name: ios-device-build\ndescription: recreated root",
-                "Body",
-            ),
-        )
-        .await;
-        let recreated = discover_skills_test(&workspace, home).await;
-        assert_eq!(recreated.len(), 1);
-        assert_eq!(recreated[0].name, "ios-device-build");
+        assert_eq!(asynchronous[0].scope, "user");
     }
 
     #[tokio::test]
@@ -1220,19 +1084,6 @@ mod tests {
             .unwrap()
             .set_len(MAX_SKILL_BYTES + 1)
             .unwrap();
-        for root in [".agents/skills", ".intent/skills"] {
-            let link = home.join(root);
-            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
-            symlink(&external, &link).unwrap();
-            let personal = discover_skills_sync(None, Some(home.clone()));
-            assert_eq!(personal.len(), 1);
-            assert_eq!(personal[0].name, "shared");
-            assert_eq!(personal[0].scope, "user");
-            assert_eq!(
-                Path::new(&personal[0].location),
-                link.join("shared/SKILL.md")
-            );
-        }
         let skills = discover_skills_test(&project.to_string_lossy(), home.clone()).await;
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "shared");

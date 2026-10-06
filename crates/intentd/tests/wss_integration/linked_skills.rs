@@ -436,7 +436,7 @@ async fn wss_linked_skills_byte_budget_counts_invalid_utf8_and_recovers() {
 }
 
 #[intent_test_macros::daemon_test]
-async fn wss_linked_skills_include_shared_personal_but_ignore_native_home_and_config() {
+async fn wss_linked_skills_ignore_native_home_and_config_but_watch_intent_personal() {
     use std::process::Stdio;
     let temp = common::test_tempdir("linked-skills-config-");
     let mut evidence = Vec::new();
@@ -475,13 +475,8 @@ async fn wss_linked_skills_include_shared_personal_but_ignore_native_home_and_co
             "intent-personal-fixture",
             "owned personal root",
         );
-        let shared_skill = home.join(".agents/skills/shared/SKILL.md");
-        write_skill(
-            &shared_skill,
-            "shared-personal-fixture",
-            "shared personal root",
-        );
         for tier in [
+            ".agents",
             ".augment",
             ".codex",
             ".factory",
@@ -554,14 +549,6 @@ async fn wss_linked_skills_include_shared_personal_but_ignore_native_home_and_co
         assert_eq!(
             named(&listed["result"], "intent-personal-fixture")["scope"],
             "user"
-        );
-        assert_eq!(
-            named(&listed["result"], "shared-personal-fixture")["scope"],
-            "user"
-        );
-        assert_eq!(
-            named(&listed["result"], "shared-personal-fixture")["location"],
-            shared_skill.to_string_lossy().as_ref()
         );
         let mut changed = Value::Null;
         if mode != "empty" {
