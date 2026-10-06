@@ -1,0 +1,5 @@
+error[E0599]: no method named `connect_lazy` found for struct `StorePoolOptions` in the current scope
+ --> tests/ui/store_pool_pool_options.rs:2:28
+  |
+2 |     let _ = pool.options().connect_lazy("sqlite::memory:");
+  |                            ^^^^^^^^^^^^ method not found in `StorePoolOptions`

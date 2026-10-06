@@ -282,6 +282,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "async-task"
 version = "4.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1582,6 +1604,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
 name = "globset"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2161,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "intent-acp"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "agent-client-protocol",
  "ctor",
@@ -2187,7 +2215,7 @@ dependencies = [
 
 [[package]]
 name = "intent-context"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "async-trait",
  "ctor",
@@ -2200,7 +2228,7 @@ dependencies = [
 
 [[package]]
 name = "intent-core"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "async-trait",
  "ctor",
@@ -2222,7 +2250,7 @@ dependencies = [
 
 [[package]]
 name = "intent-git"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "git2",
  "intent-core",
@@ -2243,7 +2271,7 @@ dependencies = [
 
 [[package]]
 name = "intent-js"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "rquickjs",
  "serde_json",
@@ -2253,7 +2281,7 @@ dependencies = [
 
 [[package]]
 name = "intent-linear"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "async-trait",
  "intent-core",
@@ -2267,7 +2295,7 @@ dependencies = [
 
 [[package]]
 name = "intent-nodes"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "intent-core",
  "tokio",
@@ -2275,7 +2303,7 @@ dependencies = [
 
 [[package]]
 name = "intent-providers"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "ctor",
  "intent-core",
@@ -2286,7 +2314,7 @@ dependencies = [
 
 [[package]]
 name = "intent-pty"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "intent-core",
  "nix 0.31.3",
@@ -2298,7 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "intent-search"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "globset",
  "grep",
@@ -2311,7 +2339,7 @@ dependencies = [
 
 [[package]]
 name = "intent-sentry"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "async-trait",
  "intent-core",
@@ -2325,7 +2353,7 @@ dependencies = [
 
 [[package]]
 name = "intent-services"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2378,7 +2406,7 @@ dependencies = [
 
 [[package]]
 name = "intent-sourcecontrol"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2403,12 +2431,15 @@ dependencies = [
 
 [[package]]
 name = "intent-store"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
+ "async-stream",
  "base64 0.23.1",
  "flate2",
+ "futures-util",
  "image",
  "intent-core",
+ "nix 0.31.3",
  "rand 0.10.3",
  "serde",
  "serde_json",
@@ -2416,6 +2447,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "trybuild",
  "uuid",
 ]
 
@@ -2429,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "intent-transport"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "base64 0.23.1",
  "ctor",
@@ -2479,7 +2511,7 @@ dependencies = [
 
 [[package]]
 name = "intentd"
-version = "0.10.21"
+version = "0.10.22"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4800,6 +4832,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "target-tuple"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "876fef147edbcbddc8ac5cbbba92c7b86519e314e86638596c09673b2ed01e7f"
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5205,6 +5243,21 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "trybuild"
+version = "1.0.121"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0cabaa10be1917331a313866bd94526343e03c77bcf69144b62b072ad35d47c"
+dependencies = [
+ "glob",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "target-tuple",
+ "termcolor",
+ "toml",
+]
 
 [[package]]
 name = "tungstenite"

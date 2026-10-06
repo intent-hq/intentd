@@ -4266,7 +4266,7 @@ const DELETE_MESSAGE_BATCH_SQL: &str = "DELETE FROM agent_message WHERE rowid IN
 /// writers queued on the pool interleave. Returns the number of non-empty
 /// batches executed.
 pub(crate) async fn delete_in_bounded_batches(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::StorePool,
     sql: &str,
     scope_id: &str,
     batch: i64,
@@ -4573,7 +4573,7 @@ async fn batch_content_cols_and_payload_rows(
 /// still carries a heavy body that was also staged, both land on an existing
 /// key. The 0109 stats UPDATE trigger keeps `conversation_bytes` balanced
 /// across the overwrite. One-shot appends never conflict (fresh message id,
-/// orphans reaped at open), so this is a no-op for them.
+/// orphans reaped at owned daemon startup), so this is a no-op for them.
 const PAYLOAD_UPSERT_SQL: &str = "INSERT INTO agent_message_payload \
      (message_id, agent_id, block_ordinal, kind, encoding, body) \
      VALUES (?,?,?,?,?,?) \
@@ -4968,7 +4968,7 @@ impl Store {
     /// Staged rows are invisible to every read path until the envelope adopts
     /// them; if the turn never finalizes they are deleted by
     /// [`Store::delete_prestaged_agent_message_payloads`] (in-process abort)
-    /// or reaped at [`Store::open`] (daemon died mid-turn).
+    /// or reaped at [`Store::open_for_daemon`] (daemon died mid-turn).
     ///
     /// Extraction + compression of a multi-MB body is CPU-bound and runs on a
     /// blocking thread, mirroring the one-shot append path.
@@ -5060,7 +5060,7 @@ impl Store {
     /// a no-op returning 0 when the owning `agent_message` row exists — a
     /// persisted message's payload rows are only removed by its own delete
     /// cascade. Rows staged by a turn the daemon died in (no chance to call
-    /// this) are reaped at [`Store::open`] instead. Returns the number of
+    /// this) are reaped at [`Store::open_for_daemon`] instead. Returns the number of
     /// rows deleted.
     ///
     /// # Errors
@@ -10802,10 +10802,10 @@ mod tests {
     }
 
     /// Rows pre-staged by a turn the daemon died in (envelope never appended)
-    /// are reaped at the next [`Store::open`]; adopted rows survive and the
+    /// are reaped at the next [`Store::open_for_daemon`]; adopted rows survive and the
     /// 0109 delete trigger rebalances `conversation_bytes`.
     #[tokio::test]
-    async fn prestaged_orphans_reaped_at_open() {
+    async fn prestaged_orphans_reaped_at_owned_startup() {
         use intent_core::now_iso;
 
         let tmp = TempDb::new("test-payload-reap");
@@ -10816,7 +10816,9 @@ mod tests {
             { "type": "tool_result", "toolCallId": "t1", "output": "r".repeat(9 * 1024) }
         );
         {
-            let store = Store::open(&tmp).await.expect("create test store");
+            let store = Store::open_for_daemon(&tmp)
+                .await
+                .expect("create test store");
             store
                 .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
                 .await
@@ -10848,16 +10850,20 @@ mod tests {
                 .await
                 .expect("prestage orphan")
                 .expect("stages");
+            store.close().await;
         }
 
-        let store = Store::open(&tmp).await.expect("reopen");
+        let store = Store::open_for_daemon(&tmp).await.expect("reopen");
         let orphan_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_message_payload WHERE message_id = 'msg-dead-turn'",
         )
         .fetch_one(store.read_pool())
         .await
         .expect("orphan rows");
-        assert_eq!(orphan_rows, 0, "orphaned staged rows reaped at open");
+        assert_eq!(
+            orphan_rows, 0,
+            "orphaned staged rows reaped at owned daemon startup"
+        );
         let survivor_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_message_payload WHERE message_id = 'msg-survivor'",
         )
