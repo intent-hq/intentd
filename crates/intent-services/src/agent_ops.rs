@@ -1335,6 +1335,13 @@ impl RecoverySource {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedMessage {
+    /// Ordered message payloads on a combined retry; legacy aggregate fields
+    /// remain for old clients. Stored in the existing queue JSON payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_groups: Option<Vec<QueuedDeliveryGroup>>,
+    /// Ordered zero-output carry-over, internal and prompt-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepend_delivery_groups: Option<Vec<QueuedDeliveryGroup>>,
     pub id: String,
     /// Turn correlation id (monorepo#1022): stable across terminal-failure
     /// requeues so retries of the same logical turn share one id. Fresh
@@ -1501,6 +1508,12 @@ impl QueuedMessage {
         if !self.turn_id.is_empty() {
             v["turnId"] = Value::String(self.turn_id.clone());
         }
+        if let Some(groups) = &self.delivery_groups {
+            v["deliveryGroups"] = json!(groups
+                .iter()
+                .map(QueuedDeliveryGroup::to_value)
+                .collect::<Vec<_>>());
+        }
         if let Some(blocks) = &self.image_blocks {
             v["imageBlocks"] = blocks.clone();
         }
@@ -1601,9 +1614,55 @@ impl QueuedMessage {
             )
     }
 
+    pub(crate) fn has_attachments(&self) -> bool {
+        [
+            self.image_blocks.as_ref(),
+            self.file_blocks.as_ref(),
+            self.prepend_image_blocks.as_ref(),
+            self.prepend_file_blocks.as_ref(),
+        ]
+        .into_iter()
+        .any(|blocks| {
+            blocks
+                .and_then(Value::as_array)
+                .is_some_and(|a| !a.is_empty())
+        }) || self
+            .delivery_groups
+            .as_ref()
+            .is_some_and(|groups| groups.iter().any(QueuedDeliveryGroup::has_attachments))
+            || self
+                .prepend_delivery_groups
+                .as_ref()
+                .is_some_and(|groups| groups.iter().any(QueuedDeliveryGroup::has_attachments))
+    }
+
+    pub(crate) fn ordered_delivery_groups(&self) -> Vec<QueuedDeliveryGroup> {
+        let mut groups = delivery_prepend_groups(
+            self.prepend_delivery_groups.as_ref(),
+            self.prepend_content.as_ref(),
+            self.prepend_image_blocks.as_ref(),
+            self.prepend_file_blocks.as_ref(),
+            self.delivery_groups.as_deref().unwrap_or_default(),
+        );
+        if let Some(current) = &self.delivery_groups {
+            extend_carry_over_groups(&mut groups, current.clone());
+            return groups;
+        }
+        groups.push(QueuedDeliveryGroup {
+            source_id: Some(self.turn_id.clone()),
+            is_prepend: false,
+            content: self.content.clone(),
+            image_blocks: self.image_blocks.clone(),
+            file_blocks: self.file_blocks.clone(),
+        });
+        groups
+    }
+
     fn can_merge_pending(&self, incoming: &Self) -> bool {
         !self.persisted
             && !incoming.persisted
+            && !self.has_attachments()
+            && !incoming.has_attachments()
             && self.is_human_queue_entry()
             && incoming.is_human_queue_entry()
             && !intent_core::human_author::is_unbound_historical_human(
@@ -1811,12 +1870,111 @@ impl Drop for DrainingGuard {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedPrepend {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_groups: Option<Vec<QueuedDeliveryGroup>>,
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
     pub image_blocks: Option<Value>,
     #[serde(default)]
     pub file_blocks: Option<Value>,
+}
+
+/// Flat, ordered text-plus-attachment payload. No nested groups or ACLs:
+/// the containing queue row retains its existing identity and permissions.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QueuedDeliveryGroup {
+    /// Durable source identity, private to queue persistence and carry-over.
+    /// Legacy groups have no identity; equal payloads never supply one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    /// Internal replay marker; never emitted on the queue wire shape.
+    #[serde(default)]
+    pub is_prepend: bool,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_blocks: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_blocks: Option<Value>,
+}
+
+/// Explicit groups, including Some(empty), are authoritative for modern
+/// retries. A legacy aggregate with unknown provenance stays readable as its
+/// own group; text/attachment equality cannot prove a captured-source mirror.
+pub(crate) fn delivery_prepend_groups(
+    explicit: Option<&Vec<QueuedDeliveryGroup>>,
+    content: Option<&String>,
+    images: Option<&Value>,
+    files: Option<&Value>,
+    _durable: &[QueuedDeliveryGroup],
+) -> Vec<QueuedDeliveryGroup> {
+    if let Some(groups) = explicit {
+        return groups.clone();
+    }
+    if content.is_none() && images.is_none() && files.is_none() {
+        return Vec::new();
+    }
+    vec![QueuedDeliveryGroup {
+        source_id: None,
+        is_prepend: true,
+        content: content.cloned().unwrap_or_default(),
+        image_blocks: images.cloned(),
+        file_blocks: files.cloned(),
+    }]
+}
+
+/// A captured zero-output turn can include the same original prefix already
+/// stored in a retry. Join that shared boundary once, without deduplicating
+/// independent queue entries or repeated messages elsewhere in the turn.
+pub(crate) fn extend_carry_over_groups(
+    older: &mut Vec<QueuedDeliveryGroup>,
+    newer: Vec<QueuedDeliveryGroup>,
+) {
+    let overlap = (1..=older.len().min(newer.len()))
+        .rev()
+        .find(|&n| {
+            older[older.len() - n..]
+                .iter()
+                .zip(&newer[..n])
+                .all(|(a, b)| {
+                    a.source_id
+                        .as_ref()
+                        .is_some_and(|id| !id.is_empty() && b.source_id.as_ref() == Some(id))
+                })
+        })
+        .unwrap_or(0);
+    // A captured source may have been a prepend in the older payload but
+    // is the current retry source here. Keep the current replay marker so
+    // recreated-session history does not suppress its grouped text.
+    let start = older.len() - overlap;
+    for (saved, current) in older[start..].iter_mut().zip(&newer[..overlap]) {
+        saved.is_prepend &= current.is_prepend;
+    }
+    older.extend(newer.into_iter().skip(overlap));
+}
+
+impl QueuedDeliveryGroup {
+    pub(crate) fn to_value(&self) -> Value {
+        let mut value = json!({"content": self.content});
+        if let Some(blocks) = &self.image_blocks {
+            value["imageBlocks"] = blocks.clone();
+        }
+        if let Some(blocks) = &self.file_blocks {
+            value["fileBlocks"] = blocks.clone();
+        }
+        value
+    }
+
+    pub(crate) fn has_attachments(&self) -> bool {
+        [self.image_blocks.as_ref(), self.file_blocks.as_ref()]
+            .into_iter()
+            .any(|blocks| {
+                blocks
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty())
+            })
+    }
 }
 
 /// Collect the `text` of every `type: "text"` content block in a message's
@@ -7430,6 +7588,28 @@ impl Services {
                 let prepended = std::mem::take(&mut queue[position].edit_prepended);
                 if content != queue[position].content {
                     content = format!("{prepended}{content}{appended}");
+                }
+            }
+            if content != queue[position].content {
+                if let Some(groups) = queue[position].delivery_groups.take() {
+                    let mut images = None;
+                    let mut files = None;
+                    for group in queue[position]
+                        .prepend_delivery_groups
+                        .take()
+                        .into_iter()
+                        .flatten()
+                        .chain(groups)
+                    {
+                        images =
+                            crate::agent_manager::merge_block_arrays(images, group.image_blocks);
+                        files = crate::agent_manager::merge_block_arrays(files, group.file_blocks);
+                    }
+                    queue[position].image_blocks = images;
+                    queue[position].file_blocks = files;
+                    queue[position].prepend_content = None;
+                    queue[position].prepend_image_blocks = None;
+                    queue[position].prepend_file_blocks = None;
                 }
             }
             queue[position].content = content;
@@ -15116,6 +15296,8 @@ impl Services {
             return (existing.clone(), position);
         }
         let queued = QueuedMessage {
+            delivery_groups: None,
+            prepend_delivery_groups: prepend.delivery_groups,
             turn_id: id.clone(),
             id,
             content,
@@ -15258,6 +15440,8 @@ impl Services {
             } else {
                 let id = new_message_id();
                 let queued = QueuedMessage {
+                    delivery_groups: None,
+                    prepend_delivery_groups: None,
                     turn_id: id.clone(),
                     id,
                     content,
@@ -17365,6 +17549,7 @@ fn resume_continuation_text(interrupted_at: &str, now: time::OffsetDateTime) -> 
 /// emits them on the recreate branch too (the history XML is text-only).
 pub(crate) struct ResumeTailRecap {
     pub(crate) text: String,
+    pub(crate) delivery_groups: Option<Vec<QueuedDeliveryGroup>>,
     /// Replayed user rows' `image` blocks (persisted shape carries the same
     /// `data`/`mimeType` keys prompt assembly reads; the extra `type` key is
     /// ignored). `None` when the replayed rows had none.
@@ -17378,7 +17563,7 @@ pub(crate) struct ResumeTailRecap {
 /// One replayed tail row, in transcript order.
 enum TailSegment {
     /// A user message the provider never committed.
-    User(String),
+    User(String, Vec<Value>, Vec<Value>),
     /// Partial assistant output flushed by an interruption.
     Partial(String),
 }
@@ -17458,13 +17643,13 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
                     }
                 }
                 if !row_images.is_empty() {
-                    image_rows.push(row_images);
+                    image_rows.push(row_images.clone());
                 }
                 if !row_files.is_empty() {
-                    file_rows.push(row_files);
+                    file_rows.push(row_files.clone());
                 }
-                if !text.is_empty() {
-                    segments.push(TailSegment::User(text));
+                if !text.is_empty() || !row_images.is_empty() || !row_files.is_empty() {
+                    segments.push(TailSegment::User(text, row_images, row_files));
                 }
             }
             // Any other tail shape (e.g. a bare `tool` row) is not the
@@ -17492,10 +17677,11 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     // actually abbreviated; untruncated, unelided recaps are byte-identical
     // to before).
     let mut body = String::new();
+    let mut segment_groups = Vec::new();
     let mut truncated_any = false;
     for segment in &segments {
         let (label, tag, text) = match segment {
-            TailSegment::User(text) => (
+            TailSegment::User(text, _, _) => (
                 "The user's message, delivered before the interruption:",
                 "interrupted_user_message",
                 text,
@@ -17510,11 +17696,22 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
         let (text, truncated_attrs) =
             crate::history_xml::truncate_marked(text, RESUME_RECAP_SEGMENT_MAX_CHARS);
         truncated_any |= !truncated_attrs.is_empty();
-        let _ = write!(
-            body,
+        let rendered = format!(
             "{label}\n<{tag}{truncated_attrs}>\n{}\n</{tag}>\n\n",
             crate::history_xml::escape_xml(&text)
         );
+        body.push_str(&rendered);
+        let (images, files) = match segment {
+            TailSegment::User(_, images, files) => (images.clone(), files.clone()),
+            TailSegment::Partial(_) => (Vec::new(), Vec::new()),
+        };
+        segment_groups.push(QueuedDeliveryGroup {
+            source_id: None,
+            is_prepend: true,
+            content: rendered,
+            image_blocks: (!images.is_empty()).then(|| Value::Array(images)),
+            file_blocks: (!files.is_empty()).then(|| Value::Array(files)),
+        });
     }
     let mut recap = String::from(
         "<supervisor>\nRestart recovery: the harness restarted while you were \
@@ -17528,15 +17725,37 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     if elided > 0 {
         let _ = write!(recap, "({elided} older interrupted segment(s) elided.)\n\n");
     }
+    let mut groups = vec![QueuedDeliveryGroup {
+        source_id: None,
+        is_prepend: true,
+        content: recap.clone(),
+        image_blocks: None,
+        file_blocks: None,
+    }];
+    groups.extend(segment_groups);
     recap.push_str(&body);
+    let mut suffix = String::new();
     if !has_partial {
-        recap.push_str(
+        suffix.push_str(
             "Your response was cut off before any output was produced — \
              treat that request as not yet acted on.\n",
         );
     }
-    recap.push_str("</supervisor>");
+    suffix.push_str("</supervisor>");
+    recap.push_str(&suffix);
+    groups.push(QueuedDeliveryGroup {
+        source_id: None,
+        is_prepend: true,
+        content: suffix,
+        image_blocks: None,
+        file_blocks: None,
+    });
+    let delivery_groups = groups
+        .iter()
+        .any(QueuedDeliveryGroup::has_attachments)
+        .then_some(groups);
     Some(ResumeTailRecap {
+        delivery_groups,
         text: recap,
         image_blocks: (!image_blocks.is_empty()).then(|| Value::Array(image_blocks)),
         file_blocks: (!file_blocks.is_empty()).then(|| Value::Array(file_blocks)),
@@ -18034,6 +18253,7 @@ impl Services {
                 let options = match recap {
                     Some(recap) => crate::agent_manager::TurnOptions {
                         reject_on_shutdown: true,
+                        prepend_delivery_groups: recap.delivery_groups,
                         prepend_content: Some(recap.text),
                         prepend_image_blocks: recap.image_blocks,
                         prepend_file_blocks: recap.file_blocks,
