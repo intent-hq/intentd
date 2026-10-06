@@ -279,6 +279,10 @@ mod tests {
         );
         opts.extra_env
             .insert("CODEX_CONFIG".into(), "{\"unsafe\":true}".into());
+        // This command-shaping test never starts Codex. Pin a local fixture so
+        // an installed host runtime cannot mask a missing test prerequisite.
+        opts.extra_env
+            .insert("CODEX_PATH".into(), bin.to_string_lossy().into_owned());
         let mut command = intent_acp::spawn::build_command(&opts);
         let mut mcp = NormalizedMcpServers::new();
         mcp.insert(

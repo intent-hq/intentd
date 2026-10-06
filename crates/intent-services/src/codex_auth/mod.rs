@@ -746,6 +746,10 @@ pub fn install_wrapper(
     result.map_err(|_| CONTRACT_ERROR.to_string())?;
     Ok(path)
 }
+/// Report that the native authentication bridge needs a Unix daemon host.
+///
+/// # Errors
+/// Always returns the unsupported-host diagnostic without changing credentials.
 #[cfg(not(unix))]
 pub fn install_wrapper(
     _: &Path,
