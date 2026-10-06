@@ -505,6 +505,7 @@ pub(crate) fn map_issue_at_number(value: Value, number: u64) -> Result<Issue> {
 pub(crate) fn map_repo(value: Value) -> Result<Repo> {
     let r: dto::Repo = serde_json::from_value(value)?;
     Ok(Repo {
+        owner_avatar_url: None,
         owner: r.owner.and_then(|o| o.login).unwrap_or_default(),
         name: r.name.unwrap_or_default(),
         url: r.html_url,

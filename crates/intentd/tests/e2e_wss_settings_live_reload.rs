@@ -81,7 +81,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     // Guarantee the config-watcher readiness marker (INFO, target `intentd`)
     // reaches daemon.log even when the caller's RUST_LOG is stricter (e.g.
     // `warn`): append a crate-scoped directive, which EnvFilter resolves in
@@ -100,6 +100,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
     cmd.spawn().expect("spawn intentd serve")
 }
 

@@ -41,6 +41,7 @@ pub use dispatch::{
 };
 mod provenance;
 use provenance::RequestProvenance;
+mod avatars;
 mod creation;
 mod observation;
 mod search;
@@ -557,12 +558,13 @@ fn to_pr(value: Value) -> Result<PullRequest> {
 }
 // Owned callback shared by direct responses and map_page.
 #[expect(clippy::needless_pass_by_value)]
-fn to_repo(value: Value) -> Result<Repo> {
+fn to_repo(instance: &GitlabInstance, value: Value) -> Result<Repo> {
     let path = string(&value, "path_with_namespace")?;
     let (owner, name) = path
         .rsplit_once('/')
         .ok_or_else(|| Error::Decode("GitLab project has no namespace".into()))?;
     Ok(Repo {
+        owner_avatar_url: avatars::owner_avatar(instance, &value, owner),
         owner: owner.into(),
         name: name.into(),
         url: optional(&value, "web_url"),
@@ -821,7 +823,7 @@ impl SourceControl for GitLabSourceControl {
                 page,
             )
             .await?,
-            to_repo,
+            |value| to_repo(self.descriptor.instance(), value),
         )
     }
 
@@ -837,12 +839,15 @@ impl SourceControl for GitLabSourceControl {
                 page,
             )
             .await?,
-            to_repo,
+            |value| to_repo(self.descriptor.instance(), value),
         )
     }
 
     async fn get_repo(&self, owner: &str, name: &str) -> Result<Repo> {
-        to_repo(self.get_project(&RepoRef::new(owner, name)).await?)
+        to_repo(
+            self.descriptor.instance(),
+            self.get_project(&RepoRef::new(owner, name)).await?,
+        )
     }
 
     async fn list_remote_branches(

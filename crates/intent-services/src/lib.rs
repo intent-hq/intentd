@@ -371,6 +371,14 @@ pub(crate) struct CompletionClassifyPark {
     pub(crate) release: tokio::sync::Notify,
 }
 
+/// Provenance retained when a synthetic completion has to defer again.
+#[derive(Clone, Copy)]
+enum InterimIdleProvenance {
+    Live,
+    StaleReport,
+    AdvisoryPending,
+}
+
 /// Retry ownership and watch scope for one child's completion delivery.
 /// Live events cover every watch; deferred startup events cover only restored IDs.
 #[derive(Debug, Default, Clone)]
@@ -700,6 +708,9 @@ pub struct Services {
     /// while a task is live bumps the generation, which the task re-checks
     /// before exiting so a racing failure never loses its retry owner.
     completion_delivery_retries: Arc<Mutex<HashMap<String, CompletionDeliveryRetry>>>,
+    /// One bounded-backoff owner per child deferred by a pending script wake
+    /// or an unreadable outbox. Generations prevent losing a racing deferral.
+    pending_completion_retries: Arc<Mutex<HashMap<AgentId, u64>>>,
     /// Delegation-group ids with an active aggregated-wake retry task.
     completion_group_delivery_retries: Arc<Mutex<HashSet<String>>>,
     /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
@@ -1630,6 +1641,7 @@ impl Services {
             host_exec_runtime: Arc::default(),
             provider_preparation: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
+            pending_completion_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
@@ -6795,6 +6807,7 @@ impl Services {
     pub async fn shutdown_agent_deliveries(&self) {
         self.delivery_tasks.shutdown().await;
         self.completion_delivery_retries.lock().unwrap().clear();
+        self.pending_completion_retries.lock().unwrap().clear();
         self.completion_group_delivery_retries
             .lock()
             .unwrap()
@@ -7515,6 +7528,19 @@ impl Services {
             self.take_interim_skipped_idle(child_id);
             return;
         }
+        // A terminal monitor can still own an undelivered notification, even
+        // though it no longer appears in the active-monitor query below.
+        // Check before consuming provenance OR sealing a delegating group.
+        // Errors also defer: no row/event need exist to trigger recovery.
+        if self
+            .store
+            .script_monitor_pending_for_agent(child_id)
+            .await
+            .unwrap_or(true)
+        {
+            self.schedule_pending_completion_retry(child_id);
+            return;
+        }
         // Idle-visibility deferral: an idle agent still owning active
         // background hooks OR active PR monitors has not settled — leave the
         // marker in place (like the busy guard) so the hook's own terminal
@@ -7661,23 +7687,33 @@ impl Services {
         // Box::pin breaks the async-recursion cycles this edge closes
         // (deliver → redeliver → deliver, and the drain's None-arm path
         // try_drain_queue → redeliver → deliver → wake → try_drain_queue).
-        // No-advisory variant by default: this synthetic pass is non-interim
-        // by construction, but a hook/monitor registered in the
-        // guard→delivery window could re-classify it as monitoring-idle —
+        // Suppress advisories by default: a hook/monitor registered in the
+        // guard→delivery window could re-classify this pass as monitoring-idle —
         // that deferral keeps today's silent skip; only a LIVE idle fires
         // the advisory. EXCEPT when the consumed marker carried
         // advisory-pending provenance (monorepo#1297 busy-slot race): the
         // LIVE idle already qualified for the advisory and was suppressed
         // solely by the busy probe, so this heal pass stands in for it and
-        // runs the advisory-ALLOWED variant — the still-active hooks/monitors
+        // allows advisories — the still-active hooks/monitors
         // re-classify the synthesized idle as monitoring-idle and the owed
         // advisory delivers (once per waiting period, via the persisted
         // marker).
-        let classification = if advisory_pending {
-            Box::pin(self.deliver_completion_to_watches(child_id, &event)).await
+        let provenance = if had_stale_report {
+            InterimIdleProvenance::StaleReport
+        } else if advisory_pending {
+            InterimIdleProvenance::AdvisoryPending
         } else {
-            Box::pin(self.deliver_completion_to_watches_no_advisory(child_id, &event)).await
+            InterimIdleProvenance::Live
         };
+        let classification = Box::pin(self.deliver_completion_to_watches_inner(
+            child_id,
+            &event,
+            advisory_pending,
+            true,
+            None,
+            Some(provenance),
+        ))
+        .await;
         // Real completion: seal the agent's open after_all group and try to
         // fire it, mirroring `handle_completion_event`'s non-queue-interim
         // idle path (monorepo#1281). Gated on the delivery pass's own
@@ -7694,6 +7730,53 @@ impl Services {
             if let Some(gid) = self.seal_group_for_parent(child_id).await {
                 Box::pin(self.try_fire_group(&gid)).await;
             }
+        }
+    }
+
+    /// Retry pending-notification admission off the delivery stack. Settlement
+    /// normally retries immediately through dispatch/worker-exit; this owner
+    /// also heals query errors with no pending row and classify-to-mark races.
+    /// Duplicate requests only bump a generation, never create another worker.
+    fn schedule_pending_completion_retry(&self, child_id: &AgentId) {
+        if self.delivery_tasks.is_closed() {
+            return;
+        }
+        {
+            let mut retries = self.pending_completion_retries.lock().unwrap();
+            let already_owned = retries.contains_key(child_id);
+            let generation = retries.entry(child_id.clone()).or_default();
+            *generation = generation.wrapping_add(1);
+            if already_owned {
+                return;
+            }
+        }
+        let services = self.clone();
+        let child = child_id.clone();
+        let task = self.delivery_tasks.spawn(async move {
+            let mut backoff = std::time::Duration::from_millis(500);
+            loop {
+                tokio::time::sleep(backoff).await;
+                let generation = services.pending_completion_retries.lock().unwrap()[&child];
+                Box::pin(services.redeliver_completion_after_queue_mutation(&child)).await;
+                {
+                    let mut retries = services.pending_completion_retries.lock().unwrap();
+                    if retries.get(&child) == Some(&generation) {
+                        retries.remove(&child);
+                        break;
+                    }
+                }
+                // The guard (or a concurrent pass) deferred again. Keep the
+                // same owner, with bounded polling and constant per-child state.
+                backoff = backoff
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(5));
+            }
+        });
+        if task.is_none() {
+            self.pending_completion_retries
+                .lock()
+                .unwrap()
+                .remove(child_id);
         }
     }
 
@@ -7912,6 +7995,7 @@ impl Services {
                             attempt.watch_ids.is_none(),
                             true,
                             attempt.watch_ids.as_ref(),
+                            None,
                         ))
                         .await
                         .ungrouped_delivery_failed;
@@ -8093,7 +8177,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, true, true, None)
+        self.deliver_completion_to_watches_inner(child_id, event, true, true, None, None)
             .await
     }
 
@@ -8109,24 +8193,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, true, false, None)
-            .await
-    }
-
-    /// [`Services::deliver_completion_to_watches`] with the advisory wake
-    /// suppressed: used by the registration-time / boot reconciliation
-    /// (`agent_subscriptions.rs`) and the synthetic mutation-path redelivery
-    /// (except its advisory-pending heal branch — monorepo#1297 — which runs
-    /// the advisory-allowed variant to stand in for a busy-suppressed LIVE
-    /// idle), whose deferred idles must keep today's silent-skip behavior —
-    /// only a LIVE `agent:idle` may fire the hook-/PR-monitor-waiting
-    /// advisory.
-    pub(crate) async fn deliver_completion_to_watches_no_advisory(
-        &self,
-        child_id: &AgentId,
-        event: &Event,
-    ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, false, true, None)
+        self.deliver_completion_to_watches_inner(child_id, event, true, false, None, None)
             .await
     }
 
@@ -8137,6 +8204,7 @@ impl Services {
         advisory_allowed: bool,
         clear_advisory_markers: bool,
         watch_ids: Option<&HashSet<String>>,
+        synthetic_provenance: Option<InterimIdleProvenance>,
     ) -> CompletionIdleClassification {
         // Queue- and busy-aware completion: an `agent:idle` for a child whose
         // pending message queue still holds ready-to-send entries, OR whose
@@ -8270,7 +8338,20 @@ impl Services {
             // OWED, not cancelled — record the advisory-pending provenance so
             // the worker-exit heal (`redeliver_completion_after_queue_mutation`)
             // runs the advisory-ALLOWED variant and delivers it.
-            if watch_ids.is_some() {
+            // Preserve the consumed marker only while the notification blocks
+            // admission. Once an advisory can deliver, its pending provenance
+            // must clear normally or the tail would keep admitting it again.
+            if let Some(provenance) = synthetic_provenance.filter(|_| pending_script_wake) {
+                match provenance {
+                    InterimIdleProvenance::StaleReport => {
+                        self.mark_interim_skipped_idle_stale_report(child_id);
+                    }
+                    InterimIdleProvenance::AdvisoryPending => {
+                        self.mark_interim_skipped_idle_advisory_pending(child_id);
+                    }
+                    InterimIdleProvenance::Live => self.mark_interim_skipped_idle(child_id),
+                }
+            } else if watch_ids.is_some() {
                 self.mark_interim_skipped_idle_preserving_provenance(child_id);
             } else if advisory_allowed
                 && busy_interim
@@ -9097,9 +9178,9 @@ impl Services {
         // snapshot and the marker landing found no marker and no-op'd —
         // re-check now and hand off to the mutation-path redelivery (its
         // guards make this a no-op unless the queue really emptied and the
-        // agent is idle). The indirect async recursion is depth-1: the
-        // synthetic redelivery's event is non-interim by construction
-        // (queue empty), so its own pass never re-enters here. An
+        // agent is idle). Pending notifications instead hand off to a
+        // coalesced retry owner: an empty queue does not mean their outbox
+        // entry settled, and retrying inline could repeat indefinitely. An
         // agent-waiting-only idle (issue intent-hq/monorepo#1468) is
         // deliberately excluded from THIS re-check — it has no queue-race to
         // heal and an unconditional synthetic pass would re-classify as
@@ -9116,7 +9197,9 @@ impl Services {
         // empty raced-drain arm) together heal it — whichever runs after the
         // slot release observes marker + empty queue + not busy and
         // synthesizes the real completion.
-        if seal_interim && !self.has_ready_to_send(child_id) {
+        if pending_script_wake {
+            self.schedule_pending_completion_retry(child_id);
+        } else if seal_interim && !self.has_ready_to_send(child_id) {
             Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
         }
         // Agent-waiting classify→mark race (issue intent-hq/monorepo#1468):

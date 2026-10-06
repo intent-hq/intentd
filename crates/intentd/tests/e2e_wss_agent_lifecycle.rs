@@ -76,18 +76,16 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn lifecycle_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let secrets_file = data_dir.join("secrets.json");
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
@@ -100,7 +98,14 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.spawn().expect("spawn intentd serve")
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
+    cmd
+}
+
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+    lifecycle_command(data_dir, listen, env)
+        .spawn()
+        .expect("spawn intentd serve")
 }
 
 /// Wait for the daemon's UDS to accept connections, up to the shared
@@ -19548,5 +19553,42 @@ async fn specialist_placeholder_first_message_naming_over_wss() {
             name.unwrap_or("Implementor"),
             "the hint itself never mutates the stored name"
         );
+    }
+}
+
+#[test]
+fn private_stored_identity_contract_survives_overrides_and_restart() {
+    use std::ffi::OsStr;
+    let dir = common::test_tempdir("stored-identity-contract-");
+    let secrets = dir.path().join("secrets.json");
+    let state = r#"{"sourceControl.github.token":"synthetic-repository-token","collaboration.github.token":"synthetic-identity-token"}"#;
+    std::fs::write(&secrets, state).unwrap();
+    for _ in 0..2 {
+        let cmd = lifecycle_command(
+            dir.path(),
+            "both",
+            &[
+                ("GITHUB_TOKEN", "synthetic-host-token"),
+                ("GH_TOKEN", "synthetic-host-token"),
+                ("GH_CONFIG_DIR", "synthetic-host-config"),
+                ("INTENTD_SECRETS_FILE", "synthetic-host-secrets"),
+                ("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:0"),
+            ],
+        );
+        let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+            assert_eq!(environment.get(OsStr::new(key)), Some(&None), "{key}");
+        }
+        for (key, path) in [
+            ("GH_CONFIG_DIR", dir.path().join("gh-config")),
+            ("INTENTD_SECRETS_FILE", secrets.clone()),
+        ] {
+            assert_eq!(
+                environment.get(OsStr::new(key)),
+                Some(&Some(path.as_os_str())),
+                "{key}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&secrets).unwrap(), state);
     }
 }

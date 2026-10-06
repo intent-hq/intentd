@@ -24,6 +24,10 @@ const SESSION_ID = 'mock-session-1';
 // daemon resumes into sees `true`; a fresh `session/new` resets it. Drives the
 // `failPromptIfLoadedRpcError` behavior (monorepo#940 poisoned-session e2e).
 let sessionFromLoad = false;
+// Optional durable provider checkpoint for actual daemon-restart tests. Only
+// completed prompts enter it; unsolicited compaction does not complete a turn.
+let checkpointContext = [];
+const checkpointFile = process.env.MOCK_AGENT_CHECKPOINT_FILE;
 let clientSupportsNotices = false;
 // Optional stateful model selector. Prompts report this accepted state, not
 // the last requested value, so rejected selections expose default-model turns.
@@ -398,7 +402,7 @@ function modelDefaultEffort(behavior) {
 async function handlePrompt(id, params) {
   promptCount += 1;
   // Record every prompt this child receives when MOCK_AGENT_PROMPT_LOG points
-  // at a file — one JSON line per prompt ({ turn, text, blockTypes }) — so
+  // at a file — one JSON line per prompt ({ turn, text, blockTypes, blocks }) — so
   // e2e tests can assert exact outbound prompt assembly (e.g. the
   // FirstTurnPrepend `<system>` block fires on the first turn of a fresh
   // session and never repeats). `blockTypes` lists each prompt content
@@ -416,9 +420,11 @@ async function handlePrompt(id, params) {
           turn: promptCount,
           sessionId: params && params.sessionId,
           loaded: sessionFromLoad,
+          ...(checkpointFile ? { checkpointContext, sessionFromLoad } : {}),
           ...(effectiveModel !== null ? { effectiveModel, effectiveEffort } : {}),
           text: extractPromptText(params),
           blockTypes: blocks.map((b) => (b && typeof b.type === 'string' ? b.type : '')),
+          blocks,
         }) + '\n',
       );
     } catch (err) {
@@ -641,6 +647,11 @@ async function handlePrompt(id, params) {
     behavior.parkIfPromptEndsWith.length > 0 &&
     promptText.trimEnd().endsWith(behavior.parkIfPromptEndsWith)
   ) {
+    // Optional native activity before parking lets restart tests interrupt a
+    // real prompt-owned compaction rather than pre-populating session state.
+    for (const update of behavior.parkedRawUpdates ?? []) {
+      note('session/update', { sessionId: SESSION_ID, update });
+    }
     log('parkIfPromptEndsWith: parking this turn');
     pendingPromptIds.push(id);
     return;
@@ -698,6 +709,11 @@ async function handlePrompt(id, params) {
     while (!fs.existsSync(active.releaseFile)) {
       await new Promise((r) => setTimeout(r, 10));
     }
+  }
+  // A queue-flush rule can fail only the selected batch, after its barrier.
+  // Restart tests boot the same durable queue with the rule removed.
+  if (active !== behavior && active.promptRpcError) {
+    return send({ jsonrpc: '2.0', id, error: active.promptRpcError });
   }
   const toolCalls = Array.isArray(active.toolCalls)
     ? active.toolCalls
@@ -915,6 +931,18 @@ async function handlePrompt(id, params) {
   if (active.promptMeta && typeof active.promptMeta === 'object') {
     payload._meta = active.promptMeta;
   }
+  // Test-owned barrier after real output but before completing the first
+  // prompt, so WSS tests can admit and edit queued input without a timing race.
+  const resultGate = process.env.MOCK_AGENT_PROMPT_RESULT_GATE_FILE;
+  if (resultGate && promptCount === 1) {
+    while (!fs.existsSync(resultGate)) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  if (checkpointFile) {
+    checkpointContext.push({ user: extractPromptText(params), assistant: text });
+    fs.writeFileSync(checkpointFile, JSON.stringify(checkpointContext));
+  }
   result(id, payload);
 }
 
@@ -1007,6 +1035,7 @@ async function dispatch(msg) {
         ? msg.params.mcpServers
         : [];
       sessionFromLoad = false;
+      checkpointContext = [];
       logSessionCall('session/new', SESSION_ID, msg.params && msg.params._meta, msg.params && msg.params.cwd);
       return result(msg.id, { sessionId: SESSION_ID, ...sessionConfigOptions(behavior) });
     }
@@ -1031,6 +1060,9 @@ async function dispatch(msg) {
       if (behavior.loadSession === true || behavior.advertiseLoadSession === true) {
         if (behavior.advertiseLoadSession === true) {
           sessionFromLoad = true;
+          if (checkpointFile) {
+            checkpointContext = JSON.parse(fs.readFileSync(checkpointFile, 'utf8'));
+          }
         }
         return result(msg.id, sessionConfigOptions(behavior));
       }
@@ -1257,6 +1289,7 @@ if (treePidFile) {
 // waking the child on its own (compaction notice, background task output):
 // the daemon must stream the burst as an implicit agent-initiated turn.
 // One-shot per process; the test controls timing by creating the file.
+// MOCK_AGENT_WAKE_JSON=1 interprets each line as a native update object.
 // The literal token `<NEWLINE_ONLY>` on a line emits one chunk whose text is
 // a bare "\n" (the monorepo#3262 incident shape — a whitespace-only wake
 // response); plain whitespace-only lines stay filtered as before.
@@ -1285,7 +1318,9 @@ if (wakeTriggerFile) {
       const text = line === '<NEWLINE_ONLY>' ? '\n' : line;
       note('session/update', {
         sessionId: SESSION_ID,
-        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+        update: process.env.MOCK_AGENT_WAKE_JSON === '1'
+          ? JSON.parse(line)
+          : { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
       });
     }
   }, 25);

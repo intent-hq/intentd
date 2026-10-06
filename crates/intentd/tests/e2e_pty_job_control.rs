@@ -519,14 +519,11 @@ fn spawn_driver(dir: tempfile::TempDir, fixture: &str) -> Harness {
     cmd.env("D", &data_dir);
     cmd.env("FIXTURE", fixture);
     cmd.env("INTENTD_BIN", env!("CARGO_BIN_EXE_intentd"));
-    cmd.env("INTENTD_DATA_DIR", &data_dir);
     cmd.env("INTENTD_WORKSPACES_DIR", &workspaces_dir);
-    cmd.env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"));
     cmd.env("INTENTD_ASSERT_HERMETIC_ROOT", "1");
     cmd.env("INTENTD_AUTH_TOKEN", TOKEN);
-    // serve-spawn: allow — bash -m driver execs $INTENTD_BIN serve in a PTY, so
-    // the shared builder cannot apply; the ephemeral-port seam is set here.
-    cmd.env("INTENTD_TCP_PORT", "0");
+    // serve-spawn: allow — bash -m driver execs the daemon; copy the complete constructor below.
+    common::hermetic_pty_fixture_identity(&mut cmd, &data_dir);
     cmd.env("SHELL", "/bin/bash");
     cmd.env("HOME", &home);
     cmd.env("INTENTD_PTY_CAPTURE_LOG", data_dir.join("capture.log"));

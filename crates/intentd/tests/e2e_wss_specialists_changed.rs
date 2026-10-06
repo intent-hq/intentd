@@ -57,8 +57,8 @@ fn spawn_serve_with_claude_config(
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = common::serve_command();
-    common::hermetic_github_identity(&mut cmd, data_dir);
+    let mut cmd = common::hermetic_serve_command(data_dir);
+
     // gh can resolve enterprise credentials when GH_HOST is inherited.
     cmd.env_remove("GH_HOST")
         .env_remove("GH_ENTERPRISE_TOKEN")
@@ -67,7 +67,6 @@ fn spawn_serve_with_claude_config(
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .stdin(Stdio::null())
         .env("HOME", home_dir)
         .env_remove("CLAUDE_CONFIG_DIR")

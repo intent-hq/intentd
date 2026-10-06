@@ -243,6 +243,7 @@ mod tests {
 
     fn sample_repo() -> Repo {
         Repo {
+            owner_avatar_url: None,
             owner: "octocat".into(),
             name: "hello".into(),
             url: Some("https://github.com/octocat/hello".into()),
