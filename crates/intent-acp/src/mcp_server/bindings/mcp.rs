@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
+use intent_core::{WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
 use super::{map_err, opt_i64, req_str};
@@ -28,24 +28,21 @@ pub(crate) const PRELUDE: &str = r"
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
-    caller_agent_id: Option<&AgentId>,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
-    let caller =
-        caller_agent_id.ok_or("MCP tools require a context-authenticated agent identity")?;
     match method {
         "listServers" => api
-            .mcp_list_servers(Some(ws.clone()), Some(caller.clone()))
+            .mcp_list_servers(Some(ws.clone()))
             .await
             .map_err(map_err),
         "listTools" => {
             let server_id = req_str(args, "serverId")?;
-            api.mcp_list_tools(server_id, Some(ws.clone()), Some(caller.clone()))
+            api.mcp_list_tools(server_id, Some(ws.clone()))
                 .await
                 .map_err(map_err)
         }
-        "callTool" => call_tool(api, ws, Some(caller), args).await,
+        "callTool" => call_tool(api, ws, args).await,
         other => Err(format!("host: unknown method `mcp.{other}`")),
     }
 }
@@ -53,7 +50,6 @@ pub(crate) async fn dispatch(
 async fn call_tool(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
-    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let server_id = req_str(args, "serverId")?;
@@ -77,7 +73,6 @@ async fn call_tool(
         tool_args,
         timeout_ms,
         Some(ws.clone()),
-        caller_agent_id.cloned(),
     )
     .await
     .map_err(map_err)
@@ -94,7 +89,6 @@ mod tests {
     #[derive(Default)]
     struct FakeApi {
         seen_timeouts: Mutex<Vec<Option<u64>>>,
-        seen_callers: Mutex<Vec<Option<AgentId>>>,
     }
 
     impl WorkspaceApi for FakeApi {
@@ -105,10 +99,8 @@ mod tests {
             _args: Value,
             timeout_ms: Option<u64>,
             _workspace_id: Option<WorkspaceId>,
-            caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.seen_timeouts.lock().unwrap().push(timeout_ms);
-            self.seen_callers.lock().unwrap().push(caller_agent_id);
             Box::pin(async move { Ok(json!({ "content": [] })) })
         }
     }
@@ -122,7 +114,7 @@ mod tests {
             args["timeoutMs"] = t;
         }
         let ws = WorkspaceId("ws-test".to_string());
-        call_tool(api, &ws, Some(&AgentId("agent-test".into())), &args).await
+        call_tool(api, &ws, &args).await
     }
 
     #[tokio::test]
@@ -150,40 +142,5 @@ mod tests {
             assert!(err.contains("positive integer"), "{bad}: {err}");
         }
         assert!(fake.seen_timeouts.lock().unwrap().is_empty());
-    }
-    #[tokio::test]
-    async fn missing_caller_cannot_forward_even_with_spoofed_argument() {
-        let fake = Arc::new(FakeApi::default());
-        let api: Arc<dyn WorkspaceApi> = fake.clone();
-        let args = json!({"serverId":"s1", "toolName":"t1", "callerAgentId":"other"});
-        let result = dispatch(
-            &api,
-            &WorkspaceId("ws-test".into()),
-            None,
-            "callTool",
-            &args,
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "agent MCP requires context-authenticated identity"
-        );
-        assert!(fake.seen_timeouts.lock().unwrap().is_empty());
-    }
-    #[tokio::test]
-    async fn trusted_caller_wins_over_spoofed_tool_arguments() {
-        let fake = Arc::new(FakeApi::default());
-        let api: Arc<dyn WorkspaceApi> = fake.clone();
-        let caller = AgentId("hook-owner".into());
-        dispatch(
-            &api,
-            &WorkspaceId("ws-test".into()),
-            Some(&caller),
-            "callTool",
-            &json!({"serverId":"s1","toolName":"t1","callerAgentId":"victim","agentId":"victim"}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(*fake.seen_callers.lock().unwrap(), vec![Some(caller)]);
     }
 }
