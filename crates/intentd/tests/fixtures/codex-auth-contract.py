@@ -47,9 +47,20 @@ class Endpoint(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        self.send_response(404)
-        self.end_headers()
-        self.wfile.write(b'{}')
+        # Exact 0.160.0 account/read routing contract, matching upstream's
+        # app-server/tests/suite/v2/workspace_routing.rs fixtures.
+        if self.path.startswith('/backend-api/wham/accounts/check'):
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'accounts': [
+                {'id': account, 'workspace_backend_origin': 'https://synthetic.invalid',
+                 'account_routing_override': 'NO_CONSTRAINT'}
+                for account in ('synthetic-A', 'synthetic-B')]}).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b'{}')
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
@@ -289,7 +300,7 @@ def main():
             with Probe(seed=auth_seed(token), start=False) as native:
                 # Force a sequential bootstrap refresh. A second independent
                 # Intent worker must read the persisted replacement lineage.
-                state = auth_seed(token)
+                state = auth_seed(jwt(expired=True))
                 state['last_refresh'] = '2000-01-01T00:00:00Z'
                 native.auth.write_text(json.dumps(state))
                 with Probe(bridge=bridge, authority=native) as worker:
@@ -306,7 +317,7 @@ def main():
 
             Endpoint.used.clear()
             with Probe(seed=auth_seed(token), start=False) as native:
-                state = auth_seed(token)
+                state = auth_seed(jwt(expired=True))
                 state['last_refresh'] = '2000-01-01T00:00:00Z'
                 native.auth.write_text(json.dumps(state))
                 failures = []
@@ -329,16 +340,25 @@ def main():
             Endpoint.used.clear()
             Endpoint.barrier = threading.Barrier(2)
             with Probe(seed=auth_seed(token), start=False) as native:
-                state = auth_seed(token)
-                state['last_refresh'] = '2000-01-01T00:00:00Z'
-                native.auth.write_text(json.dumps(state))
                 before = len(Endpoint.posts)
-                with Probe(authority=native) as first, Probe(authority=native) as second:
-                    for process in (first, second):
-                        try:
-                            process.initialize()
-                        except (EOFError, BrokenPipeError):
-                            pass
+                # Initialize the shared native SQLite schema before starting
+                # the second process; the control measures refresh, not schema races.
+                with Probe(authority=native) as first:
+                    first.initialize()
+                    with Probe(authority=native) as second:
+                        second.initialize()
+                        failures = []
+                        def refresh(process):
+                            try:
+                                process.status(True)
+                            except BaseException as error:
+                                failures.append(type(error).__name__)
+                        threads = [threading.Thread(target=refresh, args=(p,))
+                                   for p in (first, second)]
+                        for thread in threads: thread.start()
+                        for thread in threads: thread.join(timeout=10)
+                        assert all(not thread.is_alive() for thread in threads)
+                        assert not failures, failures
                 assert Endpoint.posts[before:].count('/oauth/token') == 2
                 assert len(Endpoint.used) == 1
                 passed('native/native baseline still presents a reused refresh token without Intent locking')

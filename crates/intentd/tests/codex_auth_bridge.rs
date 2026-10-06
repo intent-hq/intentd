@@ -11,9 +11,22 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 struct Client {
+    // raw-child: allow — Tokio kill_on_drop child, with process-group cleanup in Drop.
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
+}
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Some(id) = self.child.id() {
+            if let Ok(pid) = i32::try_from(id) {
+                // The child leads its own group; tear down its helpers on panic.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
 }
 impl Client {
     async fn start(profile: &Path, native: &Path, runtime: &Path) -> Self {
@@ -40,6 +53,7 @@ impl Client {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
+            .process_group(0)
             .spawn()
             .unwrap();
         let input = child.stdin.take().unwrap();

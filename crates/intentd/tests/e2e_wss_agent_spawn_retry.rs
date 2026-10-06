@@ -1319,7 +1319,7 @@ async fn fresh_send_after_failed_session_setup_loads_before_prompt_over_wss() {
     let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
     let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
     let mut rpc = connect_ws(port, cfg.clone()).await;
-    let mut sub = connect_ws(port, cfg).await;
+    let mut sub = connect_ws(port, cfg.clone()).await;
     wss_rpc(
         &mut sub,
         1,
@@ -1344,6 +1344,17 @@ async fn fresh_send_after_failed_session_setup_loads_before_prompt_over_wss() {
     {
         if index == 1 {
             wss_rpc(&mut rpc, 3, "agent.stop", json!({"agentId":agent})).await;
+            // Subscribe after stop's terminal events so they cannot masquerade
+            // as completion of the failed setup turn below.
+            sub.close(None).await.unwrap();
+            sub = connect_ws(port, cfg.clone()).await;
+            wss_rpc(
+                &mut sub,
+                4,
+                "events.subscribe",
+                json!({"eventTypes":["agent:*"],"workspaceId":ws_id}),
+            )
+            .await;
             std::fs::write(&failure_file, "reject setup").unwrap();
         } else if index == 2 {
             std::fs::remove_file(&failure_file).unwrap();
