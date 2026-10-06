@@ -24,6 +24,7 @@ pub(super) struct Authentication {
     #[cfg(unix)]
     owners: std::sync::Mutex<std::collections::BTreeMap<PathBuf, crate::codex_auth::OwnerLease>>,
     native: Option<(PathBuf, PathBuf, PathBuf)>,
+    owner_env: Vec<(OsString, Option<OsString>)>,
     config: Option<String>,
     env: Vec<(&'static str, OsString)>,
     pub secrets: BTreeSet<String>,
@@ -37,7 +38,18 @@ impl Authentication {
         if let Some(context) = &launch.installed {
             context.apply(&mut command);
         }
-        let non_empty = |name| super::effective_env(&command, name).filter(|s| !s.is_empty());
+        let non_empty = |name: &str| {
+            let value = if launch.installed.is_some() {
+                command
+                    .as_std()
+                    .get_envs()
+                    .find(|(key, _)| *key == name)
+                    .and_then(|(_, value)| value.map(std::ffi::OsStr::to_owned))
+            } else {
+                super::effective_env(&command, name)
+            };
+            value.filter(|s| !s.is_empty())
+        };
         let source = non_empty("CODEX_HOME").map(PathBuf::from).or_else(|| {
             non_empty("HOME")
                 .or_else(|| non_empty("USERPROFILE"))
@@ -48,6 +60,11 @@ impl Authentication {
             .filter_map(|key| non_empty(key).map(|value| (key, value)))
             .collect();
         let mut auth = Self::read(None, env).await?;
+        auth.owner_env = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(std::ffi::OsStr::to_owned)))
+            .collect();
         // Native Codex selects the credential backend. A stale or malformed
         // file must not override a valid keyring login; inspect only to redact.
         if let Some(source) = &source {
@@ -153,10 +170,7 @@ impl Authentication {
             {
                 let helper =
                     std::env::current_exe().map_err(|_| CatalogFailure::IsolationFailed)?;
-                let mut context = Command::new(&helper);
-                for (key, value) in &self.env {
-                    context.env(key, value);
-                }
+                let context = self.owner_context(&helper);
                 let owner =
                     crate::codex_auth::start_owner(runtime, native, user_home, &helper, &context)
                         .map_err(|_| CatalogFailure::IsolationFailed)?;
@@ -175,6 +189,22 @@ impl Authentication {
         );
         private_file(&home.path().join("config.toml"), content.as_bytes()).await?;
         Ok(home)
+    }
+
+    pub(super) fn owner_context(&self, helper: &Path) -> Command {
+        let mut context = Command::new(helper);
+        context.env_clear();
+        for (key, value) in &self.owner_env {
+            if let Some(value) = value {
+                context.env(key, value);
+            } else {
+                context.env_remove(key);
+            }
+        }
+        for (key, value) in &self.env {
+            context.env(key, value);
+        }
+        context
     }
 
     pub fn isolate(&self, command: &mut Command, launch: &CodexLaunch, home: &Path) {

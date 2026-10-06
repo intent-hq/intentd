@@ -41,6 +41,8 @@ impl Client {
         .unwrap();
         let mut context = Command::new(runtime);
         context
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
             .env("INTENT_CODEX_NATIVE_XDG_CONFIG_HOME", native.join("config"))
             .env(
                 "INTENT_CODEX_NATIVE_DBUS_SESSION_BUS_ADDRESS",
@@ -334,7 +336,9 @@ async fn managed_storage_rejection_happens_before_worker_bootstrap() {
             &native,
             &native,
             Path::new(env!("CARGO_BIN_EXE_intentd")),
-            &Command::new(&runtime),
+            Command::new(&runtime)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin"),
         )
         .unwrap();
         let output = tokio::time::timeout(

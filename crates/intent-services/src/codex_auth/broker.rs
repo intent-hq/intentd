@@ -23,6 +23,8 @@ impl OwnerLease {
 
 /// Start from the daemon, before the adapter exists. The child is consequently
 /// outside both its process group and its descendant-sweep ownership tree.
+/// `context` must contain the frozen installed-runtime environment; inheritance
+/// is cleared so omitted and explicitly removed values cannot reappear.
 ///
 /// # Errors
 /// Returns a credential-free error if private transport or process setup fails.
@@ -39,6 +41,7 @@ pub fn start_owner(
         .tempdir()
         .map_err(|_| CONTRACT_ERROR.to_owned())?;
     let mut command = Command::new(helper);
+    command.env_clear();
     command.args([
         "provider",
         "codex-auth-owner",
