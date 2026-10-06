@@ -189,7 +189,8 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Protocol 13.0 removes the deprecated git.commit router method.
 // GitLab pre-workspace checkout (13.5): +6 router methods.
 // Provider adapter preparation (13.6): +1 fast-path method.
-const EXPECTED_TOTAL_METHODS: usize = 433;
+// Desktop control adds four router methods; reverse methods are counted separately.
+const EXPECTED_TOTAL_METHODS: usize = 432;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.

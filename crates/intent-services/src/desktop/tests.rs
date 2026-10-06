@@ -750,7 +750,11 @@ async fn permission_nonfailure_wakes_keep_distinct_outcomes() {
                 h.executor.connection.lock().unwrap().connection_epoch = "replacement".into();
             }
             assert_eq!(
-                h.services.desktop_current_state(&h.agent).await,
+                intent_core::with_caller(
+                    Caller::Daemon,
+                    h.services.desktop_current_state(&h.agent),
+                )
+                .await,
                 DesktopState::Inactive
             );
         }

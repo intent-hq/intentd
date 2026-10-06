@@ -328,8 +328,9 @@ const { assertContract, assertGenerated, assertFresh, normalizeCases, hashJson, 
 const read = p => JSON.parse(fs.readFileSync(p, 'utf8'));
 const contract = read(path.join(root, 'contract.json'));
 assertContract(contract);
-const cases = normalizeCases(read(raw));
 const goldenPath = await resolveGoldenPath({fixtureRoot: root, intentdRoot: component});
+if (mode === 'golden-path') { console.log(goldenPath); process.exit(0); }
+const cases = normalizeCases(read(raw));
 if (mode === 'check') {
   const golden = read(goldenPath);
   assertGenerated(contract, golden);
@@ -370,15 +371,24 @@ fn verify(root: &Path, rows: &Path, mode: &str, output: &Path) -> std::process::
         .expect("Node is required to validate the shared transfer-selection contract")
 }
 
+// Use the contract owner's selection for the committed component expectation.
+fn fixture_golden(root: &Path) -> PathBuf {
+    let result = verify(root, Path::new(""), "golden-path", Path::new(""));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    PathBuf::from(String::from_utf8(result.stdout).unwrap().trim())
+}
+
 #[test]
 fn validator_accepts_physical_fixture_aliases() {
     let fixtures = std::fs::canonicalize(fixture_root()).unwrap();
+    let golden = fixture_golden(&fixtures);
     let temporary = test_tempdir("transfer-selection-paths-");
     let rows = temporary.path().join("rows.json");
-    write_json(
-        &rows,
-        &read_json(&fixtures.join("public-sessions.json"))["cases"],
-    );
+    write_json(&rows, &read_json(&golden)["cases"]);
     let alias = temporary.path().join("external alias with spaces");
     std::os::unix::fs::symlink(&fixtures, &alias).unwrap();
     // A lexical sibling must not replace the physical target after alias/..
@@ -405,12 +415,11 @@ fn validator_accepts_physical_fixture_aliases() {
 #[test]
 fn validator_rejects_corrupt_physical_inputs_despite_valid_lexical_sibling() {
     let fixtures = std::fs::canonicalize(fixture_root()).unwrap();
+    let golden = fixture_golden(&fixtures);
+    let golden_name = golden.file_name().unwrap().to_str().unwrap();
     let temporary = test_tempdir("transfer-selection-corrupt-paths-");
     let rows = temporary.path().join("rows.json");
-    write_json(
-        &rows,
-        &read_json(&fixtures.join("public-sessions.json"))["cases"],
-    );
+    write_json(&rows, &read_json(&golden)["cases"]);
     let physical_checkout = temporary.path().join("physical checkout");
     let lexical_checkout = temporary.path().join("lexical checkout");
     let physical = physical_checkout.join("docs/protocol/fixtures/transfer-selection");
@@ -427,7 +436,7 @@ fn validator_rejects_corrupt_physical_inputs_despite_valid_lexical_sibling() {
             checkout.join("scripts/check-transfer-selection-contract.mjs"),
         )
         .unwrap();
-        for file in ["contract.json", "public-sessions.json"] {
+        for file in ["contract.json", golden_name] {
             std::fs::copy(fixtures.join(file), root.join(file)).unwrap();
         }
     }
@@ -444,7 +453,7 @@ fn validator_rejects_corrupt_physical_inputs_despite_valid_lexical_sibling() {
     }
     for (file, diagnostic) in [
         ("contract.json", "contract keys"),
-        ("public-sessions.json", "generated envelope keys"),
+        (golden_name, "generated envelope keys"),
     ] {
         let original = std::fs::read(physical.join(file)).unwrap();
         write_json(&lexical.join(file), &json!({}));
