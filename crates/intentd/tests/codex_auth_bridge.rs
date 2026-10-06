@@ -11,6 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 struct Client {
+    _owner: intent_services::codex_auth::OwnerLease,
     // raw-child: allow — Tokio kill_on_drop child, with process-group cleanup in Drop.
     child: Child,
     input: ChildStdin,
@@ -38,10 +39,26 @@ impl Client {
             Path::new(env!("CARGO_BIN_EXE_intentd")),
         )
         .unwrap();
+        let mut context = Command::new(runtime);
+        context
+            .env("INTENT_CODEX_NATIVE_XDG_CONFIG_HOME", native.join("config"))
+            .env(
+                "INTENT_CODEX_NATIVE_DBUS_SESSION_BUS_ADDRESS",
+                "synthetic-native-bus",
+            );
+        let owner = intent_services::codex_auth::start_owner(
+            runtime,
+            native,
+            native,
+            Path::new(env!("CARGO_BIN_EXE_intentd")),
+            &context,
+        )
+        .unwrap();
         let mut child = Command::new(wrapper)
             .arg("app-server")
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
+            .env("INTENT_CODEX_AUTH_SOCKET", owner.socket())
             .env("HOME", native)
             .env("XDG_CONFIG_HOME", profile)
             .env("INTENT_CODEX_NATIVE_XDG_CONFIG_HOME", native.join("config"))
@@ -59,6 +76,7 @@ impl Client {
         let input = child.stdin.take().unwrap();
         let output = BufReader::new(child.stdout.take().unwrap());
         let mut client = Self {
+            _owner: owner,
             child,
             input,
             output,
@@ -231,12 +249,21 @@ async fn managed_storage_rejection_happens_before_worker_bootstrap() {
             Path::new(env!("CARGO_BIN_EXE_intentd")),
         )
         .unwrap();
+        let owner = intent_services::codex_auth::start_owner(
+            &runtime,
+            &native,
+            &native,
+            Path::new(env!("CARGO_BIN_EXE_intentd")),
+            &Command::new(&runtime),
+        )
+        .unwrap();
         let output = tokio::time::timeout(
             Duration::from_secs(10),
             Command::new(wrapper)
                 .arg("app-server")
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
+                .env("INTENT_CODEX_AUTH_SOCKET", owner.socket())
                 .stdin(Stdio::null())
                 .output(),
         )

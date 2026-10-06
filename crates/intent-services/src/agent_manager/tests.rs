@@ -27989,3 +27989,22 @@ async fn grouped_retry_normalizes_mirrors_and_successive_carry_over() {
         assert_eq!(blocks.iter().filter(|b| b["data"] == data).count(), 1);
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_refresh_owner_survives_runtime_teardown_after_issuer_consumption() {
+    crate::codex_auth::tests::assert_refresh_survives_teardown(|child| async move {
+        let mut handle = mock_handle();
+        {
+            let local = handle.execution.local.as_ref().unwrap();
+            let mut resources = local.resources.lock().unwrap();
+            resources.child_pid = child.id();
+            resources.child = Some(child);
+        }
+        super::RuntimeTeardown::take(&mut handle)
+            .unwrap()
+            .kill_tree()
+            .await;
+    })
+    .await;
+}

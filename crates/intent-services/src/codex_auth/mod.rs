@@ -12,6 +12,11 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+#[cfg(unix)]
+mod broker;
+#[cfg(unix)]
+pub use broker::{run_owner, start_owner, OwnerLease};
+
 pub(crate) const NATIVE_ENV: &[(&str, &str)] = &[
     ("XDG_CONFIG_HOME", "INTENT_CODEX_NATIVE_XDG_CONFIG_HOME"),
     ("XDG_DATA_HOME", "INTENT_CODEX_NATIVE_XDG_DATA_HOME"),
@@ -229,16 +234,33 @@ impl Server {
     }
 }
 
+#[derive(Clone)]
 struct Authority {
     runtime: PathBuf,
     home: PathBuf,
     user_home: PathBuf,
+    socket: Option<PathBuf>,
 }
 impl Authority {
     async fn read(&self, previous: Option<&str>) -> Result<Option<Credentials>> {
-        tokio::time::timeout(TIMEOUT, self.read_inner(previous))
-            .await
-            .map_err(|_| AUTH_ERROR)?
+        #[cfg(unix)]
+        if let Some(socket) = &self.socket {
+            return broker::read(socket, previous).await;
+        }
+        #[cfg(test)]
+        {
+            let authority = self.clone();
+            let previous = previous.map(str::to_owned);
+            let pending = intent_core::spawn_daemon(async move {
+                authority.read_inner(previous.as_deref()).await
+            });
+            tokio::time::timeout(TIMEOUT, pending)
+                .await
+                .map_err(|_| BUSY_ERROR)?
+                .map_err(|_| CONTRACT_ERROR)?
+        }
+        #[cfg(not(test))]
+        Err(CONTRACT_ERROR)
     }
     async fn read_inner(&self, previous: Option<&str>) -> Result<Option<Credentials>> {
         std::fs::create_dir_all(&self.home).map_err(|_| AUTH_ERROR)?;
@@ -278,7 +300,7 @@ impl Authority {
             }
         }
         let mut server = Server::spawn(&mut command)?;
-        let result = tokio::time::timeout(TIMEOUT, async {
+        let result = async {
             server.native_call(1, "initialize", json!({"clientInfo":{"name":"intent-native-auth","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})).await?;
             write_frame(&mut server.input, &json!({"method":"initialized"})).await?;
             let requirements = server.native_call(4, "configRequirements/read", json!({})).await?;
@@ -294,7 +316,7 @@ impl Authority {
             }
             if previous.is_some_and(|old| status["authToken"].as_str() == Some(old)) { return Err(AUTH_ERROR); }
             Credentials::from_status(&status)
-        }).await.unwrap_or(Err(AUTH_ERROR));
+        }.await;
         server.stop().await;
         drop(lock);
         result
@@ -620,6 +642,7 @@ pub async fn run(
     native_home: PathBuf,
     user_home: PathBuf,
     profile: PathBuf,
+    authority_socket: PathBuf,
     args: Vec<String>,
 ) -> std::result::Result<(), String> {
     if args.len() == 1 && matches!(args[0].as_str(), "--version" | "-V") {
@@ -644,6 +667,7 @@ pub async fn run(
         runtime: runtime.clone(),
         home: native_home,
         user_home,
+        socket: Some(authority_socket),
     };
     // Native policy can override session flags. Inspect its resolved requirements
     // before a worker can touch any persisted profile/keyring credential.
@@ -709,7 +733,7 @@ pub fn install_wrapper(
     use std::os::unix::fs::PermissionsExt;
     let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"));
     migrate_credentials(profile, native).map_err(str::to_owned)?;
-    let body = format!("#!/bin/sh\nexec {} provider codex-auth-bridge --runtime {} --native-home {} --user-home {} --profile {} -- \"$@\"\n", quote(helper), quote(runtime), quote(native), quote(user_home), quote(profile));
+    let body = format!("#!/bin/sh\nexec {} provider codex-auth-bridge --runtime {} --native-home {} --user-home {} --profile {} --authority-socket \"$INTENT_CODEX_AUTH_SOCKET\" -- \"$@\"\n", quote(helper), quote(runtime), quote(native), quote(user_home), quote(profile));
     let path = profile.join("codex-native-auth.sh");
     let result = (|| -> std::io::Result<()> {
         let mut file = tempfile::NamedTempFile::new_in(profile)?;
@@ -734,4 +758,4 @@ pub fn install_wrapper(
 }
 
 #[cfg(all(test, unix))]
-mod tests;
+pub(crate) mod tests;

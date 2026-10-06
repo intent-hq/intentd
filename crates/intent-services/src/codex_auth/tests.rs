@@ -30,6 +30,7 @@ impl Fixture {
             runtime: self.runtime.clone(),
             home: self.native.clone(),
             user_home: self.native.clone(),
+            socket: None,
         }
     }
     fn bridge(&self) -> Bridge {
@@ -499,7 +500,7 @@ async fn lock_contention_is_bounded_and_cancellation_releases_authority() {
     assert!(matches!(f.authority().read(None).await, Err(BUSY_ERROR)));
     assert!(start.elapsed() < Duration::from_secs(4));
     drop(lock);
-    std::fs::write(f.native.join("delay"), "30").unwrap();
+    std::fs::write(f.native.join("delay"), "0.5").unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(100), f.authority().read(None))
             .await
@@ -767,4 +768,93 @@ async fn native_authority_frames_remain_bounded() {
     let mut frames = Frames::new(&bytes[..]);
     frames.limit = Some(8);
     assert_eq!(frames.next().await, Err(CONTRACT_ERROR));
+}
+
+pub(crate) async fn assert_refresh_survives_teardown<F, Fut>(teardown: F)
+where
+    F: FnOnce(Child) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let f = Fixture::new();
+    let a = token("account", "user", 1, false);
+    let b = token("account", "user", 2, false);
+    f.login(&a, Some(&b));
+    std::fs::write(f.native.join("delay-refresh"), "8").unwrap();
+    let socket = f._root.path().join("auth.sock");
+    let (lease, lease_read) = tokio::io::duplex(16);
+    let owner = intent_core::spawn_daemon(broker::run_owner_with_lease(
+        f.runtime.clone(),
+        f.native.clone(),
+        f.native.clone(),
+        socket.clone(),
+        lease_read,
+    ));
+    // timing-guard: the socket bind and issuer-consumed marker are explicit
+    // readiness signals; no refresh timing is inferred from a fixed sleep.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !socket.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut adapter = Command::new("python3")
+        .args(["-c", "import json,socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.stdin.buffer.read()); s.recv(65536)"])
+        .arg(&socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn().unwrap();
+    let mut stdin = adapter.stdin.take().unwrap();
+    write_frame(&mut stdin, &json!({"previous":a}))
+        .await
+        .unwrap();
+    drop(stdin);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !f.native.join("refresh-consumed").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let native_pid: u32 = std::fs::read_to_string(f.native.join("requests"))
+        .unwrap()
+        .lines()
+        .next()
+        .map(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["pid"]
+                .as_u64()
+                .unwrap()
+                .try_into()
+                .unwrap()
+        })
+        .unwrap();
+    assert!(!intent_acp::descendant_pids(adapter.id().unwrap())
+        .await
+        .contains(&native_pid.cast_signed()));
+    teardown(adapter).await;
+    drop(lease);
+    tokio::time::timeout(Duration::from_secs(12), owner)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!socket.exists());
+    assert!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(native_pid.cast_signed()), None).is_err()
+    );
+    assert_eq!(f.authority().read(None).await.unwrap().unwrap().token, b);
+    assert_eq!(
+        std::fs::read_to_string(f.native.join("consumed"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(!f.native.join("revoked").exists());
+    let persisted: Value =
+        serde_json::from_slice(&std::fs::read(f.native.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(persisted["refresh_token"], "synthetic-R0-next");
 }

@@ -21,6 +21,8 @@ pub(super) const PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Never Debug/Serialize: native credential values are retained only for redaction.
 #[derive(Default)]
 pub(super) struct Authentication {
+    #[cfg(unix)]
+    owners: std::sync::Mutex<std::collections::BTreeMap<PathBuf, crate::codex_auth::OwnerLease>>,
     native: Option<(PathBuf, PathBuf, PathBuf)>,
     config: Option<String>,
     env: Vec<(&'static str, OsString)>,
@@ -147,6 +149,22 @@ impl Authentication {
                 &std::env::current_exe().map_err(|_| CatalogFailure::IsolationFailed)?,
             )
             .map_err(|_| CatalogFailure::IsolationFailed)?;
+            #[cfg(unix)]
+            {
+                let helper =
+                    std::env::current_exe().map_err(|_| CatalogFailure::IsolationFailed)?;
+                let mut context = Command::new(&helper);
+                for (key, value) in &self.env {
+                    context.env(key, value);
+                }
+                let owner =
+                    crate::codex_auth::start_owner(runtime, native, user_home, &helper, &context)
+                        .map_err(|_| CatalogFailure::IsolationFailed)?;
+                self.owners
+                    .lock()
+                    .map_err(|_| CatalogFailure::IsolationFailed)?
+                    .insert(home.path().to_owned(), owner);
+            }
         }
         // Only the selected routing/auth config; no cached models, MCP or keyring.
         // A package boundary also keeps npm away from ancestor workspaces.
@@ -186,6 +204,12 @@ impl Authentication {
         }
         for (key, value) in &self.env {
             command.env(key, value);
+        }
+        #[cfg(unix)]
+        if let Ok(owners) = self.owners.lock() {
+            if let Some(owner) = owners.get(home) {
+                command.env("INTENT_CODEX_AUTH_SOCKET", owner.socket());
+            }
         }
         if let Some(context) = &launch.installed {
             context.apply_isolated(command);

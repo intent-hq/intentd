@@ -17,6 +17,18 @@ pub(crate) enum ProviderCommand {
         #[arg(long)]
         path: Option<PathBuf>,
     },
+    #[cfg(unix)]
+    #[command(hide = true)]
+    CodexAuthOwner {
+        #[arg(long)]
+        runtime: PathBuf,
+        #[arg(long)]
+        native_home: PathBuf,
+        #[arg(long)]
+        user_home: PathBuf,
+        #[arg(long)]
+        socket: PathBuf,
+    },
     #[command(hide = true)]
     CodexAuthBridge {
         #[arg(long)]
@@ -27,6 +39,8 @@ pub(crate) enum ProviderCommand {
         user_home: PathBuf,
         #[arg(long)]
         profile: PathBuf,
+        #[arg(long)]
+        authority_socket: PathBuf,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -55,6 +69,10 @@ pub(crate) enum ProviderCommand {
 
 impl ProviderCommand {
     pub(crate) fn is_internal_helper(&self) -> bool {
+        #[cfg(unix)]
+        if matches!(self, Self::CodexAuthOwner { .. }) {
+            return true;
+        }
         matches!(
             self,
             Self::CodexAuthBridge { .. }
@@ -67,16 +85,35 @@ impl ProviderCommand {
 
 pub(crate) async fn run(command: ProviderCommand) -> ExitCode {
     let result = match command {
+        #[cfg(unix)]
+        ProviderCommand::CodexAuthOwner {
+            runtime,
+            native_home,
+            user_home,
+            socket,
+        } => {
+            let result =
+                intent_services::codex_auth::run_owner(runtime, native_home, user_home, socket)
+                    .await;
+            std::process::exit(i32::from(result.is_err()));
+        }
         ProviderCommand::CodexAuthBridge {
             runtime,
             native_home,
             user_home,
             profile,
+            authority_socket,
             args,
         } => {
-            let result =
-                intent_services::codex_auth::run(runtime, native_home, user_home, profile, args)
-                    .await;
+            let result = intent_services::codex_auth::run(
+                runtime,
+                native_home,
+                user_home,
+                profile,
+                authority_socket,
+                args,
+            )
+            .await;
             if let Err(error) = &result {
                 eprintln!("{error}");
             }

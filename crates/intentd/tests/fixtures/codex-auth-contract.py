@@ -45,6 +45,8 @@ class Endpoint(http.server.BaseHTTPRequestHandler):
     counter = 1
     lock = threading.Lock()
     barrier = None
+    delay_response = 0
+    consumed = threading.Event()
 
     def log_message(self, *args):
         pass
@@ -82,8 +84,11 @@ class Endpoint(http.server.BaseHTTPRequestHandler):
                     status, result = 400, {'error': {'code':'refresh_token_reused'}}
                 else:
                     cls.used.add(previous)
+                    cls.consumed.set()
                     cls.counter += 1
                     status, result = 200, {'access_token':jwt(serial=cls.counter), 'id_token':jwt(serial=cls.counter), 'refresh_token':'rotated-' + str(cls.counter)}
+        if self.path == '/oauth/token' and status == 200 and cls.delay_response:
+            time.sleep(cls.delay_response)
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.end_headers()
@@ -98,6 +103,7 @@ origin = 'http://127.0.0.1:' + str(endpoint.server_port)
 class Probe:
     def __init__(self, config='', seed=None, strict=True, prefix=(), extra_args=(), diagnostic=False, bridge=None, authority=None, start=True, adapter=None):
         self.adapter = adapter
+        self.owner = None
         self.tmp = tempfile.TemporaryDirectory(prefix='intent-codex-auth-contract-')
         self.home = Path(self.tmp.name)
         self.codex_home = self.home / 'codex'
@@ -125,7 +131,13 @@ class Probe:
             (worker / 'config.toml').write_text((self.codex_home / 'config.toml').read_text())
             native_home = authority.codex_home if authority else self.codex_home
             user_home = authority.home if authority else self.home
-            args = [str(bridge), 'provider', 'codex-auth-bridge', '--runtime', str(binary), '--native-home', str(native_home), '--user-home', str(user_home), '--profile', str(worker), '--', 'app-server']
+            socket = self.home / 'authority.sock'
+            if start:
+                owner_args = [str(bridge), 'provider', 'codex-auth-owner', '--runtime', str(binary),
+                              '--native-home', str(native_home), '--user-home', str(user_home), '--socket', str(socket)]
+                self.owner = subprocess.Popen(owner_args, cwd=self.home, env=env, stdin=subprocess.PIPE,
+                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            args = [str(bridge), 'provider', 'codex-auth-bridge', '--runtime', str(binary), '--native-home', str(native_home), '--user-home', str(user_home), '--profile', str(worker), '--authority-socket', str(socket), '--', 'app-server']
             self.worker_home = worker
             if adapter:
                 wrapper = self.home / 'codex-native-auth.sh'
@@ -160,6 +172,9 @@ class Probe:
         except ProcessLookupError:
             pass
         self.proc.wait(timeout=3)
+        if self.owner is not None:
+            self.owner.stdin.close()
+            self.owner.wait(timeout=20)
         self.tmp.cleanup()
 
     def __enter__(self):
@@ -360,6 +375,32 @@ def main():
                 assert p.status()['authToken'] != jwt(expired=True)
                 assert len(Endpoint.used) == 1
                 passed('expired access token renews through native authority before worker login')
+            # Accepted refresh ownership survives the caller's shorter budget.
+            Endpoint.used.clear()
+            Endpoint.consumed.clear()
+            Endpoint.delay_response = 8
+            with Probe(seed=auth_seed(jwt(expired=True)), start=False) as native:
+                before_revoke = Endpoint.posts.count('/oauth/revoke')
+                with Probe(bridge=bridge, authority=native) as abandoned:
+                    started = time.monotonic()
+                    response = abandoned.call('initialize', {
+                        'clientInfo': {'name': 'slow-refresh', 'version': '1'},
+                        'capabilities': {'experimentalApi': True},
+                    }, timeout=10)
+                    assert Endpoint.consumed.is_set()
+                    assert 'error' in response and 'busy' in response['error']['message']
+                    assert time.monotonic() - started < 9
+                # Closing the lease drained and reaped the owner after persistence.
+                persisted = json.loads(native.auth.read_text())
+                assert persisted['tokens']['refresh_token'].startswith('rotated-')
+                Endpoint.delay_response = 0
+                with Probe(bridge=bridge, authority=native) as retry:
+                    retry.initialize()
+                    assert 'result' in retry.call('account/read', {'refreshToken': False})
+                assert len(Endpoint.used) == 1
+                assert Endpoint.posts.count('/oauth/revoke') == before_revoke
+                passed('slow single-use refresh survives caller timeout and lease closure; fresh retry succeeds')
+            Endpoint.delay_response = 0
             Endpoint.used.clear()
             with Probe(seed=auth_seed(token), start=False) as native:
                 # Force a sequential bootstrap refresh. A second independent

@@ -65,6 +65,9 @@ for line in sys.stdin:
                 continue
             with used.open('a') as file:
                 file.write(refresh + '\n')
+            if (home / 'delay-refresh').exists():
+                (home / 'refresh-consumed').write_text('ready')
+                time.sleep(float((home / 'delay-refresh').read_text()))
             state['authToken'] = state.pop('next')
             state['refresh_token'] += '-next'
             path.write_text(json.dumps(state))

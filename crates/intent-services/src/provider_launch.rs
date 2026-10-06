@@ -94,6 +94,16 @@ pub(crate) fn prepare(
         let wrapper =
             crate::codex_auth::install_wrapper(profile.path(), &runtime, &native, &home, &helper)
                 .map_err(Error::InvalidInput)?;
+        #[cfg(unix)]
+        {
+            let owner = crate::codex_auth::start_owner(&runtime, &native, &home, &helper, command)
+                .map_err(Error::InvalidInput)?;
+            profile.env.insert(
+                "INTENT_CODEX_AUTH_SOCKET".into(),
+                owner.socket().to_string_lossy().into_owned(),
+            );
+            profile.auth_owner = Some(owner);
+        }
         profile
             .env
             .insert("CODEX_PATH".into(), wrapper.to_string_lossy().into_owned());
