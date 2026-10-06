@@ -2,6 +2,60 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.20] - 2026-10-05
+
+### 🐛 Bug Fixes
+
+- Restore personal skills in new and resumed sessions ([#2317](https://github.com/intent-hq/intentd/pull/2317))
+
+
+## [0.10.19] - 2026-10-05
+
+### 🐛 Bug Fixes
+
+- Keep deliberately emptied workspace scripts empty ([#2309](https://github.com/intent-hq/intentd/pull/2309))
+- Make provider MCP and skill configuration daemon-owned ([#2306](https://github.com/intent-hq/intentd/pull/2306))
+
+### 🧪 Testing
+
+- Await provider prompt receipt before WSS interrupt ([#2305](https://github.com/intent-hq/intentd/pull/2305))
+
+
+## [0.10.18] - 2026-10-05
+
+### 🚀 Features
+
+- Add collaborator-facing machine names ([#2304](https://github.com/intent-hq/intentd/pull/2304))
+
+### 🐛 Bug Fixes
+
+- Preserve repository context on unchanged config reload ([#2303](https://github.com/intent-hq/intentd/pull/2303))
+
+
+## [0.10.17] - 2026-10-05
+
+### 🐛 Bug Fixes
+
+- Correlate local CLI replies before completing calls ([#2300](https://github.com/intent-hq/intentd/pull/2300))
+
+### 🧪 Testing
+
+- Preserve routing authority across identity drift ([#2301](https://github.com/intent-hq/intentd/pull/2301))
+
+
+## [0.10.16] - 2026-10-05
+
+### 🚀 Features
+
+- Prepare detected provider adapters before first launch ([#2292](https://github.com/intent-hq/intentd/pull/2292))
+- Back off GitHub checks for idle workspaces ([#2294](https://github.com/intent-hq/intentd/pull/2294))
+
+### 🐛 Bug Fixes
+
+- Resolve transfer consumer fixtures by physical path ([#2296](https://github.com/intent-hq/intentd/pull/2296))
+- Retain native driver startup failure evidence ([#2295](https://github.com/intent-hq/intentd/pull/2295))
+
+
 ## [0.10.15] - 2026-10-05
 
 ### 🚀 Features

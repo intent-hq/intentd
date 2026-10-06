@@ -108,7 +108,7 @@ esac
     path
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
+fn mock_identity_command(data_dir: &Path, env: &[(&str, &str)]) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -118,7 +118,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     )
     .expect("seed config.toml with server.tunnel.enabled");
     common::enable_ws_api(data_dir);
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     // Model an ambient installation with the local protocol fake. Individual
     // fixtures must override this when their oracle requires no tunnel.
     cmd.env("INTENTD_TAILCAT_BIN", write_fake_tailcat(data_dir))
@@ -134,7 +134,20 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
+    if let Some((_, token)) = env.iter().find(|(key, _)| *key == "GITHUB_TOKEN") {
+        assert_eq!(
+            *token, OWNER_TOKEN,
+            "only the fixture-owned owner token is supported"
+        );
+        // fixture-identity: allow — invite owner identity uses OWNER_TOKEN against its local GitHub mock.
+        common::mock_github_token(&mut cmd, data_dir, token);
+    }
+    cmd
+}
+
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
+    GuardedChild::spawn(&mut mock_identity_command(data_dir, env)).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -1959,5 +1972,45 @@ async fn members_list_attaches_the_owner_identity_over_wss() {
         mock.flows.load(Ordering::SeqCst),
         0,
         "the refresh used the stored token, not a device flow"
+    );
+}
+
+#[test]
+fn mock_identity_command_contract_uses_only_owned_credentials() {
+    use std::ffi::OsStr;
+    let dir = temp_data_dir();
+    let cmd = mock_identity_command(
+        dir.path(),
+        &[
+            ("GITHUB_TOKEN", OWNER_TOKEN),
+            ("GH_TOKEN", "synthetic-host-token"),
+            ("GH_CONFIG_DIR", "synthetic-host-config"),
+            ("INTENTD_SECRETS_FILE", "synthetic-host-secrets"),
+            ("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:32123"),
+            ("INTENTD_GITHUB_LOGIN_BASE_URI", "http://127.0.0.1:32123"),
+        ],
+    );
+
+    let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+    assert_eq!(environment.get(OsStr::new("GH_TOKEN")), Some(&None));
+    for (key, path) in [
+        ("GH_CONFIG_DIR", dir.path().join("gh-config")),
+        ("INTENTD_SECRETS_FILE", dir.path().join("secrets.json")),
+    ] {
+        assert_eq!(
+            environment.get(OsStr::new(key)),
+            Some(&Some(path.as_os_str())),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("gh-config"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(
+        environment.get(OsStr::new("GITHUB_TOKEN")),
+        Some(&Some(OsStr::new(OWNER_TOKEN)))
     );
 }

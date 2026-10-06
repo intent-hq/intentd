@@ -1795,3 +1795,94 @@ fn checkout_callback_classifies_only_the_exact_read_picker_endpoints() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn owner_avatar_mapping_reuses_project_list_search_detail_and_pagination_requests() {
+    let f = Fixture::new(|r| {
+        let mut value = project();
+        value["namespace"] = json!({"full_path":"Team/Sub","avatar_url":"uploads/namespace.png"});
+        value["avatar_url"] = json!("https://images.example/project.png");
+        if r.path
+            .starts_with("/fixture/api/v4/projects/Team%2FSub%2FProject")
+        {
+            return reply(200, value);
+        }
+        let mut response = reply(200, json!([value]));
+        if r.path
+            .split_once('?')
+            .is_some_and(|(_, query)| query.split('&').any(|parameter| parameter == "page=1"))
+        {
+            response.headers.push(("x-next-page".into(), "2".into()));
+        }
+        response
+    })
+    .await;
+    let provider = f.provider();
+    let first = provider
+        .list_repos(PageParams {
+            limit: 1,
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    assert!(first.next_cursor.is_some());
+    assert_ne!(
+        first.next_cursor.as_deref(),
+        Some("2"),
+        "the cursor is scope-bound"
+    );
+    let second = provider
+        .list_repos(PageParams {
+            limit: 1,
+            cursor: first.next_cursor.clone(),
+        })
+        .await
+        .unwrap();
+    let found = provider
+        .search_repos(
+            "Team/Sub",
+            PageParams {
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .await
+        .unwrap();
+    let detail = provider.get_repo("Team/Sub", "Project").await.unwrap();
+    for repo in [&first.items[0], &second.items[0], &found.items[0], &detail] {
+        assert_eq!(
+            repo.owner_avatar_url.as_deref(),
+            Some("https://git.example:8443/forge/uploads/namespace.png")
+        );
+        assert_eq!(repo.owner, "Team/Sub");
+        assert_eq!(repo.name, "Project");
+        assert!(serde_json::to_value(repo)
+            .unwrap()
+            .get("ownerAvatarUrl")
+            .is_none());
+    }
+    let requests = f.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "mapping must not request an image, namespace or user"
+    );
+    assert_eq!(f.credentials.calls.lock().unwrap().len(), 4);
+    assert!(requests
+        .iter()
+        .all(|r| r.method == "GET" && r.path.starts_with("/fixture/api/v4/projects")));
+    assert!(
+        requests[0].path.contains("membership=true")
+            && requests[0].path.contains("simple=true")
+            && requests[0].path.contains("per_page=1")
+    );
+    assert!(requests[1].path.contains("page=2"));
+    assert!(
+        requests[2].path.contains("search=Team%2FSub")
+            && requests[2].path.contains("search_namespaces=true")
+    );
+    assert_eq!(
+        requests[3].path,
+        "/fixture/api/v4/projects/Team%2FSub%2FProject"
+    );
+}

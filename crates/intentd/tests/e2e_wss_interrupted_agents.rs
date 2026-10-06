@@ -54,7 +54,7 @@ async fn await_uds(socket: &Path) -> bool {
 }
 
 async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::BufReader;
     let stream = UnixStream::connect(socket).await.expect("connect uds");
     let (read_half, mut write_half) = stream.into_split();
     let mut line = serde_json::to_string(
@@ -64,13 +64,107 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     line.push('\n');
     write_half.write_all(line.as_bytes()).await.unwrap();
     write_half.flush().await.unwrap();
-    let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
-        .await
-        .expect("uds rpc timed out")
-        .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
+    read_uds_response(BufReader::new(read_half), id).await
+}
+
+async fn read_uds_response(mut reader: impl tokio::io::AsyncBufRead + Unpin, id: i64) -> Value {
+    use tokio::io::AsyncBufReadExt;
+
+    timeout(common::rpc_read_timeout(), async {
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            reader.read_line(&mut buf).await.expect("read uds response");
+            let frame: Value = serde_json::from_str(buf.trim_end()).expect("invalid JSON frame");
+            if frame.get("id") == Some(&json!(id)) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("uds rpc timed out")
+}
+
+mod uds_reply_tests {
+    use super::*;
+
+    async fn read_frames(frames: &str) -> Value {
+        let (reader, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(frames.as_bytes()).await.unwrap();
+        drop(peer);
+        read_uds_response(tokio::io::BufReader::new(reader), 13).await
+    }
+
+    #[tokio::test]
+    async fn notification_before_reply() {
+        let reply = read_frames(concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"workspace.repositoryContext.retired\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":13,\"result\":{\"ok\":true,\"stopping\":true}}\n",
+        ))
+        .await;
+        assert_eq!(
+            reply,
+            json!({"jsonrpc":"2.0","id":13,"result":{"ok":true,"stopping":true}})
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_ids_before_reply() {
+        let reply = read_frames(concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":14,\"result\":{\"wrong\":true}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":\"13\",\"result\":{\"wrong\":true}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":13,\"result\":{\"ok\":true}}\n",
+        ))
+        .await;
+        assert_eq!(reply, json!({"jsonrpc":"2.0","id":13,"result":{"ok":true}}));
+    }
+
+    #[tokio::test]
+    async fn notification_before_matching_error() {
+        let reply = read_frames(concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"workspace.repositoryContext.retired\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":13,\"error\":{\"code\":-32603,\"message\":\"failed\"}}\n",
+        ))
+        .await;
+        assert_eq!(
+            reply,
+            json!({"jsonrpc":"2.0","id":13,"error":{"code":-32603,"message":"failed"}})
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "invalid JSON frame")]
+    async fn notification_then_eof_is_not_a_reply() {
+        read_frames("{\"jsonrpc\":\"2.0\",\"method\":\"workspace.repositoryContext.retired\",\"params\":{}}\n").await;
+    }
+
+    #[tokio::test]
+    async fn direct_reply() {
+        assert_eq!(
+            read_frames("{\"jsonrpc\":\"2.0\",\"id\":13,\"result\":{\"ok\":true}}\n").await,
+            json!({"jsonrpc":"2.0","id":13,"result":{"ok":true}}),
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_matching_error() {
+        assert_eq!(
+            read_frames("{\"jsonrpc\":\"2.0\",\"id\":13,\"error\":{\"code\":-32603,\"message\":\"failed\"}}\n").await,
+            json!({"jsonrpc":"2.0","id":13,"error":{"code":-32603,"message":"failed"}}),
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "invalid JSON frame")]
+    async fn eof_is_not_a_reply() {
+        read_frames("").await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "invalid JSON frame")]
+    async fn malformed_frame_is_not_skipped() {
+        read_frames("not JSON\n{\"jsonrpc\":\"2.0\",\"id\":13,\"result\":{\"ok\":true}}\n").await;
+    }
 }
 
 #[derive(Debug)]
@@ -233,7 +327,7 @@ async fn interrupted_agents_persisted_across_restart() {
     // Pin resumeInterruptedOnStart=off: this suite asserts pending rows
     // survive a restart, but the `auto` default resumes on headless hosts.
     common::disable_resume_on_start(&data_dir);
-    let mut cmd1 = common::serve_command();
+    let mut cmd1 = common::hermetic_serve_command(&data_dir);
     cmd1.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -331,7 +425,7 @@ async fn interrupted_agents_persisted_across_restart() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd2 = common::serve_command();
+    let mut cmd2 = common::hermetic_serve_command(&data_dir);
     cmd2.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -382,7 +476,7 @@ async fn interrupted_agents_persisted_across_restart() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd3 = common::serve_command();
+    let mut cmd3 = common::hermetic_serve_command(&data_dir);
     cmd3.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -463,13 +557,12 @@ async fn assert_blocked_exec_stream_shutdown(eof: bool) {
     let log_path = data.join("daemon.log");
     let pid_path = data.join("stream.pid");
     common::enable_ws_api(data);
-    let mut command = common::serve_command();
+    let mut command = common::hermetic_serve_command(data);
     command
         .env("INTENTD_DATA_DIR", data)
         .env("INTENTD_WORKSPACES_DIR", data.join("workspaces"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_SECRETS_FILE", data.join("secrets.json"))
         .env("INTENTD_TEST_EXEC_STREAM_WRITE_PENDING", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&log_path).unwrap()));
@@ -626,7 +719,7 @@ async fn cancelled_settings_hook_joins_before_main_listener_teardown() {
     let responses = tokio::net::UnixListener::bind(&response_path).unwrap();
     let starts = tokio::net::UnixListener::bind(&start_path).unwrap();
     let log_path = data.join("daemon.log");
-    let mut command = common::serve_command();
+    let mut command = common::hermetic_serve_command(data);
     command
         .env("INTENTD_DATA_DIR", data)
         .env("INTENTD_WORKSPACES_DIR", data.join("workspaces"))
@@ -754,10 +847,9 @@ await import({});
     .unwrap();
     let config = json!({"id":"shutdown-held","transport":"stdio","command":"node","args":[wrapper],"env":{"MOCK_MCP_START_GATE":start_path,"INTENTD_SECRETS_FILE":data.join("secrets.json")},"enabled":false});
     let log_path = data.join("daemon.log");
-    let mut command = common::serve_command();
+    let mut command = common::hermetic_serve_command(data);
     command
         .env("INTENTD_DATA_DIR", data)
-        .env("INTENTD_SECRETS_FILE", data.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", data.join("workspaces"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -895,7 +987,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     // Pin resumeInterruptedOnStart=off: this suite asserts the captured row
     // is still pending after restart, but `auto` resumes on headless hosts.
     common::disable_resume_on_start(&data_dir);
-    let mut cmd1 = common::serve_command();
+    let mut cmd1 = common::hermetic_serve_command(&data_dir);
     cmd1.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
@@ -1032,10 +1124,21 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     // Now trigger graceful shutdown via system.shutdown RPC over UDS (system.*
     // is UDS-only; see PROTOCOL §5.7).
     let shutdown_result = uds_rpc(&socket, 13, "system.shutdown", json!({})).await;
-    assert_eq!(shutdown_result["result"].get("ok"), Some(&json!(true)));
+    let reply_shape = format!(
+        "shutdown reply: numeric_id={:?}, result_object={}, error_object={}",
+        shutdown_result.get("id").and_then(Value::as_i64),
+        shutdown_result["result"].is_object(),
+        shutdown_result["error"].is_object(),
+    );
+    assert_eq!(
+        shutdown_result["result"].get("ok"),
+        Some(&json!(true)),
+        "{reply_shape}"
+    );
     assert_eq!(
         shutdown_result["result"].get("stopping"),
-        Some(&json!(true))
+        Some(&json!(true)),
+        "{reply_shape}"
     );
 
     // Wait for daemon to exit gracefully (up to 10 seconds).
@@ -1116,7 +1219,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd2 = common::serve_command();
+    let mut cmd2 = common::hermetic_serve_command(&data_dir);
     cmd2.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")

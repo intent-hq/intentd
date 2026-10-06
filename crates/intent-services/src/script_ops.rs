@@ -243,6 +243,8 @@ pub(crate) struct SupervisePark {
 /// grouped so the manager constructor stays within arity limits.
 #[derive(Clone, Default)]
 pub(crate) struct ScriptParks {
+    /// Parks a first-use list before its atomic bootstrap claim.
+    pub(crate) bootstrap_persist: Option<Arc<SupervisePark>>,
     pub(crate) monitor_clock: Option<Arc<std::sync::atomic::AtomicI64>>,
     /// Parks before process admission; cancellation must prevent the spawn.
     pub(crate) before_spawn: Option<Arc<SupervisePark>>,
@@ -421,6 +423,18 @@ impl ScriptManager {
                 .is_some_and(|actual| actual != workspace_id)
         {
             return Err(Error::NotFound(format!("script {id}")));
+        }
+
+        // Reject invalid syntax before persisting or stopping a predecessor.
+        // Keep resolve_cwd's launch-time check for legacy stored definitions.
+        if params
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| !is_safe_relative(cwd))
+        {
+            return Err(Error::InvalidParams(
+                "cwd must be workspace-relative; absolute paths and '..' components are unsupported. Use '.' or omit cwd for the workspace root.".into(),
+            ));
         }
 
         // Upsert of an existing id (`ws.script.create` with `scriptId`):
@@ -769,8 +783,8 @@ impl ScriptManager {
     }
 
     /// `script.list`: the workspace's scripts with merged runtime state.
-    /// When empty, bootstrap from repo config `scripts[]` (FE parity:
-    /// scripts.ipc.ts L291-320).
+    /// Bootstrap repo config `scripts[]` only for a workspace that has never
+    /// held script definitions. An intentionally emptied workspace stays empty.
     pub(crate) async fn list(&self, workspace_id: &WorkspaceId) -> Result<Value> {
         self.list_filtered(workspace_id, intent_core::ScriptArchiveFilter::All)
             .await
@@ -787,7 +801,7 @@ impl ScriptManager {
             intent_core::ScriptArchiveFilter::Archived => m.def.archived_at.is_some(),
         };
         // Filter the existing registry before serializing full definitions.
-        // Bootstrap eligibility still uses unfiltered workspace membership.
+        // Nonempty registries need no initialization read, even if filtered empty.
         {
             let guard = self.scripts.lock().unwrap();
             let mut scripts: Vec<(String, Value)> = guard
@@ -805,7 +819,7 @@ impl ScriptManager {
             }
         } // guard dropped here
 
-        // Bootstrap from repo config if workspace has no scripts.
+        // Check durable initialization before bootstrapping an empty workspace.
         // Use a per-workspace async lock to prevent concurrent bootstrap attempts
         // from creating duplicate script rows (modeled after intent-git::WorktreeLocks).
         self.locks
@@ -831,6 +845,17 @@ impl ScriptManager {
                         return Ok(json!({ "scripts": scripts }));
                     }
                 } // guard dropped here
+
+                // Membership alone cannot distinguish a new workspace from a purge.
+                // The store marks initialization atomically with script insertion,
+                // so this also fences reseeding while removal is tearing down runtime.
+                if self
+                    .store
+                    .workspace_scripts_initialized(workspace_id)
+                    .await?
+                {
+                    return Ok(json!({ "scripts": [] }));
+                }
 
                 // Now safe to bootstrap
                 if let Ok(ws) = self.store.get_workspace(workspace_id).await {
@@ -885,7 +910,16 @@ impl ScriptManager {
                             // Persist in one batched upsert — one INSERT per
                             // script here tripped the per-dispatch statement
                             // budget (intent-hq/monorepo#1778) — then register.
-                            self.store.upsert_scripts(&scripts).await?;
+                            if let Some(park) = &self.parks.bootstrap_persist {
+                                park.entered.notify_one();
+                                park.release.notified().await;
+                            }
+                            let scripts =
+                                if self.store.bootstrap_scripts(workspace_id, &scripts).await? {
+                                    scripts
+                                } else {
+                                    Vec::new()
+                                };
                             for script in scripts {
                                 let id = script.id.clone();
                                 let lock = self.locks.definition_lock(&id);
@@ -2674,6 +2708,8 @@ fn script_event(workspace_id: &WorkspaceId, event_type: &str, data: Value) -> Ne
 
 #[cfg(test)]
 mod tests {
+    include!("script_ops/cwd_tests.rs");
+    include!("script_ops/bootstrap_tests.rs");
     include!("script_ops/lifecycle_tests.rs");
     include!("script_ops/retirement_tests.rs");
     include!("script_ops/monitor_tests.rs");
@@ -3165,7 +3201,7 @@ mod tests {
         services: Services,
         bus: EventBus,
         ws: WorkspaceId,
-        _worktree: Option<WorktreeDir>,
+        worktree: Option<WorktreeDir>,
     }
 
     /// Reap every PTY the test started, on normal and panicking unwinds
@@ -3205,7 +3241,7 @@ mod tests {
             services,
             bus,
             ws,
-            _worktree: worktree,
+            worktree,
         }
     }
 
@@ -3841,7 +3877,7 @@ mod tests {
         // Exercise both cwd validation and PTY spawn failure, before a process runs.
         for spawn_failure in [false, true] {
             let mut h = harness_with_worktree(true).await;
-            let id = create(
+            let id = seed_legacy_script(
                 &h,
                 ScriptCreateParams {
                     name: "auto-start".into(),
@@ -4286,7 +4322,7 @@ mod tests {
     #[intent_test_macros::daemon_test]
     async fn failed_relaunch_of_lost_command_clears_marker() {
         let h = harness_with_worktree(true).await;
-        let id = create(
+        let id = hydrate_legacy_script(
             &h,
             ScriptCreateParams {
                 name: "cmd".into(),
@@ -4359,7 +4395,7 @@ mod tests {
     #[intent_test_macros::daemon_test]
     async fn failed_relaunch_of_marked_service_keeps_marker() {
         let h = harness_with_worktree(true).await;
-        let id = create(
+        let id = hydrate_legacy_script(
             &h,
             ScriptCreateParams {
                 name: "svc".into(),
@@ -4884,7 +4920,7 @@ mod tests {
     async fn script_start_spawn_failure_surfaces_exited_not_idle() {
         let h = harness_with_worktree(true).await;
         let mut sub = subscribe(&h);
-        let id = create(
+        let id = hydrate_legacy_script(
             &h,
             ScriptCreateParams {
                 name: "bad-cwd".into(),
@@ -4980,7 +5016,7 @@ mod tests {
             "no error on a real code: {ev}"
         );
 
-        let failed = create(
+        let failed = hydrate_legacy_script(
             &h,
             ScriptCreateParams {
                 name: "spawn-failure".into(),
@@ -6183,7 +6219,7 @@ mod tests {
     #[intent_test_macros::daemon_test]
     async fn script_run_cwd_failure_resets_reservation_via_fail() {
         let h = harness_with_worktree(true).await;
-        let id = create(
+        let id = hydrate_legacy_script(
             &h,
             ScriptCreateParams {
                 name: "bad-cwd".into(),
@@ -6925,7 +6961,7 @@ mod tests {
     async fn supervise_records_cwd_escape_error_via_fail_path() {
         let h = harness_with_worktree(true).await;
         let mut sub = subscribe(&h);
-        let id = create(
+        let id = hydrate_legacy_script(
             &h,
             ScriptCreateParams {
                 name: "bad-cwd".into(),

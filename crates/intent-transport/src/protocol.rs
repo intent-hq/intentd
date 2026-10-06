@@ -734,6 +734,8 @@ use std::time::{Duration, Instant};
 // private checkout. Clients require gitlabCheckout: 1 before using it.
 // Version 13.6 adds best-effort host.prepareProviderAdapters. Acknowledgement
 // promises admission only; clients tolerate -32601 on older daemons.
+// Version 13.7 adds capability-gated checkout owner-avatar opt-in.
+// Numeric versions do not replace the original connection capability.
 // Version 13.8 reserves revision-safe note operations. The numeric version
 // does not advertise completeness: clients still require notePaging: 1, which
 // remains absent until writes, staged operations and bounded subscriptions pass.

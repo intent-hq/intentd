@@ -228,10 +228,13 @@ pub mod prepared_source_bootstrap;
 pub mod presence;
 mod primitive_ops;
 mod principal_ops;
+pub mod project_mcp;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
+mod provider_launch;
 pub mod provider_models;
 mod provider_preparation;
+pub mod provider_profiles;
 pub mod provider_test_prompt;
 mod rate_limit;
 pub mod repo_config;
@@ -827,6 +830,7 @@ pub struct Services {
     /// keeps the strong `Arc<AgentManager>` for the daemon's lifetime. `None`
     /// until attached, so read-only/test wiring keeps the store-only behavior.
     agent_manager: Arc<OnceLock<Weak<AgentManager>>>,
+    provider_policy: Arc<Mutex<HashMap<String, Vec<provider_profiles::PolicySource>>>>,
     /// Active forge for the `pr.*` methods (§7). `None` until wired by the
     /// composition root or a test; when unset, the `pr.*` handlers build the
     /// provider from default settings (token from env / `gh` / keychain).
@@ -1659,6 +1663,7 @@ impl Services {
             completion_deliveries_in_flight: Arc::new(Mutex::new(HashMap::new())),
             dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
+            provider_policy: Arc::new(Mutex::new(HashMap::new())),
             source_control: None,
             linear_engine: None,
             sentry_engine: None,
@@ -18037,6 +18042,10 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn provider_configuration_preflight(&self, provider: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move { self.validate_provider_configuration(&provider) })
+    }
+
     fn prepare_provider_adapters(&self, provider_ids: Vec<String>) {
         self.provider_preparation
             .enqueue(provider_ids, self.effective_settings());
@@ -18908,13 +18917,18 @@ impl WorkspaceApi for Services {
     fn mcp_list_servers(
         &self,
         workspace_id: Option<WorkspaceId>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_host_execution("mcp.listServers").await?;
             if let Some(ws) = workspace_id.as_ref() {
                 self.require_member(ws).await?;
             }
+            let policy = self
+                .mcp_caller_policy(workspace_id.as_ref(), caller_agent_id.as_ref())
+                .await?;
             self.mcp_servers_service()
+                .with_agent_policy(policy)
                 .agent_list_servers(workspace_id.as_ref().map(WorkspaceId::as_str))
                 .await
         })
@@ -18924,13 +18938,18 @@ impl WorkspaceApi for Services {
         &self,
         server_id: String,
         workspace_id: Option<WorkspaceId>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_host_execution("mcp.listTools").await?;
             if let Some(ws) = workspace_id.as_ref() {
                 self.require_member(ws).await?;
             }
+            let policy = self
+                .mcp_caller_policy(workspace_id.as_ref(), caller_agent_id.as_ref())
+                .await?;
             self.mcp_servers_service()
+                .with_agent_policy(policy)
                 .agent_list_tools(workspace_id.as_ref().map(WorkspaceId::as_str), &server_id)
                 .await
         })
@@ -18943,13 +18962,18 @@ impl WorkspaceApi for Services {
         args: serde_json::Value,
         timeout_ms: Option<u64>,
         workspace_id: Option<WorkspaceId>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_host_execution("mcp.callTool").await?;
             if let Some(ws) = workspace_id.as_ref() {
                 self.require_member(ws).await?;
             }
+            let policy = self
+                .mcp_caller_policy(workspace_id.as_ref(), caller_agent_id.as_ref())
+                .await?;
             self.mcp_servers_service()
+                .with_agent_policy(policy)
                 .agent_call_tool(
                     workspace_id.as_ref().map(WorkspaceId::as_str),
                     &server_id,

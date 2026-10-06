@@ -270,7 +270,7 @@ API:
   ws.event.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Removes one event subscription.
 
   ws.script.list({ archive? }?) → [scripts]  // Lists active scripts. Archive is active, archived or all. Retained IDs remain available to status/output.
-  ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId?, purpose? }) → { id }  // Creates or replaces a script. New commands default to oneOff; services default to saved. Omitted purpose on an existing scriptId preserves its stored purpose. Set purpose: "saved" for reusable commands (required with autoStart). oneOff requires command mode and no autoStart: all settled outcomes retire to history with lastRun; saved commands/services stay active. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
+  ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId?, purpose? }) → { id }  // Creates or replaces a script. `cwd` must be workspace-relative: omit it or use `.` for the workspace root; absolute paths and `..` components are rejected before replacing an existing definition. New commands default to oneOff; services default to saved. Omitted purpose on an existing scriptId preserves its stored purpose. Set purpose: "saved" for reusable commands (required with autoStart). oneOff requires command mode and no autoStart: all settled outcomes retire to history with lastRun; saved commands/services stay active. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
   ws.script.archive(scriptIds) → { archived, skipped }  // Archives inactive commands. Select 1–1000 IDs; never stops a process.
   ws.script.restore(scriptIds) → { restored, skipped }  // Restores scripts. Does not start processes.
     Example: `const { id } = await ws.script.create("Check", "make check", "command"); await ws.script.start(id);` Then follow the completion guidance under `ws.script.status(id)` and read `ws.script.output(id)`. Inspect outcomes with `ws.script.list({ archive: "archived" })`; output remains transient across daemon restart.
@@ -542,7 +542,7 @@ API:
   ws.event.unsubscribe(subscriptionId) → { ok, subscriptionId }  // Removes one event subscription.
 
   ws.script.list({ archive? }?) → [scripts]  // Lists active scripts. Archive is active, archived or all. Retained IDs remain available to status/output.
-  ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId?, purpose? }) → { id }  // Creates or replaces a script. New commands default to oneOff; services default to saved. Omitted purpose on an existing scriptId preserves its stored purpose. Set purpose: "saved" for reusable commands (required with autoStart). oneOff requires command mode and no autoStart: all settled outcomes retire to history with lastRun; saved commands/services stay active. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
+  ws.script.create(name, command, mode, { cwd?, env?, category?, autoStart?, scriptId?, purpose? }) → { id }  // Creates or replaces a script. `cwd` must be workspace-relative: omit it or use `.` for the workspace root; absolute paths and `..` components are rejected before replacing an existing definition. New commands default to oneOff; services default to saved. Omitted purpose on an existing scriptId preserves its stored purpose. Set purpose: "saved" for reusable commands (required with autoStart). oneOff requires command mode and no autoStart: all settled outcomes retire to history with lastRun; saved commands/services stay active. `mode="service"` is for long-running auto-restart processes; `mode="command"` runs once to completion.
   ws.script.archive(scriptIds) → { archived, skipped }  // Archives inactive commands. Select 1–1000 IDs; never stops a process.
   ws.script.restore(scriptIds) → { restored, skipped }  // Restores scripts. Does not start processes.
     Example: `const { id } = await ws.script.create("Check", "make check", "command"); await ws.script.start(id);` Then follow the completion guidance under `ws.script.status(id)` and read `ws.script.output(id)`. Inspect outcomes with `ws.script.list({ archive: "archived" })`; output remains transient across daemon restart.
@@ -2427,6 +2427,26 @@ mod tests {
             }),
             (&["ws.mcp."], |f| f.mcp_tools = false),
         ]
+    }
+
+    #[test]
+    fn script_create_help_explains_cwd_containment() {
+        for desc in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            let line = desc
+                .lines()
+                .find(|line| line.contains("ws.script.create(name,"))
+                .unwrap();
+            for guidance in [
+                "workspace-relative",
+                "absolute paths",
+                "..",
+                "omit",
+                "`.`",
+                "before replacing",
+            ] {
+                assert!(line.contains(guidance), "missing {guidance:?}: {line}");
+            }
+        }
     }
 
     // Every gate is open by default.

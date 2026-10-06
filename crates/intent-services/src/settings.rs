@@ -1969,6 +1969,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(100_000.0),
             256.0,
         ),
+        string(
+            "sharing.machineName",
+            "Shared machine name",
+            "Name shown to collaborators; empty uses the OS machine name",
+            "sharing",
+            Some(""),
+        ),
         number(
             "sharing.maxGuestsPerWorkspace",
             "Max guests per workspace",
@@ -3365,6 +3372,15 @@ impl<'a> SettingsService<'a> {
                 return Err(Error::InvalidParams(format!("{path} is read-only")));
             }
             def.validate(&value)?;
+            let value = if path == "sharing.machineName" {
+                let name = value.as_str().expect("string validated above");
+                json!(
+                    intent_core::settings_file::SharingSettings::normalize_machine_name(name)
+                        .map_err(|error| Error::InvalidParams(error.to_string()))?
+                )
+            } else {
+                value
+            };
             validate_bare_model_id(path, &value)?;
             planned.push((def, value));
         }

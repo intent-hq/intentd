@@ -31,13 +31,20 @@ where
 
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
-    if n == 0 {
-        anyhow::bail!("daemon closed the connection without responding");
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            anyhow::bail!("daemon closed the connection without responding");
+        }
+        let response: Value = serde_json::from_str(line.trim())
+            .map_err(|e| anyhow::anyhow!("invalid response from daemon: {e}"))?;
+        // Listener shutdown can publish retirement notifications before the
+        // control reply. Only this request's response completes the call.
+        if response.get("id") == request.get("id") {
+            return Ok(response);
+        }
     }
-    let response: Value = serde_json::from_str(line.trim())
-        .map_err(|e| anyhow::anyhow!("invalid response from daemon: {e}"))?;
-    Ok(response)
 }
 
 /// Connect to the daemon socket, send one request, and return the parsed
@@ -85,4 +92,101 @@ pub async fn rpc_call(socket: &Path, method: &str, params: Value) -> anyhow::Res
 #[cfg(not(any(unix, windows)))]
 pub async fn rpc_call(_socket: &Path, _method: &str, _params: Value) -> anyhow::Result<Value> {
     anyhow::bail!("local IPC transport is not supported on this platform")
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod tests {
+    use super::exchange;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    async fn exchange_with_frames(frames: &str) -> anyhow::Result<Value> {
+        let (client, server) = tokio::io::duplex(4096);
+        let peer = async {
+            let mut server = BufReader::new(server);
+            let mut request = String::new();
+            server.read_line(&mut request).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&request).unwrap(),
+                json!({"jsonrpc": "2.0", "id": 1, "method": "system.shutdown", "params": {}})
+            );
+            server.get_mut().write_all(frames.as_bytes()).await.unwrap();
+        };
+        let (response, ()) = tokio::join!(exchange(client, "system.shutdown", json!({})), peer);
+        response
+    }
+
+    #[tokio::test]
+    async fn shutdown_response_survives_preceding_retirement_notifications() {
+        let response = exchange_with_frames(concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"workspace.repositoryContext.retired\",\"params\":{\"terminal\":true}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"workspace.repositorySelection.retired\",\"params\":{\"terminal\":true}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true,\"stopping\":true}}\n",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            response,
+            json!({"jsonrpc":"2.0","id":1,"result":{"ok":true,"stopping":true}})
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_matching_response_id_completes_the_call() {
+        let response = exchange_with_frames(concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"wrong\":true}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"wrong\":true}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response["result"], json!({"ok":true}));
+    }
+
+    #[tokio::test]
+    async fn matching_rpc_errors_are_preserved_after_notifications() {
+        let response = exchange_with_frames(concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"workspace.repositoryContext.retired\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32001,\"message\":\"refused\"}}\n",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            response,
+            json!({"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"refused"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_without_a_matching_reply_is_not_success() {
+        for frames in [
+            "",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"workspace.repositoryContext.retired\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n",
+        ] {
+            let error = exchange_with_frames(frames).await.unwrap_err();
+            assert!(error.to_string().contains("without responding"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_reply_remains_an_error() {
+        let error = exchange_with_frames("not JSON\n").await.unwrap_err();
+        assert!(
+            error.to_string().contains("invalid response from daemon"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_response_is_preserved() {
+        let response =
+            exchange_with_frames("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n")
+                .await
+                .unwrap();
+        assert_eq!(
+            response,
+            json!({"jsonrpc":"2.0","id":1,"result":{"ok":true}})
+        );
+    }
 }

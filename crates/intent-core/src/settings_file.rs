@@ -422,6 +422,8 @@ impl Default for ServerSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct SharingSettings {
+    /// Owner-chosen label for collaborators; empty keeps the OS-name fallback.
+    pub machine_name: String,
     /// `sharing.maxGuestsPerWorkspace` — guests one workspace admits besides
     /// its owner: open invites count against it at mint time, collaborators
     /// at join time (0–100; `0` closes every workspace to guests).
@@ -434,9 +436,33 @@ pub struct SharingSettings {
     pub max_connections_per_guest: u32,
 }
 
+impl SharingSettings {
+    /// The optional collaboration label, separate from OS and personal device names.
+    #[must_use]
+    pub fn collaboration_name(&self) -> Option<&str> {
+        let name = self.machine_name.trim();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// Validate and trim an owner-supplied collaboration label.
+    ///
+    /// # Errors
+    /// Returns invalid input for control characters or over 100 Unicode scalar values.
+    pub fn normalize_machine_name(name: &str) -> Result<String> {
+        if name.chars().any(char::is_control) || name.trim().chars().count() > 100 {
+            return Err(Error::InvalidInput(
+                "sharing.machineName must contain at most 100 characters and no control characters"
+                    .into(),
+            ));
+        }
+        Ok(name.trim().to_string())
+    }
+}
+
 impl Default for SharingSettings {
     fn default() -> Self {
         Self {
+            machine_name: String::new(),
             max_guests_per_workspace: DEFAULT_SHARING_MAX_GUESTS_PER_WORKSPACE,
             max_guest_connections: DEFAULT_SHARING_MAX_GUEST_CONNECTIONS,
             max_connections_per_guest: DEFAULT_SHARING_MAX_CONNECTIONS_PER_GUEST,
@@ -1374,6 +1400,7 @@ impl SettingsFile {
         fn bad(key: &str, msg: &str) -> Error {
             Error::InvalidInput(format!("invalid config.toml at `{key}`: {msg}"))
         }
+        SharingSettings::normalize_machine_name(&self.sharing.machine_name)?;
         if self
             .providers
             .fast_mode
@@ -1737,6 +1764,8 @@ enabled = false
 enabled = true
 
 [sharing]
+# Name shown to collaborators; empty uses the OS machine name.
+# machineName = ""
 # Max guests per workspace -- guests one workspace admits besides its owner;
 # open invites count at mint time, collaborators at join time (0-100, 0
 # closes every workspace to guests).
@@ -3044,6 +3073,25 @@ mod tests {
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[sharing]"));
         let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
         assert_eq!(templated.sharing, parsed.sharing);
+    }
+
+    #[test]
+    fn collaboration_machine_name_config_validation_and_unicode() {
+        let name = "🦀".repeat(100);
+        let parsed =
+            SettingsFile::parse_str(&format!("[sharing]\nmachineName = \"  {name}  \"\n")).unwrap();
+        assert_eq!(parsed.sharing.collaboration_name(), Some(name.as_str()));
+        for invalid in ["x".repeat(101), "line\nname".into(), "\tname".into()] {
+            assert!(SharingSettings::normalize_machine_name(&invalid).is_err());
+            let mut settings = SettingsFile::default();
+            settings.sharing.machine_name = invalid;
+            assert!(settings.validate().is_err());
+        }
+        assert_eq!(SharingSettings::normalize_machine_name("   ").unwrap(), "");
+        assert!(SettingsFile::default()
+            .sharing
+            .collaboration_name()
+            .is_none());
     }
 
     #[test]

@@ -17941,6 +17941,7 @@ pub(crate) mod pr {
                     .and_then(|c| c.parse::<u64>().ok())
                     .unwrap_or(1);
                 let repo = Repo {
+                    owner_avatar_url: None,
                     owner: "octocat".into(),
                     name: format!("repo{p}"),
                     url: Some(format!("https://github.com/octocat/repo{p}")),
@@ -17960,6 +17961,7 @@ pub(crate) mod pr {
             }
             Ok(Page {
                 items: vec![Repo {
+                    owner_avatar_url: None,
                     owner: "octocat".into(),
                     name: "hello".into(),
                     url: Some("https://github.com/octocat/hello".into()),
@@ -17978,6 +17980,7 @@ pub(crate) mod pr {
                 return Err(ScError::NotFound("no such repo".into()));
             }
             Ok(Repo {
+                owner_avatar_url: None,
                 owner: owner.into(),
                 name: name.into(),
                 url: Some(format!("https://github.com/{owner}/{name}")),

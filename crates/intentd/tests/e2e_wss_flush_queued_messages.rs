@@ -104,11 +104,15 @@ fn temp_data_dir() -> tempfile::TempDir {
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
+    GuardedChild::spawn(&mut fixture_command(data_dir, env)).expect("spawn intentd serve")
+}
+
+fn fixture_command(data_dir: &Path, env: &[(&str, &str)]) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -117,7 +121,131 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
+    cmd
+}
+
+mod fixture_command_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum EnvSetting<'a> {
+        Inherited,
+        Removed,
+        Set(&'a OsStr),
+    }
+
+    fn explicit_env<'a>(cmd: &'a std::process::Command, name: &str) -> EnvSetting<'a> {
+        match cmd.get_envs().find(|(key, _)| *key == OsStr::new(name)) {
+            None => EnvSetting::Inherited,
+            Some((_, None)) => EnvSetting::Removed,
+            Some((_, Some(value))) => EnvSetting::Set(value),
+        }
+    }
+
+    #[test]
+    fn removes_synthetic_host_tokens() {
+        let dir = common::test_tempdir("queue-fixture-env-");
+        let cmd = fixture_command(
+            dir.path(),
+            &[
+                ("GH_TOKEN", "synthetic-gh-token"),
+                ("GITHUB_TOKEN", "synthetic-github-token"),
+                ("GH_ENTERPRISE_TOKEN", "synthetic-enterprise-token"),
+                ("GITHUB_ENTERPRISE_TOKEN", "synthetic-enterprise-token"),
+                ("GH_HOST", "enterprise.example.invalid"),
+            ],
+        );
+        assert_eq!(explicit_env(&cmd, "GH_TOKEN"), EnvSetting::Removed);
+        assert_eq!(explicit_env(&cmd, "GITHUB_TOKEN"), EnvSetting::Removed);
+        for key in ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST"] {
+            assert_eq!(explicit_env(&cmd, key), EnvSetting::Removed, "{key}");
+        }
+    }
+
+    #[test]
+    fn replaces_synthetic_host_gh_config() {
+        let dir = common::test_tempdir("queue-fixture-env-");
+        let host = common::test_tempdir("queue-synthetic-host-");
+        let hosts_file = host.path().join("hosts.yml");
+        std::fs::write(&hosts_file, "synthetic host configuration").unwrap();
+        let cmd = fixture_command(
+            dir.path(),
+            &[("GH_CONFIG_DIR", host.path().to_str().unwrap())],
+        );
+        let private = dir.path().join("gh-config");
+        assert_eq!(
+            explicit_env(&cmd, "GH_CONFIG_DIR"),
+            EnvSetting::Set(private.as_os_str())
+        );
+        assert_eq!(std::fs::read_dir(&private).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_to_string(hosts_file).unwrap(),
+            "synthetic host configuration"
+        );
+    }
+
+    #[test]
+    fn replaces_synthetic_host_secrets_file() {
+        let dir = common::test_tempdir("queue-fixture-env-");
+        let host = common::test_tempdir("queue-synthetic-host-");
+        let secrets_file = host.path().join("secrets.json");
+        let synthetic = r#"{"github.token":"synthetic-token"}"#;
+        std::fs::write(&secrets_file, synthetic).unwrap();
+        let cmd = fixture_command(
+            dir.path(),
+            &[("INTENTD_SECRETS_FILE", secrets_file.to_str().unwrap())],
+        );
+        let private = dir.path().join("secrets.json");
+        assert_eq!(
+            explicit_env(&cmd, "INTENTD_SECRETS_FILE"),
+            EnvSetting::Set(private.as_os_str())
+        );
+        assert!(
+            !private.exists(),
+            "fixture starts with an empty secret store"
+        );
+        assert_eq!(std::fs::read_to_string(secrets_file).unwrap(), synthetic);
+    }
+
+    #[test]
+    fn preserves_daemon_and_mock_configuration() {
+        let dir = common::test_tempdir("queue-fixture-env-");
+        let cmd = fixture_command(
+            dir.path(),
+            &[
+                ("MOCK_AGENT_BEHAVIOR", "synthetic behavior"),
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+            ],
+        );
+        assert_eq!(cmd.get_program(), OsStr::new(env!("CARGO_BIN_EXE_intentd")));
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            vec![OsStr::new("serve")]
+        );
+        assert_eq!(
+            explicit_env(&cmd, "INTENTD_DATA_DIR"),
+            EnvSetting::Set(dir.path().as_os_str())
+        );
+        let workspaces = dir.path().join("workspaces");
+        assert_eq!(
+            explicit_env(&cmd, "INTENTD_WORKSPACES_DIR"),
+            EnvSetting::Set(workspaces.as_os_str())
+        );
+        assert_eq!(
+            explicit_env(&cmd, "INTENTD_TCP_PORT"),
+            EnvSetting::Set(OsStr::new("0"))
+        );
+        assert_eq!(
+            explicit_env(&cmd, "MOCK_AGENT_BEHAVIOR"),
+            EnvSetting::Set(OsStr::new("synthetic behavior"))
+        );
+        assert_eq!(
+            explicit_env(&cmd, "INTENTD_AUTH_TOKEN"),
+            EnvSetting::Set(OsStr::new(TOKEN))
+        );
+    }
 }
 
 async fn await_uds(socket: &Path) -> bool {

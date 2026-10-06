@@ -95,12 +95,14 @@ function logSessionCall(method, sessionId, meta, cwd) {
         nodeOptions: process.env.NODE_OPTIONS ?? null,
         cwd: cwd ?? null,
         processCwd: process.cwd(),
+        mcpNames: sessionMcpServers.map((server) => server.name),
         argv: process.argv.slice(2),
         ...(process.env.MOCK_AGENT_LOG_CODEX_POLICY === '1'
           ? { codexPolicy: {
               config: process.env.CODEX_CONFIG ? JSON.parse(process.env.CODEX_CONFIG) : null,
               pathPresent: Object.hasOwn(process.env, 'CODEX_PATH'),
               codexPath: process.env.CODEX_PATH ?? null,
+              home: process.env.CODEX_HOME ?? null,
             } }
           : {}),
       }) + '\n'
@@ -412,6 +414,8 @@ async function handlePrompt(id, params) {
         promptLog,
         JSON.stringify({
           turn: promptCount,
+          sessionId: params && params.sessionId,
+          loaded: sessionFromLoad,
           ...(effectiveModel !== null ? { effectiveModel, effectiveEffort } : {}),
           text: extractPromptText(params),
           blockTypes: blocks.map((b) => (b && typeof b.type === 'string' ? b.type : '')),
@@ -1119,6 +1123,19 @@ async function dispatch(msg) {
       });
     }
     case 'session/prompt':
+      // Test-owned receipt barrier: turnInFlight can be true before this child
+      // records the prompt. Hold only the selected current prompt, so replayed
+      // history in a fresh child's follow-up cannot accidentally re-enter it.
+      if (behavior.promptReceiptGate &&
+          extractPromptText(msg.params).trimEnd().endsWith(behavior.promptReceiptGate.suffix)) {
+        const gate = behavior.promptReceiptGate;
+        fs.writeFileSync(gate.enteredFile, String(process.pid));
+        const deadline = Date.now() + 5000;
+        while (!fs.existsSync(gate.releaseFile)) {
+          if (Date.now() >= deadline) throw new Error('prompt receipt gate was not released');
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
       return handlePrompt(msg.id, msg.params);
     case 'session/cancel':
       // STAB-124: echo the abort for any tool call parked by `parkMidToolCall`

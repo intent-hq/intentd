@@ -49,14 +49,14 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", &format!("itd-wss-clone-{prefix}-"))
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn clone_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -65,7 +65,14 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.spawn().expect("spawn intentd serve")
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
+    cmd
+}
+
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+    clone_command(data_dir, listen, env)
+        .spawn()
+        .expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -533,8 +540,9 @@ async fn boot_with_stub_git() -> (Daemon, u16, Arc<ClientConfig>, PathBuf) {
     let capture = scratch.join("git-capture");
     let path = make_stub_git(&scratch.join("stub-bin"), &capture);
     let secrets_str = secrets.to_string_lossy().to_string();
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:0"),
         ("INTENTD_SECRETS_FILE", &secrets_str),
         ("PATH", &path),
     ];
@@ -719,4 +727,41 @@ async fn git_clone_missing_params_rejected_over_wss() {
         err["error"]["code"], -32602,
         "missing params ⇒ -32602: {err}"
     );
+}
+
+#[test]
+fn private_stored_identity_contract_survives_overrides_and_restart() {
+    use std::ffi::OsStr;
+    let dir = common::test_tempdir("stored-identity-contract-");
+    let secrets = dir.path().join("secrets.json");
+    let state = r#"{"sourceControl.github.token":"synthetic-repository-token","collaboration.github.token":"synthetic-identity-token"}"#;
+    std::fs::write(&secrets, state).unwrap();
+    for _ in 0..2 {
+        let cmd = clone_command(
+            dir.path(),
+            "both",
+            &[
+                ("GITHUB_TOKEN", "synthetic-host-token"),
+                ("GH_TOKEN", "synthetic-host-token"),
+                ("GH_CONFIG_DIR", "synthetic-host-config"),
+                ("INTENTD_SECRETS_FILE", "synthetic-host-secrets"),
+                ("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:0"),
+            ],
+        );
+        let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+            assert_eq!(environment.get(OsStr::new(key)), Some(&None), "{key}");
+        }
+        for (key, path) in [
+            ("GH_CONFIG_DIR", dir.path().join("gh-config")),
+            ("INTENTD_SECRETS_FILE", secrets.clone()),
+        ] {
+            assert_eq!(
+                environment.get(OsStr::new(key)),
+                Some(&Some(path.as_os_str())),
+                "{key}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&secrets).unwrap(), state);
+    }
 }
