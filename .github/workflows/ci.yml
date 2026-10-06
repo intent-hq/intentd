@@ -18,19 +18,21 @@ on:
   pull_request:
   # Merge-queue runs (intent-hq/monorepo#2893): the queue tests the actual
   # merged tree before it lands on main. CI is tiered by event: pull_request
-  # runs the fast feedback jobs (check / build / pr-title / conflict-markers /
+  # runs the fast feedback jobs (check / pr-title / conflict-markers /
   # monorepo-consumer-checks / deb-packaging / release-scripts) plus
   # coverage-changed, which runs only
   # the PR's own changed tests under llvm-cov (pull_request-ONLY; see its
-  # comment); merge_group additionally runs the full instrumented coverage
-  # jobs (coverage-e2e / coverage-all), which are merge_group-ONLY — they no
+  # comment); merge_group additionally runs the native build matrix, GitLab
+  # feature suite, and full instrumented coverage jobs (coverage-e2e /
+  # coverage-all), which are merge_group-ONLY — they no
   # longer run on pull_request, so a PR's ~20 min coverage wall time is paid
   # once, on the merged tree, instead of on every push to the PR. The gate is
   # event-aware about this (see the gate comment): it requires the coverage
   # jobs outright on merge_group and accepts their skip on pull_request /
-  # push, and the reverse for coverage-changed. The build job's target-gated
-  # clippy step runs on both pull_request and merge_group (see its comment),
-  # so the queue lints the merged tree's macOS / Windows-only code too.
+  # push, and the reverse for coverage-changed. The native matrix is skipped
+  # at job level on PRs, so it allocates no macOS / Windows Rust runners.
+  # CI Gate requires its target-gated Clippy and runtime proofs on merge_group,
+  # and its release builds on push. CI Gate is the sole required status check.
   # Merge groups are created by the repo's own ruleset from already-filed
   # PRs, so they need no same-repo fork guard. pr-title / conflict-markers
   # are PR-metadata checks that stay pull_request-only — the gate accepts
@@ -79,9 +81,9 @@ jobs:
   # mac build is intentionally not routed — it runs on the self-hosted m1mac
   # (see the build job's matrix).
   route:
-    # Runs on every event that runs the build job (push / merge_group /
-    # same-repo pull_request) because the build job's Windows entry consumes
-    # its decision (intent-hq/intent#5518). On push its Linux consumers
+    # Runs on push / merge_group / same-repo pull_request. Linux PR checks
+    # consume its decision; the native Windows entry uses it on push and
+    # merge_group (intent-hq/intent#5518). On push its Linux consumers
     # (check / coverage-e2e / coverage-all / coverage-changed) are
     # push-skipped by their own `if`s (see the `on: push` comment), so only
     # the Windows decision is used there.
@@ -139,8 +141,8 @@ jobs:
             const checkBurst = ["gh-linux-8x"];
             // The Windows build entry: the self-hosted 5090pc runner, or
             // the org-hosted 16-core Windows runner (the one
-            // release-sitter.yml builds on) — a cold `cargo check` + clippy
-            // of the whole workspace is slow on the 4-core windows-latest
+            // release-sitter.yml builds on) — cold workspace Clippy
+            // is slow on the 4-core windows-latest
             // image.
             const windowsSelfHosted = ["self-hosted", "Windows", "X64"];
             const windowsBurst = ["gh-windows-16x"];
@@ -468,8 +470,11 @@ jobs:
         run: cargo test --workspace --test '*_lint'
       # This target requires explicit cold mock authority. Ordinary/default
       # daemon builds never register these transports; keep the feature lane
-      # mandatory so default target selection cannot hide auth coverage.
+      # mandatory in the merge queue so default target selection cannot hide
+      # auth coverage. Defer this separate feature build during PR iteration;
+      # CI Gate requires check to succeed against the queue's merged tree.
       - name: GitLab auth, invitations and checkout over real sockets with explicit test transports
+        if: github.event_name == 'merge_group'
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth --test e2e_wss_invite_join_gitlab --test e2e_repository_resource_read -- --test-threads=2
@@ -618,34 +623,14 @@ jobs:
         if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
         run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
 
-  # Release-PR fast path (intent-hq/monorepo#1374): release-plz PRs change
-  # only version strings + changelog, so the compiled code is identical to
-  # what main already tested and the heavy jobs (build matrix, and — before
-  # they became merge_group-only, see the trigger comment — coverage-all /
-  # coverage-e2e) add no signal — their ~20 min wall time just makes the PR
-  # lose the strict up-to-date race against main. This job diffs the PR
-  # against its base and emits fast_path=true only when the diff has exactly
-  # the release shape (files ⊆ {CHANGELOG.md, Cargo.lock, crates/*/Cargo.toml}
-  # and every non-changelog change is a package version or its matching local dependency;
-  # see scripts/release-pr-fast-path.sh). The diff shape is the ONLY signal —
-  # never branch name or author — so a PR can't spoof its way past the heavy
-  # checks: any real code change breaks the shape. Fail-safe, not fail-open:
-  # the heavy jobs skip only when the output is exactly 'true' (script error,
-  # missing output, or job failure falls back to full CI), push runs are
-  # never gated, and check / pr-title / conflict-markers /
-  # deb-packaging still run on every PR. Job names are unchanged, so the
-  # required-check ruleset needs no edits — but the gating mechanism differs
-  # by job shape. The coverage jobs are no longer consumers of this output:
-  # they are merge_group-only (job-level skipped on every pull_request run,
-  # fast path or not — a skipped job still reports its required context).
-  # The build job CANNOT be skipped at job level: a job-level skip prevents
-  # the matrix from expanding, so GitHub reports a single skipped check named
-  # literally `matrix.name` and the required per-entry contexts
-  # (`build (aarch64-apple-darwin, macos-14)` etc.) are never reported,
-  # leaving release PRs blocked forever (intentd#868).
-  # Instead the build job always runs and every step is gated on
-  # fast_path != 'true', so on fast-path PRs each matrix entry completes as
-  # an all-steps-skipped success under its required name.
+  # Release metadata classification (intent-hq/monorepo#1374): retain the
+  # audited diff-shape output and fail-safe script behavior. Native builds
+  # and full coverage are now job-skipped on every PR, independent of this
+  # output; Linux checks and changed coverage still validate release PRs.
+  # This PR-only job is skipped on merge_group / push, leaving its output
+  # empty so the retained native step guards never bypass queue validation
+  # or main release builds. CI Gate is the only required context; the old
+  # per-matrix required-context constraint (intentd#868) no longer applies.
   release-fast-path:
     runs-on: ubuntu-latest
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
@@ -676,26 +661,19 @@ jobs:
           echo "${line:-fast_path=false}" >> "$GITHUB_OUTPUT"
 
   build:
-    # Step-gated (NOT job-gated) when the diff is release-PR-shaped: every
-    # step below carries `needs.release-fast-path.outputs.fast_path != 'true'`
-    # so on fast-path PRs the matrix still expands and each entry reports its
-    # required check context as an all-steps-skipped success (see the
-    # release-fast-path comment for why a job-level skip breaks matrix
-    # required checks). Steps run unless the output is exactly 'true': on
-    # push and merge_group the fast-path job is skipped and the output is
-    # empty, and a fast-path failure leaves it empty too, so all fall back
-    # to running the full job. `!cancelled()` keeps the job from being
-    # auto-skipped when a `needs` dependency was skipped (release-fast-path
-    # on push / merge_group) or failed (route) — which is exactly why
-    # the fork guard must be explicit here: on a fork PR both dependencies
-    # are skipped, and without the guard `!cancelled()` would still run this
-    # job on the self-hosted macOS/Windows runners.
+    # Native Rust validation runs once on the queue's merged tree; main
+    # pushes retain release builds. The explicit event allowlist prevents
+    # matrix expansion for all PRs, including forks and release-shaped PRs.
+    # `!cancelled()` permits skipped release-fast-path and failed route
+    # dependencies: release metadata is PR-only, and Windows has a hosted
+    # fallback when routing fails. CI Gate still rejects skipped Linux
+    # validation on merge_group after a route failure.
     # `route` places the Windows entry (intent-hq/intent#5518; see the
     # matrix) and runs on every event this job runs on. route runs on
     # ubuntu-latest, so this dependency can never queue behind the
     # self-hosted runners it decides about.
     needs: [release-fast-path, route]
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ !cancelled() && (github.event_name == 'merge_group' || github.event_name == 'push') }}
     strategy:
       # Don't let one platform's failure cancel the other's required check.
       fail-fast: false
@@ -705,8 +683,7 @@ jobs:
           # - target: x86_64-unknown-linux-gnu
           #   os: ubuntu-latest
           # Self-hosted Apple Silicon runner (m1mac). The explicit name below
-          # predates a temporary macos-14 stint and pins the required-check
-          # context — do not rename it.
+          # predates a temporary macos-14 stint; retain it for check history.
           - target: aarch64-apple-darwin
             os: [self-hosted, macOS, ARM64]
             name: build (aarch64-apple-darwin, macos-14)
@@ -720,18 +697,15 @@ jobs:
           # out, or was skipped (`!cancelled()` still runs this job) — falls
           # back to the burst label, never to a runner nothing confirmed
           # online. (The fallback also keeps `fromJSON('')` from failing the
-          # matrix expansion and dropping the required contexts.) The name
-          # below pins the required-check context — do not rename it.
+          # matrix expansion.) Retain the name below for check history.
           - target: x86_64-pc-windows-msvc
             os: ${{ fromJSON(needs.route.outputs.windows_labels || '["gh-windows-16x"]') }}
             name: build (x86_64-pc-windows-msvc, self-hosted, Windows, X64)
-    # Explicit per-entry names (instead of the default matrix-value join) so
-    # the required-check contexts in the main ruleset stay stable even when a
-    # matrix entry's runner labels change (or are routed at run time).
+    # Explicit per-entry names keep check history stable across runner changes.
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
-    # Keeps the cargo-check steps free of debuginfo/incremental artifacts
+    # Keeps native Clippy/tests free of debuginfo/incremental artifacts
     # (cheaper compile, smaller shared cache). Safe job-wide: the release
     # build is unaffected — these vars only touch the dev/test profiles, and
     # release builds are non-incremental by default.
@@ -789,13 +763,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: gh-build-${{ matrix.target }}
-      # On PRs and merge-queue runs a cheap `cargo check` proves per-target
-      # compilation; the full `--release` build (the expensive part, esp. on
-      # Windows) only runs on push to main. The "Warm PR check cache" step
-      # keeps the persistent target dir warm for PR checks after main builds.
-      - name: Check (PR compilation proof)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name != 'push'
-        run: cargo check --workspace --target ${{ matrix.target }}
+      # All-target Clippy supplies the native compilation proof: same
+      # workspace, target, default features, pinned toolchain and dev profile
+      # as the former cargo check, plus test/example/bench targets. A separate
+      # queue cargo check is redundant. Release builds stay push-only; the
+      # final check warms their persistent target dir for the next queue run.
       # Clippy over target-gated code (intent-hq/monorepo#3285 for macOS,
       # intent-hq/intentd#1813 for Windows): the `check` job lints on Linux,
       # where `#[cfg(target_os = "macos")]` / `#[cfg(windows)]` /
@@ -803,7 +775,7 @@ jobs:
       # target-only code (including outer `#[allow]`s that only expand there
       # and trip `clippy::allow_attributes`) land silently and break
       # `make check` on every macOS or Windows dev box. Linting here (same
-      # invocation as the check job) closes the gap. It runs on PRs and on
+      # invocation as the check job) closes the gap. It runs on
       # merge-queue runs, not on push: the queue tests the actual merged
       # tree, and a PR-only step let intent-hq/intentd#1825 (green on its
       # own PR run) land a Windows-only E0433 via the queue — main's push
@@ -817,14 +789,14 @@ jobs:
       # darwin / MSVC cross C toolchain on Linux; the native runners need
       # nothing extra and share this job's warm target dir. release-fast-path
       # is pull_request-only, so its output is empty on merge_group and the
-      # `!= 'true'` guard lets the step run there (same as the check step).
+      # `!= 'true'` guard lets the step run there.
       - name: Clippy (target-gated code)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && (runner.os == 'macOS' || runner.os == 'Windows')
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && (runner.os == 'macOS' || runner.os == 'Windows')
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       # Exercise the deterministic deadline oracle and real TLS controls on
       # macOS; listen backlog saturation cannot guarantee a pending connect.
       - name: Tunnel deadline and TLS controls (macOS runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'macOS'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'macOS'
         timeout-minutes: 20
         shell: bash
         env:
@@ -881,7 +853,7 @@ jobs:
       # Execute the Windows Job Object fixtures on the native runner. They use
       # this test executable as the child, so no Node/npm/account setup is needed.
       - name: Codex diagnostic process ownership (Windows runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'Windows'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
         shell: bash
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
@@ -900,7 +872,7 @@ jobs:
       # auth/npm setup. Require both a service rejection case and a real doctor
       # case in discovery so a cfg/filter change cannot silently run zero tests.
       - name: Codex focused diagnostics (macOS runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'macOS'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'macOS'
         shell: bash
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
@@ -925,7 +897,7 @@ jobs:
       # These retained workspace fixtures used to skip on Linux before reaching
       # their unbound caller. Require native CoW operations and original oracles.
       - name: Retained workspace CoW fixtures (macOS runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'macOS'
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'macOS'
         timeout-minutes: 20
         shell: bash
         env:
@@ -974,7 +946,7 @@ jobs:
       - name: Build (release)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo build --workspace --release --target ${{ matrix.target }}
-      - name: Warm PR check cache
+      - name: Warm merge queue check cache
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo check --workspace --target ${{ matrix.target }}
 
@@ -1861,6 +1833,8 @@ jobs:
         run: |
           python3 -S scripts/test-test-policy.py
           python3 -I -B scripts/test-ci-test-policy.py
+      - name: Test native CI routing and gate results
+        run: python3 -I -B scripts/test-ci-native-routing.py
       - name: Install release cache regression compiler
         shell: bash
         run: |
@@ -2007,41 +1981,15 @@ jobs:
           path: pi-path-evidence
           if-no-files-found: error
 
-  # Single required status check for branch protection: fans in check, build,
-  # coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers,
-  # deb-packaging, release-scripts, and install-ps1 (ported from cloudlands-fe's "CI Gate"
-  # pattern — see packages/cloudlands-fe/.github/workflows/intent-pr.yml).
-  # build / deb-packaging / release-scripts / install-ps1 must succeed
-  # outright: none carries an
-  # event-gated `if`, so a skip there is itself a failure signal. check must
-  # succeed outright
-  # on pull_request runs (a skip there — e.g. after a route failure — fails
-  # the gate, exactly as before); only on push to main, where it is
-  # job-skipped as redundant (see the `on: push` comment), does the gate
-  # accept skipped — the event-aware branch below keeps the PR semantics
-  # unweakened. coverage-e2e / coverage-all are event-aware the other way
-  # round: they are merge_group-only (see the `merge_group` trigger comment),
-  # so on merge_group they must succeed outright — a skip there (e.g. after a
-  # route failure) fails the gate, so the queue can never land a tree whose
-  # coverage run did not happen — while on pull_request and push, where they
-  # are job-level skipped by design, the gate accepts skipped. coverage-changed
-  # is the mirror image: pull_request-only (see its comment), so on
-  # pull_request it must succeed outright like check — a skip there (route
-  # failure) fails the gate — while on merge_group and push, where it is
-  # job-level skipped by design, the gate accepts skipped. pr-title /
-  # conflict-markers accept success OR skipped since
-  # both carry `if: github.event_name == 'pull_request'` and are legitimately
-  # skipped on push and merge_group runs (PR-metadata checks, already
-  # validated on the PR) — requiring strict success there would fail the
-  # gate outside pull_request events. monorepo-consumer-checks follows the
-  # check pattern: success on pull_request and merge_group, success or
-  # skipped on push (see its comment). Net per event: pull_request requires
-  # check / build / coverage-changed / monorepo-consumer-checks /
-  # deb-packaging / release-scripts / install-ps1 / pr-title /
-  # conflict-markers; merge_group requires check / build /
-  # monorepo-consumer-checks / deb-packaging / release-scripts / install-ps1 /
-  # coverage-e2e / coverage-all against the queue's merged tree; push
-  # requires build / deb-packaging / release-scripts / install-ps1.
+  # CI Gate is the sole required status check. Every failed/cancelled result
+  # fails it; skips are accepted only for jobs intentionally absent by event.
+  # build is required on merge_group (native Clippy + runtime proofs) and push
+  # (release compilation); only pull_request accepts its job-level skip.
+  # check / monorepo-consumer-checks must succeed on PRs and merge_group.
+  # Full coverage is required on merge_group, changed coverage on PRs.
+  # pr-title / conflict-markers retain their PR-metadata skip handling.
+  # deb-packaging / release-scripts / install-ps1 / pi-session-paths must
+  # succeed on every non-fork run. The gate itself is skipped on fork PRs.
   gate:
     name: CI Gate
     # Seconds-long job: pinned to ubuntu-latest (see pr-title).
@@ -2056,8 +2004,21 @@ jobs:
     steps:
       - name: Check results
         run: |
-          if [ "${{ needs.build.result }}" != "success" ] || \
-             [ "${{ needs.deb-packaging.result }}" != "success" ] || \
+          # PRs deliberately allocate no native matrix runners. A skip on
+          # merge_group or push must never pass as native validation.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            case "${{ needs.build.result }}" in
+              success|skipped) ;;
+              *)
+                echo "build did not succeed or skip"
+                exit 1
+                ;;
+            esac
+          elif [ "${{ needs.build.result }}" != "success" ]; then
+            echo "build must succeed outright on merge_group / push"
+            exit 1
+          fi
+          if [ "${{ needs.deb-packaging.result }}" != "success" ] || \
              [ "${{ needs.release-scripts.result }}" != "success" ] || \
              [ "${{ needs.pi-session-paths.result }}" != "success" ] || \
              [ "${{ needs.install-ps1.result }}" != "success" ]; then
