@@ -1,0 +1,5 @@
+error[E0614]: type `StorePool` cannot be dereferenced
+ --> tests/ui/store_pool_deref.rs:2:33
+  |
+2 |     let _: &sqlx::SqlitePool = &**pool;
+  |                                 ^^^^^^ can't be dereferenced

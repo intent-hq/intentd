@@ -113,7 +113,7 @@ fn gl() -> ReviewTarget {
     )
 }
 
-async fn original_bytes(pool: &sqlx::SqlitePool, id: &str) -> Vec<serde_json::Value> {
+async fn original_bytes(pool: &crate::StorePool, id: &str) -> Vec<serde_json::Value> {
     let row = sqlx::query(&format!(
         "SELECT {COLUMNS} FROM pr_monitor WHERE monitor_id=?"
     ))
@@ -172,7 +172,7 @@ async fn pre_target_database(path: &std::path::Path) -> sqlx::SqlitePool {
 async fn genuine_legacy_pending_row_survives_upgrade_qualification_and_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old.db");
-    let pool = pre_target_database(&path).await;
+    let pool = crate::StorePool::from(pre_target_database(&path).await);
     // The workspace moved to GitLab before the first target migration. This
     // config is deliberately absent from every Store qualification argument.
     let repo = dir.path().join("current-repo");

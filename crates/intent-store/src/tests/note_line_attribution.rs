@@ -43,7 +43,8 @@ async fn attribution_recovers_after_write_pool_timeout() {
     store.write_pool.close().await;
     store.write_pool = crate::connect_write_with_acquire_timeout(&tmp.path, Duration::from_secs(1))
         .await
-        .unwrap();
+        .unwrap()
+        .into();
     let held = store.write_pool().acquire().await.unwrap();
     let observed = Arc::new(AtomicUsize::new(0));
     let latest = snapshot(ws.clone(), 200);
@@ -146,7 +147,8 @@ async fn attribution_ticket_and_atomic_publication_recover_after_pool_timeouts()
     store.write_pool.close().await;
     store.write_pool = crate::connect_write_with_acquire_timeout(&tmp.path, Duration::from_secs(1))
         .await
-        .unwrap();
+        .unwrap()
+        .into();
     let job = after_attribution_pool_timeout(
         &store,
         store.begin_note_attribution(&ws, &note.id, note.rev),

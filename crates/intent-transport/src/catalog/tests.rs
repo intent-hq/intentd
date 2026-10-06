@@ -29,10 +29,6 @@ fn extract_router_methods() -> HashSet<String> {
     let source =
         std::fs::read_to_string(&router_path).expect("Failed to read router.rs at test time");
 
-    extract_router_methods_from_source(&source)
-}
-
-fn extract_router_methods_from_source(source: &str) -> HashSet<String> {
     let mut methods = HashSet::new();
 
     // Match patterns like: "method.name" => or "git.diffs" | "git.diff" =>
@@ -58,18 +54,6 @@ fn extract_router_methods_from_source(source: &str) -> HashSet<String> {
     }
 
     methods
-}
-
-#[test]
-fn receipt_catalog_requires_actual_dispatch_even_with_budget_comparison() {
-    let source = include_str!("../router.rs");
-    let arm = "\"note.operation.read\" => {";
-    assert_eq!(source.matches(arm).count(), 1);
-    assert!(source.contains("method == \"note.operation.read\""));
-    assert!(extract_router_methods_from_source(source).contains("note.operation.read"));
-    let removed = source.replacen(arm, "\"retired\" => {", 1);
-    assert!(removed.contains("method == \"note.operation.read\""));
-    assert!(!extract_router_methods_from_source(&removed).contains("note.operation.read"));
 }
 
 /// Extract fast-path methods from source files at test runtime.
@@ -205,14 +189,13 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Protocol 13.0 removes the deprecated git.commit router method.
 // GitLab pre-workspace checkout (13.5): +6 router methods.
 // Provider adapter preparation (13.6): +1 fast-path method.
-const EXPECTED_TOTAL_METHODS: usize = 436;
+const EXPECTED_TOTAL_METHODS: usize = 428;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
-/// Prepared 13.8 adds applySplices, receipt read and three staged upload methods.
-const EXPECTED_ROUTER_METHODS: usize = 380;
+const EXPECTED_ROUTER_METHODS: usize = 372;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -753,7 +736,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "metrics.getAgentStats",
     "models.list",
     "note.add",
-    "note.applySplices",
     "note.create",
     "note.delete",
     "note.edit",
@@ -765,13 +747,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "note.list",
     "note.listTasks",
     "note.listVersions",
-    "note.operation.append",
-    "note.operation.begin",
-    "note.operation.cancel",
-    "note.operation.commit",
-    "note.operation.read",
-    "note.operation.seal",
-    "note.operationStatus",
     "note.presence.update",
     "note.readAsset",
     "note.restoreVersion",

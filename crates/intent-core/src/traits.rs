@@ -1047,6 +1047,11 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// Fetch one note by id, scoped to the workspace (PROTOCOL §5.2).
+    /// Persistent backend identity only when bounded note reads and annotations are available.
+    fn note_paging_backend_id(&self) -> Option<String> {
+        None
+    }
+
     /// Read bounded indexed source/context/metadata at one live revision.
     fn get_note_page(
         &self,
@@ -1080,94 +1085,6 @@ pub trait WorkspaceApi: Send + Sync {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (workspace_id, note_id, incarnation);
         Box::pin(async { Err(crate::Error::Unsupported("note page state".into())) })
-    }
-
-    /// Resolve a receipt-owned context reference without a live-note snapshot.
-    fn get_note_receipt_context(
-        &self,
-        request: crate::note_receipt_detail::NoteGetReceiptContextRequest,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (request, rpc_id);
-        Box::pin(async { Err(crate::Error::Unsupported("note receipt context".into())) })
-    }
-
-    /// Read immutable receipt data under the current caller's authorization.
-    fn get_note_receipt_detail(
-        &self,
-        query: crate::note_receipt_detail::ReceiptDetailQuery,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (query, rpc_id);
-        Box::pin(async { Err(crate::Error::Unsupported("note receipt detail".into())) })
-    }
-
-    /// Apply exact source-addressed edits and return their durable commit receipt.
-    fn note_apply_splices(
-        &self,
-        request: crate::note_mutation::NoteApplySplices,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = request;
-        Box::pin(async { Err(crate::Error::Unsupported("note apply splices".into())) })
-    }
-
-    /// Admit an immutable staged source view without mutating the live note.
-    fn note_operation_begin(
-        &self,
-        request: crate::note_stage::NoteStageBegin,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = request;
-        Box::pin(async { Err(crate::Error::Unsupported("note operation begin".into())) })
-    }
-    /// Accept one contiguous bounded staged stream chunk.
-    fn note_operation_append(
-        &self,
-        request: crate::note_stage::NoteStageAppend,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = request;
-        Box::pin(async { Err(crate::Error::Unsupported("note operation append".into())) })
-    }
-    /// Validate and atomically freeze an operation-owned source view.
-    fn note_operation_seal(
-        &self,
-        request: crate::note_stage::NoteStageSeal,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = request;
-        Box::pin(async { Err(crate::Error::Unsupported("note operation seal".into())) })
-    }
-    /// Commit a sealed staged operation with exact source CAS and a durable receipt.
-    fn note_operation_commit(
-        &self,
-        request: crate::note_stage::NoteStageCommit,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = request;
-        Box::pin(async { Err(crate::Error::Unsupported("note operation commit".into())) })
-    }
-    /// Read bounded immutable staged output under current caller authorization.
-    fn read_note_stage_source(
-        &self,
-        request: crate::note_stage_read::NoteStageRead,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (request, rpc_id);
-        Box::pin(async { Err(crate::Error::Unsupported("staged source output".into())) })
-    }
-    /// Close uncommitted staging or return its retained committed receipt.
-    fn note_operation_cancel(
-        &self,
-        request: crate::note_stage::NoteStageCancel,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = request;
-        Box::pin(async { Err(crate::Error::Unsupported("note operation cancel".into())) })
-    }
-
-    /// Resolve a retained operation under current authorization, without live text.
-    fn note_operation_status(
-        &self,
-        request: crate::note_mutation::NoteOperationStatusQuery,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = request;
-        Box::pin(async { Err(crate::Error::Unsupported("note operation status".into())) })
     }
 
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {

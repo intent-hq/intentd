@@ -29,8 +29,6 @@ pub struct RetentionTickOutcome {
     pub tool_call_events_removed: u64,
     /// Full tool bodies compacted into `*_replay` previews.
     pub tool_payloads_compacted: u64,
-    /// Logical operation/root rows removed by one bounded reclamation batch.
-    pub note_operations: intent_store::NoteOperationReclaimStats,
 }
 
 fn iso_before(now: OffsetDateTime, ago: Duration) -> String {
@@ -105,16 +103,6 @@ pub async fn run_retention_tick_at(
     now: OffsetDateTime,
 ) -> RetentionTickOutcome {
     let mut outcome = RetentionTickOutcome::default();
-    // This sweep also runs when event retention is disabled. One transaction
-    // removes at most 64 operation children and 64 unpinned source pieces;
-    // persisted queue progress lets the next tick resume after interruption.
-    match u64::try_from(now.unix_timestamp_nanos() / 1_000_000) {
-        Ok(now_ms) => match store.reclaim_note_operations_batch(now_ms).await {
-            Ok(stats) => outcome.note_operations = stats,
-            Err(error) => tracing::warn!(%error, "note operation retention sweep failed"),
-        },
-        Err(error) => tracing::warn!(%error, "invalid note operation retention time"),
-    }
     if stream_retention_hours > 0 {
         let cutoff = iso_before(now, Duration::hours(i64::from(stream_retention_hours)));
         match store.delete_ephemeral_events_before(&cutoff).await {
@@ -150,57 +138,4 @@ pub async fn run_retention_tick_at(
         Err(e) => tracing::warn!(error = %e, "tool-payload retention sweep failed"),
     }
     outcome
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{run_retention_tick_at, OffsetDateTime, SettingsFile, Store};
-
-    #[tokio::test]
-    async fn note_operation_reclamation_runs_with_event_retention_disabled() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("retention.db")).await.unwrap();
-        for (key, until) in [("expired", 2_i64), ("keeper", 100)] {
-            sqlx::query("INSERT INTO note_operation(operation_key,principal,backend_id,workspace_id,note_id,instance_id,operation_id,payload_digest,admission_expires,retain_until,outcome) VALUES(?,'p','b','w','n','i',?,'digest',1,?,'{}')")
-                .bind(key).bind(key).bind(until).execute(store.write_pool()).await.unwrap();
-            for sequence in 0..130 {
-                sqlx::query("INSERT INTO note_operation_item(operation_key,kind,sequence,value) VALUES(?,'effects',?,'{}')")
-                    .bind(key).bind(sequence).execute(store.write_pool()).await.unwrap();
-            }
-        }
-        let settings = SettingsFile::default();
-        let now = OffsetDateTime::from_unix_timestamp(3).unwrap();
-        let mut removed = 0;
-        for _ in 0..32 {
-            let outcome = run_retention_tick_at(&store, 0, &settings, now).await;
-            assert_eq!(outcome.ephemeral_events_removed, 0);
-            assert_eq!(outcome.tool_call_events_removed, 0);
-            assert!(outcome.note_operations.child_rows <= 64);
-            assert!(outcome.note_operations.root_pieces <= 64);
-            removed += outcome.note_operations.operations;
-            if removed != 0 {
-                break;
-            }
-        }
-        assert_eq!(removed, 1);
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM note_operation WHERE operation_key='keeper'"
-            )
-            .fetch_one(store.read_pool())
-            .await
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM note_operation_item WHERE operation_key='keeper'"
-            )
-            .fetch_one(store.read_pool())
-            .await
-            .unwrap(),
-            130
-        );
-        store.close().await;
-    }
 }

@@ -73,7 +73,6 @@ pub mod lifecycle;
 pub mod listener;
 pub mod pairing;
 mod panic_guard;
-pub mod prepared_source_bootstrap;
 mod presence;
 mod protocol;
 mod provider_setup;

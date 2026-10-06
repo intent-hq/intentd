@@ -184,8 +184,6 @@ mod repository_read_policy;
 mod repository_read_source;
 
 mod agent_list_cache;
-pub mod artifact_recovery;
-pub mod artifact_source;
 mod automatic_pr_refresh;
 pub mod checkpoint;
 mod direct_secret_ops;
@@ -204,13 +202,9 @@ mod member_removal;
 mod model_catalog;
 mod nested_repos;
 mod note_annotation;
-mod note_conversion_plan;
 mod note_merge;
 pub mod note_ops;
 mod note_page_state;
-mod note_receipt;
-mod note_splice;
-mod note_stage;
 mod npx_cli;
 #[expect(
     dead_code,
@@ -224,7 +218,6 @@ pub mod pi_cli;
 mod pr_discovery;
 mod pr_monitor;
 mod pr_ops;
-pub mod prepared_source_bootstrap;
 pub mod presence;
 mod primitive_ops;
 mod principal_ops;
@@ -248,7 +241,6 @@ mod sentry_ops;
 mod settings;
 mod settings_registry;
 mod shell;
-pub mod source_session;
 pub(crate) mod stack_sample;
 mod task_effort;
 mod terminal_ops;
@@ -379,6 +371,14 @@ pub(crate) struct CompletionClassifyPark {
     pub(crate) entered: tokio::sync::Notify,
     /// Held by the parked delivery inside the window until the test releases it.
     pub(crate) release: tokio::sync::Notify,
+}
+
+/// Provenance retained when a synthetic completion has to defer again.
+#[derive(Clone, Copy)]
+enum InterimIdleProvenance {
+    Live,
+    StaleReport,
+    AdvisoryPending,
 }
 
 /// Retry ownership and watch scope for one child's completion delivery.
@@ -518,10 +518,6 @@ struct WorkspaceAggregateSnapshot {
 #[derive(Clone)]
 pub struct Services {
     store: Store,
-    canonical_source_admission: Arc<tokio::sync::Semaphore>,
-    canonical_source_owners: artifact_source::ownership::Registry,
-    #[cfg(test)]
-    canonical_source_open_test: artifact_source::ownership::OpenControl,
     /// Root directory for note assets, laid out as `<root>/<workspaceId>/<assetId>`.
     /// `None` until configured by the composition root; `note.readAsset` errors
     /// when unset.
@@ -714,6 +710,9 @@ pub struct Services {
     /// while a task is live bumps the generation, which the task re-checks
     /// before exiting so a racing failure never loses its retry owner.
     completion_delivery_retries: Arc<Mutex<HashMap<String, CompletionDeliveryRetry>>>,
+    /// One bounded-backoff owner per child deferred by a pending script wake
+    /// or an unreadable outbox. Generations prevent losing a racing deferral.
+    pending_completion_retries: Arc<Mutex<HashMap<AgentId, u64>>>,
     /// Delegation-group ids with an active aggregated-wake retry task.
     completion_group_delivery_retries: Arc<Mutex<HashSet<String>>>,
     /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
@@ -1204,9 +1203,6 @@ pub struct Services {
     repository_connection_directory: Arc<repository_credentials::RepositoryConnectionDirectory>,
     /// Shared identity of this server incarnation, allocated with its repository directory.
     daemon_boot_id: String,
-    /// Lazy, isolated source-bootstrap contexts; clones retain one root and debt.
-    prepared_source_contexts: Arc<OnceLock<Arc<prepared_source_bootstrap::Contexts>>>,
-    prepared_source_operations: Arc<OnceLock<Arc<source_session::registry::Registry>>>,
     /// Exact ordinary API allocation; clones cannot bind replacement owners.
     repository_wire_owner: Arc<OnceLock<Weak<Services>>>,
     repository_review_capacity: Arc<repository_native_wire::review::Capacity>,
@@ -1465,7 +1461,6 @@ pub struct Services {
     /// front door observes one set.
     pending_workspace_deletes: delete_grace::OwnedPendingDeletes,
     workspace_mutations: workspace_mutations::WorkspaceMutations,
-    stage_request_admission: Arc<note_stage::Admission>,
     startup_resume_candidates: Arc<Mutex<HashSet<AgentId>>>,
     #[cfg(test)]
     interrupted_list_park: Option<Arc<script_ops::SupervisePark>>,
@@ -1609,10 +1604,6 @@ impl Services {
         );
         let services = Self {
             store,
-            canonical_source_admission: Arc::new(tokio::sync::Semaphore::new(256)),
-            canonical_source_owners: Arc::new(std::sync::Mutex::new(Vec::new())),
-            #[cfg(test)]
-            canonical_source_open_test: Arc::new(std::sync::Mutex::new(None)),
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
@@ -1652,6 +1643,7 @@ impl Services {
             host_exec_runtime: Arc::default(),
             provider_preparation: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
+            pending_completion_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
@@ -1676,8 +1668,6 @@ impl Services {
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
             pty: Arc::new(intent_pty::PtyHost::new()),
             daemon_boot_id,
-            prepared_source_contexts: Arc::new(OnceLock::new()),
-            prepared_source_operations: Arc::new(OnceLock::new()),
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_locks: script_ops::ScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
@@ -1809,7 +1799,6 @@ impl Services {
             sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),
             pending_workspace_deletes: pending_deletes.clone(),
             workspace_mutations: workspace_mutations::WorkspaceMutations::default(),
-            stage_request_admission: Arc::new(note_stage::Admission::default()),
             startup_resume_candidates: Arc::default(),
             #[cfg(test)]
             interrupted_list_park: None,
@@ -6820,6 +6809,7 @@ impl Services {
     pub async fn shutdown_agent_deliveries(&self) {
         self.delivery_tasks.shutdown().await;
         self.completion_delivery_retries.lock().unwrap().clear();
+        self.pending_completion_retries.lock().unwrap().clear();
         self.completion_group_delivery_retries
             .lock()
             .unwrap()
@@ -7540,6 +7530,19 @@ impl Services {
             self.take_interim_skipped_idle(child_id);
             return;
         }
+        // A terminal monitor can still own an undelivered notification, even
+        // though it no longer appears in the active-monitor query below.
+        // Check before consuming provenance OR sealing a delegating group.
+        // Errors also defer: no row/event need exist to trigger recovery.
+        if self
+            .store
+            .script_monitor_pending_for_agent(child_id)
+            .await
+            .unwrap_or(true)
+        {
+            self.schedule_pending_completion_retry(child_id);
+            return;
+        }
         // Idle-visibility deferral: an idle agent still owning active
         // background hooks OR active PR monitors has not settled — leave the
         // marker in place (like the busy guard) so the hook's own terminal
@@ -7686,23 +7689,33 @@ impl Services {
         // Box::pin breaks the async-recursion cycles this edge closes
         // (deliver → redeliver → deliver, and the drain's None-arm path
         // try_drain_queue → redeliver → deliver → wake → try_drain_queue).
-        // No-advisory variant by default: this synthetic pass is non-interim
-        // by construction, but a hook/monitor registered in the
-        // guard→delivery window could re-classify it as monitoring-idle —
+        // Suppress advisories by default: a hook/monitor registered in the
+        // guard→delivery window could re-classify this pass as monitoring-idle —
         // that deferral keeps today's silent skip; only a LIVE idle fires
         // the advisory. EXCEPT when the consumed marker carried
         // advisory-pending provenance (monorepo#1297 busy-slot race): the
         // LIVE idle already qualified for the advisory and was suppressed
         // solely by the busy probe, so this heal pass stands in for it and
-        // runs the advisory-ALLOWED variant — the still-active hooks/monitors
+        // allows advisories — the still-active hooks/monitors
         // re-classify the synthesized idle as monitoring-idle and the owed
         // advisory delivers (once per waiting period, via the persisted
         // marker).
-        let classification = if advisory_pending {
-            Box::pin(self.deliver_completion_to_watches(child_id, &event)).await
+        let provenance = if had_stale_report {
+            InterimIdleProvenance::StaleReport
+        } else if advisory_pending {
+            InterimIdleProvenance::AdvisoryPending
         } else {
-            Box::pin(self.deliver_completion_to_watches_no_advisory(child_id, &event)).await
+            InterimIdleProvenance::Live
         };
+        let classification = Box::pin(self.deliver_completion_to_watches_inner(
+            child_id,
+            &event,
+            advisory_pending,
+            true,
+            None,
+            Some(provenance),
+        ))
+        .await;
         // Real completion: seal the agent's open after_all group and try to
         // fire it, mirroring `handle_completion_event`'s non-queue-interim
         // idle path (monorepo#1281). Gated on the delivery pass's own
@@ -7719,6 +7732,53 @@ impl Services {
             if let Some(gid) = self.seal_group_for_parent(child_id).await {
                 Box::pin(self.try_fire_group(&gid)).await;
             }
+        }
+    }
+
+    /// Retry pending-notification admission off the delivery stack. Settlement
+    /// normally retries immediately through dispatch/worker-exit; this owner
+    /// also heals query errors with no pending row and classify-to-mark races.
+    /// Duplicate requests only bump a generation, never create another worker.
+    fn schedule_pending_completion_retry(&self, child_id: &AgentId) {
+        if self.delivery_tasks.is_closed() {
+            return;
+        }
+        {
+            let mut retries = self.pending_completion_retries.lock().unwrap();
+            let already_owned = retries.contains_key(child_id);
+            let generation = retries.entry(child_id.clone()).or_default();
+            *generation = generation.wrapping_add(1);
+            if already_owned {
+                return;
+            }
+        }
+        let services = self.clone();
+        let child = child_id.clone();
+        let task = self.delivery_tasks.spawn(async move {
+            let mut backoff = std::time::Duration::from_millis(500);
+            loop {
+                tokio::time::sleep(backoff).await;
+                let generation = services.pending_completion_retries.lock().unwrap()[&child];
+                Box::pin(services.redeliver_completion_after_queue_mutation(&child)).await;
+                {
+                    let mut retries = services.pending_completion_retries.lock().unwrap();
+                    if retries.get(&child) == Some(&generation) {
+                        retries.remove(&child);
+                        break;
+                    }
+                }
+                // The guard (or a concurrent pass) deferred again. Keep the
+                // same owner, with bounded polling and constant per-child state.
+                backoff = backoff
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(5));
+            }
+        });
+        if task.is_none() {
+            self.pending_completion_retries
+                .lock()
+                .unwrap()
+                .remove(child_id);
         }
     }
 
@@ -7937,6 +7997,7 @@ impl Services {
                             attempt.watch_ids.is_none(),
                             true,
                             attempt.watch_ids.as_ref(),
+                            None,
                         ))
                         .await
                         .ungrouped_delivery_failed;
@@ -8118,7 +8179,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, true, true, None)
+        self.deliver_completion_to_watches_inner(child_id, event, true, true, None, None)
             .await
     }
 
@@ -8134,24 +8195,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, true, false, None)
-            .await
-    }
-
-    /// [`Services::deliver_completion_to_watches`] with the advisory wake
-    /// suppressed: used by the registration-time / boot reconciliation
-    /// (`agent_subscriptions.rs`) and the synthetic mutation-path redelivery
-    /// (except its advisory-pending heal branch — monorepo#1297 — which runs
-    /// the advisory-allowed variant to stand in for a busy-suppressed LIVE
-    /// idle), whose deferred idles must keep today's silent-skip behavior —
-    /// only a LIVE `agent:idle` may fire the hook-/PR-monitor-waiting
-    /// advisory.
-    pub(crate) async fn deliver_completion_to_watches_no_advisory(
-        &self,
-        child_id: &AgentId,
-        event: &Event,
-    ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, false, true, None)
+        self.deliver_completion_to_watches_inner(child_id, event, true, false, None, None)
             .await
     }
 
@@ -8162,6 +8206,7 @@ impl Services {
         advisory_allowed: bool,
         clear_advisory_markers: bool,
         watch_ids: Option<&HashSet<String>>,
+        synthetic_provenance: Option<InterimIdleProvenance>,
     ) -> CompletionIdleClassification {
         // Queue- and busy-aware completion: an `agent:idle` for a child whose
         // pending message queue still holds ready-to-send entries, OR whose
@@ -8295,7 +8340,20 @@ impl Services {
             // OWED, not cancelled — record the advisory-pending provenance so
             // the worker-exit heal (`redeliver_completion_after_queue_mutation`)
             // runs the advisory-ALLOWED variant and delivers it.
-            if watch_ids.is_some() {
+            // Preserve the consumed marker only while the notification blocks
+            // admission. Once an advisory can deliver, its pending provenance
+            // must clear normally or the tail would keep admitting it again.
+            if let Some(provenance) = synthetic_provenance.filter(|_| pending_script_wake) {
+                match provenance {
+                    InterimIdleProvenance::StaleReport => {
+                        self.mark_interim_skipped_idle_stale_report(child_id);
+                    }
+                    InterimIdleProvenance::AdvisoryPending => {
+                        self.mark_interim_skipped_idle_advisory_pending(child_id);
+                    }
+                    InterimIdleProvenance::Live => self.mark_interim_skipped_idle(child_id),
+                }
+            } else if watch_ids.is_some() {
                 self.mark_interim_skipped_idle_preserving_provenance(child_id);
             } else if advisory_allowed
                 && busy_interim
@@ -9122,9 +9180,9 @@ impl Services {
         // snapshot and the marker landing found no marker and no-op'd —
         // re-check now and hand off to the mutation-path redelivery (its
         // guards make this a no-op unless the queue really emptied and the
-        // agent is idle). The indirect async recursion is depth-1: the
-        // synthetic redelivery's event is non-interim by construction
-        // (queue empty), so its own pass never re-enters here. An
+        // agent is idle). Pending notifications instead hand off to a
+        // coalesced retry owner: an empty queue does not mean their outbox
+        // entry settled, and retrying inline could repeat indefinitely. An
         // agent-waiting-only idle (issue intent-hq/monorepo#1468) is
         // deliberately excluded from THIS re-check — it has no queue-race to
         // heal and an unconditional synthetic pass would re-classify as
@@ -9141,7 +9199,9 @@ impl Services {
         // empty raced-drain arm) together heal it — whichever runs after the
         // slot release observes marker + empty queue + not busy and
         // synthesizes the real completion.
-        if seal_interim && !self.has_ready_to_send(child_id) {
+        if pending_script_wake {
+            self.schedule_pending_completion_retry(child_id);
+        } else if seal_interim && !self.has_ready_to_send(child_id) {
             Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
         }
         // Agent-waiting classify→mark race (issue intent-hq/monorepo#1468):
@@ -10964,10 +11024,67 @@ async fn reanchor_note_comments(
     let comments = store
         .list_comments_in_workspace(workspace_id, note_id)
         .await?;
-    let plan = note_ops::canonical::plan_anchor_changes(&content, &comments);
+    // Ids that legitimately own markers after this pass; comments flipped to
+    // orphaned below are removed so the final scrub treats their markers as
+    // debris too.
+    let mut live_ids = live_comment_ids(&comments);
+    let mut current = content;
+    let mut orphaned: Vec<String> = Vec::new();
+    for comment in &comments {
+        // Only root-level anchored comments carry markers; replies inherit the
+        // parent's anchor and never inject their own into the note body.
+        if comment.parent_id.is_some() {
+            continue;
+        }
+        if comment.is_orphaned == Some(true) {
+            continue;
+        }
+        let state = note_ops::classify_anchor_state(&current, &comment.id);
+        match state {
+            note_ops::AnchorState::Healthy => {}
+            note_ops::AnchorState::Missing => {
+                live_ids.remove(&comment.id);
+                orphaned.push(comment.id.clone());
+            }
+            note_ops::AnchorState::Degenerate => {
+                live_ids.remove(&comment.id);
+                current = note_ops::remove_anchor_markers(&current, &comment.id);
+                orphaned.push(comment.id.clone());
+            }
+            note_ops::AnchorState::PartialStartOnly | note_ops::AnchorState::PartialEndOnly => {
+                let outcome = note_ops::recover_partial_anchor(
+                    &current,
+                    &comment.id,
+                    comment.anchor_before.as_deref(),
+                    comment.anchor_after.as_deref(),
+                );
+                match outcome {
+                    note_ops::RecoveryOutcome::Recovered(new_md) => {
+                        current = new_md;
+                    }
+                    note_ops::RecoveryOutcome::Failed(reason) => {
+                        tracing::debug!(
+                            comment_id = %comment.id,
+                            reason,
+                            "partial-anchor recovery failed; orphaning comment"
+                        );
+                        live_ids.remove(&comment.id);
+                        current = note_ops::remove_anchor_markers(&current, &comment.id);
+                        orphaned.push(comment.id.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Phantom scrub (Round 15): UUID-format markers whose id has no live
+    // comment row — an id with no row at all, or markers left behind by a
+    // row already flagged orphaned — are debris and would otherwise survive
+    // every mutation. Non-UUID marker-lookalikes (documentation literals)
+    // are user content and are never touched.
+    current = note_ops::scrub_phantom_anchor_markers(&current, &live_ids);
     Ok(ReanchorPlan {
-        content: plan.content,
-        orphaned: plan.orphaned,
+        content: current,
+        orphaned,
     })
 }
 
@@ -16265,9 +16382,7 @@ impl Services {
             } else {
                 note_ops::TaskBlocksResult {
                     tasks: Vec::new(),
-                    source_change: note_ops::canonical::CanonicalSourceChange::unchanged(
-                        note.content.clone(),
-                    ),
+                    content_without_blocks: note.content.clone(),
                 }
             };
             // Idempotency: map existing child note titles (normalized) → id.
@@ -16282,7 +16397,7 @@ impl Services {
             // block is `<!-- task-block-placeholder-{i} -->` to be replaced
             // below. New children are built here and persisted with the
             // parent rewrite.
-            let mut working = parsed.source_change.content.clone();
+            let mut working = parsed.content_without_blocks.clone();
             let mut warnings: Vec<String> = Vec::new();
             let mut created: Vec<(Note, CreatedTaskEntry)> = Vec::new();
             let mut block_note_ids: Vec<NoteId> = Vec::with_capacity(parsed.tasks.len());
@@ -16334,7 +16449,7 @@ impl Services {
                     "- [ ] [{}](intent://local/task/{})",
                     task.title, task_note_id.0
                 );
-                working = note_ops::canonical::replace_all(&working, &placeholder, &linked).content;
+                working = working.replace(&placeholder, &linked);
                 block_note_ids.push(task_note_id);
                 peer_order += 100;
             }
@@ -25008,6 +25123,10 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn note_paging_backend_id(&self) -> Option<String> {
+        Some(self.store.note_paging_backend_id().to_owned())
+    }
+
     fn get_note_page(
         &self,
         workspace_id: WorkspaceId,
@@ -25047,92 +25166,6 @@ impl WorkspaceApi for Services {
         incarnation: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(self.read_page_state(workspace_id, note_id, incarnation))
-    }
-
-    fn get_note_receipt_context(
-        &self,
-        request: intent_core::note_receipt_detail::NoteGetReceiptContextRequest,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.read_note_receipt_context(request, rpc_id))
-    }
-
-    fn get_note_receipt_detail(
-        &self,
-        query: intent_core::note_receipt_detail::ReceiptDetailQuery,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.read_note_receipt(query, rpc_id))
-    }
-
-    fn note_apply_splices(
-        &self,
-        request: intent_core::note_mutation::NoteApplySplices,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.apply_note_splices(request))
-    }
-
-    fn note_operation_begin(
-        &self,
-        request: intent_core::note_stage::NoteStageBegin,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.begin_note_stage(request))
-    }
-    fn note_operation_append(
-        &self,
-        request: intent_core::note_stage::NoteStageAppend,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.append_note_stage(request))
-    }
-    fn note_operation_seal(
-        &self,
-        request: intent_core::note_stage::NoteStageSeal,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.seal_note_stage(request))
-    }
-    fn note_operation_commit(
-        &self,
-        request: intent_core::note_stage::NoteStageCommit,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.commit_note_stage(request))
-    }
-    fn read_note_stage_source(
-        &self,
-        request: intent_core::note_stage_read::NoteStageRead,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.read_stage_source(request, rpc_id))
-    }
-    fn note_operation_cancel(
-        &self,
-        request: intent_core::note_stage::NoteStageCancel,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.cancel_note_stage(request))
-    }
-
-    fn note_operation_status(
-        &self,
-        request: intent_core::note_mutation::NoteOperationStatusQuery,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        if request.header_digest.is_some() {
-            return Box::pin(self.read_note_stage_status(request));
-        }
-        Box::pin(async move {
-            request.validate().map_err(Error::NoteMutation)?;
-            self.require_member(&WorkspaceId(request.workspace_id.clone()))
-                .await?;
-            let principal = match intent_core::current_caller() {
-                Some(intent_core::Caller::Wire { principal_id, .. }) => {
-                    format!("principal:{}", principal_id.0)
-                }
-                Some(intent_core::Caller::Agent { agent_id }) => format!("agent:{}", agent_id.0),
-                Some(intent_core::Caller::Daemon) => "daemon".into(),
-                None => return Err(Error::Forbidden("Caller required".into())),
-            };
-            self.store
-                .read_note_operation_status(&principal, &request)
-                .await
-        })
     }
 
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
@@ -27267,7 +27300,7 @@ impl WorkspaceApi for Services {
                     note.content = note_ops::scrub_phantom_anchor_markers(
                         &note.content,
                         &live_comment_ids(&peers),
-                    ).content;
+                    );
                     let (from, to, line) = note_ops::find_and_anchor_text(
                         &note.content,
                         &search_context,

@@ -211,7 +211,7 @@ where
 /// Call outside the counted span, with no connections checked out. This is
 /// for short tests that do not close/expire connections during measurement;
 /// it does not filter any SQL events or alter production pool behavior.
-pub(crate) async fn warm_sqlx_pool(pool: &sqlx::SqlitePool) {
+pub(crate) async fn warm_sqlx_pool(pool: &intent_store::StorePool) {
     let mut connections = Vec::new();
     for _ in 0..pool.options().get_max_connections() {
         connections.push(pool.acquire().await.expect("warm SQL statement-count pool"));
@@ -227,6 +227,7 @@ async fn warmed_pool_statement_count_survives_connection_contention() {
         .max_lifetime(None)
         .connect_lazy("sqlite::memory:")
         .unwrap();
+    let pool = intent_store::StorePool::from(pool);
     warm_sqlx_pool(&pool).await;
     let mut held = Vec::new();
     for _ in 1..pool.options().get_max_connections() {
@@ -257,6 +258,7 @@ async fn warmed_pool_counts_extra_queries_and_isolates_concurrent_spans() {
         .max_lifetime(None)
         .connect_lazy("sqlite::memory:")
         .unwrap();
+    let pool = intent_store::StorePool::from(pool);
     warm_sqlx_pool(&pool).await;
     let barrier = tokio::sync::Barrier::new(2);
     let read = async |statements| {

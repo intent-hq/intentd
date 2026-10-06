@@ -7995,283 +7995,30 @@ async fn invitation_account_search_routes_and_rejects_malformed_params() {
 }
 
 #[tokio::test]
-async fn note_operation_status_bounds_admission_and_all_reply_shapes() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    struct StatusApi {
-        calls: AtomicUsize,
-    }
-    impl WorkspaceApi for StatusApi {
-        fn note_operation_status(
-            &self,
-            request: intent_core::note_mutation::NoteOperationStatusQuery,
-        ) -> BoxFuture<'_, Result<Value>> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async move {
-                match request.note_id.as_str() {
-                    "large" => Ok(serde_json::json!({"private":"x".repeat(8192)})),
-                    "error" => Err(Error::Internal("private source".repeat(8192))),
-                    _ => Ok(
-                        serde_json::json!({"kind":"noteOperationStatus","outcome":"unknown",
-                        "scope":request.scope(),"operationId":request.operation_id,
-                        "payloadDigest":request.payload_digest}),
-                    ),
-                }
-            })
-        }
-    }
-    let api = StatusApi {
-        calls: AtomicUsize::new(0),
-    };
-    let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"note.operationStatus",
-        "params":{"backendId":"backend","workspaceId":"workspace","noteId":"note",
-        "noteInstanceId":"instance","operationId":"11111111-1111-4111-8111-111111111111",
-        "payloadDigest":"a".repeat(64)}});
-    let response = handle_message(&api, &request.to_string()).await.unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&response).unwrap()["result"]["outcome"],
-        "unknown"
-    );
-    assert_eq!(api.calls.load(Ordering::Relaxed), 1);
-    for id in [
-        serde_json::json!("x".repeat(65)),
-        serde_json::json!(9_007_199_254_740_992_u64),
-        Value::Null,
-    ] {
-        let mut bad = request.clone();
-        bad["id"] = id;
-        let response = handle_message(&api, &bad.to_string()).await.unwrap();
-        assert!(response.len() <= 4096);
-        assert_eq!(
-            serde_json::from_str::<Value>(&response).unwrap()["id"],
-            Value::Null
-        );
-    }
-    for field in ["payloadDigest", "headerDigest", "noteId"] {
-        let mut bad = request.clone();
-        bad["params"][field] = Value::Null;
-        let response = handle_message(&api, &bad.to_string()).await.unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&response).unwrap()["error"]["code"],
-            -32602
-        );
-    }
-    let padded = format!("{}{}", request, " ".repeat(65536));
-    let response = handle_message(&api, &padded).await.unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&response).unwrap()["error"]["data"]["code"],
-        "note-page-budget"
-    );
-    assert_eq!(
-        api.calls.load(Ordering::Relaxed),
-        1,
-        "invalid frames never dispatch"
-    );
-    for note in ["large", "error"] {
-        let mut probe = request.clone();
-        probe["params"]["noteId"] = serde_json::json!(note);
-        probe["id"] = serde_json::json!("\u{1}".repeat(64));
-        let response = handle_message(&api, &probe.to_string()).await.unwrap();
-        assert!(response.len() <= 4096);
-        assert!(!response.contains("private"));
-        assert!(serde_json::from_str::<Value>(&response)
-            .unwrap()
-            .get("error")
-            .is_some());
-    }
-}
-
-#[tokio::test]
-async fn note_splice_transport_rejects_full_escaped_budget_before_dispatch_and_bounds_errors() {
-    use intent_core::note_mutation::{NoteApplySplices, NoteSplice};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    struct SpliceApi {
-        calls: AtomicUsize,
-    }
-    impl WorkspaceApi for SpliceApi {
-        fn note_apply_splices(&self, request: NoteApplySplices) -> BoxFuture<'_, Result<Value>> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async move {
-                if request.splices[0].text == "invalid" {
-                    Err(Error::InvalidParams("secret source".repeat(8192)))
-                } else {
-                    Err(Error::Internal("secret source".repeat(8192)))
-                }
-            })
-        }
-    }
-    let api = SpliceApi {
-        calls: AtomicUsize::new(0),
-    };
-    let mut request = NoteApplySplices {
-        backend_id: "backend".into(),
-        workspace_id: "workspace".into(),
-        note_id: "note".into(),
-        note_instance_id: "instance".into(),
-        base_revision: "revision".into(),
-        operation_id: "11111111-1111-4111-8111-111111111111".into(),
-        expires_at: "2026-10-06T00:00:00.000Z".into(),
-        payload_digest: String::new(),
-        splices: vec![NoteSplice {
-            start: 0,
-            end: 0,
-            text: "\u{1}".repeat(16384),
-        }],
-    };
-    // This deliberately oversized envelope must fail before digest validation.
-    // The bounded digest helper itself correctly rejects this payload.
-    request.payload_digest = "0".repeat(64);
-    let frame =
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"note.applySplices","params":request})
-            .to_string();
-    assert!(frame.len() > 65536);
-    let result = handle_message(&api, &frame).await.unwrap();
-    assert!(result.len() <= 4096);
-    assert_eq!(
-        serde_json::from_str::<Value>(&result).unwrap()["error"]["data"]["code"],
-        "note-page-budget"
-    );
-    assert_eq!(api.calls.load(Ordering::Relaxed), 0);
-    request.splices[0].text = "valid".into();
-    request.payload_digest = request.computed_digest().unwrap();
-    for id in [
-        serde_json::json!("x".repeat(65)),
-        serde_json::json!(9_007_199_254_740_992_u64),
-        Value::Null,
-    ] {
-        let frame=serde_json::json!({"jsonrpc":"2.0","id":id,"method":"note.applySplices","params":request}).to_string();
-        let result = handle_message(&api, &frame).await.unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&result).unwrap()["id"],
-            Value::Null
-        );
-        assert_eq!(api.calls.load(Ordering::Relaxed), 0);
-    }
-    let frame=serde_json::json!({"jsonrpc":"2.0","id":"\u{1}".repeat(64),"method":"note.applySplices","params":request}).to_string();
-    let result = handle_message(&api, &frame).await.unwrap();
-    assert!(result.len() <= 4096);
-    assert!(!result.contains("secret"));
-    assert_eq!(api.calls.load(Ordering::Relaxed), 1);
-    request.splices[0].text = "invalid".into();
-    request.payload_digest = request.computed_digest().unwrap();
-    let frame =
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"note.applySplices","params":request})
-            .to_string();
-    let result = handle_message(&api, &frame).await.unwrap();
-    assert!(result.len() <= 4096);
-    assert!(!result.contains("secret"));
-    assert_eq!(
-        serde_json::from_str::<Value>(&result).unwrap()["error"]["code"],
-        -32602
-    );
-    assert_eq!(api.calls.load(Ordering::Relaxed), 2);
-}
-
-#[tokio::test]
-async fn staged_upload_transport_bounds_escaped_requests_ids_and_error_frames() {
-    use intent_core::note_stage::NoteStageAppend;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    struct StageApi {
-        calls: AtomicUsize,
-    }
-    impl WorkspaceApi for StageApi {
-        fn note_operation_append(&self, _request: NoteStageAppend) -> BoxFuture<'_, Result<Value>> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async { Err(Error::Internal("private staged bytes".repeat(8192))) })
-        }
-    }
-    let api = StageApi {
-        calls: AtomicUsize::new(0),
-    };
-    let mut params = serde_json::json!({"backendId":"b","workspaceId":"w","noteId":"n","noteInstanceId":"i","operationId":"11111111-1111-4111-8111-111111111111","headerDigest":"a".repeat(64),"stream":"text","sequence":0,"previousDigest":null,"records":[{"kind":"text","id":"x","offset":0,"text":"\u{1}".repeat(16384)}],"chunkDigest":"b".repeat(64)});
-    let frame=serde_json::json!({"jsonrpc":"2.0","id":1,"method":"note.operation.append","params":params}).to_string();
-    assert!(frame.len() > 65536);
-    let response = handle_message(&api, &frame).await.unwrap();
-    assert!(response.len() <= 4096);
-    assert!(response.contains("note-page-budget"));
-    assert_eq!(api.calls.load(Ordering::Relaxed), 0);
-    params["records"][0]["text"] = serde_json::json!("valid");
+async fn paginated_viewing_does_not_dispatch_retired_edit_operations() {
+    let api = FakeApi;
     for method in [
+        "note.applySplices",
+        "note.operationStatus",
         "note.operation.begin",
         "note.operation.append",
+        "note.operation.seal",
+        "note.operation.commit",
         "note.operation.cancel",
+        "note.operation.read",
     ] {
-        let frame=serde_json::json!({"jsonrpc":"2.0","id":"x".repeat(65),"method":method,"params":params}).to_string();
-        let response = handle_message(&api, &frame).await.unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&response).unwrap()["id"],
-            Value::Null
-        );
-        assert_eq!(api.calls.load(Ordering::Relaxed), 0);
-    }
-    let frame=serde_json::json!({"jsonrpc":"2.0","id":"\u{1}".repeat(64),"method":"note.operation.append","params":params}).to_string();
-    let response = handle_message(&api, &frame).await.unwrap();
-    assert!(response.len() <= 4096);
-    assert!(!response.contains("private staged"));
-    assert_eq!(api.calls.load(Ordering::Relaxed), 1);
-    params.as_object_mut().unwrap().remove("previousDigest");
-    let frame=serde_json::json!({"jsonrpc":"2.0","id":2,"method":"note.operation.append","params":params}).to_string();
-    let response = handle_message(&api, &frame).await.unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&response).unwrap()["error"]["code"],
-        -32602
-    );
-    assert_eq!(api.calls.load(Ordering::Relaxed), 1);
-}
-
-#[tokio::test]
-async fn note_receipt_dispatch_preserves_both_typed_envelopes_and_rejects_malformed() {
-    use intent_core::note_receipt_detail::ReceiptDetailQuery;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    struct ReceiptApi(AtomicUsize);
-    impl WorkspaceApi for ReceiptApi {
-        fn get_note_receipt_detail(
-            &self,
-            query: ReceiptDetailQuery,
-            id: Value,
-        ) -> BoxFuture<'_, Result<Value>> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                Ok(
-                    serde_json::json!({"operationEnvelope":query.operation_envelope,"ref":query.reference,"digest":query.payload_digest,"id":id}),
-                )
+        let raw = handle_message(
+            &api,
+            &serde_json::json!({
+                "jsonrpc":"2.0", "id":7, "method":method,
+                "params":{"workspaceId":"w","noteId":"n"}
             })
-        }
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["id"], 7);
+        assert_eq!(err_code(&response), -32601, "{method}: {response}");
     }
-    let api = ReceiptApi(AtomicUsize::new(0));
-    let scope =
-        serde_json::json!({"backendId":"b","workspaceId":"w","noteId":"n","noteInstanceId":"i"});
-    for operation in [false, true] {
-        let mut params = scope.clone();
-        let operation_id = "11111111-1111-4111-8111-111111111111";
-        if operation {
-            params["operationId"] = serde_json::json!(operation_id);
-            params["payloadDigest"] = serde_json::json!("a".repeat(64));
-            params["kind"] = serde_json::json!("mapping");
-            params["ref"] = serde_json::json!("owned:map");
-            params["maxWireBytes"] = serde_json::json!(4096);
-        } else {
-            params["page"] = serde_json::json!({"kind":"mapping","operationId":operation_id,"ref":"owned:map","maxWireBytes":4096});
-        }
-        let mut request = serde_json::json!({"jsonrpc":"2.0","id":7,"method":if operation{"note.operation.read"}else{"note.get"},"params":params});
-        let raw = handle_message(&api, &request.to_string()).await.unwrap();
-        assert!(raw.len() <= 4096);
-        let value: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(value["result"]["operationEnvelope"], operation);
-        assert_eq!(value["result"]["ref"], "owned:map");
-        assert_eq!(value["result"]["id"], 7);
-        assert_eq!(
-            value["result"]["digest"],
-            if operation {
-                serde_json::json!("a".repeat(64))
-            } else {
-                Value::Null
-            }
-        );
-        let before = api.0.load(Ordering::SeqCst);
-        request["params"]["unexpected"] = serde_json::json!(true);
-        let invalid = handle_message(&api, &request.to_string()).await.unwrap();
-        assert_eq!(err_code(&serde_json::from_str(&invalid).unwrap()), -32602);
-        assert_eq!(api.0.load(Ordering::SeqCst), before);
-    }
-    assert_eq!(api.0.load(Ordering::SeqCst), 2);
 }

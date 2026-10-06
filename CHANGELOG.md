@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.22] - 2026-10-06
+
+### 🐛 Bug Fixes
+
+- Bump Codex ACP fallback to v2.1.1 ([#2232](https://github.com/intent-hq/intentd/pull/2232))
+
+
+## [0.10.21] - 2026-10-06
+
+### 🚀 Features
+
+- Expose negotiated GitLab owner avatars ([#2316](https://github.com/intent-hq/intentd/pull/2316))
+
+### 🐛 Bug Fixes
+
+- Defer completion retries while script notifications are pending ([#2314](https://github.com/intent-hq/intentd/pull/2314))
+- Reject invalid script cwd before replacing definitions ([#2311](https://github.com/intent-hq/intentd/pull/2311))
+- Preserve queued message attachment groups ([#2321](https://github.com/intent-hq/intentd/pull/2321))
+- Preserve automatic recovery during native compaction ([#2313](https://github.com/intent-hq/intentd/pull/2313))
+
+### 🧪 Testing
+
+- Isolate daemon fixture identities by default ([#2312](https://github.com/intent-hq/intentd/pull/2312))
+
+
 ## [0.10.20] - 2026-10-05
 
 ### 🐛 Bug Fixes

@@ -20,6 +20,8 @@
 #![cfg(unix)]
 
 mod common;
+#[path = "e2e_wss_harness_wake/compaction_restart.rs"]
+mod compaction_restart;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};

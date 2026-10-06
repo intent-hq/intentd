@@ -26,7 +26,6 @@ mod workspace_delete;
 
 mod metadata_key_json;
 mod note_annotations;
-mod note_artifacts;
 mod note_line_attribution;
 mod note_pages;
 mod note_search;
@@ -7302,11 +7301,12 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
     };
     let store = Store {
         note_pages: std::sync::Arc::default(),
-        artifact_arena: std::sync::Arc::default(),
-        write_pool,
+        _daemon_owner: None,
+        write_pool: write_pool.into(),
         read_pool: crate::connect_read(&tmp.path)
             .await
-            .expect("open read pool"),
+            .expect("open read pool")
+            .into(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
         export_author_barrier: std::sync::Arc::default(),
         repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),

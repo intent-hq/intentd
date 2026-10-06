@@ -185,6 +185,18 @@ impl Fixture {
         config["installed"] = json!(true);
         fs::write(root.path().join("fixture.json"), config.to_string()).unwrap();
         fs::write(root.path().join("events.jsonl"), "").unwrap();
+        // Doctor now inspects only existing databases; fixture setup owns schema creation.
+        fs::create_dir(root.path().join("data")).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let store = intent_store::Store::open(&root.path().join("data/intentd.db"))
+                    .await
+                    .unwrap();
+                store.close().await;
+            });
         Self {
             root,
             adapter,

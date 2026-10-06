@@ -1,0 +1,5 @@
+error[E0599]: no method named `set_connect_options` found for reference `&StorePool` in the current scope
+ --> tests/ui/store_pool_setter.rs:2:10
+  |
+2 |     pool.set_connect_options(sqlx::sqlite::SqliteConnectOptions::new());
+  |          ^^^^^^^^^^^^^^^^^^^ method not found in `&StorePool`

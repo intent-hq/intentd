@@ -1693,7 +1693,7 @@ async fn cmd_serve(
     // Snapshot DB-file existence before `Store::open` creates it: the one-time
     // legacy workspace import below fires only on a truly fresh database.
     let db_existed = config.db_path.exists();
-    let store = Store::open(&config.db_path)
+    let store = Store::open_for_daemon(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     // One-time auto_vacuum activation (monorepo#720 finding 1): a legacy
@@ -7084,7 +7084,7 @@ async fn cmd_doctor(codex_models: bool) -> ExitCode {
         }
     }
 
-    match Store::open(&config.db_path).await {
+    match intent_store::DiagnosticStore::open(&config.db_path).await {
         Ok(store) => {
             println!("[ok] sqlite openable: {}", config.db_path.display());
             match store.migration_status().await {
@@ -7118,6 +7118,7 @@ async fn cmd_doctor(codex_models: bool) -> ExitCode {
 
             // DB health checks (STAB-15 observability)
             report_db_health(&store).await;
+            store.close().await;
         }
         Err(e) => {
             ok = false;
@@ -7682,10 +7683,9 @@ fn check_data_dir_writable(config: &Config) -> anyhow::Result<()> {
 }
 
 /// Report database health metrics for diagnostics (STAB-15 observability).
-/// Runs PRAGMA `integrity_check`, PRAGMA `wal_checkpoint(PASSIVE)`, and reports
-/// connection pool stats. Never fails the doctor check — all checks are
-/// informational.
-async fn report_db_health(store: &Store) {
+/// Runs read-only integrity and space queries; never checkpoints the WAL.
+/// Never fails the doctor check — all checks are informational.
+async fn report_db_health(store: &intent_store::DiagnosticStore) {
     println!("database health:");
 
     // PRAGMA integrity_check: verify DB structural integrity
@@ -7717,44 +7717,7 @@ async fn report_db_health(store: &Store) {
         }
     }
 
-    // PRAGMA wal_checkpoint(PASSIVE): report checkpoint stats
-    // Returns (busy, log, checkpointed) — number of frames in WAL and how many
-    // were checkpointed. PASSIVE mode does not block writers. busy > 0 means the
-    // checkpoint couldn't complete.
-    match sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
-        .fetch_one(store.write_pool())
-        .await
-    {
-        Ok(row) => {
-            let busy = row.try_get::<i64, _>(0);
-            let log = row.try_get::<i64, _>(1);
-            let checkpointed = row.try_get::<i64, _>(2);
-
-            match (busy, log, checkpointed) {
-                (Ok(busy), Ok(log), Ok(checkpointed)) => {
-                    if busy != 0 {
-                        println!(
-                            "  [WARN] wal_checkpoint(PASSIVE): busy={busy}, log={log} frames, checkpointed={checkpointed} frames (checkpoint incomplete)"
-                        );
-                    } else if checkpointed < log {
-                        println!(
-                            "  [WARN] wal_checkpoint(PASSIVE): log={log} frames, checkpointed={checkpointed} frames (partial checkpoint)"
-                        );
-                    } else {
-                        println!(
-                            "  [ok] wal_checkpoint(PASSIVE): log={log} frames, checkpointed={checkpointed} frames"
-                        );
-                    }
-                }
-                _ => {
-                    println!("  [WARN] wal_checkpoint(PASSIVE): failed to decode PRAGMA result");
-                }
-            }
-        }
-        Err(e) => {
-            println!("  [WARN] wal_checkpoint failed: {e}");
-        }
-    }
+    println!("  [ok] WAL checkpoint skipped (read-only diagnostics)");
 
     // auto_vacuum / freelist: new databases are created with
     // auto_vacuum=INCREMENTAL so the retention loop's bounded
@@ -7767,7 +7730,9 @@ async fn report_db_health(store: &Store) {
         .await
         .ok()
         .and_then(|row| row.try_get::<i64, _>(0).ok());
-    let freelist = store.freelist_count().await;
+    let freelist = sqlx::query_scalar::<_, i64>("PRAGMA freelist_count")
+        .fetch_one(store.read_pool())
+        .await;
     match (auto_vacuum, &freelist) {
         (Some(2), Ok(freelist)) => {
             println!("  [ok] auto_vacuum: INCREMENTAL (freelist_count={freelist} pages)");
@@ -7786,15 +7751,11 @@ async fn report_db_health(store: &Store) {
         _ => println!("  [WARN] auto_vacuum/freelist_count: failed to query"),
     }
 
-    // Connection pool stats: report size and idle connections for both pools
-    let write_pool = store.write_pool();
-    let write_size = write_pool.size();
-    let write_idle = write_pool.num_idle();
-    let read_pool = store.read_pool();
-    let read_size = read_pool.size();
-    let read_idle = read_pool.num_idle();
+    let pool = store.read_pool();
     println!(
-        "  [ok] write_pool: size={write_size}, idle={write_idle} | read_pool: size={read_size}, idle={read_idle}"
+        "  [ok] diagnostic read_pool: size={}, idle={}",
+        pool.size(),
+        pool.num_idle()
     );
 }
 

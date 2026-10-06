@@ -1,23 +1,7 @@
 //! Bounded reads over write-maintained indexes. Tokens are authenticated with a
 //! persistent database secret, while bounded snapshot leases are process-local.
-mod artifact;
-mod artifact_arena;
-pub(crate) use artifact_arena::ArtifactArena;
-mod artifact_append;
-pub use artifact_append::ArtifactJournalRecordCost;
-mod artifact_begin;
 mod token;
-pub use artifact::{ArtifactSourceGrant, CanonicalSourceBinding, CanonicalSourceHold};
-mod artifact_lifecycle;
-mod artifact_maintenance;
-mod artifact_publication;
-mod artifact_read;
-mod artifact_response;
 use crate::Store;
-pub use artifact_lifecycle::ArtifactJournalStatus;
-pub use artifact_maintenance::ArtifactJournalPurge;
-pub use artifact_publication::ArtifactJournalLease;
-pub use artifact_read::ArtifactJournalRecord;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
 use intent_core::{
@@ -27,7 +11,7 @@ use intent_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
-use sqlx::{Acquire, Row, SqliteConnection, SqlitePool};
+use sqlx::{Acquire, Row, SqliteConnection};
 use std::{collections::BTreeMap, sync::Mutex, time::Instant};
 
 const MAX_SNAPSHOTS: usize = 256;
@@ -41,20 +25,10 @@ struct Snapshot {
     principal: String,
     born: Instant,
     expires: String,
-    pins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-}
-
-#[derive(Debug)]
-pub(super) struct SnapshotPin(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-impl Drop for SnapshotPin {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
 }
 
 #[cfg_attr(test, derive(Default))]
 pub(crate) struct Runtime {
-    id: String,
     backend: String,
     key: Vec<u8>,
     snapshots: Mutex<BTreeMap<String, Snapshot>>,
@@ -103,14 +77,13 @@ fn utf16_byte(text: &str, offset: u64) -> Result<usize> {
 }
 
 impl Runtime {
-    pub(crate) async fn open(pool: &SqlitePool) -> Result<Self> {
+    pub(crate) async fn open(pool: &crate::StorePool) -> Result<Self> {
         let row =
             sqlx::query("SELECT backend_id,token_key FROM note_page_backend WHERE singleton=1")
                 .fetch_one(pool)
                 .await
                 .map_err(db_error)?;
         Ok(Self {
-            id: uuid::Uuid::new_v4().simple().to_string(),
             backend: row.try_get("backend_id").map_err(db_error)?,
             key: row.try_get("token_key").map_err(db_error)?,
             snapshots: Mutex::new(BTreeMap::new()),
@@ -170,7 +143,7 @@ impl Runtime {
         }
         Ok(snapshot.clone())
     }
-    fn remember(&self, mut snapshot: Snapshot) -> Result<String> {
+    fn remember(&self, snapshot: Snapshot) -> Result<String> {
         let mut snapshots = self
             .snapshots
             .lock()
@@ -179,7 +152,6 @@ impl Runtime {
         if snapshots.len() >= MAX_SNAPSHOTS {
             if let Some(id) = snapshots
                 .iter()
-                .filter(|(_, s)| s.pins.load(std::sync::atomic::Ordering::Relaxed) == 0)
                 .min_by_key(|(_, s)| s.born)
                 .map(|(id, _)| id.clone())
             {
@@ -189,22 +161,8 @@ impl Runtime {
             }
         }
         let id = uuid::Uuid::new_v4().simple().to_string();
-        snapshot.pins = std::sync::Arc::default();
         snapshots.insert(id.clone(), snapshot);
         Ok(id)
-    }
-    fn pin_snapshot(&self, id: &str) -> Result<std::sync::Arc<SnapshotPin>> {
-        let snapshots = self.snapshots.lock().map_err(|_| invalid())?;
-        let snapshot = snapshots
-            .get(id)
-            .ok_or_else(|| failure(NotePageError::Expired))?;
-        if snapshot.born.elapsed().as_secs() >= SNAPSHOT_SECONDS {
-            return Err(failure(NotePageError::Expired));
-        }
-        snapshot
-            .pins
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(std::sync::Arc::new(SnapshotPin(snapshot.pins.clone())))
     }
     fn reference(&self, snapshot: &str, raw: &str) -> String {
         let (collection, offset) = raw.split_once('@').map_or((raw, 0), |(c, n)| {
@@ -234,6 +192,12 @@ impl Runtime {
 }
 
 impl Store {
+    /// Persistent database identity used by bounded note page scopes.
+    #[must_use]
+    pub fn note_paging_backend_id(&self) -> &str {
+        &self.note_pages.backend
+    }
+
     /// Prepared source-session read requiring observable connection settlement.
     ///
     /// # Errors
@@ -457,7 +421,6 @@ impl Store {
             principal: principal.into(),
             born: Instant::now(),
             expires: intent_core::iso_ms_from_now(300_000),
-            pins: std::sync::Arc::default(),
         });
         let snapshot_id = match snapshot_id {
             Some(id) => id.into(),
@@ -952,7 +915,6 @@ mod lifetime_tests {
     #[tokio::test]
     async fn authenticated_snapshot_expiry_eviction_and_principal_scope() {
         let runtime = Runtime {
-            id: "test-runtime".into(),
             backend: "db".into(),
             key: vec![7; 32],
             snapshots: Mutex::new(BTreeMap::new()),
@@ -969,7 +931,6 @@ mod lifetime_tests {
             principal: "alice".into(),
             born: Instant::now(),
             expires: "fixed".into(),
-            pins: std::sync::Arc::default(),
         };
         let id = runtime.remember(snapshot.clone()).unwrap();
         let value = Token(
@@ -1003,7 +964,6 @@ mod lifetime_tests {
                 ));
             }
             let restarted = Runtime {
-                id: "restarted-runtime".into(),
                 backend: runtime.backend.clone(),
                 key: runtime.key.clone(),
                 snapshots: Mutex::new(BTreeMap::new()),
@@ -1037,12 +997,6 @@ mod lifetime_tests {
             .born
             .checked_sub(std::time::Duration::from_secs(1))
             .unwrap();
-        let pin = runtime.pin_snapshot(&pinned_id).unwrap();
-        for _ in 0..MAX_SNAPSHOTS {
-            runtime.remember(snapshot.clone()).unwrap();
-        }
-        assert!(runtime.snapshot(&pinned_id, "ws", "n", "alice").is_ok());
-        drop(pin);
         for _ in 0..MAX_SNAPSHOTS {
             runtime.remember(snapshot.clone()).unwrap();
         }

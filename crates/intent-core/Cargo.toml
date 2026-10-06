@@ -1,6 +1,6 @@
 [package]
 name = "intent-core"
-version = "0.10.20"
+version = "0.10.22"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -11,9 +11,7 @@ description = "Intent domain vocabulary: ids, errors, config, events, and cross-
 async-trait = "0.1"
 thiserror = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true, features = ["float_roundtrip"] }
-ryu-js = "=1.0.2"
-sha2 = "0.10"
+serde_json = { workspace = true }
 uuid = { workspace = true }
 time = { workspace = true }
 directories = { workspace = true }

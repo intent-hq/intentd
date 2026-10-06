@@ -192,7 +192,7 @@ pub(crate) async fn handle(
         };
     }
     *client_id = Some(resolved.clone());
-    let server = server_json(
+    let mut server = server_json(
         detect_has_display(),
         std::env::consts::OS,
         std::env::consts::ARCH,
@@ -200,6 +200,11 @@ pub(crate) async fn handle(
         crate::BUILD_COMMIT,
         is_local,
     );
+    if let Some(backend_id) = api.note_paging_backend_id() {
+        server["capabilities"]["notePagingRead"] = json!(1);
+        server["capabilities"]["notePagingBackendId"] = json!(backend_id);
+        server["capabilities"]["noteAnnotations"] = json!(1);
+    }
     HelloOutcome {
         frame: frame(
             req.id_present,

@@ -1,5 +1,5 @@
 //! Opt-in bounded note read vocabulary. This does not advertise `notePaging`:
-//! that capability also requires partial writes and bounded subscriptions.
+//! the retired editing capability is separate from bounded read support.
 use serde::{Deserialize, Serialize};
 
 /// Hard decoded source budget.

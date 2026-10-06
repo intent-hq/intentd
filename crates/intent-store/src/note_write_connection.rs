@@ -16,7 +16,7 @@ impl NoteWriteConnection {
         Self::begin_pool(store.write_pool()).await
     }
 
-    pub(crate) async fn begin_pool(pool: &sqlx::SqlitePool) -> Result<Self> {
+    pub(crate) async fn begin_pool(pool: &crate::StorePool) -> Result<Self> {
         let conn = pool
             .acquire()
             .await
