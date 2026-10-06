@@ -36,7 +36,9 @@ for line in sys.stdin:
               'message': 'unsupported method; never-echo-this-secret'}})
         continue
     result = {}
-    if method == 'configRequirements/read':
+    if method == 'test/echo':
+        result = request['params']
+    elif method == 'configRequirements/read':
         result = {'requirements': None}
         if (home / 'managed-store').exists():
             result = {'requirements': {'cliAuthCredentialsStore': (home / 'managed-store').read_text()}}

@@ -23,7 +23,7 @@ pub(crate) const NATIVE_ENV: &[(&str, &str)] = &[
     ),
 ];
 
-const LIMIT: usize = 8 * 1024 * 1024;
+const AUTH_FRAME_LIMIT: usize = 8 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(7);
 const AUTH_ERROR: &str =
     "Native Codex authentication is unavailable. Run codex login on this daemon host, then Retry.";
@@ -128,12 +128,14 @@ fn token_identity(token: &str) -> Result<(String, String)> {
 struct Frames<R> {
     reader: R,
     bytes: Vec<u8>,
+    limit: Option<usize>,
 }
 impl<R: AsyncBufRead + Unpin> Frames<R> {
     fn new(reader: R) -> Self {
         Self {
             reader,
             bytes: Vec::new(),
+            limit: None,
         }
     }
     // Bytes live on the reader, so cancelling a select branch cannot discard
@@ -152,7 +154,10 @@ impl<R: AsyncBufRead + Unpin> Frames<R> {
                 .iter()
                 .position(|&b| b == b'\n')
                 .map_or(buffer.len(), |i| i + 1);
-            if self.bytes.len() + take > LIMIT {
+            if self
+                .limit
+                .is_some_and(|limit| self.bytes.len().saturating_add(take) > limit)
+            {
                 return Err(CONTRACT_ERROR);
             }
             self.bytes.extend_from_slice(&buffer[..take]);
@@ -199,6 +204,9 @@ impl Server {
         let _ = self.child.wait().await;
     }
     async fn native_call(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
+        // Only authority responses have an auth-sized cap. Worker traffic must
+        // preserve ACP's inline images, tool output and session history sizes.
+        self.output.limit = Some(AUTH_FRAME_LIMIT);
         write_frame(
             &mut self.input,
             &json!({"id":id,"method":method,"params":params}),

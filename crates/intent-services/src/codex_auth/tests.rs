@@ -722,3 +722,49 @@ async fn cancelled_partial_frame_is_retained_and_malformed_payload_is_redacted()
     );
     assert_eq!(frames.next().await, Err(CONTRACT_ERROR));
 }
+
+#[tokio::test]
+async fn proxy_preserves_supported_image_sized_frames_in_both_directions() {
+    let f = Fixture::new();
+    f.login(&token("account", "user", 1, false), None);
+    let mut server = f.server();
+    let mut bridge = f.bridge();
+    let (mut client, input) = tokio::io::duplex(65536);
+    let (mut output, client_output) = tokio::io::duplex(65536);
+    let mut input = Frames::new(BufReader::new(input));
+    let image_len = usize::try_from(crate::agent_ops::IMAGE_REF_MAX_BYTES)
+        .unwrap()
+        .div_ceil(3)
+        * 4;
+    let exchange = async {
+        let image = "A".repeat(image_len);
+        write_frame(
+            &mut client,
+            &json!({"id":7,"method":"test/echo","params":{"image":image}}),
+        )
+        .await
+        .unwrap();
+        let mut responses = Frames::new(BufReader::new(client_output));
+        let response = responses.next().await.unwrap().unwrap();
+        let returned = response["result"]["image"].as_str().unwrap();
+        assert_eq!(returned.len(), image_len);
+        assert!(returned.bytes().all(|byte| byte == b'A'));
+        drop(client);
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (result, ()) =
+            tokio::join!(bridge.proxy(&mut server, &mut input, &mut output), exchange);
+        result.unwrap();
+    })
+    .await
+    .unwrap();
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn native_authority_frames_remain_bounded() {
+    let bytes = b"{\"id\":1,\"result\":{}}\n";
+    let mut frames = Frames::new(&bytes[..]);
+    frames.limit = Some(8);
+    assert_eq!(frames.next().await, Err(CONTRACT_ERROR));
+}

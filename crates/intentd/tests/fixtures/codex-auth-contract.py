@@ -316,6 +316,20 @@ def main():
         if len(sys.argv) > 2:
             bridge = Path(sys.argv[2])
             assert bridge.is_absolute() and bridge.is_file()
+            # Proxy traffic must retain upstream's supported inline image size.
+            # A nonexistent thread rejects before model work or image decoding.
+            for label, executable in [('native', None), ('Intent', bridge)]:
+                with Probe(seed=auth_seed(token), bridge=executable) as image_probe:
+                    image_probe.initialize()
+                    assert 'result' in image_probe.call('account/read', {'refreshToken': False})
+                    image = 'data:image/png;base64,' + 'A' * (9 * 1024 * 1024)
+                    result = image_probe.call('turn/start', {
+                        'threadId': 'synthetic-missing-thread',
+                        'input': [{'type': 'image', 'url': image}],
+                    })
+                    assert 'error' in result and 'thread' in result['error']['message'].lower()
+                    assert 'result' in image_probe.call('account/read', {'refreshToken': False})
+                    passed(label + ' accepts a 9MiB inline-image frame and stays available')
             # Local detach never routes account/logout to native auth. The
             # separate unmodified native control must still reach revoke.
             with Probe(seed=auth_seed(token), bridge=bridge) as p:
