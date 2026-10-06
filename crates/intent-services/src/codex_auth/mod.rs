@@ -349,7 +349,7 @@ fn read_record(path: &Path) -> Result<Option<Vec<u8>>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = match options.open(path) {
         Ok(file) => file,
@@ -370,6 +370,82 @@ fn read_record(path: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
+fn persist_identity(profile: &Path, identity: &str) -> Result<()> {
+    use std::io::Write;
+    let marker = profile.join(".intent-native-account");
+    match read_record(&marker)? {
+        Some(saved) if saved != identity.as_bytes() => return Err(ACCOUNT_ERROR),
+        Some(_) => {}
+        None => {
+            let mut file = tempfile::NamedTempFile::new_in(profile).map_err(|_| AUTH_ERROR)?;
+            file.write_all(identity.as_bytes())
+                .map_err(|_| AUTH_ERROR)?;
+            file.as_file().sync_all().map_err(|_| AUTH_ERROR)?;
+            match file.persist_noclobber(&marker) {
+                Ok(_) => {}
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if read_record(&marker)?.as_deref() != Some(identity.as_bytes()) {
+                        return Err(ACCOUNT_ERROR);
+                    }
+                }
+                Err(_) => return Err(AUTH_ERROR),
+            }
+        }
+    }
+    // The binding must survive a crash before any legacy credential is removed.
+    std::fs::File::open(profile)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| AUTH_ERROR)
+}
+
+fn migrate_credentials(profile: &Path, native: &Path) -> Result<()> {
+    let profile_path = profile.canonicalize().map_err(|_| AUTH_ERROR)?;
+    if native.canonicalize().ok().as_ref() == Some(&profile_path) {
+        return Err(AUTH_ERROR);
+    }
+    let mut sources = Vec::new();
+    let mut identity = None;
+    for name in ["auth.json", "auth.json.intent-legacy"] {
+        let path = profile.join(name);
+        if let Some(bytes) = read_record(&path)? {
+            let auth: Value = serde_json::from_slice(&bytes).map_err(|_| AUTH_ERROR)?;
+            let binding =
+                if let Some(token) = auth.pointer("/tokens/access_token").and_then(Value::as_str) {
+                    // Historical JWTs may have expired; only identity is retained.
+                    let (account, user) = token_identity(token)?;
+                    fingerprint(&format!("chatgpt\0{account}\0{user}"))
+                } else if let Some(key) = auth["OPENAI_API_KEY"]
+                    .as_str()
+                    .filter(|key| !key.is_empty())
+                {
+                    fingerprint(&format!("apikey\0{key}"))
+                } else {
+                    return Err(AUTH_ERROR);
+                };
+            if identity.as_ref().is_some_and(|old| old != &binding) {
+                return Err(ACCOUNT_ERROR);
+            }
+            identity = Some(binding);
+            sources.push((path, bytes));
+        }
+    }
+    if let Some(identity) = identity {
+        // All sources agree before anything changes. Failed persistence retains
+        // them; a retry after binding reuses the marker and finishes removal.
+        persist_identity(profile, &identity)?;
+        for (path, bytes) in sources {
+            match read_record(&path)? {
+                Some(current) if current == bytes => {
+                    std::fs::remove_file(path).map_err(|_| AUTH_ERROR)?
+                }
+                None => {}
+                Some(_) => return Err(ACCOUNT_ERROR),
+            }
+        }
+    }
+    Ok(())
+}
+
 struct Bridge {
     authority: Authority,
     profile: PathBuf,
@@ -377,48 +453,7 @@ struct Bridge {
 }
 impl Bridge {
     fn accept_identity(&self, credentials: &Credentials) -> Result<()> {
-        use std::io::Write;
-        let marker = self.profile.join(".intent-native-account");
-        match read_record(&marker)? {
-            Some(saved) if saved != credentials.identity.as_bytes() => return Err(ACCOUNT_ERROR),
-            Some(_) => return Ok(()),
-            None => {}
-        }
-        // Preserve a directly logged-in legacy profile's account boundary.
-        // Old auth stays on disk for recovery, but ephemeral workers ignore it.
-        if let Some(bytes) = read_record(&self.profile.join("auth.json.intent-legacy"))? {
-            let auth: Value = serde_json::from_slice(&bytes).map_err(|_| AUTH_ERROR)?;
-            if let Some(token) = auth.pointer("/tokens/access_token").and_then(Value::as_str) {
-                let (account, user) = token_identity(token)?;
-                if credentials.identity != fingerprint(&format!("chatgpt\0{account}\0{user}")) {
-                    return Err(ACCOUNT_ERROR);
-                }
-            } else if let Some(key) = auth["OPENAI_API_KEY"]
-                .as_str()
-                .filter(|key| !key.is_empty())
-            {
-                if credentials.identity != fingerprint(&format!("apikey\0{key}")) {
-                    return Err(ACCOUNT_ERROR);
-                }
-            } else {
-                return Err(AUTH_ERROR);
-            }
-        }
-        let mut file = tempfile::NamedTempFile::new_in(&self.profile).map_err(|_| AUTH_ERROR)?;
-        file.write_all(credentials.identity.as_bytes())
-            .map_err(|_| AUTH_ERROR)?;
-        file.as_file().sync_all().map_err(|_| AUTH_ERROR)?;
-        match file.persist_noclobber(&marker) {
-            Ok(_) => Ok(()),
-            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if read_record(&marker)?.as_deref() == Some(credentials.identity.as_bytes()) {
-                    Ok(())
-                } else {
-                    Err(ACCOUNT_ERROR)
-                }
-            }
-            Err(_) => Err(AUTH_ERROR),
-        }
+        persist_identity(&self.profile, &credentials.identity)
     }
 
     async fn refresh(&mut self, frame: &Value, server: &mut Server) -> Result<()> {
@@ -574,6 +609,7 @@ pub async fn run(
     if args.first().map(String::as_str) != Some("app-server") {
         return Err(CONTRACT_ERROR.into());
     }
+    migrate_credentials(&profile, &native_home).map_err(str::to_owned)?;
     let authority = Authority {
         runtime: runtime.clone(),
         home: native_home,
@@ -642,17 +678,7 @@ pub fn install_wrapper(
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"));
-    let legacy = profile.join("auth.json");
-    if std::fs::symlink_metadata(&legacy).is_ok() {
-        let backup = profile.join("auth.json.intent-legacy");
-        let meta = std::fs::symlink_metadata(&legacy).map_err(|_| AUTH_ERROR.to_string())?;
-        if !meta.is_file() || std::fs::symlink_metadata(&backup).is_ok() {
-            return Err("The Codex profile has conflicting legacy credentials. Preserve them and choose the native login before retrying.".into());
-        }
-        std::fs::rename(&legacy, &backup).map_err(|_| AUTH_ERROR.to_string())?;
-        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600))
-            .map_err(|_| AUTH_ERROR.to_string())?;
-    }
+    migrate_credentials(profile, native).map_err(str::to_owned)?;
     let body = format!("#!/bin/sh\nexec {} provider codex-auth-bridge --runtime {} --native-home {} --user-home {} --profile {} -- \"$@\"\n", quote(helper), quote(runtime), quote(native), quote(user_home), quote(profile));
     let path = profile.join("codex-native-auth.sh");
     let result = (|| -> std::io::Result<()> {

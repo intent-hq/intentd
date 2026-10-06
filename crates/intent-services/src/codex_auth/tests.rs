@@ -191,6 +191,8 @@ fn expired_legacy_identity_migrates_but_account_or_user_changes_do_not() {
         )
         .unwrap();
         assert!(!f.profile.join("auth.json").exists());
+        assert!(!f.profile.join("auth.json.intent-legacy").exists());
+        assert!(f.profile.join(".intent-native-account").exists());
         assert_eq!(
             f.bridge()
                 .accept_identity(&credentials(&token(account, user, 1, false)))
@@ -210,6 +212,113 @@ fn expired_legacy_identity_migrates_but_account_or_user_changes_do_not() {
         }
     }
 }
+#[test]
+fn migration_failure_preserves_credentials_and_retry_removes_only_owned_legacy_files() {
+    let f = Fixture::new();
+    let legacy = json!({"tokens":{"access_token":token("account", "user", 0, true),"refresh_token":"old-secret"}}).to_string();
+    let marker = f.profile.join(".intent-native-account");
+    let install = || {
+        install_wrapper(
+            &f.profile,
+            &f.runtime,
+            &f.native,
+            &f.native,
+            Path::new("/intentd"),
+        )
+    };
+    std::fs::write(f.native.join("auth.json"), "native-untouched").unwrap();
+    std::fs::write(f.profile.join("auth.json"), &legacy).unwrap();
+    std::fs::write(f.profile.join("auth.json.intent-legacy"), &legacy).unwrap();
+    std::fs::write(f.profile.join("session"), "keep-history").unwrap();
+    // A non-file marker deterministically prevents durable binding, even as root.
+    std::fs::create_dir(&marker).unwrap();
+    assert!(install().is_err());
+    for name in ["auth.json", "auth.json.intent-legacy"] {
+        assert_eq!(
+            std::fs::read_to_string(f.profile.join(name)).unwrap(),
+            legacy
+        );
+    }
+    std::fs::remove_dir(&marker).unwrap();
+    install().unwrap();
+    let expected = credentials(&token("account", "user", 1, false)).identity;
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), expected);
+    for name in ["auth.json", "auth.json.intent-legacy"] {
+        assert!(!f.profile.join(name).exists());
+    }
+    // Simulate interruption after binding but before removing the old source.
+    std::fs::write(f.profile.join("auth.json.intent-legacy"), &legacy).unwrap();
+    install().unwrap();
+    install().unwrap();
+    assert!(!f.profile.join("auth.json.intent-legacy").exists());
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), expected);
+    assert_eq!(
+        std::fs::read_to_string(f.profile.join("session")).unwrap(),
+        "keep-history"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.native.join("auth.json")).unwrap(),
+        "native-untouched"
+    );
+}
+
+#[test]
+fn migration_rejects_conflicting_bindings_and_never_migrates_the_native_home() {
+    let f = Fixture::new();
+    for (name, account) in [("auth.json", "one"), ("auth.json.intent-legacy", "two")] {
+        std::fs::write(f.profile.join(name), json!({"tokens":{"access_token":token(account, "user", 0, true),"refresh_token":"secret"}}).to_string()).unwrap();
+    }
+    assert!(install_wrapper(
+        &f.profile,
+        &f.runtime,
+        &f.native,
+        &f.native,
+        Path::new("/intentd")
+    )
+    .is_err());
+    assert!(!f.profile.join(".intent-native-account").exists());
+    assert!(f.profile.join("auth.json").exists());
+    assert!(f.profile.join("auth.json.intent-legacy").exists());
+    std::fs::write(f.native.join("auth.json"), "native-only").unwrap();
+    assert!(install_wrapper(
+        &f.native,
+        &f.runtime,
+        &f.native,
+        &f.native,
+        Path::new("/intentd")
+    )
+    .is_err());
+    assert_eq!(
+        std::fs::read_to_string(f.native.join("auth.json")).unwrap(),
+        "native-only"
+    );
+}
+
+#[test]
+fn migration_does_not_follow_legacy_credential_symlinks() {
+    let f = Fixture::new();
+    let unrelated = f.native.join("unrelated.json");
+    let bytes = json!({"tokens":{"access_token":token("account", "user", 0, true),"refresh_token":"unrelated-secret"}}).to_string();
+    std::fs::write(&unrelated, &bytes).unwrap();
+    std::os::unix::fs::symlink(&unrelated, f.profile.join("auth.json.intent-legacy")).unwrap();
+    assert!(install_wrapper(
+        &f.profile,
+        &f.runtime,
+        &f.native,
+        &f.native,
+        Path::new("/intentd")
+    )
+    .is_err());
+    assert!(!f.profile.join(".intent-native-account").exists());
+    assert!(
+        std::fs::symlink_metadata(f.profile.join("auth.json.intent-legacy"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read_to_string(unrelated).unwrap(), bytes);
+}
+
 #[tokio::test]
 async fn worker_refresh_receives_only_access_token_and_persists_native_rotation() {
     let f = Fixture::new();

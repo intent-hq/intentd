@@ -131,6 +131,12 @@ async fn startup_error_cleanup_preserves_native_login_and_retry_uses_relogin() {
         std::fs::create_dir(&profile).unwrap();
         std::fs::write(profile.join("worker"), "").unwrap();
         std::fs::write(profile.join("session"), "existing-conversation").unwrap();
+        std::fs::write(
+            profile.join("auth.json"),
+            json!({"tokens":{"access_token":a,"refresh_token":"obsolete-profile-secret"}})
+                .to_string(),
+        )
+        .unwrap();
         let login = |access: &str| {
             std::fs::write(
                 native.join("auth.json"),
@@ -142,6 +148,9 @@ async fn startup_error_cleanup_preserves_native_login_and_retry_uses_relogin() {
         login(&a);
         std::fs::write(profile.join("setup-error"), error).unwrap();
         let mut client = Client::start(&profile, &native, &runtime).await;
+        assert!(!profile.join("auth.json").exists());
+        assert!(!profile.join("auth.json.intent-legacy").exists());
+        assert!(profile.join(".intent-native-account").exists());
         let failed = client
             .call(
                 2,
