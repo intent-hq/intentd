@@ -1300,3 +1300,7 @@ mod tests;
 
 #[path = "native_checkout/operations.rs"]
 pub(crate) mod operations;
+
+#[path = "native_checkout/repo_config.rs"]
+mod repo_config;
+pub(crate) use repo_config::read as repo_config;

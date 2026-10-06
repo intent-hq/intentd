@@ -190,13 +190,14 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // GitLab pre-workspace checkout (13.5): +6 router methods.
 // Provider adapter preparation (13.6): +1 fast-path method.
 // Desktop control adds four router methods; reverse methods are counted separately.
-const EXPECTED_TOTAL_METHODS: usize = 432;
+// GitLab checkout repository configuration adds one router method.
+const EXPECTED_TOTAL_METHODS: usize = 433;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
-const EXPECTED_ROUTER_METHODS: usize = 376;
+const EXPECTED_ROUTER_METHODS: usize = 377;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -834,6 +835,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "sourceControl.checkout.project",
     "sourceControl.checkout.projects",
     "sourceControl.checkout.release",
+    "sourceControl.checkout.repoConfig",
     "sourceControl.checkout.warm",
     "sourceControl.connect",
     "sourceControl.getUser",

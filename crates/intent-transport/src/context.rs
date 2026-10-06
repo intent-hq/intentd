@@ -168,6 +168,9 @@ pub(crate) fn with_repository_frame<T>(raw: &str, construct: impl FnOnce() -> T)
                 "sourceControl.checkout.branches" => {
                     serde_json::from_value(params).ok().map(Frame::Branches)
                 }
+                "sourceControl.checkout.repoConfig" => {
+                    serde_json::from_value(params).ok().map(Frame::RepoConfig)
+                }
                 "sourceControl.checkout.warm" => {
                     serde_json::from_value(params).ok().map(Frame::Warm)
                 }

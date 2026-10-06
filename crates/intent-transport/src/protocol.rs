@@ -736,7 +736,9 @@ use std::time::{Duration, Instant};
 // promises admission only; clients tolerate -32601 on older daemons.
 // Version 13.7 adds capability-gated checkout owner-avatar opt-in.
 // Numeric versions do not replace the original connection capability.
-pub const PROTOCOL_VERSION: &str = "13.7";
+// Version 13.8 adds fixed GitLab checkout configuration reads, gated by
+// gitlabCheckoutRepoConfig: 1 as well as the original checkout capability.
+pub const PROTOCOL_VERSION: &str = "13.8";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

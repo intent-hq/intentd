@@ -129,6 +129,20 @@ pub trait WorkspaceApi: Send + Sync {
     > {
         Box::pin(async { Err(Error::Forbidden("Repository checkout unavailable".into())) })
     }
+    fn repository_checkout_repo_config(
+        &self,
+        _query: crate::repository_checkout::CheckoutRepoConfigQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            crate::repository_checkout::CheckoutResult<
+                crate::repository_checkout::CheckoutRepoConfig,
+            >,
+        >,
+    > {
+        Box::pin(async { Err(Error::Forbidden("Repository checkout unavailable".into())) })
+    }
+
     fn repository_checkout_warm(
         &self,
         _query: crate::repository_checkout::CheckoutSelection,

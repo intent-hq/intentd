@@ -78,3 +78,72 @@ fn owner_avatar_capture_opt_in_is_optional_boolean_and_cannot_be_changed_on_a_pa
     )
     .is_err());
 }
+
+#[test]
+fn config_contract_keeps_null_and_rejects_arbitrary_read_inputs() {
+    let query = serde_json::json!({"checkoutId":"c","revision":"r","projectPath":"team/sub/app","branch":"release/a","commitSha":"0123456789012345678901234567890123456789"});
+    let parsed: CheckoutRepoConfigQuery = serde_json::from_value(query.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), query);
+    for field in ["url", "path", "mode", "workspaceId"] {
+        let mut invalid = query.clone();
+        invalid[field] = serde_json::json!("bad");
+        assert!(serde_json::from_value::<CheckoutRepoConfigQuery>(invalid).is_err());
+    }
+    let result = CheckoutResult::Ready {
+        value: CheckoutRepoConfig {
+            project_path: "team/sub/app".into(),
+            branch: "release/a".into(),
+            commit_sha: "sha".into(),
+            config: None,
+            exists: false,
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        serde_json::json!({"status":"ready","value":{"projectPath":"team/sub/app","branch":"release/a","commitSha":"sha","config":null,"exists":false}})
+    );
+}
+
+#[test]
+fn checkout_config_golden_matches_actual_wire_serialization() {
+    let golden: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/goldens/checkout_repo_config.json"
+    ))
+    .unwrap();
+    let q: CheckoutRepoConfigQuery =
+        serde_json::from_value(golden["request"]["params"].clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&q).unwrap(),
+        golden["request"]["params"]
+    );
+    let mut value = CheckoutRepoConfig {
+        project_path: q.project_path,
+        branch: q.branch,
+        commit_sha: q.commit_sha,
+        config: Some(crate::RepoConfig {
+            setup_script: Some("npm ci".into()),
+            ..Default::default()
+        }),
+        exists: true,
+    };
+    assert_eq!(
+        serde_json::to_value(CheckoutResult::Ready {
+            value: value.clone()
+        })
+        .unwrap(),
+        golden["ready"]
+    );
+    value.config = None;
+    value.exists = false;
+    assert_eq!(
+        serde_json::to_value(CheckoutResult::Ready { value }).unwrap(),
+        golden["absent"]
+    );
+    assert_eq!(
+        serde_json::to_value(CheckoutResult::<CheckoutRepoConfig>::unavailable(
+            CheckoutUnavailable::BranchChanged
+        ))
+        .unwrap(),
+        golden["unavailable"]
+    );
+}

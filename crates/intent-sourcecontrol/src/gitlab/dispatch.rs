@@ -114,4 +114,10 @@ impl GitlabResponseObservation {
 /// or authorize another request; stale receipt rejection remains owner-defined.
 pub trait GitlabResponseReceipt: Send + Sync {
     fn observe(&self, observation: GitlabResponseObservation);
+
+    /// An exact file/branch read confirmed absence after GitLab authorized the
+    /// project. Other receipts keep their conservative behavior.
+    fn observe_missing_checkout_resource(&self, observation: GitlabResponseObservation) {
+        self.observe(observation);
+    }
 }
