@@ -1046,6 +1046,7 @@ rl.on('line', (line) => {{
         std::fs::write(
             &script,
             r"import readline from 'node:readline';
+import { readFileSync } from 'node:fs';
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
 let sessionNew = null;
@@ -1057,7 +1058,7 @@ rl.on('line', (line) => {
   if (msg.method === 'session/new') { sessionNew = msg.params; return send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1' } }); }
   if (msg.method === 'session/set_config_option') { selectedModel = msg.params.value; return send({ jsonrpc: '2.0', id: msg.id, result: {} }); }
   if (msg.method === 'session/prompt') {
-    const text = JSON.stringify({ sessionNew, prompt: msg.params.prompt[0].text, selectedModel, argv: process.argv.slice(2), config: process.argv.includes('--workspaces=false') ? process.env.CODEX_CONFIG : null, hasCodexPath: 'CODEX_PATH' in process.env, codexPath: process.env.CODEX_PATH });
+    const text = JSON.stringify({ sessionNew, prompt: msg.params.prompt[0].text, selectedModel, argv: process.argv.slice(2), config: process.argv.includes('--workspaces=false') ? process.env.CODEX_CONFIG : null, hasCodexPath: 'CODEX_PATH' in process.env, codexPath: process.env.CODEX_PATH, launcher: process.argv.includes('--workspaces=false') ? readFileSync(process.env.CODEX_PATH, 'utf8') : null });
     send({
       jsonrpc: '2.0',
       method: 'session/update',
@@ -1424,10 +1425,16 @@ rl.on('line', (line) => {
                     ])
                 );
                 assert_eq!(observed["hasCodexPath"], true);
-                assert_eq!(
-                    observed["codexPath"],
-                    json!(dir.path().join("runtime/codex"))
-                );
+                assert!(observed["codexPath"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("/codex-native-auth.sh"));
+                let launcher = observed["launcher"].as_str().unwrap();
+                assert!(launcher.contains("provider codex-auth-bridge"));
+                assert!(launcher.contains(&format!(
+                    "--runtime '{}'",
+                    dir.path().join("runtime/codex").display()
+                )));
                 let config: Value =
                     serde_json::from_str(observed["config"].as_str().unwrap()).unwrap();
                 assert_eq!(config["agents"]["enabled"], false);
