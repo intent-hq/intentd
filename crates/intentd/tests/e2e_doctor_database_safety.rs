@@ -379,13 +379,14 @@ async fn competing_serve_exits_before_touching_live_payloads() {
     let slim = seed(&writer).await;
     let before = payloads(&writer, STAGED).await;
     fixture.preflight();
-    let mut command = common::serve_command();
+    let mut command = common::hermetic_serve_command(&fixture.data_dir());
     // Keep the standard serve builder while replacing its environment with the
     // same fail-closed synthetic routing verified by preflight.
     let isolated = fixture.command(Path::new(env!("CARGO_BIN_EXE_intentd")));
     command
         .env_clear()
         .envs(isolated.get_envs().filter_map(|(k, v)| v.map(|v| (k, v))));
+    common::hermetic_fixture_identity(&mut command, &fixture.data_dir());
     command.current_dir(fixture.root.path());
     fixture.run_expected(command, "competing-serve", false);
     fixture.assert_owned();
