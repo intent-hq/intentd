@@ -1058,7 +1058,7 @@ rl.on('line', (line) => {
   if (msg.method === 'session/new') { sessionNew = msg.params; return send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1' } }); }
   if (msg.method === 'session/set_config_option') { selectedModel = msg.params.value; return send({ jsonrpc: '2.0', id: msg.id, result: {} }); }
   if (msg.method === 'session/prompt') {
-    const text = JSON.stringify({ sessionNew, prompt: msg.params.prompt[0].text, selectedModel, argv: process.argv.slice(2), config: process.argv.includes('--workspaces=false') ? process.env.CODEX_CONFIG : null, hasCodexPath: 'CODEX_PATH' in process.env, codexPath: process.env.CODEX_PATH, launcher: process.argv.includes('--workspaces=false') ? readFileSync(process.env.CODEX_PATH, 'utf8') : null });
+    const text = JSON.stringify({ sessionNew, prompt: msg.params.prompt[0].text, selectedModel, argv: process.argv.slice(2), config: process.argv.includes('--workspaces=false') ? process.env.CODEX_CONFIG : null, hasCodexPath: 'CODEX_PATH' in process.env, codexPath: process.env.CODEX_PATH, launcher: process.env.CODEX_PATH?.endsWith('/codex-native-auth.sh') ? readFileSync(process.env.CODEX_PATH, 'utf8') : null });
     send({
       jsonrpc: '2.0',
       method: 'session/update',
