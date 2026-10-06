@@ -952,39 +952,46 @@ async fn native_review_commit_and_separate_create_retain_original_effects() {
 }
 #[intent_test_macros::daemon_test]
 async fn native_review_repeated_create_reuses_exact_and_uncertain_never_repairs() {
-    let f = Fixture::new().await;
-    let s = f.socket().await;
-    f.server.control.lost_post.store(true, Ordering::SeqCst);
-    let p = s.prepare(&f, f.query(Stage::CreatePr)).await;
-    let q = command(&f, &p, Stage::CreatePr);
-    let lost = s
-        .request(&f.services, Frame::Execute(q.clone()))
-        .await
-        .unwrap();
-    assert_eq!(
-        lost["reviewExecution"]["outcome"]["status"], "uncertain",
-        "{lost}"
-    );
-    assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 1);
-    f.server.control.lost_post.store(false, Ordering::SeqCst);
-    let again = s
-        .request(&f.services, Frame::Reconcile(bound(&q)))
-        .await
-        .unwrap();
-    assert_eq!(again["reviewExecution"], lost["reviewExecution"]);
-    let p = s.prepare(&f, f.query(Stage::CreatePr)).await;
-    let newer = s
-        .request(
-            &f.services,
-            Frame::Execute(command(&f, &p, Stage::CreatePr)),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        newer["reviewExecution"]["outcome"]["status"], "reused",
-        "{newer}"
-    );
-    assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 1);
+    // Own time before setup so the monitor cannot contend with admitted reuse.
+    with_review_clock(async {
+        let fixed_time = Instant::now();
+        let f = Fixture::new().await;
+        let s = f.socket().await;
+        assert_eq!(Instant::now(), fixed_time);
+        f.server.control.lost_post.store(true, Ordering::SeqCst);
+        let p = s.prepare(&f, f.query(Stage::CreatePr)).await;
+        let q = command(&f, &p, Stage::CreatePr);
+        let lost = s
+            .request(&f.services, Frame::Execute(q.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            lost["reviewExecution"]["outcome"]["status"], "uncertain",
+            "{lost}"
+        );
+        assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 1);
+        f.server.control.lost_post.store(false, Ordering::SeqCst);
+        let again = s
+            .request(&f.services, Frame::Reconcile(bound(&q)))
+            .await
+            .unwrap();
+        assert_eq!(again["reviewExecution"], lost["reviewExecution"]);
+        let p = s.prepare(&f, f.query(Stage::CreatePr)).await;
+        let newer = s
+            .request(
+                &f.services,
+                Frame::Execute(command(&f, &p, Stage::CreatePr)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            newer["reviewExecution"]["outcome"]["status"], "reused",
+            "{newer}"
+        );
+        assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(Instant::now(), fixed_time);
+    })
+    .await;
 }
 #[intent_test_macros::daemon_test]
 async fn native_review_confirmation_changes_release_and_foreign_socket_refuse() {
