@@ -6,12 +6,15 @@ Native baseline controls and the maintained Intent bridge use synthetic tokens o
 """
 import base64
 import datetime
+import fcntl
 import http.server
 import json
 import os
 from pathlib import Path
 import queue
 import signal
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -93,7 +96,8 @@ origin = 'http://127.0.0.1:' + str(endpoint.server_port)
 
 
 class Probe:
-    def __init__(self, config='', seed=None, strict=True, prefix=(), extra_args=(), diagnostic=False, bridge=None, authority=None, start=True):
+    def __init__(self, config='', seed=None, strict=True, prefix=(), extra_args=(), diagnostic=False, bridge=None, authority=None, start=True, adapter=None):
+        self.adapter = adapter
         self.tmp = tempfile.TemporaryDirectory(prefix='intent-codex-auth-contract-')
         self.home = Path(self.tmp.name)
         self.codex_home = self.home / 'codex'
@@ -123,6 +127,13 @@ class Probe:
             user_home = authority.home if authority else self.home
             args = [str(bridge), 'provider', 'codex-auth-bridge', '--runtime', str(binary), '--native-home', str(native_home), '--user-home', str(user_home), '--profile', str(worker), '--', 'app-server']
             self.worker_home = worker
+            if adapter:
+                wrapper = self.home / 'codex-native-auth.sh'
+                wrapper.write_text('#!/bin/sh\nexec ' + shlex.join(args[:-1]) + ' "$@"\n')
+                wrapper.chmod(0o700)
+                env['CODEX_HOME'] = str(worker)
+                env['CODEX_PATH'] = str(wrapper)
+                args = [shutil.which('node'), str(adapter)]
         self.proc = None
         if not start:
             return
@@ -158,14 +169,16 @@ class Probe:
         self.close()
 
     def send(self, frame):
+        if self.adapter:
+            frame = {'jsonrpc': '2.0', **frame}
         self.proc.stdin.write(json.dumps(frame) + '\n')
         self.proc.stdin.flush()
 
-    def call(self, method, params=None):
+    def call(self, method, params=None, timeout=8):
         self.counter += 1
         wanted = self.counter
         self.send({'id': wanted, 'method': method, 'params': params or {}})
-        deadline = time.monotonic() + 8
+        deadline = time.monotonic() + timeout
         while True:
             frame = self.frames.get(timeout=max(.01, deadline - time.monotonic()))
             if frame is None:
@@ -194,6 +207,43 @@ def auth_seed(token, account='synthetic-A'):
 
 def passed(name):
     print('PASS ' + name, flush=True)
+
+
+def adapter_busy_recovery(bridge, adapter):
+    with Probe(seed=auth_seed(jwt()), start=False) as native:
+        with Probe(bridge=bridge, authority=native, adapter=adapter) as acp:
+            initialized = acp.call('initialize', {
+                'protocolVersion': 1, 'clientCapabilities': {},
+                'clientInfo': {'name': 'intent-busy-contract', 'version': '1'},
+            }, timeout=20)
+            assert 'result' in initialized, 'actual ACP initialize failed'
+            params = {'cwd': str(acp.home), 'mcpServers': []}
+            created = acp.call('session/new', params, timeout=30)
+            assert 'result' in created, 'actual ACP session setup failed'
+            session_id = created['result']['sessionId']
+            resume = {**params, 'sessionId': session_id}
+            before = native.auth.read_bytes()
+            revocations = Endpoint.posts.count('/oauth/revoke')
+            with (native.codex_home / '.intent-auth.lock').open('r+') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                started = time.monotonic()
+                busy = acp.call('session/load', resume)
+                waited = time.monotonic() - started
+                assert 'error' in busy, 'busy authority must reject this request'
+                assert busy['error']['code'] != -32000, 'ACP must not report Authentication required'
+                assert 'authentication is busy' in json.dumps(busy), 'busy guidance must reach ACP caller'
+                assert 'codex login' not in json.dumps(busy), 'busy must not request native login'
+                assert 2 <= waited < 8, 'busy response must remain bounded'
+                assert native.auth.read_bytes() == before, 'busy request changed native credentials'
+                assert Endpoint.posts.count('/oauth/revoke') == revocations
+                assert acp.proc.poll() is None, 'adapter died on busy response'
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            retried = acp.call('session/load', resume, timeout=30)
+            assert 'result' in retried, ('same-adapter resume failed after busy', retried.get('error'))
+            assert native.auth.read_bytes() == before
+            assert Endpoint.posts.count('/oauth/revoke') == revocations
+            assert not (acp.worker_home / 'auth.json').exists()
+            passed('actual ACP busy classification and same-session retry preserve native login; wait=' + format(waited, '.3f') + 's')
 
 
 def main():
@@ -369,4 +419,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 4:
+        try:
+            adapter_busy_recovery(Path(sys.argv[2]), Path(sys.argv[3]))
+        finally:
+            endpoint.shutdown()
+            endpoint.server_close()
+    else:
+        main()

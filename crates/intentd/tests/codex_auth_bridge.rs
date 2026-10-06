@@ -279,3 +279,28 @@ fn installed_codex_native_auth_contract_and_bridge() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires installed Codex and ACP paths; synthetic busy-session recovery contract"]
+fn installed_codex_acp_busy_recovery() {
+    let runtime = std::env::var_os("INTENTD_PROFILE_CODEX_BIN").expect("set Codex path");
+    let adapter = std::env::var_os("INTENTD_PROFILE_CODEX_ADAPTER_JS").expect("set ACP path");
+    let output = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/codex-auth-contract.py"
+        ))
+        .arg(runtime)
+        .arg(env!("CARGO_BIN_EXE_intentd"))
+        .arg(adapter)
+        .env_remove("NODE_OPTIONS")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

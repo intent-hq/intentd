@@ -10502,6 +10502,27 @@ fn map_acp_session_error_maps_auth_and_demotes_verdict() {
         None,
         "non-auth failure must not touch the cached verdict"
     );
+
+    // Codex ACP wraps app-server contention as an internal RPC error. It must
+    // preserve a known-good login so a retry reaches the provider again.
+    crate::provider_auth::seed_auth_verdict_for_tests("pi", Some(true));
+    let busy = AcpError::Rpc(JsonRpcError {
+        code: -32603,
+        message: "Internal error".into(),
+        data: Some(serde_json::json!({"details":
+            "Native Codex authentication is busy. Retry shortly; your native login is unchanged."
+        })),
+    });
+    for method in ["session/new", "session/load", "session/prompt"] {
+        let mapped = super::map_acp_session_error(method, &busy, "pi");
+        assert!(
+            matches!(&mapped, Error::Internal(message) if message.contains("authentication is busy"))
+        );
+        assert!(!super::load_auth_required_error(&mapped));
+        assert!(!super::prompt_auth_required_turn_error(&mapped));
+        assert_eq!(crate::provider_auth::cached_auth_verdict("pi"), Some(true));
+    }
+    crate::provider_auth::seed_auth_verdict_for_tests("pi", None);
 }
 
 /// The auth-mapped `session/prompt` failure is recognized by the turn
