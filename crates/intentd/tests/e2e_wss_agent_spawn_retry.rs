@@ -1293,6 +1293,7 @@ async fn fresh_send_after_failed_session_setup_loads_before_prompt_over_wss() {
     let rpc_log_s = rpc_log.to_string_lossy().into_owned();
     let behavior = json!({
         "loadSession": true,
+        "exitOnCancel": true,
         "requireSessionSetup": true,
         "sessionSetupErrorFile": failure_file,
         "response": "session is ready",
@@ -1344,7 +1345,8 @@ async fn fresh_send_after_failed_session_setup_loads_before_prompt_over_wss() {
     {
         if index == 1 {
             wss_rpc(&mut rpc, 3, "agent.stop", json!({"agentId":agent})).await;
-            // Subscribe after stop's terminal events so they cannot masquerade
+            // The fixture exits on cancel, forcing fresh setup while preserving
+            // the durable session id. Subscribe after stop's terminal events so they cannot masquerade
             // as completion of the failed setup turn below.
             sub.close(None).await.unwrap();
             sub = connect_ws(port, cfg.clone()).await;

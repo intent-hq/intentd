@@ -1187,6 +1187,7 @@ async function dispatch(msg) {
       }
       return handlePrompt(msg.id, msg.params);
     case 'session/cancel':
+      if (behavior.exitOnCancel) process.exit(0);
       // STAB-124: echo the abort for any tool call parked by `parkMidToolCall`
       // — a title-less `tool_call_update` (failed, abort-error output), the
       // shape real providers emit when a cancel lands mid-tool-call.
