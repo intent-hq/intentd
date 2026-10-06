@@ -1770,6 +1770,7 @@ fn checkout_callback_classifies_only_the_exact_read_picker_endpoints() {
     for path in [
         "projects/Group%2FSub%2FProject",
         "projects/Group%2FSub%2FProject/repository/branches",
+        "projects/Group%2FSub%2FProject/repository/files/.intent%2Fconfig.json",
     ] {
         assert_eq!(
             GitlabCredentialRequest::direct(&descriptor, path, false)
@@ -1783,12 +1784,22 @@ fn checkout_callback_classifies_only_the_exact_read_picker_endpoints() {
         "user",
         "projects/123",
         "projects/Group%2FSub%2FProject/repository/files/x",
+        "projects/Group%2FSub%2FProject/repository/files/.intent%2Fconfig.json/raw",
+        "projects/Group%2FSub%2FProject/repository/files/.intent%252Fconfig.json",
+        "projects/Group%2FSub%2FProject/repository/files/.intent%2Fconfig.json?ref=main",
         "projects/Group%2F..%2FProject",
     ] {
         assert!(GitlabCredentialRequest::direct(&descriptor, path, false)
             .checkout_project()
             .is_err());
     }
+    assert!(GitlabCredentialRequest::direct(
+        &descriptor,
+        "projects/Group%2FSub%2FProject/repository/files/.intent%2Fconfig.json",
+        true
+    )
+    .checkout_project()
+    .is_err());
     assert!(
         GitlabCredentialRequest::direct(&descriptor, "projects", true)
             .checkout_project()
@@ -1885,4 +1896,105 @@ async fn owner_avatar_mapping_reuses_project_list_search_detail_and_pagination_r
         requests[3].path,
         "/fixture/api/v4/projects/Team%2FSub%2FProject"
     );
+}
+
+#[tokio::test]
+async fn checkout_config_requires_exact_file_identity_and_confirmed_absence() {
+    const SHA: &str = "0123456789012345678901234567890123456789";
+    for (status, body, expected) in [
+        (
+            200,
+            json!({"file_path":".intent/config.json","commit_id":SHA,"encoding":"base64","content":"e30="}),
+            Some(Some("{}")),
+        ),
+        (404, json!({"message":"404 File Not Found"}), Some(None)),
+        (404, json!({"message":"404 Project Not Found"}), None),
+        (404, json!({"message":"404 Commit Not Found"}), None),
+        (404, json!({"message":"404 Not Found"}), None),
+        (403, json!({"message":"404 File Not Found"}), None),
+        (401, json!({}), None),
+        (429, json!({}), None),
+        (500, json!({}), None),
+        (200, Value::Null, None),
+        (
+            200,
+            json!({"file_path":"other","commit_id":SHA,"encoding":"base64","content":"e30="}),
+            None,
+        ),
+        (
+            200,
+            json!({"file_path":".intent/config.json","commit_id":"wrong","encoding":"base64","content":"e30="}),
+            None,
+        ),
+        (
+            200,
+            json!({"file_path":".intent/config.json","commit_id":SHA,"encoding":"base64","content":"!"}),
+            None,
+        ),
+    ] {
+        let f = Fixture::new(move |r| {
+            assert_eq!(r.method, "GET");
+            assert_eq!(r.path, format!("/fixture/api/v4/projects/Team%2FSub%2FProject/repository/files/.intent%2Fconfig.json?ref={SHA}"));
+            reply(status, body.clone())
+        }).await;
+        let result = f
+            .provider()
+            .checkout_repo_config(&RepoRef::new("Team/Sub", "Project"), SHA)
+            .await;
+        match expected {
+            Some(expected) => assert_eq!(result.unwrap().as_deref(), expected),
+            None => assert!(result.is_err(), "status {status}: {result:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn checkout_config_keeps_response_limits_and_rejects_mutable_refs_before_http() {
+    let f = Fixture::new(|_| reply(200, json!({"content":"x".repeat(16 * 1024 * 1024)}))).await;
+    let repo = RepoRef::new("Team/Sub", "Project");
+    for sha in [
+        "HEAD",
+        "main",
+        "a",
+        "012345678901234567890123456789012345678x",
+    ] {
+        assert!(f.provider().checkout_repo_config(&repo, sha).await.is_err());
+    }
+    assert!(f.requests.lock().unwrap().is_empty());
+    assert!(f
+        .provider()
+        .checkout_repo_config(&repo, "0123456789012345678901234567890123456789")
+        .await
+        .is_err());
+    let f = Fixture::new(|_| {
+        let mut response = reply(404, json!({"message":"404 File Not Found"}));
+        response.body.push_str(&" ".repeat(1024));
+        response
+    })
+    .await;
+    assert!(f
+        .provider()
+        .checkout_repo_config(&repo, "0123456789012345678901234567890123456789")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn checkout_config_malformed_transport_json_is_not_tolerant_content_decode() {
+    for status in [200, 404] {
+        let f = Fixture::new(move |_| Reply {
+            status,
+            headers: vec![],
+            body: "{invalid transport json".into(),
+        })
+        .await;
+        let error = f
+            .provider()
+            .checkout_repo_config(&repo(), "0123456789012345678901234567890123456789")
+            .await
+            .unwrap_err();
+        // Services tolerates Decode only after file/SHA identity was verified.
+        // A corrupt HTTP envelope must remain a provider failure instead.
+        assert!(matches!(error, Error::Provider(_)), "{error:?}");
+    }
 }

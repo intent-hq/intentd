@@ -133,6 +133,7 @@ struct Cohort {
 }
 
 pub(crate) struct FixtureConnection {
+    checkout_frames: Mutex<Vec<intent_core::repository_checkout::CheckoutFrame>>,
     resource_frames: Mutex<Vec<intent_core::repository_request::RepositoryResourceFrame>>,
     review_frames: Mutex<Vec<intent_core::repository_request::NativeReviewFrame>>,
     selection_frames: Mutex<Vec<intent_core::repository_request::RepositorySelectionFrame>>,
@@ -157,6 +158,14 @@ impl FixtureConnection {
 }
 
 impl RepositoryReadConnection for FixtureConnection {
+    fn capture_checkout(
+        &self,
+        frame: &intent_core::repository_checkout::CheckoutFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        self.checkout_frames.lock().unwrap().push(frame.clone());
+        Some(self.capture())
+    }
+
     fn capture_resource(
         &self,
         frame: &intent_core::repository_request::RepositoryResourceFrame,
@@ -246,6 +255,33 @@ impl FixtureApi {
 }
 
 impl WorkspaceApi for FixtureApi {
+    fn repository_checkout_repo_config(
+        &self,
+        q: intent_core::repository_checkout::CheckoutRepoConfigQuery,
+    ) -> BoxFuture<
+        '_,
+        intent_core::Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutRepoConfig,
+            >,
+        >,
+    > {
+        Box::pin(async move {
+            let scope = FIXTURE_SCOPE.with(Clone::clone);
+            scope.state.lock().unwrap().qualified = true;
+            assert_eq!(scope.caller, intent_core::current_caller());
+            Ok(intent_core::repository_checkout::CheckoutResult::Ready {
+                value: intent_core::repository_checkout::CheckoutRepoConfig {
+                    project_path: q.project_path,
+                    branch: q.branch,
+                    commit_sha: q.commit_sha,
+                    config: Some(intent_core::RepoConfig::default()),
+                    exists: true,
+                },
+            })
+        })
+    }
+
     fn native_review_execute(
         &self,
         _q: intent_core::repository_request::NativeReviewExecuteQuery,
@@ -345,6 +381,7 @@ impl WorkspaceApi for FixtureApi {
         entry: RepositoryWireEntry,
     ) -> Option<Arc<dyn RepositoryReadConnection>> {
         let connection = Arc::new(FixtureConnection {
+            checkout_frames: Mutex::new(Vec::new()),
             resource_frames: Mutex::new(Vec::new()),
             review_frames: Mutex::new(Vec::new()),
             selection_frames: Mutex::new(Vec::new()),
@@ -1515,8 +1552,9 @@ async fn native_review_consumed_packet_faults_never_replay_primitive_or_reply() 
 #[test]
 fn native_review_companion_capability_is_explicit_and_versioned() {
     let server = crate::client::server_json(false, "linux", "fixture", "fixture", None, true);
-    assert_eq!(server["protocolVersion"], "13.7");
+    assert_eq!(server["protocolVersion"], "13.8");
     assert_eq!(server["capabilities"]["gitlabCheckout"], 1);
+    assert_eq!(server["capabilities"]["gitlabCheckoutRepoConfig"], 1);
     assert_eq!(server["capabilities"]["gitlabCheckoutOwnerAvatar"], 1);
     assert_eq!(server["capabilities"]["submissionCorrelation"], 1);
     assert_eq!(server["capabilities"]["repositoryResourceRead"], 1);
@@ -1619,4 +1657,60 @@ async fn resource_invalid_null_unknown_and_old_api_keep_refusal() {
     assert_eq!(h.original().resource_frames.lock().unwrap().len(), 1);
     assert!(h.original().review_frames.lock().unwrap().is_empty());
     assert!(h.original().selection_frames.lock().unwrap().is_empty());
+}
+
+fn checkout_config_request() -> String {
+    json!({"jsonrpc":"2.0","id":91,"method":"sourceControl.checkout.repoConfig","params":{"checkoutId":"original","revision":"revision","projectPath":"team/sub/project","branch":"release/config","commitSha":"0123456789012345678901234567890123456789"}}).to_string()
+}
+
+#[tokio::test]
+async fn checkout_config_typed_frame_precedes_writer_queue() {
+    let h = Harness::new(FixtureApi::default(), HostRole::Owner).await;
+    for _ in 0..PRIORITY_CAPACITY {
+        h.tx.priority.send("occupied".into()).await.unwrap();
+    }
+    let raw = checkout_config_request();
+    let call = h.dispatch_selection(&raw);
+    tokio::pin!(call);
+    tokio::select! {biased; r=&mut call=>panic!("queue did not wait {r}"),()=tokio::task::yield_now()=>{}}
+    let original = h.original();
+    let frames = original.checkout_frames.lock().unwrap();
+    let [intent_core::repository_checkout::CheckoutFrame::RepoConfig(q)] = frames.as_slice() else {
+        panic!("missing original config frame")
+    };
+    assert_eq!(q.checkout_id, "original");
+    assert_eq!(q.branch, "release/config");
+    h.connection.retire();
+}
+
+#[tokio::test]
+async fn checkout_config_private_reply_obeys_final_delivery_retirement() {
+    for retire_first in [true, false] {
+        let gate = Arc::new(Gate::default());
+        let mut h = Harness::new(
+            FixtureApi {
+                delivery: Some(gate.clone()),
+                ..FixtureApi::default()
+            },
+            HostRole::Owner,
+        )
+        .await;
+        assert!(h.dispatch_selection(&checkout_config_request()).await);
+        gate.entered.notified().await;
+        assert!(h.rx.priority.try_recv().is_err());
+        if retire_first {
+            h.connection.retire();
+        }
+        gate.release.notify_one();
+        until(|| h.limiter.available_permits() == Some(1)).await;
+        if !retire_first {
+            h.connection.retire();
+        }
+        let reply = h.response().await;
+        assert_eq!(reply.get("result").is_some(), !retire_first);
+        if retire_first {
+            assert!(!reply.to_string().contains("team/sub/project"));
+        }
+        assert!(h.rx.priority.try_recv().is_err());
+    }
 }

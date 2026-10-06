@@ -135,7 +135,10 @@ impl GitlabCredentialRequest<'_> {
             .strip_prefix("projects/")
             .ok_or(Error::AdmissionRetired)?;
         let (encoded, suffix) = rest.split_once('/').unwrap_or((rest, ""));
-        if !matches!(suffix, "" | "repository/branches") {
+        if !matches!(
+            suffix,
+            "" | "repository/branches" | "repository/files/.intent%2Fconfig.json"
+        ) {
             return Err(Error::AdmissionRetired);
         }
         let mut decoded = Vec::with_capacity(encoded.len());
@@ -220,6 +223,56 @@ impl GitLabSourceControl {
     pub fn with_pagination_scope(mut self, scope: String) -> Self {
         self.pagination_scope = scope;
         self
+    }
+
+    /// Read only the checkout configuration at an immutable commit.
+    /// # Errors
+    /// Preserves provider/auth failures and rejects malformed file envelopes.
+    pub async fn checkout_repo_config(&self, repo: &RepoRef, sha: &str) -> Result<Option<String>> {
+        if sha.len() != 40 || !sha.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::Config(
+                "checkout config requires an immutable SHA".into(),
+            ));
+        }
+        let (value, _) = self
+            .request_for(
+                Method::GET,
+                &format!("{}/repository/files/.intent%2Fconfig.json", project(repo)),
+                &[("ref".into(), sha.into())],
+                None,
+                Purpose::CheckoutConfig,
+            )
+            .await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        if value["file_path"] != ".intent/config.json" || value["commit_id"] != sha {
+            return Err(Error::AdmissionRetired);
+        }
+        if value["encoding"] != "base64" {
+            return Err(Error::Decode("unsupported GitLab file encoding".into()));
+        }
+        let encoded = string(&value, "content")?.replace(['\n', '\r'], "");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| Error::Decode("invalid GitLab file content".into()))?;
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| Error::Decode("GitLab file is not UTF-8".into()))
+    }
+
+    /// Numeric identity used to detect project replacement around a checkout read.
+    /// # Errors
+    /// Rejects provider failures and a different or malformed project response.
+    pub async fn checkout_project_identity(&self, repo: &RepoRef) -> Result<u64> {
+        let value = self.get_project(repo).await?;
+        if value["path_with_namespace"] != format!("{}/{}", repo.owner, repo.name) {
+            return Err(Error::AdmissionRetired);
+        }
+        value["id"]
+            .as_u64()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| Error::Decode("GitLab project identity missing".into()))
     }
 
     /// Legacy aggregates cannot carry per-field availability; any consumed quota
