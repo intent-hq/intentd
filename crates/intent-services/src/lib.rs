@@ -61,6 +61,7 @@ mod agent_subscriptions;
 pub mod antigravity;
 pub mod antigravity_install;
 pub mod antigravity_setup;
+mod assistant_context;
 mod attachment_upload;
 mod auggie_cli;
 mod auto_commit;

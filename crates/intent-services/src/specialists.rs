@@ -207,7 +207,22 @@ pub(crate) const EMBEDDED_BUNDLED_V2_5: &[(&str, &str)] = &[
 /// default — the LATEST version's set (the file tiers above it are
 /// user-owned and unversioned). Session-scoped resolution swaps in the
 /// session's pinned bundle via [`SpecialistsService::with_embedded`] (H2).
-const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V2_5;
+const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V3_1;
+
+pub(crate) const EMBEDDED_BUNDLED_V3_1: &[(&str, &str)] = &[
+    (
+        "chief-of-staff",
+        include_str!("../resources/specialists/v3.1/chief-of-staff.md"),
+    ),
+    EMBEDDED_BUNDLED_V2_5[1],
+    EMBEDDED_BUNDLED_V2_5[2],
+    EMBEDDED_BUNDLED_V2_5[3],
+    EMBEDDED_BUNDLED_V2_5[4],
+    EMBEDDED_BUNDLED_V2_5[5],
+    EMBEDDED_BUNDLED_V2_5[6],
+    EMBEDDED_BUNDLED_V2_5[7],
+    EMBEDDED_BUNDLED_V2_5[8],
+];
 
 /// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
 /// base tier: no shipped specialist survives the replacement.

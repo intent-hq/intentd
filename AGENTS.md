@@ -5,6 +5,20 @@ guide first for the cross-package workflow (submodule PR → monorepo bump, conv
 commits). This file covers conventions specific to `packages/intentd`, the
 Rust backend daemon.
 
+**Assistant app guide:** When adding, changing, moving, renaming, or removing a
+user-facing feature, update the affected section of
+[`crates/intent-services/resources/assistant-app-guide.md`](crates/intent-services/resources/assistant-app-guide.md)
+in the same change. This is the single bundled guide; keep it concise and replace
+obsolete paths, labels, and prerequisites, including changes coordinated with the frontend.
+Keep the guide and user-facing help focused on features ready for users. Do not promote
+unfinished, experimental, Labs-only, internal, or unreleased features as normal options;
+code or tool availability is not proof of readiness. When explicitly asked about such
+a feature, or assigned to develop or test it, discuss it honestly and label its status.
+Update the guide and its source pointers when readiness or UI behavior changes.
+Before opening a PR, record the affected guide section (and companion intentd PR
+for frontend changes), or explain why the change has no user-help impact. Coordinate
+companion releases; this checkpoint does not require simultaneous cross-repo merges.
+
 > **Merge permission**: never merge a PR or arm auto-merge without explicit permission
 > from a human — approved + green is not enough. See the
 > [root `AGENTS.md`](../../AGENTS.md) for the full rule.
