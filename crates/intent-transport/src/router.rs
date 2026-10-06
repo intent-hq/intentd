@@ -3612,6 +3612,15 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(json!(result))
         }
+        "sourceControl.checkout.repoConfig" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_repo_config(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
         "sourceControl.checkout.warm" => {
             let query = serde_json::from_value(Value::Object(params.clone()))
                 .map_err(|e| invalid_params(e.to_string()))?;
