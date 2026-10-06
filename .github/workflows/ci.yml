@@ -471,6 +471,8 @@ jobs:
       # including adapter pin changes; an ignored local test alone is insufficient.
       # Update the version and independently verified release digest together.
       - name: Pinned Codex native authentication contract
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
         timeout-minutes: 5
         run: |
           set -euo pipefail
