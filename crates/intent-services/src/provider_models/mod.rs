@@ -186,7 +186,6 @@ where
     let profile = crate::antigravity::probe_profile(&helper)
         .map_err(|err| ProbeError::Spawn(format!("isolated Antigravity configuration: {err}")))?;
     let mut cmd = AcpProbeCommand::binary(bin, Vec::new())
-        .for_provider("antigravity")
         .cwd(profile.path().to_path_buf())
         .auth_required_marker(crate::antigravity::AUTH_REQUIRED_MARKER);
     for (key, value) in crate::antigravity::unattended_env(profile.path(), &helper)
@@ -422,10 +421,9 @@ pub(crate) async fn fetch_droid_models() -> ProviderModelsFetch {
         "--output-format".to_string(),
         "acp".to_string(),
     ];
-    let outcome = run_acp_probe(
-        AcpProbeCommand::binary(bin, args).for_provider("droid"),
-        |v| parse::parse_acp_models(v, "droid"),
-    )
+    let outcome = run_acp_probe(AcpProbeCommand::binary(bin, args), |v| {
+        parse::parse_acp_models(v, "droid")
+    })
     .await;
     match outcome {
         Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
@@ -447,10 +445,9 @@ pub(crate) async fn probe_droid_auth(bin: PathBuf) -> Option<bool> {
         "--output-format".to_string(),
         "acp".to_string(),
     ];
-    let outcome = run_acp_probe(
-        AcpProbeCommand::binary(bin, args).for_provider("droid"),
-        |v| parse::parse_acp_models(v, "droid"),
-    )
+    let outcome = run_acp_probe(AcpProbeCommand::binary(bin, args), |v| {
+        parse::parse_acp_models(v, "droid")
+    })
     .await;
     match outcome {
         Ok(models) if !models.is_empty() => Some(true),
@@ -567,18 +564,12 @@ async fn run_opencode_models_cli(bin: PathBuf, timeout: Duration) -> Result<Stri
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let cwd = std::env::temp_dir();
-    cmd.current_dir(&cwd);
-    let profile = crate::provider_launch::ephemeral_command_profile(
-        "opencode",
-        crate::provider_profiles::LaunchPurpose::ModelProbe,
-        &cmd,
-        &cwd,
-    )
-    .map_err(|e| e.to_string())?;
-    let output = crate::provider_launch::run_utility(cmd, profile, Vec::new(), timeout)
-        .await
-        .map_err(|e| format!("opencode models {e}"))?;
+    let fut = cmd.output();
+    let output = match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return Err(format!("failed to run opencode models: {e}")),
+        Err(_) => return Err("opencode models timed out".to_string()),
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -661,18 +652,11 @@ async fn run_grok_models_cli(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let cwd = std::env::temp_dir();
-    cmd.current_dir(&cwd);
-    let profile = crate::provider_launch::ephemeral_command_profile(
-        "grok",
-        crate::provider_profiles::LaunchPurpose::ModelProbe,
-        &cmd,
-        &cwd,
-    )
-    .map_err(|e| e.to_string())?;
-    crate::provider_launch::run_utility(cmd, profile, Vec::new(), timeout)
-        .await
-        .map_err(|e| format!("grok models {e}"))
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(format!("failed to run grok models: {e}")),
+        Err(_) => Err("grok models timed out".to_string()),
+    }
 }
 
 /// unsloth: fetch the Hugging Face `unsloth` org's GGUF repos and build one

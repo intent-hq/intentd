@@ -10,7 +10,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, copyFileSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, copyFileSync, rmSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -183,52 +183,6 @@ function fakePi() {
   const pi = fakePi();
   await ext.default(pi);
   assert.equal(pi.tools.length, 0, "unreachable bridge: no tools, no crash");
-}
-
-
-// Owned project stdio servers are loaded once and their tools are callable.
-{
-  const file = path.join(tmpDir, "owned-mcp.json");
-  writeFileSync(file, JSON.stringify({mcpServers:{project:{command:process.execPath,args:[mockPath]}}}));
-  process.env.INTENTD_PI_MCP_CONFIG = file;
-  const tools = [];
-  const shutdown = [];
-  await ext.registerOwnedStdioServers({registerTool: tool => tools.push(tool), on: (_event, close) => shutdown.push(close)});
-  assert.equal(tools.length, 2);
-  assert.equal(tools[0].name, "mcp_70726f6a656374__echo");
-  assert.equal((await tools[0].execute("call",{input:"owned"})).content[0].text,"echo:owned");
-  for (const close of shutdown) await close();
-  delete process.env.INTENTD_PI_MCP_CONFIG;
-}
-
-// A helper in a separate process group must not outlive its MCP leader.
-if (process.platform === "linux") {
-  const helperScript = path.join(tmpDir, "tree-server.mjs");
-  const pidsFile = path.join(tmpDir, "tree-pids.json");
-  writeFileSync(helperScript, `import {spawn} from "node:child_process";
-import fs from "node:fs";
-const helper = spawn(process.execPath, ["-e", 'process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'], {detached:true,stdio:"ignore"});
-helper.unref();
-fs.writeFileSync(${JSON.stringify(pidsFile)},JSON.stringify({server:process.pid,helper:helper.pid}));
-await import(${JSON.stringify(pathToFileURL(path.resolve(mockPath)).href)});`);
-  const file = path.join(tmpDir, "tree-mcp.json");
-  writeFileSync(file, JSON.stringify({mcpServers:{tree:{command:process.execPath,args:[helperScript]}}}));
-  process.env.INTENTD_PI_MCP_CONFIG = file;
-  const tools = [], shutdown = [];
-  let pids;
-  const alive = pid => { try { return !/^State:\s+Z/m.test(readFileSync(`/proc/${pid}/status`, "utf8")); } catch { return false; } };
-  try {
-    await ext.registerOwnedStdioServers({registerTool:t=>tools.push(t),on:(_e,close)=>shutdown.push(close)});
-    pids = JSON.parse(readFileSync(pidsFile, "utf8"));
-    assert.equal((await tools[0].execute("tree", {input:"tree"})).content[0].text, "echo:tree");
-    for (const close of shutdown) await close();
-    for (let i = 0; i < 100 && alive(pids.server); i++) await new Promise(resolve => setTimeout(resolve, 10));
-    assert.equal(alive(pids.server), false, "owned MCP leader exited");
-    assert.equal(alive(pids.helper), false, "detached helper was escalated and reaped before shutdown returned");
-  } finally {
-    for (const pid of Object.values(pids ?? {})) { try { process.kill(pid, "SIGKILL"); } catch {} }
-    delete process.env.INTENTD_PI_MCP_CONFIG;
-  }
 }
 
 for (const s of serverSockets) s.destroy();

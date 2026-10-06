@@ -2361,25 +2361,18 @@ const AUGGIE_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// `.mjs` shim's `#!/usr/bin/env node` resolves in a packaged-app
 /// environment.
 async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
-    let mut cmd = tokio::process::Command::new(auggie);
-    let cwd = std::env::temp_dir();
-    cmd.args(args)
-        .env("PATH", intent_context::discovery::exec_path(auggie))
-        .current_dir(&cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let profile = crate::provider_launch::ephemeral_command_profile(
-        "auggie",
-        crate::provider_profiles::LaunchPurpose::ModelProbe,
-        &cmd,
-        &cwd,
+    tokio::time::timeout(
+        AUGGIE_MODELS_TIMEOUT,
+        tokio::process::Command::new(auggie)
+            .args(args)
+            .env("PATH", intent_context::discovery::exec_path(auggie))
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
     )
-    .ok()?;
-    crate::provider_launch::run_utility(cmd, profile, Vec::new(), AUGGIE_MODELS_TIMEOUT)
-        .await
-        .ok()
+    .await
+    .ok()?
+    .ok()
 }
 
 /// Best-effort `models.list` dynamic fetch (PROTOCOL §5.30), porting the
@@ -6977,7 +6970,6 @@ impl Services {
     /// CLI yields an empty model list (the provider CLI owns model
     /// discovery — there is no static fallback catalog).
     pub(crate) async fn agent_get_models_op(&self) -> Result<Value> {
-        self.validate_provider_configuration("auggie")?;
         let models = fetch_auggie_models(self.auggie_bin.clone())
             .await?
             .unwrap_or_default();
@@ -7029,13 +7021,11 @@ impl Services {
         let version_key = antigravity
             .as_ref()
             .map_or_else(|| (source.version_key)(), |s| s.version_key.clone());
-        let policy_services = self.clone();
-        let policy_provider = provider_id.clone();
         let resolved = if intent_providers::installed_cli::InstalledCli::for_provider(&provider_id)
             .is_some()
         {
             self.models_catalog
-                .resolve_installed_with_policy(&provider_id, force_refresh, Some(self.clone()))
+                .resolve_installed(&provider_id, force_refresh)
                 .await
         } else {
             crate::model_catalog::resolve_with_cache(
@@ -7045,16 +7035,6 @@ impl Services {
                 force_refresh,
                 crate::model_catalog::ModelCatalogCache::now_ms(),
                 move || {
-                    if let Err(error) =
-                        policy_services.validate_provider_configuration(&policy_provider)
-                    {
-                        return Box::pin(async move {
-                            crate::model_catalog::ModelFetchResult {
-                                models: None,
-                                warning: Some(error.to_string()),
-                            }
-                        });
-                    }
                     if let Some(antigravity) = antigravity {
                         Box::pin(async move {
                             crate::model_catalog::from_provider_fetch(
@@ -7114,7 +7094,7 @@ impl Services {
             .models_list_auggie_with(
                 force_refresh,
                 crate::model_catalog::ModelCatalogCache::now_ms(),
-                move || Box::pin(async move { fetch_auggie_models_rich(auggie_bin).await }),
+                || Box::pin(fetch_auggie_models_rich(auggie_bin)),
             )
             .await?;
         if !include_fallback_warning && response["source"] == "static" {
@@ -7148,7 +7128,6 @@ impl Services {
         let version_key = crate::model_catalog::source_for("auggie")
             .map(|s| (s.version_key)())
             .unwrap_or_default();
-        let policy_services = self.clone();
         let resolved = crate::model_catalog::resolve_with_cache(
             &self.models_catalog,
             "auggie",
@@ -7157,12 +7136,6 @@ impl Services {
             now_ms,
             || {
                 Box::pin(async move {
-                    if let Err(error) = policy_services.validate_provider_configuration("auggie") {
-                        return crate::model_catalog::ModelFetchResult {
-                            models: None,
-                            warning: Some(error.to_string()),
-                        };
-                    }
                     match fetch().await {
                         Some(models) => crate::model_catalog::ModelFetchResult {
                             models: Some(models),

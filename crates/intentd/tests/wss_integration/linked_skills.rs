@@ -436,7 +436,7 @@ async fn wss_linked_skills_byte_budget_counts_invalid_utf8_and_recovers() {
 }
 
 #[intent_test_macros::daemon_test]
-async fn wss_linked_skills_ignore_native_home_and_config_but_watch_intent_personal() {
+async fn wss_linked_skills_custom_config_directory_and_empty_fallback() {
     use std::process::Stdio;
     let temp = common::test_tempdir("linked-skills-config-");
     let mut evidence = Vec::new();
@@ -445,7 +445,6 @@ async fn wss_linked_skills_ignore_native_home_and_config_but_watch_intent_person
         let home = data.join("home");
         let config = data.join("config");
         let target = data.join("config-target");
-        let owned = home.join(".intent");
         let project = data.join("project");
         std::fs::create_dir_all(&project).unwrap();
         write_skill(
@@ -465,32 +464,6 @@ async fn wss_linked_skills_ignore_native_home_and_config_but_watch_intent_person
                 "custom root",
             );
             symlink(&target, &config).unwrap();
-            let owned_target = data.join("owned-target");
-            std::fs::create_dir_all(&owned_target).unwrap();
-            std::fs::create_dir_all(&owned).unwrap();
-            symlink(&owned_target, owned.join("skills")).unwrap();
-        }
-        write_skill(
-            &owned.join("skills/custom/SKILL.md"),
-            "intent-personal-fixture",
-            "owned personal root",
-        );
-        for tier in [
-            ".agents",
-            ".augment",
-            ".codex",
-            ".factory",
-            ".grok",
-            ".opencode",
-            ".pi",
-            ".cortex",
-            ".agent",
-        ] {
-            write_skill(
-                &home.join(tier).join("skills/native/SKILL.md"),
-                &format!("native-{tier}"),
-                "must not be imported",
-            );
         }
         common::enable_ws_api(&data);
         let log_path = data.join("daemon.log");
@@ -537,18 +510,17 @@ async fn wss_linked_skills_ignore_native_home_and_config_but_watch_intent_person
         assert_eq!(listed["jsonrpc"], "2.0");
         assert_eq!(listed["id"], 2);
         let skills = listed["result"].as_array().unwrap();
-        assert!(!skills.iter().any(|s| s["name"] == "default-config-fixture"));
-        assert!(!skills.iter().any(|s| s["name"] == "custom-config-fixture"));
+        assert_eq!(
+            skills.iter().any(|s| s["name"] == "default-config-fixture"),
+            mode == "empty"
+        );
+        assert_eq!(
+            skills.iter().any(|s| s["name"] == "custom-config-fixture"),
+            mode == "linked"
+        );
         assert_eq!(
             named(&listed["result"], "project-config-fixture")["scope"],
             "project"
-        );
-        assert!(skills
-            .iter()
-            .all(|s| !s["name"].as_str().unwrap().starts_with("native-")));
-        assert_eq!(
-            named(&listed["result"], "intent-personal-fixture")["scope"],
-            "user"
         );
         let mut changed = Value::Null;
         if mode != "empty" {
@@ -573,8 +545,8 @@ async fn wss_linked_skills_ignore_native_home_and_config_but_watch_intent_person
             .await
             .expect("config skills subscription");
             write_skill(
-                &owned.join("skills/custom/SKILL.md"),
-                "intent-personal-fixture",
+                &config.join("skills/custom/SKILL.md"),
+                "custom-config-fixture",
                 "live update",
             );
             changed = tokio::time::timeout(Duration::from_secs(30), async {
@@ -584,7 +556,7 @@ async fn wss_linked_skills_ignore_native_home_and_config_but_watch_intent_person
                             let event: Value = serde_json::from_str(&text).unwrap();
                             if event["method"] == "events.event" && event["params"]["event"]["type"] == "skills:changed" {
                                 let reply = wss_call(port, cfg.clone(), &json!({"jsonrpc":"2.0","id":4,"method":"skill.list","params":{"workspaceId":id}}).to_string()).await;
-                                if reply["result"].as_array().unwrap().iter().any(|s| s["name"] == "intent-personal-fixture" && s["description"] == "live update") {
+                                if reply["result"].as_array().unwrap().iter().any(|s| s["name"] == "custom-config-fixture" && s["description"] == "live update") {
                                     break json!({"event":event,"listed":reply});
                                 }
                             }
@@ -597,7 +569,7 @@ async fn wss_linked_skills_ignore_native_home_and_config_but_watch_intent_person
             }).await.expect("live custom config skills update");
         }
         let fanout = if mode == "linked" {
-            shared_user_update_evidence(port, cfg.clone(), &data, id, &owned).await
+            shared_user_update_evidence(port, cfg.clone(), &data, id, &config).await
         } else {
             Value::Null
         };
@@ -646,7 +618,7 @@ async fn shared_user_update_evidence(
     for description in ["fanout warmup", "fanout final"] {
         write_skill(
             &config.join("skills/custom/SKILL.md"),
-            "intent-personal-fixture",
+            "custom-config-fixture",
             description,
         );
         for (id, stream) in &mut streams {
@@ -698,7 +670,7 @@ async fn shared_user_update_evidence(
             )
             .await;
             assert_eq!(
-                named(&listed["result"], "intent-personal-fixture")["description"],
+                named(&listed["result"], "custom-config-fixture")["description"],
                 description
             );
             if description == "fanout final" {

@@ -1,6 +1,6 @@
 //! Skills directory watcher → `skills:changed` events.
 //!
-//! Watches the same Intent personal and project roots used by skill discovery
+//! Watches the 8-tier skills scan roots (4 user-tier + 4 project-tier per workspace)
 //! and emits `skills:changed` events when SKILL.md files are created, modified, or
 //! deleted — or when a tier directory itself appears or disappears (#612).
 //! User-tier changes affect all workspaces; project-tier changes are scoped
@@ -31,8 +31,9 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// Holds watchers for all skills directories (user-tier + project-tier).
 /// Dropping this tears down all watchers.
 ///
-/// The Intent personal tier keeps one [`RootWatch`] shared per daemon, so it
-/// does not scale with the workspace count. Project tiers ride the shared
+/// The four user tiers keep a [`RootWatch`] each — they are shared once per
+/// daemon, so they do not scale with the workspace count. The four project
+/// tiers per workspace no longer own streams at all: they ride the shared
 /// workspace-root stream via [`watch_tiers`].
 pub(crate) struct SkillsWatcher {
     hub: Arc<SharedWatchHub>,
@@ -65,9 +66,9 @@ impl SkillsWatcher {
 
         // Start user-tier watchers (affect all workspaces)
         let mut user_watchers = Vec::new();
-        let home = crate::skills::skill_home_dir();
-        for root in crate::skills::skill_roots(None, home.as_deref()) {
-            user_watchers.push(watch_directory(hub, root.root, None, raw_tx.clone()));
+        let user_roots = get_user_skill_roots();
+        for root in user_roots {
+            user_watchers.push(watch_directory(hub, root, None, raw_tx.clone()));
         }
 
         // Start project-tier watchers (per-workspace)
@@ -178,8 +179,9 @@ impl SkillsWatcher {
     }
 }
 
-/// Watch all project skill roots over one shared workspace-root subscription.
-/// Derive relative tiers from discovery so newly added roots cannot drift.
+/// Watch all four project-tier skill roots of one workspace over the shared
+/// workspace-root stream — one subscription, no streams of its own (previously
+/// four [`RootWatch`]es, each its own stream even when the tier was missing).
 fn start_project_watch(
     hub: &Arc<SharedWatchHub>,
     workspace_id: &WorkspaceId,
@@ -188,15 +190,15 @@ fn start_project_watch(
 ) -> TierWatch {
     let ws_id = workspace_id.clone();
     let tx = raw_tx.clone();
-    let roots = crate::skills::skill_roots(Some(Path::new("")), None);
-    let subpaths: Vec<_> = roots
-        .iter()
-        .map(|root| root.root.to_string_lossy())
-        .collect();
-    let subpaths: Vec<_> = subpaths.iter().map(AsRef::as_ref).collect();
-    watch_tiers(hub, workspace_path, &subpaths, is_skill_md, move || {
-        let _ = tx.send(SkillsMsg::Change(Some(ws_id.clone())));
-    })
+    watch_tiers(
+        hub,
+        workspace_path,
+        PROJECT_SKILL_TIERS,
+        is_skill_md,
+        move || {
+            let _ = tx.send(SkillsMsg::Change(Some(ws_id.clone())));
+        },
+    )
 }
 
 /// Linked targets are scoped to workspace lifetime, like the ordinary tiers.
@@ -271,6 +273,36 @@ fn is_skill_md(path: &Path) -> bool {
         || path
             .symlink_metadata()
             .is_ok_and(|metadata| metadata.is_symlink())
+}
+
+fn get_user_skill_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = home_dir() {
+        roots.push(home.join(".agents").join("skills"));
+        roots.push(crate::skills::claude_config_dir(&home).join("skills"));
+        roots.push(home.join(".intent").join("skills"));
+        roots.push(home.join(".augment").join("skills"));
+    } else if let Some(config) =
+        std::env::var_os("CLAUDE_CONFIG_DIR").filter(|path| !path.is_empty())
+    {
+        roots.push(PathBuf::from(config).join("skills"));
+    }
+    roots
+}
+
+/// Project-tier skill roots, relative to the workspace root.
+const PROJECT_SKILL_TIERS: &[&str] = &[
+    ".agents/skills",
+    ".claude/skills",
+    ".intent/skills",
+    ".augment/skills",
+];
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
 }
 
 /// Debounce loop that coalesces rapid skill file changes per workspace.
@@ -563,52 +595,6 @@ mod tests {
 
     fn skill_md(name: &str) -> String {
         format!("---\nname: {name}\ndescription: d\n---\n\nbody")
-    }
-
-    #[tokio::test]
-    #[expect(clippy::await_holding_lock)]
-    async fn newly_created_provider_roots_emit_and_refresh_catalog() {
-        let _serial = crate::events::WATCHER_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (_db, bus, mut sub) = bus_and_sub().await;
-        let ws = crate::test_support::test_tempdir("skills-new-provider-roots-");
-        let id = WorkspaceId::from("skills-new-provider-roots");
-        let watcher = SkillsWatcher::start(
-            &SharedWatchHub::new(),
-            bus,
-            vec![(id.clone(), ws.path().to_path_buf())],
-        );
-        watcher.wait_established(LIVENESS).await;
-        watcher.barrier().await;
-        for (index, root) in [
-            ".agent/skills",
-            ".codex/skills",
-            ".factory/skills",
-            ".grok/skills",
-            ".opencode/skill",
-            ".opencode/skills",
-            ".pi/skills",
-            ".cortex/skills",
-        ]
-        .iter()
-        .enumerate()
-        {
-            let name = format!("new-provider-root-{index}");
-            let skill = ws.path().join(root).join(&name);
-            std::fs::create_dir_all(&skill).unwrap();
-            std::fs::write(skill.join("SKILL.md"), skill_md(&name)).unwrap();
-            let events = drain_skills_events(&mut sub, Duration::from_millis(100), LIVENESS).await;
-            assert!(
-                events.iter().any(|event| event.workspace_id == id),
-                "missing event for {root}"
-            );
-            let skills = crate::skills::discover_skills(&ws.path().to_string_lossy()).await;
-            assert!(
-                skills.iter().any(|skill| skill.name == name),
-                "missing skill from {root}"
-            );
-        }
     }
 
     #[tokio::test]

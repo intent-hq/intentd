@@ -110,14 +110,6 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
             format!("provider \"{provider_id}\" does not support the live test prompt"),
         ));
     }
-    if let Some(api) = api {
-        if let Err(reason) = api
-            .provider_configuration_preflight(provider_id.into())
-            .await
-        {
-            return Ok(failure("spawn-failed", reason.to_string()));
-        }
-    }
     // Binary resolution mirrors `agent.completeOnce`: the `providers.paths`
     // override is keyed by the provider that OWNS the primary binary, and an
     // empty value counts as unset.
@@ -191,16 +183,6 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
         Ok(cmd) => cmd,
         Err(reason) => return Ok(failure("not-installed", reason)),
     };
-    let cmd = match cmd
-        .prepare_profile(
-            crate::provider_profiles::LaunchPurpose::PromptTest,
-            Vec::new(),
-        )
-        .await
-    {
-        Ok(cmd) => cmd,
-        Err(reason) => return Ok(failure("spawn-failed", reason)),
-    };
     let outcome = run_one_shot_acp(
         Some((
             provider_id,
@@ -223,7 +205,7 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
         cmd,
         TEST_PROMPT,
         crate::complete_ops::config_option_model(provider, model),
-        crate::complete_ops::one_shot_session_shape(provider_id, TEST_PROMPT, None).1,
+        None,
         TEST_PROMPT_TIMEOUT,
         &OneShotEffort::default(),
     )

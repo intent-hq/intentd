@@ -311,7 +311,7 @@ pub(crate) fn one_shot_launch(
             cmd = cmd.env(key, value);
         }
     }
-    Some(apply_one_shot_launch_policy(provider, cmd).for_provider(provider.id))
+    Some(apply_one_shot_launch_policy(provider, cmd))
 }
 
 /// Apply daemon-owned launch policy after caller-specific environment merges.
@@ -457,7 +457,6 @@ impl Services {
             },
         };
 
-        self.validate_provider_configuration(&run_provider)?;
         let effort = resolve_quick_action_effort(
             &settings,
             quick_action_type.as_deref(),
@@ -636,13 +635,6 @@ impl Services {
             Ok(cmd) => cmd,
             Err(reason) => return Ok(unavailable(reason)),
         };
-        let cmd = cmd
-            .prepare_profile(
-                crate::provider_profiles::LaunchPurpose::Completion,
-                self.provider_policy_sources(provider_id),
-            )
-            .await
-            .map_err(Error::InvalidInput)?;
         let (turn_prompt, session_meta) =
             one_shot_session_shape(provider_id, prompt, system_prompt);
         match run_one_shot_acp(
@@ -778,121 +770,6 @@ mod tests {
         std::fs::write(&bin, format!("#!/bin/sh\ncat > /dev/null\n{body}\n")).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         (dir, bin)
-    }
-
-    #[tokio::test]
-    async fn provider_policy_unavailable_blocks_all_utility_entrypoints_before_spawn() {
-        let (_tmp, services) = services_with_bin(PathBuf::from("/never-launch/provider")).await;
-        services.set_provider_policy_sources(
-            "auggie",
-            vec![crate::provider_profiles::PolicySource::Unavailable],
-        );
-        let err = services
-            .agent_complete_once_op("p".into(), None, None, None, None, None, None)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("policy"), "{err}");
-        let err = services
-            .agent_enhance_prompt_op("p".into(), "enhance".into(), None, None, None)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("policy"), "{err}");
-        for provider in intent_providers::ACP_PROVIDERS {
-            services.set_provider_policy_sources(
-                provider.id,
-                vec![crate::provider_profiles::PolicySource::Unavailable],
-            );
-            let models = services
-                .models_list_op(Some(provider.id.into()), true)
-                .await
-                .unwrap();
-            if crate::model_catalog::source_for(provider.id).is_some() {
-                assert!(
-                    models["warning"].as_str().unwrap().contains("policy"),
-                    "{models}"
-                );
-            } else {
-                assert_eq!(models["source"], "static");
-            }
-            if provider.supports_test_prompt {
-                let tested = crate::provider_test_prompt::provider_test_prompt(
-                    Some(&services),
-                    provider.id,
-                    None,
-                    &std::collections::HashMap::<String, String>::new(),
-                    None,
-                )
-                .await
-                .unwrap();
-                assert_eq!(tested["reason"], "spawn-failed", "{tested}");
-                assert!(
-                    tested["message"].as_str().unwrap().contains("policy"),
-                    "{tested}"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn provider_policy_cached_models_skip_preflight_but_refresh_never_spawns() {
-        let (fixture, bin) = fake_auggie("policy-sentinel", "touch \"$0.spawned\"; exit 99");
-        let marker = fixture.path().join("auggie.spawned");
-        let (_tmp, services) = services_with_bin(bin).await;
-        let source = crate::model_catalog::source_for("auggie").unwrap();
-        let version = (source.version_key)();
-        crate::model_catalog::resolve_with_cache(
-            &services.models_catalog,
-            "auggie",
-            &version,
-            true,
-            crate::model_catalog::ModelCatalogCache::now_ms(),
-            || {
-                Box::pin(async {
-                    crate::model_catalog::ModelFetchResult {
-                        models: Some(vec![serde_json::json!({"id":"cached"})]),
-                        warning: None,
-                    }
-                })
-            },
-        )
-        .await;
-        services.set_provider_policy_sources(
-            "auggie",
-            vec![crate::provider_profiles::PolicySource::Unavailable],
-        );
-        let cached = services
-            .models_list_op(Some("auggie".into()), false)
-            .await
-            .unwrap();
-        assert_eq!(cached["models"][0]["id"], "cached");
-        assert!(cached.get("warning").is_none(), "{cached}");
-        let refreshed = services
-            .models_list_op(Some("auggie".into()), true)
-            .await
-            .unwrap();
-        assert!(
-            refreshed["warning"].as_str().unwrap().contains("policy"),
-            "{refreshed}"
-        );
-        assert!(services
-            .agent_get_models_op()
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("policy"));
-        assert!(services
-            .agent_complete_once_op("p".into(), None, None, None, None, None, None)
-            .await
-            .is_err());
-        assert!(services
-            .agent_enhance_prompt_op("p".into(), "enhance".into(), None, None, None)
-            .await
-            .is_err());
-        assert!(
-            !marker.exists(),
-            "denied utility must not start the sentinel binary"
-        );
     }
 
     #[tokio::test]
@@ -1139,7 +1016,6 @@ rl.on('line', (line) => {
                         "tools": [],
                         "settingSources": ["user"],
                         "strictMcpConfig": true,
-                        "extraArgs": {"disable-slash-commands": null},
                     }
                 },
             })
@@ -1318,7 +1194,7 @@ rl.on('line', (line) => {
             .as_str()
             .expect("adapter echoed CODEX_HOME");
         assert!(
-            child_home.contains("provider-profiles-v1/ephemeral-"),
+            child_home.contains("intentd-codex-home-"),
             "the one-shot child must see the isolated throwaway CODEX_HOME, got: {child_home}"
         );
     }
@@ -1430,13 +1306,10 @@ rl.on('line', (line) => {
                 );
                 let config: Value =
                     serde_json::from_str(observed["config"].as_str().unwrap()).unwrap();
-                assert_eq!(config["agents"]["enabled"], false);
-                assert_eq!(config["features"]["multi_agent_v2"], false);
-                assert!(config["mcp_servers"]
-                    .as_object()
-                    .unwrap()
-                    .values()
-                    .all(|server| server["enabled"] == false));
+                assert_eq!(
+                    config,
+                    json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}})
+                );
                 assert_eq!(
                     observed["selectedModel"],
                     json!(config_option_model(codex, model))

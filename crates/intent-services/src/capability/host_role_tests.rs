@@ -434,38 +434,8 @@ async fn member_script_remove_preserves_a_protected_definition_and_runtime() {
 async fn member_tools_share_configured_mcp_without_admin_authority() {
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
-    let ws = WorkspaceId::from("member-mcp");
-    svc.store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let created = with_caller(
-        Caller::Daemon,
-        svc.agent_create(
-            ws.clone(),
-            None,
-            Some("default".into()),
-            None,
-            None,
-            None,
-            intent_core::AgentCreateExtra {
-                provider: Some("mock".into()),
-                ..Default::default()
-            },
-        ),
-    )
-    .await
-    .unwrap();
-    let agent = AgentId::from(created["agent"]["id"].as_str().unwrap());
     with_caller(caller(&member), async {
-        let listed = svc
-            .mcp_list_servers(Some(ws.clone()), Some(agent.clone()))
-            .await
-            .unwrap();
-        assert!(listed["servers"].is_array());
-        for (workspace, caller) in [(None, None), (Some(ws), None), (None, Some(agent))] {
-            assert!(matches!(
-                svc.mcp_list_servers(workspace, caller).await,
-                Err(Error::InvalidParams(_))
-            ));
-        }
+        svc.mcp_list_servers(None).await.unwrap();
         assert!(matches!(
             svc.settings_list().await,
             Err(Error::Forbidden(_))

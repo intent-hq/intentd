@@ -2703,16 +2703,13 @@ fn mock_handle() -> AgentHandle {
             _mcp_bridge: None,
             _mcp_config: None,
             _rules_config: None,
-            pi_extension: None,
-            provider_profile: None,
+            _pi_extension: None,
             npx_launch_dir: None,
             preparation_guard: None,
             cleanup_lease: None,
             cleanup_services: None,
         }),
         antigravity_profile: None,
-        profile_meta: json!({}),
-        provider_profile: None,
         session_mcp_servers: Vec::new(),
         spawned_model: None,
         spawned_provider: "auggie".to_string(),
@@ -5024,16 +5021,13 @@ fn track_mock_agent_inner(
                 _mcp_bridge: None,
                 _mcp_config: None,
                 _rules_config: None,
-                pi_extension: None,
-                provider_profile: None,
+                _pi_extension: None,
                 npx_launch_dir: None,
                 preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
             antigravity_profile: None,
-            profile_meta: json!({}),
-            provider_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
@@ -5185,16 +5179,13 @@ fn track_mock_agent_prompt_rpc_error_inner(
                 _mcp_bridge: None,
                 _mcp_config: None,
                 _rules_config: None,
-                pi_extension: None,
-                provider_profile: None,
+                _pi_extension: None,
                 npx_launch_dir: None,
                 preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
             antigravity_profile: None,
-            profile_meta: json!({}),
-            provider_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: spawned_provider.to_string(),
@@ -9098,16 +9089,13 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
                 _mcp_bridge: None,
                 _mcp_config: None,
                 _rules_config: None,
-                pi_extension: None,
-                provider_profile: None,
+                _pi_extension: None,
                 npx_launch_dir: None,
                 preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
             antigravity_profile: None,
-            profile_meta: json!({}),
-            provider_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
@@ -18764,189 +18752,6 @@ mod merge_user_mcp_servers_tests {
     }
 
     #[tokio::test]
-    async fn master_mcp_switch_denies_saved_project_identities_and_restores_precedence() {
-        assert_master_mcp_switch_policy(false).await;
-    }
-
-    #[tokio::test]
-    async fn master_mcp_switch_preserves_bridge_despite_saved_alias() {
-        assert_master_mcp_switch_policy(true).await;
-    }
-
-    async fn assert_master_mcp_switch_policy(bridge_alias: bool) {
-        let (_tmp, mgr, secrets, cfg) = manager_with_secrets().await;
-        let mut saved = json!({
-                "saved-id": {"id":"saved-id", "name":"saved-name", "transport":"stdio", "command":"saved-command", "enabled":true},
-                "old-id": {"id":"old-id", "name":"old-name", "transport":"stdio", "command":"old-command", "enabled":false},
-                "old-name": {"id":"old-name", "name":"renamed", "transport":"stdio", "command":"renamed-command", "enabled":true},
-                "bridge-id": {"id":"bridge-id", "name":"workspace-mcp", "transport":"stdio", "command":"untrusted-bridge", "enabled":false}
-        });
-        if bridge_alias {
-            saved["workspace-mcp"] = json!({"id":"workspace-mcp", "name":"bridge-id", "transport":"stdio", "command":"false", "enabled":true});
-        } else {
-            saved.as_object_mut().unwrap().remove("bridge-id");
-        }
-        write_servers(&secrets, &saved);
-        let mut project = json!({});
-        for name in [
-            "saved-id",
-            "saved-name",
-            "old-id",
-            "old-name",
-            "renamed",
-            "bridge-id",
-            "workspace-mcp",
-            "project-only",
-        ] {
-            if name != "bridge-id" || bridge_alias {
-                project[name] = json!({"command":"project-command"});
-            }
-        }
-        std::fs::write(
-            cfg.path().join(".mcp.json"),
-            json!({"mcpServers":project}).to_string(),
-        )
-        .unwrap();
-        for enabled in [false, true] {
-            mgr.services
-                .settings_registry()
-                .unwrap()
-                .apply(&[("mcp.enableUserServers".to_string(), json!(enabled))])
-                .unwrap();
-            let servers = mgr
-                .effective_launch_mcp(
-                    &intent_core::WorkspaceId::from("project-policy"),
-                    cfg.path(),
-                    "bridge-address".into(),
-                )
-                .await
-                .unwrap();
-            assert!(servers.contains_key("project-only"));
-            match &servers["workspace-mcp"] {
-                NormalizedMcpServer::Stdio { command, args, .. } => {
-                    assert_ne!(command, "untrusted-bridge");
-                    assert_ne!(command, "project-command");
-                    assert!(args.contains(&"mcp-bridge".to_owned()));
-                    assert!(args.contains(&"bridge-address".to_owned()));
-                }
-                other => panic!("expected trusted stdio bridge, got {other:?}"),
-            }
-            for name in ["old-id", "old-name", "renamed", "bridge-id"] {
-                assert!(!servers.contains_key(name), "disabled identity {name}");
-            }
-            if enabled {
-                assert!(
-                    matches!(&servers["saved-name"], NormalizedMcpServer::Stdio {command, ..} if command == "saved-command")
-                );
-            } else {
-                assert!(
-                    !servers.contains_key("saved-name"),
-                    "master switch must deny saved name from project"
-                );
-                assert!(
-                    !servers.contains_key("saved-id"),
-                    "master switch must deny saved ID from project"
-                );
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn pi_delivery_respects_global_bridge_disable() {
-        assert_pi_bridge_disable(false).await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn pi_delivery_respects_workspace_bridge_disable() {
-        assert_pi_bridge_disable(true).await;
-    }
-
-    #[cfg(unix)]
-    async fn assert_pi_bridge_disable(workspace_disable: bool) {
-        let (_tmp, mgr, _secrets, cfg) = manager_with_secrets().await;
-        let ws = intent_core::WorkspaceId::from("pi-bridge-policy");
-        super::seed_agent(&mgr, &ws, &intent_core::AgentId::from("pi-bridge-agent")).await;
-        std::fs::write(
-            cfg.path().join(".mcp.json"),
-            r#"{"mcpServers":{"external":{"command":"echo"}}}"#,
-        )
-        .unwrap();
-        for enabled in [false, true] {
-            for disabled in [true, false] {
-                mgr.services
-                    .settings_registry()
-                    .unwrap()
-                    .apply(&[
-                        ("mcp.enableUserServers".into(), json!(enabled)),
-                        (
-                            "mcp.disabledServers".into(),
-                            if disabled && !workspace_disable {
-                                json!(["workspace-mcp"])
-                            } else {
-                                json!([])
-                            },
-                        ),
-                    ])
-                    .unwrap();
-                mgr.services
-                    .store
-                    .set_workspace_mcp_server_disabled(
-                        &ws,
-                        "workspace-mcp",
-                        disabled && workspace_disable,
-                    )
-                    .await
-                    .unwrap();
-                let servers = mgr
-                    .effective_launch_mcp(&ws, cfg.path(), "127.0.0.1:9999".into())
-                    .await
-                    .unwrap();
-                assert_eq!(servers.contains_key("workspace-mcp"), !disabled);
-                let mut command = tokio::process::Command::new("unused-test-command");
-                command
-                    .env("HOME", cfg.path())
-                    .env(super::super::INTENTD_MCP_BRIDGE_ADDR_ENV, "poison:1");
-                let mut profile = crate::provider_launch::prepare(
-                    "pi",
-                    crate::provider_profiles::LaunchPurpose::Persistent,
-                    &command,
-                    cfg.path(),
-                    cfg.path(),
-                    cfg.path(),
-                    Some("pi-policy"),
-                    &servers,
-                    &[],
-                )
-                .unwrap();
-                let delivery = super::super::PiExtensionDelivery::write(
-                    "pi",
-                    profile.path(),
-                    &profile.native_args,
-                )
-                .unwrap();
-                delivery.apply_spawn_env(&mut profile, "127.0.0.1:9999".into());
-                profile.apply_to_command(&mut command);
-                assert_eq!(
-                    crate::provider_launch::command_env(
-                        &command,
-                        super::super::INTENTD_MCP_BRIDGE_ADDR_ENV
-                    ),
-                    (!disabled).then(|| "127.0.0.1:9999".to_owned()),
-                    "direct bridge disable must clear inherited delivery address"
-                );
-                let external: serde_json::Value = serde_json::from_str(
-                    &std::fs::read_to_string(&profile.env["INTENTD_PI_MCP_CONFIG"]).unwrap(),
-                )
-                .unwrap();
-                assert_eq!(external["mcpServers"]["external"]["command"], "echo");
-                assert!(external["mcpServers"].get("workspace-mcp").is_none());
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn merges_enabled_stdio_server_by_name() {
         let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
@@ -21243,16 +21048,13 @@ mod harness_wake_tests {
                 _mcp_bridge: None,
                 _mcp_config: None,
                 _rules_config: None,
-                pi_extension: None,
-                provider_profile: None,
+                _pi_extension: None,
                 npx_launch_dir: None,
                 preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
             antigravity_profile: None,
-            profile_meta: json!({}),
-            provider_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
@@ -27395,228 +27197,6 @@ pub(crate) async fn held_preparation_foreground(
     .await
     .unwrap();
     (mgr, id, services)
-}
-
-#[tokio::test]
-async fn provider_policy_requires_trusted_workspace_identity_and_reloads_sources() {
-    let (_tmp, mgr) = manager().await;
-    let ws = WorkspaceId::from("policy-workspace");
-    let agent = AgentId::from("policy-agent");
-    seed_agent(&mgr, &ws, &agent).await;
-    let svc = &mgr.services;
-    assert!(svc.mcp_caller_policy(Some(&ws), None).await.is_err());
-    assert!(svc.mcp_caller_policy(None, Some(&agent)).await.is_err());
-    assert!(svc
-        .mcp_caller_policy(Some(&WorkspaceId::from("other")), Some(&agent))
-        .await
-        .is_err());
-    svc.store
-        .rehome_agent_session_provider(&ws, &agent, Some("auggie"), "claude-code", None, &now_iso())
-        .await
-        .unwrap();
-    let dir = test_tempdir("live-provider-policy");
-    let path = dir.path().join("managed.json");
-    std::fs::write(&path, r#"{"deniedMcpServers":[{"serverName":"blocked"}]}"#).unwrap();
-    svc.set_provider_policy_sources(
-        "claude-code",
-        vec![crate::provider_profiles::PolicySource::ClaudeSettings(
-            path.clone(),
-        )],
-    );
-    let server = intent_acp::NormalizedMcpServer::Stdio {
-        command: "echo".into(),
-        args: vec![],
-        env: std::collections::BTreeMap::new(),
-    };
-    let policy = svc
-        .mcp_caller_policy(Some(&ws), Some(&agent))
-        .await
-        .unwrap();
-    assert!(!policy.allows_tool("blocked", &server, "read"));
-    assert!(policy.allows_tool("allowed", &server, "read"));
-    std::fs::write(&path, r#"{"allowedMcpServers":[]}"#).unwrap();
-    assert!(!svc
-        .mcp_caller_policy(Some(&ws), Some(&agent))
-        .await
-        .unwrap()
-        .allows_server("allowed", &server));
-    svc.set_provider_policy_sources(
-        "claude-code",
-        vec![crate::provider_profiles::PolicySource::Unavailable],
-    );
-    assert!(svc
-        .mcp_caller_policy(Some(&ws), Some(&agent))
-        .await
-        .is_err());
-}
-
-#[tokio::test]
-async fn provider_policy_routes_separate_agents_and_reject_untrusted_callers() {
-    intent_core::with_caller(intent_core::Caller::Daemon, async {
-    let (_tmp, mgr) = manager().await;
-    let mgr = Arc::new(mgr);
-    mgr.services.attach_agent_manager(&mgr);
-    let ws = WorkspaceId::from("policy-routes");
-    let denied = AgentId::from("policy-denied");
-    seed_agent(&mgr, &ws, &denied).await;
-    let svc = &mgr.services;
-    let mut other = svc.store.get_agent_session(&denied).await.unwrap();
-    other.id = AgentId::from("policy-allowed");
-    svc.store
-        .insert_agent_session_with_task_graph(&other, false)
-        .await
-        .unwrap();
-    svc.store
-        .rehome_agent_session_provider(
-            &ws,
-            &denied,
-            Some("auggie"),
-            "claude-code",
-            None,
-            &now_iso(),
-        )
-        .await
-        .unwrap();
-    let dir = test_tempdir("provider-policy-routes");
-    let file = dir.path().join("managed.json");
-    std::fs::write(&file, r#"{"allowedMcpServers":[]}"#).unwrap();
-    svc.set_provider_policy_sources(
-        "claude-code",
-        vec![crate::provider_profiles::PolicySource::ClaudeSettings(
-            file.clone(),
-        )],
-    );
-    svc.secrets.store("mcp.servers", &json!({"srv":{"id":"srv","name":"shared","command":"echo","enabled":true,"transport":"stdio"}}).to_string()).await.unwrap();
-    assert_eq!(
-        svc.mcp_list_servers(Some(ws.clone()), Some(denied.clone()))
-            .await
-            .unwrap()["servers"],
-        json!([])
-    );
-    assert_eq!(
-        svc.mcp_list_servers(Some(ws.clone()), Some(other.id.clone()))
-            .await
-            .unwrap()["servers"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    // Active process identity wins over the next provider stored on the row.
-    track(&mgr, &other.id);
-    let mut command = tokio::process::Command::new("unused");
-    command.env("HOME", dir.path());
-    let active = crate::provider_launch::prepare(
-        "claude-code",
-        crate::provider_profiles::LaunchPurpose::Persistent,
-        &command,
-        dir.path(),
-        dir.path(),
-        dir.path(),
-        Some("active-caller"),
-        &intent_acp::NormalizedMcpServers::new(),
-        &[],
-    )
-    .unwrap();
-    mgr.handles
-        .lock()
-        .unwrap()
-        .get_mut(&other.id)
-        .unwrap()
-        .provider_profile = Some(Arc::new(active));
-    assert_eq!(
-        svc.mcp_list_servers(Some(ws.clone()), Some(other.id.clone()))
-            .await
-            .unwrap()["servers"],
-        json!([])
-    );
-    for caller in [None, Some(AgentId::from("missing"))] {
-        assert!(svc
-            .mcp_list_servers(Some(ws.clone()), caller.clone())
-            .await
-            .is_err());
-        assert!(svc
-            .mcp_list_tools("srv".into(), Some(ws.clone()), caller.clone())
-            .await
-            .is_err());
-        assert!(svc
-            .mcp_call_tool(
-                "srv".into(),
-                "echo".into(),
-                json!({}),
-                None,
-                Some(ws.clone()),
-                caller
-            )
-            .await
-            .is_err());
-    }
-    assert!(svc
-        .mcp_list_servers(Some(WorkspaceId::from("wrong")), Some(other.id.clone()))
-        .await
-        .is_err());
-    std::fs::write(&file, "{}").unwrap();
-    assert_eq!(
-        svc.mcp_list_servers(Some(ws.clone()), Some(denied))
-            .await
-            .unwrap()["servers"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    svc.secrets.store("mcp.servers", "malformed").await.unwrap();
-    assert!(svc
-        .mcp_list_servers(Some(ws), Some(other.id))
-        .await
-        .is_err());
-    }).await;
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn provider_profile_respawn_releases_previous_lease_and_reuses_directory() {
-    use std::os::unix::fs::PermissionsExt;
-    let (_tmp, mgr) = manager().await;
-    let root = test_tempdir("provider-profile-respawn");
-    let ws = WorkspaceId::from("profile-respawn");
-    let id = AgentId::from("profile-respawn-agent");
-    seed_agent(&mgr, &ws, &id).await;
-    let bin = root.path().join("hold");
-    std::fs::write(&bin, "#!/bin/sh\nread -r line\n").unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let provider = test_provider();
-    let mut opts = intent_acp::SpawnOptions::new(&provider);
-    opts.provider_binary = Some(&bin);
-    opts.extra_env
-        .insert("HOME".into(), root.path().to_string_lossy().into_owned());
-    let mut path = None;
-    for _ in 0..2 {
-        mgr.create_agent(
-            id.clone(),
-            ws.clone(),
-            "profile test",
-            "implementor",
-            root.path().to_owned(),
-            &opts,
-        )
-        .await
-        .unwrap();
-        let profile = mgr.active_profile(&id).unwrap();
-        if let Some(path) = &path {
-            assert_eq!(profile.path(), path);
-        }
-        path = Some(profile.path().to_owned());
-        assert_eq!(
-            profile.args.iter().filter(|s| *s == "--mcp-config").count(),
-            1
-        );
-    }
-    mgr.shutdown().await;
-    assert!(
-        path.unwrap().is_dir(),
-        "stable session profile survives shutdown"
-    );
 }
 
 /// Failure cases: pooled batch attachments, duplicate aggregate attachments,
