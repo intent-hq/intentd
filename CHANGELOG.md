@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.25] - 2026-10-06
+
+### 🚀 Features
+
+- Read GitLab checkout repository configuration ([#2325](https://github.com/intent-hq/intentd/pull/2325))
+
+### 🧪 Testing
+
+- Stabilize repository reader paths and native review clock ([#2329](https://github.com/intent-hq/intentd/pull/2329))
+
+### ⚙️ Miscellaneous Tasks
+
+- Revert daemon-owned provider configuration and personal skill restoration ([#2331](https://github.com/intent-hq/intentd/pull/2331))
+
+
 ## [0.10.24] - 2026-10-06
 
 ### 🧪 Testing
