@@ -1396,6 +1396,7 @@ async fn fresh_send_after_failed_session_setup_loads_before_prompt_over_wss() {
                 if result["session"]["isActive"] == false {
                     break;
                 }
+                // timing-guard: bounded polling for persisted state after stream:end.
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
