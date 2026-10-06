@@ -971,10 +971,12 @@ impl Store {
         disposition: &mut RepositoryWorkspaceDeleteDisposition,
         committed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
-        let mut lifecycle = self.repository_lifecycle_write().await?;
         // Hold through every bounded sweep and final commit/failure. All private
         // desktop producers use this same Store-level admission gate.
+        // Wait before taking database-wide lifecycle serialization: another
+        // deletion holding this guard needs that serialization for agent cleanup.
         let _desktop_deletion = self.desktop_writes.delete(id).await;
+        let mut lifecycle = self.repository_lifecycle_write().await?;
         // In particular, a missing workspace must not delete opaque draft
         // keys. The final transaction also checks existence for racing deletes.
         let exists: bool =
