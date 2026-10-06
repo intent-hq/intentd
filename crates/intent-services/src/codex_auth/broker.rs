@@ -1,5 +1,9 @@
 //! The daemon owns refresh work; adapter trees only own cancellable RPC clients.
-use super::*;
+use super::{
+    json, write_frame, Authority, BufReader, ChildStdin, Command, Credentials, Duration, Frames,
+    Path, PathBuf, Result, Stdio, ACCOUNT_ERROR, AUTH_ERROR, AUTH_FRAME_LIMIT, BUSY_ERROR,
+    CONTRACT_ERROR, POLICY_ERROR, TIMEOUT,
+};
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -138,7 +142,10 @@ pub(super) async fn run_owner_with_lease(
             _ = lease.read(&mut byte) => break,
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else { break };
-                requests.spawn(serve(authority.clone(), stream));
+                requests.spawn(intent_core::with_caller(
+                    intent_core::Caller::Daemon,
+                    serve(authority.clone(), stream),
+                ));
             }
             _ = requests.join_next(), if !requests.is_empty() => {}
         }

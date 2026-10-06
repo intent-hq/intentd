@@ -375,31 +375,47 @@ def main():
                 assert p.status()['authToken'] != jwt(expired=True)
                 assert len(Endpoint.used) == 1
                 passed('expired access token renews through native authority before worker login')
-            # Accepted refresh ownership survives the caller's shorter budget.
-            Endpoint.used.clear()
-            Endpoint.consumed.clear()
-            Endpoint.delay_response = 8
-            with Probe(seed=auth_seed(jwt(expired=True)), start=False) as native:
-                before_revoke = Endpoint.posts.count('/oauth/revoke')
-                with Probe(bridge=bridge, authority=native) as abandoned:
-                    started = time.monotonic()
-                    response = abandoned.call('initialize', {
-                        'clientInfo': {'name': 'slow-refresh', 'version': '1'},
-                        'capabilities': {'experimentalApi': True},
-                    }, timeout=10)
-                    assert Endpoint.consumed.is_set()
-                    assert 'error' in response and 'busy' in response['error']['message']
-                    assert time.monotonic() - started < 9
-                # Closing the lease drained and reaped the owner after persistence.
-                persisted = json.loads(native.auth.read_text())
-                assert persisted['tokens']['refresh_token'].startswith('rotated-')
-                Endpoint.delay_response = 0
-                with Probe(bridge=bridge, authority=native) as retry:
-                    retry.initialize()
-                    assert 'result' in retry.call('account/read', {'refreshToken': False})
-                assert len(Endpoint.used) == 1
-                assert Endpoint.posts.count('/oauth/revoke') == before_revoke
-                passed('slow single-use refresh survives caller timeout and lease closure; fresh retry succeeds')
+            # Every abandonment mode occurs after the issuer has consumed R0.
+            # The private owner is a sibling, retains its lock/pipes, and drains
+            # even when its daemon lease closes before the response is ready.
+            for abandon in ('deadline', 'eof', 'kill'):
+                Endpoint.used.clear()
+                Endpoint.consumed.clear()
+                Endpoint.delay_response = 8
+                with Probe(seed=auth_seed(jwt(expired=True)), start=False) as native:
+                    before_revoke = Endpoint.posts.count('/oauth/revoke')
+                    with Probe(bridge=bridge, authority=native) as abandoned:
+                        started = time.monotonic()
+                        params = {'clientInfo': {'name': 'slow-refresh', 'version': '1'},
+                                  'capabilities': {'experimentalApi': True}}
+                        if abandon == 'deadline':
+                            response = abandoned.call('initialize', params, timeout=10)
+                            assert Endpoint.consumed.is_set()
+                            assert 'error' in response and 'busy' in response['error']['message']
+                            assert time.monotonic() - started < 9
+                        else:
+                            abandoned.send({'id': 1, 'method': 'initialize', 'params': params})
+                            assert Endpoint.consumed.wait(timeout=5)
+                            if abandon == 'eof':
+                                abandoned.proc.stdin.close()
+                            else:
+                                os.killpg(abandoned.proc.pid, signal.SIGKILL)
+                            abandoned.owner.stdin.close()
+                            abandoned.proc.wait(timeout=9)
+                            # Inherited lease writers would prevent this exit.
+                            abandoned.owner.wait(timeout=12)
+                            assert abandoned.owner.returncode == 0
+                            assert not (abandoned.home / 'authority.sock').exists()
+                    assert abandoned.owner.returncode == 0
+                    persisted = json.loads(native.auth.read_text())
+                    assert persisted['tokens']['refresh_token'].startswith('rotated-')
+                    Endpoint.delay_response = 0
+                    with Probe(bridge=bridge, authority=native) as retry:
+                        retry.initialize()
+                        assert 'result' in retry.call('account/read', {'refreshToken': False})
+                    assert len(Endpoint.used) == 1
+                    assert Endpoint.posts.count('/oauth/revoke') == before_revoke
+                    passed('slow single-use refresh survives ' + abandon + ', drains lease and retries')
             Endpoint.delay_response = 0
             Endpoint.used.clear()
             with Probe(seed=auth_seed(token), start=False) as native:

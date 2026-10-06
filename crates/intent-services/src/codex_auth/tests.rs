@@ -780,7 +780,7 @@ where
     let b = token("account", "user", 2, false);
     f.login(&a, Some(&b));
     std::fs::write(f.native.join("delay-refresh"), "8").unwrap();
-    let socket = f._root.path().join("auth.sock");
+    let socket = f.profile.join("auth.sock");
     let (lease, lease_read) = tokio::io::duplex(16);
     let owner = intent_core::spawn_daemon(broker::run_owner_with_lease(
         f.runtime.clone(),

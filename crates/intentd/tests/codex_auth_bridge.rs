@@ -123,6 +123,86 @@ fn token(generation: u64) -> String {
     )
 }
 #[tokio::test]
+async fn refresh_callback_deadline_abandons_reply_but_preserves_native_rotation() {
+    let root = common::test_tempdir("codex-auth-callback-lifetime");
+    let native = root.path().join("native");
+    let profile = root.path().join("worker");
+    std::fs::create_dir(&native).unwrap();
+    std::fs::create_dir(&profile).unwrap();
+    std::fs::write(profile.join("worker"), "").unwrap();
+    let runtime = root.path().join("codex");
+    std::fs::write(
+        &runtime,
+        include_str!("../../intent-services/src/codex_auth/fixture.py"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let a = token(1);
+    let b = token(2);
+    std::fs::write(
+        native.join("auth.json"),
+        json!({
+            "authMethod":"chatgpt", "authToken":a, "refresh_token":"single-use", "next":b
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut client = Client::start(&profile, &native, &runtime).await;
+    std::fs::write(native.join("delay-refresh"), "8").unwrap();
+    std::fs::write(profile.join("request-refresh"), "").unwrap();
+    let started = std::time::Instant::now();
+    let response = client.call(2, "turn/start", json!({})).await;
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("busy"));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(native.join("refresh-consumed").exists());
+    assert_eq!(
+        std::fs::read_to_string(profile.join("refresh-outcome")).unwrap(),
+        "error"
+    );
+    // Both the bridge process and daemon lease disappear while native I/O is
+    // still outstanding. Only the independent owner may complete persistence.
+    drop(client);
+    // timing-guard: observe the native write, never infer success from a sleep.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state: Value =
+                serde_json::from_slice(&std::fs::read(native.join("auth.json")).unwrap()).unwrap();
+            if state["refresh_token"] == "single-use-next" {
+                break;
+            }
+            // timing-guard: poll the persisted replacement after issuer consumption.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::remove_file(profile.join("request-refresh")).unwrap();
+    let mut retry = Client::start(&profile, &native, &runtime).await;
+    assert!(retry
+        .call(3, "thread/resume", json!({"threadId":"existing"}))
+        .await
+        .get("result")
+        .is_some());
+    assert_eq!(
+        std::fs::read_to_string(profile.join("injected")).unwrap(),
+        b
+    );
+    assert_eq!(
+        std::fs::read_to_string(native.join("consumed"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(!native.join("revoked").exists());
+    assert!(!profile.join("revoked").exists());
+    assert!(!profile.join("auth.json").exists());
+}
+
+#[tokio::test]
 async fn startup_error_cleanup_preserves_native_login_and_retry_uses_relogin() {
     let root = common::test_tempdir("codex-auth-binary");
     let native = root.path().join("native");
