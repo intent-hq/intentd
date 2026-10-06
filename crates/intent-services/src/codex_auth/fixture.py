@@ -43,6 +43,12 @@ for line in sys.stdin:
     elif method == 'config/read':
         result = {'layers': []}
     elif method == 'getAuthStatus':
+        once = home / 'delay-once'
+        if once.exists():
+            delay = float(once.read_text())
+            once.unlink()
+            (home / 'auth-read-started').write_text('ready')
+            time.sleep(delay)
         if (home / 'delay').exists():
             time.sleep(float((home / 'delay').read_text()))
         path = home / 'auth.json'

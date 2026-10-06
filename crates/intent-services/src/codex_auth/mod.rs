@@ -27,6 +27,8 @@ const LIMIT: usize = 8 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(7);
 const AUTH_ERROR: &str =
     "Native Codex authentication is unavailable. Run codex login on this daemon host, then Retry.";
+const BUSY_ERROR: &str =
+    "Native Codex authentication is busy. Retry shortly; your native login is unchanged.";
 const CONTRACT_ERROR: &str = "The installed Codex does not support Intent's native authentication bridge. Update Codex on this daemon host.";
 const POLICY_ERROR: &str = "Managed Codex credential storage cannot safely be used by an isolated Intent worker. Ask your administrator for a supported configuration.";
 const ACCOUNT_ERROR: &str = "Native Codex is signed in to a different account. Restore this agent's original account or start a new agent.";
@@ -344,6 +346,9 @@ async fn auth_lock(home: &Path) -> Result<std::fs::File> {
             {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(BUSY_ERROR);
+            }
             Err(_) => return Err(AUTH_ERROR),
         }
     }
@@ -578,6 +583,9 @@ impl Bridge {
                         | "thread/backgroundTerminals/terminate" | "thread/goal/clear") {
                         if let Err(error) = self.synchronize(server, output).await {
                             write_frame(output, &json!({"id":frame["id"],"error":{"code":-32000,"message":error}})).await?;
+                            // Contention rejects only this request. Keep existing
+                            // work and cancellation alive so a later retry can sync.
+                            if error == BUSY_ERROR { continue; }
                             return Ok(());
                         }
                     }

@@ -108,8 +108,16 @@ async fn refresh_owner_serializes_rotation_and_persists_it_past_probe_cleanup() 
     let first = f.authority();
     let second = f.authority();
     let (one, two) = tokio::join!(first.read(Some(&a)), second.read(Some(&a)));
-    assert_eq!(one.unwrap().unwrap().token, b);
-    assert_eq!(two.unwrap().unwrap().token, b);
+    assert!(one.is_ok() || two.is_ok(), "a refresh owner must complete");
+    for result in [one, two] {
+        // A bounded waiter may be told to retry while the owner succeeds.
+        // Only busy is recoverable here: credential/issuer errors still fail.
+        let credentials = match result {
+            Err(BUSY_ERROR) => f.authority().read(Some(&a)).await.unwrap().unwrap(),
+            other => other.unwrap().unwrap(),
+        };
+        assert_eq!(credentials.token, b);
+    }
     assert_eq!(
         std::fs::read_to_string(f.native.join("consumed"))
             .unwrap()
@@ -488,7 +496,7 @@ async fn lock_contention_is_bounded_and_cancellation_releases_authority() {
     f.login(&token("account", "user", 1, false), None);
     let lock = auth_lock(&f.native).await.unwrap();
     let start = tokio::time::Instant::now();
-    assert!(f.authority().read(None).await.is_err());
+    assert!(matches!(f.authority().read(None).await, Err(BUSY_ERROR)));
     assert!(start.elapsed() < Duration::from_secs(4));
     drop(lock);
     std::fs::write(f.native.join("delay"), "30").unwrap();
@@ -499,6 +507,100 @@ async fn lock_contention_is_bounded_and_cancellation_releases_authority() {
     );
     std::fs::remove_file(f.native.join("delay")).unwrap();
     assert!(f.authority().read(None).await.is_ok());
+}
+
+#[tokio::test]
+async fn busy_native_owner_reports_retry_and_preserves_lineage_and_session() {
+    let f = Fixture::new();
+    let a = token("account", "user", 1, false);
+    let b = token("account", "user", 2, false);
+    f.login(&a, Some(&b));
+    let mut worker = f.server();
+    let mut bridge = f.bridge();
+    bridge
+        .synchronize(&mut worker, &mut Vec::new())
+        .await
+        .unwrap();
+    std::fs::write(f.profile.join("session.json"), "original-session").unwrap();
+    std::fs::write(f.native.join("delay-once"), "3").unwrap();
+    let authority = f.authority();
+    let owner = tokio::spawn(async move {
+        let start = tokio::time::Instant::now();
+        (authority.read(Some(&a)).await, start.elapsed())
+    });
+    // timing-guard: wait for the synthetic native helper's explicit ready
+    // signal, not an assumed startup delay, before entering lock contention.
+    tokio::time::timeout(Duration::from_secs(7), async {
+        while !f.native.join("auth-read-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (mut client, input) = tokio::io::duplex(4096);
+    let (mut output, client_output) = tokio::io::duplex(4096);
+    let mut input = Frames::new(BufReader::new(input));
+    let exchange = async {
+        let mut responses = Frames::new(BufReader::new(client_output));
+        let wait_started = tokio::time::Instant::now();
+        write_frame(&mut client, &json!({"id":7,"method":"turn/start"}))
+            .await
+            .unwrap();
+        let response = responses.next().await.unwrap().unwrap();
+        let waited = wait_started.elapsed();
+        assert_eq!(response["error"]["message"], BUSY_ERROR);
+        assert!(!response.to_string().contains("codex login"));
+        assert!(!std::fs::read_to_string(f.profile.join("requests"))
+            .unwrap()
+            .contains("turn/start"));
+        let (result, held) = owner.await.unwrap();
+        assert_eq!(result.unwrap().unwrap().token, b);
+        assert!(waited >= Duration::from_secs(2) && waited < Duration::from_secs(4));
+        assert!(held >= Duration::from_secs(3) && held < TIMEOUT);
+        eprintln!("native owner duration={held:?}; contending request wait={waited:?}; classification=busy");
+        // Retry through the SAME worker and proxy after the native owner exits.
+        write_frame(&mut client, &json!({"id":8,"method":"turn/start"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            responses.next().await.unwrap().unwrap(),
+            json!({"id":8,"result":{}})
+        );
+        drop(client);
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (proxy, ()) =
+            tokio::join!(bridge.proxy(&mut worker, &mut input, &mut output), exchange);
+        proxy.unwrap();
+    })
+    .await
+    .unwrap();
+    assert_eq!(bridge.credentials.unwrap().token, b);
+    worker.stop().await;
+    assert_eq!(
+        std::fs::read_to_string(f.profile.join("session.json")).unwrap(),
+        "original-session"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.native.join("consumed"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    let persisted: Value =
+        serde_json::from_slice(&std::fs::read(f.native.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(persisted["refresh_token"], "synthetic-R0-next");
+    assert!(!f.native.join("revoked").exists());
+    assert!(!f.profile.join("revoked").exists());
+    assert!(!f.profile.join("auth.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(f.profile.join("requests"))
+            .unwrap()
+            .matches("turn/start")
+            .count(),
+        1
+    );
 }
 
 #[test]
