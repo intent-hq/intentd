@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.23] - 2026-10-06
+
+### 🐛 Bug Fixes
+
+- Prevent doctor from mutating daemon databases ([#2318](https://github.com/intent-hq/intentd/pull/2318))
+
+
 ## [0.10.22] - 2026-10-06
 
 ### 🐛 Bug Fixes
