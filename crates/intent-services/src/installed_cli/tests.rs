@@ -601,7 +601,7 @@ impl DetachedCleanup {
             revents: 0,
         };
         // SAFETY: poll points to one initialized descriptor and never blocks.
-        let result = if unsafe { libc::poll(&mut poll, 1, 0) } < 0 {
+        let result = if unsafe { libc::poll(&raw mut poll, 1, 0) } < 0 {
             Err(std::io::Error::last_os_error())
         } else {
             Ok(poll.revents)
