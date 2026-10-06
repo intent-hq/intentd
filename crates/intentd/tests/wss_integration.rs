@@ -11609,12 +11609,10 @@ async fn wss_models_list_preserves_legacy_metadata_through_cache() {
     let bin = dir.path().join("auggie");
     let script = format!(
         r#"#!/bin/sh
-[ "$#" = 5 ] && [ "$4" = "--mcp-config" ] && [ -f "$5" ] || exit 1
-[ "$(cat "$5")" = '{{"mcpServers":{{}}}}' ] || exit 1
-if [ "$1 $2 $3" != "model list --json" ]; then
+printf '%s\n' "$*" >> '{}'
+if [ "$*" != "model list --json" ]; then
   exit 1
 fi
-printf '%s\n' "$1 $2 $3" >> '{}'
 cat <<'JSON'
 {{"models":[{{"shortName":"current","displayName":"Current","modelGroupPriority":1,"priority":1,"isLegacyModel":false}},{{"shortName":"legacy","displayName":"Legacy","modelGroupPriority":2,"priority":1,"isLegacyModel":true}}]}}
 JSON
@@ -12844,7 +12842,6 @@ async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
                     "tools": [],
                     "settingSources": ["user"],
                     "strictMcpConfig": true,
-                    "extraArgs": {"disable-slash-commands": null},
                 }
             },
         }),

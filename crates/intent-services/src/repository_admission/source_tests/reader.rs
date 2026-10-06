@@ -62,7 +62,13 @@ impl Interaction {
     }
 
     async fn from_auth(auth: Fixture, server: &Server) -> Self {
-        let mut git = GitFixture::new().await;
+        Self::from_fixtures(auth, GitFixture::new().await, server).await
+    }
+
+    async fn from_fixtures(auth: Fixture, mut git: GitFixture, server: &Server) -> Self {
+        // Admission compares against the canonical root. Temporary directories
+        // can have symlinked parents (for example /var on macOS).
+        git.path = std::fs::canonicalize(&git.path).unwrap();
         // Reuse the disposable Git setup, but every exercised source and writer
         // uses the SAME Store owned by the adopted Services instance.
         auth.service
@@ -734,6 +740,37 @@ async fn actual_pat_and_settings_replacement_never_rebind_an_existing_reader_sta
         .await
         .unwrap();
     }
+}
+
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn reader_fixture_under_symlinked_parent_reaches_repository_dispatch() {
+    let server = Server::new().await;
+    let mut git = GitFixture::new().await;
+    let alias = crate::test_support::test_tempdir("reader-parent-alias-");
+    let parent = alias.path().join("parent");
+    std::os::unix::fs::symlink(git.dir.path(), &parent).unwrap();
+    git.path = parent.join("repo");
+    git.workspace.repository_path = Some(git.path.to_str().unwrap().into());
+    assert_ne!(git.path, std::fs::canonicalize(&git.path).unwrap());
+    let f = Interaction::from_fixtures(Fixture::new(&server).await, git, &server).await;
+    *server.control.expected_project_token.lock().unwrap() = Some("stored-pat");
+    f.run(&server, vec![NativeReviewStage::CreatePr], |admission| {
+        let f = &f;
+        async move {
+            let stamp = start(&admission, NativeReviewStage::CreatePr).await;
+            f.callback(&stamp)
+                .into_provider()
+                .unwrap()
+                .get_repo("group", "project")
+                .await
+                .unwrap();
+            Ok(())
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(project_calls(&server), 1);
 }
 
 #[intent_test_macros::daemon_test]

@@ -28,7 +28,7 @@
 //! in the sender's checkout with a `workspace_api` bridge scoped to the
 //! sender's workspace.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, Weak};
@@ -41,10 +41,11 @@ use intent_acp::session::{
 use intent_acp::{
     apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process,
     normalize_mcp_servers, normalize_spaced_bridge_command, serve_workspace_mcp_tcp,
-    to_acp_session_mcp_servers, ClientRequestHandler, Connection, ConnectionHooks, EnvMap,
-    EventSink, FileService, IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer,
-    NormalizedMcpServers, NpxLaunchDir, PermissionOutcome, PermissionPolicy, PermissionRegistry,
-    PermissionRequestData, SinkEvent, SpawnOptions, WorkspaceMcpServer,
+    spawn_provider, to_acp_session_mcp_servers, to_auggie_mcp_config, to_opencode_mcp_config,
+    ClientRequestHandler, Connection, ConnectionHooks, EnvMap, EventSink, FileService,
+    IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer, NormalizedMcpServers,
+    NpxLaunchDir, PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,
+    SinkEvent, SpawnOptions, WorkspaceMcpServer,
 };
 use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
@@ -105,7 +106,6 @@ impl OriginalTurn {
 }
 
 mod repository_origin;
-mod skill_catalog;
 use crate::repository_admission::lifecycle::physical_owner::RepositoryCreationIntent;
 pub(crate) use repository_origin::callback_delivery::RepositoryPromptInput;
 use repository_origin::callback_delivery::{deliver_captured, EndpointBlueprint, ServerBlueprint};
@@ -2421,9 +2421,9 @@ struct PiExtensionDelivery {
 
 impl PiExtensionDelivery {
     /// Write the extension + wrapper (0755) files into `dir`. The wrapper only
-    /// applies the owned native arguments before our explicit `-e` extension.
+    /// appends our `-e` flag — user-installed pi extensions stay enabled.
     #[cfg(unix)]
-    fn write(real_pi_command: &str, dir: &Path, native_args: &[String]) -> Result<Self> {
+    fn write(real_pi_command: &str, dir: &Path) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt;
 
         let extension_path = dir.join(format!("intentd-pi-ext-{}.ts", Uuid::new_v4()));
@@ -2435,13 +2435,8 @@ impl PiExtensionDelivery {
 
         let wrapper_path = dir.join(format!("intentd-pi-wrapper-{}.sh", Uuid::new_v4()));
         let script = format!(
-            "#!/bin/sh\nexec {}{} -e {} \"$@\"\n",
+            "#!/bin/sh\nexec {} -e {} \"$@\"\n",
             sh_squote(real_pi_command),
-            native_args.iter().fold(String::new(), |mut args, arg| {
-                args.push(' ');
-                args.push_str(&sh_squote(arg));
-                args
-            }),
             sh_squote(&extension.path.to_string_lossy())
         );
         std::fs::write(&wrapper_path, script)
@@ -2459,33 +2454,24 @@ impl PiExtensionDelivery {
     /// non-unix equivalent, so fail with a clear error instead of spawning pi
     /// with a script it cannot execute.
     #[cfg(not(unix))]
-    fn write(_real_pi_command: &str, _dir: &Path, _native_args: &[String]) -> Result<Self> {
+    fn write(_real_pi_command: &str, _dir: &Path) -> Result<Self> {
         Err(Error::Internal(
             "pi extension MCP delivery requires a unix host (sh wrapper script)".to_string(),
         ))
     }
 
-    /// Route pi-acp through the wrapper; deliver the bridge address only when
-    /// the final profile approves it. An absent bridge also clears inherited
-    /// addresses without affecting the separate external MCP configuration.
+    /// Insert the two spawn env vars: route pi-acp's pi spawn through the
+    /// wrapper, and hand the extension the bridge's TCP address.
     fn apply_spawn_env(
         &self,
-        profile: &mut crate::provider_profiles::ProviderLaunchProfile,
+        extra_env: &mut BTreeMap<String, String>,
         bridge_connect_addr: String,
     ) {
-        profile.env.insert(
+        extra_env.insert(
             PI_ACP_PI_COMMAND_ENV.to_string(),
             self.wrapper.path.to_string_lossy().into_owned(),
         );
-        profile
-            .remove_env
-            .insert(INTENTD_MCP_BRIDGE_ADDR_ENV.to_string());
-        profile.env.remove(INTENTD_MCP_BRIDGE_ADDR_ENV);
-        if profile.approved_mcp.contains_key("workspace-mcp") {
-            profile
-                .env
-                .insert(INTENTD_MCP_BRIDGE_ADDR_ENV.to_string(), bridge_connect_addr);
-        }
+        extra_env.insert(INTENTD_MCP_BRIDGE_ADDR_ENV.to_string(), bridge_connect_addr);
     }
 }
 
@@ -2494,7 +2480,6 @@ impl PiExtensionDelivery {
 fn pi_extension_delivery(
     provider: &ProviderConfig,
     dir: &Path,
-    native_args: &[String],
 ) -> Result<Option<PiExtensionDelivery>> {
     if !provider.mcp_via_pi_extension {
         return Ok(None);
@@ -2502,7 +2487,6 @@ fn pi_extension_delivery(
     Ok(Some(PiExtensionDelivery::write(
         &resolve_real_pi_command(),
         dir,
-        native_args,
     )?))
 }
 
@@ -2538,8 +2522,6 @@ struct AgentHandle {
     /// consume them there (claude-code, codex, droid, grok). Empty for providers
     /// that receive MCP config out-of-band (auggie `--mcp-config`, opencode
     /// env config) — passing servers they'd ignore is avoided for wire parity.
-    profile_meta: Value,
-    provider_profile: Option<Arc<crate::provider_profiles::ProviderLaunchProfile>>,
     session_mcp_servers: Vec<McpServer>,
     spawned_model: Option<String>,
     spawned_provider: String,
@@ -2773,9 +2755,6 @@ pub struct AgentManager {
     /// prompt). Consumed by [`AgentManager::build_turn_prompt`] so the block
     /// fires exactly once per fresh session and re-fires after a recreate.
     prepend_pending: Arc<Mutex<HashSet<AgentId>>>,
-    /// Catalog fingerprints awaiting successful delivery; never acknowledge a
-    /// cancelled or failed prompt. Persisted fingerprints survive session/load.
-    skill_catalog_pending: Mutex<HashMap<AgentId, String>>,
     /// Most recent interrupt-priority `messageId` delivered per agent
     /// (PROTOCOL §5.5). [`AgentManager::interrupt_send_message`] records the
     /// client-supplied id under this lock BEFORE preempting, so the SAME
@@ -2963,9 +2942,7 @@ impl AgentManager {
             policy: PermissionPolicy::AllowAll,
             mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
             agent_log_root: None,
-            agent_config_root: Some(
-                std::env::temp_dir().join(format!("intentd-agent-configs-{}", Uuid::new_v4())),
-            ),
+            agent_config_root: None,
             antigravity_state_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
@@ -2982,7 +2959,6 @@ impl AgentManager {
             recreated: Arc::new(Mutex::new(HashSet::new())),
             setup_failure_notified: Arc::new(Mutex::new(HashSet::new())),
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
-            skill_catalog_pending: Mutex::new(HashMap::new()),
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
             active_delivery_groups: Arc::new(Mutex::new(HashMap::new())),
             stop_redelivery: Arc::new(Mutex::new(HashMap::new())),
@@ -3086,16 +3062,22 @@ impl AgentManager {
         self
     }
 
-    /// Daemon-owned root. Never privatize the shared OS temporary directory,
-    /// and never silently move a persistent session when its root is unavailable.
-    fn agent_config_dir(&self) -> Result<PathBuf> {
-        let root = self
-            .agent_config_root
-            .as_ref()
-            .ok_or_else(|| Error::Internal("Agent configuration root unavailable".into()))?;
-        intent_core::agent_configs::create_agent_configs_dir(root)
-            .map_err(|_| Error::Internal("Cannot create agent configuration root".into()))?;
-        Ok(root.clone())
+    /// Directory the per-agent generated config files are written into: the
+    /// wired `<data_dir>/agent-configs` dir, created on demand — or the OS
+    /// temp dir when no root is wired (tests / bare wiring) or creation fails.
+    fn agent_config_dir(&self) -> PathBuf {
+        let Some(root) = self.agent_config_root.as_ref() else {
+            return std::env::temp_dir();
+        };
+        if let Err(e) = intent_core::agent_configs::create_agent_configs_dir(root) {
+            tracing::warn!(
+                error = %e,
+                path = %root.display(),
+                "failed to create agent-configs dir; falling back to temp dir"
+            );
+            return std::env::temp_dir();
+        }
+        root.clone()
     }
 
     /// Stderr capture directory for `agent_id`, when capture is enabled —
@@ -3249,86 +3231,6 @@ impl AgentManager {
             .values()
             .filter(|h| h.spawned_provider == provider_id)
             .count()
-    }
-
-    pub(crate) fn active_profile(
-        &self,
-        agent: &AgentId,
-    ) -> Option<Arc<crate::provider_profiles::ProviderLaunchProfile>> {
-        self.handles
-            .lock()
-            .unwrap()
-            .get(agent)
-            .and_then(|h| h.provider_profile.clone())
-    }
-
-    pub(crate) fn profile_meta(&self, agent: &AgentId) -> Option<Value> {
-        self.handles
-            .lock()
-            .unwrap()
-            .get(agent)
-            .map(|h| h.profile_meta.clone())
-    }
-
-    async fn effective_launch_mcp(
-        &self,
-        ws: &WorkspaceId,
-        cwd: &Path,
-        addr: String,
-    ) -> Result<NormalizedMcpServers> {
-        let mut explicit = self.normalized_mcp_servers(addr).await?;
-        let bridge = explicit.remove("workspace-mcp");
-        let configs = crate::mcp_servers::read_configs_for_policy(&self.services.secrets).await?;
-        let settings = self.services.effective_settings();
-        let mut global: BTreeSet<String> = settings.mcp.disabled_servers.iter().cloned().collect();
-        let workspace: BTreeSet<String> = self
-            .services
-            .store
-            .workspace_mcp_disabled_servers(ws)
-            .await?
-            .into_iter()
-            .collect();
-        // Only the original trusted disable lists may revoke the reserved bridge;
-        // saved record IDs/names must not acquire that authority through aliases.
-        let bridge_disabled =
-            global.contains("workspace-mcp") || workspace.contains("workspace-mcp");
-        if !crate::mcp_servers::enable_user_servers(&settings) {
-            global.extend(configs.keys().cloned());
-        }
-        let mut disabled = crate::project_mcp::intent_mcp_disabled_names(
-            &Value::Object(configs),
-            &global,
-            &workspace,
-        );
-        if !bridge_disabled {
-            disabled.remove("workspace-mcp");
-        }
-        let root = self
-            .services
-            .store
-            .get_workspace(ws)
-            .await
-            .ok()
-            .and_then(|w| crate::git_ops::worktree_path(&w))
-            .unwrap_or_else(|| cwd.to_owned());
-        let cwd = cwd.to_owned();
-        let project = tokio::task::spawn_blocking(move || {
-            crate::project_mcp::discover_project_mcp(&root, &cwd)
-        })
-        .await
-        .map_err(|_| Error::Internal("Project MCP discovery failed".into()))?;
-        let merged = crate::project_mcp::merge_project_mcp(project, explicit, &disabled, bridge);
-        for d in merged.diagnostics {
-            tracing::warn!(
-                code = d.code,
-                message = d.message,
-                "Project MCP configuration"
-            );
-        }
-        Ok(apply_baseline_env_to_stdio_servers(
-            &merged.servers,
-            &build_baseline_mcp_env_from_process(),
-        ))
     }
 
     /// The daemon-owned singleton Unsloth server manager, for the
@@ -3490,21 +3392,65 @@ impl AgentManager {
         // Directory the generated per-agent files below are written into:
         // `<data_dir>/agent-configs` when wired (swept at startup so a killed
         // daemon's leftovers don't accumulate, monorepo#1302), else temp dir.
-        let config_dir = self.agent_config_dir()?;
+        let config_dir = self.agent_config_dir();
 
-        let servers = self
-            .effective_launch_mcp(&workspace_id, &cwd, bridge.connect_addr())
-            .await?;
-        if let Some(blueprint) = servers.get("workspace-mcp").and_then(|original| {
-            EndpointBlueprint::from_original(server_blueprint, original, &bridge.connect_addr())
-        }) {
-            repository_origin.configure_callbacks(blueprint);
+        // Generated MCP config (auggie format) pointing at the bridge
+        // subcommand, written only for providers that consume an MCP-config flag.
+        let mut mcp_config: Option<TempConfigFile> = None;
+        let mut mcp_config_path: Option<String> = None;
+        if opts.provider.supports_mcp_config {
+            let config = self.generate_mcp_config(&bridge).await?;
+            let path = config_dir.join(format!("intentd-mcp-{}.json", Uuid::new_v4()));
+            let bytes = serde_json::to_vec_pretty(&config)
+                .map_err(|e| Error::Internal(format!("serialize mcp config failed: {e}")))?;
+            std::fs::write(&path, bytes)
+                .map_err(|e| Error::Internal(format!("write mcp config failed: {e}")))?;
+            mcp_config_path = Some(path.to_string_lossy().into_owned());
+            mcp_config = Some(TempConfigFile { path });
         }
+
+        // For env-config providers (opencode), the same normalized server set
+        // (workspace bridge + user servers) rides in `OPENCODE_CONFIG_CONTENT`
+        // as an `mcp` block instead of an `--mcp-config` file, pointing at the
+        // same bridge endpoint.
+        let mut env_mcp_config: Option<String> = None;
+        if opts.provider.injection_mechanism == InjectionMechanism::EnvConfig {
+            env_mcp_config = Some(self.opencode_env_mcp_config(bridge.connect_addr()).await?);
+        }
+
+        // For pi, MCP delivery rides a bundled pi extension: pi-acp has no
+        // MCP CLI flag and does not wire `session/new` `mcpServers` into the
+        // pi process, so the spawn env routes pi-acp's pi spawn through a
+        // wrapper script adding `-e <extension>` (PI_ACP_PI_COMMAND) and the
+        // extension dials the same bridge endpoint (INTENTD_MCP_BRIDGE_ADDR).
+        //
+        // Fail fast before spawning when the `pi` CLI the wrapper would exec
+        // is missing or known-too-old for the pinned pi-acp adapter
+        // (monorepo#1662) — a clear error instead of a silent hang. The probe
+        // is blocking (subprocess, ≤3s budget), so it runs off the runtime.
         if opts.provider.mcp_via_pi_extension {
             let status = tokio::task::spawn_blocking(crate::pi_cli::probe_pi_cli)
                 .await
                 .map_err(|e| Error::Internal(format!("pi CLI probe task failed: {e}")))?;
             crate::pi_cli::check_pi_cli_for_spawn(&status)?;
+        }
+        let pi_extension = pi_extension_delivery(opts.provider, &config_dir)?;
+
+        // For providers that consume MCP servers from the ACP session setup
+        // (claude-code, codex, droid, grok), the same normalized server set is
+        // carried as the typed `session/new` / `session/load` `mcpServers`
+        // field, pointing at the same bridge endpoint. Kept on the handle so
+        // `start_session` (which runs after `create_agent`) can pass it into
+        // every session-open branch.
+        let mut session_mcp_servers: Vec<McpServer> = Vec::new();
+        if opts.provider.supports_session_mcp_servers {
+            let servers = self.normalized_mcp_servers(bridge.connect_addr()).await?;
+            if let Some(blueprint) = servers.get("workspace-mcp").and_then(|original| {
+                EndpointBlueprint::from_original(server_blueprint, original, &bridge.connect_addr())
+            }) {
+                repository_origin.configure_callbacks(blueprint);
+            }
+            session_mcp_servers = to_acp_session_mcp_servers(&servers);
         }
 
         // Assemble the effective system prompt (the §18.1 injection pipeline:
@@ -3588,9 +3534,12 @@ impl AgentManager {
         }
 
         // Reconstruct the spawn options with the generated config path injected.
-        let mut spawn_opts = rebuild_spawn_opts(opts, rules_file_path.as_deref(), None, None);
-        spawn_opts.mcp_config_file = None;
-        spawn_opts.env_mcp_config = None;
+        let mut spawn_opts = rebuild_spawn_opts(
+            opts,
+            rules_file_path.as_deref(),
+            mcp_config_path.as_deref(),
+            env_mcp_config.as_deref(),
+        );
         // An npx launch starts in a fresh empty dir under the daemon-owned
         // agent-configs root, so the workspace's own package configuration
         // never reaches npm (intent-hq/intent#5738). Unlike the config files
@@ -3611,6 +3560,9 @@ impl AgentManager {
                 .effective_settings()
                 .agents
                 .acp_node_max_old_space_mb;
+        }
+        if let Some(delivery) = &pi_extension {
+            delivery.apply_spawn_env(&mut spawn_opts.extra_env, bridge.connect_addr());
         }
         if let Some(profile) = &antigravity_profile {
             spawn_opts.extra_env.extend(profile.env().map_err(|err| {
@@ -3662,16 +3614,16 @@ impl AgentManager {
         } else {
             None
         };
-        let mut prepared = intent_acp::spawn::prepare_provider(&spawn_opts)
-            .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
-        if let Some(cli) =
+        let spawned = if let Some(cli) =
             intent_providers::installed_cli::InstalledCli::for_provider(spawn_opts.provider.id)
         {
             let context = crate::installed_cli::InstalledContext::discover(cli)
                 .await
                 .map_err(Error::InvalidInput)?;
+            let mut prepared = intent_acp::spawn::prepare_provider(&spawn_opts)
+                .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
             context.apply(&mut prepared.command);
-            prepared = intent_core::caller::spawn_with_current_caller(async move {
+            let prepared = intent_core::caller::spawn_with_current_caller(async move {
                 let prepared = Arc::new(prepared);
                 let dependency =
                     crate::codex_diagnostics::process::ProbeDependency::hold(prepared.clone());
@@ -3685,47 +3637,11 @@ impl AgentManager {
             })
             .await
             .map_err(|_| Error::Internal("installed CLI preparation task failed".into()))??;
-        }
-        // Release the previous process tree and its profile lease before
-        // regenerating the stable profile. A replacement cannot mutate files
-        // still owned by the old child. The per-agent turn slot serializes this.
-        let stale = repository_origin::capture(&self.handles, &agent_id).and_then(|original| {
-            repository_origin::take(&self.handles, &agent_id, &original, Some(&self.registry))
-        });
-        if let Some(mut stale) = stale {
-            if let Some(child) = RuntimeTeardown::take(&mut stale) {
-                child.kill_tree().await;
-            }
-        }
-        let identity = format!("{}\0{}", workspace_id.0, agent_id.0);
-        let mut profile = crate::provider_launch::prepare(
-            opts.provider.id,
-            crate::provider_profiles::LaunchPurpose::Persistent,
-            &prepared.command,
-            &config_dir,
-            &cwd,
-            &cwd,
-            Some(&identity),
-            &servers,
-            &self.services.provider_policy_sources(opts.provider.id),
-        )?;
-        let pi_extension =
-            pi_extension_delivery(opts.provider, profile.path(), &profile.native_args)?;
-        if let Some(delivery) = &pi_extension {
-            delivery.apply_spawn_env(&mut profile, bridge.connect_addr());
-        }
-        if opts.provider.id == "mock" && opts.provider.supports_mcp_config {
-            profile.write_mcp_file()?;
-        }
-        let session_mcp_servers = if opts.provider.supports_session_mcp_servers {
-            to_acp_session_mcp_servers(&profile.session_mcp)
+            intent_acp::spawn::spawn_prepared_provider(&spawn_opts, prepared, hooks)
         } else {
-            Vec::new()
-        };
-        profile.apply_to_command(&mut prepared.command);
-        let profile = Arc::new(profile);
-        let spawned = intent_acp::spawn::spawn_prepared_provider(&spawn_opts, prepared, hooks)
-            .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
+            spawn_provider(&spawn_opts, hooks)
+        }
+        .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
         let (child, connection, npx_launch_dir) = spawned.into_parts();
         // Pin the spawned child's pid for the exit watcher armed below: the
         // watcher stands down when the handle's child no longer matches it
@@ -3770,10 +3686,9 @@ impl AgentManager {
                 child: Some(child),
                 child_pid,
                 _mcp_bridge: Some(bridge),
-                _mcp_config: None,
-                provider_profile: Some(profile.clone()),
+                _mcp_config: mcp_config,
                 _rules_config: rules_config,
-                pi_extension,
+                _pi_extension: pi_extension,
                 npx_launch_dir,
                 preparation_guard,
                 cleanup_lease: Some(cleanup_lease),
@@ -3781,8 +3696,6 @@ impl AgentManager {
                 cleanup_services: Some(self.services.clone()),
             }),
             antigravity_profile,
-            profile_meta: profile.session_meta.clone(),
-            provider_profile: Some(profile.clone()),
             session_mcp_servers,
             spawned_model: opts.model.map(std::string::ToString::to_string),
             spawned_provider: opts.provider.command.to_string(),
@@ -3792,6 +3705,25 @@ impl AgentManager {
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
         };
+        // Concurrency safety: fully reap any stale handle + child for this agent
+        // BEFORE installing the new one, reusing the process-group teardown.
+        // A bare `insert` would only drop the old handle, which starts the
+        // tree kill but does not wait for it — risking a lingering streamer
+        // from a lost/old session that could keep appending to the
+        // agentId-keyed transcript. The per-agent single-flight slot
+        // serializes turns; this closes the respawn-time window. (Drop the
+        // lock before awaiting the kill.) If this await is cancelled, the
+        // fresh `handle` above drops with its child still inside: its `Drop`
+        // hands that child to the owned cleanup too, so neither tree is
+        // orphaned and neither launch dir is removed early.
+        let stale = repository_origin::capture(&self.handles, &agent_id).and_then(|original| {
+            repository_origin::take(&self.handles, &agent_id, &original, Some(&self.registry))
+        });
+        if let Some(mut stale) = stale {
+            if let Some(child) = RuntimeTeardown::take(&mut stale) {
+                child.kill_tree().await;
+            }
+        }
         // Teardown fence (ghost-agent race): a `workspace.delete` batch stop
         // (`stop_many`) may have swept this agent AFTER the caller's session
         // checks passed — installing the fresh handle now would leave a live
@@ -3853,14 +3785,20 @@ impl AgentManager {
         Ok(())
     }
 
+    /// Build the generated `--mcp-config` (auggie `{ mcpServers }` shape) from
+    /// the normalized spawn server set ([`Self::normalized_mcp_servers`]).
+    async fn generate_mcp_config(&self, bridge: &McpBridge) -> Result<serde_json::Value> {
+        let servers = self.normalized_mcp_servers(bridge.connect_addr()).await?;
+        Ok(to_auggie_mcp_config(&servers))
+    }
+
     /// Serialize the same normalized spawn server set as the `OpenCode` config
     /// `mcp` block, merged into `OPENCODE_CONFIG_CONTENT` at spawn for
     /// env-config providers. The bridge entry points at the same endpoint the
     /// auggie `--mcp-config` path uses.
-    #[cfg(test)]
     async fn opencode_env_mcp_config(&self, connect_addr: String) -> Result<String> {
         let servers = self.normalized_mcp_servers(connect_addr).await?;
-        serde_json::to_string(&intent_acp::to_opencode_mcp_config(&servers))
+        serde_json::to_string(&to_opencode_mcp_config(&servers))
             .map_err(|e| Error::Internal(format!("serialize opencode mcp config failed: {e}")))
     }
 
@@ -3914,7 +3852,7 @@ impl AgentManager {
         if !crate::mcp_servers::enable_user_servers(&settings) {
             return Ok(());
         }
-        let configs = crate::mcp_servers::read_configs_for_policy(&self.services.secrets).await?;
+        let configs = crate::mcp_servers::read_configs(&self.services.secrets).await;
         if configs.is_empty() {
             return Ok(());
         }
@@ -5477,13 +5415,6 @@ impl AgentManager {
         // `session/new` (brand-new or recreate, never `session/load` resume)
         // and consumed here so it fires exactly once per fresh session.
         let prepend = self.build_first_turn_prepend(agent_id).await;
-        let catalog_update = self
-            .build_skill_catalog_update(agent_id, prepend.as_deref())
-            .await;
-        let prepend = match (prepend, catalog_update) {
-            (Some(initial), Some(update)) => Some(format!("{initial}\n\n{update}")),
-            (initial, update) => initial.or(update),
-        };
         let prompt_text =
             crate::harness::latest().compose_turn_prompt(&crate::harness::TurnEnvelopeParams {
                 first_turn_prepend: prepend.as_deref(),
@@ -5970,7 +5901,6 @@ impl AgentManager {
         self.recreated.lock().unwrap().remove(agent_id);
         self.active_delivery_groups.lock().unwrap().remove(agent_id);
         self.prepend_pending.lock().unwrap().remove(agent_id);
-        self.skill_catalog_pending.lock().unwrap().remove(agent_id);
         // A spawn attempt cancelled by this teardown never reaches the
         // spawn-failure publisher that would consume its provider record.
         self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
@@ -11399,7 +11329,7 @@ async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) -> bool {
 /// probes never signal: a recycled pid/group can only cause conservative
 /// retention of the launch directory, never kill an unrelated process.
 #[cfg(unix)]
-pub(crate) async fn confirm_tree_exit(
+async fn confirm_tree_exit(
     child: &mut Child,
     pgid: nix::unistd::Pid,
     descendants: &[i32],
@@ -12832,7 +12762,6 @@ async fn run_message_worker(
                         .await;
                     return;
                 }
-                let catalog_delivery = mgr.skill_catalog_pending.lock().unwrap().remove(&agent_id);
                 match mgr
                     .run_turn_owned(
                         &agent_id,
@@ -12844,15 +12773,7 @@ async fn run_message_worker(
                     )
                     .await
                 {
-                    Ok(stop_reason) => {
-                        if stop_reason != StopReason::Cancelled {
-                            mgr.acknowledge_skill_catalog(
-                                &agent_id,
-                                &workspace_id,
-                                catalog_delivery,
-                            )
-                            .await;
-                        }
+                    Ok(_stop_reason) => {
                         // A successful turn resets the identical-failure
                         // streak (monorepo#840): the session is provably not
                         // poisoned.
@@ -14438,10 +14359,7 @@ async fn retry_spawn_owned(
     let mut last_error: Option<Error> = None;
 
     for attempt in 1..=MAX_SPAWN_ATTEMPTS {
-        // Keep launch/session state out of the enclosing worker and task-local
-        // futures: their combined polling frames can exhaust the default stack.
-        // Pinning here preserves caller scope and cancellation of this attempt.
-        match Box::pin(mgr.ensure_started_owned(agent_id, workspace_id)).await {
+        match mgr.ensure_started_owned(agent_id, workspace_id).await {
             Ok(session_id) => return Ok(session_id),
             Err(e) => {
                 let retryable = is_retryable_spawn_error(&e);
@@ -18434,16 +18352,13 @@ mod dead_child_respawn_tests {
                 _mcp_bridge: None,
                 _mcp_config: None,
                 _rules_config: None,
-                pi_extension: None,
-                provider_profile: None,
+                _pi_extension: None,
                 npx_launch_dir,
                 preparation_guard: None,
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
             antigravity_profile: None,
-            profile_meta: json!({}),
-            provider_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "node".to_string(),
@@ -20352,7 +20267,7 @@ mod pi_extension_delivery_tests {
 
     #[test]
     fn write_creates_extension_and_executable_wrapper() {
-        let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir(), &[]).unwrap();
+        let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir()).unwrap();
 
         let ext = std::fs::read_to_string(&delivery._extension.path).unwrap();
         assert_eq!(ext, PI_MCP_EXTENSION_SOURCE);
@@ -20378,23 +20293,9 @@ mod pi_extension_delivery_tests {
     }
 
     #[test]
-    fn wrapper_native_args_are_inside_pi_command() {
-        let args = vec![
-            "--no-skills".into(),
-            "--no-extensions".into(),
-            "--no-prompt-templates".into(),
-        ];
-        let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir(), &args).unwrap();
-        let script = std::fs::read_to_string(&delivery.wrapper.path).unwrap();
-        assert!(script
-            .contains("exec 'pi' '--no-skills' '--no-extensions' '--no-prompt-templates' -e "));
-    }
-
-    #[test]
     fn wrapper_single_quotes_special_characters() {
         let delivery =
-            PiExtensionDelivery::write("/opt/pi's \"odd$\" bin/pi", &std::env::temp_dir(), &[])
-                .unwrap();
+            PiExtensionDelivery::write("/opt/pi's \"odd$\" bin/pi", &std::env::temp_dir()).unwrap();
         let script = std::fs::read_to_string(&delivery.wrapper.path).unwrap();
         assert!(
             script.contains("exec '/opt/pi'\\''s \"odd$\" bin/pi' -e '"),
@@ -20406,7 +20307,7 @@ mod pi_extension_delivery_tests {
     fn write_places_files_in_the_given_dir() {
         let dir = std::env::temp_dir().join(format!("intentd-pi-dir-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let delivery = PiExtensionDelivery::write("pi", &dir, &[]).unwrap();
+        let delivery = PiExtensionDelivery::write("pi", &dir).unwrap();
         assert_eq!(delivery._extension.path.parent().unwrap(), dir);
         assert_eq!(delivery.wrapper.path.parent().unwrap(), dir);
         drop(delivery);
@@ -20415,7 +20316,7 @@ mod pi_extension_delivery_tests {
 
     #[test]
     fn temp_files_removed_when_delivery_drops() {
-        let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir(), &[]).unwrap();
+        let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir()).unwrap();
         let ext = delivery._extension.path.clone();
         let wrapper = delivery.wrapper.path.clone();
         drop(delivery);
@@ -20425,32 +20326,9 @@ mod pi_extension_delivery_tests {
 
     #[test]
     fn apply_spawn_env_sets_wrapper_and_bridge_addr() {
-        let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir(), &[]).unwrap();
-        let dir = crate::test_support::test_tempdir("pi-delivery-env");
-        let mut command = tokio::process::Command::new("unused-test-command");
-        command.env("HOME", dir.path());
-        let mcp = BTreeMap::from([(
-            "workspace-mcp".into(),
-            NormalizedMcpServer::Stdio {
-                command: "bridge".into(),
-                args: vec![],
-                env: BTreeMap::new(),
-            },
-        )]);
-        let mut profile = crate::provider_launch::prepare(
-            "pi",
-            crate::provider_profiles::LaunchPurpose::Persistent,
-            &command,
-            dir.path(),
-            dir.path(),
-            dir.path(),
-            Some("pi-env"),
-            &mcp,
-            &[],
-        )
-        .unwrap();
-        delivery.apply_spawn_env(&mut profile, "127.0.0.1:9999".to_string());
-        let extra_env = &profile.env;
+        let delivery = PiExtensionDelivery::write("pi", &std::env::temp_dir()).unwrap();
+        let mut extra_env = BTreeMap::new();
+        delivery.apply_spawn_env(&mut extra_env, "127.0.0.1:9999".to_string());
         assert_eq!(
             extra_env.get(PI_ACP_PI_COMMAND_ENV),
             Some(&delivery.wrapper.path.to_string_lossy().into_owned())
@@ -20466,7 +20344,7 @@ mod pi_extension_delivery_tests {
     #[test]
     fn delivery_gated_on_capability_flag() {
         let pi = intent_providers::find_provider("pi").unwrap();
-        let delivery = pi_extension_delivery(pi, &std::env::temp_dir(), &[]).unwrap();
+        let delivery = pi_extension_delivery(pi, &std::env::temp_dir()).unwrap();
         assert!(delivery.is_some(), "pi must get the extension delivery");
 
         for provider in intent_providers::ACP_PROVIDERS
@@ -20474,7 +20352,7 @@ mod pi_extension_delivery_tests {
             .filter(|p| p.id != "pi")
         {
             assert!(
-                pi_extension_delivery(provider, &std::env::temp_dir(), &[])
+                pi_extension_delivery(provider, &std::env::temp_dir())
                     .unwrap()
                     .is_none(),
                 "{} must not get a wrapper or extension",

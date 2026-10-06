@@ -69,3 +69,87 @@ async fn desktop_lifecycle_normal_turn_and_mcp_transport_recreation_keep_control
         "desktop-not-active"
     );
 }
+
+#[tokio::test]
+async fn desktop_lifecycle_terminal_turn_failure_revokes_active_and_pending_control() {
+    for remembered in [false, true] {
+        let h = Harness::new().await;
+        if remembered {
+            h.remember().await;
+        }
+        let started = h.agent("startControl", json!({})).await.unwrap();
+        assert_eq!(
+            started["status"],
+            if remembered {
+                "active"
+            } else {
+                "pending_permission"
+            }
+        );
+        let manager = AgentManager::new(
+            h.services.clone(),
+            Arc::new(BusEventSink::new(h.services.event_bus.clone().unwrap())),
+            4,
+        );
+        assert!(manager.try_begin(&h.agent, &h.workspace).await);
+        let options = TurnOptions::default();
+        let failure = Error::Internal("desktop lifecycle test provider failure".into());
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            intent_core::with_caller(
+                Caller::Daemon,
+                handle_terminal_turn_failure(
+                    &manager,
+                    &h.agent,
+                    &h.workspace,
+                    "failed desktop turn",
+                    &options,
+                    true,
+                    &failure,
+                ),
+            ),
+        )
+        .await
+        .expect("terminal failure must finish desktop teardown");
+        assert_eq!(
+            h.services
+                .store
+                .get_agent_session_summary(&h.agent)
+                .await
+                .unwrap()
+                .status,
+            AgentStatus::Error
+        );
+        assert_eq!(
+            intent_core::with_caller(Caller::Daemon, h.services.desktop_current_state(&h.agent))
+                .await,
+            DesktopState::Inactive
+        );
+        assert_eq!(
+            h.agent("listDisplay", json!({})).await.unwrap_err().code,
+            "desktop-not-active"
+        );
+        if remembered {
+            assert_eq!(
+                h.services
+                    .store
+                    .desktop_terminal(started["sessionId"].as_str().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap()["reason"],
+                "agent_terminated"
+            );
+        } else {
+            assert_eq!(
+                h.client(
+                    "respondPermission",
+                    json!({"requestId":started["requestId"],"decision":"allow_once"})
+                )
+                .await
+                .unwrap_err()
+                .code,
+                "desktop-stale-request"
+            );
+        }
+    }
+}

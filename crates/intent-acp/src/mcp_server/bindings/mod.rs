@@ -291,9 +291,7 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("mcp.") {
-        return mcp::dispatch(api, workspace_id, caller_agent_id, rest, args)
-            .await
-            .map(Some);
+        return mcp::dispatch(api, workspace_id, rest, args).await.map(Some);
     }
     if let Some(rest) = method.strip_prefix("file.") {
         return file::dispatch(api, workspace_id, caller_agent_id, rest, args)
