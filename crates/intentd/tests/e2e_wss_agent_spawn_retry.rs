@@ -1277,3 +1277,167 @@ async fn agent_spawn_slow_initialize_succeeds_over_wss() {
     assert!(chunks >= 1, "at least one agent:stream:activity over WSS");
     assert_eq!(ends, 1, "exactly one terminal agent:stream:end over WSS");
 }
+
+/// A fresh send after terminal load/new failure must start a new adapter,
+/// load its persisted session, and only then prompt. Native auth is not used.
+#[tokio::test]
+async fn fresh_send_after_failed_session_setup_loads_before_prompt_over_wss() {
+    let Some(script) = gate("WSS failed setup then send") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let failure_file = data_dir.join("setup-error");
+    let rpc_log = data_dir.join("provider-rpc.jsonl");
+    let rpc_log_s = rpc_log.to_string_lossy().into_owned();
+    let behavior = json!({
+        "loadSession": true,
+        "exitOnCancel": true,
+        "requireSessionSetup": true,
+        "sessionSetupErrorFile": failure_file,
+        "response": "session is ready",
+    })
+    .to_string();
+    let child = spawn_serve(
+        &data_dir,
+        "both",
+        &[
+            ("INTENTD_AUTH_TOKEN", TOKEN),
+            ("MOCK_AGENT_SCRIPT_PATH", &script),
+            ("MOCK_AGENT_BEHAVIOR", &behavior),
+            ("MOCK_AGENT_RPC_LOG", &rpc_log_s),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "10,20"),
+        ],
+    );
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir_guard,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({"eventTypes":["agent:*"],"workspaceId":ws_id}),
+    )
+    .await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({
+            "workspaceId":ws_id,"name":"setup-recovery","model":"default","provider":"mock",
+        }),
+    )
+    .await;
+    let agent = created["agent"]["id"].as_str().unwrap().to_string();
+
+    for (index, content) in ["establish history", "fails setup", "send after failure"]
+        .iter()
+        .enumerate()
+    {
+        if index == 1 {
+            wss_rpc(&mut rpc, 3, "agent.stop", json!({"agentId":agent})).await;
+            // The fixture exits on cancel, forcing fresh setup while preserving
+            // the durable session id. Subscribe after stop's terminal events so they cannot masquerade
+            // as completion of the failed setup turn below.
+            sub.close(None).await.unwrap();
+            sub = connect_ws(port, cfg.clone()).await;
+            wss_rpc(
+                &mut sub,
+                4,
+                "events.subscribe",
+                json!({"eventTypes":["agent:*"],"workspaceId":ws_id}),
+            )
+            .await;
+            std::fs::write(&failure_file, "reject setup").unwrap();
+        } else if index == 2 {
+            std::fs::remove_file(&failure_file).unwrap();
+        }
+        wss_rpc(
+            &mut rpc,
+            10 + i64::try_from(index).unwrap(),
+            "agent.sendMessage",
+            json!({
+                "workspaceId":ws_id,"agentId":agent,"content":content,
+            }),
+        )
+        .await;
+        let mut failure = None;
+        timeout(common::test_timeout(Duration::from_secs(30)), async {
+            loop {
+                let frame = wss_event(&mut sub, 30).await;
+                let event = &frame["params"]["event"];
+                if event["data"]["agentId"] != agent {
+                    continue;
+                }
+                if event["type"] == "agent:failed" {
+                    failure = Some(event.clone());
+                }
+                if event["type"] == "agent:stream:end" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("turn terminates");
+        if index == 1 {
+            assert!(
+                failure.as_ref().is_some_and(|e| e
+                    .to_string()
+                    .contains("failed to load workspace requirements")),
+                "original setup error: {failure:?}"
+            );
+        } else {
+            assert!(
+                failure.is_none(),
+                "fresh send must establish the session before prompting: {failure:?}"
+            );
+        }
+        // Wait for the worker's persisted idle/error state, not just stream:end.
+        timeout(common::test_timeout(Duration::from_secs(10)), async {
+            loop {
+                let result =
+                    wss_rpc(&mut rpc, 20, "agent.getSession", json!({"agentId":agent})).await;
+                if result["session"]["isActive"] == false {
+                    break;
+                }
+                // timing-guard: bounded polling for persisted state after stream:end.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let calls: Vec<Value> = std::fs::read_to_string(rpc_log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let prompts: Vec<_> = calls
+        .iter()
+        .filter(|call| call["method"] == "session/prompt")
+        .collect();
+    assert!(prompts.len() >= 2);
+    let last = prompts.last().unwrap();
+    let loaded = calls
+        .iter()
+        .position(|call| call["pid"] == last["pid"] && call["method"] == "session/load")
+        .expect("fresh child's load");
+    let prompted = calls
+        .iter()
+        .position(|call| std::ptr::eq(call, *last))
+        .unwrap();
+    assert!(loaded < prompted, "new child's load precedes its prompt");
+    assert_eq!(
+        calls[loaded]["params"]["sessionId"],
+        prompts[0]["params"]["sessionId"]
+    );
+}

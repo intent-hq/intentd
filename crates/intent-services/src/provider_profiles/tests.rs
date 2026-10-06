@@ -411,17 +411,9 @@ fn credential_files_are_private_and_profile_symlinks_are_rejected() {
         fs::metadata(p.path()).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    assert_eq!(
-        fs::metadata(p.path().join("auth.json"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
+    assert!(!p.path().join("auth.json").exists());
     let path = p.path().to_owned();
     drop(p);
-    fs::remove_file(path.join("auth.json")).unwrap();
     let target = dir.path().join("untouched");
     write(&target, "original");
     symlink(&target, path.join("auth.json")).unwrap();
@@ -756,4 +748,35 @@ fn excessive_deny_glob_is_rejected_at_policy_load_instead_of_becoming_unrestrict
         .err()
         .expect("oversized deny must reject policy loading");
     assert_eq!(error.code, "managed-policy-unsupported");
+}
+
+#[test]
+fn native_relogin_never_seeds_refreshable_worker_credentials() {
+    let dir = fixture();
+    let native = dir.path().join(".codex/auth.json");
+    write(&native, r#"{"tokens":{"refresh_token":"synthetic-A"}}"#);
+    let empty = NormalizedMcpServers::new();
+    let profile = prepare_provider_profile(request(dir.path(), "codex", &empty)).unwrap();
+    write(
+        &profile.path().join("sessions/sentinel"),
+        "preserved conversation",
+    );
+    assert!(!profile.path().join("auth.json").exists());
+    drop(profile);
+    write(&native, r#"{"tokens":{"refresh_token":"synthetic-B"}}"#);
+    let mut resumed = request(dir.path(), "codex", &empty);
+    resumed.resume = true;
+    let profile = prepare_provider_profile(resumed).unwrap();
+    assert_eq!(
+        fs::read_to_string(profile.path().join("sessions/sentinel")).unwrap(),
+        "preserved conversation"
+    );
+    assert!(!profile.path().join("auth.json").exists());
+    assert_eq!(
+        profile.env["INTENT_CODEX_NATIVE_HOME"],
+        dir.path().join(".codex").to_string_lossy()
+    );
+    assert!(fs::read_to_string(profile.path().join("config.toml"))
+        .unwrap()
+        .contains("cli_auth_credentials_store = \"ephemeral\""));
 }

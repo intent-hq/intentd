@@ -14929,6 +14929,103 @@ async fn terminal_spawn_failure_parks_error_without_crash_loop() {
     assert!(!session.is_active);
 }
 
+/// A failed load/new leaves the persisted ID intact, but that ID was never
+/// opened in this child. A fresh send must not reuse that uninitialized child.
+#[tokio::test]
+async fn terminal_session_setup_failure_retires_child_and_preserves_resume() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-setup"), AgentId::from("a-setup"));
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "lost-id")
+        .await
+        .unwrap();
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{"type":"text","text":"Keep this history"}]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    let before = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let (failed_child, calls) = track_antigravity_setup(&mgr, &id, Some("session/new"));
+    let error = mgr
+        .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect_err("both load and new fail");
+    assert!(
+        mgr.handle_is_live(&id),
+        "failed setup left a live transport"
+    );
+    let methods: Vec<_> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(m, _)| m.clone())
+        .collect();
+    assert!(methods.contains(&"session/load".to_string()));
+    assert!(methods.contains(&"session/new".to_string()));
+    assert!(!methods.contains(&"session/prompt".to_string()));
+
+    super::handle_terminal_spawn_failure(
+        &mgr,
+        &id,
+        &ws,
+        "Retry this request",
+        &super::TurnOptions::default(),
+        true,
+        &error,
+    )
+    .await;
+
+    assert!(
+        !mgr.contains(&id),
+        "terminal setup failure must retire the uninitialized child before another send"
+    );
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(stored.acp_session_id, before.acp_session_id);
+    assert_eq!(
+        &stored.messages[..before.messages.len()],
+        before.messages.as_slice()
+    );
+    assert_eq!(stored.messages.last().unwrap().role, "system");
+    assert!(stored
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .to_string()
+        .contains("session/new failed"));
+    assert_eq!(stored.status, AgentStatus::Error);
+    assert_eq!(
+        stored.stop_reason.as_deref(),
+        Some(error.to_string().as_str())
+    );
+    assert_eq!(
+        mgr.services.queue_snapshot(&id)[0]["content"],
+        "Retry this request"
+    );
+    failed_child.abort();
+
+    // A new child can resume the same history only after session/load succeeds.
+    let (recovered_child, calls) = track_mock_agent_with_log(&mgr, &id, true);
+    let resumed = mgr
+        .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .unwrap();
+    assert_eq!(resumed, "lost-id");
+    assert!(calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(method, params)| method == "session/load" && params["sessionId"] == "lost-id"));
+    recovered_child.abort();
+}
+
 /// STAB-51 regression (intent-hq/monorepo#454): when the pre-turn
 /// `persist_user` append fails for a drained message, the terminal-failure
 /// requeue must carry `persisted: false` so the `agent.retry` drain
@@ -27891,4 +27988,23 @@ async fn grouped_retry_normalizes_mirrors_and_successive_carry_over() {
         );
         assert_eq!(blocks.iter().filter(|b| b["data"] == data).count(), 1);
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_refresh_owner_survives_runtime_teardown_after_issuer_consumption() {
+    crate::codex_auth::tests::assert_refresh_survives_teardown(|child| async move {
+        let mut handle = mock_handle();
+        {
+            let local = handle.execution.local.as_ref().unwrap();
+            let mut resources = local.resources.lock().unwrap();
+            resources.child_pid = child.id();
+            resources.child = Some(child);
+        }
+        super::RuntimeTeardown::take(&mut handle)
+            .unwrap()
+            .kill_tree()
+            .await;
+    })
+    .await;
 }

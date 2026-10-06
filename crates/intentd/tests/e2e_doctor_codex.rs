@@ -585,7 +585,9 @@ fn live_ignores_runtime_override_and_uses_the_installed_cli() {
         .events()
         .iter()
         .filter(|event| event["started"] == true)
-        .all(|event| event["codexPath"] == json!(fixture.runtime)));
+        .all(|event| event["codexPath"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("/codex-native-auth.sh"))));
     fixture.assert_clean();
 }
 
@@ -688,7 +690,7 @@ fn unavailable_authentication_is_separate_from_an_empty_catalog() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn unreadable_authentication_does_not_start_live_probes() {
+fn stale_auth_file_does_not_override_native_backend_selection() {
     let fixture = Fixture::new("managed", &json!({}));
     fs::write(
         fixture.root.path().join("user/auth.json"),
@@ -696,13 +698,9 @@ fn unreadable_authentication_does_not_start_live_probes() {
     )
     .unwrap();
     let stdout = fixture.run(true);
-    assert_eq!(
-        stdout
-            .matches("authentication is unavailable for this probe")
-            .count(),
-        2
-    );
-    fixture.assert_version_only();
+    assert!(stdout.contains("ACP catalog: advertised"));
+    assert!(stdout.contains("raw runtime catalog: advertised"));
+    fixture.assert_clean();
 }
 
 #[cfg(target_os = "linux")]

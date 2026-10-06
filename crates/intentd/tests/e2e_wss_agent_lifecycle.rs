@@ -17087,7 +17087,14 @@ async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
         );
         let policy = &session["codexPolicy"];
         assert_eq!(policy["pathPresent"], true);
-        assert_eq!(policy["codexPath"], json!(selected_cli));
+        let launcher_path = std::path::Path::new(policy["codexPath"].as_str().unwrap());
+        assert_eq!(
+            launcher_path,
+            std::path::Path::new(policy["home"].as_str().unwrap()).join("codex-native-auth.sh")
+        );
+        let launcher = std::fs::read_to_string(launcher_path).unwrap();
+        assert!(launcher.contains("provider codex-auth-bridge"));
+        assert!(launcher.contains(&format!("--runtime '{}'", selected_cli.display())));
         assert_eq!(policy["config"]["agents"]["enabled"], false);
         assert_eq!(policy["config"]["features"]["multi_agent_v2"], false);
         assert!(policy["config"]["mcp_servers"]

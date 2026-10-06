@@ -104,3 +104,41 @@ async fn private_files_are_ready_private_and_never_overwrite() {
         );
     }
 }
+
+#[tokio::test]
+async fn diagnostic_workers_use_native_bridge_without_copying_refresh_credentials() {
+    let root = crate::test_support::test_tempdir("codex-diagnostic-native-auth");
+    let native = root.path().join("native");
+    std::fs::create_dir(&native).unwrap();
+    std::fs::write(
+        native.join("auth.json"),
+        r#"{"tokens":{"refresh_token":"never-in-worker"}}"#,
+    )
+    .unwrap();
+    let mut auth = Authentication::read(Some(&native), vec![]).await.unwrap();
+    auth.native = Some((
+        root.path().join("codex"),
+        native.clone(),
+        root.path().to_path_buf(),
+    ));
+    auth.config = Some("model = 'fixture'\n".into());
+    for _ in 0..2 {
+        // ACP and raw catalogs have independent temporary homes.
+        let home = auth.home().await.unwrap();
+        assert!(!home.path().join("auth.json").exists());
+        let wrapper = std::fs::read_to_string(home.path().join("codex-native-auth.sh")).unwrap();
+        assert!(wrapper.contains(&native.to_string_lossy().to_string()));
+        assert!(!wrapper.contains("never-in-worker"));
+        let config = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(config.contains("cli_auth_credentials_store = \"ephemeral\""));
+        assert!(config.contains("model = 'fixture'"));
+        let command = auth.raw_command(Command::new("wrong-runtime"), home.path());
+        assert_eq!(
+            command.as_std().get_program(),
+            home.path().join("codex-native-auth.sh")
+        );
+    }
+    assert!(std::fs::read_to_string(native.join("auth.json"))
+        .unwrap()
+        .contains("never-in-worker"));
+}

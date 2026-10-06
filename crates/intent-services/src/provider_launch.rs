@@ -52,7 +52,7 @@ pub(crate) fn prepare(
         .find(|(k, _)| *k == "OPENCODE_CONFIG_CONTENT")
         .and_then(|(_, v)| v)
         .and_then(|v| serde_json::from_str(&v.to_string_lossy()).ok());
-    let profile = crate::provider_profiles::prepare_provider_profile(ProviderProfileRequest {
+    let mut profile = crate::provider_profiles::prepare_provider_profile(ProviderProfileRequest {
         provider_id: provider,
         detected_version: None,
         purpose,
@@ -70,6 +70,44 @@ pub(crate) fn prepare(
         trusted_launch_config: routing.as_ref(),
     })
     .map_err(|e| Error::InvalidInput(e.to_string()))?;
+    if provider == "codex" {
+        let runtime = command_env(command, "CODEX_PATH")
+            .map(PathBuf::from)
+            .or_else(|| {
+                intent_providers::installed_cli::InstalledCli::Codex
+                    .resolve()
+                    .ok()
+                    .map(|r| r.path().to_path_buf())
+            })
+            .ok_or_else(|| {
+                Error::InvalidInput(
+                    "Install Codex on this daemon host before starting an agent.".into(),
+                )
+            })?;
+        let native = profile
+            .env
+            .get("INTENT_CODEX_NATIVE_HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| Error::Internal("Missing native Codex home".into()))?;
+        let helper = std::env::current_exe()
+            .map_err(|_| Error::Internal("Cannot locate Codex authentication helper".into()))?;
+        let wrapper =
+            crate::codex_auth::install_wrapper(profile.path(), &runtime, &native, &home, &helper)
+                .map_err(Error::InvalidInput)?;
+        #[cfg(unix)]
+        {
+            let owner = crate::codex_auth::start_owner(&runtime, &native, &home, &helper, command)
+                .map_err(Error::InvalidInput)?;
+            profile.env.insert(
+                "INTENT_CODEX_AUTH_SOCKET".into(),
+                owner.socket().to_string_lossy().into_owned(),
+            );
+            profile.auth_owner = Some(owner);
+        }
+        profile
+            .env
+            .insert("CODEX_PATH".into(), wrapper.to_string_lossy().into_owned());
+    }
     for d in &profile.diagnostics {
         tracing::warn!(
             provider,
@@ -241,6 +279,10 @@ mod tests {
         );
         opts.extra_env
             .insert("CODEX_CONFIG".into(), "{\"unsafe\":true}".into());
+        // This command-shaping test never starts Codex. Pin a local fixture so
+        // an installed host runtime cannot mask a missing test prerequisite.
+        opts.extra_env
+            .insert("CODEX_PATH".into(), bin.to_string_lossy().into_owned());
         let mut command = intent_acp::spawn::build_command(&opts);
         let mut mcp = NormalizedMcpServers::new();
         mcp.insert(

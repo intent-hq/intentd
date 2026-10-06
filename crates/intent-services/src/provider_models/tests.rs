@@ -1776,7 +1776,7 @@ async fn grok_cli_timeout_flows_into_attributed_warning() {
 }
 
 #[test]
-fn isolated_codex_home_seeds_auth_but_never_mcp_servers() {
+fn isolated_codex_home_never_seeds_auth_or_mcp_servers() {
     let user = tempfile::tempdir().unwrap();
     std::fs::write(
         user.path().join("config.toml"),
@@ -1788,7 +1788,7 @@ fn isolated_codex_home_seeds_auth_but_never_mcp_servers() {
     let home = super::isolated_codex_home(Some(user.path())).unwrap();
     assert!(home.path().is_dir());
     assert_ne!(home.path(), user.path());
-    assert!(home.path().join("auth.json").is_file());
+    assert!(!home.path().join("auth.json").exists());
     // No allowlisted scalar keys ⇒ no config.toml at all; mcp_servers never
     // reaches the probe home.
     assert!(!home.path().join("config.toml").exists());
@@ -1871,7 +1871,7 @@ fn isolated_codex_home_tolerates_malformed_config() {
     std::fs::write(user.path().join("auth.json"), "{\"tokens\":{}}").unwrap();
 
     let home = super::isolated_codex_home(Some(user.path())).unwrap();
-    assert!(home.path().join("auth.json").is_file());
+    assert!(!home.path().join("auth.json").exists());
     assert!(!home.path().join("config.toml").exists());
 }
 
@@ -1881,7 +1881,7 @@ fn isolated_codex_home_tolerates_absent_config() {
     std::fs::write(user.path().join("auth.json"), "{\"tokens\":{}}").unwrap();
 
     let home = super::isolated_codex_home(Some(user.path())).unwrap();
-    assert!(home.path().join("auth.json").is_file());
+    assert!(!home.path().join("auth.json").exists());
     assert!(!home.path().join("config.toml").exists());
 }
 

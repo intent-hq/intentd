@@ -825,6 +825,85 @@ child.on('exit',code=>process.exit(code||0));
     }
 
     #[tokio::test]
+    async fn diagnostic_auth_owner_preserves_frozen_network_and_custom_credentials() {
+        let fixture = Fixture::new(&json!({"installed":true}));
+        let mut launch = fixture.launch(true);
+        let installed_dir = fixture.root.path().join("installed-owner");
+        std::fs::create_dir(&installed_dir).unwrap();
+        symlink(&fixture.runtime, installed_dir.join("codex")).unwrap();
+        let runtime = intent_providers::installed_cli::InstalledCli::Codex
+            .resolve_in_dirs(std::slice::from_ref(&installed_dir), false)
+            .unwrap();
+        let captured = std::collections::BTreeMap::from([
+            (
+                "HTTPS_PROXY".into(),
+                "http://synthetic-proxy.invalid:443".into(),
+            ),
+            ("NO_PROXY".into(), "synthetic-native.invalid".into()),
+            ("SSL_CERT_FILE".into(), "/synthetic/cert.pem".into()),
+            (
+                "SYNTHETIC_PROVIDER_KEY".into(),
+                "synthetic-only-credential".into(),
+            ),
+        ]);
+        let names = intent_core::cli_env::CodexEnvNames::from_config(
+            "[model_providers.synthetic]\nenv_key='SYNTHETIC_PROVIDER_KEY'",
+        )
+        .unwrap();
+        launch.installed = Some(
+            crate::installed_cli::InstalledContext::from_inputs(
+                runtime,
+                &captured,
+                std::collections::BTreeMap::from([
+                    (
+                        OsString::from("HOME"),
+                        fixture.root.path().as_os_str().to_owned(),
+                    ),
+                    (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+                ]),
+                &names,
+            )
+            .unwrap(),
+        );
+        let auth = Authentication::capture(&launch).await.unwrap();
+        let helper = fixture.root.path().join("capture-owner");
+        let output = fixture.root.path().join("owner-environment.json");
+        executable(&helper, "#!/usr/bin/python3\nimport json,os\nfrom pathlib import Path\np=Path(os.environ['CAPTURE_OUTPUT']); t=p.with_suffix('.tmp'); keys=('HTTPS_PROXY','NO_PROXY','SSL_CERT_FILE','SYNTHETIC_PROVIDER_KEY','HOME','USER','SHELL','INTENT_CODEX_NATIVE_XDG_CONFIG_HOME'); t.write_text(json.dumps({k:os.environ[k] for k in keys if k in os.environ})); t.replace(p)\n");
+        let mut context = auth.owner_context(&helper);
+        context.env("CAPTURE_OUTPUT", &output);
+        // A removal remains removed even if the daemon currently defines it.
+        context.env_remove("USER");
+        let owner = crate::codex_auth::start_owner(
+            &fixture.runtime,
+            fixture.root.path(),
+            fixture.root.path(),
+            &helper,
+            &context,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !output.exists() {
+                // timing-guard: wait for the child to record its actual environment.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let observed: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        for (key, value) in captured {
+            assert_eq!(observed[&key], value);
+        }
+        assert_eq!(observed["HOME"], json!(fixture.root.path()));
+        assert!(observed.get("USER").is_none());
+        assert!(
+            observed.get("SHELL").is_none(),
+            "omitted daemon values must not leak into a frozen snapshot"
+        );
+        assert_eq!(observed["INTENT_CODEX_NATIVE_XDG_CONFIG_HOME"], "");
+        drop(owner);
+    }
+
+    #[tokio::test]
     async fn catalog_launch_keeps_the_production_policy_and_ignores_runtime_overrides() {
         let fixture = Fixture::new(&json!({"installed":true}));
         let custom = Fixture::new(&json!({"model":"custom-model"}));

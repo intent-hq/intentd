@@ -384,7 +384,7 @@ async fn installed_cli_version_output_is_bounded_and_errors_do_not_echo_output()
 async fn installed_cli_ephemeral_isolation_uses_effective_home_before_env_override() {
     let (root, context) = fixture(
         InstalledCli::Codex,
-        "#!/bin/sh\n[ -f \"$CODEX_HOME/auth.json\" ] || exit 5\nprintf 'codex-cli 1.2.3\\n'\n",
+        "#!/bin/sh\n[ ! -e \"$CODEX_HOME/auth.json\" ] || exit 5\n[ \"$CODEX_HOME\" != \"$HOME/.codex\" ] || exit 6\ngrep -q test-model \"$CODEX_HOME/config.toml\" || exit 7\nprintf 'codex-cli 1.2.3\\n'\n",
     );
     std::fs::create_dir(root.path().join(".codex")).unwrap();
     std::fs::write(root.path().join(".codex/auth.json"), "{}").unwrap();

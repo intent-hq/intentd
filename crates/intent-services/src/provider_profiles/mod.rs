@@ -122,6 +122,8 @@ pub struct ProviderLaunchProfile {
     purpose: LaunchPurpose,
     storage: storage::ProfileStorage,
     parent: Option<tempfile::TempDir>,
+    #[cfg(unix)]
+    pub(crate) auth_owner: Option<crate::codex_auth::OwnerLease>,
 }
 
 impl ProviderLaunchProfile {
@@ -272,6 +274,8 @@ pub fn prepare_provider_profile(
             request.resume,
         )?,
         parent: None,
+        #[cfg(unix)]
+        auth_owner: None,
         env: BTreeMap::new(),
         remove_env: BTreeSet::new(),
         args: Vec::new(),
