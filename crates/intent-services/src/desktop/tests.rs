@@ -185,7 +185,7 @@ impl Harness {
         )
         .await
     }
-    async fn client(&self, method: &str, mut args: Value) -> DesktopResult<Value> {
+    pub(crate) async fn client(&self, method: &str, mut args: Value) -> DesktopResult<Value> {
         args["workspaceId"] = self.workspace.0.clone().into();
         let connection = self.executor.connection.lock().unwrap().clone();
         intent_core::with_caller(
