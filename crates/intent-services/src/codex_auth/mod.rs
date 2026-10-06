@@ -249,12 +249,16 @@ struct Authority {
     socket: Option<PathBuf>,
 }
 #[cfg(not(unix))]
-struct Authority;
+enum Authority {
+    Unsupported,
+}
 
 impl Authority {
     #[cfg(not(unix))]
     fn read(&self, _previous: Option<&str>) -> std::future::Ready<Result<Option<Credentials>>> {
-        std::future::ready(Err(UNSUPPORTED_HOST))
+        match self {
+            Self::Unsupported => std::future::ready(Err(UNSUPPORTED_HOST)),
+        }
     }
 
     #[cfg(unix)]
@@ -692,7 +696,7 @@ pub async fn run(
     let authority = {
         // Unsupported hosts have no native owner context or refresh backend.
         drop((user_home, authority_socket));
-        Authority
+        Authority::Unsupported
     };
     // Native policy can override session flags. Inspect its resolved requirements
     // before a worker can touch any persisted profile/keyring credential.
@@ -793,7 +797,7 @@ mod unsupported_tests {
     #[tokio::test]
     async fn unsupported_host_never_attempts_native_authentication() {
         assert!(matches!(
-            Authority.read(Some("synthetic-access")).await,
+            Authority::Unsupported.read(Some("synthetic-access")).await,
             Err(UNSUPPORTED_HOST)
         ));
         let root = crate::test_support::test_tempdir("unsupported-native-auth");
