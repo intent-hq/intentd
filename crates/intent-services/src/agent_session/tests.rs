@@ -750,6 +750,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -1402,6 +1403,78 @@ fn replay_tool() -> IncomingNotification {
     }
 }
 
+#[tokio::test]
+async fn structured_notices_survive_resume_replay_drain() {
+    use std::future::{poll_fn, Future};
+    use std::io::{Read, Seek};
+    use std::task::Poll;
+
+    let (_tmp, _services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut log = tempfile::tempfile().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(log.try_clone().unwrap())
+        .finish();
+    let _capture = crate::test_tracing::set_capture_default(subscriber);
+    let notice = |title: &str| {
+        tool_call_notification(&json!({
+            "sessionUpdate": "notice", "severity": "warning", "title": title,
+            "description": "Live diagnostic during replay"
+        }))
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tx.send(notice("Buffered notice")).unwrap();
+    tx.send(replay_chunk("Old assistant reply")).unwrap();
+    let mut drain = Box::pin(Services::drain_replay_notifications(
+        &mut rx,
+        &agent_id,
+        Some(&workspace_id),
+    ));
+    // Poll through the already-buffered burst and into the settle-window recv,
+    // then send a straggler without a timing-based sleep.
+    poll_fn(|cx| {
+        assert!(drain.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tx.send(notice("Settle-window notice")).unwrap();
+    tx.send(replay_tool()).unwrap();
+    drop(tx);
+    drain.await;
+    assert!(rx.try_recv().is_err());
+    assert!(timeout(Duration::from_millis(50), sub.recv())
+        .await
+        .is_err());
+    assert!(bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap()
+        .is_empty());
+    log.rewind().unwrap();
+    let mut diagnostics = String::new();
+    log.read_to_string(&mut diagnostics).unwrap();
+    for title in ["Buffered notice", "Settle-window notice"] {
+        let line = diagnostics
+            .lines()
+            .find(|line| line.contains(title))
+            .expect("notice logged");
+        for expected in [
+            "WARN",
+            "warning",
+            "Live diagnostic during replay",
+            ACP_SID,
+            agent_id.as_str(),
+            workspace_id.as_str(),
+        ] {
+            assert!(line.contains(expected), "missing {expected}: {line}");
+        }
+    }
+    assert!(!diagnostics.contains("Old assistant reply"));
+}
+
 /// The `session/load` replay burst buffered in the handle's channel is discarded
 /// (no events published, transcript untouched), while a subsequent real turn
 /// still streams its updates and accumulates the assistant message.
@@ -1424,7 +1497,7 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
     // The bounded drain empties the burst and cannot hang.
     timeout(
         Duration::from_secs(2),
-        Services::drain_replay_notifications(&mut replay_rx),
+        Services::drain_replay_notifications(&mut replay_rx, &agent_id, Some(&workspace_id)),
     )
     .await
     .expect("drain settles within the cap");
@@ -2429,6 +2502,158 @@ fn tool_call_notification(update: &Value) -> IncomingNotification {
     IncomingNotification {
         method: "session/update".to_string(),
         params: json!({ "sessionId": ACP_SID, "update": update }),
+    }
+}
+
+#[tokio::test]
+async fn structured_notices_do_not_count_as_output_or_block_silent_redrive() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("notice-turn".into());
+    for severity in ["info", "warning", "error", "_future"] {
+        let update = tool_call_notification(&json!({
+            "sessionUpdate": "notice", "severity": severity,
+            "title": "Runtime diagnostic", "description": "Provider detail"
+        }));
+        assert!(
+            !services
+                .route_notification(&update, &agent_id, &workspace_id, &mut transcript)
+                .await
+        );
+    }
+    assert!(transcript.blocks.is_empty());
+    assert!(transcript.text_block_strings().is_empty());
+    assert!(
+        timeout(Duration::from_millis(50), sub.recv())
+            .await
+            .is_err(),
+        "no chat or activity events"
+    );
+}
+
+/// A binding can successfully create a proposal before its enclosing JS
+/// fails. Preserve registered cards on failure, but never trust an error's
+/// echoed proposal payload to create a new actionable card.
+#[tokio::test]
+async fn failed_workspace_api_attaches_only_registered_proposals() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    for registered in [false, true] {
+        let mut transcript = super::Transcript::new("m1".to_string());
+        if registered {
+            services.turn_attachments().register(
+                &agent_id,
+                test_attachment("tar-created", intent_core::AttachmentPolicy::AtToolResult),
+            );
+        }
+        services.route_notification(
+            &tool_call_notification(&json!({
+                "sessionUpdate": "tool_call", "toolCallId": "transfer", "title": "workspace_api",
+                "kind": "other", "status": "in_progress",
+                "rawInput": { "code": "await ws.app.workspaces.transfer(id); throw Error('later');", "summary": "Transfer project" }
+            })), &agent_id, &workspace_id, &mut transcript,
+        ).await;
+        services.route_notification(
+            &tool_call_notification(&json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "transfer", "status": "failed",
+                "rawOutput": [{ "type": "resource", "resource": {
+                    "uri": "intent-proposal://workspace-transfer/untrusted",
+                    "mimeType": "application/vnd.intent.proposal+json",
+                    "text": "{\"kind\":\"workspace-transfer\",\"preview\":{\"title\":\"Untrusted echo\"},\"payload\":{}}"
+                }}]
+            })), &agent_id, &workspace_id, &mut transcript,
+        ).await;
+        let blocks = transcript.into_blocks();
+        assert_eq!(blocks[1]["is_error"], true);
+        assert_eq!(blocks.len(), if registered { 3 } else { 2 });
+        if registered {
+            assert!(blocks[2]["resource"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("tar-created"));
+        }
+        assert!(services
+            .turn_attachments()
+            .claim_at_tool_result(&agent_id, None, "workspace_api", None)
+            .is_empty());
+    }
+}
+
+/// Status-only completions claim and materialize the entire trusted batch,
+/// without inventing tool output, and publish the real resource block IDs.
+#[tokio::test]
+async fn status_only_workspace_api_attaches_registered_batch() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    for status in ["failed", "completed"] {
+        for registered in [false, true] {
+            let mut transcript = super::Transcript::new("m1".to_string());
+            let mut sub = bus.subscribe(SubscriptionFilter::default());
+            if registered {
+                services.turn_attachments().register_all(
+                    &agent_id,
+                    ["tar-first", "tar-second"]
+                        .into_iter()
+                        .map(|id| test_attachment(id, intent_core::AttachmentPolicy::AtToolResult))
+                        .collect(),
+                );
+            }
+            services.route_notification(
+                &tool_call_notification(&json!({
+                    "sessionUpdate": "tool_call", "toolCallId": "proposal", "title": "workspace_api",
+                    "kind": "other", "status": "in_progress",
+                    "rawInput": { "code": "await ws.app.proposal.show(p);" }
+                })), &agent_id, &workspace_id, &mut transcript,
+            ).await;
+            let terminal = tool_call_notification(&json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "proposal", "status": status
+            }));
+            services
+                .route_notification(&terminal, &agent_id, &workspace_id, &mut transcript)
+                .await;
+            let event = timeout(Duration::from_secs(2), async {
+                loop {
+                    for event in sub.recv().await.expect("subscription open") {
+                        if event.event_type == "agent:tool:call"
+                            && event.data["status"] != "started"
+                        {
+                            return event;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("terminal tool event");
+            assert!(event.data.get("output").is_none());
+            assert!(event.data.get("resultBlockId").is_none());
+            assert!(event.data.get("resultBlockIndex").is_none());
+            if registered {
+                assert_eq!(event.data["proposalBlockIds"], json!(["m1:1", "m1:2"]));
+                let items = event.data["registeredAttachments"].as_array().unwrap();
+                assert_eq!(items.len(), 2);
+                for (i, item) in items.iter().enumerate() {
+                    assert_eq!(
+                        transcript.blocks[i + 1],
+                        crate::tool_block::build_proposal_resource_block(
+                            &format!("m1:{}", i + 1),
+                            item
+                        )
+                    );
+                }
+            } else {
+                assert!(event.data.get("proposalBlockIds").is_none());
+                assert!(event.data.get("registeredAttachments").is_none());
+            }
+            // A repeated status-only update cannot attach the consumed batch again.
+            services
+                .route_notification(&terminal, &agent_id, &workspace_id, &mut transcript)
+                .await;
+            let blocks = transcript.into_blocks();
+            assert_eq!(blocks.len(), if registered { 3 } else { 1 });
+            assert!(!blocks.iter().any(|b| b["type"] == "tool_result"));
+            assert!(services
+                .turn_attachments()
+                .finish_turn(&agent_id)
+                .is_empty());
+        }
     }
 }
 
@@ -4315,8 +4540,9 @@ fn connect_with_prompt_rpc_error(
 fn spawn_mock_agent_with_prompt_rpc_error_code<R, W>(
     read: R,
     write: W,
-    code: i64,
-    error_message: String,
+    error: Value,
+    updates: Vec<String>,
+    prompt_calls: Arc<AtomicUsize>,
 ) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -4336,10 +4562,17 @@ where
                 continue;
             };
             if method == "session/prompt" {
+                prompt_calls.fetch_add(1, Ordering::SeqCst);
+                for note in &updates {
+                    write
+                        .write_all(format!("{note}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
                 let resp = json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "error": { "code": code, "message": error_message },
+                    "error": error,
                 });
                 write
                     .write_all(format!("{resp}\n").as_bytes())
@@ -4368,20 +4601,23 @@ where
 /// [`connect`] against a mock whose `session/prompt` fails with a JSON-RPC
 /// error carrying an explicit `code` + `message`.
 fn connect_with_prompt_rpc_error_code(
-    code: i64,
-    error_message: &str,
+    error: Value,
+    updates: Vec<String>,
 ) -> (
     Connection,
     mpsc::UnboundedReceiver<IncomingNotification>,
     JoinHandle<()>,
+    Arc<AtomicUsize>,
 ) {
     let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
     let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let prompt_calls = Arc::new(AtomicUsize::new(0));
     let agent = spawn_mock_agent_with_prompt_rpc_error_code(
         c2a_agent,
         a2c_agent,
-        code,
-        error_message.to_string(),
+        error,
+        updates,
+        prompt_calls.clone(),
     );
     let (note_tx, note_rx) = mpsc::unbounded_channel();
     let hooks = ConnectionHooks {
@@ -4389,7 +4625,7 @@ fn connect_with_prompt_rpc_error_code(
         ..ConnectionHooks::default()
     };
     let conn = Connection::new(c2a_client, a2c_client, None, hooks);
-    (conn, note_rx, agent)
+    (conn, note_rx, agent, prompt_calls)
 }
 
 /// Durable-before-observable on the STREAMING terminal-failure path
@@ -4478,8 +4714,10 @@ async fn streaming_terminal_failure_persists_error_before_publishing_events() {
 #[tokio::test]
 async fn streaming_benign_cancel_does_not_persist_error() {
     let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
-    let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error_code(-32800, "request cancelled");
+    let (conn, mut note_rx, _agent, _prompt_calls) = connect_with_prompt_rpc_error_code(
+        json!({ "code": -32800, "message": "request cancelled" }),
+        Vec::new(),
+    );
 
     let err = services
         .run_connection_prompt_turn(
@@ -4513,6 +4751,125 @@ async fn streaming_benign_cancel_does_not_persist_error() {
         services.take_pending_terminal_error(&agent_id).is_none(),
         "nothing stashed for a benign cancel"
     );
+}
+
+/// Explicit cancellation wins over incidental network details, even after
+/// partial output or a host suspend: never retry or enroll cancelled work.
+#[tokio::test]
+async fn explicit_cancellation_with_transient_details_never_retries_or_suspends() {
+    let _env = EnvGuard::set_all(&[("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "1")]);
+    for error in [
+        json!({ "code": -32800, "message": "request cancelled",
+            "data": { "details": "terminated" } }),
+        json!({ "code": -32800, "message": "The operation was aborted due to timeout" }),
+        json!({ "code": -32800, "message": "request cancelled",
+            "data": { "details": "TimeoutError: request timed out" } }),
+        json!({ "code": -32800, "message": "TypeError: terminated" }),
+        json!({ "code": -32800, "message": "request cancelled",
+            "data": { "details": "Connection reset by peer" } }),
+    ] {
+        for overlap in [None, Some(Duration::from_secs(120))] {
+            for partial in [false, true] {
+                assert_explicit_cancellation_is_not_recovered(error.clone(), overlap, partial)
+                    .await;
+            }
+        }
+    }
+}
+
+async fn assert_explicit_cancellation_is_not_recovered(
+    error: Value,
+    overlap: Option<Duration>,
+    partial: bool,
+) {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(Arc::new(FakeSuspend(overlap)));
+    let updates = if partial {
+        vec![suspend_chunk("partial ")]
+    } else {
+        Vec::new()
+    };
+    let (conn, mut note_rx, _agent, prompt_calls) =
+        connect_with_prompt_rpc_error_code(error.clone(), updates);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let err = timeout(
+        Duration::from_secs(10),
+        services.run_connection_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        ),
+    )
+    .await
+    .expect("cancelled turn settles")
+    .expect_err("cancellation returns Err");
+    assert_eq!(
+        prompt_calls.load(Ordering::SeqCst),
+        1,
+        "cancelled prompt must not retry: {error}, overlap={overlap:?}, partial={partial}"
+    );
+    assert!(
+        crate::agent_manager::prompt_cancellation_error(&err),
+        "cancellation must reach the worker, not the suspend marker: {err}"
+    );
+    assert!(
+        bus.store()
+            .list_interrupted_agents()
+            .await
+            .unwrap()
+            .is_empty(),
+        "cancelled work must not enroll for wake recovery"
+    );
+    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_ne!(stored.status, AgentStatus::Error);
+    assert!(stored.stop_reason.is_none());
+    assert!(
+        stored.attention_request_kind.is_none(),
+        "no recovery blocker for cancellation"
+    );
+    assert!(services.take_pending_terminal_error(&agent_id).is_none());
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.len(),
+        usize::from(partial),
+        "preserve only existing partial output"
+    );
+    for message in &messages {
+        assert_eq!(message.role, "assistant");
+        assert!(message
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("interruptReason"))
+            .is_none());
+    }
+    let mut events = Vec::new();
+    while !events
+        .iter()
+        .any(|e: &Event| e.event_type == "agent:stream:end")
+    {
+        events.extend(
+            timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .expect("terminal stream event arrives")
+                .expect("subscription open"),
+        );
+    }
+    assert!(!events
+        .iter()
+        .any(|e| e.event_type == "agent:attention-requested"));
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .unwrap();
+    assert_ne!(end.data["interruptReason"], json!("system_suspend"));
 }
 
 /// Mock agent whose `session/prompt` fails the first `failures` calls with a
@@ -4621,16 +4978,25 @@ fn connect_with_failing_prompts_then_success(
 const FETCH_EPIPE_UNAVAILABLE: &str = "fetch failed (EPIPE: connect EPIPE 34.36.229.120:443): \
     {\"apiStatus\":\"unavailable\",\"message\":\"fetch failed (EPIPE: connect EPIPE 34.36.229.120:443)\"}";
 
-/// Regression for monorepo#3007: a transient provider-fetch failure (`-32603`
-/// wrapping an EPIPE connect + `apiStatus: unavailable`) on an output-free
+/// Regression for monorepo#3007 / intent#6750: a transient provider-fetch failure
+/// (including timeout and undici body-stream termination) on an output-free
 /// attempt is retried in place — the turn completes normally instead of
 /// failing terminally, and no Error status is persisted.
 #[tokio::test]
 async fn transient_provider_fetch_failure_retries_and_turn_completes() {
-    std::env::set_var("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10");
+    let _env = EnvGuard::set_all(&[("INTENTD_TRANSIENT_PROMPT_RETRY_BASE_MS", "10")]);
+    for error_message in
+        std::iter::once(FETCH_EPIPE_UNAVAILABLE).chain(SUSPEND_TRANSIENT_ERRORS.iter().copied())
+    {
+        assert_output_free_fetch_failure_retries(error_message).await;
+    }
+}
+
+async fn assert_output_free_fetch_failure_retries(error_message: &str) {
     let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(None)));
     let (conn, mut note_rx, _agent, prompt_calls) =
-        connect_with_failing_prompts_then_success(2, FETCH_EPIPE_UNAVAILABLE, prompt_updates());
+        connect_with_failing_prompts_then_success(2, error_message, prompt_updates());
 
     let stop = timeout(
         Duration::from_secs(10),
@@ -5324,7 +5690,16 @@ fn suspend_chunk(text: &str) -> String {
     .to_string()
 }
 
-/// Task C happy path: a transient upstream disconnect whose active window
+// Include fetch-only shapes: disconnect classification alone must not gate
+// suspend enrollment (intent-hq/intent#6750).
+const SUSPEND_TRANSIENT_ERRORS: &[&str] = &[
+    "Connection reset by peer",
+    "Internal error: The operation was aborted due to timeout: {\"apiStatus\":\"unavailable\"}",
+    "Internal error: The operation was aborted due to timeout",
+    "Internal error: {\"details\":\"terminated\"}",
+];
+
+/// A transient upstream disconnect or provider-fetch failure whose active window
 /// overlapped a detected host suspend is ENROLLED as interrupted, not surfaced
 /// terminally. `run_prompt_turn` returns the suspend-interrupt marker error,
 /// emits the interrupted terminal `agent:stream:end` (`stopReason:
@@ -5333,13 +5708,20 @@ fn suspend_chunk(text: &str) -> String {
 /// `interrupted_agent` row for the wake orchestrator (Task D).
 #[tokio::test]
 async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_failure() {
+    for error_message in SUSPEND_TRANSIENT_ERRORS {
+        assert_suspend_interrupt_enrolled(error_message).await;
+    }
+}
+
+async fn assert_suspend_interrupt_enrolled(error_message: &str) {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
         Duration::from_secs(120),
     ))));
-    // Stream a partial chunk, then fail with a connection-reset RPC error.
+    // Partial output rules out in-place retry; suspend enrollment must also
+    // take precedence over the post-output blocker path.
     let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], error_message);
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let capture = LifecycleCapture::default();
     let _capture_guard = capture.set_as_default();
@@ -5372,6 +5754,12 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
     assert!(
         !events.iter().any(|e| e.event_type == "agent:failed"),
         "no agent:failed for a sleep-induced interruption"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.event_type == "agent:attention-requested"),
+        "no terminal blocker for a sleep-induced interruption: {error_message}"
     );
     let end = events
         .iter()
@@ -5428,7 +5816,9 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
     // The interrupted_agent row is written for the wake orchestrator (Task D).
     let interrupted = bus.store().list_interrupted_agents().await.unwrap();
     assert!(
-        interrupted.iter().any(|ia| ia.agent_id == agent_id),
+        interrupted
+            .iter()
+            .any(|ia| ia.agent_id == agent_id && ia.reason.as_deref() == Some("system_suspend")),
         "interrupted_agent row enrolled for wake-resume"
     );
 }
@@ -5439,10 +5829,16 @@ async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_fai
 /// no `interrupted_agent` row).
 #[tokio::test]
 async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
+    for error_message in SUSPEND_TRANSIENT_ERRORS {
+        assert_awake_transient_failure(error_message).await;
+    }
+}
+
+async fn assert_awake_transient_failure(error_message: &str) {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(None)));
     let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], error_message);
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
@@ -5473,6 +5869,12 @@ async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
         events.iter().any(|e| e.event_type == "agent:failed"),
         "awake-time failure surfaces agent:failed"
     );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_type == "agent:attention-requested"),
+        "awake-time post-output failure still raises blocker attention: {error_message}"
+    );
     let interrupted = bus.store().list_interrupted_agents().await.unwrap();
     assert!(
         interrupted.is_empty(),
@@ -5480,7 +5882,7 @@ async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
     );
 }
 
-/// Task C boundary: a NON-transient error (a terminal 4xx) is NOT enrolled even
+/// A NON-transient error (4xx, quota, or unrelated termination) is NOT enrolled even
 /// when a suspend overlapped — the classifier rejects it, so the turn surfaces
 /// terminally with `agent:failed` and no `interrupted_agent` row. (A 404, not
 /// a 401: an auth-flavored 4xx now takes the auth-required mapping instead of
@@ -5488,12 +5890,24 @@ async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
 /// `map_acp_session_error_maps_auth_and_demotes_verdict`.)
 #[tokio::test]
 async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
+    for error_message in [
+        "HTTP 404 Not Found",
+        "Internal error: process: terminated by signal",
+        "Internal error: rate_limit_error: {\"details\":\"terminated\"}",
+        "Internal error: insufficient_quota: fetch failed",
+        "Internal error: monthly quota exhausted: ECONNRESET",
+    ] {
+        assert_suspend_rejects_terminal_failure(error_message).await;
+    }
+}
+
+async fn assert_suspend_rejects_terminal_failure(error_message: &str) {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
         Duration::from_secs(120),
     ))));
     let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error(Vec::new(), "HTTP 404 Not Found");
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], error_message);
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
@@ -5507,7 +5921,7 @@ async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
             None,
         )
         .await
-        .expect_err("a terminal 4xx fails the turn");
+        .expect_err("a terminal rejection fails the turn");
     assert!(
         matches!(
             &err,
@@ -5604,14 +6018,20 @@ async fn suspend_late_enrollment_persists_after_early_close() {
 /// the row resolved (no longer pending).
 #[intent_test_macros::daemon_test]
 async fn wake_resume_resumes_turn_enrolled_by_suspend_classifier() {
+    for error_message in SUSPEND_TRANSIENT_ERRORS {
+        assert_wake_resumes_enrolled_turn(error_message).await;
+    }
+}
+
+async fn assert_wake_resumes_enrolled_turn(error_message: &str) {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
         Duration::from_secs(120),
     ))));
 
-    // Task C: a transient disconnect overlapping a suspend enrolls the turn.
+    // A transient failure overlapping a suspend enrolls the turn.
     let (conn, mut note_rx, _agent) =
-        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], error_message);
     services
         .run_connection_prompt_turn(
             &conn,

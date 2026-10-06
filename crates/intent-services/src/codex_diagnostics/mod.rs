@@ -161,6 +161,7 @@ pub struct CodexInspection {
 /// Keep this object for both ACP and raw catalog probes so they share selection.
 pub struct CodexLaunch {
     selection: ProviderLaunch,
+    installed: Option<crate::installed_cli::InstalledContext>,
     path: OsString,
     codex_path: Option<OsString>,
 }
@@ -179,11 +180,24 @@ impl CodexLaunch {
                 package: CODEX_ACP_NPX_PACKAGE,
             },
         );
-        let command = build_command(&spawn_options(&selection));
+        let installed = crate::installed_cli::InstalledContext::resolve(
+            intent_providers::installed_cli::InstalledCli::Codex,
+        )
+        .ok();
+        let mut command = build_command(&spawn_options(&selection));
+        if let Some(context) = &installed {
+            context.apply(&mut command);
+        }
         Self {
             selection,
+            codex_path: Some(
+                installed
+                    .as_ref()
+                    .map(|c| c.runtime.path().as_os_str().to_owned())
+                    .unwrap_or_default(),
+            ),
+            installed,
             path: effective_env(&command, "PATH").unwrap_or_default(),
-            codex_path: effective_env(&command, "CODEX_PATH"),
         }
     }
 
@@ -210,13 +224,43 @@ impl CodexLaunch {
     /// Default local reporting. Never launches npx, scans npm caches, installs
     /// packages, or asks a provider for models/account/auth information.
     pub async fn inspect_local(&self) -> CodexInspection {
-        match &self.selection {
+        let inspection = match &self.selection {
             ProviderLaunch::Local(binary) => self.inspect(&binary.path, None, None).await,
             ProviderLaunch::Managed { .. } => {
                 self.unknown(UnknownReason::ManagedPackageNotInspected)
             }
             ProviderLaunch::Bare { .. } => self.unknown(UnknownReason::AdapterNotFound),
+        };
+        self.with_installed_runtime(inspection).await
+    }
+
+    async fn with_installed_runtime(&self, mut inspection: CodexInspection) -> CodexInspection {
+        if let Some(context) = &self.installed {
+            let mut command = build_command(&self.spawn_options());
+            context.apply(&mut command);
+            inspection.report.runtime_source = RuntimeSource::EnvironmentOverride;
+            inspection.report.runtime_path =
+                Some(safe_text(&context.runtime.path().to_string_lossy()));
+            inspection.report.removes_codex_overrides = false;
+            inspection.report.runtime_version = match context.observe(&command).await {
+                Ok((_, version)) => parse_version(version.as_bytes(), VersionKind::Runtime).map_or(
+                    VersionMeasurement::Unknown(UnknownReason::InvalidVersion),
+                    VersionMeasurement::Measured,
+                ),
+                Err(_) => VersionMeasurement::Unknown(UnknownReason::InspectionFailed),
+            };
+            inspection.runtime = Some(DiagnosticExecutable {
+                program: context.runtime.path().to_owned(),
+                args: Vec::new(),
+            });
+        } else if self.codex_path.as_ref().is_some_and(|p| p.is_empty()) {
+            inspection.report.runtime_source = RuntimeSource::EnvironmentOverride;
+            inspection.report.runtime_version =
+                VersionMeasurement::Unknown(UnknownReason::RuntimeNotFound);
+            inspection.report.runtime_path = None;
+            inspection.runtime = None;
         }
+        inspection
     }
 
     /// Inspect an entrypoint established by the opt-in managed-package launch.
@@ -235,7 +279,8 @@ impl CodexLaunch {
     ) -> CodexInspection {
         if let ProviderLaunch::Managed { package, .. } = &self.selection {
             let version = package.rsplit_once('@').map(|(_, version)| version);
-            self.inspect(adapter, version, dependency).await
+            let inspection = self.inspect(adapter, version, dependency).await;
+            self.with_installed_runtime(inspection).await
         } else {
             self.inspect_local().await
         }
@@ -343,6 +388,11 @@ impl CodexLaunch {
         result.report.adapter_version = self
             .version(command, VersionKind::Adapter, dependency)
             .await;
+        if self.installed.is_some() {
+            // Native binaries and version-manager shims must be invoked
+            // directly with the frozen launch environment, never through node.
+            return result;
+        }
         let runtime_override = match runtime_override {
             Ok(path) => path,
             Err(reason) => {
@@ -377,7 +427,14 @@ impl CodexLaunch {
     }
 
     fn runtime_override_path(&self) -> Result<Option<PathBuf>, UnknownReason> {
-        if let Some(value) = self.codex_path.as_ref().filter(|value| !value.is_empty()) {
+        if self
+            .codex_path
+            .as_ref()
+            .is_some_and(|value| value.is_empty())
+        {
+            return Err(UnknownReason::RuntimeNotFound);
+        }
+        if let Some(value) = self.codex_path.as_ref() {
             let configured = PathBuf::from(value);
             let program = if configured.is_absolute() {
                 configured

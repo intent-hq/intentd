@@ -40,7 +40,7 @@ fn spawn_serve(data_dir: &Path) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    common::serve_command()
+    common::hermetic_serve_command(data_dir)
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")

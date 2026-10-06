@@ -37,6 +37,10 @@ use tokio::time::timeout;
 
 use intent_store::Store;
 
+use crate::source_control_auth_ops::repository_owner::{
+    GitlabCredentialGate, RepositorySettingsWrite,
+};
+
 use crate::settings_registry::{SettingOrigin, SettingsRegistry, KNOWN_PATHS};
 
 /// Placeholder returned for a sensitive setting that **has** a stored value, so
@@ -205,6 +209,9 @@ type MutationHook<T> = Arc<Mutex<Option<Box<dyn FnOnce() -> T + Send>>>>;
 /// invalidated on successful writes and expire on TTL.
 #[derive(Clone)]
 pub(crate) struct AsyncSecretStore {
+    paired_gitlab: Option<std::path::PathBuf>,
+    repository_gate: Arc<OnceLock<GitlabCredentialGate>>,
+    repository_write: Option<Arc<RepositorySettingsWrite>>,
     inner: Arc<dyn SecretStore>,
     state: Arc<Mutex<AsyncState>>,
     mutation_tasks: Arc<crate::delivery_tasks::DeliveryTasks>,
@@ -339,6 +346,9 @@ impl AsyncSecretStore {
         warn_interval: Duration,
     ) -> Self {
         Self {
+            paired_gitlab: None,
+            repository_gate: Arc::new(OnceLock::new()),
+            repository_write: None,
             inner,
             state: Arc::new(Mutex::new(AsyncState {
                 entries: HashMap::new(),
@@ -417,6 +427,43 @@ impl AsyncSecretStore {
             self.state.lock().unwrap().entries.remove(account);
         }
         Ok(guard)
+    }
+
+    /// Explicit common backing-file construction. Generic store injection does
+    /// not establish this provenance even if its values happen to match.
+    pub(crate) fn paired_gitlab(store: intent_core::FileSecretStore) -> Self {
+        let path = store.path().to_path_buf();
+        let mut wrapper = Self::new(Arc::new(store));
+        wrapper.paired_gitlab = Some(path);
+        wrapper
+    }
+
+    pub(crate) fn is_paired_gitlab_store(&self, store: &intent_core::FileSecretStore) -> bool {
+        self.paired_gitlab.as_deref() == Some(store.path())
+    }
+
+    pub(crate) fn install_repository_boundary(&self, gate: GitlabCredentialGate) -> Result<()> {
+        self.repository_gate
+            .set(gate)
+            .map_err(|_| Error::Internal("repository secret boundary already installed".into()))
+    }
+
+    pub(crate) fn with_repository_write(&self, write: Arc<RepositorySettingsWrite>) -> Self {
+        let mut operation = self.clone();
+        operation.repository_write = Some(write);
+        operation
+    }
+
+    fn check_repository_write(&self, account: &str) -> Result<()> {
+        if account == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT
+            || forge_token_secret_siblings(intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT)
+                .contains(&account)
+        {
+            if let Some(gate) = self.repository_gate.get() {
+                gate.check_settings_secret(self.repository_write.as_deref())?;
+            }
+        }
+        Ok(())
     }
 
     /// Override the [`settle_detached`](Self::settle_detached) cap so a test can
@@ -727,8 +774,16 @@ impl AsyncSecretStore {
         let inner = self.inner.clone();
         let owned_account = account.to_string();
         let owned_value = value.to_string();
-        self.mutate(account, move || inner.store(&owned_account, &owned_value))
-            .await?;
+        let operation = self.clone();
+        self.mutate(account, move || {
+            let _lease = operation
+                .repository_write
+                .as_ref()
+                .map(|write| write.lease());
+            operation.check_repository_write(&owned_account)?;
+            inner.store(&owned_account, &owned_value)
+        })
+        .await?;
         self.set_cached(account, Some(value.into()));
         Ok(())
     }
@@ -791,6 +846,55 @@ impl AsyncSecretStore {
         .await
     }
 
+    pub(crate) async fn persist_gitlab_grant_observed(
+        &self,
+        grant: intent_sourcecontrol::gitlab_auth::GitlabGrant,
+        lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
+        observer: Option<Arc<dyn intent_sourcecontrol::gitlab_auth::GitlabWriteObserver>>,
+    ) -> Result<()> {
+        if let Some(observer) = observer {
+            self.mutate_gitlab(grant.into_persistence_observed(lease, observer))
+                .await
+        } else {
+            self.persist_gitlab_grant(grant, lease).await
+        }
+    }
+
+    pub(crate) async fn persist_gitlab_pat_observed(
+        &self,
+        store: intent_core::FileSecretStore,
+        token: intent_sourcecontrol::SecretString,
+        lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
+        observer: Option<Arc<dyn intent_sourcecontrol::gitlab_auth::GitlabWriteObserver>>,
+    ) -> Result<()> {
+        if let Some(observer) = observer {
+            self.mutate_gitlab(intent_sourcecontrol::gitlab_auth::pat_persistence_observed(
+                store, token, lease, observer,
+            ))
+            .await
+        } else {
+            self.persist_gitlab_pat(store, token, lease).await
+        }
+    }
+
+    pub(crate) async fn revoke_gitlab_token_observed(
+        &self,
+        store: intent_core::FileSecretStore,
+        lease: intent_sourcecontrol::gitlab_auth::PersistenceLease,
+        observer: Option<Arc<dyn intent_sourcecontrol::gitlab_auth::GitlabWriteObserver>>,
+    ) -> Result<()> {
+        if let Some(observer) = observer {
+            self.mutate_gitlab(
+                intent_sourcecontrol::gitlab_auth::token_revocation_observed(
+                    store, lease, observer,
+                ),
+            )
+            .await
+        } else {
+            self.revoke_gitlab_token(store, lease).await
+        }
+    }
+
     async fn mutate_gitlab(
         &self,
         write: impl FnOnce() -> Result<()> + Send + 'static,
@@ -812,8 +916,16 @@ impl AsyncSecretStore {
     pub(crate) async fn delete(&self, account: &str) -> Result<()> {
         let inner = self.inner.clone();
         let owned_account = account.to_string();
-        self.mutate(account, move || inner.delete(&owned_account))
-            .await?;
+        let operation = self.clone();
+        self.mutate(account, move || {
+            let _lease = operation
+                .repository_write
+                .as_ref()
+                .map(|write| write.lease());
+            operation.check_repository_write(&owned_account)?;
+            inner.delete(&owned_account)
+        })
+        .await?;
         self.set_cached(account, None);
         Ok(())
     }
@@ -1779,8 +1891,8 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         bind_address_definition(),
         number(
             "server.port",
-            "WS port",
-            "TCP port for the WSS listener",
+            "Legacy port (unused)",
+            "Preserved for compatibility; unused by listeners. Use server.wsApi.port for backend connections",
             "server",
             Some(1024.0),
             Some(65535.0),
@@ -1788,8 +1900,8 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         ),
         number(
             "server.wsApi.port",
-            "WSS API port",
-            "TCP port for the WSS listener",
+            "Backend connection port",
+            "TCP port for backend connections over WSS (server.wsApi.port)",
             "server",
             Some(1024.0),
             Some(65535.0),
@@ -1856,6 +1968,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(0.0),
             Some(100_000.0),
             256.0,
+        ),
+        string(
+            "sharing.machineName",
+            "Shared machine name",
+            "Name shown to collaborators; empty uses the OS machine name",
+            "sharing",
+            Some(""),
         ),
         number(
             "sharing.maxGuestsPerWorkspace",
@@ -1930,6 +2049,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
              never as a raw GITHUB_TOKEN/GH_TOKEN",
             "sourceControl",
             true,
+        ),
+        string(
+            "sourceControl.gitlab.instanceBaseUrl",
+            "GitLab instance root",
+            "Logical HTTPS instance root including port and installation path",
+            "integrations",
+            None,
         ),
         string(
             "sourceControl.gitlab.host",
@@ -2252,16 +2378,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             f64::from(intent_core::config::DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS),
         ),
         enumerated(
-            "agents.flushQueuedMessages",
-            "Flush queued messages",
-            "Controls how messages waiting in the queue are delivered to the agent when a turn ends: \
-             all batches every ready entry into one turn, systemOnly batches only system-origin \
-             entries (user-origin entries stay FIFO), off delivers one turn per queued message",
-            "agents",
-            &["all", "systemOnly", "off"],
-            "all",
-        ),
-        enumerated(
             "agents.resumeInterruptedOnStart",
             "Resume interrupted agents on start",
             "Whether the daemon resumes interrupted agents at startup when --resume-all is absent: \
@@ -2433,11 +2549,11 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "prMonitor.pollSeconds",
             "PR monitor poll seconds",
-            "Tick cadence (in seconds) of the centralized loop and the per-PR poll interval floor (minimum 10)",
+            "Tick cadence (in seconds) of the centralized loop and the active PR poll interval floor (minimum 10). Idle workspaces back off to 2/5/10/15 minutes after 15 minutes/1 hour/6 hours/24 hours without content work; slower configured intervals still apply",
             "prMonitor",
             Some(10.0),
             Some(3_600.0),
-            30.0,
+            60.0,
         ),
         number(
             "prMonitor.hourlyRequestBudget",
@@ -2862,7 +2978,7 @@ pub(crate) fn wire_value(def: &SettingDefinition, value: Value) -> Value {
 // The `n.abs() <= i64::MAX as f64` guard bounds the float→int cast; the
 // i64::MAX→f64 comparison constant rounding up by one ULP is harmless here.
 #[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-fn registry_value(def: &SettingDefinition, value: &Value) -> Value {
+pub(crate) fn registry_value(def: &SettingDefinition, value: &Value) -> Value {
     if let SettingType::Number { .. } = def.ty {
         if let Some(n) = value.as_f64() {
             if n.is_finite() && n.fract() == 0.0 && n.abs() <= i64::MAX as f64 {
@@ -2881,9 +2997,31 @@ fn registry_value(def: &SettingDefinition, value: &Value) -> Value {
 /// (`config.toml`); without it, every non-secret key keeps the legacy
 /// `SQLite` path (read-only test wiring).
 pub(crate) struct SettingsService<'a> {
+    repository_write: Option<Arc<RepositorySettingsWrite>>,
+    operation_secrets: Option<AsyncSecretStore>,
     store: &'a Store,
     secrets: &'a AsyncSecretStore,
     registry: Option<&'a SettingsRegistry>,
+}
+
+/// Failure evidence from the existing ordinary-settings writer. This describes
+/// only file/database effects; secret and runtime compensation retain their own
+/// owners. An attempted asynchronous database write cannot attest no effect.
+pub(crate) enum NonSecretSettingsFailure {
+    NoEffect(Error),
+    Indeterminate(Error),
+}
+
+impl NonSecretSettingsFailure {
+    pub(crate) fn no_effect(&self) -> bool {
+        matches!(self, Self::NoEffect(_))
+    }
+
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            Self::NoEffect(error) | Self::Indeterminate(error) => error,
+        }
+    }
 }
 
 /// Settings readers/writers of one secret wait for its whole mutation,
@@ -2952,6 +3090,7 @@ impl SecretSettingsGates {
 
 #[derive(Default)]
 pub(crate) struct SecretSettingsUpdate {
+    repository_write: Option<Arc<RepositorySettingsWrite>>,
     applied: Vec<(usize, Value)>,
     prior: Vec<(String, Option<String>)>,
     github_generation: Option<u64>,
@@ -2973,6 +3112,11 @@ impl SecretSettingsUpdate {
     /// stays in `store_secret_and_clear_siblings`; never add its unknown-state
     /// accounts to this ledger.
     pub(crate) async fn rollback(&self, secrets: &AsyncSecretStore) -> bool {
+        let operation = self
+            .repository_write
+            .as_ref()
+            .map(|write| secrets.with_repository_write(write.clone()));
+        let secrets = operation.as_ref().unwrap_or(secrets);
         let mut failed = false;
         for github in [true, false] {
             // Never hold GitHub ownership across another account's backend
@@ -3043,7 +3187,24 @@ impl<'a> SettingsService<'a> {
             store,
             secrets,
             registry,
+            repository_write: None,
+            operation_secrets: None,
         }
+    }
+
+    pub(crate) fn with_repository_write(
+        mut self,
+        write: Option<Arc<RepositorySettingsWrite>>,
+    ) -> Self {
+        self.operation_secrets = write
+            .as_ref()
+            .map(|write| self.secrets().with_repository_write(write.clone()));
+        self.repository_write = write;
+        self
+    }
+
+    fn secrets(&self) -> &AsyncSecretStore {
+        self.operation_secrets.as_ref().unwrap_or(self.secrets)
     }
 
     /// The registry serving `path`, when it is a TOML-backed key and the
@@ -3080,7 +3241,7 @@ impl<'a> SettingsService<'a> {
     /// absent for display.
     async fn current_value(&self, def: &SettingDefinition) -> Value {
         if def.sensitive {
-            match self.secrets.load(def.path).await {
+            match self.secrets().load(def.path).await {
                 Ok(Some(_)) => json!(REDACTED_PLACEHOLDER),
                 Ok(None) | Err(_) => Value::Null,
             }
@@ -3112,7 +3273,7 @@ impl<'a> SettingsService<'a> {
         let futs: Vec<LoadFuture<'_>> = sensitive
             .iter()
             .map(|path| {
-                let fut = self.secrets.load(path);
+                let fut = self.secrets().load(path);
                 Box::pin(fut) as LoadFuture<'_>
             })
             .collect();
@@ -3198,12 +3359,14 @@ impl<'a> SettingsService<'a> {
             // monorepo#1729 compatibility: pre-rename clients still write the
             // `backgroundAgents.*` paths. Tolerate-and-ignore these entries —
             // the renamed `quickActions.*` keys are the only writable surface.
+            // Retired batching preferences are ignored: every ready entry batches.
             // The deprecated `providers.active` gets the same treatment so a
             // write can never recreate the key `migrate_active_provider_setting`
             // removed from config.toml (its catalog entry is read-only, but a
             // hard rejection would fail whole batches from old clients).
             if RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
                 || path == DEPRECATED_ACTIVE_PROVIDER_PATH
+                || path == "agents.flushQueuedMessages"
             {
                 tracing::debug!(path, "ignoring settings.update for retired setting");
                 continue;
@@ -3217,6 +3380,15 @@ impl<'a> SettingsService<'a> {
                 return Err(Error::InvalidParams(format!("{path} is read-only")));
             }
             def.validate(&value)?;
+            let value = if path == "sharing.machineName" {
+                let name = value.as_str().expect("string validated above");
+                json!(
+                    intent_core::settings_file::SharingSettings::normalize_machine_name(name)
+                        .map_err(|error| Error::InvalidParams(error.to_string()))?
+                )
+            } else {
+                value
+            };
             validate_bare_model_id(path, &value)?;
             planned.push((def, value));
         }
@@ -3236,14 +3408,17 @@ impl<'a> SettingsService<'a> {
     /// the caller. No ordinary setting is changed until the final commit.
     pub(crate) async fn update_secrets(&self, changes: &Value) -> Result<SecretSettingsUpdate> {
         let planned = self.validate_update(changes)?;
-        let mut update = SecretSettingsUpdate::default();
+        let mut update = SecretSettingsUpdate {
+            repository_write: self.repository_write.clone(),
+            ..Default::default()
+        };
         let mut prior = Vec::new();
         for (def, _) in planned.iter().filter(|(def, _)| def.sensitive) {
             for path in std::iter::once(def.path)
                 .chain(forge_token_secret_siblings(def.path).iter().copied())
             {
                 if !prior.iter().any(|(p, _)| p == path) {
-                    prior.push((path.to_string(), self.secrets.load_fresh(path).await?));
+                    prior.push((path.to_string(), self.secrets().load_fresh(path).await?));
                 }
             }
         }
@@ -3267,7 +3442,7 @@ impl<'a> SettingsService<'a> {
             if value.as_str() != Some(REDACTED_PLACEHOLDER) {
                 let github_snapshot = async {
                     let guard = if def.path == crate::github_auth_ops::SECRET_ACCOUNT {
-                        let guard = self.secrets.github_mutation().await?;
+                        let guard = self.secrets().github_mutation().await?;
                         if update.github_generation != Some(*guard) {
                             // Preflight can precede another account's slow write.
                             // Snapshot the owner we will replace, not an earlier
@@ -3276,7 +3451,7 @@ impl<'a> SettingsService<'a> {
                                 .iter_mut()
                                 .filter(|(path, _)| is_github_credential(path))
                             {
-                                *value = self.secrets.load_fresh(path).await?;
+                                *value = self.secrets().load_fresh(path).await?;
                             }
                             update.prior.retain(|(path, _)| !is_github_credential(path));
                             update.github_generation = None;
@@ -3290,7 +3465,7 @@ impl<'a> SettingsService<'a> {
                 .await;
                 let mut github_guard = match github_snapshot {
                     Ok(guard) => guard,
-                    Err(error) => return Err(update.compensate_error(self.secrets, error).await),
+                    Err(error) => return Err(update.compensate_error(self.secrets(), error).await),
                 };
                 let desired = match &value {
                     Value::String(s) => s.clone(),
@@ -3320,7 +3495,7 @@ impl<'a> SettingsService<'a> {
                     // failed mutation (including siblings) has settled.
                     if update.prior.iter().any(|(path, _)| owns_account(path)) {
                         for path in std::iter::once(def.path).chain(siblings.iter().copied()) {
-                            if self.secrets.settle_detached(path).await.is_err() {
+                            if self.secrets().settle_detached(path).await.is_err() {
                                 update.prior.retain(|(path, _)| !owns_account(path));
                                 break;
                             }
@@ -3330,7 +3505,7 @@ impl<'a> SettingsService<'a> {
                     // the revision gate. Never compensate untouched accounts
                     // or a failing operation whose state is still unknown.
                     drop(github_guard.take());
-                    return Err(update.compensate_error(self.secrets, error).await);
+                    return Err(update.compensate_error(self.secrets(), error).await);
                 }
                 for (path, value) in prior.iter().filter(|(path, _)| owns_account(path)) {
                     if !update.prior.iter().any(|(p, _)| p == path) {
@@ -3349,7 +3524,34 @@ impl<'a> SettingsService<'a> {
     /// Called with the revision gate held after secret persistence succeeds.
     /// Re-check ordinary values here: another settings call or a config-file
     /// reload may have committed while the secret store was busy.
+    #[cfg(test)]
     pub(crate) async fn update_non_secrets(&self, changes: &Value) -> Result<Vec<(usize, Value)>> {
+        self.update_non_secrets_with_outcome(changes)
+            .await
+            .map_err(NonSecretSettingsFailure::into_error)
+    }
+
+    pub(crate) async fn update_non_secrets_with_outcome(
+        &self,
+        changes: &Value,
+    ) -> std::result::Result<Vec<(usize, Value)>, NonSecretSettingsFailure> {
+        let mut ordinary_effect = false;
+        self.update_non_secrets_inner(changes, &mut ordinary_effect)
+            .await
+            .map_err(|error| {
+                if ordinary_effect {
+                    NonSecretSettingsFailure::Indeterminate(error)
+                } else {
+                    NonSecretSettingsFailure::NoEffect(error)
+                }
+            })
+    }
+
+    async fn update_non_secrets_inner(
+        &self,
+        changes: &Value,
+        ordinary_effect: &mut bool,
+    ) -> Result<Vec<(usize, Value)>> {
         let planned = self.validate_update(changes)?;
         // Keep validated entries only when persisting them would change the
         // observable setting state. For TOML-backed keys, origin is part of
@@ -3405,7 +3607,15 @@ impl<'a> SettingsService<'a> {
                         (path.clone(), prior)
                     })
                     .collect();
-                reg.apply(&registry_changes)?;
+                reg.apply_with_repository_write(
+                    &registry_changes,
+                    self.repository_write.as_deref(),
+                    None,
+                )?;
+                // The registry returns no error after its successful rename:
+                // failed validation/write has no ordinary publication. A later
+                // failure after this point needs separate compensation evidence.
+                *ordinary_effect = true;
             }
         }
 
@@ -3418,11 +3628,16 @@ impl<'a> SettingsService<'a> {
                 Ok(json!({ "path": def.path, "value": wire_value(&def, value) }))
             } else {
                 match serde_json::to_string(&value) {
-                    Ok(raw) => self
-                        .store
-                        .set_setting(def.path, &raw)
-                        .await
-                        .map(|()| json!({ "path": def.path, "value": value })),
+                    Ok(raw) => {
+                        // Cancellation or an error cannot prove that an awaited
+                        // database effect did not land. Existing best-effort
+                        // registry rollback never upgrades that uncertainty.
+                        *ordinary_effect = true;
+                        self.store
+                            .set_setting(def.path, &raw)
+                            .await
+                            .map(|()| json!({ "path": def.path, "value": value }))
+                    }
                     Err(e) => Err(Error::Internal(format!("encode setting failed: {e}"))),
                 }
             };
@@ -3439,7 +3654,11 @@ impl<'a> SettingsService<'a> {
                     // an error and never emits `settings:changed`.
                     if !registry_rollback.is_empty() {
                         if let Some(reg) = self.registry {
-                            if let Err(rollback_err) = reg.apply(&registry_rollback) {
+                            if let Err(rollback_err) = reg.apply_with_repository_write(
+                                &registry_rollback,
+                                self.repository_write.as_deref(),
+                                None,
+                            ) {
                                 tracing::error!(
                                     error = %rollback_err,
                                     "settings.update registry rollback failed after \
@@ -3461,7 +3680,7 @@ impl<'a> SettingsService<'a> {
         match self.update_non_secrets(changes).await {
             Ok(applied) => Ok(secrets.merge_applied(applied)),
             Err(error) => {
-                secrets.rollback(self.secrets).await;
+                secrets.rollback(self.secrets()).await;
                 Err(error)
             }
         }
@@ -3481,13 +3700,13 @@ impl<'a> SettingsService<'a> {
     async fn store_secret_and_clear_siblings(&self, path: &str, value: &str) -> Result<()> {
         let siblings = forge_token_secret_siblings(path);
         if siblings.is_empty() {
-            return self.secrets.store(path, value).await;
+            return self.secrets().store(path, value).await;
         }
         let mut prior = Vec::with_capacity(siblings.len() + 1);
         for account in std::iter::once(path).chain(siblings.iter().copied()) {
-            prior.push((account, self.secrets.load_fresh(account).await?));
+            prior.push((account, self.secrets().load_fresh(account).await?));
         }
-        let failure = match self.secrets.store(path, value).await {
+        let failure = match self.secrets().store(path, value).await {
             Ok(()) => match self.clear_forge_token_secret_siblings(path).await {
                 Ok(()) => return Ok(()),
                 Err(e) => e,
@@ -3495,14 +3714,14 @@ impl<'a> SettingsService<'a> {
             // A synchronous store error mutated nothing; a timed-out write may
             // still land, so wait for it and then put the prior value back.
             Err(e) => {
-                if !self.secrets.settle_detached(path).await? {
+                if !self.secrets().settle_detached(path).await? {
                     return Err(e);
                 }
                 e
             }
         };
         for (account, _) in &prior {
-            if let Err(settle_err) = self.secrets.settle_detached(account).await {
+            if let Err(settle_err) = self.secrets().settle_detached(account).await {
                 tracing::warn!(
                     account = %account,
                     error = %failure,
@@ -3513,8 +3732,8 @@ impl<'a> SettingsService<'a> {
         }
         for (account, prior_value) in prior {
             let restored = match prior_value {
-                Some(v) => self.secrets.store(account, &v).await,
-                None => self.secrets.delete(account).await,
+                Some(v) => self.secrets().store(account, &v).await,
+                None => self.secrets().delete(account).await,
             };
             if let Err(restore_err) = restored {
                 tracing::error!(
@@ -3533,7 +3752,7 @@ impl<'a> SettingsService<'a> {
     /// so the classifier that reads next sees token and siblings move together.
     async fn clear_forge_token_secret_siblings(&self, path: &str) -> Result<()> {
         for sibling in forge_token_secret_siblings(path) {
-            self.secrets.delete(sibling).await?;
+            self.secrets().delete(sibling).await?;
         }
         Ok(())
     }
@@ -3552,7 +3771,7 @@ impl<'a> SettingsService<'a> {
             .ok_or_else(|| Error::InvalidParams(format!("unknown setting: {path}")))?;
         let changed = if def.sensitive {
             let _github_guard = if def.path == crate::github_auth_ops::SECRET_ACCOUNT {
-                let mut guard = self.secrets.github_mutation().await?;
+                let mut guard = self.secrets().github_mutation().await?;
                 *guard += 1;
                 Some(guard)
             } else {
@@ -3566,12 +3785,12 @@ impl<'a> SettingsService<'a> {
             // "absent" would skip the delete while the siblings still go.
             let mut changed = false;
             for sibling in forge_token_secret_siblings(def.path) {
-                if self.secrets.load_fresh(sibling).await?.is_some() {
+                if self.secrets().load_fresh(sibling).await?.is_some() {
                     changed = true;
                 }
             }
-            if self.secrets.load_fresh(def.path).await?.is_some() {
-                self.secrets.delete(def.path).await?;
+            if self.secrets().load_fresh(def.path).await?.is_some() {
+                self.secrets().delete(def.path).await?;
                 changed = true;
             }
             self.clear_forge_token_secret_siblings(def.path).await?;
@@ -3580,7 +3799,11 @@ impl<'a> SettingsService<'a> {
             if matches!(reg.origin(def.path), Some(SettingOrigin::Default)) {
                 false
             } else {
-                reg.apply(&[(def.path.to_string(), Value::Null)])?;
+                reg.apply_with_repository_write(
+                    &[(def.path.to_string(), Value::Null)],
+                    self.repository_write.as_deref(),
+                    None,
+                )?;
                 true
             }
         } else if self.store.get_setting(def.path).await?.is_some() {
@@ -3629,6 +3852,106 @@ async fn join_all_pinned<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[intent_test_macros::daemon_test]
+    async fn ordinary_outcome_attests_validation_and_atomic_file_no_effect() {
+        let dir = crate::test_support::test_tempdir("ordinary-settings-no-effect");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let path = dir.path().join("config.toml");
+        let registry = SettingsRegistry::load(&path).unwrap();
+        let secrets = AsyncSecretStore::new(Arc::new(InMemorySecretStore::default()));
+        let service = SettingsService::new(&store, &secrets, Some(&registry));
+        let original = registry.snapshot();
+        let error = service
+            .update_non_secrets_with_outcome(&json!([
+                {"path":"git.autoCommit","value":"invalid"}
+            ]))
+            .await
+            .expect_err("validation must fail");
+        assert!(error.no_effect());
+        assert!(matches!(error.into_error(), Error::InvalidParams(_)));
+        std::fs::rename(&path, dir.path().join("config.saved")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = service
+            .update_non_secrets_with_outcome(&json!([
+                {"path":"git.autoCommit","value":false}
+            ]))
+            .await
+            .expect_err("atomic file replacement must fail");
+        assert!(error.no_effect());
+        assert!(Arc::ptr_eq(&original, &registry.snapshot()));
+        assert_eq!(store.get_setting("git.autoCommit").await.unwrap(), None);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn ordinary_outcome_never_attests_partial_database_writes_as_compensated() {
+        let dir = crate::test_support::test_tempdir("ordinary-settings-partial-db");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = SettingsRegistry::load(dir.path().join("config.toml")).unwrap();
+        sqlx::query("CREATE TRIGGER reject_workspace_rules BEFORE INSERT ON settings WHEN new.key = 'workspaceRules' BEGIN SELECT RAISE(FAIL, 'fixture refusal'); END")
+            .execute(store.write_pool()).await.unwrap();
+        let secrets = AsyncSecretStore::new(Arc::new(InMemorySecretStore::default()));
+        let service = SettingsService::new(&store, &secrets, Some(&registry));
+        let error = service
+            .update_non_secrets_with_outcome(&json!([
+                {"path":"git.autoCommit","value":false},
+                {"path":"userRules","value":{"rule":"landed"}},
+                {"path":"workspaceRules","value":{"rule":"refused"}}
+            ]))
+            .await
+            .expect_err("the later database write must fail");
+        assert!(!error.no_effect());
+        assert!(matches!(error, NonSecretSettingsFailure::Indeterminate(_)));
+        assert_eq!(registry.get("git.autoCommit"), Some(json!(true)));
+        assert_eq!(
+            store.get_setting("userRules").await.unwrap().as_deref(),
+            Some("{\"rule\":\"landed\"}")
+        );
+        assert_eq!(store.get_setting("workspaceRules").await.unwrap(), None);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn ordinary_outcome_preserves_failed_registry_compensation_as_unknown() {
+        let dir = crate::test_support::test_tempdir("ordinary-settings-rollback-failed");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let path = dir.path().join("config.toml");
+        let registry = Arc::new(SettingsRegistry::load(&path).unwrap());
+        sqlx::query("CREATE TRIGGER reject_workspace_rules BEFORE INSERT ON settings WHEN new.key = 'workspaceRules' BEGIN SELECT RAISE(FAIL, 'fixture refusal'); END")
+            .execute(store.write_pool()).await.unwrap();
+        let secrets = Arc::new(AsyncSecretStore::new(Arc::new(
+            InMemorySecretStore::default(),
+        )));
+        let mut notice = registry.subscribe();
+        let held = store.write_pool().acquire().await.unwrap();
+        let task = tokio::spawn({
+            let store = store.clone();
+            let registry = registry.clone();
+            async move {
+                SettingsService::new(&store, &secrets, Some(&registry))
+                    .update_non_secrets_with_outcome(&json!([
+                        {"path":"git.autoCommit","value":false},
+                        {"path":"workspaceRules","value":{"rule":"refused"}}
+                    ]))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), notice.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(registry.get("git.autoCommit"), Some(json!(false)));
+        std::fs::rename(&path, dir.path().join("config.saved")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        drop(held);
+        let error = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect_err("database refusal must trigger failing registry compensation");
+        assert!(!error.no_effect());
+        assert_eq!(registry.get("git.autoCommit"), Some(json!(false)));
+        assert!(path.is_dir());
+    }
 
     #[intent_test_macros::daemon_test]
     async fn provider_default_blanks_keep_write_responses_and_noops_consistent() {
@@ -3776,7 +4099,7 @@ mod tests {
     async fn rejected_settings_batches_preserve_all_stores() {
         for (invalid_path, invalid_value) in [
             ("future.setting", json!(true)),
-            ("agents.flushQueuedMessages", json!("future-policy")),
+            ("agents.resumeInterruptedOnStart", json!("future-policy")),
             (
                 "quickActions.providerSettings",
                 json!({"future-provider": {"option": null}}),
@@ -3922,6 +4245,20 @@ mod tests {
             find_definition("server.listenMode").is_none(),
             "server.listenMode must not be in the catalog"
         );
+    }
+
+    #[test]
+    fn connection_port_catalog_distinguishes_preserved_legacy_value() {
+        let legacy = find_definition("server.port").unwrap();
+        let live = find_definition("server.wsApi.port").unwrap();
+        assert_eq!(legacy.label, "Legacy port (unused)");
+        assert!(legacy.description.contains("server.wsApi.port"));
+        assert_eq!(live.label, "Backend connection port");
+        // Older clients can still read, update and reset their saved legacy key.
+        assert!(!legacy.read_only);
+        assert!(!live.read_only);
+        legacy.validate(&json!(5182)).unwrap();
+        live.validate(&json!(5182)).unwrap();
     }
 
     /// `model.workspaceOverrides` is retired (monorepo#1000): the per-workspace
@@ -6473,84 +6810,10 @@ mod tests {
         }
     }
 
-    /// `agents.flushQueuedMessages` is a TOML-backed enum (`all` / `systemOnly`
-    /// / `off`) defaulting to `all`: the catalog entry and wire round-trip
-    /// through the registry-wired service (default origin → file override →
-    /// reset). Also covers a legacy boolean already on disk loading as the
-    /// wire-reported string.
-    #[tokio::test]
-    async fn agents_flush_queued_messages_round_trip_via_registry() {
-        let def = find_definition("agents.flushQueuedMessages")
-            .expect("agents.flushQueuedMessages missing");
-        assert!(!def.sensitive);
-        assert!(!def.read_only);
-        assert_eq!(def.category, "agents");
-        assert!(
-            matches!(def.ty, SettingType::Enum(values) if values == ["all", "systemOnly", "off"])
-        );
-        assert_eq!(def.default_value, Some(json!("all")));
-        assert!(KNOWN_PATHS.contains(&"agents.flushQueuedMessages"));
-
-        let tag = uuid::Uuid::new_v4();
-        let tmp = std::env::temp_dir().join(format!("intentd-settings-flushq-{tag}.db"));
-        let store = Store::open(&tmp).await.expect("open store");
-        let config_path = std::env::temp_dir().join(format!("intentd-settings-flushq-{tag}.toml"));
-        std::fs::write(&config_path, "").expect("write empty config");
-        let registry = SettingsRegistry::load(&config_path).expect("load registry");
-        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
-        let secrets = AsyncSecretStore::new(secrets);
-        let svc = SettingsService::new(&store, &secrets, Some(&registry));
-
-        // Default with `default` origin.
-        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
-        assert_eq!(got["value"], json!("all"));
-        assert_eq!(got["origin"], json!("default"));
-
-        // Update persists to config.toml with `file` origin, never SQLite.
-        svc.update(&json!([
-            { "path": "agents.flushQueuedMessages", "value": "systemOnly" },
-        ]))
-        .await
-        .expect("update");
-        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
-        assert_eq!(got["value"], json!("systemOnly"));
-        assert_eq!(got["origin"], json!("file"));
-        let text = std::fs::read_to_string(&config_path).expect("read config");
-        assert!(text.contains("flushQueuedMessages"), "{text}");
-        assert_eq!(
-            store
-                .get_setting("agents.flushQueuedMessages")
-                .await
-                .expect("read settings table"),
-            None,
-            "TOML-backed keys must never write a SQLite settings row"
-        );
-
-        // Rejects an unknown enum value.
-        let err = svc
-            .update(&json!([
-                { "path": "agents.flushQueuedMessages", "value": "sometimes" },
-            ]))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("flushQueuedMessages"), "{err}");
-
-        // Reset restores the default.
-        let reset = svc
-            .reset("agents.flushQueuedMessages")
-            .await
-            .expect("reset");
-        assert_eq!(reset["value"], json!("all"));
-        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
-        assert_eq!(got["origin"], json!("default"));
-
-        let _ = std::fs::remove_file(&config_path);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
-                "{}{suffix}",
-                tmp.display()
-            )));
-        }
+    #[test]
+    fn agents_flush_queued_messages_is_not_supported() {
+        assert!(find_definition("agents.flushQueuedMessages").is_none());
+        assert!(!KNOWN_PATHS.contains(&"agents.flushQueuedMessages"));
     }
 
     /// `agents.resumeInterruptedOnStart` is a TOML-backed enum (`auto` / `on`
@@ -6632,36 +6895,6 @@ mod tests {
             .await
             .expect("get");
         assert_eq!(got["origin"], json!("default"));
-
-        let _ = std::fs::remove_file(&config_path);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
-                "{}{suffix}",
-                tmp.display()
-            )));
-        }
-    }
-
-    /// A `config.toml` written by an older daemon (`flushQueuedMessages =
-    /// true/false`) still loads through the registry, wire-reporting the
-    /// equivalent string value.
-    #[tokio::test]
-    async fn agents_flush_queued_messages_legacy_boolean_loads_via_registry() {
-        let tag = uuid::Uuid::new_v4();
-        let tmp = std::env::temp_dir().join(format!("intentd-settings-flushq-legacy-{tag}.db"));
-        let store = Store::open(&tmp).await.expect("open store");
-        let config_path =
-            std::env::temp_dir().join(format!("intentd-settings-flushq-legacy-{tag}.toml"));
-        std::fs::write(&config_path, "[agents]\nflushQueuedMessages = false\n")
-            .expect("write legacy config");
-        let registry = SettingsRegistry::load(&config_path).expect("load registry");
-        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
-        let secrets = AsyncSecretStore::new(secrets);
-        let svc = SettingsService::new(&store, &secrets, Some(&registry));
-
-        let got = svc.get("agents.flushQueuedMessages").await.expect("get");
-        assert_eq!(got["value"], json!("off"));
-        assert_eq!(got["origin"], json!("file"));
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {
@@ -6824,7 +7057,7 @@ mod tests {
 
     /// `[prMonitor]` exposes five TOML-backed numbers: `maxPerAgent`
     /// (default 5, floor 1, max 100), `debounceSeconds`
-    /// (default 60, floor 10), `pollSeconds` (default 30, floor 10),
+    /// (default 60, floor 10), `pollSeconds` (default 60, floor 10),
     /// `hourlyRequestBudget` (default 1500, floor 60, max 5000) and
     /// `quotaSharePercent` (default 50, floor 1, max 100) — the latter
     /// three are config-file keys the Settings UI does not surface. All
@@ -6835,7 +7068,7 @@ mod tests {
         for (path, default, floor) in [
             ("prMonitor.maxPerAgent", 5.0, 1.0),
             ("prMonitor.debounceSeconds", 60.0, 10.0),
-            ("prMonitor.pollSeconds", 30.0, 10.0),
+            ("prMonitor.pollSeconds", 60.0, 10.0),
             ("prMonitor.hourlyRequestBudget", 1500.0, 60.0),
             ("prMonitor.quotaSharePercent", 50.0, 1.0),
         ] {
@@ -6924,7 +7157,7 @@ mod tests {
         for (path, default, updated, rejected) in [
             ("prMonitor.maxPerAgent", 5.0, 55, 0),
             ("prMonitor.debounceSeconds", 60.0, 120, 5),
-            ("prMonitor.pollSeconds", 30.0, 120, 5),
+            ("prMonitor.pollSeconds", 60.0, 120, 5),
             ("prMonitor.hourlyRequestBudget", 1500.0, 120, 5),
             ("prMonitor.quotaSharePercent", 50.0, 25, 0),
         ] {
@@ -8466,6 +8699,11 @@ mod rollback_order_tests {
             Arc<tokio::sync::Notify>,
             Mutex<std::sync::mpsc::Receiver<()>>,
         )>,
+        newer: Option<(
+            Arc<tokio::sync::Notify>,
+            Mutex<std::sync::mpsc::Receiver<()>>,
+        )>,
+        write_order: Mutex<Vec<&'static str>>,
     }
 
     impl SecretStore for RejectSecondSecret {
@@ -8474,6 +8712,9 @@ mod rollback_order_tests {
         }
 
         fn store(&self, account: &str, value: &str) -> Result<()> {
+            use intent_sourcecontrol::gitlab_token::{
+                EXPIRES_AT_SECRET_ACCOUNT, REFRESH_SECRET_ACCOUNT, SECRET_ACCOUNT,
+            };
             if account == "accounts.sentry.token" && value == "rejected-sentry" {
                 return Err(Error::Internal("injected second-secret failure".into()));
             }
@@ -8488,7 +8729,27 @@ mod rollback_order_tests {
                     let _ = release.lock().unwrap().recv();
                 }
             }
-            self.raw.store(account, value)
+            if account == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT && value == "newer-pat"
+            {
+                // Record entry before the test barrier: parking this write must
+                // not hide a regression that lets it overtake compensation.
+                self.write_order.lock().unwrap().push("newer write entered");
+                if let Some((entered, release)) = &self.newer {
+                    entered.notify_one();
+                    let _ = release.lock().unwrap().recv();
+                }
+            }
+            self.raw.store(account, value)?;
+            let restored = match (account, value) {
+                (SECRET_ACCOUNT, "original-device") => Some("token restored"),
+                (REFRESH_SECRET_ACCOUNT, "original-refresh") => Some("refresh restored"),
+                (EXPIRES_AT_SECRET_ACCOUNT, "12345") => Some("expiry restored"),
+                _ => None,
+            };
+            if let Some(restored) = restored {
+                self.write_order.lock().unwrap().push(restored);
+            }
+            Ok(())
         }
 
         fn delete(&self, account: &str) -> Result<()> {
@@ -8522,13 +8783,18 @@ mod rollback_order_tests {
             .unwrap();
         let entered = Arc::new(tokio::sync::Notify::new());
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let newer_entered = Arc::new(tokio::sync::Notify::new());
+        let (newer_release_tx, newer_release_rx) = std::sync::mpsc::channel();
+        let secrets = Arc::new(RejectSecondSecret {
+            raw: raw.clone(),
+            reject_rollback: false,
+            rollback: concurrent.then_some((entered.clone(), Mutex::new(release_rx))),
+            newer: concurrent.then_some((newer_entered.clone(), Mutex::new(newer_release_rx))),
+            write_order: Mutex::new(Vec::new()),
+        });
         let services = crate::Services::new(store)
             .with_settings_registry(registry)
-            .with_secret_store(Arc::new(RejectSecondSecret {
-                raw: raw.clone(),
-                reject_rollback: false,
-                rollback: concurrent.then_some((entered.clone(), Mutex::new(release_rx))),
-            }))
+            .with_secret_store(secrets.clone())
             .with_event_bus(bus);
         let writer = services.clone();
         let failed = intent_core::spawn_daemon(async move {
@@ -8551,7 +8817,7 @@ mod rollback_order_tests {
                 .expect("rollback parked");
             assert!(
                 poll_fn(|cx| Poll::Ready(newer.as_mut().poll(cx).is_pending())).await,
-                "a newer credential must wait for compensation to finish"
+                "the newer request must remain pending while compensation is parked"
             );
             let ordinary = timeout(
                 Duration::from_secs(3),
@@ -8569,6 +8835,23 @@ mod rollback_order_tests {
             error.to_string().contains("injected second-secret failure"),
             "{error}"
         );
+        if concurrent {
+            // Polling the outer request starts an owned task. Hold its backing
+            // write through the intermediate assertions and revision-one probe.
+            timeout(Duration::from_secs(5), newer_entered.notified())
+                .await
+                .expect("newer write parked");
+            assert_eq!(
+                *secrets.write_order.lock().unwrap(),
+                [
+                    "token restored",
+                    "refresh restored",
+                    "expiry restored",
+                    "newer write entered",
+                ],
+                "compensation must finish before the newer write enters the backing store"
+            );
+        }
         for (account, value) in originals {
             assert_eq!(
                 raw.load(account).unwrap().as_deref(),
@@ -8590,13 +8873,27 @@ mod rollback_order_tests {
         assert_no_settings_events(&mut sub).await;
         assert_next_commit_is_revision_one(&services, &mut sub).await;
         if concurrent {
-            assert_eq!(newer.await.unwrap()["revision"], json!(2));
+            newer_release_tx.send(()).unwrap();
+            let newer = newer.await.unwrap();
+            assert_eq!(newer["revision"], json!(2));
             assert_eq!(
                 raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
                 Some("newer-pat")
             );
             assert_eq!(raw.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
             assert_eq!(raw.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
+            let events = timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .expect("newer settings event")
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].data["revision"], json!(2));
+            assert_eq!(
+                events[0].data["changes"],
+                json!([{"path": SECRET_ACCOUNT, "value": REDACTED_PLACEHOLDER}])
+            );
+            assert_eq!(events[0].data["changes"], newer["applied"]);
+            assert_no_settings_events(&mut sub).await;
         }
     }
 
@@ -8641,6 +8938,8 @@ mod rollback_order_tests {
                 raw: raw.clone(),
                 reject_rollback: true,
                 rollback: None,
+                newer: None,
+                write_order: Mutex::new(Vec::new()),
             }))
             .with_event_bus(bus);
         let error = services

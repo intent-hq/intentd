@@ -33,6 +33,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: path.as_ref().map(|p| p.to_string_lossy().to_string()),
         repository_path: None,

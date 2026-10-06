@@ -277,7 +277,9 @@ jobs:
     if: github.event_name != 'push'
     needs: route
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
-    timeout-minutes: 15
+    # Cold burst builds plus the socket suites can use nearly 15 minutes;
+    # leave time for post-job cache saving after the checks finish.
+    timeout-minutes: 20
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -439,6 +441,8 @@ jobs:
       - name: Acquire the shared transfer selection contract
         uses: ./.github/actions/transfer-selection-fixtures
       - name: Real import and public session contract
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
         run: "cargo test -p intent-services --lib transfer_selection_contract::"
       # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on the
       # tinybox slots rust-lld has failed to open objects rustc had just
@@ -462,6 +466,14 @@ jobs:
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: cargo test --workspace --test '*_lint'
+      # This target requires explicit cold mock authority. Ordinary/default
+      # daemon builds never register these transports; keep the feature lane
+      # mandatory so default target selection cannot hide auth coverage.
+      - name: GitLab auth, invitations and checkout over real sockets with explicit test transports
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+        run: cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth --test e2e_wss_invite_join_gitlab --test e2e_repository_resource_read -- --test-threads=2
+
       # Per-slot HOME for install-action — see the coverage-e2e job's comment
       # for the full rationale (shared ~/.install-action tmp/bin race across
       # the 8 tinybox slots; monorepo#1239).
@@ -749,6 +761,11 @@ jobs:
         if: needs.release-fast-path.outputs.fast_path != 'true' && contains(matrix.os, 'self-hosted')
         shell: bash
         run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
+      # Run before toolchain/build steps. Only known CI profiles are eligible;
+      # Cargo locks remain held and their inodes survive every deletion.
+      - name: Ensure macOS CI disk headroom
+        if: needs.release-fast-path.outputs.fast_path != 'true' && runner.os == 'macOS' && contains(matrix.os, 'self-hosted')
+        run: python3 -I -B scripts/macos-ci-cleanup.py --apply
       - name: Resolve pinned Rust channel
         if: needs.release-fast-path.outputs.fast_path != 'true'
         id: toolchain
@@ -804,12 +821,70 @@ jobs:
       - name: Clippy (target-gated code)
         if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && (runner.os == 'macOS' || runner.os == 'Windows')
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+      # Exercise the deterministic deadline oracle and real TLS controls on
+      # macOS; listen backlog saturation cannot guarantee a pending connect.
+      - name: Tunnel deadline and TLS controls (macOS runtime)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'macOS'
+        timeout-minutes: 20
+        shell: bash
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+          INTENTD_TUNNEL_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
+          INTENTD_TUNNEL_TARGET: ${{ matrix.target }}
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          python3 -I -B -S - <<'PYTHON'
+          import os, signal, subprocess
+
+          cargo = ["rustup", "run", os.environ["INTENTD_TUNNEL_TOOLCHAIN"],
+                   "cargo", "test", "--locked", "--target", os.environ["INTENTD_TUNNEL_TARGET"]]
+          groups = [
+              (["-p", "intent-transport", "--lib"], [
+                  "tunnel::tests::connect_pending_deadline_emits_terminal_open_err",
+                  "tunnel::tests::connect_reset_preserves_error_before_deadline",
+                  "tunnel::tests::connect_success_before_deadline_relays",
+              ]),
+              (["-p", "intentd", "--test", "e2e_wss_tunnel"], [
+                  "tunnel_open_echo_eof_close_lifecycle",
+                  "tunnel_open_err_for_closed_port_keeps_connection_alive",
+                  "tunnel_close_tears_down_and_frees_stream_id",
+                  "tunnel_connections_counted_in_health_and_stopped",
+                  "tunnel_unauthenticated_upgrade_rejected",
+              ]),
+          ]
+
+          def bounded(command):
+              child = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True, start_new_session=True)
+              try:
+                  output, _ = child.communicate(timeout=30)
+                  print(output, end="", flush=True)
+                  assert child.returncode == 0, (command, child.returncode)
+                  return output
+              except subprocess.TimeoutExpired:
+                  os.killpg(child.pid, signal.SIGKILL)
+                  output, _ = child.communicate()
+                  print(output, end="", flush=True)
+                  raise
+
+          for package, tests in groups:
+              subprocess.run(cargo + package + ["--no-run"], check=True)
+              for test in tests:
+                  command = cargo + package + [test, "--", "--exact"]
+                  listed = bounded(command + ["--list"])
+                  assert test + ": test" in listed.splitlines(), listed
+                  assert "1 test, 0 benchmarks" in listed.splitlines(), listed
+                  output = bounded(command + ["--nocapture", "--test-threads=1"])
+                  assert "running 1 test" in output.splitlines(), output
+                  assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in output, output
+          PYTHON
       # Execute the Windows Job Object fixtures on the native runner. They use
       # this test executable as the child, so no Node/npm/account setup is needed.
       - name: Codex diagnostic process ownership (Windows runtime)
         if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'Windows'
         shell: bash
         env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_DIAGNOSTIC_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
         run: |
           set -euo pipefail
@@ -828,6 +903,7 @@ jobs:
         if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'macOS'
         shell: bash
         env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_DIAGNOSTIC_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
         run: |
           set -euo pipefail
@@ -846,6 +922,55 @@ jobs:
             exit 1
           fi
           rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test e2e_doctor_codex --target ${{ matrix.target }} -- --nocapture
+      # These retained workspace fixtures used to skip on Linux before reaching
+      # their unbound caller. Require native CoW operations and original oracles.
+      - name: Retained workspace CoW fixtures (macOS runtime)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && runner.os == 'macOS'
+        timeout-minutes: 20
+        shell: bash
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+          INTENTD_COW_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
+          INTENTD_TEST_REQUIRE_COW: "1"
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set -euo pipefail
+          # Keep fixtures armed; the capability probe removes the guard only
+          # in its exact child. Retain scratch cleanup assertions for every case.
+          unset INTENTD_TEST_KEEP_TMP
+          tests=(
+            tests::worktree_provisioning::create_provisions_cow_checkout_when_isolation_enabled
+            tests::worktree_provisioning::duplicate_provisions_cow_checkout_when_isolation_enabled
+            tests::worktree_provisioning::create_cleans_up_empty_ws_dir_when_cow_provisioning_fails
+            tests::worktree_provisioning::duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails
+            tests::clone_orchestration::progress_id_cow_create_streams_cow_copy_milestone
+            capability::tests::unbound_caller_is_forbidden_on_every_gate
+          )
+          cargo_test=(rustup run "$INTENTD_COW_TOOLCHAIN" cargo test --locked -p intent-services --lib --target ${{ matrix.target }})
+          status=0
+          for test in "${tests[@]}"; do
+            listed=$("${cargo_test[@]}" "$test" -- --exact --list)
+            printf '%s\n' "$listed"
+            grep -Fx "$test: test" <<< "$listed" > /dev/null
+            grep -Fx '1 test, 0 benchmarks' <<< "$listed" > /dev/null
+            log="$RUNNER_TEMP/cow-${test##*::}.log"
+            scratch=$(mktemp -d "$RUNNER_TEMP/cow-${test##*::}.XXXXXX")
+            if ! TMPDIR="$scratch" "${cargo_test[@]}" "$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"; then
+              status=1
+            fi
+            if rmdir "$scratch"; then
+              echo "CoW fixture scratch cleaned: $test"
+            else
+              echo "::error::Fixture scratch remains at $scratch"
+              status=1
+            fi
+            if [[ "$test" == tests::* ]]; then
+              grep -Fx 'CoW fixture clone and independent contents verified' "$log" > /dev/null || status=1
+              grep -Fx 'CoW fixture proof scratch cleaned' "$log" > /dev/null || status=1
+              grep -Fx "CoW fixture assertions passed: ${test##*::}" "$log" > /dev/null || status=1
+            fi
+          done
+          exit "$status"
       - name: Build (release)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo build --workspace --release --target ${{ matrix.target }}
@@ -1001,6 +1126,15 @@ jobs:
       - uses: taiki-e/install-action@nextest
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
+      - name: Prepare native startup evidence
+        id: native-evidence
+        shell: bash
+        run: |
+          # Never reuse slots from a previous job on a persistent runner.
+          umask 077
+          evidence_dir=$(mktemp -d "$RUNNER_TEMP/native-review-startup-failures.XXXXXX")
+          evidence_dir=$(realpath "$evidence_dir")
+          printf 'directory=%s\n' "$evidence_dir" >> "$GITHUB_OUTPUT"
       - name: Run e2e coverage
         # Arm the bound-caller seam for the test processes themselves, not
         # only the daemons they spawn: a direct-call test that evaluates a
@@ -1012,9 +1146,29 @@ jobs:
         # `intent_services::capability::ASSERT_BOUND_CALLER_ENV`.
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
+          NATIVE_REVIEW_FAILURE_DIR: ${{ steps.native-evidence.outputs.directory }}
         run: |
           cd ${{ github.workspace }}
           GENERATE_LCOV=1 ./scripts/coverage-e2e.sh 40
+      - name: Validate native startup evidence
+        id: native-evidence-check
+        if: ${{ failure() && steps.native-evidence.outputs.directory != '' }}
+        env:
+          NATIVE_REVIEW_FAILURE_DIR: ${{ steps.native-evidence.outputs.directory }}
+        run: python3 -I -B scripts/native-review-artifact.py "$NATIVE_REVIEW_FAILURE_DIR" >> "$GITHUB_OUTPUT"
+      # Only the sanitized owned-fixture exports: 16 fixed slots, 128 KiB each.
+      # Run before coverage reporting and independently of lcov.info existence.
+      - name: Upload native startup evidence
+        if: ${{ failure() && steps.native-evidence-check.outputs.ready == 'true' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-review-startup-failures
+          path: |
+            ${{ steps.native-evidence.outputs.directory }}/startup-failure-0[0-9].json
+            ${{ steps.native-evidence.outputs.directory }}/startup-failure-1[0-5].json
+          if-no-files-found: ignore
+          retention-days: 3
       - name: Generate coverage summary
         if: always()
         run: |
@@ -1171,7 +1325,16 @@ jobs:
       # self-skip without it, which silently drops coverage below the floor.
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24.21.0
+      - name: Verify callback fixture provisioner offline
+        run: python3 -I -B -S scripts/test-prepare-acp-callback-fixture.py
+      - name: Build the pinned callback fixture from verified source
+        run: |
+          set -euo pipefail
+          # The provisioner checks Node and uses only isolated npm 11.19.0.
+          fixture=$(python3 -I -B -S scripts/prepare-acp-callback-fixture.py \
+            --cache-dir "$RUNNER_TEMP/acp-callback-fixture" --build-from-source)
+          echo "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE=$fixture" >> "$GITHUB_ENV"
       # Per-slot HOME for install-action — see the coverage-e2e job's comment
       # for the full rationale (shared ~/.install-action tmp/bin race across
       # the 8 tinybox slots; monorepo#1239).
@@ -1256,6 +1419,13 @@ jobs:
       # Same value and rationale as coverage-e2e (co-tenancy on tinybox,
       # matches the 16-core burst runner).
       NEXTEST_TEST_THREADS: 16
+      CALLBACK_FIXTURE_TESTS: |
+        callback_registration::tests::actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_old_result
+        callback_registration::tests::actual_adapter_replacement_rejects_old_query_and_disabled_never_registers
+        agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_actual_created_3_0_reaches_original_guidance_boundary
+        agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_saved_legacy_and_disabled_outbound_messages_remain_ordinary
+        agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_load_and_failed_load_new_keep_original_producers_and_capture
+        agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_successful_zero_pending_absent_and_failed_never_conflate
       BASE_REF: ${{ github.event.pull_request.base.ref }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
@@ -1298,6 +1468,23 @@ jobs:
             echo "::error title=coverage-changed: base unresolvable::changed-tests.sh could not connect BASE $BASE_SHA to HEAD $(git rev-parse HEAD) — a checkout/fetch problem in this job, not a test failure (intent-hq/intent#5414)"
           fi
           [ "$status" -eq 0 ] || exit "$status"
+          fixture_changed=false
+          fixture_status=0
+          git diff --quiet "$BASE_SHA" HEAD -- \
+            scripts/prepare-acp-callback-fixture.py \
+            scripts/test-prepare-acp-callback-fixture.py \
+            crates/intent-acp/tests/fixtures/claude-callback-adapter.json \
+            crates/intent-acp/tests/fixtures/claude-callback-canonical.patch \
+            crates/intent-acp/tests/fixtures/claude-callback-files.json \
+            .github/workflows/ci.yml || fixture_status=$?
+          if [ "$fixture_status" -eq 1 ]; then
+            fixture_changed=true
+            filter=$(printf '%s\n' "$CALLBACK_FIXTURE_TESTS" | sed '/^$/d;s/^/test(=/;s/$/)/' | paste -sd '|' -)
+            printf 'INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest -p intent-acp -p intent-services --lib -E "%s" --retries 0\n' "$filter" | tee -a "$plan"
+          elif [ "$fixture_status" -ne 0 ]; then
+            exit "$fixture_status"
+          fi
+          echo "callback_fixture_changed=$fixture_changed" >> "$GITHUB_OUTPUT"
           if grep -q 'cargo llvm-cov' "$plan"; then
             echo "has_selection=true" >> "$GITHUB_OUTPUT"
           else
@@ -1404,7 +1591,18 @@ jobs:
       - uses: actions/setup-node@v7
         if: steps.select.outputs.has_selection == 'true'
         with:
-          node-version: 22
+          node-version: 24.21.0
+      - name: Verify callback fixture provisioner offline
+        if: steps.select.outputs.has_selection == 'true'
+        run: python3 -I -B -S scripts/test-prepare-acp-callback-fixture.py
+      - name: Build the pinned callback fixture from verified source
+        if: steps.select.outputs.has_selection == 'true'
+        run: |
+          set -euo pipefail
+          # The provisioner checks Node and uses only isolated npm 11.19.0.
+          fixture=$(python3 -I -B -S scripts/prepare-acp-callback-fixture.py \
+            --cache-dir "$RUNNER_TEMP/acp-callback-fixture" --build-from-source)
+          echo "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE=$fixture" >> "$GITHUB_ENV"
       # Per-slot install-action HOME — see coverage-e2e's comment
       # (monorepo#1239).
       - name: Key install-action dirs per runner slot
@@ -1428,13 +1626,33 @@ jobs:
         uses: ./.github/actions/transfer-selection-fixtures
       - name: Run changed tests under llvm-cov
         if: steps.select.outputs.has_selection == 'true'
-        # Armed bound-caller seam — see coverage-e2e's run step. The plan
-        # lines the script echoes name only the env it prepends itself
-        # (INTENTD_TEST_TIMEOUT_MULTIPLIER); this variable reaches cargo
-        # through the step environment.
+        # Armed bound-caller seam — see coverage-e2e's run step. The
+        # script also enforces the same policy at its test launch boundary.
+        # test-ci-test-policy.py checks parity with this explicit CI setting.
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: ./scripts/changed-tests.sh --instrumented --base "$BASE_SHA"
+      - name: Run callback fixture composition under llvm-cov
+        if: steps.select.outputs.callback_fixture_changed == 'true'
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+          INTENTD_TEST_TIMEOUT_MULTIPLIER: "3"
+        run: |
+          set -euo pipefail
+          filter=$(printf '%s\n' "$CALLBACK_FIXTURE_TESTS" | sed '/^$/d;s/^/test(=/;s/$/)/' | paste -sd '|' -)
+          cargo nextest list -p intent-acp -p intent-services --lib \
+            -E "$filter" --message-format json > "$RUNNER_TEMP/callback-fixture-tests.json"
+          python3 -I -B -S - "$RUNNER_TEMP/callback-fixture-tests.json" <<'PYTHON'
+          import json, os, sys
+          expected = os.environ["CALLBACK_FIXTURE_TESTS"].split()
+          suites = json.load(open(sys.argv[1]))["rust-suites"]
+          selected = [name for suite in suites.values() for name, case in suite["testcases"].items()
+                      if case["filter-match"]["status"] == "matches"]
+          assert len(expected) == len(selected) == 6 and set(selected) == set(expected), selected
+          PYTHON
+          cargo llvm-cov --no-report nextest -p intent-acp -p intent-services --lib \
+            -E "$filter" --no-fail-fast --retries 0 --show-progress none \
+            --status-level pass --final-status-level fail
       # Release the `.in-use` marker — see the `check` job's last step
       # (intent-hq/intent#5256). CARGO_TARGET_DIR is empty when the
       # selection was empty or on burst runners, so this is a no-op there.
@@ -1638,6 +1856,11 @@ jobs:
           python3 -m pip install PyYAML==6.0.2
           python3 -B scripts/test-prerelease-cleanup-workflow.py
           python3 -B scripts/test-release-rust-cache.py
+          python3 -I -B scripts/test-native-review-artifact.py
+      - name: Test local and CI caller policy
+        run: |
+          python3 -S scripts/test-test-policy.py
+          python3 -I -B scripts/test-ci-test-policy.py
       - name: Install release cache regression compiler
         shell: bash
         run: |
@@ -1659,6 +1882,10 @@ jobs:
         run: ./scripts/test-ci-lld-retry.sh
       - name: Test ci-target-slot.sh
         run: ./scripts/test-ci-target-slot.sh
+      - name: Test macOS cleanup safety and Cargo lock ownership
+        run: |
+          python3 -I -B scripts/test-macos-ci-cleanup.py
+          python3 -I -B scripts/test-macos-ci-workflows.py
       - name: Test changed-tests.sh
         run: python3 -S scripts/test-changed-tests-stdin.py
       - name: Test the Makefile gate forwarder

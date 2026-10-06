@@ -72,7 +72,6 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("client.rs", "client."),
         ("drafts.rs", "drafts."),
         ("browser.rs", "browser."),
-        ("forward.rs", "forward."),
         ("host.rs", "host."),
         ("control.rs", "system."),
         ("pairing.rs", "pairing."),
@@ -182,24 +181,30 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
 /// stays as byte-identical aliases.
 /// Direct user retirement (protocol 10.10): +1 router method (`agent.retire`).
+/// Explicit PR detail reads (protocol 13.2): +3 router methods.
+/// Explicit queued batch sending (protocol 13.1): +1 router method.
 /// Reversible script history (protocol 10.11): +2 router methods
 /// (`script.archive`, `script.restore`).
-/// Desktop control: +4 client router methods and desktop.control reverse RPC.
-const EXPECTED_TOTAL_METHODS: usize = 415;
+/// Durable script monitors (protocol 12.1): +3 router methods.
+/// Protocol 13.0 removes the deprecated git.commit router method.
+// GitLab pre-workspace checkout (13.5): +6 router methods.
+// Provider adapter preparation (13.6): +1 fast-path method.
+const EXPECTED_TOTAL_METHODS: usize = 433;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
-/// This includes both git.diffs and git.commits (the canonical forms) even
-/// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 355;
+/// Protocol 12.0 removes five router methods, three fast paths and two aliases.
+/// Protocol 12.1 adds the three script-monitor controls.
+/// The subsequent git.commit removal removes one more router method.
+const EXPECTED_ROUTER_METHODS: usize = 376;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 58;
+const EXPECTED_FASTPATH_METHODS: usize = 56;
 
 /// Golden count: method aliases.
-const EXPECTED_ALIASES: usize = 2;
+const EXPECTED_ALIASES: usize = 0;
 
 /// Golden count: server→client notifications.
-const EXPECTED_NOTIFICATIONS: usize = 1;
+const EXPECTED_NOTIFICATIONS: usize = 5;
 
 /// Golden count: client-served reverse RPCs.
 const EXPECTED_REVERSE_METHODS: usize = 6;
@@ -467,6 +472,10 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
         "drains the entry with the stamp captured at enqueue (the drainer is not the author)",
     ),
     (
+        "agent.sendQueuedMessagesNow",
+        "drains the selected entries with their captured stamps; the drainer is not the author (WSS explicit batch coverage)",
+    ),
+    (
         "agent.sendToTask",
         "stamped in `WorkspaceApi::agent_send_to_task` before the assignee delivery",
     ),
@@ -510,6 +519,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "accept-changes.getStatus",
     "accept-changes.mergePR",
     "accept-changes.prepare",
+    "accept-changes.reconcile",
+    "accept-changes.release",
     "agent.cancelDelete",
     "agent.cancelSubscriptions",
     "agent.completeOnce",
@@ -582,7 +593,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "events.unsubscribe",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
-    "file-tracking.getLineStats",
     "file-tracking.loadCommits",
     "file-tracking.stage",
     "file-tracking.unstage",
@@ -602,9 +612,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "file.stat",
     "file.tree",
     "file.write",
-    "forward.close",
-    "forward.create",
-    "forward.list",
     "git.agentCommit",
     "git.branchDiff",
     "git.branchStatus",
@@ -612,7 +619,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "git.checkMergeConflicts",
     "git.checkoutBranch",
     "git.clone",
-    "git.commit",
     "git.commitDetails",
     "git.commits",
     "git.createBranch",
@@ -647,10 +653,13 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "github.issues.list",
     "github.issues.search",
     "github.listReviewComments",
+    "github.pulls.checks",
     "github.pulls.create",
+    "github.pulls.files",
     "github.pulls.get",
     "github.pulls.list",
     "github.pulls.merge",
+    "github.pulls.reviews",
     "github.pulls.search",
     "github.pulls.updateBranch",
     "github.relatedRepos.list",
@@ -683,11 +692,13 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "host.invite.create",
     "host.invite.list",
     "host.invite.revoke",
+    "host.invite.searchAccounts",
     "host.listDirectory",
     "host.listInstalledEditors",
     "host.members.list",
     "host.members.remove",
     "host.openInEditor",
+    "host.prepareProviderAdapters",
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.providerTestPrompt",
@@ -726,10 +737,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "mcp.servers.toggle",
     "mcp.servers.update",
     "mcp.testConnection",
-    "metrics.clearAgentStats",
     "metrics.getAgentStats",
-    "metrics.getAllWorkspaceStats",
-    "metrics.getWorkspaceStats",
     "models.list",
     "note.add",
     "note.create",
@@ -753,7 +761,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "pairing.getInfo",
     "pairing.getSelfInfo",
     "pr.refresh",
-    "pr.status",
     "prMonitor.cancel",
     "prMonitor.flush",
     "prMonitor.list",
@@ -794,6 +801,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "script.start",
     "script.status",
     "script.stop",
+    "scriptMonitor.cancel",
+    "scriptMonitor.cancelRun",
+    "scriptMonitor.list",
     "search.cancel",
     "search.codebase",
     "search.events",
@@ -818,10 +828,19 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "skill.list",
     "sourceControl.authStatus",
     "sourceControl.cancelAuth",
+    "sourceControl.checkout.branches",
+    "sourceControl.checkout.capture",
+    "sourceControl.checkout.project",
+    "sourceControl.checkout.projects",
+    "sourceControl.checkout.release",
+    "sourceControl.checkout.warm",
     "sourceControl.connect",
     "sourceControl.getUser",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
+    "sourceControl.read.capture",
+    "sourceControl.read.detail",
+    "sourceControl.read.release",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -898,6 +917,14 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
+    "workspace.repositoryContext",
+    "workspace.repositoryContext.capture",
+    "workspace.repositoryContext.release",
+    "workspace.repositorySelection.capture",
+    "workspace.repositorySelection.reconcile",
+    "workspace.repositorySelection.release",
+    "workspace.repositorySelection.reset",
+    "workspace.repositorySelection.save",
     "workspace.restore",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
@@ -1002,10 +1029,10 @@ fn user_origin_message_entry_points_frozen() {
     }
     assert_eq!(
         USER_ORIGIN_MESSAGE_ENTRY_POINTS.len(),
-        11,
-        "the Product Brief's ten user-origin entry points plus `workspace.create`'s \
-         initialAgent kickoff; a change here needs the service matrix and \
-         docs/protocol/ updated alongside"
+        12,
+        "the user-origin entry points including explicit queue batching and \
+         workspace.create's initialAgent kickoff; a change here needs \
+         attribution coverage and docs/protocol/ updated alongside"
     );
 
     // Exhaustive partition of the FULL catalog (router + fast path): a new
@@ -1158,7 +1185,7 @@ fn client_callable_universe() -> BTreeSet<String> {
 /// `voice.*`, `settings.*`, `repo.*` / `repoConfig.*`, `mcp.*`, `server.*`,
 /// `pairing.*`, `providers.setup.*`, `system.*` (but `system.capabilities`
 /// and `system.status`),
-/// `rules.*`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
+/// `rules.list` / `rules.update`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
 /// export / import / setup / browser-client pinning, `git.clone`,
 /// `git.agentCommit` (agent-only), agent creation / delegation (decided
 /// 2026-09-19: guests steer existing agents only — `agent.create`,
@@ -1174,6 +1201,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "accept-changes.getStatus",
     "accept-changes.mergePR",
     "accept-changes.prepare",
+    "accept-changes.reconcile",
+    "accept-changes.release",
     "agent.cancelDelete",
     "agent.completeOnce",
     "agent.create",
@@ -1199,13 +1228,9 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "desktop.setPermission",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
-    "file-tracking.getLineStats",
     "file-tracking.loadCommits",
     "file-tracking.stage",
     "file-tracking.unstage",
-    "forward.close",
-    "forward.create",
-    "forward.list",
     "git.agentCommit",
     "git.clone",
     "github.authStatus",
@@ -1221,10 +1246,13 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "github.issues.list",
     "github.issues.search",
     "github.listReviewComments",
+    "github.pulls.checks",
     "github.pulls.create",
+    "github.pulls.files",
     "github.pulls.get",
     "github.pulls.list",
     "github.pulls.merge",
+    "github.pulls.reviews",
     "github.pulls.search",
     "github.pulls.updateBranch",
     "github.relatedRepos.list",
@@ -1256,11 +1284,13 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "host.invite.create",
     "host.invite.list",
     "host.invite.revoke",
+    "host.invite.searchAccounts",
     "host.listDirectory",
     "host.listInstalledEditors",
     "host.members.list",
     "host.members.remove",
     "host.openInEditor",
+    "host.prepareProviderAdapters",
     "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.providerTestPrompt",
@@ -1297,8 +1327,6 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "mcp.servers.toggle",
     "mcp.servers.update",
     "mcp.testConnection",
-    "metrics.clearAgentStats",
-    "metrics.getAllWorkspaceStats",
     "pairing.getInfo",
     "prMonitor.cancel",
     "prMonitor.flush",
@@ -1314,7 +1342,6 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "repoConfig.get",
     "repoConfig.has",
     "repoConfig.save",
-    "rules.get",
     "rules.list",
     "rules.update",
     "sandbox.cow.discard",
@@ -1330,6 +1357,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "script.start",
     "script.status",
     "script.stop",
+    "scriptMonitor.cancel",
+    "scriptMonitor.cancelRun",
     "sentry.assignIssue",
     "sentry.authStatus",
     "sentry.getIssue",
@@ -1509,6 +1538,28 @@ fn collaborator_refused_golden_is_sorted_unique_and_disjoint() {
 }
 
 #[test]
+fn retired_rpc_names_are_absent_from_catalog_and_authorization() {
+    for method in [
+        "git.diff",
+        "git.log",
+        "pr.status",
+        "file-tracking.getLineStats",
+        "metrics.getWorkspaceStats",
+        "metrics.getAllWorkspaceStats",
+        "metrics.clearAgentStats",
+        "forward.create",
+        "forward.list",
+        "forward.close",
+    ] {
+        assert!(!ROUTER_METHODS.contains(&method), "{method}");
+        assert!(!FASTPATH_METHODS.contains(&method), "{method}");
+        assert_eq!(canonical_method(method), method);
+        assert!(!collaborator_may_call(method), "{method}");
+        assert!(!super::member_may_call(method), "{method}");
+    }
+}
+
+#[test]
 fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
     for (alias, canonical) in METHOD_ALIASES {
         assert_eq!(canonical_method(alias), *canonical);
@@ -1519,14 +1570,10 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         );
     }
     assert_eq!(canonical_method("note.get"), "note.get");
-    assert!(
-        collaborator_may_call("git.diff"),
-        "git.diff is treated as git.diffs"
-    );
-    assert!(
-        collaborator_may_call("git.log"),
-        "git.log is treated as git.commits"
-    );
+    assert!(!collaborator_may_call("git.diff"));
+    assert!(!collaborator_may_call("git.log"));
+    assert!(collaborator_may_call("git.diffs"));
+    assert!(collaborator_may_call("git.commits"));
     for allowed in [
         "client.hello",
         "events.subscribe",
@@ -1536,7 +1583,6 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "system.status",
         "host.status",
         "principal.me",
-        "pr.status",
         "pr.refresh",
         "prMonitor.list",
         "presence.snapshot",
@@ -1548,7 +1594,6 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "agent.sendMessage",
         "agent.setModel",
         "hook.list",
-        "git.commit",
         "git.push",
     ] {
         assert!(collaborator_may_call(allowed), "{allowed} must be allowed");
@@ -1558,7 +1603,6 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "host.openInEditor",
         "browser.exec",
         "browser.listTabs",
-        "forward.create",
         "github.authStatus",
         "github.pulls.create",
         "github.pulls.get",
@@ -1686,8 +1730,6 @@ mod unbound_owner_only_methods {
         ("agent.memoryUsage", "ok"),
         // No gate: process-wide stack sampler.
         ("debug.sampleStacks", "ok"),
-        // No gate: daemon-wide metrics read.
-        ("metrics.getAllWorkspaceStats", "ok"),
         // No gate: no-manager early return `{ running: false }`.
         ("unsloth.status", "ok"),
         // No gate: no-manager early return `{ stopped: false }`.
@@ -1756,6 +1798,14 @@ mod unbound_owner_only_methods {
                 "accept-changes.prepare",
                 json!({ "workspaceId": ws, "action": "a" }),
             ),
+            (
+                "accept-changes.reconcile",
+                json!({"workspaceId":ws,"operationId":"held-operation","root":{"workspaceId":ws,"kind":"primary"}}),
+            ),
+            (
+                "accept-changes.release",
+                json!({"workspaceId":ws,"operationId":"held-operation","root":{"workspaceId":ws,"kind":"primary"}}),
+            ),
             ("agent.cancelDelete", json!({ "agentId": "a1" })),
             (
                 "agent.completeOnce",
@@ -1804,7 +1854,6 @@ mod unbound_owner_only_methods {
             ),
             ("file-tracking.getAgentLocks", json!({ "workspaceId": ws })),
             ("file-tracking.getChanges", json!({ "workspaceId": ws })),
-            ("file-tracking.getLineStats", json!({ "workspaceId": ws })),
             ("file-tracking.loadCommits", json!({ "workspaceId": ws })),
             (
                 "file-tracking.stage",
@@ -1842,6 +1891,9 @@ mod unbound_owner_only_methods {
                 "github.pulls.create",
                 json!({ "owner": "o", "repo": "r", "title": "t", "body": "b", "head": "h", "base": "b" }),
             ),
+            ("github.pulls.checks", gh_n.clone()),
+            ("github.pulls.files", gh_n.clone()),
+            ("github.pulls.reviews", gh_n.clone()),
             ("github.pulls.get", gh_n.clone()),
             ("github.pulls.list", gh.clone()),
             ("github.pulls.merge", gh_n.clone()),
@@ -1864,6 +1916,10 @@ mod unbound_owner_only_methods {
             ("hook.runNow", json!({ "workspaceId": ws, "hookId": "h1" })),
             ("host.executionContext", json!({})),
             ("host.invite.list", json!({})),
+            (
+                "host.invite.searchAccounts",
+                json!({"provider":"github","query":"ab"}),
+            ),
             ("host.invite.revoke", json!({ "inviteId": "missing" })),
             ("host.members.list", json!({})),
             ("host.members.remove", json!({"principalId":"missing"})),
@@ -1905,8 +1961,6 @@ mod unbound_owner_only_methods {
                 "mcp.testConnection",
                 json!({ "url": "http://127.0.0.1:9/" }),
             ),
-            ("metrics.clearAgentStats", json!({ "agentId": "a1" })),
-            ("metrics.getAllWorkspaceStats", json!({})),
             (
                 "prMonitor.cancel",
                 json!({ "workspaceId": ws, "monitorId": "m1" }),
@@ -1928,10 +1982,6 @@ mod unbound_owner_only_methods {
             (
                 "repoConfig.save",
                 json!({ "workspaceId": ws, "config": {} }),
-            ),
-            (
-                "rules.get",
-                json!({ "workspaceId": ws, "ruleType": "agents" }),
             ),
             ("rules.list", json!({})),
             (
@@ -1966,6 +2016,14 @@ mod unbound_owner_only_methods {
             ("script.start", script.clone()),
             ("script.status", script.clone()),
             ("script.stop", script.clone()),
+            (
+                "scriptMonitor.cancel",
+                json!({ "workspaceId": ws, "monitorId": "m1" }),
+            ),
+            (
+                "scriptMonitor.cancelRun",
+                json!({ "workspaceId": ws, "monitorId": "m1" }),
+            ),
             ("sentry.assignIssue", json!({ "id": "i" })),
             ("sentry.authStatus", json!({})),
             ("sentry.getIssue", json!({ "id": "i" })),
@@ -2471,11 +2529,13 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "host.invite.create",
         "host.invite.list",
         "host.invite.revoke",
+        "host.invite.searchAccounts",
         "host.listDirectory",
         "host.listInstalledEditors",
         "host.members.list",
         "host.members.remove",
         "host.openInEditor",
+        "host.prepareProviderAdapters",
         "host.providerTestPrompt",
         "identity.authStatus",
         "identity.cancelAuth",
@@ -2499,8 +2559,6 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "mcp.servers.restart",
         "mcp.servers.update",
         "mcp.testConnection",
-        "metrics.clearAgentStats",
-        "metrics.getAllWorkspaceStats",
         "pairing.getInfo",
         "providers.setup.cancel",
         "providers.setup.login",
@@ -2561,4 +2619,12 @@ fn member_methods_and_administrator_remainder_are_classified() {
     for method in REVERSE_METHODS {
         assert_eq!(super::member_may_call(method), *method == "browser.exec");
     }
+}
+
+#[test]
+fn removed_git_commit_is_not_advertised_or_authorized() {
+    assert!(!super::ROUTER_METHODS.contains(&"git.commit"));
+    assert!(!super::collaborator_may_call("git.commit"));
+    assert!(!super::collaborator_may_call("git.agentCommit"));
+    assert!(super::member_may_call("git.agentCommit"));
 }

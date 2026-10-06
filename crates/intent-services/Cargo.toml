@@ -1,30 +1,35 @@
 [package]
 name = "intent-services"
-version = "0.9.137"
+version = "0.10.21"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 description = "Shared business-logic surface invoked by every transport and the agent MCP server"
 
+[features]
+# Explicit disposable repository sources for integration-test composition only.
+repository-test-fixtures = []
+
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.9.137" }
-intent-store = { path = "../intent-store", version = "0.9.137" }
-intent-git = { path = "../intent-git", version = "0.9.137" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.137" }
-intent-linear = { path = "../intent-linear", version = "0.9.137" }
-intent-sentry = { path = "../intent-sentry", version = "0.9.137" }
+intent-core = { path = "../intent-core", version = "0.10.21" }
+intent-store = { path = "../intent-store", version = "0.10.21" }
+intent-git = { path = "../intent-git", version = "0.10.21" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.10.21" }
+intent-linear = { path = "../intent-linear", version = "0.10.21" }
+intent-sentry = { path = "../intent-sentry", version = "0.10.21" }
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
-intent-acp = { path = "../intent-acp", version = "0.9.137" }
-intent-js = { path = "../intent-js", version = "0.9.137" }
-intent-context = { path = "../intent-context", version = "0.9.137" }
-intent-providers = { path = "../intent-providers", version = "0.9.137" }
-intent-pty = { path = "../intent-pty", version = "0.9.137" }
-intent-search = { path = "../intent-search", version = "0.9.137" }
+intent-acp = { path = "../intent-acp", version = "0.10.21" }
+intent-js = { path = "../intent-js", version = "0.10.21" }
+intent-context = { path = "../intent-context", version = "0.10.21" }
+intent-providers = { path = "../intent-providers", version = "0.10.21" }
+intent-pty = { path = "../intent-pty", version = "0.10.21" }
+intent-search = { path = "../intent-search", version = "0.10.21" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 ignore = { workspace = true }
 serde_json = { workspace = true }
+regex = "1.12"
 uuid = { workspace = true }
 tokio = { workspace = true }
 notify = { workspace = true }
@@ -34,7 +39,9 @@ time = { workspace = true, features = ["formatting", "local-offset"] }
 similar = { version = "3.1.1", default-features = false }
 serde_yaml = "0.9"
 toml_edit = "0.25.5"
+toml.workspace = true
 tempfile = "3"
+fs2 = "0.4"
 reqwest.workspace = true
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 sha2 = "0.11"

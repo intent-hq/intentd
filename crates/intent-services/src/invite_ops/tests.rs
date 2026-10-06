@@ -1552,7 +1552,7 @@ async fn inspect_previews_an_open_invite_without_a_nonce() {
         .expect("inspect");
     assert_eq!(
         r,
-        json!({ "scope": "workspace", "role": "collaborator", "workspaceId": ws2.0, "workspaceTitle": "Second", "pinIdentity": null }),
+        json!({ "scope": "workspace", "role": "collaborator", "workspaceId": ws2.0, "workspaceTitle": "Second", "pinIdentity": null, "collaborationName": null }),
         "{r}"
     );
     assert_eq!(
@@ -1686,9 +1686,10 @@ async fn assert_preview_pin_identity(challenge: bool) {
         );
         assert_eq!(result["workspaceId"], json!(f.ws));
         assert_eq!(result["workspaceTitle"], json!("WS"));
+        assert_eq!(result.get("collaborationName"), Some(&Value::Null));
         assert_eq!(
             result.as_object().unwrap().len(),
-            if challenge { 7 } else { 5 }
+            if challenge { 8 } else { 6 }
         );
         if challenge {
             assert!(result["nonce"].is_string());
@@ -4053,4 +4054,131 @@ fn secret_hashing_shape() {
     assert!(hashes_match(&h, &hash_secret("abc")));
     assert!(!hashes_match(&h, &hash_secret("abd")));
     assert!(!hashes_match(&h, "ba78"));
+}
+
+#[tokio::test]
+async fn collaboration_machine_name_persists_resets_and_is_owner_only() {
+    let tmp = TempDb::new();
+    let (f, registry, cfg) = capped_fixture(&tmp, 10).await;
+    let owner = Caller::Wire {
+        principal_id: f.owner.clone(),
+        host_role: intent_core::HostRole::Owner,
+    };
+    let path = "sharing.machineName";
+    let saved = with_caller(
+        owner.clone(),
+        f.services.settings_update(json!([
+            {"path":path,"value":"  Team 🦀 machine  "}
+        ])),
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved["applied"][0]["value"], "Team 🦀 machine");
+    assert_eq!(registry.get(path), Some(json!("Team 🦀 machine")));
+    let reloaded = crate::SettingsRegistry::load(cfg.path().join("config.toml")).unwrap();
+    assert_eq!(reloaded.get(path), Some(json!("Team 🦀 machine")));
+    for role in [intent_core::HostRole::Member, intent_core::HostRole::Guest] {
+        let caller = Caller::Wire {
+            principal_id: f.collaborator.clone(),
+            host_role: role,
+        };
+        for result in [
+            with_caller(
+                caller.clone(),
+                f.services
+                    .settings_update(json!([{"path":path,"value":"intruder"}])),
+            )
+            .await,
+            with_caller(caller.clone(), f.services.settings_reset(path.into())).await,
+            with_caller(caller, f.services.settings_get(path.into())).await,
+        ] {
+            assert!(matches!(result, Err(Error::Forbidden(_))), "{result:?}");
+        }
+        assert_eq!(registry.get(path), Some(json!("Team 🦀 machine")));
+    }
+    for invalid in [
+        json!("x".repeat(101)),
+        json!("line\nname"),
+        json!("\tname"),
+        json!(null),
+        json!(42),
+    ] {
+        let result = with_caller(
+            owner.clone(),
+            f.services
+                .settings_update(json!([{"path":path,"value":invalid}])),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::InvalidParams(_))), "{result:?}");
+        assert_eq!(registry.get(path), Some(json!("Team 🦀 machine")));
+    }
+    with_caller(owner.clone(), f.services.settings_reset(path.into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::SettingsRegistry::load(cfg.path().join("config.toml"))
+            .unwrap()
+            .get(path),
+        Some(json!(""))
+    );
+    with_caller(
+        owner,
+        f.services
+            .settings_update(json!([{"path":path,"value":"   "}])),
+    )
+    .await
+    .unwrap();
+    assert_eq!(registry.get(path), Some(json!("")));
+}
+
+#[tokio::test]
+async fn collaboration_machine_name_reaches_both_invite_previews_and_refreshes() {
+    let tmp = TempDb::new();
+    let (mut f, registry, _cfg) = capped_fixture(&tmp, 10).await;
+    with_forge(&mut f, vec![]);
+    let workspace = f.create_invite(None).await;
+    let host = with_caller(
+        Caller::Daemon,
+        f.services.host_invite_create_op(InvitePin {
+            login: "guest".into(),
+            provider: Some("github".into()),
+            host: None,
+        }),
+    )
+    .await
+    .unwrap();
+    for name in ["", "Team machine", "Renamed", ""] {
+        with_caller(
+            Caller::Daemon,
+            f.services
+                .settings_update(json!([{"path":"sharing.machineName","value":name}])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(registry.get("sharing.machineName"), Some(json!(name)));
+        let expected = if name.is_empty() {
+            Value::Null
+        } else {
+            json!(name)
+        };
+        for (invite, scope) in [
+            (&workspace, InviteScope::Workspace),
+            (&host, InviteScope::Host),
+        ] {
+            let id = id_of(invite);
+            let secret = invite["secret"].as_str().unwrap();
+            for preview in [
+                f.services
+                    .invite_inspect_op(&id, secret, scope)
+                    .await
+                    .unwrap(),
+                f.services
+                    .invite_challenge_op(&id, secret, scope)
+                    .await
+                    .unwrap(),
+            ] {
+                assert_eq!(preview.get("collaborationName"), Some(&expected));
+            }
+        }
+    }
 }

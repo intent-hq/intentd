@@ -16,6 +16,15 @@ mod common;
 #[path = "e2e_wss_agent_lifecycle/creation_preferences.rs"]
 mod creation_preferences;
 
+#[path = "e2e_wss_agent_lifecycle/provider_policy.rs"]
+mod provider_policy;
+
+#[path = "e2e_wss_agent_lifecycle/skill_catalog.rs"]
+mod skill_catalog;
+
+#[path = "e2e_wss_agent_lifecycle/structured_notices.rs"]
+mod structured_notices;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -67,18 +76,16 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn lifecycle_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let secrets_file = data_dir.join("secrets.json");
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
@@ -91,7 +98,14 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.spawn().expect("spawn intentd serve")
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
+    cmd
+}
+
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+    lifecycle_command(data_dir, listen, env)
+        .spawn()
+        .expect("spawn intentd serve")
 }
 
 /// Wait for the daemon's UDS to accept connections, up to the shared
@@ -7078,6 +7092,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -7209,8 +7224,8 @@ async fn boot_daemon_with_seeded_note() -> (tempfile::TempDir, Daemon, String, S
 /// WSS-2 (router): drive a broad slice of untested-over-WSS read/lifecycle
 /// router arms — `note.*` (list/get/create/update/listTasks), `mcp.servers.list`,
 /// `script.*` (list/create/status/remove), `terminal.*` (create/list/kill),
-/// `primitive.*` (addReference/addCli + note mutation), and the `pr.status`
-/// error-envelope arm — all over ONE pinned WSS RPC connection so each match
+/// `primitive.*` (addReference/addCli + note mutation), and the `pr.refresh`
+/// unlinked-workspace result — all over ONE pinned WSS RPC connection so each match
 /// arm in `intent-transport::router::dispatch` is exercised through
 /// `conn::process_frame` (which is uncounted over WSS in the COV-1 baseline).
 /// No agent turn → no `node` dependency.
@@ -7500,20 +7515,9 @@ async fn router_read_lifecycle_arms_over_wss() {
         "primitive.* appended to note body: {body}"
     );
 
-    // --- pr.status: error-envelope arm on a fresh workspace -----------------
-    // The seeded workspace has no `repository_owner`/`repository_name`/`pr_number`,
-    // so `pr.status` returns the well-defined "no active PR" envelope — still a
-    // valid hit on the router arm via the WSS path.
-    let pr_env = wss_rpc_envelope(&mut rpc, 21, "pr.status", json!({ "workspaceId": ws_id })).await;
-    assert!(
-        pr_env.get("error").is_some(),
-        "pr.status returns an error envelope on a fresh workspace: {pr_env}"
-    );
-    assert_eq!(
-        pr_env["error"]["code"],
-        json!(-32603),
-        "pr.status `Error::Internal` → -32603 (§9): {pr_env}"
-    );
+    // Retiring pr.status must keep refresh working for an unlinked workspace.
+    let refreshed = wss_rpc(&mut rpc, 21, "pr.refresh", json!({ "workspaceId": ws_id })).await;
+    assert!(refreshed["pullRequests"].is_array(), "{refreshed}");
 }
 
 /// WSS-2 (terminal.create env, §5.13 gap): the `env` param is layered onto the
@@ -8734,6 +8738,7 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     let me = wss_rpc(&mut rpc, 15, "principal.me", json!({})).await;
     let mut stamped = metadata.clone();
     stamped["fromPrincipalId"] = me["id"].clone();
+    stamped["submissionIds"] = json!([send2["queuedMessage"]["id"]]);
     assert_eq!(
         send2["queuedMessage"]["messageMetadata"], stamped,
         "queued entry must carry messageMetadata: {send2}"
@@ -8804,9 +8809,10 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     // Both direct-delivery placements are covered: the row-level `metadata`
     // column (direct `agent.sendMessage` parity) and the in-block fold
     // (`deliver_wake_message` parity) — the fold carries queueInfo too, but
-    // the `fromPrincipalId` stamp stays row-level only.
+    // principal and submission-correlation stamps stay row-level only.
     let mut folded = tagged["metadata"].clone();
     folded.as_object_mut().unwrap().remove("fromPrincipalId");
+    folded.as_object_mut().unwrap().remove("submissionIds");
     assert_eq!(
         tagged["contentBlocks"][0]["messageMetadata"], folded,
         "drained user block must fold the same messageMetadata: {tagged}"
@@ -13297,7 +13303,9 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
                 saw_settle_idle = true;
             }
             Some("agent:status-changed")
-                if saw_settle_idle && event["data"]["status"] == "idle" =>
+                if saw_settle_idle
+                    && event["data"]["agentId"].as_str() == Some(agent_id.as_str())
+                    && event["data"]["status"] == "idle" =>
             {
                 // The earlier idle event precedes end_turn's durable status
                 // write. Ignore the preemption's idle status before this turn.
@@ -14038,6 +14046,197 @@ fn assert_no_file_data(v: &Value, surface: &str) {
     }
 }
 
+/// Real TLS/WebSocket coverage for the chat-only twenty-row snapshot policy:
+/// fresh/stale/recent subscriptions, cursor continuation and invalidation reset.
+#[intent_test_macros::daemon_test]
+async fn twenty_message_chat_snapshots_and_invalidation_over_wss() {
+    use intent_core::{now_iso, AgentId, WorkspaceApi, WorkspaceId};
+    use intent_services::Services;
+    use intent_store::Store;
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let (ws_id, agent_id, ids) = {
+        let store = Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("store");
+        let ws_root = common::hermetic_workspaces_root();
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(common::registry_with_default_provider(ws_root.path()));
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace_seed(&ws))
+            .await
+            .expect("workspace");
+        let created = services
+            .agent_create(
+                ws.clone(),
+                Some("Twenty messages".into()),
+                None,
+                None,
+                None,
+                None,
+                intent_core::AgentCreateExtra::default(),
+            )
+            .await
+            .expect("agent");
+        let agent = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let mut ids = Vec::new();
+        for seq in 0..27 {
+            ids.push(
+                store
+                    .append_agent_message(
+                        &agent,
+                        "user",
+                        &json!([{ "type": "text", "text": format!("message {seq}") }]),
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("message")
+                    .id,
+            );
+        }
+        (ws.0, agent.0, ids)
+    };
+    let child = spawn_serve(&data_dir, "both", &[("INTENTD_AUTH_TOKEN", TOKEN)]);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    // Generic conversation paging keeps its existing default (all 27 here).
+    let generic = wss_rpc(
+        &mut rpc,
+        1,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(generic["messages"].as_array().unwrap().len(), 27);
+
+    for (since, expected_start, resumed) in [
+        (None, 7, None),
+        (Some(ids[3].as_str()), 7, Some(false)),
+        (Some(ids[10].as_str()), 11, Some(true)),
+    ] {
+        let mut chat = connect_ws(port, cfg.clone()).await;
+        let mut params = json!({ "agentId": agent_id });
+        if let Some(since) = since {
+            params["sinceMessageId"] = json!(since);
+        }
+        // Read the response envelope explicitly as well as the push envelope.
+        chat.send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": 10,
+            "method": "chat.subscribe", "params": params })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("subscribe");
+        let response: Value = loop {
+            let frame = timeout(Duration::from_secs(15), chat.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            match frame {
+                Message::Text(text) => break serde_json::from_str(&text).unwrap(),
+                Message::Ping(p) => chat.send(Message::Pong(p)).await.unwrap(),
+                other => panic!("unexpected subscribe response: {other:?}"),
+            }
+        };
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 10);
+        assert!(response.get("error").is_none(), "{response}");
+        assert!(response["result"]["subscriptionId"].is_string());
+        let push = wss_push(&mut chat, 15).await;
+        assert_eq!(push["jsonrpc"], "2.0");
+        assert_eq!(
+            push["params"]["subscriptionId"],
+            response["result"]["subscriptionId"]
+        );
+        assert_eq!(push["params"]["kind"], "snapshot");
+        assert_eq!(push["params"]["seq"], 0);
+        let snapshot = &push["params"]["snapshot"];
+        let rows = snapshot["messages"].as_array().unwrap();
+        assert_eq!(rows.len(), 27 - expected_start);
+        for (row, expected_id) in rows.iter().zip(&ids[expected_start..]) {
+            assert_eq!(row["id"], expected_id.as_str());
+        }
+        assert_eq!(snapshot.get("resumed").and_then(Value::as_bool), resumed);
+        assert_eq!(snapshot["totalMessages"], 27);
+        assert_eq!(snapshot["truncated"], resumed != Some(true));
+        eprintln!(
+            "WSS twenty-message snapshot: resumed={resumed:?} rows={} bytes={}",
+            rows.len(),
+            serde_json::to_vec(snapshot).unwrap().len()
+        );
+        if resumed == Some(true) {
+            assert!(snapshot["nextToken"].is_null());
+        } else {
+            let older = wss_rpc(
+                &mut rpc,
+                11,
+                "agent.getConversation",
+                json!({
+                "workspaceId": ws_id, "agentId": agent_id, "limit": 5,
+                "nextToken": snapshot["nextToken"] }),
+            )
+            .await;
+            let older_rows = older["messages"].as_array().unwrap();
+            assert_eq!(older_rows.len(), 5);
+            for (row, expected_id) in older_rows.iter().zip(&ids[2..7]) {
+                assert_eq!(row["id"], expected_id.as_str());
+            }
+            let oldest = wss_rpc(
+                &mut rpc,
+                12,
+                "agent.getConversation",
+                json!({
+                "workspaceId": ws_id, "agentId": agent_id, "limit": 5,
+                "nextToken": older["nextToken"] }),
+            )
+            .await;
+            assert_eq!(oldest["messages"].as_array().unwrap().len(), 2);
+            assert_eq!(oldest["messages"][0]["id"], ids[0].as_str());
+            assert_eq!(oldest["messages"][1]["id"], ids[1].as_str());
+            assert!(oldest["nextToken"].is_null());
+        }
+        // An active recent-resume connection must reset to twenty on replacement.
+        if resumed == Some(true) {
+            let messages: Vec<Value> = (0..24)
+                .map(|seq| {
+                    json!({ "role": "user",
+                "contentBlocks": [{ "type": "text", "text": format!("replacement {seq}") }] })
+                })
+                .collect();
+            let replaced = wss_rpc(
+                &mut rpc,
+                13,
+                "agent.replaceMessages",
+                json!({
+                "workspaceId": ws_id, "agentId": agent_id, "messages": messages }),
+            )
+            .await;
+            assert_eq!(replaced["success"], true);
+            let reset = wss_push(&mut chat, 15).await;
+            assert_eq!(reset["params"]["kind"], "snapshot", "{reset}");
+            assert_eq!(reset["params"]["seq"], 1);
+            let snapshot = &reset["params"]["snapshot"];
+            assert_eq!(snapshot["resumed"], false);
+            assert_eq!(snapshot["totalMessages"], 24);
+            assert_eq!(snapshot["messages"].as_array().unwrap().len(), 20);
+            assert_eq!(snapshot["messages"][0]["seq"], 4);
+            assert_eq!(snapshot["messages"][19]["seq"], 23);
+            assert!(snapshot["nextToken"].is_string());
+        }
+        chat.close(None).await.expect("close chat");
+    }
+}
+
 /// Protocol 10.0 serve side over the real WSS wire: a legacy inline file
 /// block already persisted on a user row (`{ type: 'file', data, fileName }`
 /// with no `attachmentId`, written by a pre-10.0 daemon) is served as a
@@ -14354,6 +14553,7 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
             "type": "agent_message",
             "fromAgentId": sender_id,
             "fromAgentName": "SenderA",
+            "submissionIds": [tagged["id"]],
         }),
         "agent-originated send must carry sender attribution: {tagged}"
     );
@@ -14608,7 +14808,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         "explicit-metadata child turn completed: {done:?}"
     );
 
-    let expected_tag = json!({
+    let mut expected_tag = json!({
         "type": "agent_message",
         "fromAgentId": sender_id,
         "fromAgentName": "SenderA",
@@ -14639,6 +14839,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     )
     .await;
     let row = user_row(&conv, "task hello");
+    expected_tag["submissionIds"] = json!([row["id"]]);
     assert_eq!(
         row["metadata"], expected_tag,
         "sendToTask must carry sender attribution: {row}"
@@ -14653,6 +14854,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     )
     .await;
     let row = user_row(&conv, "kickoff hello");
+    expected_tag["submissionIds"] = json!([row["id"]]);
     assert_eq!(
         row["metadata"], expected_tag,
         "create kickoff must carry sender attribution: {row}"
@@ -14674,6 +14876,7 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         json!({
             "type": "custom_tag",
             "note": "explicit wins",
+            "submissionIds": [row["id"]],
             "fromAgentId": sender_id,
             "fromAgentName": "SenderA",
         }),
@@ -15041,13 +15244,14 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
         md["fromPrincipalId"].is_string(),
         "a human row carries the principal stamp: {lean}"
     );
+    assert_eq!(md["submissionIds"], human["submissionIds"]);
     let extra: Vec<&String> = md
         .keys()
-        .filter(|k| *k != "fromPrincipalId" && *k != "queueInfo")
+        .filter(|k| *k != "fromPrincipalId" && *k != "queueInfo" && *k != "submissionIds")
         .collect();
     assert!(
         extra.is_empty(),
-        "a human row carries at most the principal + queueInfo stamps: {lean}"
+        "a human row carries only principal, queueInfo and correlation stamps: {lean}"
     );
 
     // Contrast: a parentless BYSTANDER sending to the CHILD — a created
@@ -16719,6 +16923,8 @@ async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
     let data_dir = data_dir_guard.path();
     let ws_id = seed_workspace_only(data_dir).await;
     let toolchain = common::codex_npx::install(data_dir, &script);
+    let selected_cli = std::path::absolute(data_dir.join("codex-toolchain/codex"))
+        .expect("absolute installed CLI fixture path");
     let wrapper = data_dir.join("fake-codex-acp");
     std::fs::write(
         &wrapper,
@@ -16879,11 +17085,29 @@ async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
             1,
             "each launch must use the selected adapter exactly once: {argv:?}"
         );
+        let policy = &session["codexPolicy"];
+        assert_eq!(policy["pathPresent"], true);
+        assert_eq!(policy["codexPath"], json!(selected_cli));
+        assert_eq!(policy["config"]["agents"]["enabled"], false);
+        assert_eq!(policy["config"]["features"]["multi_agent_v2"], false);
+        assert!(policy["config"]["mcp_servers"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|s| s["enabled"] == true));
         assert_eq!(
-            session["codexPolicy"],
-            json!({"config": {"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}, "pathPresent": false}),
-            "daemon policy must replace enabling environment on every launch: {session}"
+            session["mcpNames"],
+            json!([]),
+            "Codex receives MCP only via owned CODEX_CONFIG"
         );
+        assert_eq!(
+            policy["home"], entries[0]["codexPolicy"]["home"],
+            "restart keeps stable owned home"
+        );
+        assert!(policy["home"]
+            .as_str()
+            .unwrap()
+            .contains("provider-profiles-v1/session-"));
         let pid = session["pid"].as_u64().expect("mock child pid");
         if turn == 0 {
             first_pid = Some(pid);
@@ -18931,11 +19155,18 @@ async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
     let ws_id = seed_workspace_only(&data_dir).await;
     let prompt_log = data_dir.join("prompt-log.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().to_string();
+    let prompt_entered = data_dir.join("prompt-entered");
+    let prompt_release = data_dir.join("prompt-release");
     // 30 chunks × 100ms = 3s of stragglers — comfortably past the 500ms
     // post-interrupt drain cap, so a kept-alive child provably leaks them
     // into the follow-up turn (the pre-fix failure this test regresses).
     let behavior = json!({
         "parkIfPromptEndsWith": PARK_MARKER,
+        "promptReceiptGate": {
+            "suffix": PARK_MARKER,
+            "enteredFile": prompt_entered,
+            "releaseFile": prompt_release,
+        },
         "zombieAfterCancel": { "marker": ZOMBIE_MARKER, "count": 30, "intervalMs": 100 },
         "response": "resumed after respawn",
     })
@@ -18996,10 +19227,13 @@ async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // The parked turn streams nothing; poll turn-liveness until the prompt is
-    // provably in flight before interrupting it.
+    // A live daemon turn is NOT a provider receipt: the child is deliberately
+    // held before recording the prompt. Keep the original five-second budget
+    // for both turn-liveness and the provider receipt below (intent#6689).
+    let receipt_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut in_flight = false;
-    for i in 0..100 {
+    let mut i = 0;
+    while tokio::time::Instant::now() < receipt_deadline {
         let got = wss_rpc(
             &mut rpc,
             100 + i,
@@ -19011,9 +19245,53 @@ async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
             in_flight = true;
             break;
         }
+        i += 1;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(in_flight, "first turn is in flight before the stop");
+    while !prompt_entered.exists() {
+        assert!(
+            tokio::time::Instant::now() < receipt_deadline,
+            "mock did not enter the prompt receipt gate"
+        );
+        // timing-guard: wait for the child to enter its test-owned receipt gate.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !prompt_log.exists(),
+        "turnInFlight precedes the held child's prompt receipt"
+    );
+
+    // Release the test-owned gate only after observing the early liveness
+    // signal, then require the exact current prompt, not a replayed marker.
+    // Removing this receipt wait leaves the first child unrecorded and the
+    // final two-record assertion fails even though the follow-up succeeds.
+    std::fs::write(&prompt_release, "release").expect("release prompt receipt gate");
+    loop {
+        let log = std::fs::read_to_string(&prompt_log).unwrap_or_default();
+        if log.ends_with('\n') {
+            let entries: Vec<Value> = log
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("complete prompt record"))
+                .collect();
+            assert_eq!(entries.len(), 1, "one prompt before interrupt: {entries:?}");
+            assert_eq!(entries[0]["turn"], 1, "first child's first prompt");
+            assert!(
+                entries[0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.trim_end().ends_with(PARK_MARKER)),
+                "recorded the current parked prompt: {entries:?}"
+            );
+            assert!(prompt_entered.exists(), "the mock entered the receipt gate");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < receipt_deadline,
+            "first prompt was not recorded before interrupt; log: {log:?}"
+        );
+        // timing-guard: poll the child's complete prompt receipt within the shared deadline.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     // Interrupt mid-turn. The mock resolves the cancel politely, then keeps
     // streaming zombie chunks; the quirk tears the child down underneath them.
@@ -19275,5 +19553,42 @@ async fn specialist_placeholder_first_message_naming_over_wss() {
             name.unwrap_or("Implementor"),
             "the hint itself never mutates the stored name"
         );
+    }
+}
+
+#[test]
+fn private_stored_identity_contract_survives_overrides_and_restart() {
+    use std::ffi::OsStr;
+    let dir = common::test_tempdir("stored-identity-contract-");
+    let secrets = dir.path().join("secrets.json");
+    let state = r#"{"sourceControl.github.token":"synthetic-repository-token","collaboration.github.token":"synthetic-identity-token"}"#;
+    std::fs::write(&secrets, state).unwrap();
+    for _ in 0..2 {
+        let cmd = lifecycle_command(
+            dir.path(),
+            "both",
+            &[
+                ("GITHUB_TOKEN", "synthetic-host-token"),
+                ("GH_TOKEN", "synthetic-host-token"),
+                ("GH_CONFIG_DIR", "synthetic-host-config"),
+                ("INTENTD_SECRETS_FILE", "synthetic-host-secrets"),
+                ("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:0"),
+            ],
+        );
+        let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+            assert_eq!(environment.get(OsStr::new(key)), Some(&None), "{key}");
+        }
+        for (key, path) in [
+            ("GH_CONFIG_DIR", dir.path().join("gh-config")),
+            ("INTENTD_SECRETS_FILE", secrets.clone()),
+        ] {
+            assert_eq!(
+                environment.get(OsStr::new(key)),
+                Some(&Some(path.as_os_str())),
+                "{key}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&secrets).unwrap(), state);
     }
 }

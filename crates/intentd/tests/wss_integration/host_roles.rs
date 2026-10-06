@@ -460,3 +460,211 @@ async fn member_workspace_tools_and_safe_context_over_wss() {
     drop(member);
     srv.ws.stop().await;
 }
+
+#[tokio::test]
+async fn shared_global_rules_over_wss_preserve_owner_writes_and_workspace_boundaries() {
+    let srv = start(WsOptions::default()).await;
+    let shared = WorkspaceId::new();
+    let hidden = WorkspaceId::new();
+    for id in [&shared, &hidden] {
+        srv.store
+            .insert_workspace(&fixture_workspace(id))
+            .await
+            .unwrap();
+    }
+    let guest_token = "d8".repeat(32);
+    let mut guest = Guest::connect(&srv, &guest_token).await;
+    let mut member = Guest::connect(&srv, &"e8".repeat(32)).await;
+    sqlx::query("INSERT INTO host_member (principal_id, added_at) VALUES (?, ?)")
+        .bind(&member.principal.id.0)
+        .bind(now_iso())
+        .execute(srv.store.write_pool())
+        .await
+        .unwrap();
+    srv.store
+        .add_workspace_member(&shared, &guest.principal.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let params = json!({"workspaceId":"global","ruleType":"base-system-prompt"});
+    let updated = wss_call(srv.port, srv.cfg.clone(), &json!({"jsonrpc":"2.0","id":1,"method":"rules.update","params":{"workspaceId":"global","ruleType":"base-system-prompt","content":"Shared host instructions","enabled":true}}).to_string()).await;
+    assert!(updated.get("error").is_none(), "{updated}");
+    for reader in [&mut guest, &mut member] {
+        let got = reader.call("rules.get", params.clone()).await;
+        assert_eq!(
+            got["result"]["content"], "Shared host instructions",
+            "{got}"
+        );
+        assert_eq!(got["result"]["enabled"], true);
+        assert!(got["result"]["updatedAt"].is_i64());
+        assert!(reader
+            .call("specialist.list", json!({}))
+            .await
+            .get("error")
+            .is_none());
+        for (method, args) in [
+            (
+                "rules.update",
+                json!({"workspaceId":shared,"ruleType":"base-system-prompt","content":"forbidden"}),
+            ),
+            (
+                "rules.update",
+                json!({"workspaceId":"global","ruleType":"base-system-prompt","content":"forbidden"}),
+            ),
+            ("specialist.create", json!({"id":"forbidden","spec":{}})),
+            ("specialist.edit", json!({"id":"implementor","spec":{}})),
+            ("specialist.delete", json!({"id":"implementor"})),
+            ("settings.list", json!({})),
+        ] {
+            let denied = reader.call(method, args).await;
+            assert_eq!(denied["error"]["code"], -32003, "{method}: {denied}");
+        }
+        for ws in [json!("global"), json!(WorkspaceId::chief())] {
+            assert!(reader
+                .call(
+                    "rules.get",
+                    json!({"workspaceId":ws,"ruleType":"workspace"})
+                )
+                .await
+                .get("error")
+                .is_some());
+        }
+    }
+    assert!(guest
+        .call("rules.list", json!({"workspaceId":shared}))
+        .await
+        .get("error")
+        .is_some());
+    assert!(guest
+        .call(
+            "rules.get",
+            json!({"workspaceId":hidden,"ruleType":"base-system-prompt"})
+        )
+        .await
+        .get("error")
+        .is_some());
+    srv.store
+        .remove_workspace_member(&shared, &guest.principal.id)
+        .await
+        .unwrap();
+    assert!(
+        guest
+            .call("rules.get", params.clone())
+            .await
+            .get("error")
+            .is_some(),
+        "removed guest"
+    );
+    srv.store
+        .add_workspace_member(&shared, &guest.principal.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    assert!(guest
+        .call("rules.get", params.clone())
+        .await
+        .get("error")
+        .is_none());
+    assert!(guest
+        .call("principal.revokeSelf", json!({}))
+        .await
+        .get("error")
+        .is_none());
+    assert_eq!(
+        status_code(
+            &https_request(
+                srv.port,
+                srv.cfg.clone(),
+                &upgrade_req("/ws", None, Some(&guest_token))
+            )
+            .await
+        ),
+        401,
+        "revoked token cannot reconnect to read instructions"
+    );
+    sqlx::query("DELETE FROM host_member WHERE principal_id = ?")
+        .bind(&member.principal.id.0)
+        .execute(srv.store.write_pool())
+        .await
+        .unwrap();
+    assert!(
+        member
+            .call("rules.get", params)
+            .await
+            .get("error")
+            .is_some(),
+        "removed member"
+    );
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn shared_specialist_project_paths_over_wss_require_guest_membership() {
+    let tree = common::test_tempdir("shared-specialist-wss");
+    let allowed = tree.path().join("allowed");
+    let hidden = tree.path().join("hidden");
+    for dir in [&allowed, &hidden] {
+        let specialists = dir.join(".intent/specialists");
+        std::fs::create_dir_all(&specialists).unwrap();
+        std::fs::write(
+            specialists.join("project-only.md"),
+            "---\nname: Project only\ndescription: Project definition\n---\nProject instructions",
+        )
+        .unwrap();
+    }
+    let srv = start(WsOptions::default()).await;
+    let shared = WorkspaceId::new();
+    let mut row = fixture_workspace(&shared);
+    row.worktree_path = Some(allowed.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&row).await.unwrap();
+    let mut guest = Guest::connect(&srv, &"f8".repeat(32)).await;
+    srv.store
+        .add_workspace_member(&shared, &guest.principal.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let got = guest
+        .call(
+            "specialist.get",
+            json!({"id":"project-only","workspacePath":allowed}),
+        )
+        .await;
+    assert_eq!(got["result"]["specialist"]["name"], "Project only", "{got}");
+    let listed = guest
+        .call(
+            "specialist.list",
+            json!({"workspaceId":shared,"includeProject":true}),
+        )
+        .await;
+    assert!(
+        listed["result"]["specialists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == "project-only"),
+        "{listed}"
+    );
+    let denied = guest
+        .call(
+            "specialist.get",
+            json!({"id":"project-only","workspacePath":hidden}),
+        )
+        .await;
+    assert_eq!(denied["error"]["code"], -32003, "{denied}");
+    let global = guest
+        .call("specialist.get", json!({"id":"implementor"}))
+        .await;
+    assert_eq!(
+        global["result"]["specialist"]["id"], "implementor",
+        "{global}"
+    );
+    srv.store
+        .remove_workspace_member(&shared, &guest.principal.id)
+        .await
+        .unwrap();
+    let denied = guest
+        .call(
+            "specialist.get",
+            json!({"id":"project-only","workspacePath":allowed}),
+        )
+        .await;
+    assert_eq!(denied["error"]["code"], -32003, "{denied}");
+    srv.ws.stop().await;
+}

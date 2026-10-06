@@ -162,6 +162,9 @@ fn logout_with(cli: &dyn GhCli, revoked: Option<SecretString>) -> GhLogoutOutcom
 /// caller's flow proceeds unaffected. Runs the blocking work (secret-store
 /// read + subprocesses) on the blocking pool, bounded by [`GH_SYNC_TIMEOUT`].
 pub async fn sync_token_to_gh(store: FileSecretStore) {
+    if !crate::token::gh_credential_access_allowed() {
+        return;
+    }
     let handle = tokio::task::spawn_blocking(move || {
         let token = store
             .load(SECRET_ACCOUNT)
@@ -212,6 +215,9 @@ pub async fn sync_token_to_gh(store: FileSecretStore) {
 /// unaffected. Runs the blocking work (subprocesses) on the blocking pool,
 /// bounded by [`GH_SYNC_TIMEOUT`].
 pub async fn logout_gh_after_revoke(revoked: Option<String>) {
+    if !crate::token::gh_credential_access_allowed() {
+        return;
+    }
     let revoked = revoked
         .filter(|t| !t.trim().is_empty())
         .map(SecretString::from);

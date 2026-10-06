@@ -67,7 +67,7 @@ fn spawn_serve_inner(data_dir: &Path, extra_env: &[(&str, &str)]) -> GuardedChil
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -78,6 +78,7 @@ fn spawn_serve_inner(data_dir: &Path, extra_env: &[(&str, &str)]) -> GuardedChil
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
     GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 

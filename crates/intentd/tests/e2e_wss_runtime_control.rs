@@ -10,6 +10,9 @@ mod common;
 #[path = "e2e_wss_runtime_control/independent_installations.rs"]
 mod independent_installations;
 
+#[path = "e2e_wss_runtime_control/port_lease.rs"]
+mod port_lease;
+
 use intentd_test_support::GuardedChild;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -87,10 +90,11 @@ fn configure_serve(cmd: &mut Command, data_dir: &Path, listen: &str, env: &[(&st
     for (k, v) in env {
         cmd.env(k, v);
     }
+    common::hermetic_fixture_identity(cmd, data_dir);
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     configure_serve(&mut cmd, data_dir, listen, env);
     GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
@@ -99,7 +103,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedCh
 /// the seeded/settings `server.wsApi.port`, for tests whose assertion IS that
 /// port (a same-port listener restart, a batch's explicit port).
 fn spawn_serve_fixed_port(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
-    let mut cmd = common::serve_command_fixed_port();
+    let mut cmd = common::hermetic_serve_command_fixed_port(data_dir);
+    cmd.env_remove("INTENTD_TCP_PORT");
     configure_serve(&mut cmd, data_dir, listen, env);
     GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
@@ -129,9 +134,9 @@ fn spawn_serve_under_stand_in_sitter(
     spawn_retrying_etxtbsy(&mut cmd, "stand-in sitter wrapper")
 }
 
-/// Builder contract: `common::serve_command` spawns the `intentd` bin's
+/// Builder contract: `common::hermetic_serve_command` spawns the `intentd` bin's
 /// `serve` subcommand with the `INTENTD_TCP_PORT=0` ephemeral-port seam
-/// baked in; `serve_command_fixed_port` omits the seam; a later `.env` on
+/// baked in; `hermetic_serve_command_fixed_port` omits the seam; a later `.env` on
 /// the same `Command` overrides the seam, so deliberate pins keep working.
 #[test]
 fn serve_command_builders_own_the_tcp_port_seam() {
@@ -143,7 +148,8 @@ fn serve_command_builders_own_the_tcp_port_seam() {
             .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
     }
 
-    let cmd = common::serve_command();
+    let dir = common::test_tempdir("port-contract-");
+    let cmd = common::hermetic_serve_command(dir.path());
     assert_eq!(cmd.get_program(), OsStr::new(env!("CARGO_BIN_EXE_intentd")));
     assert_eq!(
         cmd.get_args().collect::<Vec<_>>(),
@@ -156,7 +162,7 @@ fn serve_command_builders_own_the_tcp_port_seam() {
         "serve_command carries the INTENTD_TCP_PORT=0 seam"
     );
 
-    let fixed = common::serve_command_fixed_port();
+    let fixed = common::hermetic_serve_command_fixed_port(dir.path());
     assert_eq!(
         fixed.get_program(),
         OsStr::new(env!("CARGO_BIN_EXE_intentd"))
@@ -171,7 +177,7 @@ fn serve_command_builders_own_the_tcp_port_seam() {
         "serve_command_fixed_port sets no INTENTD_TCP_PORT"
     );
 
-    let mut pinned = common::serve_command();
+    let mut pinned = common::hermetic_serve_command(dir.path());
     pinned.env("INTENTD_TCP_PORT", "7000");
     assert_eq!(
         tcp_port_env(&pinned),
@@ -234,15 +240,29 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     write_half.write_all(line.as_bytes()).await.unwrap();
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(
-        common::test_timeout(Duration::from_secs(30)),
-        reader.read_line(&mut buf),
-    )
+    timeout(common::test_timeout(Duration::from_secs(30)), async {
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            assert!(
+                reader.read_line(&mut buf).await.expect("read uds frame") > 0,
+                "UDS closed before the original RPC response"
+            );
+            let frame: Value = serde_json::from_str(buf.trim_end()).expect("invalid JSON frame");
+            if frame["id"] == json!(id) {
+                return frame;
+            }
+            // Retirement notifications may precede a shutdown reply on this
+            // same connection; a notification is not the request's result.
+            assert!(
+                common::is_repository_retirement_notification(&frame),
+                "unexpected UDS response: {frame}"
+            );
+            eprintln!("UDS RPC {id}: original notification {}", frame["method"]);
+        }
+    })
     .await
     .expect("uds rpc timed out")
-    .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
 /// Poll until new TCP connections to `port` are refused — the listener socket
@@ -956,7 +976,7 @@ async fn wss_system_request_update_signals_the_sitter() {
     let daemon_pid_path = sitter_dir.join("daemon.pid");
 
     // The wrapper shell, not the `intentd` bin, is the spawned program, so
-    // `common::serve_command` cannot build it: carry its seam explicitly.
+    // `common::hermetic_serve_command` cannot build it: carry its seam explicitly.
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let mut daemon = Daemon {
         child: spawn_serve_under_stand_in_sitter(
@@ -2042,6 +2062,16 @@ fn occupied_fixed_wss_port_fails_daemon_boot() {
 
 #[tokio::test]
 async fn first_enable_publishes_assignment_and_fixed_failure_keeps_daemon_alive() {
+    first_enable_scenario(false).await;
+}
+
+#[tokio::test]
+async fn first_enable_port_lease_blocks_competing_fixture_until_recovery() {
+    first_enable_scenario(true).await;
+}
+
+async fn first_enable_scenario(with_contender: bool) {
+    let lease = port_lease::acquire();
     let dir = temp_data_dir();
     std::fs::write(
         dir.path().join("config.toml"),
@@ -2124,6 +2154,11 @@ async fn first_enable_publishes_assignment_and_fixed_failure_keeps_daemon_alive(
         saved
     );
     drop(hog);
+    let contender = if with_contender {
+        Some(port_lease::Contender::start(port).await)
+    } else {
+        None
+    };
     let retried = uds_rpc(
         &socket,
         6,
@@ -2134,4 +2169,46 @@ async fn first_enable_publishes_assignment_and_fixed_failure_keeps_daemon_alive(
     assert!(retried.get("error").is_none(), "{retried}");
     let status = uds_rpc(&socket, 7, "system.status", json!({})).await;
     assert_eq!(status["result"]["port"], port);
+    if let Some(contender) = contender {
+        drop(daemon);
+        drop(lease);
+        contender.finish(port).await;
+    }
+}
+
+#[test]
+fn stand_in_sitter_configuration_restores_private_identity_after_overrides() {
+    use std::ffi::OsStr;
+    let dir = common::test_tempdir("sitter-wrapper-contract-");
+    let mut cmd = Command::new("never-executed-wrapper");
+    configure_serve(
+        &mut cmd,
+        dir.path(),
+        "uds",
+        &[
+            ("GITHUB_TOKEN", "synthetic-host-token"),
+            ("GH_TOKEN", "synthetic-host-token"),
+            ("GH_CONFIG_DIR", "synthetic-host-config"),
+            ("INTENTD_SECRETS_FILE", "synthetic-host-secrets"),
+            ("INTENTD_TCP_PORT", "54321"),
+        ],
+    );
+    let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        assert_eq!(environment.get(OsStr::new(key)), Some(&None), "{key}");
+    }
+    for (key, path) in [
+        ("GH_CONFIG_DIR", dir.path().join("gh-config")),
+        ("INTENTD_SECRETS_FILE", dir.path().join("secrets.json")),
+    ] {
+        assert_eq!(
+            environment.get(OsStr::new(key)),
+            Some(&Some(path.as_os_str())),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        environment.get(OsStr::new("INTENTD_TCP_PORT")),
+        Some(&Some(OsStr::new("54321")))
+    );
 }

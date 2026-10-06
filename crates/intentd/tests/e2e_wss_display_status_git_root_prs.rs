@@ -150,6 +150,7 @@ fn workspace(id: &WorkspaceId, title: &str) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,

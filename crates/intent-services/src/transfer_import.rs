@@ -534,6 +534,12 @@ impl Services {
         // Boot hydration may have cached the reclaimed orphan definitions.
         // Refresh only imported IDs, after commit so a failed import leaves
         // both the durable rows and their live definitions untouched.
+        // Resolve imported monitor deadlines/results before compact run recovery
+        // manufactures an interruption. No source process is resumed here.
+        if let Err(error) = self.script_manager().recover_monitors().await {
+            tracing::warn!(%error, "post-import script monitor recovery failed");
+        }
+        self.start_script_monitor_maintenance();
         if let Some((_, scripts)) = outcome.rows.iter().find(|(table, _)| table == "script") {
             let manager = self.script_manager();
             for script in scripts {
@@ -1106,6 +1112,7 @@ fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value
         created_at: now.clone(),
         updated_at: now,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: s("path"),
         repository_path: s("repository_path"),
@@ -1205,6 +1212,24 @@ fn validate_row_scope(
         for row in objects {
             let ok = match table.as_str() {
                 "workspace" => field(row, "id") == workspace_id.0,
+                "script_monitor" => {
+                    let monitor: intent_core::ScriptMonitor =
+                        serde_json::from_str(row["row_json"].as_str().unwrap_or_default())
+                            .map_err(|e| {
+                                Error::InvalidParams(format!(
+                                    "invalid imported script monitor: {e}"
+                                ))
+                            })?;
+                    field(row, "workspace_id") == workspace_id.0
+                        && monitor.workspace_id == *workspace_id
+                        && monitor.monitor_id == field(row, "id")
+                        && monitor.agent_id.as_str() == field(row, "agent_id")
+                        && monitor.script_id == field(row, "script_id")
+                        && monitor.run_id == field(row, "run_id")
+                        && monitor.state == field(row, "state")
+                        && (session_ids.contains(monitor.agent_id.as_str())
+                            || (monitor.state != "active" && row["wake_state"] == "suppressed"))
+                }
                 "agent_message" | "agent_usage_cell" | "agent_queue" => {
                     session_ids.contains(field(row, "agent_id").as_str())
                 }
@@ -1401,6 +1426,8 @@ fn transform_rows(
                 for object in &mut objects {
                     let map = expect_object(&table, object)?;
                     rewrite_path(map, "cwd", &ws_dir);
+                    // Source process ownership cannot cross daemon hosts.
+                    map.insert("was_running".into(), serde_json::json!(0));
                 }
             }
             _ => {}
@@ -1506,6 +1533,39 @@ mod tests {
             .find(|(t, _)| t == table)
             .unwrap_or_else(|| panic!("table {table} missing from outcome"))
             .1
+    }
+
+    #[test]
+    fn imported_script_monitor_scope_checks_owner_and_embedded_identity() {
+        let monitor = serde_json::json!({"monitorId":"m", "workspaceId":ws(), "agentId":"a",
+            "scriptId":"s", "runId":"r", "scriptName":"script", "mode":"command", "state":"active",
+            "createdAt":"2026-10-01T00:00:00Z", "expiresAt":"2026-10-01T01:00:00Z"});
+        let row = serde_json::json!({"id":"m", "workspace_id":ws(), "agent_id":"a", "script_id":"s",
+            "run_id":"r", "state":"active", "row_json":monitor.to_string(), "wake_state":"none"});
+        let mut rows = vec![
+            (
+                "agent_session".into(),
+                vec![serde_json::json!({"id":"a", "workspace_id":ws()})],
+            ),
+            ("script_monitor".into(), vec![row.clone()]),
+        ];
+        validate_row_scope(&rows, &ws()).unwrap();
+        rows[1].1[0]["agent_id"] = serde_json::json!("foreign");
+        assert!(validate_row_scope(&rows, &ws()).is_err());
+        rows[1].1[0] = row.clone();
+        let mut forged = monitor.clone();
+        forged["workspaceId"] = serde_json::json!("foreign");
+        rows[1].1[0]["row_json"] = serde_json::json!(forged.to_string());
+        assert!(validate_row_scope(&rows, &ws()).is_err());
+        rows[1].1[0] = row;
+        rows[0].1.clear();
+        assert!(validate_row_scope(&rows, &ws()).is_err());
+        let mut cancelled = monitor;
+        cancelled["state"] = serde_json::json!("cancelled");
+        rows[1].1[0]["state"] = serde_json::json!("cancelled");
+        rows[1].1[0]["row_json"] = serde_json::json!(cancelled.to_string());
+        rows[1].1[0]["wake_state"] = serde_json::json!("suppressed");
+        validate_row_scope(&rows, &ws()).unwrap();
     }
 
     /// Workspace paths are re-rooted under `<target_root>/<workspaceId>/`,
@@ -2197,8 +2257,45 @@ mod tests {
         ]
     }
 
-    async fn selection_fixture() -> (TempDir, TempDir, tempfile::TempDir, Services) {
+    struct SelectionFixture {
+        root: TempDir,
+        _env: crate::agent_manager::tests::EnvGuard,
+    }
+
+    impl Drop for SelectionFixture {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                assert!(
+                    !self.root.0.join("bin/codex.launched").exists(),
+                    "import selection must not launch the installed CLI"
+                );
+            }
+        }
+    }
+
+    async fn selection_fixture() -> (SelectionFixture, TempDir, tempfile::TempDir, Services) {
         let root = TempDir::new("import-selection");
+        // Codex availability requires its canonical installed CLI, even when
+        // the legacy adapter override below is present. Import only inspects
+        // executable paths and cached catalogs; it must not run the CLI.
+        let bin = root.0.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let cli = bin.join("codex");
+            std::fs::write(&cli, "#!/bin/sh\n: > \"$0.launched\"\nexit 91\n").unwrap();
+            std::fs::set_permissions(cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        std::fs::write(bin.join("codex.exe"), b"discovery-only fixture").unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let path = std::env::join_paths(paths).unwrap();
+        let env =
+            crate::agent_manager::tests::EnvGuard::set_all(&[("PATH", path.to_str().unwrap())]);
         let assets = TempDir::new("import-selection-assets");
         let registry =
             std::sync::Arc::new(crate::SettingsRegistry::load(root.0.join("config.toml")).unwrap());
@@ -2235,7 +2332,7 @@ mod tests {
                 crate::model_catalog::ModelCatalogCache::now_ms(),
             );
         }
-        (root, assets, db_dir, svc)
+        (SelectionFixture { root, _env: env }, assets, db_dir, svc)
     }
 
     fn seed_selection_catalog(svc: &Services, provider: &str, model: &str, now: u64) {

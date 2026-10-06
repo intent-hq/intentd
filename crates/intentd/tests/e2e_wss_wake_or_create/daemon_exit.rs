@@ -740,6 +740,46 @@ fn response(value: &Value, id: &str) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct ShutdownFrames {
+    pending: Vec<u8>,
+    received: usize,
+    matched: bool,
+}
+
+impl ShutdownFrames {
+    fn push(&mut self, bytes: &[u8], id: &str) -> io::Result<bool> {
+        self.received = self.received.saturating_add(bytes.len());
+        if self.received > 4096 {
+            return Err(invalid("shutdown response exceeds bound"));
+        }
+        self.pending.extend_from_slice(bytes);
+        while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let value: Value =
+                serde_json::from_slice(&self.pending[..end]).map_err(io::Error::other)?;
+            if super::common::is_repository_retirement_notification(&value) {
+                // Validate every already-received frame, including notifications
+                // after the response. They confer no process-exit evidence.
+            } else {
+                if self.matched {
+                    return Err(invalid("extra shutdown response data"));
+                }
+                response(&value, id)?;
+                self.matched = true;
+            }
+            self.pending.drain(..=end);
+        }
+        Ok(self.matched && self.pending.is_empty())
+    }
+
+    fn closed(&self) -> io::Result<()> {
+        if !self.matched || !self.pending.is_empty() {
+            return Err(invalid("shutdown closed before a complete response stream"));
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn shutdown(
     path: &Path,
     pid: u32,
@@ -825,35 +865,113 @@ pub(super) fn shutdown(
             Err(error) => return Err(error),
         }
     }
-    let mut bytes = Vec::new();
+    let mut frames = ShutdownFrames::default();
     loop {
         remaining(deadline)?;
         let mut buffer = [0; 1024];
-        match stream.read(&mut buffer) {
-            Ok(0) => return Err(invalid("shutdown closed before response")),
-            Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+        let count = match stream.read(&mut buffer) {
+            Ok(0) => return frames.closed(),
+            Ok(count) => count,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 readable(stream.as_raw_fd(), deadline)?;
                 continue;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
-        }
-        if bytes.len() > 4096 {
-            return Err(invalid("shutdown response exceeds bound"));
-        }
-        if let Some(end) = bytes.iter().position(|byte| *byte == b'\n') {
-            events.push(json!({"event": "ShutdownResponse", "bytes": bytes}));
-            if end + 1 != bytes.len() {
-                return Err(invalid("extra shutdown response data"));
-            }
-            let value: Value = serde_json::from_slice(&bytes[..end]).map_err(io::Error::other)?;
-            response(&value, &id)?;
+        };
+        events.push(json!({"event": "ShutdownBytes", "bytes": &buffer[..count]}));
+        if frames.push(&buffer[..count], &id)? {
             remaining(deadline)?;
             events.push(json!({"event": "ShutdownAccepted", "id": id, "peer": credentials}));
             return Ok(());
         }
     }
+}
+
+#[test]
+fn shutdown_frames_preserve_response_and_notification_boundaries() {
+    let ack = json!({"jsonrpc":"2.0","id":"owned","result":{"ok":true,"stopping":true}});
+    let notices = [
+        ("workspace.repositoryContext.retired", "lifetimeIds"),
+        ("workspace.repositorySelection.retired", "selectionIds"),
+        ("accept-changes.retired", "operationIds"),
+        ("sourceControl.read.retired", "readLifetimeIds"),
+    ]
+    .map(|(method, ids)| {
+        json!({"jsonrpc":"2.0","method":method,"params":{
+        ids:["original"],"sequence":u64::MAX.to_string(),"allRetired":true,"terminal":true}})
+    });
+    let wire = |values: &[Value]| {
+        use std::fmt::Write as _;
+        values
+            .iter()
+            .fold(String::new(), |mut bytes, value| {
+                writeln!(bytes, "{value}").unwrap();
+                bytes
+            })
+            .into_bytes()
+    };
+    for values in [
+        vec![ack.clone()],
+        vec![
+            ack.clone(),
+            notices[0].clone(),
+            notices[1].clone(),
+            notices[2].clone(),
+            notices[3].clone(),
+        ],
+        vec![
+            notices[3].clone(),
+            notices[0].clone(),
+            ack.clone(),
+            notices[2].clone(),
+            notices[1].clone(),
+        ],
+    ] {
+        let bytes = wire(&values);
+        for split in 0..=bytes.len() {
+            let mut frames = ShutdownFrames::default();
+            frames.push(&bytes[..split], "owned").unwrap();
+            assert!(frames.push(&bytes[split..], "owned").unwrap());
+            frames.closed().unwrap();
+        }
+    }
+    let mut partial = ShutdownFrames::default();
+    assert!(!partial
+        .push(format!("{ack}\n{{").as_bytes(), "owned")
+        .unwrap());
+    assert!(
+        partial.closed().is_err(),
+        "a started suffix cannot be discarded"
+    );
+    assert!(!ShutdownFrames::default()
+        .push(&wire(&notices), "owned")
+        .unwrap());
+    let mut missing = ShutdownFrames::default();
+    missing.push(&wire(&notices), "owned").unwrap();
+    assert!(missing.closed().is_err());
+    assert!(ShutdownFrames::default()
+        .push(&[b' '; 4097], "owned")
+        .is_err());
+    let mut bad_notice = notices[0].clone();
+    bad_notice["params"]["sequence"] = json!("01");
+    let mut bad_ids = notices[0].clone();
+    bad_ids["params"]["lifetimeIds"] = json!([7]);
+    for bad in [
+        ack.clone(),
+        json!({"jsonrpc":"2.0","id":"foreign","result":{"ok":true,"stopping":true}}),
+        json!({"jsonrpc":"2.0","id":"owned","error":null,"result":{"ok":true,"stopping":true}}),
+        json!({"jsonrpc":"2.0","method":"unknown","params":{}}),
+        bad_notice,
+        bad_ids,
+    ] {
+        assert!(ShutdownFrames::default()
+            .push(&wire(&[ack.clone(), bad]), "owned")
+            .is_err());
+    }
+    assert!(ShutdownFrames::default()
+        .push(b"{invalid}\n", "owned")
+        .is_err());
 }
 
 pub(super) fn normal(status: ExitStatus) -> bool {

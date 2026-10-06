@@ -18,6 +18,20 @@ const SCRIPT_COLUMNS: &str = "id, workspace_id, name, command, cwd, env, mode, c
     source, auto_start, created_at, updated_at, purpose, archived_at, last_run";
 
 impl Store {
+    /// Whether this workspace has ever held a script definition. Unlike row
+    /// membership, this remains true after the final script is removed.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database read fails.
+    pub async fn workspace_scripts_initialized(&self, workspace_id: &WorkspaceId) -> Result<bool> {
+        sqlx::query_scalar::<_, bool>("SELECT scripts_initialized FROM workspace WHERE id = ?")
+            .bind(workspace_id.as_str())
+            .fetch_optional(self.read_pool())
+            .await
+            .map(|value| value.unwrap_or(false))
+            .map_err(|e| Error::Internal(format!("get scripts initialization failed: {e}")))
+    }
+
     /// Resolve a script's durable scope without reading its command or environment.
     ///
     /// # Errors
@@ -107,6 +121,41 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_scripts(&self, scripts: &[Script]) -> Result<()> {
+        self.upsert_scripts_inner(scripts, None).await.map(|_| ())
+    }
+
+    /// Seed defaults only if no definition has ever been persisted in this
+    /// workspace. The initialization claim and inserts commit together, so a
+    /// stale first-use reader cannot undo a concurrent create followed by purge.
+    /// Empty defaults do not initialize the workspace. Returns whether seeded.
+    ///
+    /// # Errors
+    /// Returns `Error::InvalidParams` for a script in another workspace, or
+    /// `Error::Internal` if the transaction fails (the claim is rolled back).
+    pub async fn bootstrap_scripts(
+        &self,
+        workspace_id: &WorkspaceId,
+        scripts: &[Script],
+    ) -> Result<bool> {
+        if scripts.is_empty() {
+            return Ok(false);
+        }
+        if scripts
+            .iter()
+            .any(|s| s.workspace_id != workspace_id.as_str())
+        {
+            return Err(Error::InvalidParams(
+                "bootstrap scripts workspace mismatch".into(),
+            ));
+        }
+        self.upsert_scripts_inner(scripts, Some(workspace_id)).await
+    }
+
+    async fn upsert_scripts_inner(
+        &self,
+        scripts: &[Script],
+        initialize_workspace: Option<&WorkspaceId>,
+    ) -> Result<bool> {
         // Per-row bind count derived from SCRIPT_COLUMNS so the placeholder
         // row and chunk math cannot drift if the persisted set changes.
         // 2048 rows × 12 binds = 24576, well under the 32766 cap; one chunk
@@ -119,6 +168,21 @@ impl Store {
             .begin()
             .await
             .map_err(|e| Error::Internal(format!("bulk upsert scripts begin failed: {e}")))?;
+        if let Some(workspace_id) = initialize_workspace {
+            let claimed = sqlx::query(
+                "UPDATE workspace SET scripts_initialized = 1 WHERE id = ? AND scripts_initialized = 0",
+            )
+            .bind(workspace_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("claim script initialization failed: {e}")))?;
+            if claimed.rows_affected() == 0 {
+                tx.rollback().await.map_err(|e| {
+                    Error::Internal(format!("script initialization rollback failed: {e}"))
+                })?;
+                return Ok(false);
+            }
+        }
         for chunk in scripts.chunks(ROWS_PER_STATEMENT) {
             let placeholders = vec![row.as_str(); chunk.len()].join(",");
             let sql =
@@ -158,7 +222,7 @@ impl Store {
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("bulk upsert scripts commit failed: {e}")))?;
-        Ok(())
+        Ok(true)
     }
 
     /// Delete a script definition by `id` (FE `removeScript`). Returns whether
@@ -262,8 +326,8 @@ impl Store {
     /// # Errors
     /// Returns a database error or `NotFound` for a missing/foreign definition.
     pub async fn admit_script_run(&self, ws: &WorkspaceId, id: &str, token: &str) -> Result<()> {
-        let result = sqlx::query("UPDATE script SET pending_run_id = ?, pending_started_at = NULL, was_running = 1 WHERE workspace_id = ? AND id = ? AND mode = 'command'")
-            .bind(token).bind(ws.as_str()).bind(id).execute(self.write_pool()).await
+        let result = sqlx::query("UPDATE script SET pending_run_id = ?, latest_run_id = ?, latest_run_result = NULL, pending_started_at = NULL, was_running = CASE WHEN mode = 'command' THEN 1 ELSE was_running END WHERE workspace_id = ? AND id = ?")
+            .bind(token).bind(token).bind(ws.as_str()).bind(id).execute(self.write_pool()).await
             .map_err(|e| Error::Internal(format!("admit script run failed: {e}")))?;
         if result.rows_affected() == 0 {
             return Err(Error::NotFound(format!("script {id}")));
@@ -305,7 +369,8 @@ impl Store {
 
     /// Atomically settle the matching admission and retire explicit one-offs.
     /// A replaced, removed, already settled or newer run is an unchanged false.
-    /// Recovery keeps the legacy lost/dismiss marker, but consumes the token.
+    /// Recovery keeps the command lost marker or existing service restore marker,
+    /// but never recreates a dismissed service marker; it consumes the token.
     /// # Errors
     /// Returns a database/encoding error; neither result nor archive is changed.
     pub async fn settle_script_run(
@@ -317,8 +382,8 @@ impl Store {
         recovery: bool,
     ) -> Result<bool> {
         let encoded = serde_json::to_string(result).map_err(|e| Error::Internal(e.to_string()))?;
-        let result = sqlx::query("UPDATE script SET last_run = ?, archived_at = CASE WHEN purpose = 'oneOff' THEN coalesce(archived_at, ?) ELSE archived_at END, pending_run_id = NULL, pending_started_at = NULL, was_running = ? WHERE workspace_id = ? AND id = ? AND pending_run_id = ? AND mode = 'command'")
-            .bind(encoded).bind(&result.stopped_at).bind(recovery).bind(ws.as_str()).bind(id).bind(token)
+        let result = sqlx::query("UPDATE script SET last_run = CASE WHEN mode = 'command' THEN ? ELSE last_run END, latest_run_result = ?, archived_at = CASE WHEN purpose = 'oneOff' THEN coalesce(archived_at, ?) ELSE archived_at END, pending_run_id = NULL, pending_started_at = NULL, was_running = CASE WHEN ? THEN CASE WHEN mode = 'command' THEN 1 ELSE was_running END ELSE 0 END WHERE workspace_id = ? AND id = ? AND pending_run_id = ?")
+            .bind(&encoded).bind(&encoded).bind(&result.stopped_at).bind(recovery).bind(ws.as_str()).bind(id).bind(token)
             .execute(self.write_pool()).await.map_err(|e| Error::Internal(format!("settle script run failed: {e}")))?;
         Ok(result.rows_affected() != 0)
     }
@@ -329,7 +394,7 @@ impl Store {
     pub async fn pending_script_runs(
         &self,
     ) -> Result<Vec<(WorkspaceId, String, String, Option<String>)>> {
-        let rows = sqlx::query("SELECT workspace_id, id, pending_run_id, pending_started_at FROM script WHERE pending_run_id IS NOT NULL AND mode = 'command'")
+        let rows = sqlx::query("SELECT workspace_id, id, pending_run_id, pending_started_at FROM script WHERE pending_run_id IS NOT NULL")
             .fetch_all(self.read_pool()).await.map_err(|e| Error::Internal(format!("read pending script runs failed: {e}")))?;
         Ok(rows
             .iter()

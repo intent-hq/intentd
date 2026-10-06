@@ -50,9 +50,14 @@ impl ScriptManager {
             ScriptRunOutcome::Succeeded
         };
         m.pending_result = Some(ScriptLastRun {
+            run_id: m.run_id.clone(),
             outcome,
             exit_code: if cancelled && m.state.started_at.is_none() {
                 None
+            } else if cancelled {
+                m.state
+                    .exit_code
+                    .filter(|code| *code != EXIT_CODE_UNOBSERVABLE)
             } else {
                 m.state.exit_code
             },
@@ -144,9 +149,18 @@ impl ScriptManager {
         let Some((token, result)) = pending else {
             return;
         };
+        let _monitor_lane = self.locks.monitor_lane.lock().await;
+        if let Err(error) = self.reconcile_script_monitors_locked(ws, id).await {
+            tracing::warn!(%error,"monitor reconciliation failed");
+            return;
+        }
+        let preserve_marker = self.scripts.lock().unwrap().get(&key).is_some_and(|m| {
+            m.def.mode == intent_core::ScriptMode::Service
+                && m.state.previously_running == Some(true)
+        });
         match self
             .store
-            .settle_script_run(ws, id, &token, &result, false)
+            .settle_script_run(ws, id, &token, &result, preserve_marker)
             .await
         {
             Ok(true) => {
@@ -161,7 +175,9 @@ impl ScriptManager {
                             .archived_at
                             .get_or_insert_with(|| result.stopped_at.clone());
                     }
-                    m.def.last_run = Some(result);
+                    if m.def.mode == intent_core::ScriptMode::Command {
+                        m.def.last_run = Some(result);
+                    }
                     m.run_id = None;
                     m.pending_result = None;
                 }
@@ -171,6 +187,9 @@ impl ScriptManager {
                 tracing::warn!(script = %id, %error, "script result persistence failed; leaving active");
                 return;
             }
+        }
+        if let Err(error) = self.reconcile_script_monitors_locked(ws, id).await {
+            tracing::warn!(%error,"monitor result failed");
         }
         self.emit_changed_locked(ws, id, "updated").await;
     }
@@ -205,6 +224,7 @@ impl ScriptManager {
                 continue;
             }
             let result = ScriptLastRun {
+                run_id: Some(token.clone()),
                 outcome: ScriptRunOutcome::Interrupted,
                 exit_code: Some(EXIT_CODE_UNOBSERVABLE),
                 started_at,

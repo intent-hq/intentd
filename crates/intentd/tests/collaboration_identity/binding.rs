@@ -112,7 +112,7 @@ async fn binding_survives(change: Change) {
     }
     let changes = match change {
         Change::Host | Change::Restart => json!([
-            {"path":"sourceControl.gitlab.host","value":b.base_uri},
+            {"path":"sourceControl.gitlab.host","value":intent_sourcecontrol::GitlabHost::parse(&b.base_uri).unwrap().host()},
             {"path":"sourceControl.gitlab.oauthClientId","value":"application-b"},
             {"path":"sourceControl.gitlab.apiBaseUrl","value":b.base_uri}
         ]),

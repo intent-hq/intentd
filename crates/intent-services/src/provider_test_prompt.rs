@@ -110,6 +110,14 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
             format!("provider \"{provider_id}\" does not support the live test prompt"),
         ));
     }
+    if let Some(api) = api {
+        if let Err(reason) = api
+            .provider_configuration_preflight(provider_id.into())
+            .await
+        {
+            return Ok(failure("spawn-failed", reason.to_string()));
+        }
+    }
     // Binary resolution mirrors `agent.completeOnce`: the `providers.paths`
     // override is keyed by the provider that OWNS the primary binary, and an
     // empty value counts as unset.
@@ -179,22 +187,19 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
         cmd = cmd.env(key, value);
     }
     let cmd = crate::complete_ops::apply_one_shot_launch_policy(provider, cmd);
-    // codex loads MCP servers from its inherited CODEX_HOME regardless of the
-    // empty ACP `mcpServers` list; the probe child gets the same isolated
-    // throwaway home the one-shot completion path uses — a test prompt must
-    // never start user-configured MCP servers.
-    let (cmd, _codex_home) = if provider_id == "codex" {
-        match crate::provider_models::with_isolated_codex_home(cmd) {
-            Ok((cmd, home)) => (cmd, Some(home)),
-            Err(e) => {
-                return Ok(failure(
-                    "spawn-failed",
-                    format!("codex: failed to create isolated CODEX_HOME: {e}"),
-                ))
-            }
-        }
-    } else {
-        (cmd, None)
+    let cmd = match cmd.prepare_installed().await {
+        Ok(cmd) => cmd,
+        Err(reason) => return Ok(failure("not-installed", reason)),
+    };
+    let cmd = match cmd
+        .prepare_profile(
+            crate::provider_profiles::LaunchPurpose::PromptTest,
+            Vec::new(),
+        )
+        .await
+    {
+        Ok(cmd) => cmd,
+        Err(reason) => return Ok(failure("spawn-failed", reason)),
     };
     let outcome = run_one_shot_acp(
         Some((
@@ -218,7 +223,7 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
         cmd,
         TEST_PROMPT,
         crate::complete_ops::config_option_model(provider, model),
-        None,
+        crate::complete_ops::one_shot_session_shape(provider_id, TEST_PROMPT, None).1,
         TEST_PROMPT_TIMEOUT,
         &OneShotEffort::default(),
     )

@@ -70,18 +70,31 @@ needs. Fields that matter most:
   `auth_error_patterns` (stderr matching), `login_command_hint`, `login_docs_url`.
 - **npx fields** — `fallback_npx_package` (spawn `npx -y <pkg>` only when no local binary
   resolves) vs `npx_only_package` (spawn via npx with a version we pin, skipping
-  auto-discovery entirely; claude-code, codex, pi). The one npx-only exception, for providers
-  that opt in via `npx_only_honors_path_override` (claude-code), is a valid
-  `providers.paths[id]` override (absolute + executable): it is exec'd directly in place
-  of the pinned npx spawn (`resolve_npx_only_override`, intent-hq/monorepo#4352) and the
-  same override drives discovery's `installed`, the one-shot / test-prompt launches, and
-  the claude-code ACP auth fallback probe, so every launch surface runs the same adapter
-  (the model-catalog fetch stays on the pinned package). pi does not opt in: its adapter
-  also depends on the version-gated real `pi` CLI, so it keeps pinned-npx-only
-  semantics. Codex also ignores overrides so every entrypoint uses the
-  compatible runtime and policy described in §6. Resolution:
-  `resolve_npx_only` in `crates/intent-services/src/agent_manager.rs` and the
-  `npx_fallback_*` fields on `SpawnOptions` (`crates/intent-acp/src/spawn.rs`).
+  adapter auto-discovery entirely; claude-code, codex, pi). Codex and Claude always
+  use their reviewed adapter pins with the execution host's canonical `codex` / `claude`
+  executable, resolved from enhanced PATH. Both the installed CLI and npx are required;
+  there is no bundled-runtime fallback. Legacy `providers.paths.codex` and
+  `providers.paths["claude-code"]` adapter overrides are ignored on all launch/catalog
+  paths, with one warning per provider per daemon process. Remove those settings and
+  install the canonical CLI on the execution host. `CODEX_PATH` and
+  `CLAUDE_CODE_EXECUTABLE` are daemon-owned outputs, not runtime selectors.
+  `npx_only_honors_path_override` remains available to other registry entries that
+  deliberately opt in. pi retains pinned-npx-only semantics and its secondary CLI check.
+  See `installed_cli` in intent-providers and intent-services and `resolve_npx_only`
+  in `crates/intent-services/src/agent_manager.rs`.
+
+  Installed model catalogs use adapter + runtime version/metadata + auth/config identity.
+  Fresh bounded version checks run with the launch environment at refresh/launch boundaries;
+  publication rechecks that identity after the probe. Cache-only readers never start a CLI.
+  Ordinary catalog requests reuse identity observations for up to one minute; explicit
+  refresh forces a new observation. Last-good fallback belongs only to the same identity,
+  and installed-provider entries stay in memory because auth fingerprints are process-private.
+  A cold daemon restart has no installed-provider last-good list: its first catalog read
+  must probe again. Login-shell PATH and captured credentials retain their daemon-restart
+  refresh behavior. When changing either adapter contract, run the opt-in
+  `e2e_wss_installed_cli` test with the actual packages (prerequisites in README.md).
+  That test doubles only the installed CLI protocol; it does not replace the ACP adapter.
+  Keep live-account and real-platform evidence separate from this controlled proof.
 
 **Binary discovery** — `find_provider_binary` (`crates/intent-providers/src/discover.rs`)
 resolves in precedence order: (1) explicit `providers.paths[id]` setting (must be absolute
@@ -219,8 +232,8 @@ certainly needs new normalization arms:
     Installed native or JS `codex-acp` binaries and `providers.paths.codex`
     overrides are bypassed.
     After all environment merges, the shared `CODEX_SUBAGENT_POLICY_CONFIG`
-    policy (`crates/intent-providers/src/config.rs`) removes
-    `CODEX_PATH` and replaces `CODEX_CONFIG` with
+    policy (`crates/intent-providers/src/config.rs`) sets `CODEX_PATH` to the
+    resolved installed CLI and replaces `CODEX_CONFIG` with
     `{"agents":{"enabled":false},"features":{"multi_agent_v2":false}}`.
     Both values are JSON booleans: the V2 feature setting can otherwise
     override the agents setting. Native `-c agents.enabled=false` is not a
@@ -228,8 +241,8 @@ certainly needs new normalization arms:
     with a native adapter; missing prerequisites produce an actionable error.
     The unchanged frontend may still offer Codex on a native-only host; the
     daemon launch error explains the missing toolchain. The adapter package
-    is pinned, but its Codex dependency permits patch updates, so validation
-    records the actual installed Codex version. Existing children acquire
+    stays pinned while the independently installed Codex can be upgraded; validation
+    records its actual version. Existing children acquire
     this policy on their next normal restart or relaunch. New, recreated,
     and resumed sessions must keep Intent tools and prior conversation
     context; cross-adapter continuity requires live resume or history-replay

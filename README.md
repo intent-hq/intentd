@@ -381,33 +381,155 @@ Paths are resolved via the `directories` crate and can be overridden with the
 `INTENTD_DATA_DIR` and `INTENTD_CONFIG` environment variables. The data dir holds the SQLite
 database (`intentd.db`) and the socket (`intentd.sock`).
 
+### Installed Codex and Claude CLIs
+
+Install and authenticate the canonical `codex` or `claude` executable on the
+execution host. In remote workspaces this is the daemon/worker host, not the desktop.
+Intent resolves executable files through PATH, supported installer/version-manager
+locations and captured login-shell PATH; aliases and shell functions do not qualify.
+Node.js and npx remain prerequisites for the pinned upstream ACP adapters.
+
+Upgrade the installed CLI and refresh the model picker to discover its current model
+advertisements. Intent keeps the adapter pin fixed and supplies the resolved absolute
+CLI path through `CODEX_PATH` or `CLAUDE_CODE_EXECUTABLE`. Inherited overrides cannot
+redirect it. Missing or incompatible CLIs fail explicitly; bundled adapter dependencies
+never supply a fallback runtime or model. A future CLI protocol change can still require
+an adapter update. Catalog membership does not establish account entitlement.
+
+Provider authentication/configuration and network environment are preserved. Captured
+login-shell values are below inherited daemon values (including empty values), then
+trusted daemon overrides and the selected runtime/policy take precedence. Codex custom
+credential variables referenced by its configuration are included. Login-shell capture
+is cached: restart the daemon after changing shell-only environment or PATH. Intent
+always enforces its Codex native-subagent denial and Claude tool restrictions.
+
+Codex model probes use private temporary profiles, copy supported auth/routing
+configuration, and exclude user MCP servers/hooks. Claude model probes retain user
+settings for authentication (`settingSources: ["user"]`), disable tools (`tools: []`),
+and enforce `strictMcpConfig: true` with no MCP servers; they do not strip user hooks.
+Neither provider's model probes send prompts or initiate login. The installed executable,
+bounded version observation, adapter pin and private auth/config fingerprint identify
+each cached catalog. Explicit refresh observes changes even behind
+an unchanged CLI wrapper. Last-good fallback is confined to that identity. Codex/Claude
+catalogs are memory-only; the first request after daemon restart must probe again.
+Catalog fingerprinting inspects relevant credential/configuration files with a 1 MiB
+limit per file. An unreadable or oversized file makes catalog discovery unavailable
+without reusing a previous account's models; these catalog inspection limits do not
+block ordinary installed-CLI launches.
+Existing sessions retain their process; new/recreated launches resolve the installed CLI
+again. Resuming across upgrades remains subject to adapter/CLI compatibility.
+
+The opt-in functional test runs the actual pinned adapters against synthetic installed
+CLIs over authenticated, fingerprint-pinned WSS. It replaces only CLI executables, checks
+catalog refresh, selected-model turns and same-process continuity across CLI replacements,
+and never uses provider accounts. Prepare the exact packages named by `crates/intent-providers/src/config.rs` outside the checkout,
+including their optional dependencies. Set `INTENTD_TEST_CODEX_ADAPTER` and
+`INTENTD_TEST_CLAUDE_ADAPTER` to their package directories (containing `package.json`), then:
+
+```bash
+cargo nextest run -p intentd --test e2e_wss_installed_cli --run-ignored all --test-threads 1
+```
+
+This Unix fixture requires Node and Python 3. It excludes host tracing only for its
+synthetic processes; production timeouts remain unchanged. It is adapter compatibility
+proof with controlled CLIs, not a live account or cross-platform certification.
+
+### Provider MCP and skill ownership
+
+Intent discovers project MCP configuration and skills, then prepares provider-specific
+launch settings using unmodified upstream adapters. This is best-effort control of
+native discovery, not complete isolation from host configuration. Normal agent tools
+remain available. Completion, prompt-test, enhancement and model-probe launches receive
+no MCP servers and retain their existing tool restrictions; native loading limitations
+below still apply. Configuration diagnostics appear in daemon logs with the provider and
+a redacted diagnostic code/message.
+
+Project MCP discovery scans from the workspace root to the launch directory, bounded
+to 64 directories and 1 MiB per regular configuration file. Supported sources are
+`.cursor/mcp.json`, `.codex/config.toml`, `.factory/mcp.json`, `.grok/config.toml`,
+`opencode.json[c]`, `.opencode/opencode.json[c]`, `.augment/settings.json`,
+`.augment/settings.local.json`, and `.mcp.json`. Within the provider-specific tier,
+nearer directories win; the order above breaks ties, with JSONC above JSON and Auggie
+local above shared settings. Common `.mcp.json` entries override that tier. Same-name
+entries replace whole entries, not individual fields. Explicit Intent settings take
+precedence over project preferences; global/workspace disables apply after merging.
+Turning off `mcp.enableUserServers` also blocks saved server IDs and name aliases
+from project imports, while unrelated project-only entries remain available.
+`workspace-mcp` is reserved and cannot be disabled by saved user-server aliases.
+An explicit global or workspace disable of `workspace-mcp` remains authoritative.
+Unsupported semantics, including OpenCode restrictions
+that cannot be preserved and the unaudited `.pi/mcp.json` convention, are diagnosed
+instead of silently translated. Configure these servers and their restrictions in
+Intent. Discovery does not run credential helpers, expand shell commands, fetch remote
+includes or import personal CLI MCP files.
+
+The skill catalog includes these workspace roots, from lowest to highest precedence:
+`.agent/skills`, `.agents/skills`, `.codex/skills`, `.factory/skills`, `.grok/skills`,
+`.opencode/skill`, `.opencode/skills`, `.pi/skills`, `.cortex/skills`, `.claude/skills`,
+`.augment/skills`, and `.intent/skills`. Project skills override both implicit
+personal sources: `~/.agents/skills` and the higher-priority `~/.intent/skills`.
+To share a personal skill with Intent, place it in either directory or explicitly
+link it from an approved root; provider-specific home skill directories are not
+automatically imported. Explicit links retain bounded, canonical deduplication,
+including links outside the workspace. This compatibility
+does not make skill discovery a filesystem sandbox. Discovery and watchers use the
+same roots, including roots created after the first scan.
+
+Provider behavior and remaining limits:
+
+| Provider | Controls and known limitations |
+| --- | --- |
+| Claude Code | Strict MCP configuration, retained user settings, and disabled native skill commands. Synthetic file-based MCP/skill suppression and explicit injection were verified with ACP 0.81.1 / SDK 0.3.280 / CLI 2.1.280. User plugins, hooks and authenticated connectors remain unverified; user hooks are not stripped. Exclusive managed MCP configuration conflicts explicitly rather than being bypassed. |
+| Codex | Private stable `CODEX_HOME`, narrow auth/model seeding, transport-aware disables for inventoried native MCP, collision-safe names for owned servers, and per-file skill disables. ACP 2.1.0 / native 0.160.0 tests establish snapshot behavior and live unprompted thread resume only. The native command catalog, built-in/custom/symlink skill sources, new names and configuration reloads can remain visible. Keep unwanted native sources absent and restart after native configuration changes. MCP SSE and mandatory name rules incompatible with safe remapping fail explicitly. |
+| OpenCode / Unsloth | Private config directories, project-config and external-skill discovery controls, explicit MCP with remote OAuth disabled, and native skill permission denial. Unsloth retains Intent's endpoint/model configuration. OpenCode 1.18.18 still discovers `HOME/.opencode`; remote/plugin sources remain a risk, and denying a skill tool does not remove discovery. Keep those native sources clean. JSONC custom routing is not imported: configure endpoints explicitly in Intent. Unsloth inference was not exercised. |
+| Pi | The native wrapper disables ambient skills, extensions and prompt templates while retaining Intent's explicit bridge. The Intent extension delivers owned stdio MCP; remote MCP must be configured in Intent and accessed through `ws.mcp`. Pi ACP ignores session MCP lists. Actual Pi 0.81.0 probes verified suppression and bridge process cleanup on Linux; built-in extensions remain. Authenticated resume and cleanup on other platforms are unverified. |
+| Auggie | One owned `--mcp-config` file replaces settings MCP. Registry/plugin composition remains unverified; no audited global native skill-off switch exists. Home/project/plugin skills can duplicate Intent skills. Keep unwanted native skill roots absent; auth/session storage stays in place. Evidence is help/source plus configuration inspection, not authenticated launch/resume. |
+| Droid | Applies the documented built-in-skill disable flag. The binary was unavailable for runtime checks; native user/project MCP and skills may still load. Remove unwanted native entries and restart. |
+| Grok | Disables Claude/Cursor compatibility MCP and skill sources through source-backed environment controls. Native `.grok`, `.agents` and plugin sources remain; runtime behavior was not verified. Use clean native configuration. |
+| Cortex | The configured legacy adapter cannot receive Intent MCP servers. Newer Cortex CLI controls are not assumed compatible; native MCP/skills, authentication and resume remain unverified. |
+| Antigravity | Retains the existing private session profile and tool guards. Project-skill suppression, native behavior and macOS authentication were not verified on the Linux test host. |
+| Mock | Protocol and lifecycle test fixture only; its results establish Intent plumbing, never upstream isolation. |
+
+Applicable supported local MCP policies and explicitly supplied trusted policies
+constrain both launch injection and context-authenticated `ws.mcp` discovery/tool calls,
+including the workspace bridge. Live bridge authorization checks current server identity,
+global/workspace disables and policy without stopping a server shared by other agents.
+Known unsupported, unreadable or incompatible mandatory policy fails explicitly.
+There is no authoritative remote/MDM enrollment discovery in this implementation;
+supplied policy enforcement must not be read as enterprise enrollment certification.
+Launch snapshots also do not continuously police native provider processes.
+
+Owned profiles remain alive through process cleanup and retain stable persistent
+identity across recreation. File-credential seeding and preserved routing are not proof
+of keychain identity, token refresh, custom-endpoint inference or authenticated persisted
+recovery. Real upstream probes use synthetic configuration and no model prompts;
+deterministic authenticated TLS WSS tests establish daemon delivery and lifecycle
+behavior separately. No universal Windows/macOS or live-account guarantee follows
+from these tests. Provider versions outside the observed versions remain unverified.
+
 ### Codex diagnostics
 
-`intentd doctor` reports the pinned managed Codex ACP adapter and whether Node.js and
-npx are available on the daemon host. Both are required. Production selection ignores
-`providers.paths.codex`, local `codex-acp` installations on PATH, and `CODEX_PATH`.
-The adapter receives the daemon-owned, fixed `CODEX_CONFIG` policy that disables
-built-in subagents; inherited configuration is replaced, not merged.
+`intentd doctor` reports the pinned managed Codex ACP adapter, Node/npx prerequisites,
+and the canonical installed Codex path with a bounded `--version` observation. Production
+selection ignores `providers.paths.codex`, local `codex-acp` installations and inherited
+`CODEX_PATH`; the daemon sets its selected runtime path and fixed `CODEX_CONFIG` policy.
 
-The configured managed package pin is configuration, not a measured version. Ordinary
-doctor does not resolve or install the package, so adapter and runtime versions remain
-unknown. Package metadata applies only to an established selected entrypoint: a declared
-package version is labeled **metadata, not measured** and does not prove the running
-adapter or bundled runtime version. On Linux and Windows, the opt-in check below measures
-adapter and runtime versions separately after verifying their package entrypoints;
-opaque wrappers, missing runtimes, and failed checks remain explicitly unknown. An
-unrelated `codex` on PATH never supplies evidence of the selected adapter's runtime.
+The configured adapter pin is configuration, not a measured version. Ordinary doctor
+does not resolve or install its npm package, so the adapter version remains unknown.
+Package metadata applies only to an established selected entrypoint and is labeled
+**metadata, not measured**. The runtime measurement comes from the installed CLI, never
+from a neighboring bundled dependency. Failed version checks remain explicitly unknown.
 
-On Linux, diagnostic process probes also require `/bin/bash` for private process
-supervision. If it is unavailable, probes report a failure and their results remain
-unknown; diagnostics do not install Bash or fall back to another shell. This requirement
-applies only to diagnostic probes, not normal provider launches.
+On Linux, `/bin/bash` is required for private process supervision during both
+normal installed-CLI launch version checks and diagnostic probes. If it is unavailable,
+normal launch checks fail and diagnostic results remain unknown. Intent does not install
+Bash or fall back to another shell.
 
 On macOS, diagnostics report the selected launch and configured managed pin without
-resolving the package or inspecting ignored local adapters. They do not execute Node,
-the adapter, or Codex, or infer a runtime from PATH or neighboring packages.
-Version and catalog process probes are explicitly unsupported because detached-child
-cleanup cannot be guaranteed. Even with `--codex-models`, macOS performs no diagnostic
+resolving the package or inspecting ignored local adapters. Adapter and catalog diagnostic process probes are explicitly unsupported because
+detached-child cleanup cannot be guaranteed. The normal installed-CLI version check
+remains enabled and bounded, with direct-child/process-group cleanup on a best-effort
+basis; escaped detached descendants are not guaranteed to be contained. Even with `--codex-models`, macOS performs no diagnostic
 authentication capture, npm resolution, or temporary probe setup; catalog comparison
 remains inconclusive. This does not change normal agent/provider execution.
 
@@ -430,8 +552,9 @@ model access. No prompts, login, or token-refresh requests are sent.
 The probe copies existing file authentication from `CODEX_HOME/auth.json` (otherwise
 `$HOME/.codex/auth.json`, with `USERPROFILE` as the home fallback) and selected
 `OPENAI_API_KEY`, `CODEX_API_KEY`, or `CODEX_ACCESS_TOKEN` environment credentials into
-private temporary state. It does not import keyring-only credentials, user/project
-configuration, MCP servers, or cached model catalogs. Authentication may therefore be
+private temporary state. It also preserves supported provider routing/credential configuration and relevant
+provider/network environment. It does not import keyring-only credentials, MCP servers,
+hooks, unrelated user/project configuration, or cached model catalogs. Authentication may therefore be
 unavailable even when an ordinary session is logged in. Do not paste credentials into
 diagnostic commands. Output contains safe report fields and fixed failure messages,
 never raw provider errors or account metadata.

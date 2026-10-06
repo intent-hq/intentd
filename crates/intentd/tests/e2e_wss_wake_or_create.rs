@@ -196,18 +196,18 @@ fn temp_data_dir() -> tempfile::TempDir {
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
-    serve_command(data_dir, listen, env)
+    fixture_command(data_dir, listen, env)
         .spawn()
         .expect("spawn intentd serve")
 }
 
-fn serve_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Command {
+fn fixture_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
     common::seed_default_provider(data_dir);
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .stdout(Stdio::null())
@@ -219,13 +219,12 @@ fn serve_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Command
     // caller-provided fixture inputs cannot restore a host credential or root.
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    common::hermetic_github_identity(&mut cmd, data_dir);
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
     cmd.env_remove("GH_HOST")
         .env_remove("GH_ENTERPRISE_TOKEN")
         .env_remove("GITHUB_ENTERPRISE_TOKEN")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_CONFIG", data_dir.join("config.toml"))
-        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1");
     cmd
@@ -390,6 +389,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,

@@ -285,6 +285,8 @@ pub(crate) fn stamp_principal_attribution(
 }
 
 fn stamp_metadata_object(obj: &mut serde_json::Map<String, Value>) {
+    obj.remove("submissionIds");
+    obj.remove("recoverySources");
     obj.remove(intent_core::human_author::HUMAN_AUTHOR_KEY);
     match stamping_principal_id() {
         Some(principal_id) => {
@@ -315,6 +317,8 @@ pub(crate) fn carries_principal_stamp(message_metadata: Option<&Value>) -> bool 
 pub(crate) fn strip_principal_attribution(message_metadata: Option<Value>) -> Option<Value> {
     match message_metadata {
         Some(Value::Object(mut obj)) => {
+            obj.remove("submissionIds");
+            obj.remove("recoverySources");
             obj.remove(FROM_PRINCIPAL_ID_KEY);
             obj.remove(intent_core::human_author::HUMAN_AUTHOR_KEY);
             obj.remove(crate::agent_ops::MERGED_MESSAGE_METADATA_KEY);

@@ -18,7 +18,7 @@ fn configure(mock: &qwen::MockQwen) {
     });
 }
 
-async fn browser_connect(
+pub(super) async fn browser_connect(
     fx: &Fixture,
     origin: &str,
     token: &str,
@@ -235,29 +235,76 @@ async fn ancestry_old_baseline_and_neutral_changes_over_wss() {
         }),
     )
     .await;
-    for (count, changes) in [
-        (
-            1,
-            json!([
-                "branch ancestry available: 1 commit behind base",
-                "forge branch-update requirement available: not required"
-            ]),
-        ),
-        (2, json!(["branch ancestry: 1 → 2 commits behind base"])),
-    ] {
+    // An old baseline still reports the newly known forge verdict, while
+    // ancestry availability itself adds no change line.
+    mock.edit(|s| s.compare = json!({"behind_by":1}));
+    fx.services.poll_pr_monitors().await;
+    let event = next_event(&mut sub, "prMonitor:changed").await;
+    assert_eq!(
+        event["data"]["changes"],
+        json!(["forge branch-update requirement available: not required"])
+    );
+    let flushed = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.flush",
+        json!({
+            "workspaceId":fx.ws_id,"monitorId":monitor.monitor_id
+        }),
+    )
+    .await;
+    assert_eq!(flushed, json!({"ok":true,"flushed":true}));
+    next_event(&mut sub, "prMonitor:emitted").await;
+    let before = owner_messages(&fx).await;
+
+    for count in [0, 1, 2] {
         mock.edit(|s| s.compare = json!({"behind_by":count}));
         fx.services.poll_pr_monitors().await;
-        let event = next_event(&mut sub, "prMonitor:changed").await;
-        assert_eq!(
-            event["data"],
-            json!({
-                "workspaceId":fx.ws_id,"agentId":fx.agent_id,"monitorId":monitor.monitor_id,
-                "repo":"o/r","prNumber":10978,"state":"active","changes":changes
-            })
-        );
         let row = list(&fx, &mut rpc).await;
         assert_eq!(row["lastSnapshot"]["ancestry"], known(count));
-        assert_eq!(row["pendingChanges"], changes);
+        assert_eq!(row["pendingChanges"], json!([]));
+        assert_eq!(row["hasPendingChanges"], false);
+        let flushed = wss_rpc(
+            &mut rpc,
+            3,
+            "prMonitor.flush",
+            json!({
+                "workspaceId":fx.ws_id,"monitorId":monitor.monitor_id
+            }),
+        )
+        .await;
+        assert_eq!(flushed, json!({"ok":true,"flushed":false}));
+        assert_eq!(owner_messages(&fx).await, before);
+    }
+    for (state, expected) in [
+        (
+            "BEHIND",
+            "forge now requires a branch update before merging",
+        ),
+        ("DIRTY", "merge conflicts appeared"),
+    ] {
+        mock.edit(|s| {
+            s.pr["mergeStateStatus"] = json!(state);
+            s.mergeable = if state == "DIRTY" {
+                "CONFLICTING"
+            } else {
+                "MERGEABLE"
+            }
+            .into();
+            s.compare = json!({"behind_by":3});
+        });
+        fx.services.poll_pr_monitors().await;
+        // A stale ancestry-only event would be returned here and fail this assertion.
+        let event = next_event(&mut sub, "prMonitor:changed").await;
+        let row = list(&fx, &mut rpc).await;
+        assert_eq!(event["data"]["changes"], row["pendingChanges"]);
+        assert!(row["pendingChanges"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(expected)));
+        assert!(!row["pendingChanges"]
+            .to_string()
+            .contains("branch ancestry"));
         let flushed = wss_rpc(
             &mut rpc,
             3,
@@ -270,11 +317,6 @@ async fn ancestry_old_baseline_and_neutral_changes_over_wss() {
         assert_eq!(flushed, json!({"ok":true,"flushed":true}));
         let emitted = next_event(&mut sub, "prMonitor:emitted").await;
         assert!(emitted["data"].get("ancestry").is_none());
-        assert!(emitted["data"].get("branchUpdateRequired").is_none());
+        assert!(owner_messages(&fx).await.contains(expected));
     }
-    let messages = owner_messages(&fx).await;
-    assert!(messages.contains("behind but mergeable"), "{messages}");
-    assert!(messages.contains("branch ancestry: 1 → 2 commits behind base"));
-    assert!(!messages.contains("branch needs update"));
-    assert!(!messages.contains("branch updated"));
 }

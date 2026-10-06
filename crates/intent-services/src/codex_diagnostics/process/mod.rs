@@ -10,7 +10,7 @@ use super::UnknownReason;
 
 mod resources;
 pub(crate) use resources::ProbeDependency;
-use resources::ProbeHome;
+pub(crate) use resources::ProbeHome;
 
 // The read-only implementation is also built and tested on other hosts. Only
 // macOS selects its uninhabited process owner; Linux/Windows keep real owners.

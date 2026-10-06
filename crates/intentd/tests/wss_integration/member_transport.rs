@@ -47,91 +47,6 @@ async fn revoked_close(ws: &mut common::TlsWs) {
 }
 
 #[tokio::test]
-async fn member_transport_forward_revocation_stops_accepted_streams() {
-    let srv = start(WsOptions::default()).await;
-    let token = "a8".repeat(32);
-    let mut member = Guest::connect(&srv, &token).await;
-    promote(&srv, &member.principal).await;
-    let mut other = Guest::connect(&srv, &"c8".repeat(32)).await;
-    promote(&srv, &other.principal).await;
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let created = member
-        .call("forward.create", json!({"remotePort":port}))
-        .await;
-    assert!(created.get("error").is_none(), "{created}");
-    let forwarded_port = u16::try_from(created["result"]["localPort"].as_u64().unwrap()).unwrap();
-    let mut downstream = TcpStream::connect(("127.0.0.1", forwarded_port))
-        .await
-        .unwrap();
-    let (mut upstream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    downstream.write_all(b"preview").await.unwrap();
-    let mut bytes = [0; 7];
-    upstream.read_exact(&mut bytes).await.unwrap();
-    assert_eq!(&bytes, b"preview");
-    upstream.write_all(b"preview").await.unwrap();
-    downstream.read_exact(&mut bytes).await.unwrap();
-    assert_eq!(&bytes, b"preview");
-    let other_created = other
-        .call("forward.create", json!({"remotePort":port}))
-        .await;
-    assert!(other_created.get("error").is_none(), "{other_created}");
-    let other_port = u16::try_from(other_created["result"]["localPort"].as_u64().unwrap()).unwrap();
-    let mut other_downstream = TcpStream::connect(("127.0.0.1", other_port)).await.unwrap();
-    let (mut other_upstream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        member.call("principal.revokeSelf", json!({})).await["result"]["revoked"],
-        true
-    );
-    revoked_close(&mut member.ws).await;
-    let read = tokio::time::timeout(Duration::from_secs(5), downstream.read(&mut bytes))
-        .await
-        .expect("revocation must stop an accepted forward");
-    assert!(
-        matches!(read, Ok(0)) || read.is_err(),
-        "forward remained open: {read:?}"
-    );
-    assert!(TcpStream::connect(("127.0.0.1", forwarded_port))
-        .await
-        .is_err());
-    tokio::time::timeout(Duration::from_secs(5), async {
-        other_downstream.write_all(b"stillok").await.unwrap();
-        other_upstream.read_exact(&mut bytes).await.unwrap();
-        assert_eq!(&bytes, b"stillok");
-        other_upstream.write_all(b"healthy").await.unwrap();
-        other_downstream.read_exact(&mut bytes).await.unwrap();
-        assert_eq!(&bytes, b"healthy");
-    })
-    .await
-    .expect("another member's accepted forward must survive");
-    assert!(TcpStream::connect(("127.0.0.1", other_port)).await.is_ok());
-    assert_eq!(
-        other.call("principal.me", json!({})).await["result"]["hostRole"],
-        "member"
-    );
-    assert_eq!(
-        status_code(
-            &https_request(
-                srv.port,
-                srv.cfg.clone(),
-                &upgrade_req("/ws", None, Some(&token))
-            )
-            .await
-        ),
-        401
-    );
-    srv.ws.stop().await;
-}
-
-#[tokio::test]
 async fn member_transport_tunnel_lifecycle_revocation_and_trust_guards() {
     let srv = start(WsOptions::default()).await;
     let token = "a9".repeat(32);
@@ -329,17 +244,16 @@ async fn member_transport_browser_and_forward_admission() {
         let hello = client.call("client.hello", json!({"clientId":"same-browser","kind":"desktop","capabilities":{"browserExec":true}})).await;
         assert!(hello.get("error").is_none(), "{hello}");
     }
-    for (method, params) in [
-        ("browser.listTabs", json!({"workspaceId":ws})),
-        ("forward.list", json!({})),
-    ] {
-        assert_eq!(
-            guest.call(method, params.clone()).await["error"]["code"],
-            -32003
-        );
-        let got = member.call(method, params).await;
-        assert!(got.get("error").is_none(), "{method}: {got}");
-    }
+    assert_eq!(
+        guest
+            .call("browser.listTabs", json!({"workspaceId":ws}))
+            .await["error"]["code"],
+        -32003
+    );
+    let tabs = member
+        .call("browser.listTabs", json!({"workspaceId":ws}))
+        .await;
+    assert!(tabs.get("error").is_none(), "{tabs}");
     let bad = member
         .call(
             "browser.listTabs",
@@ -487,6 +401,18 @@ async fn member_transport_live_events_upgrade_and_workspace_deltas() {
         guest_raw.event(NOTE_UPDATED).await["workspaceId"],
         shared.as_str()
     );
+    // The shared note invalidates its workspace row; the hidden note must not
+    // disclose a row before promotion. Consume this before changing access.
+    let content_update = channel.push(&sub).await;
+    assert_eq!(content_update["seq"], 1);
+    let mut expected_shared = initial["snapshot"][0].clone();
+    // Live row refreshes include activity and agent details omitted by lite snapshots.
+    expected_shared["lastActivity"] = expected_shared["updatedAt"].clone();
+    expected_shared["agentSummary"] = json!({"count":0,"agents":[],"agentIds":[]});
+    assert_eq!(
+        content_update["delta"],
+        json!({"updated": [expected_shared]})
+    );
     promote(&srv, &member).await;
     publish(
         &srv,
@@ -500,7 +426,7 @@ async fn member_transport_live_events_upgrade_and_workspace_deltas() {
         member.id.as_str()
     );
     let upgraded = channel.push(&sub).await;
-    assert_eq!(upgraded["seq"], 1);
+    assert_eq!(upgraded["seq"], 2);
     let rows = upgraded["delta"]["updated"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "{upgraded}");
     assert!(rows
@@ -556,6 +482,15 @@ async fn member_transport_live_events_upgrade_and_workspace_deltas() {
     assert_eq!(
         raw.event(NOTE_UPDATED).await["workspaceId"],
         hidden.as_str()
+    );
+    let visible_content_update = channel.push(&sub).await;
+    assert_eq!(visible_content_update["seq"], 4);
+    let mut expected_hidden = upgraded["delta"]["added"][0].clone();
+    expected_hidden["lastActivity"] = expected_hidden["updatedAt"].clone();
+    expected_hidden["agentSummary"] = json!({"count":0,"agents":[],"agentIds":[]});
+    assert_eq!(
+        visible_content_update["delta"],
+        json!({"updated": [expected_hidden]})
     );
     publish(
         &srv,

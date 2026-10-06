@@ -180,7 +180,12 @@ pub fn live_adapters() -> usize {
 }
 
 /// How to launch an ephemeral ACP adapter.
+#[derive(Clone)]
 pub(crate) struct AcpAdapterCommand {
+    profile_provider: Option<String>,
+    profile: Option<Arc<crate::provider_profiles::ProviderLaunchProfile>>,
+    installed_cli: Option<intent_providers::installed_cli::InstalledCli>,
+    installed: Option<Arc<PreparedInstalled>>,
     program: PathBuf,
     args: Vec<String>,
     envs: Vec<(String, OsString)>,
@@ -197,6 +202,230 @@ pub(crate) struct AcpAdapterCommand {
 }
 
 impl AcpAdapterCommand {
+    pub(crate) fn for_provider(mut self, provider: &str) -> Self {
+        self.profile_provider = Some(provider.into());
+        self
+    }
+
+    pub(crate) async fn prepare_profile(
+        mut self,
+        purpose: crate::provider_profiles::LaunchPurpose,
+        sources: Vec<crate::provider_profiles::PolicySource>,
+    ) -> Result<Self, String> {
+        if self.profile.is_some() {
+            return Ok(self);
+        }
+        let provider = self.profile_provider.clone().or_else(|| {
+            self.installed_cli.map(|cli| match cli {
+                intent_providers::installed_cli::InstalledCli::Codex => "codex".into(),
+                intent_providers::installed_cli::InstalledCli::Claude => "claude-code".into(),
+            })
+        });
+        let Some(provider) = provider else {
+            return Ok(self);
+        };
+        let cwd = self.working_dir();
+        let mut command = self.command_in(&cwd);
+        if let Some(installed) = &self.installed {
+            installed.apply(&mut command);
+            // Inventory the original home, not the older probe's temporary seed.
+            if provider == "codex" {
+                if let Some(home) = installed.context.codex_home() {
+                    command.env("CODEX_HOME", home);
+                }
+            }
+        }
+        let profile = tokio::task::spawn_blocking(move || {
+            let root = tempfile::Builder::new()
+                .prefix("intent-provider-run-")
+                .tempdir()
+                .map_err(|e| e.to_string())?;
+            let mut profile = crate::provider_launch::prepare(
+                &provider,
+                purpose,
+                &command,
+                root.path(),
+                &cwd,
+                &cwd,
+                None,
+                &intent_acp::NormalizedMcpServers::new(),
+                &sources,
+            )
+            .map_err(|e| e.to_string())?;
+            if provider == "pi" {
+                crate::provider_launch::pi_native_wrapper(&mut profile)?;
+            }
+            // Profile owns its temporary leaf; keep the parent with that lease.
+            profile.hold_parent(root);
+            Ok::<_, String>(Arc::new(profile))
+        })
+        .await
+        .map_err(|_| "Provider profile preparation failed")??;
+        self.profile = Some(profile);
+        Ok(self)
+    }
+
+    pub(crate) fn merge_profile_meta(&self, meta: Option<Value>) -> Option<Value> {
+        let mut value = meta.unwrap_or_else(|| json!({}));
+        if let Some(profile) = &self.profile {
+            profile.merge_session_meta(&mut value);
+        }
+        (value != json!({})).then_some(value)
+    }
+
+    fn command_in(&self, process_cwd: &std::path::Path) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.program);
+        command
+            .args(&self.args)
+            .current_dir(process_cwd)
+            .env("PATH", enhanced_path(Some(&self.program)))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        for (key, value) in &self.envs {
+            command.env(key, value);
+        }
+        for key in &self.envs_removed {
+            command.env_remove(key);
+        }
+        // An inherited npm workspace selector (`npm_config_workspace` and its
+        // case variants) makes npm reject `--workspaces=false` before the adapter
+        // starts (intent-hq/intent#5738); scrub it after every env merge, for the
+        // npx bootstrap only.
+        if self.via_npx {
+            let explicit = self.envs.iter().map(|(key, _)| key.as_str());
+            for key in npm_workspace_selector_env_keys(explicit) {
+                command.env_remove(key);
+            }
+        }
+        #[cfg(unix)]
+        command.process_group(0);
+
+        command
+    }
+
+    pub(crate) async fn prepare_installed(self) -> Result<Self, String> {
+        let Some(cli) = self.installed_cli else {
+            return Ok(self);
+        };
+        if self.installed.is_some() {
+            return Ok(self);
+        }
+        let context = crate::installed_cli::InstalledContext::discover(cli).await?;
+        self.prepare_with_context(context).await
+    }
+
+    pub(crate) async fn prepare_installed_catalog(self) -> Result<Self, String> {
+        let cli = self
+            .installed_cli
+            .ok_or("catalog requires an installed CLI")?;
+        let context = crate::installed_cli::InstalledContext::discover(cli)
+            .await?
+            .with_catalog_fingerprint()
+            .await?;
+        self.prepare_with_context(context).await
+    }
+
+    pub(crate) async fn prepare_with_context(
+        mut self,
+        context: crate::installed_cli::InstalledContext,
+    ) -> Result<Self, String> {
+        let cli = context.runtime.cli();
+        self.installed_cli = Some(cli);
+        let context_for_home = context.clone();
+        let root = self.npx_launch_root.clone();
+        let via_npx = self.via_npx;
+        let (npx_dir, codex_home) = tokio::task::spawn_blocking(move || {
+            let npx_dir = if via_npx {
+                Some(Arc::new(NpxLaunchDir::create(root.as_deref())?))
+            } else {
+                None
+            };
+            let codex_home = if cli == intent_providers::installed_cli::InstalledCli::Codex {
+                Some(Arc::new(crate::provider_models::isolated_codex_home(
+                    context_for_home.codex_home().as_deref(),
+                )?))
+            } else {
+                None
+            };
+            Ok::<_, std::io::Error>((npx_dir, codex_home))
+        })
+        .await
+        .map_err(|_| "installed CLI isolation task failed")?
+        .map_err(|e| format!("installed CLI isolation failed: {e}"))?;
+        let cwd = npx_dir
+            .as_ref()
+            .map_or_else(|| self.working_dir(), |d| d.path().to_owned());
+        let mut command = self.command_in(&cwd);
+        if let Some(home) = &codex_home {
+            command.env("CODEX_HOME", home.path());
+        }
+        context.apply(&mut command);
+        // Own the profile until bounded version cleanup finishes, even if the
+        // caller cancels while waiting for the version child.
+        self.installed = Some(
+            intent_core::caller::spawn_with_current_caller(async move {
+                let dependency = crate::codex_diagnostics::process::ProbeDependency::hold((
+                    npx_dir.clone(),
+                    codex_home.clone(),
+                ));
+                let (identity, _version) = context
+                    .observe_with_dependency(&command, Some(dependency))
+                    .await?;
+                let env = command
+                    .as_std()
+                    .get_envs()
+                    .map(|(k, v)| (k.to_owned(), v.map(std::ffi::OsStr::to_owned)))
+                    .collect();
+                Ok::<_, String>(Arc::new(PreparedInstalled {
+                    context,
+                    identity,
+                    env,
+                    cwd,
+                    npx_dir,
+                    _codex_home: codex_home,
+                }))
+            })
+            .await
+            .map_err(|_| "installed CLI preparation task failed")??,
+        );
+        Ok(self)
+    }
+
+    pub(crate) fn installed_key(&self) -> Option<String> {
+        self.installed
+            .as_ref()
+            .and_then(|p| p.context.key(&p.identity))
+    }
+
+    pub(crate) async fn installed_still_current(&self) -> bool {
+        let Some(p) = self.installed.clone() else {
+            return true;
+        };
+        let mut command = self.command_in(&p.cwd);
+        p.apply(&mut command);
+        intent_core::caller::spawn_with_current_caller(async move {
+            p.context
+                .still_current(
+                    &p.identity,
+                    &command,
+                    crate::codex_diagnostics::process::ProbeDependency::hold(p.clone()),
+                )
+                .await
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    pub(crate) fn probe_session_meta(&self) -> Option<Value> {
+        self.merge_profile_meta(
+            (self.installed_cli == Some(intent_providers::installed_cli::InstalledCli::Claude))
+                .then(|| crate::complete_ops::one_shot_session_shape("claude-code", "", None).1)
+                .flatten(),
+        )
+    }
+
     /// Check the selected npx runtime before launch. Direct adapters never
     /// depend on npx, even when a stale installation is present on PATH.
     pub(crate) async fn check_npx_version(&self) -> intent_core::Result<()> {
@@ -212,6 +441,19 @@ impl AcpAdapterCommand {
     /// it to the adapter).
     pub(crate) fn npx(npx: PathBuf, package: &str) -> Self {
         Self {
+            profile: None,
+            profile_provider: (package == intent_providers::PI_ACP_NPX_PACKAGE)
+                .then(|| "pi".into()),
+            installed_cli: match package {
+                intent_providers::CODEX_ACP_NPX_PACKAGE => {
+                    Some(intent_providers::installed_cli::InstalledCli::Codex)
+                }
+                intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE => {
+                    Some(intent_providers::installed_cli::InstalledCli::Claude)
+                }
+                _ => None,
+            },
+            installed: None,
             program: npx,
             args: vec![
                 NPX_NO_WORKSPACES_ARG.to_string(),
@@ -230,6 +472,10 @@ impl AcpAdapterCommand {
     /// Run a resolved adapter binary with the given args.
     pub(crate) fn binary(bin: PathBuf, args: Vec<String>) -> Self {
         Self {
+            profile: None,
+            profile_provider: None,
+            installed_cli: None,
+            installed: None,
             program: bin,
             args,
             envs: Vec::new(),
@@ -335,6 +581,26 @@ impl AcpAdapterCommand {
     }
 }
 
+struct PreparedInstalled {
+    context: crate::installed_cli::InstalledContext,
+    identity: intent_providers::installed_cli::InstalledCliIdentity,
+    env: Vec<(OsString, Option<OsString>)>,
+    cwd: PathBuf,
+    npx_dir: Option<Arc<NpxLaunchDir>>,
+    _codex_home: Option<Arc<tempfile::TempDir>>,
+}
+
+impl PreparedInstalled {
+    fn apply(&self, command: &mut tokio::process::Command) {
+        command.env_clear().current_dir(&self.cwd);
+        for (k, v) in &self.env {
+            if let Some(v) = v {
+                command.env(k, v);
+            }
+        }
+    }
+}
+
 /// A spawned adapter: the child, its ACP connection, and the inbound
 /// notification/request streams the caller drives.
 pub(crate) struct SpawnedAdapter {
@@ -356,8 +622,11 @@ pub(crate) struct SpawnedAdapter {
 /// leave descendants that still run in the directory (in its process group
 /// or escaped from it).
 struct HeldWhileLive {
-    npx_launch_dir: Option<NpxLaunchDir>,
+    npx_launch_dir: Option<Arc<NpxLaunchDir>>,
     slot: OwnedSemaphorePermit,
+    installed: Option<Arc<PreparedInstalled>>,
+    profile: Option<Arc<crate::provider_profiles::ProviderLaunchProfile>>,
+    preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
 }
 
 /// The adapter process plus [`HeldWhileLive`], dereferencing to the
@@ -406,8 +675,11 @@ impl AdapterChild {
         let HeldWhileLive {
             npx_launch_dir,
             slot,
+            installed,
+            profile,
+            preparation_guard,
         } = held;
-        let launch_dir = RetainUnlessSwept(npx_launch_dir);
+        let launch_dir = RetainUnlessSwept(npx_launch_dir, installed, profile);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             drop(launch_dir);
             drop(child);
@@ -415,10 +687,12 @@ impl AdapterChild {
             return None;
         };
         Some(handle.spawn(async move {
-            reap_child(&mut child, spawn_pid).await;
-            launch_dir.remove();
+            if reap_child(&mut child, spawn_pid).await {
+                launch_dir.remove();
+            }
             drop(child);
             drop(slot);
+            drop(preparation_guard);
         }))
     }
 }
@@ -451,11 +725,17 @@ impl Drop for AdapterChild {
 /// deletes it once the tree has been reaped; dropping the wrapper any other
 /// way (the cleanup future dropped unpolled on a shutting-down runtime, or
 /// never scheduled at all) retains the directory instead of deleting it.
-struct RetainUnlessSwept(Option<NpxLaunchDir>);
+struct RetainUnlessSwept(
+    Option<Arc<NpxLaunchDir>>,
+    Option<Arc<PreparedInstalled>>,
+    Option<Arc<crate::provider_profiles::ProviderLaunchProfile>>,
+);
 
 impl RetainUnlessSwept {
     fn remove(mut self) {
         drop(self.0.take());
+        drop(self.1.take());
+        drop(self.2.take());
     }
 }
 
@@ -467,6 +747,13 @@ impl Drop for RetainUnlessSwept {
                 "retaining npx launch dir: adapter cleanup could not finish"
             );
             std::mem::forget(dir);
+        }
+        if let Some(profile) = self.2.take() {
+            std::mem::forget(profile);
+        }
+        if let Some(installed) = self.1.take() {
+            // Its isolated auth profile must also survive an unfinished sweep.
+            std::mem::forget(installed);
         }
     }
 }
@@ -520,7 +807,56 @@ pub(crate) async fn spawn_adapter_in(
             limit: slots.limit(),
         });
     };
-    spawn_admitted_adapter(cmd, slot).map_err(SpawnError::Spawn)
+    let preparation_guard = if cmd.via_npx {
+        let provider = intent_providers::ACP_PROVIDERS.iter().find(|provider| {
+            provider
+                .npx_only_package
+                .is_some_and(|package| cmd.args.iter().any(|arg| arg == package))
+        });
+        if let Some(provider) = provider {
+            crate::provider_preparation::before_launch(provider.id).await
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let prepared;
+    let cmd = if cmd.installed_cli.is_some() && cmd.installed.is_none() {
+        prepared = cmd
+            .clone()
+            .prepare_installed()
+            .await
+            .map_err(SpawnError::Spawn)?;
+        &prepared
+    } else {
+        if let Some(selected) = cmd.installed.clone() {
+            // Catalog commands may have been cached while no probe was needed.
+            // Validate the original runtime again at the actual launch boundary.
+            let mut command = cmd.command_in(&selected.cwd);
+            selected.apply(&mut command);
+            intent_core::caller::spawn_with_current_caller(async move {
+                let (identity, _) = selected
+                    .context
+                    .observe_with_dependency(
+                        &command,
+                        Some(crate::codex_diagnostics::process::ProbeDependency::hold(
+                            selected.clone(),
+                        )),
+                    )
+                    .await?;
+                if identity != selected.identity {
+                    return Err(crate::provider_models::INSTALLED_SOURCE_CHANGED.to_owned());
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| SpawnError::Spawn("installed CLI validation task failed".into()))?
+            .map_err(SpawnError::Spawn)?;
+        }
+        cmd
+    };
+    spawn_admitted_adapter(cmd, slot, preparation_guard).map_err(SpawnError::Spawn)
 }
 
 /// The spawn itself, once a slot is held. Split out so the bound and the
@@ -529,46 +865,29 @@ pub(crate) async fn spawn_adapter_in(
 fn spawn_admitted_adapter(
     cmd: &AcpAdapterCommand,
     slot: OwnedSemaphorePermit,
+    preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
 ) -> Result<SpawnedAdapter, String> {
-    let npx_launch_dir = if cmd.via_npx {
-        Some(
+    let npx_launch_dir = if let Some(installed) = &cmd.installed {
+        installed.npx_dir.clone()
+    } else if cmd.via_npx {
+        Some(Arc::new(
             NpxLaunchDir::create(cmd.npx_launch_root.as_deref())
                 .map_err(|e| format!("{}: npx launch dir: {e}", cmd.program.display()))?,
-        )
+        ))
     } else {
         None
     };
     let process_cwd = npx_launch_dir
         .as_ref()
         .map_or_else(|| cmd.working_dir(), |dir| dir.path().to_path_buf());
-    let mut command = tokio::process::Command::new(&cmd.program);
-    command
-        .args(&cmd.args)
-        .current_dir(process_cwd)
-        .env("PATH", enhanced_path(Some(&cmd.program)))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    for (key, value) in &cmd.envs {
-        command.env(key, value);
+    let mut command = cmd.command_in(&process_cwd);
+    if let Some(installed) = &cmd.installed {
+        installed.apply(&mut command);
     }
-    for key in &cmd.envs_removed {
-        command.env_remove(key);
-    }
-    // An inherited npm workspace selector (`npm_config_workspace` and its
-    // case variants) makes npm reject `--workspaces=false` before the adapter
-    // starts (intent-hq/intent#5738); scrub it after every env merge, for the
-    // npx bootstrap only.
-    if cmd.via_npx {
-        let explicit = cmd.envs.iter().map(|(key, _)| key.as_str());
-        for key in npm_workspace_selector_env_keys(explicit) {
-            command.env_remove(key);
-        }
-    }
-    #[cfg(unix)]
-    command.process_group(0);
 
+    if let Some(profile) = &cmd.profile {
+        profile.apply_to_command(&mut command);
+    }
     let mut child = command
         .spawn()
         .map_err(|e| format!("{}: {e}", cmd.program.display()))?;
@@ -604,6 +923,9 @@ fn spawn_admitted_adapter(
             held: Some(HeldWhileLive {
                 npx_launch_dir,
                 slot,
+                installed: cmd.installed.clone(),
+                profile: cmd.profile.clone(),
+                preparation_guard,
             }),
         },
         conn,
@@ -657,13 +979,9 @@ pub(crate) async fn observe_exit_status(
     status
 }
 
-/// How many trailing stderr lines to include in an exit attribution. npm's
-/// final line is typically just "A complete log of this run can be found
-/// in: …" with the actual cause a few lines earlier, so a single line is
-/// not enough.
-const STDERR_TAIL_LINES: usize = 3;
-/// Character bound on the joined stderr tail (kept from the end).
-const STDERR_TAIL_MAX_CHARS: usize = 300;
+/// Character budget for captured stderr in an exit diagnostic. Large enough
+/// for npm's cause/path plus boilerplate, while keeping warning strings bounded.
+const STDERR_EXCERPT_MAX_CHARS: usize = 4_096;
 
 /// The "adapter died" detail for an observed exit: `Some("<status>; stderr:
 /// …")` when the child exited unsuccessfully, `None` when it is still running
@@ -677,33 +995,125 @@ pub(crate) fn exited_detail(
     if status.success() {
         return None;
     }
-    let tail = match stderr_tail(stderr) {
+    let excerpt = match stderr_excerpt(stderr) {
         Some(t) => format!("; stderr: {t}"),
         None => String::new(),
     };
-    Some(format!("{status}{tail}"))
+    Some(format!("{status}{excerpt}"))
 }
 
-/// Join the last [`STDERR_TAIL_LINES`] non-empty stderr lines, bounded to
-/// [`STDERR_TAIL_MAX_CHARS`] characters kept from the end.
-fn stderr_tail(stderr: &[String]) -> Option<String> {
-    let non_empty: Vec<&str> = stderr
+/// Preserve captured lines in order, retaining both the beginning (often the
+/// cause) and end (often a final error or log path) if they exceed the budget.
+/// This is an excerpt of the connection's recent stderr, not a diagnosis: npm
+/// ENOENT can mean a missing shell, package file, or many other things.
+fn stderr_excerpt(stderr: &[String]) -> Option<String> {
+    const TRUNCATED: &str = "\n[stderr truncated]\n";
+    let joined = stderr
         .iter()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
-    let start = non_empty.len().saturating_sub(STDERR_TAIL_LINES);
-    let joined = non_empty[start..].join(" | ");
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     if joined.is_empty() {
         return None;
     }
     let count = joined.chars().count();
-    Some(
-        joined
-            .chars()
-            .skip(count.saturating_sub(STDERR_TAIL_MAX_CHARS))
-            .collect(),
-    )
+    if count <= STDERR_EXCERPT_MAX_CHARS {
+        return Some(joined);
+    }
+    let available = STDERR_EXCERPT_MAX_CHARS - TRUNCATED.chars().count();
+    let head_chars = available / 2;
+    let tail_chars = available - head_chars;
+    // Count Unicode scalar values, not bytes, so every cut remains valid UTF-8.
+    let mut excerpt: String = joined.chars().take(head_chars).collect();
+    excerpt.push_str(TRUNCATED);
+    excerpt.extend(joined.chars().skip(count - tail_chars));
+    Some(excerpt)
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_other_startup_errors_without_interpreting_them() {
+        for cause in [
+            "npm error syscall spawn /missing/custom-shell ENOENT",
+            "Error: Cannot find module '@example/adapter'",
+            "Error: EACCES: permission denied, open '/opt/adapter/config.json'",
+            "Authentication failed: API key is missing",
+            "adapter failed for an unknown reason",
+        ] {
+            let lines =
+                [cause, "context one", "context two", "context three", "done"].map(str::to_owned);
+            let excerpt = stderr_excerpt(&lines).unwrap();
+            assert!(excerpt.contains(cause), "{excerpt}");
+            assert!(excerpt.contains("done"), "{excerpt}");
+            assert!(
+                !excerpt.contains("cache"),
+                "must not infer a cause: {excerpt}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_unicode_diagnostics_keep_both_ends_with_explicit_truncation() {
+        // A single long line must obey the same budget as many lines, without
+        // cutting UTF-8 code points or silently dropping the beginning.
+        for stderr in [
+            vec![format!(
+                "startup cause {} final detail",
+                "🦀é".repeat(5_000)
+            )],
+            std::iter::once("startup cause".to_owned())
+                .chain((0..100).map(|_| "🦀é".repeat(100)))
+                .chain(std::iter::once("final detail".to_owned()))
+                .collect(),
+        ] {
+            let excerpt = stderr_excerpt(&stderr).unwrap();
+            assert!(excerpt.starts_with("startup cause"), "beginning lost");
+            assert!(excerpt.ends_with("final detail"), "end lost");
+            assert!(excerpt.contains("[stderr truncated]"));
+            assert!(excerpt.chars().count() <= 4_096);
+            assert!(excerpt.contains("🦀é"));
+        }
+    }
+
+    #[test]
+    fn empty_stderr_has_no_excerpt() {
+        assert_eq!(stderr_excerpt(&[]), None);
+        assert_eq!(stderr_excerpt(&[" \t".into(), "\n".into()]), None);
+        assert_eq!(stderr_excerpt(&["  boom  ".into()]), Some("boom".into()));
+    }
+
+    #[test]
+    fn excerpts_within_budget_preserve_all_lines_and_unicode() {
+        assert_eq!(
+            stderr_excerpt(&["  first  ".into(), String::new(), "最後 🦀".into()]),
+            Some("first\n最後 🦀".into())
+        );
+        for length in [4_095, 4_096] {
+            let text = "🦀".repeat(length);
+            assert_eq!(stderr_excerpt(std::slice::from_ref(&text)), Some(text));
+        }
+        let excerpt = stderr_excerpt(&["🦀".repeat(4_097)]).unwrap();
+        assert_eq!(excerpt.chars().count(), 4_096);
+        assert!(excerpt.contains("[stderr truncated]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_stderr_keeps_exit_status_and_clean_exit_has_no_diagnostic() {
+        use std::os::unix::process::ExitStatusExt;
+        let failure = std::process::ExitStatus::from_raw(7 << 8);
+        assert_eq!(exited_detail(Some(failure), &[]), Some(failure.to_string()));
+        let stderr = ["startup warning".into()];
+        assert_eq!(
+            exited_detail(Some(std::process::ExitStatus::from_raw(0)), &stderr),
+            None
+        );
+        assert_eq!(exited_detail(None, &stderr), None);
+    }
 }
 
 /// Grace window between SIGTERM and SIGKILL when reaping an adapter child
@@ -731,7 +1141,7 @@ const TERM_GRACE: Duration = Duration::from_millis(500);
 /// snapshot-before-kill rationale. The snapshot is taken only while the
 /// leader is unreaped: a reaped leader's descendants have already reparented
 /// (nothing to find), and its pid may already be reused.
-pub(crate) async fn reap_child(child: &mut tokio::process::Child, spawn_pid: u32) {
+pub(crate) async fn reap_child(child: &mut tokio::process::Child, spawn_pid: u32) -> bool {
     #[cfg(not(unix))]
     let _ = spawn_pid;
     #[cfg(unix)]
@@ -758,7 +1168,18 @@ pub(crate) async fn reap_child(child: &mut tokio::process::Child, spawn_pid: u32
     let _ = child.kill().await;
     let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
     #[cfg(unix)]
-    sweep_escaped_descendants(&descendants).await;
+    {
+        sweep_escaped_descendants(&descendants).await;
+        crate::agent_manager::confirm_tree_exit(
+            child,
+            nix::unistd::Pid::from_raw(spawn_pid.cast_signed()),
+            &descendants,
+            Duration::from_secs(2),
+        )
+        .await
+    }
+    #[cfg(not(unix))]
+    matches!(child.try_wait(), Ok(Some(_)))
 }
 
 /// Unit tests for the daemon-wide adapter bound itself (monorepo#2062).

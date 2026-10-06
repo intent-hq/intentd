@@ -95,6 +95,7 @@ mod git_status_singleflight;
 pub mod host_exec;
 pub mod host_exec_stream;
 mod host_execution;
+mod installed_cli;
 mod workspace_mutations;
 
 mod github_ops;
@@ -104,7 +105,87 @@ mod github_auth_ops;
 mod github_browse_ops;
 mod source_control_auth_ops;
 
+// Repository sources use the original Services instance and private gates.
+// Entry and dispatch integration remain separate from observer installation.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        clippy::wildcard_imports,
+        reason = "Physical producer and repository dispatch integration remain pending"
+    )
+)]
+mod repository_admission;
+#[path = "repository_admission/durable_source.rs"]
+mod repository_admission_durable_source;
+#[path = "repository_admission/git_source.rs"]
+mod repository_admission_git_source;
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::allow_attributes,
+        reason = "The private installation API is optional in isolated manager compositions"
+    )
+)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "The private installation API is consumed by separately composed manager integration"
+    )
+)]
+#[path = "repository_admission/installation.rs"]
+mod repository_admission_installation;
+#[cfg(test)]
+#[path = "repository_admission/source_tests.rs"]
+mod repository_admission_source_tests;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Repository entry integration remains pending")
+)]
+#[path = "repository_admission/source.rs"]
+mod repository_admission_sources;
+mod repository_context_live;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Original optional delivery is private until manager integration"
+    )
+)]
+mod repository_context_output;
+mod repository_context_reader;
+#[expect(
+    dead_code,
+    unused_imports,
+    reason = "Settings and child-policy writer integration remains inactive"
+)]
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::wildcard_imports,
+        reason = "Preserve private writer imports while native and child-policy integration is pending"
+    )
+)]
+mod repository_credential_writers;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        clippy::wildcard_imports,
+        reason = "Native credential consumers remain inactive; unit tests exercise their contracts"
+    )
+)]
+mod repository_credentials;
+#[path = "repository_admission/native_wire.rs"]
+mod repository_native_wire;
+#[path = "repository_admission/read_policy.rs"]
+mod repository_read_policy;
+#[path = "repository_admission/read_source.rs"]
+mod repository_read_source;
+
 mod agent_list_cache;
+mod automatic_pr_refresh;
 pub mod checkpoint;
 mod direct_secret_ops;
 mod fast_mode;
@@ -124,6 +205,12 @@ mod nested_repos;
 mod note_merge;
 pub mod note_ops;
 mod npx_cli;
+#[expect(
+    dead_code,
+    reason = "qualified cache primitives await admitted caller-directory wiring"
+)]
+mod observation_adapter;
+mod observation_policy;
 mod one_shot_acp;
 pub mod pagination;
 pub mod pi_cli;
@@ -133,15 +220,20 @@ mod pr_ops;
 pub mod presence;
 mod primitive_ops;
 mod principal_ops;
+pub mod project_mcp;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
+mod provider_launch;
 pub mod provider_models;
+mod provider_preparation;
+pub mod provider_profiles;
 pub mod provider_test_prompt;
 mod rate_limit;
 pub mod repo_config;
 pub mod retention;
 mod rtk;
 mod sandbox_ops;
+mod script_monitor;
 mod script_ops;
 mod search_ops;
 mod sentry_ops;
@@ -169,15 +261,20 @@ mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
 mod workspace_branch;
+mod workspace_check_cadence;
 mod workspace_status;
 pub mod workspace_vocabulary;
 
 #[cfg(test)]
 mod periodic_shutdown_tests;
+#[cfg(all(test, unix))]
+#[path = "tests/repository_pending_delete.rs"]
+mod repository_pending_delete_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod test_tracing;
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -200,7 +297,7 @@ mod v2_5_goldens;
 mod v2_7_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
-pub use config_watcher::ConfigWatcher;
+pub use config_watcher::{ConfigWatcher, PreparedReloadAdmission};
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
@@ -273,6 +370,14 @@ pub(crate) struct CompletionClassifyPark {
     pub(crate) entered: tokio::sync::Notify,
     /// Held by the parked delivery inside the window until the test releases it.
     pub(crate) release: tokio::sync::Notify,
+}
+
+/// Provenance retained when a synthetic completion has to defer again.
+#[derive(Clone, Copy)]
+enum InterimIdleProvenance {
+    Live,
+    StaleReport,
+    AdvisoryPending,
 }
 
 /// Retry ownership and watch scope for one child's completion delivery.
@@ -594,6 +699,7 @@ pub struct Services {
     terminal_tasks: Arc<delivery_tasks::DeliveryTasks>,
     pending_delete_tasks: Arc<delivery_tasks::DeliveryTasks>,
     host_exec_runtime: Arc<host_exec::HostExecRuntime>,
+    provider_preparation: Arc<provider_preparation::Preparation>,
     /// Child agent ids with an active terminal-delivery retry task, mapped
     /// to pending attempts and a schedule generation. Ownership is coalesced per CHILD, not per
     /// watch (intent-hq/intent#3728): one delivery pass processes ALL of the
@@ -604,6 +710,9 @@ pub struct Services {
     /// while a task is live bumps the generation, which the task re-checks
     /// before exiting so a racing failure never loses its retry owner.
     completion_delivery_retries: Arc<Mutex<HashMap<String, CompletionDeliveryRetry>>>,
+    /// One bounded-backoff owner per child deferred by a pending script wake
+    /// or an unreadable outbox. Generations prevent losing a racing deferral.
+    pending_completion_retries: Arc<Mutex<HashMap<AgentId, u64>>>,
     /// Delegation-group ids with an active aggregated-wake retry task.
     completion_group_delivery_retries: Arc<Mutex<HashSet<String>>>,
     /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
@@ -720,6 +829,7 @@ pub struct Services {
     /// keeps the strong `Arc<AgentManager>` for the daemon's lifetime. `None`
     /// until attached, so read-only/test wiring keeps the store-only behavior.
     agent_manager: Arc<OnceLock<Weak<AgentManager>>>,
+    provider_policy: Arc<Mutex<HashMap<String, Vec<provider_profiles::PolicySource>>>>,
     /// Active forge for the `pr.*` methods (§7). `None` until wired by the
     /// composition root or a test; when unset, the `pr.*` handlers build the
     /// provider from default settings (token from env / `gh` / keychain).
@@ -1088,6 +1198,21 @@ pub struct Services {
     /// (see [`source_control_auth_ops::GitlabCredentialGate`]). Shared across
     /// clones.
     gitlab_credential_gate: source_control_auth_ops::GitlabCredentialGate,
+    /// The one repository credential directory for this server incarnation.
+    /// Clones share it; construction alone leaves the connection unverified.
+    repository_connection_directory: Arc<repository_credentials::RepositoryConnectionDirectory>,
+    /// Shared identity of this server incarnation, allocated with its repository directory.
+    daemon_boot_id: String,
+    /// Exact ordinary API allocation; clones cannot bind replacement owners.
+    repository_wire_owner: Arc<OnceLock<Weak<Services>>>,
+    repository_review_capacity: Arc<repository_native_wire::review::Capacity>,
+    repository_resource_capacity: Arc<repository_native_wire::resource::Capacity>,
+    repository_checkout_capacity: Arc<repository_native_wire::checkout::Capacity>,
+    repository_selection_capacity: Arc<repository_native_wire::selection::Capacity>,
+    /// Original invalidation owner for this Services instance. Clones share it;
+    /// Store must accept this exact observer before it can be used.
+    repository_lifecycle_registry:
+        Arc<repository_admission::lifecycle::RepositoryLifecycleRegistry>,
     /// When the primary principal's GitHub profile was last refreshed from
     /// `GET /user` on a `principal.me` read (multiplayer w1); shared across
     /// clones so the rate limit spans every RPC handle.
@@ -1256,6 +1381,7 @@ pub struct Services {
     /// read within `prCache.maxAgeSeconds` (see [`pr_monitor::PrCache`]).
     /// In-memory only; shared across clones.
     pr_cache: pr_monitor::PrCache,
+    automatic_pr_refresh: Arc<Mutex<automatic_pr_refresh::Admission>>,
     pr_discovery: pr_discovery::Discovery,
     /// The issue cache behind `github.issues.get`: each issue's last forge
     /// read, served within `prCache.maxAgeSeconds` like the PR cache and
@@ -1333,7 +1459,7 @@ pub struct Services {
     /// here; `workspace.cancelDelete` removes it. Never persisted — a daemon
     /// restart drops every pending deletion. Shared across clones so every
     /// front door observes one set.
-    pending_workspace_deletes: delete_grace::PendingDeletes,
+    pending_workspace_deletes: delete_grace::OwnedPendingDeletes,
     workspace_mutations: workspace_mutations::WorkspaceMutations,
     startup_resume_candidates: Arc<Mutex<HashSet<AgentId>>>,
     #[cfg(test)]
@@ -1342,14 +1468,16 @@ pub struct Services {
     interrupted_resume_park: Option<Arc<CompletionClassifyPark>>,
     #[cfg(test)]
     workspace_delete_test_gate: tests::workspace_delete::DeleteGate,
+    #[cfg(all(test, unix))]
+    pending_delete_test_gate: repository_pending_delete_tests::DeletionGates,
     /// In-memory pending agent-session deletions for the delete grace window
     /// (§5.5): `agent.delete` with `undoDelayMs > 0` registers the timer
     /// here; `agent.cancelDelete` removes it. Keyed by agent id, in a
-    /// registry separate from [`Services::pending_workspace_deletes`] so the
-    /// key spaces never collide. Never persisted — a daemon restart drops
+    /// typed shared allocation with [`Services::pending_workspace_deletes`]
+    /// so workspace and Agent key spaces never collide. Never persisted — a daemon restart drops
     /// every pending deletion. Shared across clones so every front door
     /// observes one set.
-    pending_agent_deletes: delete_grace::PendingDeletes,
+    pending_agent_deletes: delete_grace::OwnedPendingDeletes,
     /// In-flight staged workspace imports (`workspace.import.*`, keyed by
     /// `importId`): manifest + staging paths + chunk cursor between `begin`
     /// and `commit`/`abort`. Shared across clones so chunks arriving over any
@@ -1436,17 +1564,45 @@ impl Services {
     /// Wire the services surface over a persistence handle.
     #[must_use]
     pub fn new(store: Store) -> Self {
-        Self::new_with_file_secrets(store, intent_core::FileSecretStore::new())
+        Self::new_with_repository_sources(store, intent_core::FileSecretStore::new(), None)
     }
 
-    /// Wire explicit file storage before any default secret-store constructor
-    /// can run. Isolated auth fixtures must not trigger legacy host migration.
+    /// Select the backing file before constructing any secret wrapper.
+    #[cfg(test)]
     pub(crate) fn new_with_file_secrets(
         store: Store,
         file_secrets: intent_core::FileSecretStore,
     ) -> Self {
+        Self::new_with_repository_sources(store, file_secrets, None)
+    }
+
+    /// Hidden test support: select disposable original sources before attachment.
+    /// Production composition must use `Services::new`.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "repository-test-fixtures"))]
+    #[must_use]
+    pub fn new_repository_fixture(
+        store: Store,
+        secrets: intent_core::FileSecretStore,
+        descriptor: Option<intent_sourcecontrol::GitlabDescriptor>,
+    ) -> Self {
+        Self::new_with_repository_sources(store, secrets, descriptor)
+    }
+
+    fn new_with_repository_sources(
+        store: Store,
+        gitlab_secret_store: intent_core::FileSecretStore,
+        descriptor: Option<intent_sourcecontrol::GitlabDescriptor>,
+    ) -> Self {
+        let pending_delete_tasks = Arc::new(delivery_tasks::DeliveryTasks::default());
+        let pending_deletes = delete_grace::OwnedPendingDeletes::new(store.clone())
+            .with_tasks(pending_delete_tasks.clone());
         let mcp_hub = Arc::new(McpHub::with_oauth_store(store.clone()));
-        Self {
+        let daemon_boot_id = uuid::Uuid::new_v4().to_string();
+        let repository_connection_directory = Arc::new(
+            repository_credentials::RepositoryConnectionDirectory::new(daemon_boot_id.clone()),
+        );
+        let services = Self {
             store,
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
@@ -1484,9 +1640,11 @@ impl Services {
             settings_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             primary_auth_admitted: false,
             terminal_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
-            pending_delete_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
+            pending_delete_tasks,
             host_exec_runtime: Arc::default(),
+            provider_preparation: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
+            pending_completion_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
@@ -1498,6 +1656,7 @@ impl Services {
             completion_deliveries_in_flight: Arc::new(Mutex::new(HashMap::new())),
             dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
+            provider_policy: Arc::new(Mutex::new(HashMap::new())),
             source_control: None,
             linear_engine: None,
             sentry_engine: None,
@@ -1509,6 +1668,7 @@ impl Services {
             search_cancels: intent_search::CancelRegistry::new(),
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
             pty: Arc::new(intent_pty::PtyHost::new()),
+            daemon_boot_id,
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_locks: script_ops::ScriptLocks::new(),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
@@ -1529,9 +1689,9 @@ impl Services {
             archive_tail_park: None,
             archive_predrop_park: None,
             queue_mutation_gate_park: None,
-            secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
-                file_secrets.clone(),
-            ))),
+            secrets: Arc::new(settings::AsyncSecretStore::paired_gitlab(
+                gitlab_secret_store.clone(),
+            )),
             settings_registry: None,
             settings_revision: Arc::new(AtomicU64::new(0)),
             settings_revision_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -1563,8 +1723,15 @@ impl Services {
             collaboration_auth: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             github_login_base_uri: None,
             gitlab_auth: source_control_auth_ops::new_gitlab_state(),
-            gitlab_secret_store: file_secrets,
+            gitlab_secret_store,
             gitlab_credential_gate: source_control_auth_ops::new_gitlab_credential_gate(),
+            repository_connection_directory,
+            repository_lifecycle_registry: Arc::default(),
+            repository_wire_owner: Arc::default(),
+            repository_resource_capacity: Arc::default(),
+            repository_checkout_capacity: Arc::default(),
+            repository_review_capacity: Arc::default(),
+            repository_selection_capacity: Arc::default(),
             principal_identity_refreshed_at: Arc::new(tokio::sync::Mutex::new(None)),
             identity_transition: Arc::new(tokio::sync::Mutex::new(())),
             identity_rekey_generation: Arc::new(AtomicU64::new(0)),
@@ -1616,6 +1783,7 @@ impl Services {
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
             pr_cache: Arc::new(Mutex::new(HashMap::new())),
+            automatic_pr_refresh: Arc::new(Mutex::new(automatic_pr_refresh::Admission::default())),
             pr_discovery: pr_discovery::Discovery::default(),
             issue_cache: Arc::new(Mutex::new(HashMap::new())),
             pr_cache_max_age_seconds: None,
@@ -1630,7 +1798,7 @@ impl Services {
             pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
             pr_refresh_fetch_timeout: PR_REFRESH_FETCH_TIMEOUT,
             sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),
-            pending_workspace_deletes: delete_grace::PendingDeletes::default(),
+            pending_workspace_deletes: pending_deletes.clone(),
             workspace_mutations: workspace_mutations::WorkspaceMutations::default(),
             startup_resume_candidates: Arc::default(),
             #[cfg(test)]
@@ -1639,7 +1807,9 @@ impl Services {
             interrupted_resume_park: None,
             #[cfg(test)]
             workspace_delete_test_gate: tests::workspace_delete::DeleteGate::default(),
-            pending_agent_deletes: delete_grace::PendingDeletes::default(),
+            #[cfg(all(test, unix))]
+            pending_delete_test_gate: repository_pending_delete_tests::DeletionGates::default(),
+            pending_agent_deletes: pending_deletes,
             execution_invalidation: Arc::new(tokio::sync::Notify::new()),
             execution_readiness: Arc::new(Mutex::new(HashMap::new())),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
@@ -1648,7 +1818,12 @@ impl Services {
             idempotency_inflight: Arc::new(IdempotencyInflight::default()),
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
-        }
+        };
+        services
+            .gitlab_credential_gate
+            .attach_repository(services.repository_connection_directory(), descriptor)
+            .expect("a new credential gate has no prior repository attachment");
+        services
     }
 
     /// Pin how old a cached PR read may be and still be served on demand,
@@ -1818,8 +1993,25 @@ impl Services {
     /// `~/intent/.secrets.json`.
     #[must_use]
     pub fn with_gitlab_secret_store(mut self, store: intent_core::FileSecretStore) -> Self {
+        self.retire_repository_before_source_override();
         self.gitlab_secret_store = store;
         self
+    }
+
+    /// The original server directory; this accessor does not adopt credentials.
+    pub(crate) fn repository_connection_directory(
+        &self,
+    ) -> Arc<repository_credentials::RepositoryConnectionDirectory> {
+        self.repository_connection_directory.clone()
+    }
+
+    fn retire_repository_before_source_override(&self) {
+        if self.gitlab_credential_gate.has_settings_boundary() {
+            // Builders cannot replace an attached owner. Retire the SAME
+            // directory before changing a source, including across clones.
+            // A poisoned directory already refuses acquisition and dispatch.
+            let _ = self.repository_connection_directory.retire();
+        }
     }
 
     /// Override the GitHub API base the invite identity reads talk to
@@ -1849,6 +2041,7 @@ impl Services {
     /// same timeout / single-flight guarantees apply in tests.
     #[must_use]
     pub fn with_secret_store(mut self, secrets: Arc<dyn settings::SecretStore>) -> Self {
+        self.retire_repository_before_source_override();
         self.secrets = Arc::new(settings::AsyncSecretStore::new(secrets));
         self
     }
@@ -1859,6 +2052,7 @@ impl Services {
     /// wiring may leave it unset, keeping the legacy SQLite-only behavior.
     #[must_use]
     pub fn with_settings_registry(mut self, registry: Arc<SettingsRegistry>) -> Self {
+        self.retire_repository_before_source_override();
         self.settings_registry = Some(registry);
         self
     }
@@ -1879,12 +2073,6 @@ impl Services {
             .as_ref()
             .map(|r| r.snapshot().effective.clone())
             .unwrap_or_default()
-    }
-
-    /// The effective `agents.flushQueuedMessages` mode (default `All`). Read
-    /// at drain time by the agent manager; cheap registry-snapshot read.
-    pub(crate) fn flush_queued_messages_mode(&self) -> intent_core::FlushQueuedMessagesMode {
-        self.effective_settings().agents.flush_queued_messages
     }
 
     /// Resolve the effective auto-commit state for a workspace (spec Diagnosis
@@ -2278,6 +2466,7 @@ impl Services {
         )
         .with_settings(self.settings_registry.clone())
         .with_tasks(self.store_tasks.clone())
+        .with_owner_services(self.clone())
     }
 
     /// Test seam: raise the `script.*` too-fast-exit floor so the no-restart
@@ -2705,6 +2894,8 @@ impl Services {
     ///
     /// Returns `Error::Internal` if loading the persisted scripts from the store fails.
     pub async fn hydrate_scripts(&self) -> Result<usize> {
+        self.script_manager().recover_monitors().await?;
+        self.start_script_monitor_maintenance();
         self.script_manager().hydrate().await
     }
 
@@ -3262,7 +3453,15 @@ impl Services {
         include_agent_summary: bool,
     ) {
         ws.activity = self.workspace_activity(&ws.id);
-        ws.pending_delete_at = self.pending_workspace_deletes.deadline(ws.id.as_str());
+        ws.pending_delete_at = self
+            .pending_workspace_deletes
+            .deadline(&delete_grace::PendingDeleteSubject::Workspace(
+                ws.id.clone(),
+            ))
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, workspace = %ws.id, "pending delete display projection unavailable");
+                None
+            });
         let mut activity_max = if include_agent_summary {
             latest_activity_candidate(&[
                 ws.last_activity.as_deref(),
@@ -4780,11 +4979,13 @@ impl Services {
         &self,
         ws: &Workspace,
         sc: Option<&Arc<dyn intent_sourcecontrol::SourceControl>>,
+        interval_secs: u64,
+        local_maintenance: bool,
     ) {
         if ws.is_remote || ws.archived {
             return;
         }
-        if let Some(worktree) = git_ops::worktree_path(ws) {
+        if let Some(worktree) = git_ops::worktree_path(ws).filter(|_| local_maintenance) {
             let gitmodules = tokio::fs::read_to_string(worktree.join(".gitmodules"))
                 .await
                 .unwrap_or_default();
@@ -4873,6 +5074,16 @@ impl Services {
             }
         };
         for root in roots {
+            let admitted = sc.filter(|_| !self.sweeps_rate_limited()).and_then(|sc| {
+                let permit =
+                    self.admit_automatic_pr_refresh(&ws.id, Some(root.id.as_str()), interval_secs)?;
+                Some((sc, permit))
+            });
+            // Cached rows are cheap to list; avoid filesystem work on idle
+            // checkouts unless maintenance or their forge refresh is due.
+            if !local_maintenance && admitted.is_none() {
+                continue;
+            }
             // Auto-prune only on a genuine path-gone (`NotFound`, or a parent
             // component that is no longer a directory). Roots may live
             // anywhere on the host (network/FUSE mounts included), so a
@@ -4943,11 +5154,15 @@ impl Services {
             // local steps above have already done their work. A forge whose
             // quota is exhausted is treated the same for the remaining roots
             // — the local steps 1–3 above still ran (monorepo#2961).
-            let Some(sc) = sc.filter(|_| !self.sweeps_rate_limited()) else {
+            let Some((sc, _permit)) = admitted else {
                 continue;
             };
             let root_id = root.id.clone();
-            let refreshed = self.refresh_git_root_pr(root, sc).await;
+            let refreshed = pr_discovery::automatically_refresh(
+                interval_secs,
+                self.refresh_git_root_pr(root, sc),
+            )
+            .await;
             match refreshed {
                 Err(Error::RateLimited(detail)) => {
                     intent_sourcecontrol::traffic::with_caller(
@@ -5958,11 +6173,9 @@ impl Services {
     /// those lacking repo/branch info are skipped. Errors are logged per
     /// workspace and never abort the sweep.
     ///
-    /// To trim steady forge load (§7.7), the sweep is tiered by recency via
-    /// [`pr_ops::sweep_due`]: every [`pr_ops::SWEEP_IDLE_TICK_MULTIPLE`]-th
-    /// `tick` (including tick 0) refreshes every workspace; ticks in between
-    /// refresh only workspaces active within
-    /// [`pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES`].
+    /// Forge admission follows the shared meaningful-work idle cadence and
+    /// remembers failed attempts. Frontend automatic commands use the same
+    /// reservation; local git-root maintenance keeps its separate scan cadence.
     ///
     /// The sweep operates on the workspace snapshot taken at sweep start
     /// (`list_workspaces`); each workspace is passed into the refresh path
@@ -5988,22 +6201,32 @@ impl Services {
     }
 
     async fn refresh_all_workspace_prs_owned(&self, tick: u64) {
-        let mut workspaces = match self.store.list_workspaces(false).await {
+        let workspaces = match self.store.list_workspaces(false).await {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!(error = %e, "pr refresh: listing workspaces failed");
                 return;
             }
         };
-        // Parse the cutoff once per sweep; `sweep_due` fails open on `None`.
-        let cutoff = intent_core::parse_iso(&intent_core::iso_minutes_ago(
-            pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES,
-        ));
-        workspaces.retain(|ws| pr_ops::sweep_due(ws, cutoff, tick));
+        let ids: Vec<_> = workspaces.iter().map(|ws| ws.id.clone()).collect();
+        self.automatic_pr_refresh
+            .lock()
+            .unwrap()
+            .retain_workspaces(&ids);
+        let intervals = match self
+            .workspace_automatic_check_intervals(&ids, time::OffsetDateTime::now_utc())
+            .await
+        {
+            Ok(intervals) => intervals,
+            Err(error) => {
+                tracing::warn!(%error, "PR refresh: activity projection failed");
+                return;
+            }
+        };
         // Resolve the SourceControl provider once per sweep to avoid spamming
         // warnings when unconfigured and hitting keychain/gh on the blocking pool
-        // once per workspace (Copilot review comment on PR #131). Resolved after
-        // the due filter so an all-idle tick performs no keychain/`gh` work.
+        // once per workspace (Copilot review comment on PR #131). Forge work
+        // is admitted per workspace/root below; local root maintenance still runs.
         if workspaces.is_empty() {
             return;
         }
@@ -6034,6 +6257,7 @@ impl Services {
             // those already linked. `refresh_workspace_pr_with_sc` skips
             // ineligible workspaces internally.
             let ws_id = ws.id.clone();
+            let interval = intervals.get(&ws_id).copied().unwrap_or(60);
             // Forge reads share a deadline inside the refresh. Its admitted
             // store/event continuation remains owned after that deadline.
             //
@@ -6041,8 +6265,19 @@ impl Services {
             // sweep) so a limit hit mid-sweep stops the remaining forge
             // calls immediately instead of burning them into the exhausted
             // quota (monorepo#2961).
-            if let Some(sc) = sc.as_ref().filter(|_| !self.sweeps_rate_limited()) {
-                let refreshed = self.refresh_workspace_pr_with_sc(ws.clone(), sc).await;
+            let admitted = sc
+                .as_ref()
+                .filter(|_| !self.sweeps_rate_limited())
+                .and_then(|sc| {
+                    let permit = self.admit_automatic_pr_refresh(&ws_id, None, interval)?;
+                    Some((sc, permit))
+                });
+            if let Some((sc, _permit)) = admitted {
+                let refreshed = pr_discovery::automatically_refresh(
+                    interval,
+                    self.refresh_workspace_pr_with_sc(ws.clone(), sc),
+                )
+                .await;
                 match refreshed {
                     Err(Error::RateLimited(detail)) => {
                         intent_sourcecontrol::traffic::with_caller(
@@ -6064,27 +6299,30 @@ impl Services {
             // After the workspace's own refresh, sweep its tracked git roots
             // (submodule auto-detect, auto-prune, per-root PR refresh;
             // monorepo#2053). Fail-soft internally, per-root timeouts inside.
-            self.sweep_workspace_git_roots(&ws, sc.as_ref()).await;
+            self.sweep_workspace_git_roots(
+                &ws,
+                sc.as_ref(),
+                interval,
+                pr_ops::local_root_maintenance_due(&ws, tick, time::OffsetDateTime::now_utc()),
+            )
+            .await;
             // Release the SQLite pool slot between workspaces so queued
             // interactive acquires win it (intent-hq/monorepo#703).
             tokio::time::sleep(SWEEP_INTER_WORKSPACE_PAUSE).await;
         }
     }
 
-    /// Spawn the background PR refresh loop (§7.6): every `interval` (180 s at
+    /// Spawn the background PR refresh loop (§7.6): every `interval` (60 s at
     /// the composition root) it sweeps active workspaces — discovering open PRs
     /// by head-ref or baseRef match for unlinked workspaces (emitting
     /// `pr:linked`) and updating linked PRs (emitting
     /// `pr:updated`/`pr:unlinked`). The first sweep runs after one `interval`
-    /// and refreshes every workspace (tick 0); thereafter the sweep is tiered
-    /// by recency (see [`Services::refresh_all_workspace_prs`]) so idle
-    /// workspaces only refresh every [`pr_ops::SWEEP_IDLE_TICK_MULTIPLE`]-th
-    /// tick (~30 min). Each sweep pauses [`SWEEP_INTER_WORKSPACE_PAUSE`]
+    /// and admits each workspace immediately after restart; thereafter the
+    /// shared idle cadence gates forge work. Each sweep pauses [`SWEEP_INTER_WORKSPACE_PAUSE`]
     /// between workspaces so it never monopolizes `SQLite` pool slots. Missed
     /// ticks are skipped (no pile-up). No-op-safe when source control is
-    /// unconfigured (a sweep with due workspaces logs a single warning and
-    /// returns; an all-idle tick returns silently before resolving the
-    /// provider). Returns the task handle so the composition root can
+    /// unconfigured: local maintenance still runs and forge reads are skipped.
+    /// Returns the task handle so the composition root can
     /// hold/abort it.
     #[must_use]
     pub fn spawn_pr_refresh_loop(
@@ -6181,9 +6419,10 @@ impl Services {
     /// transaction ([`Store::update_workspace_token_usage`], monorepo#738):
     /// the tally/change-detection/zero-guard logic below executes as a sync
     /// closure over the in-transaction session rows and stored usage, and the
-    /// persist is a scoped `token_usage` + `updated_at` UPDATE — concurrent
-    /// recomputes fully serialize and a racing title/status update is never
-    /// clobbered. `workspace:tokenUsage-changed` is emitted only after the
+    /// persist is a scoped `token_usage` UPDATE that preserves workspace
+    /// activity timestamps — concurrent recomputes fully serialize and a
+    /// racing title/status update is never clobbered.
+    /// `workspace:tokenUsage-changed` is emitted only after the
     /// store reports a committed write.
     ///
     /// `guard_zero_regression` (set by the scan, not the live path): when the
@@ -6496,6 +6735,7 @@ impl Services {
     }
 
     pub async fn shutdown_store_writers(&self) {
+        self.provider_preparation.shutdown().await;
         self.shutdown_settings().await;
         // Called after RPC/agent admission is fenced, root schedulers joined,
         // and PtyHost::kill_all has refused/reaped every late PTY spawn.
@@ -6570,6 +6810,7 @@ impl Services {
     pub async fn shutdown_agent_deliveries(&self) {
         self.delivery_tasks.shutdown().await;
         self.completion_delivery_retries.lock().unwrap().clear();
+        self.pending_completion_retries.lock().unwrap().clear();
         self.completion_group_delivery_retries
             .lock()
             .unwrap()
@@ -7290,6 +7531,19 @@ impl Services {
             self.take_interim_skipped_idle(child_id);
             return;
         }
+        // A terminal monitor can still own an undelivered notification, even
+        // though it no longer appears in the active-monitor query below.
+        // Check before consuming provenance OR sealing a delegating group.
+        // Errors also defer: no row/event need exist to trigger recovery.
+        if self
+            .store
+            .script_monitor_pending_for_agent(child_id)
+            .await
+            .unwrap_or(true)
+        {
+            self.schedule_pending_completion_retry(child_id);
+            return;
+        }
         // Idle-visibility deferral: an idle agent still owning active
         // background hooks OR active PR monitors has not settled — leave the
         // marker in place (like the busy guard) so the hook's own terminal
@@ -7320,7 +7574,11 @@ impl Services {
         let advisory_pending = self.has_advisory_pending_interim_skip(child_id);
         if !advisory_pending
             && (!self.active_hooks_for_agent(child_id).await.is_empty()
-                || !self.active_pr_monitors_for_agent(child_id).await.is_empty())
+                || (!self.active_pr_monitors_for_agent(child_id).await.is_empty()
+                    || !self
+                        .active_script_monitors_for_agent(child_id)
+                        .await
+                        .is_empty()))
         {
             // monorepo#2532 Gap B provenance gate: when the marker was
             // recorded by a REGISTRATION-TIME deferral, the persisted report
@@ -7432,23 +7690,33 @@ impl Services {
         // Box::pin breaks the async-recursion cycles this edge closes
         // (deliver → redeliver → deliver, and the drain's None-arm path
         // try_drain_queue → redeliver → deliver → wake → try_drain_queue).
-        // No-advisory variant by default: this synthetic pass is non-interim
-        // by construction, but a hook/monitor registered in the
-        // guard→delivery window could re-classify it as monitoring-idle —
+        // Suppress advisories by default: a hook/monitor registered in the
+        // guard→delivery window could re-classify this pass as monitoring-idle —
         // that deferral keeps today's silent skip; only a LIVE idle fires
         // the advisory. EXCEPT when the consumed marker carried
         // advisory-pending provenance (monorepo#1297 busy-slot race): the
         // LIVE idle already qualified for the advisory and was suppressed
         // solely by the busy probe, so this heal pass stands in for it and
-        // runs the advisory-ALLOWED variant — the still-active hooks/monitors
+        // allows advisories — the still-active hooks/monitors
         // re-classify the synthesized idle as monitoring-idle and the owed
         // advisory delivers (once per waiting period, via the persisted
         // marker).
-        let classification = if advisory_pending {
-            Box::pin(self.deliver_completion_to_watches(child_id, &event)).await
+        let provenance = if had_stale_report {
+            InterimIdleProvenance::StaleReport
+        } else if advisory_pending {
+            InterimIdleProvenance::AdvisoryPending
         } else {
-            Box::pin(self.deliver_completion_to_watches_no_advisory(child_id, &event)).await
+            InterimIdleProvenance::Live
         };
+        let classification = Box::pin(self.deliver_completion_to_watches_inner(
+            child_id,
+            &event,
+            advisory_pending,
+            true,
+            None,
+            Some(provenance),
+        ))
+        .await;
         // Real completion: seal the agent's open after_all group and try to
         // fire it, mirroring `handle_completion_event`'s non-queue-interim
         // idle path (monorepo#1281). Gated on the delivery pass's own
@@ -7465,6 +7733,53 @@ impl Services {
             if let Some(gid) = self.seal_group_for_parent(child_id).await {
                 Box::pin(self.try_fire_group(&gid)).await;
             }
+        }
+    }
+
+    /// Retry pending-notification admission off the delivery stack. Settlement
+    /// normally retries immediately through dispatch/worker-exit; this owner
+    /// also heals query errors with no pending row and classify-to-mark races.
+    /// Duplicate requests only bump a generation, never create another worker.
+    fn schedule_pending_completion_retry(&self, child_id: &AgentId) {
+        if self.delivery_tasks.is_closed() {
+            return;
+        }
+        {
+            let mut retries = self.pending_completion_retries.lock().unwrap();
+            let already_owned = retries.contains_key(child_id);
+            let generation = retries.entry(child_id.clone()).or_default();
+            *generation = generation.wrapping_add(1);
+            if already_owned {
+                return;
+            }
+        }
+        let services = self.clone();
+        let child = child_id.clone();
+        let task = self.delivery_tasks.spawn(async move {
+            let mut backoff = std::time::Duration::from_millis(500);
+            loop {
+                tokio::time::sleep(backoff).await;
+                let generation = services.pending_completion_retries.lock().unwrap()[&child];
+                Box::pin(services.redeliver_completion_after_queue_mutation(&child)).await;
+                {
+                    let mut retries = services.pending_completion_retries.lock().unwrap();
+                    if retries.get(&child) == Some(&generation) {
+                        retries.remove(&child);
+                        break;
+                    }
+                }
+                // The guard (or a concurrent pass) deferred again. Keep the
+                // same owner, with bounded polling and constant per-child state.
+                backoff = backoff
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(5));
+            }
+        });
+        if task.is_none() {
+            self.pending_completion_retries
+                .lock()
+                .unwrap()
+                .remove(child_id);
         }
     }
 
@@ -7683,6 +7998,7 @@ impl Services {
                             attempt.watch_ids.is_none(),
                             true,
                             attempt.watch_ids.as_ref(),
+                            None,
                         ))
                         .await
                         .ungrouped_delivery_failed;
@@ -7864,7 +8180,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, true, true, None)
+        self.deliver_completion_to_watches_inner(child_id, event, true, true, None, None)
             .await
     }
 
@@ -7880,24 +8196,7 @@ impl Services {
         child_id: &AgentId,
         event: &Event,
     ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, true, false, None)
-            .await
-    }
-
-    /// [`Services::deliver_completion_to_watches`] with the advisory wake
-    /// suppressed: used by the registration-time / boot reconciliation
-    /// (`agent_subscriptions.rs`) and the synthetic mutation-path redelivery
-    /// (except its advisory-pending heal branch — monorepo#1297 — which runs
-    /// the advisory-allowed variant to stand in for a busy-suppressed LIVE
-    /// idle), whose deferred idles must keep today's silent-skip behavior —
-    /// only a LIVE `agent:idle` may fire the hook-/PR-monitor-waiting
-    /// advisory.
-    pub(crate) async fn deliver_completion_to_watches_no_advisory(
-        &self,
-        child_id: &AgentId,
-        event: &Event,
-    ) -> CompletionIdleClassification {
-        self.deliver_completion_to_watches_inner(child_id, event, false, true, None)
+        self.deliver_completion_to_watches_inner(child_id, event, true, false, None, None)
             .await
     }
 
@@ -7908,6 +8207,7 @@ impl Services {
         advisory_allowed: bool,
         clear_advisory_markers: bool,
         watch_ids: Option<&HashSet<String>>,
+        synthetic_provenance: Option<InterimIdleProvenance>,
     ) -> CompletionIdleClassification {
         // Queue- and busy-aware completion: an `agent:idle` for a child whose
         // pending message queue still holds ready-to-send entries, OR whose
@@ -7931,7 +8231,13 @@ impl Services {
         let queue_ready = event.event_type == AGENT_IDLE && self.has_ready_to_send(child_id);
         let busy_interim =
             event.event_type == AGENT_IDLE && !queue_ready && self.agent_is_busy(child_id.clone());
-        let queue_interim = queue_ready || busy_interim;
+        let pending_script_wake = event.event_type == AGENT_IDLE
+            && self
+                .store
+                .script_monitor_pending_for_agent(child_id)
+                .await
+                .unwrap_or(true);
+        let queue_interim = queue_ready || busy_interim || pending_script_wake;
         // monorepo#1945: an `agent:idle` carrying a non-empty
         // completionReport (stamped by every idle emit site from the
         // session's persisted report, set exclusively by
@@ -7961,7 +8267,12 @@ impl Services {
             } else {
                 Vec::new()
             };
-        let hook_waiting = !active_hooks.is_empty();
+        let active_script_monitors = if event.event_type == AGENT_IDLE && !completion_reported {
+            self.active_script_monitors_for_agent(child_id).await
+        } else {
+            Vec::new()
+        };
+        let hook_waiting = !active_hooks.is_empty() || !active_script_monitors.is_empty();
         // Idle-visibility deferral (unified external-wait, mirrors
         // `hook_waiting` exactly): an `agent:idle` for a child that owns
         // active PR monitors is not its real completion — a monitored PR's
@@ -8030,7 +8341,20 @@ impl Services {
             // OWED, not cancelled — record the advisory-pending provenance so
             // the worker-exit heal (`redeliver_completion_after_queue_mutation`)
             // runs the advisory-ALLOWED variant and delivers it.
-            if watch_ids.is_some() {
+            // Preserve the consumed marker only while the notification blocks
+            // admission. Once an advisory can deliver, its pending provenance
+            // must clear normally or the tail would keep admitting it again.
+            if let Some(provenance) = synthetic_provenance.filter(|_| pending_script_wake) {
+                match provenance {
+                    InterimIdleProvenance::StaleReport => {
+                        self.mark_interim_skipped_idle_stale_report(child_id);
+                    }
+                    InterimIdleProvenance::AdvisoryPending => {
+                        self.mark_interim_skipped_idle_advisory_pending(child_id);
+                    }
+                    InterimIdleProvenance::Live => self.mark_interim_skipped_idle(child_id),
+                }
+            } else if watch_ids.is_some() {
                 self.mark_interim_skipped_idle_preserving_provenance(child_id);
             } else if advisory_allowed
                 && busy_interim
@@ -8857,9 +9181,9 @@ impl Services {
         // snapshot and the marker landing found no marker and no-op'd —
         // re-check now and hand off to the mutation-path redelivery (its
         // guards make this a no-op unless the queue really emptied and the
-        // agent is idle). The indirect async recursion is depth-1: the
-        // synthetic redelivery's event is non-interim by construction
-        // (queue empty), so its own pass never re-enters here. An
+        // agent is idle). Pending notifications instead hand off to a
+        // coalesced retry owner: an empty queue does not mean their outbox
+        // entry settled, and retrying inline could repeat indefinitely. An
         // agent-waiting-only idle (issue intent-hq/monorepo#1468) is
         // deliberately excluded from THIS re-check — it has no queue-race to
         // heal and an unconditional synthetic pass would re-classify as
@@ -8876,7 +9200,9 @@ impl Services {
         // empty raced-drain arm) together heal it — whichever runs after the
         // slot release observes marker + empty queue + not busy and
         // synthesizes the real completion.
-        if seal_interim && !self.has_ready_to_send(child_id) {
+        if pending_script_wake {
+            self.schedule_pending_completion_retry(child_id);
+        } else if seal_interim && !self.has_ready_to_send(child_id) {
             Box::pin(self.redeliver_completion_after_queue_mutation(child_id)).await;
         }
         // Agent-waiting classify→mark race (issue intent-hq/monorepo#1468):
@@ -9005,7 +9331,7 @@ impl Services {
             );
             return false;
         }
-        let wake = format_monitoring_idle_advisory_wake(
+        let mut wake = format_monitoring_idle_advisory_wake(
             child_id,
             event,
             active_hooks,
@@ -9013,9 +9339,23 @@ impl Services {
             grouped,
             child_of_recipient,
         );
+        let script_waits = self.active_script_monitors_for_agent(child_id).await;
+        if !script_waits.is_empty() {
+            use std::fmt::Write as _;
+            wake.push_str("\nActive script monitors:");
+            for row in &script_waits {
+                let _ = write!(
+                    wake,
+                    "\n- {} (run {}, expires {})",
+                    row["scriptName"], row["runId"], row["expiresAt"]
+                );
+            }
+        }
         let mut metadata = build_event_notification_metadata(&[event]);
         metadata["watchStillArmed"] = serde_json::json!(true);
         metadata["childExternallyWaiting"] = serde_json::json!(true);
+        self.annotate_waiting_on_script_monitors(child_id, &mut metadata)
+            .await;
         if !active_hooks.is_empty() {
             metadata["waitingOnHooks"] = serde_json::Value::Array(active_hooks.to_vec());
         }
@@ -12762,7 +13102,8 @@ fn cleanup_workspace_worktree_locked(
     worktree: &Path,
     branch: &str,
     branch_auto_generated: bool,
-) -> Option<PathBuf> {
+) -> (Option<PathBuf>, bool) {
+    let mut completed = true;
     let checked_out = intent_git::worktree::worktree_branch(worktree);
     // An already-absent repository (retried delete, swept repo cache,
     // orphaned row) is an expected state, not a failure: there is no
@@ -12782,6 +13123,7 @@ fn cleanup_workspace_worktree_locked(
         match intent_git::worktree::detach_worktree(repo, worktree) {
             Ok(trash) => trash,
             Err(e) => {
+                completed = false;
                 tracing::warn!(
                     error = %e,
                     worktree = %worktree.display(),
@@ -12809,6 +13151,7 @@ fn cleanup_workspace_worktree_locked(
         && branch != "master";
     if deletable {
         if let Err(e) = intent_git::branches::delete_local_branch(repo, branch) {
+            completed = false;
             tracing::debug!(error = %e, branch, "could not delete workspace branch");
         }
     } else if let Some(checked_out) = checked_out {
@@ -12817,7 +13160,7 @@ fn cleanup_workspace_worktree_locked(
             "skipping branch deletion - not the auto-generated workspace branch"
         );
     }
-    trash
+    (trash, completed)
 }
 
 /// Locked phase of the `workspace.delete` cleanup for a standalone `CoW`
@@ -12832,10 +13175,12 @@ fn cleanup_workspace_worktree_locked(
 /// happens unlocked via [`cleanup_detached_worktree`]), drop the `.workspace`
 /// metadata dir, and best-effort `remove_dir` the empty parent. Best-effort
 /// throughout; returns the trash path awaiting recursive removal.
-fn cleanup_workspace_cow_checkout_locked(checkout: &Path) -> Option<PathBuf> {
+fn cleanup_workspace_cow_checkout_locked(checkout: &Path) -> (Option<PathBuf>, bool) {
+    let mut completed = true;
     let trash = match intent_git::worktree::detach_checkout_dir(checkout) {
         Ok(trash) => trash,
         Err(e) => {
+            completed = false;
             tracing::warn!(
                 error = %e,
                 checkout = %checkout.display(),
@@ -12852,7 +13197,7 @@ fn cleanup_workspace_cow_checkout_locked(checkout: &Path) -> Option<PathBuf> {
         let _ = std::fs::remove_dir_all(parent.join(".workspace"));
         let _ = std::fs::remove_dir(parent);
     }
-    trash
+    (trash, completed)
 }
 
 /// Best-effort removal of the `<root>/<workspaceId>` dir a `CoW` probe created
@@ -12865,48 +13210,12 @@ fn remove_workspace_dir_if_empty(ws_dir: &Path) {
     let _ = std::fs::remove_dir(ws_dir);
 }
 
-/// Loud degradation probe for PR-aware creates (§5.1): when the workspace
-/// branch was derived from a PR head but the source repo has neither a local
-/// branch nor a `refs/remotes/{remote}/{branch}` tip — a fork-hosted head
-/// (the base repo carries no ref for it), or a never-fetched branch on a
-/// local-repo create (provisioning does no network fetch) — the checkout
-/// silently materializes as a FRESH branch at the base commit, named like
-/// the PR head but carrying none of its commits, while `pr_number`/`pr_url`
-/// claim PR linkage. Warn so the degradation is visible; best-effort and
-/// read-only (probe errors are ignored — provisioning surfaces real
-/// failures itself).
-fn warn_if_pr_head_missing(
-    repo_path: &Path,
-    branch: &str,
-    remote: &str,
-    link: Option<&intent_core::ContextLink>,
-) {
-    let Some(link) = link else { return };
-    let Ok(repo) = git2::Repository::open(repo_path) else {
-        return;
-    };
-    let local = repo.find_branch(branch, git2::BranchType::Local).is_ok();
-    let remote_tip = repo
-        .find_reference(&format!("refs/remotes/{remote}/{branch}"))
-        .is_ok();
-    if !local && !remote_tip {
-        tracing::warn!(
-            owner = %link.owner,
-            repo = %link.repo,
-            pr = link.number,
-            branch = %branch,
-            "workspace.create: PR head branch has no local or remote-tracking ref (fork-hosted head, or never fetched); the checkout will be a fresh branch at the base commit WITHOUT the PR's commits"
-        );
-    }
-}
-
 /// `baseCommitSha` for a PR-derived checkout (§5.1): the provisioning helpers
 /// return the CHECKED-OUT tip, which for a materialized PR head is the head
 /// SHA — not the base boundary the `baseCommitSha` contract records. Resolve
 /// the merge-base of the checkout's HEAD with the (PR-derived) `baseRef`
 /// instead, falling back to the checked-out tip when the boundary cannot be
-/// resolved (e.g. the head degraded to a fresh branch at the base commit,
-/// where tip == boundary anyway).
+/// resolved (for example, the base branch has not been fetched).
 fn pr_aware_base_commit_sha(
     checkout_path: &Path,
     base_ref: Option<&str>,
@@ -12951,14 +13260,16 @@ fn clear_standalone_repository_path(ws: &mut Workspace, source_standalone: bool)
 /// The empty-only parent `remove_dir` retry that the trash sibling blocked is
 /// the caller's job, back under the lock — doing it here unlocked could race
 /// a same-slug recreate's `create_dir_all(parent)`.
-fn cleanup_detached_worktree(trash: &Path) {
+fn cleanup_detached_worktree(trash: &Path) -> bool {
     if let Err(e) = intent_git::worktree::remove_detached_worktree(trash) {
         tracing::warn!(
             error = %e,
             path = %trash.display(),
             "failed to remove detached worktree dir"
         );
+        return false;
     }
+    true
 }
 
 /// Startup sweep for orphaned worktree trash directories (monorepo#473). If
@@ -16856,6 +17167,62 @@ impl Services {
         Ok(())
     }
 
+    /// Prepare an external configuration candidate under its original settings
+    /// owner before publication. Credential serialization precedes the revision
+    /// gate; account verification runs only after that gate has been released.
+    ///
+    /// # Errors
+    /// Rejects invalid or superseded candidates and unprepared relevant changes.
+    pub async fn apply_prepared_settings_reload(
+        &self,
+        text: String,
+        expected: Arc<SettingsSnapshot>,
+        mut admission: PreparedReloadAdmission,
+    ) -> Result<SettingsChanged> {
+        let registry = self
+            .settings_registry
+            .as_deref()
+            .ok_or_else(|| Error::Internal("settings registry is unavailable for reload".into()))?;
+        let candidate = registry.prepare_repository_reload_at(&text, expected)?;
+        let relevant = candidate.snapshot().effective.source_control.gitlab
+            != registry.snapshot().effective.source_control.gitlab;
+        let credential_guard = if relevant {
+            Some(admission.wait(self.gitlab_credential_gate.lock()).await?)
+        } else {
+            None
+        };
+        let revision_guard = admission.wait(self.settings_revision_gate.write()).await?;
+        let (write, result) = admission.publish(|| {
+            let write = if self.gitlab_credential_gate.has_settings_boundary() {
+                credential_guard
+                    .as_ref()
+                    .map(|guard| {
+                        self.gitlab_credential_gate.prepare_settings(
+                            registry,
+                            candidate.snapshot(),
+                            guard,
+                        )
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            let result = registry.publish_repository_reload(candidate, write.as_deref());
+            Ok((write, result))
+        })?;
+        admission
+            .finish(async {
+                if let Ok(notice) = &result {
+                    self.apply_external_settings_change(notice).await;
+                }
+                drop(revision_guard);
+                self.settle_gitlab_repository_settings(write.as_deref(), result.is_ok(), false)
+                    .await;
+                result
+            })
+            .await
+    }
+
     /// Apply an **externally driven** settings change (config.toml
     /// live-reload): the registry has already adopted the new file layer, so
     /// this runs the same server runtime hooks as `settings.update`
@@ -17028,19 +17395,6 @@ impl Services {
         }))
     }
 
-    /// Whether a `settings.update` batch writes the GitLab credential
-    /// ([`intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT`]), i.e. must
-    /// run under [`Self::gitlab_credential_gate`]. Placeholder entries count:
-    /// the gate is cheap and the apply decides the no-op.
-    fn batch_touches_gitlab_credential(changes: &serde_json::Value) -> bool {
-        changes.as_array().is_some_and(|entries| {
-            entries.iter().any(|e| {
-                e.get("path").and_then(|v| v.as_str())
-                    == Some(intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT)
-            })
-        })
-    }
-
     /// Default-model re-resolution on a default-provider switch
     /// (monorepo#3177). When a `settings.update` batch writes
     /// `model.defaultProvider` to a registered provider that differs from
@@ -17149,6 +17503,655 @@ impl Services {
     }
 }
 
+impl Services {
+    fn delete_workspace_with_claim(
+        &self,
+        id: WorkspaceId,
+        original_claim: Option<delete_grace::PendingDeleteClaim>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let store = self.store.clone();
+        let worktree_locks = self.worktree_locks.clone();
+        let bus = self.event_bus.clone();
+        let workspaces_root = self
+            .workspaces_root
+            .clone()
+            .unwrap_or_else(default_workspaces_root);
+        // Custom `workspace.worktreesLocation` sweep target: the workspace's
+        // actual parent is derived from its persisted worktree path below,
+        // but worktree-less rows created under a custom location need the
+        // currently configured location as a candidate too.
+        let worktrees_location = self.configured_worktrees_location();
+        // Live-state teardown handles: cloned so the boxed future owns them
+        // across the store cascade below. `agent_manager()` upgrades the weak
+        // reference; read-only/test wiring with no manager attached simply
+        // skips the runtime stop and still sweeps the in-memory registries.
+        let manager = self.agent_manager();
+        let agent_queues = self.agent_queues.clone();
+        let live_turns = self.live_turns.clone();
+        let last_turn_silent_tails = self.last_turn_silent_tails.clone();
+        let truncation_redrives = self.truncation_redrives.clone();
+        let pending_truncation_redrive = self.pending_truncation_redrive.clone();
+        let agent_subscriptions = self.agent_subscriptions.clone();
+        // Full handle for the direct completion delivery below (Services is
+        // Clone — the same capture pattern the spawn helpers use).
+        let services = self.clone();
+        Box::pin(async move {
+            self.require_workspace_manager(&id, "workspace.delete")
+                .await?;
+            // Chief is virtual and never appears in `workspace.list`; delete is
+            // a no-op success (TS `workspace.repository.delete` / virtual-guard
+            // parity — the seeded row is not torn down and no cascade fires).
+            if id.is_chief() {
+                return Ok(());
+            }
+            let subject = delete_grace::PendingDeleteSubject::Workspace(id.clone());
+            let claim = match original_claim {
+                Some(claim) if claim.subject() == &subject => claim,
+                Some(_) => {
+                    return Err(Error::InvalidParams(
+                        "different original deletion subject".into(),
+                    ))
+                }
+                None => {
+                    services
+                        .pending_workspace_deletes
+                        .take_for_immediate_delete(subject)
+                        .await?
+                }
+            };
+            let mut deletion_claims = vec![claim];
+            // Close producer admission before the snapshot. Existing admitted
+            // creates/sends finish first; unrelated workspaces stay writable.
+            // Keep the permit through cleanup and terminal event publication.
+            let _deletion = services.workspace_mutations.delete(&id).await;
+            services
+                .cancel_script_monitors(&id, None, "workspace-deleted")
+                .await?;
+            // Terminate live agent sessions BEFORE the store cascade drops
+            // their rows. A same-slug recreate hitting `agent.list` after the
+            // delete would otherwise surface ghost sessions whose workers are
+            // still draining, their live-turn slots + pending message queues
+            // still populated, and their completion watches still firing. The
+            // order mirrors `agent_delete_op`: capture the workspace-scoped
+            // sessions, drop each session's runtime state, then emit
+            // `agent:deleted` per session so subscribers see the tear-down
+            // before the terminal `workspace:deleted`.
+            // Fail fast on a transient session-list error: skipping the
+            // sweep here but still deleting the workspace row leaves ghost
+            // workers, live-turn slots, queued messages, and completion
+            // watches with no owning workspace — a client can retry the
+            // delete, but silent partial success cannot recover.
+            // Summaries only (intent-hq/monorepo#4130): the sweep reads just
+            // `id` + `name`, and the full `list_agent_sessions` hydrated
+            // every session's transcript (2 statements per agent) for rows
+            // the cascade below is about to drop.
+            let sessions = store.list_agent_session_summaries(&id).await?;
+            let session_ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
+            // Cascade interaction (§5.5): the workspace delete — immediate
+            // or committed-from-pending — supersedes any pending agent
+            // deletions inside it. Abort their timers without per-agent
+            // cancel events; each session is deleted just below, emitting
+            // `agent:deleted` per session.
+            deletion_claims.extend(services.take_pending_agent_deletes(&sessions).await?);
+            // Batch stop: aborts each worker, drops each handle, clears
+            // busy + agent_ws, and deregisters each process — the
+            // `agent.stop` semantics per agent — then kills all detached
+            // ACP children's process groups under ONE shared grace
+            // window (`kill_child_trees`), so the delete ack pays ~one
+            // grace period total instead of one per live agent.
+            // The returned fence keeps the swept agents blocked from the
+            // lazy-spawn paths until this future completes (it drops at the
+            // end of this scope, after the store cascade below deletes the
+            // session rows): a concurrent `agent.sendMessage` that passed
+            // its store check before the sweep would otherwise respawn a
+            // replacement child during the shared grace wait and leave it
+            // running as a ghost process after the rows are gone.
+            let _teardown_fence = match manager.as_ref() {
+                Some(manager) => Some(manager.stop_many(&session_ids).await),
+                None => None,
+            };
+            for session in &sessions {
+                // Live-turn slot + pending message queue live in `Services`'
+                // maps (not touched by `manager.stop_many`); drop them so a
+                // same-slug recreate observes no ghost state. Recover through
+                // a poisoned lock via `into_inner` — the delete path is the
+                // last chance to unlink this state, so best-effort teardown
+                // outweighs propagating a mutex-poison panic.
+                live_turns
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&session.id);
+                last_turn_silent_tails
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&session.id);
+                truncation_redrives
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&session.id);
+                pending_truncation_redrive
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&session.id);
+                agent_queues
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&session.id);
+            }
+            // Sweep the deleted workspace out of the daemon-global
+            // subscription registry: drop watches whose PARENT lives here
+            // (their wake destination is gone) and groups anchored here.
+            // Watches whose parent lives elsewhere (a chief watching a child
+            // in this workspace) are kept — the `agent:deleted` events
+            // published just below still wake the cross-workspace parent.
+            // Poison recovery mirrors the per-session sweep above.
+            let parent_watch_ids: Vec<String> = {
+                let registry = agent_subscriptions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                registry
+                    .subscriptions
+                    .iter()
+                    .filter(|s| s.parent_workspace_id == id)
+                    .map(|s| s.id.clone())
+                    .collect()
+            };
+            // These rows have no FK cascade. Delete each outside the registry
+            // lock before forgetting it in memory, so failure/cancellation
+            // leaves its id available for retry. Admission also covers any
+            // delayed registration write, so none can land behind this sweep.
+            for watch_id in &parent_watch_ids {
+                store.delete_completion_watch(watch_id).await?;
+            }
+            {
+                let mut registry = agent_subscriptions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                registry
+                    .subscriptions
+                    .retain(|s| s.parent_workspace_id != id);
+                registry.delegation_groups.retain(|g| g.workspace_id != id);
+            }
+            // Emit `agent:deleted` per swept session before the worktree /
+            // store cleanup so subscribers see the terminal event for each
+            // agent ahead of `workspace:deleted`. Best-effort: emits when the
+            // bus is wired; a `None` bus (read-only wiring) is a quiet no-op.
+            for session in &sessions {
+                publish_event(
+                    bus.as_ref(),
+                    NewEvent {
+                        workspace_id: id.clone(),
+                        timestamp: now_iso(),
+                        event_type: AGENT_DELETED.to_string(),
+                        actor: system_actor(),
+                        session_id: Some(session.id.0.clone()),
+                        correlation_id: None,
+                        parent_event_id: None,
+                        metadata: None,
+                        data: serde_json::json!({
+                            "agentId": session.id.0,
+                            "agentName": session.name,
+                        }),
+                    },
+                )
+                .await;
+            }
+            // Deterministic cross-workspace consumption (monorepo#463): the
+            // publishes above are best-effort (`None` bus, logged-and-skipped
+            // delivery failures), so a chief parent's watch on a child here
+            // could otherwise leak forever (watches have no timed cleanup)
+            // and a chief-anchored after_all group would stay
+            // incomplete until restart. Deliver the same synthetic
+            // `agent:deleted` directly, BEFORE the store cascade drops the
+            // session rows (grouped delivery still resolves the child's
+            // completion report). The remove-before-deliver guard in
+            // `deliver_completion_to_watches` makes the bus loop's later
+            // processing of the published event a no-op — no duplicate wake —
+            // and `record_group_child_completion` is idempotent.
+            // The settlement clear of each child's advisory-wake period
+            // markers runs ONCE for the whole sweep (one `IN`-list statement)
+            // instead of inside every delivery (intent-hq/monorepo#4130);
+            // best-effort on the same terms as the per-child clear — the
+            // cascade below drops the rows regardless.
+            if let Err(e) = store
+                .clear_advisory_wake_deliveries_for_children(&session_ids)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    workspace = %id.as_str(),
+                    "failed to clear advisory-wake period markers for deleted workspace"
+                );
+            }
+            for session in &sessions {
+                let event = Event {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    workspace_id: id.clone(),
+                    timestamp: now_iso(),
+                    event_type: AGENT_DELETED.to_string(),
+                    actor: system_actor(),
+                    session_id: Some(session.id.0.clone()),
+                    correlation_id: None,
+                    parent_event_id: None,
+                    metadata: None,
+                    data: serde_json::json!({
+                        "agentId": session.id.0,
+                        "agentName": session.name,
+                    }),
+                };
+                services
+                    .deliver_completion_to_watches_markers_precleared(&session.id, &event)
+                    .await;
+            }
+            // Backstop sweep: grouped watches survive delivery (group
+            // settlement owns their lifecycle) and a racing registration can
+            // land behind the loop above — after this point no watch may
+            // reference the deleted workspace as its child side. In-memory
+            // retain + best-effort delete of the persisted rows. Each
+            // affected parent then gets a refreshed
+            // `agent:subscriptions-changed` so clients converge on the
+            // shrunken watch set without polling (PROTOCOL §6.5).
+            let leaked: Vec<(String, WorkspaceId, AgentId)> = {
+                let mut registry = agent_subscriptions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut leaked = Vec::new();
+                registry.subscriptions.retain(|s| {
+                    if s.child_workspace_id == id {
+                        leaked.push((
+                            s.id.clone(),
+                            s.parent_workspace_id.clone(),
+                            s.parent_agent_id.clone(),
+                        ));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                leaked
+            };
+            for (watch_id, _, _) in &leaked {
+                if let Err(e) = store.delete_completion_watch(watch_id).await {
+                    tracing::warn!("completion_watch delete failed {watch_id}: {e}");
+                }
+            }
+            let mut notified: Vec<(&WorkspaceId, &AgentId)> = Vec::new();
+            for (_, parent_ws, parent_id) in &leaked {
+                if !notified.contains(&(parent_ws, parent_id)) {
+                    notified.push((parent_ws, parent_id));
+                    services
+                        .publish_subscriptions_changed(parent_ws, parent_id)
+                        .await;
+                }
+            }
+            // Drop the workspace's event subscriptions (monorepo#947): their
+            // filter is workspace-scoped, so once the workspace is gone they
+            // can never match again — without this sweep their delivery
+            // tasks and persisted rows leak and rehydrate forever. Aborts
+            // the tasks and deletes the rows (chief-anchored subscriptions
+            // scoped to OTHER workspaces are untouched — this removes only
+            // subscriptions whose events came from the deleted workspace).
+            // Producer admission is already closed: no new subscription can
+            // register behind this sweep while the store cleanup yields.
+            services.remove_event_subscriptions_for_workspace(&id).await;
+            // Eagerly abort the workspace's live hook scheduler tasks BEFORE
+            // the store cascade drops their rows — otherwise each task would
+            // linger until its next tick before noticing the row is gone.
+            services.abort_workspace_hook_tasks(&id).await;
+            // Capture workspace state for the async cleanup below (before the
+            // row delete). Best-effort: when the workspace is already gone or
+            // the read fails, the background task simply skips the worktree
+            // step — the orphaned directory sweep can still unlink
+            // `<workspaces_root>/<id>/` on a retry, per the idempotent delete.
+            let workspace_observation = store.get_workspace(&id).await;
+            let mut known_completion =
+                matches!(&workspace_observation, Ok(_) | Err(Error::NotFound(_)));
+            let ws_for_cleanup = workspace_observation.ok();
+            let branch_observation = store.workspace_branch_auto_generated(&id).await;
+            known_completion &= matches!(&branch_observation, Ok(_) | Err(Error::NotFound(_)));
+            let branch_auto_generated = branch_observation.unwrap_or(false);
+            #[cfg(test)]
+            services.workspace_delete_test_gate.pause(&id).await;
+            // Idempotent DB delete: swallow `NotFound` so retries and
+            // orphan-dir-only cleanups don't surface as `"Failed to delete
+            // space"` on the FE. Any other error still propagates. Publish
+            // `workspace:deleted` only when we actually removed a row —
+            // subscribers dedup by id but a spurious event confuses UIs
+            // that treat it as a state transition.
+            let store_outcome = store.delete_workspace_with_outcome(&id).await;
+            known_completion &= store_outcome.disposition
+                != intent_store::RepositoryWorkspaceDeleteDisposition::Unknown;
+            match store_outcome.result {
+                Ok(()) => {
+                    publish_event(bus.as_ref(), workspace_deleted_event(&id)).await;
+                }
+                Err(Error::NotFound(_)) => {
+                    tracing::debug!(
+                        workspace = %id.as_str(),
+                        "workspace.delete: row already gone; treating as idempotent success"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+            // Cancel any pending debounced lastActivity derivation
+            // (monorepo#3623): the timer must not outlive the workspace —
+            // it would fire against the deleted row and log a spurious
+            // not-found WARN. After the row delete, so a schedule placed
+            // by the teardown above is swept too.
+            services.cancel_last_activity_schedule(&id);
+            // Sweep the pending idle debouncer the same way (monorepo#3632):
+            // an `agent_activity_end` during the agent teardown above
+            // schedules an idle flip whose timer would otherwise outlive the
+            // workspace and emit a spurious
+            // `workspace:activity-changed { idle }` ~3s after deletion.
+            // Residual race: an `agent_activity_end` landing after this sweep
+            // can still re-arm a flip for the deleted id — the timer's
+            // every-exit-path removal self-heals the map entry, and its
+            // emit-time existence guard skips the spurious event.
+            services.cancel_idle_debounce(&id);
+            // Evict the deleted workspace's last-observed displayStatus
+            // baseline so the in-memory map does not leak for the daemon's
+            // lifetime (and a same-id recreate seeds fresh).
+            services.evict_display_status_baseline(&id);
+            // Same for the cached git status: a dirty repo's `files` vec is
+            // unbounded, so the deleted worktree's last scan must not be
+            // retained for the daemon's lifetime (monorepo#1648).
+            if let Some(worktree) = ws_for_cleanup.as_ref().and_then(git_ops::worktree_path) {
+                services.git_status_cache.evict(&worktree);
+            }
+            // Fast-ack: the client receives `{ success: true }` here while the
+            // worktree and workspace-directory cleanup proceeds asynchronously
+            // in the background. Bounded latency regardless of checkout size
+            // (no multi-GB `remove_dir_all` blocking the response).
+            //
+            // Same-slug-recreate race guard: the `create` path already takes
+            // the per-repo worktree lock before provisioning, so a recreate
+            // cannot run its `add_worktree` while this cleanup's locked phase
+            // (registration prune + rename to a trash path) is still in
+            // progress for the same repo.
+            // Residual risk: if a recreate runs *before* the background task
+            // fires (row is deleted, event is sent, response is ACKed, but the
+            // spawn hasn't yet grabbed the worktree lock), the recreate could
+            // complete and then this cleanup might delete its brand-new
+            // worktree. Mitigation: we re-check the workspace row inside the
+            // background task and skip cleanup if it exists again. This is
+            // best-effort; the cleanup is naturally idempotent, and
+            // `workspace.delete` of the recreated workspace will clean up any
+            // mismatched leftovers.
+            let workspaces_root_bg = workspaces_root.clone();
+            let worktrees_location_bg = worktrees_location.clone();
+            let id_bg = id.clone();
+            let store_bg = store.clone();
+            let worktree_locks_bg = worktree_locks.clone();
+            let branch_auto_generated_bg = branch_auto_generated;
+            #[cfg(all(test, unix))]
+            let cleanup_gate = services.pending_delete_test_gate.clone();
+            let cleanup_task = services.store_tasks.spawn_draining(async move {
+                #[cfg(all(test, unix))]
+                cleanup_gate.pause("background", &id_bg.0).await;
+                // Re-check that the workspace is actually deleted. If it
+                // exists now (same-slug recreate landed before this task ran),
+                // skip the worktree cleanup entirely — the new workspace owns
+                // the branch and directory now. Still sweep the
+                // `<workspaces_root>/<id>/` directory if it doesn't match the
+                // recreated workspace's path, for orphan-cleanup parity.
+                let recreated_observation = store_bg.get_workspace(&id_bg).await;
+                known_completion &=
+                    matches!(&recreated_observation, Ok(_) | Err(Error::NotFound(_)));
+                let recreated = recreated_observation.ok();
+                let deleted_worktree_path = ws_for_cleanup
+                    .as_ref()
+                    .and_then(|w| w.worktree_path.clone());
+                // Root-anchored ownership: the persisted checkout counts as
+                // daemon-provisioned only when its parent directory is named
+                // after the workspace id AND it lives under a root the daemon
+                // provisions into (the boot workspaces root or the currently
+                // configured `workspace.worktreesLocation`). The parent
+                // basename alone is spoofable — the workspace id derives from
+                // the initial prompt, so an `isNewRepo` caller could place
+                // their repository at `<anywhere>/<wsId>/<repo>` and a
+                // basename-only gate would route the user's folder into the
+                // delete paths below. Trade-off: a checkout provisioned under
+                // a since-changed custom location is no longer matched and its
+                // `<oldLocation>/<wsId>/` directory leaks instead of being
+                // swept — leaking is the safe direction (never delete what we
+                // cannot prove we created).
+                let checkout_owned = deleted_worktree_path.as_deref().is_some_and(|wt| {
+                    checkout_parent_is_workspace_dir(wt, &id_bg)
+                        && (Path::new(wt).starts_with(&workspaces_root_bg)
+                            || worktrees_location_bg
+                                .as_deref()
+                                .is_some_and(|loc| Path::new(wt).starts_with(loc)))
+                });
+                // A standalone row's checkout path is caller-influenced
+                // (`repository_path == worktree_path`), so unless ownership is
+                // proven above it must not seed the final
+                // `workspace_dir_candidates` sweep either — that sweep
+                // recursively removes the checkout's parent directory.
+                // Worktree-mode rows keep their persisted path: the daemon
+                // derived it at provision time (covers a since-changed custom
+                // location).
+                let is_standalone_row = ws_for_cleanup.as_ref().is_some_and(|w| {
+                    matches!(
+                        w.checkout_mode,
+                        Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
+                    )
+                });
+                let sweep_worktree_path = deleted_worktree_path
+                    .as_deref()
+                    .filter(|_| !is_standalone_row || checkout_owned);
+                if let Some(ws_cleanup) = ws_for_cleanup {
+                    // Only run the worktree cleanup if the workspace is still
+                    // deleted (no recreate) or the recreate has a different
+                    // worktree path (the old worktree is now orphaned).
+                    let skip_worktree = recreated
+                        .as_ref()
+                        .is_some_and(|r| r.worktree_path == ws_cleanup.worktree_path);
+                    if !skip_worktree {
+                        let repo_dir = ws_cleanup
+                            .repository_path
+                            .as_deref()
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from);
+                        let wt = ws_cleanup
+                            .worktree_path
+                            .as_deref()
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from);
+                        if let (Some(repo_dir), Some(wt)) = (repo_dir, wt) {
+                            if !ws_cleanup.skip_worktree && !ws_cleanup.is_remote {
+                                let branch = ws_cleanup.branch.clone();
+                                let repo = repo_dir.clone();
+                                let branch_flag = branch_auto_generated_bg;
+                                let wt_locked = wt.clone();
+                                // A CoW or direct checkout is a standalone
+                                // clone: no registration to prune in the
+                                // source repo, and its workspace branch lives
+                                // only inside the clone — so the source-repo
+                                // branch-delete guard must not run (a
+                                // same-named source branch was never this
+                                // workspace's).
+                                let is_standalone = matches!(
+                                    ws_cleanup.checkout_mode,
+                                    Some(
+                                        intent_core::CheckoutMode::Cow
+                                            | intent_core::CheckoutMode::Direct
+                                    )
+                                );
+                                // Standalone-checkout removal is gated on the
+                                // root-anchored `checkout_owned` proof above
+                                // (`<root>/<wsId>/<slug>` under a daemon
+                                // root). An `isNewRepo` direct row's checkout
+                                // IS the user's repository folder
+                                // (`worktree_path == repository_path`,
+                                // intent-hq/monorepo#2611): never provisioned
+                                // by the daemon, never deleted with the
+                                // workspace.
+                                if is_standalone && !checkout_owned {
+                                    tracing::debug!(
+                                        workspace = %ws_cleanup.id.as_str(),
+                                        checkout = %wt_locked.display(),
+                                        "workspace.delete: standalone checkout is the user's repository folder; keeping it"
+                                    );
+                                } else {
+                                    // Under the per-repo lock: git-metadata work
+                                    // only (registration prune, rename of the
+                                    // checkout to a trash path, branch-delete
+                                    // guard; for CoW just the rename + metadata
+                                    // dir removal). On the rename-success path
+                                    // the multi-GB recursive removal runs below,
+                                    // after the lock is released, so concurrent
+                                    // `workspace.create` provisioning on the same
+                                    // repo is not starved by bulk deletes; only
+                                    // the rare rename-failure fallback removes
+                                    // in place under the lock.
+                                    let (trash, detached) = worktree_locks_bg
+                                        .with_lock(&repo_dir, move || async move {
+                                            let task = tokio::task::spawn_blocking(move || {
+                                                if is_standalone {
+                                                    cleanup_workspace_cow_checkout_locked(
+                                                        &wt_locked,
+                                                    )
+                                                } else {
+                                                    cleanup_workspace_worktree_locked(
+                                                        &repo,
+                                                        &wt_locked,
+                                                        &branch,
+                                                        branch_flag,
+                                                    )
+                                                }
+                                            })
+                                            .await;
+                                            match task {
+                                                Ok(trash) => trash,
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        "background worktree cleanup task failed"
+                                                    );
+                                                    (None, false)
+                                                }
+                                            }
+                                        })
+                                        .await;
+                                    known_completion &= detached;
+                                    if let Some(trash) = trash {
+                                        let removal = tokio::task::spawn_blocking(move || {
+                                            cleanup_detached_worktree(&trash)
+                                        })
+                                        .await;
+                                        known_completion &= matches!(&removal, Ok(true));
+                                        if let Err(e) = removal {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "background detached-worktree removal task failed"
+                                            );
+                                        }
+                                        // Retry the empty-only parent `remove_dir`
+                                        // the trash sibling blocked — back under
+                                        // the per-repo lock, so it can't race a
+                                        // same-slug recreate's freshly created
+                                        // parent between its `create_dir_all` and
+                                        // `git worktree add`. O(1) while held.
+                                        if let Some(parent) = wt.parent().map(Path::to_path_buf) {
+                                            worktree_locks_bg
+                                                .with_lock(&repo_dir, move || async move {
+                                                    let _ = std::fs::remove_dir(&parent);
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Final sweep of the daemon-owned workspace directory
+                // (`<parent>/<id>/`). The worktree cleanup's best-effort
+                // `remove_dir` (empty-only) leaves any residual content
+                // behind, and legacy pre-daemon workspaces have a directory
+                // but no worktree path at all. Recursive best-effort removal
+                // keeps the FE `FileSystemWorkspaceRepository.findAll` scan
+                // from re-surfacing the deleted id (ENOENT WARN spam) and
+                // makes the delete idempotent for orphaned directories.
+                //
+                // Candidates cover every parent this workspace may live under
+                // (persisted worktree's parent — the location in force at
+                // create time — plus the boot root and the currently
+                // configured `workspace.worktreesLocation`), so deleting a
+                // workspace created under a custom location does not leak
+                // `<location>/<id>/`.
+                //
+                // If a same-slug recreate happened and uses the same
+                // `<parent>/<id>/` directory, skip that candidate so we don't
+                // destroy the recreated workspace's directory tree.
+                let recreated_parent = recreated
+                    .as_ref()
+                    .and_then(|r| r.worktree_path.as_deref())
+                    .filter(|p| !p.is_empty())
+                    .and_then(|wt_path| Path::new(wt_path).parent())
+                    .map(Path::to_path_buf);
+                for dir in workspace_dir_candidates(
+                    &id_bg,
+                    sweep_worktree_path,
+                    &workspaces_root_bg,
+                    worktrees_location_bg.as_deref(),
+                ) {
+                    if recreated_parent.as_deref() == Some(dir.as_path()) {
+                        continue;
+                    }
+                    // Shared parallel removal helper; `NotFound` is already
+                    // folded into `Ok` there.
+                    #[cfg(all(test, unix))]
+                    let worker_gate = cleanup_gate.clone();
+                    #[cfg(all(test, unix))]
+                    let worker_id = id_bg.0.clone();
+                    let cleanup = tokio::task::spawn_blocking(move || {
+                        #[cfg(all(test, unix))]
+                        worker_gate.pause_worker(&worker_id);
+                        let result = intent_git::fs_remove::remove_dir_all_parallel(&dir);
+                        #[cfg(all(test, unix))]
+                        worker_gate.worker_finished(&worker_id);
+                        result
+                    })
+                    .await;
+                    known_completion &= matches!(&cleanup, Ok(Ok(())));
+                    match cleanup {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!(
+                            workspace = %id_bg.as_str(),
+                            error = %e,
+                            "background cleanup: failed to remove workspace directory"
+                        ),
+                        Err(join_err) => tracing::warn!(
+                            workspace = %id_bg.as_str(),
+                            error = %join_err,
+                            "background cleanup: workspace-dir task failed"
+                        ),
+                    }
+                }
+                // Only this original worker can confirm its terminal Store/FS work.
+                // Cancellation or a late blocking worker drops the claims as unknown.
+                if known_completion {
+                    for claim in deletion_claims {
+                        claim.settle_confirmed();
+                    }
+                }
+                #[cfg(all(test, unix))]
+                cleanup_gate.finished(&id_bg.0);
+            });
+            #[cfg(all(test, unix))]
+            if let Some(task) = &cleanup_task {
+                services
+                    .pending_delete_test_gate
+                    .track(&id.0, task.abort_handle());
+            }
+            drop(cleanup_task);
+            Ok(())
+        })
+    }
+}
+
 impl WorkspaceApi for Services {
     fn desktop_agent_call(
         &self,
@@ -17165,6 +18168,198 @@ impl WorkspaceApi for Services {
         connection: intent_core::desktop::DesktopConnection,
     ) -> BoxFuture<'_, intent_core::desktop::DesktopResult<serde_json::Value>> {
         Box::pin(self.desktop_client_op(method, args, connection))
+    }
+
+    fn provider_configuration_preflight(&self, provider: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move { self.validate_provider_configuration(&provider) })
+    }
+
+    fn prepare_provider_adapters(&self, provider_ids: Vec<String>) {
+        self.provider_preparation
+            .enqueue(provider_ids, self.effective_settings());
+    }
+
+    fn repository_read_connection(
+        &self,
+        entry: intent_core::repository_request::RepositoryWireEntry,
+    ) -> Option<Arc<dyn intent_core::repository_request::RepositoryReadConnection>> {
+        repository_native_wire::connection(self, entry)
+    }
+
+    fn native_review_prepare(
+        &self,
+        query: intent_core::repository_request::NativeReviewPrepareQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        repository_native_wire::review::prepare(self, query)
+    }
+    fn native_review_execute(
+        &self,
+        query: intent_core::repository_request::NativeReviewExecuteQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        repository_native_wire::review::execute(self, query)
+    }
+    fn native_review_reconcile(
+        &self,
+        query: intent_core::repository_request::NativeReviewBoundQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        repository_native_wire::review::reconcile(self, query)
+    }
+    fn native_review_release(
+        &self,
+        query: intent_core::repository_request::NativeReviewBoundQuery,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        repository_native_wire::review::release(self, query)
+    }
+    fn repository_selection_capture(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionCapture>> {
+        repository_native_wire::selection::capture(self, query)
+    }
+
+    fn repository_selection_save(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionSaveQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionAttempt>> {
+        repository_native_wire::selection::save(self, query)
+    }
+
+    fn repository_selection_reset(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionAttempt>> {
+        repository_native_wire::selection::reset(self, query)
+    }
+
+    fn repository_selection_reconcile(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionAttempt>> {
+        repository_native_wire::selection::reconcile(self, query)
+    }
+
+    fn repository_selection_release(
+        &self,
+        query: intent_core::repository_request::RepositorySelectionBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositorySelectionReleased>> {
+        repository_native_wire::selection::release(self, query)
+    }
+
+    fn repository_checkout_capture(
+        &self,
+        query: intent_core::repository_checkout::CheckoutCaptureQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutCapture,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::capture(self, query)
+    }
+
+    fn repository_checkout_projects(
+        &self,
+        query: intent_core::repository_checkout::CheckoutProjectsQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutProjects,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::projects(self, query)
+    }
+
+    fn repository_checkout_project(
+        &self,
+        query: intent_core::repository_checkout::CheckoutProjectQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutProjectDetail,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::project(self, query)
+    }
+
+    fn repository_checkout_branches(
+        &self,
+        query: intent_core::repository_checkout::CheckoutBranchesQuery,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutBranches,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::branches(self, query)
+    }
+
+    fn repository_checkout_warm(
+        &self,
+        query: intent_core::repository_checkout::CheckoutSelection,
+    ) -> BoxFuture<
+        '_,
+        Result<
+            intent_core::repository_checkout::CheckoutResult<
+                intent_core::repository_checkout::CheckoutWarm,
+            >,
+        >,
+    > {
+        repository_native_wire::checkout::warm(self, query)
+    }
+
+    fn repository_checkout_release(
+        &self,
+        query: intent_core::repository_checkout::CheckoutBinding,
+    ) -> BoxFuture<'_, Result<intent_core::repository_checkout::CheckoutReleased>> {
+        repository_native_wire::checkout::release(self, query)
+    }
+
+    fn repository_resource_capture(
+        &self,
+        query: intent_core::repository_request::RepositoryResourceQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryResourceCapture>> {
+        repository_native_wire::resource::capture(self, query)
+    }
+    fn repository_resource_detail(
+        &self,
+        query: intent_core::repository_request::RepositoryResourceDetailQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryResourceResult>> {
+        repository_native_wire::resource::detail(self, query)
+    }
+    fn repository_resource_release(
+        &self,
+        query: intent_core::repository_request::RepositoryResourceBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextReleased>> {
+        repository_native_wire::resource::release(self, query)
+    }
+
+    fn repository_context_capture(
+        &self,
+        query: intent_core::repository_request::RepositoryContextQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextCapture>> {
+        repository_native_wire::capture(self, query)
+    }
+
+    fn repository_context(
+        &self,
+        query: intent_core::repository_request::RepositoryContextBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::RepositoryContext>> {
+        repository_native_wire::read(self, query)
+    }
+
+    fn repository_context_release(
+        &self,
+        query: intent_core::repository_request::RepositoryContextBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextReleased>> {
+        repository_native_wire::release(self, query)
     }
 
     fn settings_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -17470,7 +18665,24 @@ impl WorkspaceApi for Services {
         rule_type: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            if workspace_id.as_str() == "global" && rule_type == "base-system-prompt" {
+                // Settings uses an exact placeholder, not a workspace. Recheck
+                // durable admission without exposing any other override or file.
+                if let Some(principal) = capability::gated_collaborator_caller("rules.get")? {
+                    if self.store.get_host_role(&principal).await? == intent_core::HostRole::Guest
+                        && !self.store.has_workspace_membership(&principal).await?
+                    {
+                        return Err(Error::Forbidden(
+                            "rules.get requires current admission".into(),
+                        ));
+                    }
+                }
+            } else {
+                // Guests gain only the settings read above, not the member
+                // workspace rules surface now reachable through the catalog.
+                self.require_host_execution("rules.get").await?;
+                self.require_member(&workspace_id).await?;
+            }
             rules::RulesService::new(&self.store).get(&rule_type).await
         })
     }
@@ -17483,7 +18695,8 @@ impl WorkspaceApi for Services {
         enabled: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_member(&workspace_id).await?;
+            // All overrides are instance-wide, even with a real workspace ID.
+            Self::require_administrator("rules.update")?;
             let _revision_guard = self.settings_revision_gate.write().await;
             let path = ft_worktree(&self.store, &workspace_id).await;
             let (rules, changed) = rules::RulesService::new(&self.store)
@@ -17514,6 +18727,10 @@ impl WorkspaceApi for Services {
         // Decoration uses those resolved rows without further filesystem reads.
         let services = self.clone();
         Box::pin(async move {
+            if let Some(path) = workspace_path.as_deref() {
+                self.require_member_repo_path(path, "specialist.list")
+                    .await?;
+            }
             tokio::task::spawn_blocking(move || {
                 let provider = specialist_preview_provider(provider)?;
                 let ws_path = workspace_path.as_deref().map(Path::new);
@@ -17573,6 +18790,10 @@ impl WorkspaceApi for Services {
         // (monorepo#4148).
         let services = self.clone();
         Box::pin(async move {
+            if let Some(path) = workspace_path.as_deref() {
+                self.require_member_repo_path(path, "specialist.get")
+                    .await?;
+            }
             tokio::task::spawn_blocking(move || {
                 let provider = specialist_preview_provider(provider)?;
                 let ws_path = workspace_path.as_deref().map(Path::new);
@@ -17824,13 +19045,18 @@ impl WorkspaceApi for Services {
     fn mcp_list_servers(
         &self,
         workspace_id: Option<WorkspaceId>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_host_execution("mcp.listServers").await?;
             if let Some(ws) = workspace_id.as_ref() {
                 self.require_member(ws).await?;
             }
+            let policy = self
+                .mcp_caller_policy(workspace_id.as_ref(), caller_agent_id.as_ref())
+                .await?;
             self.mcp_servers_service()
+                .with_agent_policy(policy)
                 .agent_list_servers(workspace_id.as_ref().map(WorkspaceId::as_str))
                 .await
         })
@@ -17840,13 +19066,18 @@ impl WorkspaceApi for Services {
         &self,
         server_id: String,
         workspace_id: Option<WorkspaceId>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_host_execution("mcp.listTools").await?;
             if let Some(ws) = workspace_id.as_ref() {
                 self.require_member(ws).await?;
             }
+            let policy = self
+                .mcp_caller_policy(workspace_id.as_ref(), caller_agent_id.as_ref())
+                .await?;
             self.mcp_servers_service()
+                .with_agent_policy(policy)
                 .agent_list_tools(workspace_id.as_ref().map(WorkspaceId::as_str), &server_id)
                 .await
         })
@@ -17859,13 +19090,18 @@ impl WorkspaceApi for Services {
         args: serde_json::Value,
         timeout_ms: Option<u64>,
         workspace_id: Option<WorkspaceId>,
+        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_host_execution("mcp.callTool").await?;
             if let Some(ws) = workspace_id.as_ref() {
                 self.require_member(ws).await?;
             }
+            let policy = self
+                .mcp_caller_policy(workspace_id.as_ref(), caller_agent_id.as_ref())
+                .await?;
             self.mcp_servers_service()
+                .with_agent_policy(policy)
                 .agent_call_tool(
                     workspace_id.as_ref().map(WorkspaceId::as_str),
                     &server_id,
@@ -19162,6 +20398,53 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn script_monitor(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let _admission = self.workspace_mutations.enter(&workspace_id)?;
+            self.require_member(&workspace_id).await?;
+            let _archive = self.archive_fence.acquire(&workspace_id).await;
+            let retirement = self.agent_retirement_gates.for_agent(&agent_id);
+            let _retirement = retirement.lock().await;
+            self.script_manager()
+                .monitor(&workspace_id, &agent_id, &script_id, options)
+                .await
+        })
+    }
+    fn script_monitor_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            Ok(
+                serde_json::json!({"monitors":self.store.script_monitors(&workspace_id,agent_id.as_ref()).await?}),
+            )
+        })
+    }
+    fn script_monitor_cancel(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+        stop_run: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_workspace_manager(&workspace_id, "script.stop")
+                .await?;
+            self.require_member(&workspace_id).await?;
+            self.script_manager()
+                .cancel_monitor(&workspace_id, &monitor_id, owner.as_ref(), stop_run)
+                .await
+        })
+    }
+
     fn script_start(
         &self,
         workspace_id: WorkspaceId,
@@ -19375,7 +20658,9 @@ impl WorkspaceApi for Services {
             ws.activity = this.workspace_activity(&id);
             // Delete grace window (§5.1): surface the in-memory
             // pending-deletion deadline; O(1) map read, never persisted.
-            ws.pending_delete_at = this.pending_workspace_deletes.deadline(id.as_str());
+            ws.pending_delete_at = this
+                .pending_workspace_deletes
+                .deadline(&delete_grace::PendingDeleteSubject::Workspace(id.clone()))?;
             // The git-root PRs and monitor rows are read ONCE and shared by
             // the displayStatus derivation and the PR merge below, so the
             // detail read's statement count does not grow with the merge
@@ -19522,6 +20807,7 @@ impl WorkspaceApi for Services {
         input: WorkspaceCreate,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
+        let native_checkout = repository_native_wire::checkout::create::prepare(self, &input);
         let store = self.store.clone();
         let worktree_locks = self.worktree_locks.clone();
         let workspaces_root = self.workspaces_root.clone();
@@ -19542,6 +20828,11 @@ impl WorkspaceApi for Services {
             .and_then(|r| r.origin("workspaces.root"))
             == Some(SettingOrigin::Flag);
         self.execution_call(async move {
+            let native_checkout = native_checkout.await?;
+            let idempotency_key = match &native_checkout {
+                Some(checkout) => { checkout.current().await?; checkout.idempotency_key(idempotency_key) }
+                None => idempotency_key,
+            };
             // Creation is host-wide and must also work before any workspace exists.
             services
                 .require_workspace_creator("workspace.create")
@@ -19583,7 +20874,10 @@ impl WorkspaceApi for Services {
                 "",
                 idempotency_key,
                 "workspace.create",
-                move || async move {
+                // Keep the creation operation on the heap through the generic
+                // replay and execution scopes. Its initial-message persistence
+                // path otherwise exhausts the default stack in debug builds.
+                move || Box::pin(async move {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
@@ -19780,6 +21074,10 @@ impl WorkspaceApi for Services {
                         &workspaces_root,
                     )
                     .await;
+                    if let Some(checkout) = &native_checkout {
+                        checkout.current().await?;
+                        checkout.configure(&mut input, &workspaces_root, &id)?;
+                    }
                     let progress = progress_id.and_then(|pid| {
                         bus.clone().map(|b| {
                             std::sync::Arc::new(create_progress::CreateProgress::new(
@@ -20250,12 +21548,14 @@ impl WorkspaceApi for Services {
                     // materializes remote-only branches at the remote tip)
                     // and `baseRef` to the PR base branch, so ahead/behind
                     // and diffs reflect the merge target. Explicit `branch`/
-                    // `baseRef` params always win. Lookup failure is
-                    // non-fatal: the create proceeds without the PR-derived
-                    // git setup. With multiple pr-kind links the FIRST one
+                    // `baseRef` params always win. A real PR checkout must
+                    // resolve its head and fetch the canonical PR ref; only
+                    // registry-only rows retain best-effort lookup semantics. With multiple pr-kind links the FIRST one
                     // wins (deliberate tie-break: the FE puts the primary
                     // link first).
-                    let pr_link = input.context_links.as_deref().and_then(|links| {
+                    // GitLab URL context is retained verbatim; it never invokes
+                    // the legacy GitHub PR-head/fork branch derivation.
+                    let pr_link = input.context_links.as_deref().filter(|_| native_checkout.is_none()).and_then(|links| {
                         links
                             .iter()
                             .find(|l| l.kind == intent_core::ContextLinkKind::Pr)
@@ -20342,7 +21642,7 @@ impl WorkspaceApi for Services {
                                             repo = %link.repo,
                                             pr = link.number,
                                             error = %e,
-                                            "workspace.create: PR contextLink forge lookup failed; creating without PR-derived git setup"
+                                            "workspace.create: PR contextLink forge lookup failed; canonical PR checkout still requires a resolved branch and fetched head"
                                         );
                                     }
                                     Err(_) => {
@@ -20351,7 +21651,7 @@ impl WorkspaceApi for Services {
                                             repo = %link.repo,
                                             pr = link.number,
                                             timeout = ?services.pr_refresh_fetch_timeout,
-                                            "workspace.create: PR contextLink forge lookup timed out; creating without PR-derived git setup"
+                                            "workspace.create: PR contextLink forge lookup timed out; canonical PR checkout still requires a resolved branch and fetched head"
                                         );
                                     }
                                 }
@@ -20360,10 +21660,49 @@ impl WorkspaceApi for Services {
                                 tracing::warn!(
                                     pr = link.number,
                                     error = %e,
-                                    "workspace.create: no source-control provider for PR contextLink; creating without PR-derived git setup"
+                                    "workspace.create: no source-control provider for PR contextLink; canonical PR checkout still requires a resolved branch and fetched head"
                                 );
                             }
                         }
+                    }
+                    // A real PR checkout must resolve a head; never disguise a
+                    // generated branch at the base as a successful PR import.
+                    let pr_checkout = pr_link
+                        .as_ref()
+                        .filter(|_| {
+                            linked_pr
+                                .as_ref()
+                                .is_none_or(|pr| input.branch.as_deref() == Some(pr.source_branch.as_str()))
+                        })
+                        .map(|link| {
+                            (
+                                link.number,
+                                linked_pr.as_ref().and_then(|pr| pr.head_sha.clone()),
+                            )
+                        });
+                    if pr_checkout.is_some()
+                        && input
+                            .repository_path
+                            .as_deref()
+                            .is_some_and(|path| !path.is_empty())
+                    {
+                        if input.branch.as_deref().is_none_or(str::is_empty) {
+                            return Err(Error::InvalidParams(
+                                "cannot resolve the PR head branch; refresh the pull request and try again".into(),
+                            ));
+                        }
+                        if input.skip_isolation.unwrap_or(false)
+                            || input
+                                .worktree_path
+                                .as_deref()
+                                .is_some_and(|path| !path.is_empty())
+                            || input.is_remote.unwrap_or(false)
+                        {
+                            return Err(Error::InvalidParams(
+                                "PR checkout requires daemon-managed checkout provisioning".into(),
+                            ));
+                        }
+                        pr_derived_branch = true;
                     }
                     // Branch naming (TS parity): an explicit `branch` wins
                     // untouched; otherwise the branch is a friendly slug —
@@ -20470,6 +21809,7 @@ impl WorkspaceApi for Services {
                         // populated — the emit path (§9.1) still enriches
                         // with the max of notes / agents / updatedAt.
                         last_activity: Some(now),
+                        last_content_activity: None,
                         tags: input.tags.unwrap_or_default(),
                         path: input.path,
                         repository_path: input.repository_path,
@@ -20536,7 +21876,12 @@ impl WorkspaceApi for Services {
                         .filter(|p| !p.is_empty())
                         .map(PathBuf::from);
                     let workspaces_root_pathbuf = workspaces_root.clone();
-                    if let Some((cache_path, hydration_url)) = cache_hydration {
+                    if let Some(checkout) = &native_checkout {
+                        let path = repo_dir.clone().ok_or_else(|| Error::Internal("native checkout path missing".into()))?;
+                        checkout.provision(path.clone(), ws.branch.clone(), &workspaces_root_pathbuf, progress.clone()).await?;
+                        ws.worktree_path = Some(path.to_string_lossy().into_owned());
+                        ws.checkout_mode = Some(intent_core::CheckoutMode::Direct);
+                    } else if let Some((cache_path, hydration_url)) = cache_hydration {
                         // Cache hydration (PROTOCOL §5.1): provision a
                         // **standalone** checkout from the repo cache at the
                         // `repositoryPath` chosen in the clone arm above
@@ -20624,17 +21969,16 @@ impl WorkspaceApi for Services {
                             }
                             let branch = ws.branch.clone();
                             let base_ref = ws.base_ref.clone();
-                            if pr_derived_branch {
-                                warn_if_pr_head_missing(
-                                    &cache_path,
-                                    &branch,
-                                    "origin",
-                                    pr_link.as_ref(),
-                                );
-                            }
+                            let pr_token = if pr_checkout.is_some() {
+                                github_git_token(services.settings_registry.as_deref(), &cache_path).await
+                            } else {
+                                None
+                            };
                             let provision_progress = progress.clone();
                             let provision = |mode: intent_core::CheckoutMode| {
                                 let cache = cache_path.clone();
+                                let pr_checkout = pr_checkout.clone();
+                                let pr_token = pr_token.clone();
                                 let checkout = checkout_path.clone();
                                 let branch = branch.clone();
                                 let base_ref = base_ref.clone();
@@ -20666,16 +22010,26 @@ impl WorkspaceApi for Services {
                                     };
                                     let result = intent_git::repo_cache::with_cache_lock_blocking(
                                         &lock_cache,
-                                        move || match mode {
-                                            intent_core::CheckoutMode::Cow => {
-                                                // No cowCloneExclude here (unlike
-                                                // the cowIsolation arm below):
-                                                // the source is the pristine
-                                                // cache clone — tracked files
-                                                // only, no deps/build artifacts
-                                                // for excludes to skip.
-                                                let sha =
-                                                    intent_git::cow_checkout::provision_cow_checkout(
+                                        move || {
+                                            if let Some((number, sha)) = pr_checkout.as_ref() {
+                                                intent_git::fetch::prepare_cached_pr_branch(
+                                                    &cache,
+                                                    "origin",
+                                                    *number,
+                                                    &branch,
+                                                    sha.as_deref(),
+                                                    pr_token.as_deref(),
+                                                )?;
+                                            }
+                                            let result = match mode {
+                                                intent_core::CheckoutMode::Cow => {
+                                                    // No cowCloneExclude here (unlike
+                                                    // the cowIsolation arm below):
+                                                    // the source is the pristine
+                                                    // cache clone — tracked files
+                                                    // only, no deps/build artifacts
+                                                    // for excludes to skip.
+                                                    let sha = intent_git::cow_checkout::provision_cow_checkout(
                                                         &cache,
                                                         &checkout,
                                                         &branch,
@@ -20683,34 +22037,39 @@ impl WorkspaceApi for Services {
                                                         "origin",
                                                         &[],
                                                     )?;
-                                                // The CoW clone inherits the
-                                                // cache's `origin` (already the
-                                                // GitHub URL); retarget
-                                                // explicitly so the checkout
-                                                // never references the cache
-                                                // even if the cache was seeded
-                                                // differently.
-                                                intent_git::remote::set_remote_url(
-                                                    &checkout, "origin", &url,
-                                                )?;
-                                                Ok(sha)
+                                                    // The CoW clone inherits the
+                                                    // cache's `origin` (already the
+                                                    // GitHub URL); retarget
+                                                    // explicitly so the checkout
+                                                    // never references the cache
+                                                    // even if the cache was seeded
+                                                    // differently.
+                                                    intent_git::remote::set_remote_url(&checkout, "origin", &url)?;
+                                                    Ok(sha)
+                                                }
+                                                intent_core::CheckoutMode::Direct => {
+                                                    intent_git::repo_cache::provision_direct_checkout_with_progress(
+                                                        &cache,
+                                                        &checkout,
+                                                        &url,
+                                                        &branch,
+                                                        base_ref.as_deref(),
+                                                        sub_chunk,
+                                                    )
+                                                }
+                                                intent_core::CheckoutMode::Worktree => Err(Error::Internal(
+                                                    "cache hydration never provisions a linked worktree".to_string(),
+                                                )),
+                                            };
+                                            let checked_out = result?;
+                                            if let Some((number, _)) = pr_checkout.as_ref() {
+                                                let expected =
+                                                    intent_git::refs::rev_parse(&cache, &format!("refs/intent/pr/{number}/head"))?;
+                                                if checked_out != expected {
+                                                    return Err(Error::InvalidParams("provisioned checkout does not match the fetched PR head; workspace creation cancelled".into()));
+                                                }
                                             }
-                                            intent_core::CheckoutMode::Direct => {
-                                                intent_git::repo_cache::provision_direct_checkout_with_progress(
-                                                    &cache,
-                                                    &checkout,
-                                                    &url,
-                                                    &branch,
-                                                    base_ref.as_deref(),
-                                                    sub_chunk,
-                                                )
-                                            }
-                                            intent_core::CheckoutMode::Worktree => {
-                                                Err(Error::Internal(
-                                                    "cache hydration never provisions a linked worktree"
-                                                        .to_string(),
-                                                ))
-                                            }
+                                            Ok(checked_out)
                                         },
                                     )
                                     .await;
@@ -20805,9 +22164,28 @@ impl WorkspaceApi for Services {
                                 let branch = ws.branch.clone();
                                 let base_ref = ws.base_ref.clone();
                                 let repo = repo_dir.clone();
+                                let pr_checkout = pr_checkout.clone();
+                                let pr_remote = input.remote.clone().unwrap_or_else(|| "origin".into());
+                                let pr_token = if pr_checkout.is_some() {
+                                    github_git_token(services.settings_registry.as_deref(), &repo_dir).await
+                                } else {
+                                    None
+                                };
                                 let sha = worktree_locks
                                     .with_lock(&repo_dir, move || async move {
                                         tokio::task::spawn_blocking(move || {
+                                            if let Some((number, sha)) = pr_checkout.as_ref() {
+                                                intent_git::fetch::prepare_pr_branch(
+                                                    &repo,
+                                                    &pr_remote,
+                                                    *number,
+                                                    &branch,
+                                                    sha.as_deref(),
+                                                    pr_token.as_deref(),
+                                                )?;
+                                                intent_git::branches::checkout_branch(&repo, &branch)?;
+                                                return intent_git::refs::rev_parse(&repo, "HEAD");
+                                            }
                                             // Reuse an existing branch of the
                                             // same name (retried create), else
                                             // create it — at the caller's
@@ -20860,7 +22238,15 @@ impl WorkspaceApi for Services {
                                 ws.worktree_path =
                                     Some(repo_dir.to_string_lossy().into_owned());
                                 if ws.base_commit_sha.is_none() {
-                                    ws.base_commit_sha = Some(sha);
+                                    ws.base_commit_sha = Some(if pr_derived_branch {
+                                        pr_aware_base_commit_sha(
+                                            &repo_dir,
+                                            ws.base_ref.as_deref(),
+                                            sha,
+                                        )
+                                    } else {
+                                        sha
+                                    });
                                 }
                             }
                         }
@@ -20879,14 +22265,11 @@ impl WorkspaceApi for Services {
                                 let base_ref = ws.base_ref.clone();
                                 let remote =
                                     input.remote.unwrap_or_else(|| "origin".to_string());
-                                if pr_derived_branch {
-                                    warn_if_pr_head_missing(
-                                        &repo_dir,
-                                        &branch,
-                                        &remote,
-                                        pr_link.as_ref(),
-                                    );
-                                }
+                                let pr_token = if pr_checkout.is_some() {
+                                    github_git_token(services.settings_registry.as_deref(), &repo_dir).await
+                                } else {
+                                    None
+                                };
                                 let mut mode = if cow_isolation
                                     && repo_dir.join(".git").is_file()
                                 {
@@ -20981,6 +22364,8 @@ impl WorkspaceApi for Services {
                                 }
                                 let provision = |mode: intent_core::CheckoutMode| {
                                     let name = name.clone();
+                                    let pr_checkout = pr_checkout.clone();
+                                    let pr_token = pr_token.clone();
                                     let branch = branch.clone();
                                     let base_ref = base_ref.clone();
                                     let remote = remote.clone();
@@ -21009,37 +22394,51 @@ impl WorkspaceApi for Services {
                                                     std::time::Instant::now();
                                                 let repo_for_log = repo.clone();
                                                 let result = match tokio::task::spawn_blocking(
-                                                    move || match mode {
-                                                        intent_core::CheckoutMode::Cow => {
-                                                            intent_git::cow_checkout::provision_cow_checkout(
+                                                    move || {
+                                                        if let Some((number, sha)) = pr_checkout.as_ref() {
+                                                            intent_git::fetch::prepare_pr_branch(
+                                                                &repo,
+                                                                &remote,
+                                                                *number,
+                                                                &branch,
+                                                                sha.as_deref(),
+                                                                pr_token.as_deref(),
+                                                            )?;
+                                                        }
+                                                        let result = match mode {
+                                                            intent_core::CheckoutMode::Cow => intent_git::cow_checkout::provision_cow_checkout(
                                                                 &repo,
                                                                 &wt,
                                                                 &branch,
                                                                 base_ref.as_deref(),
                                                                 &remote,
                                                                 &clone_excludes,
-                                                            )
-                                                        }
-                                                        intent_core::CheckoutMode::Worktree => {
-                                                            intent_git::worktree::provision_worktree(
+                                                            ),
+                                                            intent_core::CheckoutMode::Worktree => intent_git::worktree::provision_worktree(
                                                                 &repo,
                                                                 &name,
                                                                 &wt,
                                                                 &branch,
                                                                 base_ref.as_deref(),
                                                                 &remote,
-                                                            )
+                                                            ),
+                                                            // Local-repo creates never
+                                                            // select `direct` (cache
+                                                            // hydration has its own
+                                                            // provisioning arm above).
+                                                            intent_core::CheckoutMode::Direct => Err(Error::Internal(
+                                                                "direct checkout mode is not provisioned from a local repository".to_string(),
+                                                            )),
+                                                        };
+                                                        let checked_out = result?;
+                                                        if let Some((number, _)) = pr_checkout.as_ref() {
+                                                            let expected =
+                                                                intent_git::refs::rev_parse(&repo, &format!("refs/intent/pr/{number}/head"))?;
+                                                            if checked_out != expected {
+                                                                return Err(Error::InvalidParams("provisioned checkout does not match the fetched PR head; workspace creation cancelled".into()));
+                                                            }
                                                         }
-                                                        // Local-repo creates never
-                                                        // select `direct` (cache
-                                                        // hydration has its own
-                                                        // provisioning arm above).
-                                                        intent_core::CheckoutMode::Direct => {
-                                                            Err(Error::Internal(
-                                                                "direct checkout mode is not provisioned from a local repository"
-                                                                    .to_string(),
-                                                            ))
-                                                        }
+                                                        Ok(checked_out)
                                                     },
                                                 )
                                                 .await
@@ -21155,6 +22554,27 @@ impl WorkspaceApi for Services {
                             }
                         }
                     }
+                    if pr_checkout.is_some()
+                        && ws
+                            .repository_path
+                            .as_deref()
+                            .is_some_and(|path| !path.is_empty())
+                    {
+                        let checkout = ws.worktree_path.as_deref().ok_or_else(|| {
+                            Error::InvalidParams(
+                                "PR checkout was not provisioned; select a local Git repository".into(),
+                            )
+                        })?;
+                        let actual = intent_git::refs::rev_parse(Path::new(checkout), "HEAD")?;
+                        if let Some((_, Some(expected))) = pr_checkout.as_ref() {
+                            if !actual.eq_ignore_ascii_case(expected) {
+                                return Err(Error::InvalidParams(
+                                    "provisioned checkout does not match the PR head; workspace creation cancelled"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
                     // Provisioning is done in every mode; the remaining work
                     // (row insert, spec seed, initial agent) is fast local
                     // bookkeeping — the unified scale's last milestone before
@@ -21169,9 +22589,11 @@ impl WorkspaceApi for Services {
                     // in the same INSERT so later global changes don't
                     // retroactively flip existing workspaces — atomic, so the
                     // row can never exist without its seed.
-                    store
-                        .insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
-                        .await?;
+                    if let Some(checkout) = &native_checkout {
+                        checkout.insert(ws.clone(), global_auto_commit).await?;
+                    } else {
+                        store.insert_workspace_with_auto_commit(&ws, Some(global_auto_commit)).await?;
+                    }
                     // Write the legacy `<root>/<id>/.workspace/workspace.json`
                     // file so renderer paths (FE `FileSystemWorkspaceRepository`)
                     // find their per-workspace metadata without ENOENT spam.
@@ -21267,6 +22689,7 @@ impl WorkspaceApi for Services {
                     // `ws.workspace.details().setupStatus`. `pending` when a
                     // worktree exists; `skipped` when the stage never runs
                     // (skipWorktree / no worktree provisioned).
+                    if let Some(checkout) = &native_checkout { checkout.current().await?; }
                     let setup_worktree = if ws.skip_worktree {
                         None
                     } else {
@@ -21449,6 +22872,7 @@ impl WorkspaceApi for Services {
                     // exactly one `workspace:setup:completed` fires per logical create
                     // on every terminal path of the setup stage. Idempotent replays
                     // publish nothing (same as `workspace:created`).
+                    if let Some(checkout) = &native_checkout { checkout.current().await?; }
                     let pty_for_setup = self.pty.clone();
                     let bus_for_setup = self.event_bus.clone();
                     let setup_states = self.workspace_setup_states.clone();
@@ -21664,7 +23088,7 @@ impl WorkspaceApi for Services {
                         workspace: ws,
                         initial_agent,
                     })
-                },
+                }),
             )
             .await;
 
@@ -21978,593 +23402,7 @@ impl WorkspaceApi for Services {
     }
 
     fn delete_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
-        let store = self.store.clone();
-        let worktree_locks = self.worktree_locks.clone();
-        let bus = self.event_bus.clone();
-        let workspaces_root = self
-            .workspaces_root
-            .clone()
-            .unwrap_or_else(default_workspaces_root);
-        // Custom `workspace.worktreesLocation` sweep target: the workspace's
-        // actual parent is derived from its persisted worktree path below,
-        // but worktree-less rows created under a custom location need the
-        // currently configured location as a candidate too.
-        let worktrees_location = self.configured_worktrees_location();
-        // Live-state teardown handles: cloned so the boxed future owns them
-        // across the store cascade below. `agent_manager()` upgrades the weak
-        // reference; read-only/test wiring with no manager attached simply
-        // skips the runtime stop and still sweeps the in-memory registries.
-        let manager = self.agent_manager();
-        let agent_queues = self.agent_queues.clone();
-        let live_turns = self.live_turns.clone();
-        let last_turn_silent_tails = self.last_turn_silent_tails.clone();
-        let truncation_redrives = self.truncation_redrives.clone();
-        let pending_truncation_redrive = self.pending_truncation_redrive.clone();
-        let agent_subscriptions = self.agent_subscriptions.clone();
-        // Full handle for the direct completion delivery below (Services is
-        // Clone — the same capture pattern the spawn helpers use).
-        let services = self.clone();
-        Box::pin(async move {
-            self.require_workspace_manager(&id, "workspace.delete")
-                .await?;
-            // Chief is virtual and never appears in `workspace.list`; delete is
-            // a no-op success (TS `workspace.repository.delete` / virtual-guard
-            // parity — the seeded row is not torn down and no cascade fires).
-            if id.is_chief() {
-                return Ok(());
-            }
-            // Immediate-delete-while-pending (§5.1): an immediate delete
-            // supersedes a running grace window — drop the pending entry and
-            // abort its timer, then commit now. The timer-fired commit path
-            // has already claimed (removed) its entry before calling here,
-            // so this is a no-op for it.
-            services.pending_workspace_deletes.cancel(id.as_str());
-            // Close producer admission before the snapshot. Existing admitted
-            // creates/sends finish first; unrelated workspaces stay writable.
-            // Keep the permit through cleanup and terminal event publication.
-            let _deletion = services.workspace_mutations.delete(&id).await;
-            // Terminate live agent sessions BEFORE the store cascade drops
-            // their rows. A same-slug recreate hitting `agent.list` after the
-            // delete would otherwise surface ghost sessions whose workers are
-            // still draining, their live-turn slots + pending message queues
-            // still populated, and their completion watches still firing. The
-            // order mirrors `agent_delete_op`: capture the workspace-scoped
-            // sessions, drop each session's runtime state, then emit
-            // `agent:deleted` per session so subscribers see the tear-down
-            // before the terminal `workspace:deleted`.
-            // Fail fast on a transient session-list error: skipping the
-            // sweep here but still deleting the workspace row leaves ghost
-            // workers, live-turn slots, queued messages, and completion
-            // watches with no owning workspace — a client can retry the
-            // delete, but silent partial success cannot recover.
-            // Summaries only (intent-hq/monorepo#4130): the sweep reads just
-            // `id` + `name`, and the full `list_agent_sessions` hydrated
-            // every session's transcript (2 statements per agent) for rows
-            // the cascade below is about to drop.
-            let sessions = store.list_agent_session_summaries(&id).await?;
-            let session_ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
-            // Cascade interaction (§5.5): the workspace delete — immediate
-            // or committed-from-pending — supersedes any pending agent
-            // deletions inside it. Abort their timers without per-agent
-            // cancel events; each session is deleted just below, emitting
-            // `agent:deleted` per session.
-            services.abort_pending_agent_deletes(&sessions);
-            // Batch stop: aborts each worker, drops each handle, clears
-            // busy + agent_ws, and deregisters each process — the
-            // `agent.stop` semantics per agent — then kills all detached
-            // ACP children's process groups under ONE shared grace
-            // window (`kill_child_trees`), so the delete ack pays ~one
-            // grace period total instead of one per live agent.
-            // The returned fence keeps the swept agents blocked from the
-            // lazy-spawn paths until this future completes (it drops at the
-            // end of this scope, after the store cascade below deletes the
-            // session rows): a concurrent `agent.sendMessage` that passed
-            // its store check before the sweep would otherwise respawn a
-            // replacement child during the shared grace wait and leave it
-            // running as a ghost process after the rows are gone.
-            let _teardown_fence = match manager.as_ref() {
-                Some(manager) => Some(manager.stop_many(&session_ids).await),
-                None => None,
-            };
-            for session in &sessions {
-                // Live-turn slot + pending message queue live in `Services`'
-                // maps (not touched by `manager.stop_many`); drop them so a
-                // same-slug recreate observes no ghost state. Recover through
-                // a poisoned lock via `into_inner` — the delete path is the
-                // last chance to unlink this state, so best-effort teardown
-                // outweighs propagating a mutex-poison panic.
-                live_turns
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-                last_turn_silent_tails
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-                truncation_redrives
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-                pending_truncation_redrive
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-                agent_queues
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&session.id);
-            }
-            // Sweep the deleted workspace out of the daemon-global
-            // subscription registry: drop watches whose PARENT lives here
-            // (their wake destination is gone) and groups anchored here.
-            // Watches whose parent lives elsewhere (a chief watching a child
-            // in this workspace) are kept — the `agent:deleted` events
-            // published just below still wake the cross-workspace parent.
-            // Poison recovery mirrors the per-session sweep above.
-            let parent_watch_ids: Vec<String> = {
-                let registry = agent_subscriptions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                registry
-                    .subscriptions
-                    .iter()
-                    .filter(|s| s.parent_workspace_id == id)
-                    .map(|s| s.id.clone())
-                    .collect()
-            };
-            // These rows have no FK cascade. Delete each outside the registry
-            // lock before forgetting it in memory, so failure/cancellation
-            // leaves its id available for retry. Admission also covers any
-            // delayed registration write, so none can land behind this sweep.
-            for watch_id in &parent_watch_ids {
-                store.delete_completion_watch(watch_id).await?;
-            }
-            {
-                let mut registry = agent_subscriptions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                registry
-                    .subscriptions
-                    .retain(|s| s.parent_workspace_id != id);
-                registry.delegation_groups.retain(|g| g.workspace_id != id);
-            }
-            // Emit `agent:deleted` per swept session before the worktree /
-            // store cleanup so subscribers see the terminal event for each
-            // agent ahead of `workspace:deleted`. Best-effort: emits when the
-            // bus is wired; a `None` bus (read-only wiring) is a quiet no-op.
-            for session in &sessions {
-                publish_event(
-                    bus.as_ref(),
-                    NewEvent {
-                        workspace_id: id.clone(),
-                        timestamp: now_iso(),
-                        event_type: AGENT_DELETED.to_string(),
-                        actor: system_actor(),
-                        session_id: Some(session.id.0.clone()),
-                        correlation_id: None,
-                        parent_event_id: None,
-                        metadata: None,
-                        data: serde_json::json!({
-                            "agentId": session.id.0,
-                            "agentName": session.name,
-                        }),
-                    },
-                )
-                .await;
-            }
-            // Deterministic cross-workspace consumption (monorepo#463): the
-            // publishes above are best-effort (`None` bus, logged-and-skipped
-            // delivery failures), so a chief parent's watch on a child here
-            // could otherwise leak forever (watches have no timed cleanup)
-            // and a chief-anchored after_all group would stay
-            // incomplete until restart. Deliver the same synthetic
-            // `agent:deleted` directly, BEFORE the store cascade drops the
-            // session rows (grouped delivery still resolves the child's
-            // completion report). The remove-before-deliver guard in
-            // `deliver_completion_to_watches` makes the bus loop's later
-            // processing of the published event a no-op — no duplicate wake —
-            // and `record_group_child_completion` is idempotent.
-            // The settlement clear of each child's advisory-wake period
-            // markers runs ONCE for the whole sweep (one `IN`-list statement)
-            // instead of inside every delivery (intent-hq/monorepo#4130);
-            // best-effort on the same terms as the per-child clear — the
-            // cascade below drops the rows regardless.
-            if let Err(e) = store
-                .clear_advisory_wake_deliveries_for_children(&session_ids)
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    workspace = %id.as_str(),
-                    "failed to clear advisory-wake period markers for deleted workspace"
-                );
-            }
-            for session in &sessions {
-                let event = Event {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    workspace_id: id.clone(),
-                    timestamp: now_iso(),
-                    event_type: AGENT_DELETED.to_string(),
-                    actor: system_actor(),
-                    session_id: Some(session.id.0.clone()),
-                    correlation_id: None,
-                    parent_event_id: None,
-                    metadata: None,
-                    data: serde_json::json!({
-                        "agentId": session.id.0,
-                        "agentName": session.name,
-                    }),
-                };
-                services
-                    .deliver_completion_to_watches_markers_precleared(&session.id, &event)
-                    .await;
-            }
-            // Backstop sweep: grouped watches survive delivery (group
-            // settlement owns their lifecycle) and a racing registration can
-            // land behind the loop above — after this point no watch may
-            // reference the deleted workspace as its child side. In-memory
-            // retain + best-effort delete of the persisted rows. Each
-            // affected parent then gets a refreshed
-            // `agent:subscriptions-changed` so clients converge on the
-            // shrunken watch set without polling (PROTOCOL §6.5).
-            let leaked: Vec<(String, WorkspaceId, AgentId)> = {
-                let mut registry = agent_subscriptions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut leaked = Vec::new();
-                registry.subscriptions.retain(|s| {
-                    if s.child_workspace_id == id {
-                        leaked.push((
-                            s.id.clone(),
-                            s.parent_workspace_id.clone(),
-                            s.parent_agent_id.clone(),
-                        ));
-                        false
-                    } else {
-                        true
-                    }
-                });
-                leaked
-            };
-            for (watch_id, _, _) in &leaked {
-                if let Err(e) = store.delete_completion_watch(watch_id).await {
-                    tracing::warn!("completion_watch delete failed {watch_id}: {e}");
-                }
-            }
-            let mut notified: Vec<(&WorkspaceId, &AgentId)> = Vec::new();
-            for (_, parent_ws, parent_id) in &leaked {
-                if !notified.contains(&(parent_ws, parent_id)) {
-                    notified.push((parent_ws, parent_id));
-                    services
-                        .publish_subscriptions_changed(parent_ws, parent_id)
-                        .await;
-                }
-            }
-            // Drop the workspace's event subscriptions (monorepo#947): their
-            // filter is workspace-scoped, so once the workspace is gone they
-            // can never match again — without this sweep their delivery
-            // tasks and persisted rows leak and rehydrate forever. Aborts
-            // the tasks and deletes the rows (chief-anchored subscriptions
-            // scoped to OTHER workspaces are untouched — this removes only
-            // subscriptions whose events came from the deleted workspace).
-            // Producer admission is already closed: no new subscription can
-            // register behind this sweep while the store cleanup yields.
-            services.remove_event_subscriptions_for_workspace(&id).await;
-            // Eagerly abort the workspace's live hook scheduler tasks BEFORE
-            // the store cascade drops their rows — otherwise each task would
-            // linger until its next tick before noticing the row is gone.
-            services.abort_workspace_hook_tasks(&id).await;
-            // Capture workspace state for the async cleanup below (before the
-            // row delete). Best-effort: when the workspace is already gone or
-            // the read fails, the background task simply skips the worktree
-            // step — the orphaned directory sweep can still unlink
-            // `<workspaces_root>/<id>/` on a retry, per the idempotent delete.
-            let ws_for_cleanup = store.get_workspace(&id).await.ok();
-            let branch_auto_generated = store
-                .workspace_branch_auto_generated(&id)
-                .await
-                .unwrap_or(false);
-            #[cfg(test)]
-            services.workspace_delete_test_gate.pause(&id).await;
-            // Idempotent DB delete: swallow `NotFound` so retries and
-            // orphan-dir-only cleanups don't surface as `"Failed to delete
-            // space"` on the FE. Any other error still propagates. Publish
-            // `workspace:deleted` only when we actually removed a row —
-            // subscribers dedup by id but a spurious event confuses UIs
-            // that treat it as a state transition.
-            match store.delete_workspace(&id).await {
-                Ok(()) => {
-                    publish_event(bus.as_ref(), workspace_deleted_event(&id)).await;
-                }
-                Err(Error::NotFound(_)) => {
-                    tracing::debug!(
-                        workspace = %id.as_str(),
-                        "workspace.delete: row already gone; treating as idempotent success"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-            // Cancel any pending debounced lastActivity derivation
-            // (monorepo#3623): the timer must not outlive the workspace —
-            // it would fire against the deleted row and log a spurious
-            // not-found WARN. After the row delete, so a schedule placed
-            // by the teardown above is swept too.
-            services.cancel_last_activity_schedule(&id);
-            // Sweep the pending idle debouncer the same way (monorepo#3632):
-            // an `agent_activity_end` during the agent teardown above
-            // schedules an idle flip whose timer would otherwise outlive the
-            // workspace and emit a spurious
-            // `workspace:activity-changed { idle }` ~3s after deletion.
-            // Residual race: an `agent_activity_end` landing after this sweep
-            // can still re-arm a flip for the deleted id — the timer's
-            // every-exit-path removal self-heals the map entry, and its
-            // emit-time existence guard skips the spurious event.
-            services.cancel_idle_debounce(&id);
-            // Evict the deleted workspace's last-observed displayStatus
-            // baseline so the in-memory map does not leak for the daemon's
-            // lifetime (and a same-id recreate seeds fresh).
-            services.evict_display_status_baseline(&id);
-            // Same for the cached git status: a dirty repo's `files` vec is
-            // unbounded, so the deleted worktree's last scan must not be
-            // retained for the daemon's lifetime (monorepo#1648).
-            if let Some(worktree) = ws_for_cleanup.as_ref().and_then(git_ops::worktree_path) {
-                services.git_status_cache.evict(&worktree);
-            }
-            // Fast-ack: the client receives `{ success: true }` here while the
-            // worktree and workspace-directory cleanup proceeds asynchronously
-            // in the background. Bounded latency regardless of checkout size
-            // (no multi-GB `remove_dir_all` blocking the response).
-            //
-            // Same-slug-recreate race guard: the `create` path already takes
-            // the per-repo worktree lock before provisioning, so a recreate
-            // cannot run its `add_worktree` while this cleanup's locked phase
-            // (registration prune + rename to a trash path) is still in
-            // progress for the same repo.
-            // Residual risk: if a recreate runs *before* the background task
-            // fires (row is deleted, event is sent, response is ACKed, but the
-            // spawn hasn't yet grabbed the worktree lock), the recreate could
-            // complete and then this cleanup might delete its brand-new
-            // worktree. Mitigation: we re-check the workspace row inside the
-            // background task and skip cleanup if it exists again. This is
-            // best-effort; the cleanup is naturally idempotent, and
-            // `workspace.delete` of the recreated workspace will clean up any
-            // mismatched leftovers.
-            let workspaces_root_bg = workspaces_root.clone();
-            let worktrees_location_bg = worktrees_location.clone();
-            let id_bg = id.clone();
-            let store_bg = store.clone();
-            let worktree_locks_bg = worktree_locks.clone();
-            let branch_auto_generated_bg = branch_auto_generated;
-            let _ = services.store_tasks.spawn_draining(async move {
-                // Re-check that the workspace is actually deleted. If it
-                // exists now (same-slug recreate landed before this task ran),
-                // skip the worktree cleanup entirely — the new workspace owns
-                // the branch and directory now. Still sweep the
-                // `<workspaces_root>/<id>/` directory if it doesn't match the
-                // recreated workspace's path, for orphan-cleanup parity.
-                let recreated = store_bg.get_workspace(&id_bg).await.ok();
-                let deleted_worktree_path = ws_for_cleanup
-                    .as_ref()
-                    .and_then(|w| w.worktree_path.clone());
-                // Root-anchored ownership: the persisted checkout counts as
-                // daemon-provisioned only when its parent directory is named
-                // after the workspace id AND it lives under a root the daemon
-                // provisions into (the boot workspaces root or the currently
-                // configured `workspace.worktreesLocation`). The parent
-                // basename alone is spoofable — the workspace id derives from
-                // the initial prompt, so an `isNewRepo` caller could place
-                // their repository at `<anywhere>/<wsId>/<repo>` and a
-                // basename-only gate would route the user's folder into the
-                // delete paths below. Trade-off: a checkout provisioned under
-                // a since-changed custom location is no longer matched and its
-                // `<oldLocation>/<wsId>/` directory leaks instead of being
-                // swept — leaking is the safe direction (never delete what we
-                // cannot prove we created).
-                let checkout_owned = deleted_worktree_path.as_deref().is_some_and(|wt| {
-                    checkout_parent_is_workspace_dir(wt, &id_bg)
-                        && (Path::new(wt).starts_with(&workspaces_root_bg)
-                            || worktrees_location_bg
-                                .as_deref()
-                                .is_some_and(|loc| Path::new(wt).starts_with(loc)))
-                });
-                // A standalone row's checkout path is caller-influenced
-                // (`repository_path == worktree_path`), so unless ownership is
-                // proven above it must not seed the final
-                // `workspace_dir_candidates` sweep either — that sweep
-                // recursively removes the checkout's parent directory.
-                // Worktree-mode rows keep their persisted path: the daemon
-                // derived it at provision time (covers a since-changed custom
-                // location).
-                let is_standalone_row = ws_for_cleanup.as_ref().is_some_and(|w| {
-                    matches!(
-                        w.checkout_mode,
-                        Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
-                    )
-                });
-                let sweep_worktree_path = deleted_worktree_path
-                    .as_deref()
-                    .filter(|_| !is_standalone_row || checkout_owned);
-                if let Some(ws_cleanup) = ws_for_cleanup {
-                    // Only run the worktree cleanup if the workspace is still
-                    // deleted (no recreate) or the recreate has a different
-                    // worktree path (the old worktree is now orphaned).
-                    let skip_worktree = recreated
-                        .as_ref()
-                        .is_some_and(|r| r.worktree_path == ws_cleanup.worktree_path);
-                    if !skip_worktree {
-                        let repo_dir = ws_cleanup
-                            .repository_path
-                            .as_deref()
-                            .filter(|p| !p.is_empty())
-                            .map(PathBuf::from);
-                        let wt = ws_cleanup
-                            .worktree_path
-                            .as_deref()
-                            .filter(|p| !p.is_empty())
-                            .map(PathBuf::from);
-                        if let (Some(repo_dir), Some(wt)) = (repo_dir, wt) {
-                            if !ws_cleanup.skip_worktree && !ws_cleanup.is_remote {
-                                let branch = ws_cleanup.branch.clone();
-                                let repo = repo_dir.clone();
-                                let branch_flag = branch_auto_generated_bg;
-                                let wt_locked = wt.clone();
-                                // A CoW or direct checkout is a standalone
-                                // clone: no registration to prune in the
-                                // source repo, and its workspace branch lives
-                                // only inside the clone — so the source-repo
-                                // branch-delete guard must not run (a
-                                // same-named source branch was never this
-                                // workspace's).
-                                let is_standalone = matches!(
-                                    ws_cleanup.checkout_mode,
-                                    Some(
-                                        intent_core::CheckoutMode::Cow
-                                            | intent_core::CheckoutMode::Direct
-                                    )
-                                );
-                                // Standalone-checkout removal is gated on the
-                                // root-anchored `checkout_owned` proof above
-                                // (`<root>/<wsId>/<slug>` under a daemon
-                                // root). An `isNewRepo` direct row's checkout
-                                // IS the user's repository folder
-                                // (`worktree_path == repository_path`,
-                                // intent-hq/monorepo#2611): never provisioned
-                                // by the daemon, never deleted with the
-                                // workspace.
-                                if is_standalone && !checkout_owned {
-                                    tracing::debug!(
-                                        workspace = %ws_cleanup.id.as_str(),
-                                        checkout = %wt_locked.display(),
-                                        "workspace.delete: standalone checkout is the user's repository folder; keeping it"
-                                    );
-                                } else {
-                                    // Under the per-repo lock: git-metadata work
-                                    // only (registration prune, rename of the
-                                    // checkout to a trash path, branch-delete
-                                    // guard; for CoW just the rename + metadata
-                                    // dir removal). On the rename-success path
-                                    // the multi-GB recursive removal runs below,
-                                    // after the lock is released, so concurrent
-                                    // `workspace.create` provisioning on the same
-                                    // repo is not starved by bulk deletes; only
-                                    // the rare rename-failure fallback removes
-                                    // in place under the lock.
-                                    let trash = worktree_locks_bg
-                                        .with_lock(&repo_dir, move || async move {
-                                            let task = tokio::task::spawn_blocking(move || {
-                                                if is_standalone {
-                                                    cleanup_workspace_cow_checkout_locked(
-                                                        &wt_locked,
-                                                    )
-                                                } else {
-                                                    cleanup_workspace_worktree_locked(
-                                                        &repo,
-                                                        &wt_locked,
-                                                        &branch,
-                                                        branch_flag,
-                                                    )
-                                                }
-                                            })
-                                            .await;
-                                            match task {
-                                                Ok(trash) => trash,
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        error = %e,
-                                                        "background worktree cleanup task failed"
-                                                    );
-                                                    None
-                                                }
-                                            }
-                                        })
-                                        .await;
-                                    if let Some(trash) = trash {
-                                        let removal = tokio::task::spawn_blocking(move || {
-                                            cleanup_detached_worktree(&trash);
-                                        })
-                                        .await;
-                                        if let Err(e) = removal {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "background detached-worktree removal task failed"
-                                            );
-                                        }
-                                        // Retry the empty-only parent `remove_dir`
-                                        // the trash sibling blocked — back under
-                                        // the per-repo lock, so it can't race a
-                                        // same-slug recreate's freshly created
-                                        // parent between its `create_dir_all` and
-                                        // `git worktree add`. O(1) while held.
-                                        if let Some(parent) = wt.parent().map(Path::to_path_buf) {
-                                            worktree_locks_bg
-                                                .with_lock(&repo_dir, move || async move {
-                                                    let _ = std::fs::remove_dir(&parent);
-                                                })
-                                                .await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // Final sweep of the daemon-owned workspace directory
-                // (`<parent>/<id>/`). The worktree cleanup's best-effort
-                // `remove_dir` (empty-only) leaves any residual content
-                // behind, and legacy pre-daemon workspaces have a directory
-                // but no worktree path at all. Recursive best-effort removal
-                // keeps the FE `FileSystemWorkspaceRepository.findAll` scan
-                // from re-surfacing the deleted id (ENOENT WARN spam) and
-                // makes the delete idempotent for orphaned directories.
-                //
-                // Candidates cover every parent this workspace may live under
-                // (persisted worktree's parent — the location in force at
-                // create time — plus the boot root and the currently
-                // configured `workspace.worktreesLocation`), so deleting a
-                // workspace created under a custom location does not leak
-                // `<location>/<id>/`.
-                //
-                // If a same-slug recreate happened and uses the same
-                // `<parent>/<id>/` directory, skip that candidate so we don't
-                // destroy the recreated workspace's directory tree.
-                let recreated_parent = recreated
-                    .as_ref()
-                    .and_then(|r| r.worktree_path.as_deref())
-                    .filter(|p| !p.is_empty())
-                    .and_then(|wt_path| Path::new(wt_path).parent())
-                    .map(Path::to_path_buf);
-                for dir in workspace_dir_candidates(
-                    &id_bg,
-                    sweep_worktree_path,
-                    &workspaces_root_bg,
-                    worktrees_location_bg.as_deref(),
-                ) {
-                    if recreated_parent.as_deref() == Some(dir.as_path()) {
-                        continue;
-                    }
-                    // Shared parallel removal helper; `NotFound` is already
-                    // folded into `Ok` there.
-                    let cleanup = tokio::task::spawn_blocking(move || {
-                        intent_git::fs_remove::remove_dir_all_parallel(&dir)
-                    })
-                    .await;
-                    match cleanup {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => tracing::warn!(
-                            workspace = %id_bg.as_str(),
-                            error = %e,
-                            "background cleanup: failed to remove workspace directory"
-                        ),
-                        Err(join_err) => tracing::warn!(
-                            workspace = %id_bg.as_str(),
-                            error = %join_err,
-                            "background cleanup: workspace-dir task failed"
-                        ),
-                    }
-                }
-            });
-            Ok(())
-        })
+        self.delete_workspace_with_claim(id, None)
     }
 
     fn schedule_workspace_delete(
@@ -22590,51 +23428,20 @@ impl WorkspaceApi for Services {
             // unknown workspace is the standard `NotFound` error, not a
             // timer that fails later.
             store.get_workspace(&id).await?;
-            let delay_ms = delete_grace::clamp_undo_delay_ms(undo_delay_ms);
-            let delete_at = intent_core::iso_ms_from_now(delay_ms);
-            let key = id.as_str().to_string();
             let timer_services = services.clone();
             let timer_id = id.clone();
-            // Idempotent re-schedule (§5.1): the registry arms the timer only
-            // when nothing is pending for this key — the check runs under the
-            // registry lock, so concurrent schedules converge on one deadline
-            // and only the arming call emits `workspace:delete-scheduled`.
-            if let Some(existing) = services.pending_workspace_deletes.schedule(
-                key,
-                delete_at.clone(),
-                move |generation| {
-                    let tasks = timer_services.pending_delete_tasks.clone();
-                    let stopping = tasks.clone();
-                    tasks.spawn_draining(async move {
-                        tokio::select! {
-                            biased;
-                            () = stopping.closed() => return,
-                            () = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
-                        }
-                        // Claim-or-abstain: only the timer that still owns the
-                        // entry commits. A cancel or an immediate delete that
-                        // raced ahead removed/superseded the entry — do nothing.
-                        if !timer_services
-                            .pending_workspace_deletes
-                            .claim(timer_id.as_str(), generation)
-                        {
-                            return;
-                        }
-                        // Commit via the existing immediate-delete cascade
-                        // (same events, fast-ack cleanup). Best-effort: the
-                        // caller is long gone, so a failure is logged, not
-                        // surfaced.
-                        if let Err(e) = timer_services.delete_workspace(timer_id.clone()).await {
-                            tracing::warn!(
-                                workspace = %timer_id.as_str(),
-                                error = %e,
-                                "scheduled workspace delete failed at commit"
-                            );
-                        }
-                    }).unwrap_or_else(|| intent_core::spawn_daemon(async {}))
-                },
-            ) {
-                return Ok(existing);
+            let scheduled = services.pending_workspace_deletes.schedule_owned(
+                delete_grace::PendingDeleteSubject::Workspace(id.clone()),
+                undo_delay_ms,
+                move |claim| intent_core::with_caller(intent_core::Caller::Daemon, async move {
+                    if let Err(e) = timer_services.delete_workspace_with_claim(timer_id.clone(), Some(claim)).await {
+                        tracing::warn!(workspace = %timer_id.as_str(), error = %e, "scheduled workspace delete failed at commit");
+                    }
+                }),
+            ).await?;
+            let delete_at = scheduled.delete_at;
+            if !scheduled.newly_armed {
+                return Ok(delete_at);
             }
             publish_event(
                 bus.as_ref(),
@@ -22651,7 +23458,10 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&id, "workspace.delete")
                 .await?;
-            let cancelled = services.pending_workspace_deletes.cancel(id.as_str());
+            let cancelled = services
+                .pending_workspace_deletes
+                .cancel_owned(&delete_grace::PendingDeleteSubject::Workspace(id.clone()))
+                .await?;
             if cancelled {
                 publish_event(bus.as_ref(), workspace_delete_cancelled_event(&id)).await;
             }
@@ -22699,6 +23509,8 @@ impl WorkspaceApi for Services {
             // failure fails the RPC with the row still active: access
             // revocation is never best-effort. Unarchive does NOT restore
             // either; a guest rejoins by a fresh invite.
+            this.cancel_script_monitors(&id, None, "workspace-archived")
+                .await?;
             let guest_sweep = store.archive_workspace_detaching_guests(&id, &now).await?;
             ws.status = WorkspaceStatus::Archived;
             ws.archived = true;
@@ -22999,6 +23811,7 @@ impl WorkspaceApi for Services {
                 // then folds in any copied notes / activity carried over from
                 // the source workspace.
                 last_activity: Some(now.clone()),
+                last_content_activity: None,
                 tags: source.tags.clone(),
                 path: source.path.clone(),
                 repository_path: source.repository_path.clone(),
@@ -27833,6 +28646,13 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         force: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let native_operation = repository_native_wire::checkout::operations::capture(
+            self,
+            &intent_core::repository_checkout::CheckoutFrame::Push {
+                workspace_id: workspace_id.clone(),
+                force,
+            },
+        );
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
@@ -27847,6 +28667,15 @@ impl WorkspaceApi for Services {
             let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                 Error::Internal("Failed to push: workspace has no worktree".to_string())
             })?;
+            if let Some(plan) = native_operation.prepare(&ws, &worktree).await? {
+                let outcome = plan
+                    .execute(Some(force))
+                    .await?
+                    .ok_or_else(|| Error::Internal("native push result missing".into()))?;
+                return Ok(
+                    serde_json::json!({"branch":outcome.branch,"pushedSha":outcome.pushed_sha}),
+                );
+            }
             // Resolve the GitHub token outside the lock (bounded async lookups)
             // so the credential chain can fall back to it for HTTPS github.com
             // remotes (see `intent_git::auth`).
@@ -27909,6 +28738,10 @@ impl WorkspaceApi for Services {
     }
 
     fn git_fetch(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
+        let native_operation = repository_native_wire::checkout::operations::capture(
+            self,
+            &intent_core::repository_checkout::CheckoutFrame::Fetch(workspace_id.clone()),
+        );
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
@@ -27923,6 +28756,10 @@ impl WorkspaceApi for Services {
             let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                 Error::Internal("Failed to fetch: workspace has no worktree".to_string())
             })?;
+            if let Some(plan) = native_operation.prepare(&ws, &worktree).await? {
+                plan.execute(None).await?;
+                return Ok(());
+            }
             // Token resolved outside the lock — see the matching note on
             // `git_push` above.
             let token = github_git_token(registry.as_deref(), &worktree).await;
@@ -28520,79 +29357,6 @@ impl WorkspaceApi for Services {
                 },
             ));
             Ok(serde_json::json!({ "started": true, "owner": owner, "repo": repo }))
-        })
-    }
-
-    fn git_commit(
-        &self,
-        workspace_id: WorkspaceId,
-        message: String,
-        idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<intent_core::GitCommitResult>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
-        let this = self.clone();
-        Box::pin(async move {
-            self.require_member(&workspace_id).await?;
-            // TS `ws.git.commit` gates on auto-commit (no userRequested
-            // bypass), resolved per-workspace (override → global fallback).
-            let auto_commit_enabled = this.effective_auto_commit(&workspace_id).await;
-            let ws_scope = workspace_id.0.clone();
-            let op_store = store.clone();
-            let event_bus = bus.clone();
-            let event_message = message.clone();
-            let status_cache = this.git_status_invalidator();
-            let inflight = this.idempotency_inflight.clone();
-            with_idempotency(
-                &inflight,
-                &store,
-                &ws_scope,
-                idempotency_key,
-                "git.commit",
-                move || async move {
-                    let store = op_store;
-                    git_ops::assert_agent_commit_allowed(auto_commit_enabled, false)?;
-                    // All commit failures surface as `-32603` (the TS handler wraps the
-                    // whole path in INTERNAL_ERROR), so a missing workspace is `Internal`.
-                    let ws = store
-                        .get_workspace(&workspace_id)
-                        .await
-                        .map_err(|e| Error::Internal(format!("Failed to commit: {e}")))?;
-                    let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
-                        Error::Internal("Failed to commit: workspace has no worktree".to_string())
-                    })?;
-                    let outcome = intent_git::commit::commit(&worktree, &message)?;
-                    // Staged content became a commit → the cached scan still
-                    // lists it as pending (monorepo#1648).
-                    status_cache.invalidate(&worktree);
-                    // Emissions live inside the idempotency scope so a replayed
-                    // commit (same idempotencyKey) returns the cached result
-                    // without re-firing events (parity with `workspace:created`
-                    // §6.5). `git:commit` mirrors the reserved
-                    // `GitOperationEvent` FE shape; `changes:git-status` feeds
-                    // the FE bridge's `git:status-changed` relay so the UI
-                    // refreshes without a follow-up `git.status` read.
-                    publish_event(
-                        event_bus.as_ref(),
-                        git_commit_event(&ws.id, &outcome.hash, &event_message, &outcome.files),
-                    )
-                    .await;
-                    let status = intent_git::status::status(&worktree)
-                        .unwrap_or_else(|_| intent_git::status::empty_status());
-                    let status_json =
-                        serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-                    publish_event(
-                        event_bus.as_ref(),
-                        changes_git_status_event(&ws.id, &status_json),
-                    )
-                    .await;
-                    Ok(intent_core::GitCommitResult {
-                        hash: outcome.hash,
-                        files: outcome.files,
-                    })
-                },
-            )
-            .await
         })
     }
 
@@ -29675,12 +30439,13 @@ impl WorkspaceApi for Services {
 
     fn agent_activity_flags(&self, agent_id: AgentId) -> BoxFuture<'_, serde_json::Value> {
         Box::pin(async move {
-            // Load the session so the flags honor the same terminal-status
+            // Load only session metadata: activity and liveness do not need
+            // the transcript or its externalized payloads. Honor the same terminal-status
             // short-circuit and parent-watch lookup as the `AgentLite`
             // projection (see [`agent_activity_flags_for`]). On a read error the
             // snapshot degrades to all-`false` rather than failing the
             // subscription (matching `chat_snapshot`'s degrade-to-empty pattern).
-            match self.store.get_agent_session(&agent_id).await {
+            match self.store.get_agent_session_summary(&agent_id).await {
                 Ok(session) => {
                     let (
                         is_responding,
@@ -29834,6 +30599,14 @@ impl WorkspaceApi for Services {
             } else {
                 crate::principal_ops::strip_principal_attribution(message_metadata)
             };
+            crate::agent_ops::validate_submission_id(message_id.as_deref())?;
+            if let Some(id) = message_id.as_deref() {
+                if let Some(result) =
+                    self.submission_replay(&agent_id, id, message_metadata.as_ref())?
+                {
+                    return Ok(result);
+                }
+            }
             // Collaborator sender preamble (multiplayer): the content-level
             // counterpart of the stamp, applied once here so the runtime
             // path and the store-only fallback persist what the model sees.
@@ -29930,6 +30703,24 @@ impl WorkspaceApi for Services {
                         .await
                 }
             }
+        }))
+    }
+
+    fn agent_send_queued_messages_now(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_ids: Vec<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.execution_call(self.instruction_admission(async move {
+            self.require_agent_member_in(&agent_id, &workspace_id)
+                .await?;
+            let manager = self.agent_manager().ok_or_else(|| {
+                Error::Unsupported("explicit queue batching requires an agent manager".into())
+            })?;
+            manager
+                .send_queued_messages_now(agent_id, workspace_id, message_ids)
+                .await
         }))
     }
 
@@ -30066,6 +30857,25 @@ impl WorkspaceApi for Services {
     fn agent_queue_message(
         &self,
         agent_id: AgentId,
+        content: String,
+        image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.agent_queue_submission(
+            agent_id,
+            None,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+        )
+    }
+
+    fn agent_queue_submission(
+        &self,
+        agent_id: AgentId,
+        message_id: Option<String>,
         mut content: String,
         image_blocks: Option<serde_json::Value>,
         file_blocks: Option<serde_json::Value>,
@@ -30082,8 +30892,9 @@ impl WorkspaceApi for Services {
             // entry's content, so the drain persists what the model sees.
             self.annotate_collaborator_sender_for_agent(&agent_id, &mut content)
                 .await?;
-            self.agent_queue_message_op(
+            self.agent_queue_submission_op(
                 agent_id,
+                message_id,
                 content,
                 image_blocks,
                 file_blocks,
@@ -31065,26 +31876,64 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn pr_refresh_automatic(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.execution_call(async move {
+            self.require_member(&workspace_id).await?;
+            let outcome = self
+                .refresh_workspace_pr_automatically(&workspace_id)
+                .await?;
+            let ws = self.store.get_workspace(&workspace_id).await?;
+            Ok(serde_json::json!({
+                "outcome": outcome.as_wire_str(),
+                "prNumber": ws.pr_number,
+                "prUrl": ws.pr_url,
+                "prStatus": ws.pr_status,
+                "pullRequests": ws.pull_requests.as_deref().unwrap_or_default(),
+            }))
+        })
+    }
+
     fn pr_state(
         &self,
         workspace_id: WorkspaceId,
         pr_number: u64,
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let captured = repo.is_none().then(|| {
+            repository_read_source::CapturedReview::capture(self, workspace_id.clone(), pr_number)
+        });
         let store = self.store.clone();
         let this = self.clone();
         self.execution_call(async move {
             self.require_member(&workspace_id).await?;
-            let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            // Cross-repo override (`{ repo: "owner/name" }`) wins over the
-            // workspace repo; either way the resolved repo is echoed in the
-            // result so a wrong-repo read is detectable.
+            load_ws_for_pr(&store, &workspace_id).await?;
+            // Explicit GitHub addressing keeps its existing path. Implicit
+            // reads first resolve the actual original local repository.
             let repo_ref = match repo {
                 Some(slug) => {
                     let (owner, repo) = pr_ops::parse_repo_slug(&slug)?;
                     intent_sourcecontrol::RepoRef::new(owner, repo)
                 }
-                None => pr_ops::repo_of(&ws)?,
+                None => match captured
+                    .ok_or_else(repository_read_source::refused)?
+                    .read(self)
+                    .await
+                    .map_err(|_| repository_read_source::refused())?
+                {
+                    repository_read_source::ReadOutcome::Github(repo) => repo,
+                    repository_read_source::ReadOutcome::Managed { target, result } => {
+                        let read = (*result).map_err(|failure| match failure.cause {
+                            pr_monitor::qualified_cache::CacheError::Provider(error) => {
+                                pr_ops::map_sc_err(error)
+                            }
+                            _ => repository_read_source::refused(),
+                        })?;
+                        return pr_ops::qualified_review_snapshot(&target, &read.value);
+                    }
+                },
             };
             let repo_slug = format!("{}/{}", repo_ref.owner, repo_ref.name);
             // Served from the shared PR cache (§5.7): the entry is the PR
@@ -31254,6 +32103,85 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn github_pulls_checks(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsChecks").await?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let pr = sc
+                .get_pr(&repo_ref, number)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let head_sha = pr
+                .head_sha
+                .filter(|sha| !sha.is_empty())
+                .ok_or_else(|| Error::Internal("Pull request head SHA unavailable".into()))?;
+            let checks = sc
+                .check_runs(&repo_ref, &head_sha)
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({ "headSha": head_sha, "checks": checks }))
+        })
+    }
+
+    fn github_pulls_reviews(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsReviews").await?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let page = sc.pull_reviews(&repo_ref, number, intent_sourcecontrol::PageParams {
+                limit: github_ops::clamp_limit(limit).min(100),
+                cursor: github_ops::decode_next_token(next_token.as_deref()),
+            }).await.map_err(pr_ops::map_sc_err)?;
+            Ok(serde_json::json!({ "reviews": page.items, "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()) }))
+        })
+    }
+
+    fn github_pulls_files(
+        &self,
+        owner: String,
+        repo: String,
+        number: u64,
+        limit: Option<i64>,
+        next_token: Option<String>,
+        expected_head_sha: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsFiles").await?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let head_sha = sc.get_pr(&repo_ref, number).await.map_err(pr_ops::map_sc_err)?.head_sha
+                .filter(|sha| !sha.is_empty()).ok_or_else(|| Error::Internal("Pull request head SHA unavailable".into()))?;
+            if expected_head_sha.as_ref().is_some_and(|expected| expected != &head_sha) {
+                return Err(Error::Conflict { current: serde_json::json!({"headSha": head_sha}) });
+            }
+            let page = sc.pull_files(&repo_ref, number, intent_sourcecontrol::PageParams {
+                limit: github_ops::clamp_limit(limit).min(100),
+                cursor: github_ops::decode_next_token(next_token.as_deref()),
+            }).await.map_err(pr_ops::map_sc_err)?;
+            let after = sc.get_pr(&repo_ref, number).await.map_err(pr_ops::map_sc_err)?.head_sha;
+            if after.as_ref() != Some(&head_sha) {
+                return Err(Error::Conflict { current: serde_json::json!({"headSha": after}) });
+            }
+            Ok(serde_json::json!({ "headSha": head_sha, "truncated": page.truncated, "files": page.items, "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()) }))
+        })
+    }
+
     fn github_pulls_list(
         &self,
         owner: String,
@@ -31353,6 +32281,66 @@ impl WorkspaceApi for Services {
                     github_ops::pull_to_json_with_repo(p, &github_ops::hit_repo(&scope, &p.url))
                 })
                 .collect();
+            Ok(serde_json::json!({
+                "pulls": pulls,
+                "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
+            }))
+        })
+    }
+
+    fn github_org_pulls_search(
+        &self,
+        org: String,
+        filter: Option<String>,
+        state: Option<String>,
+        query: Option<String>,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        self.execution_call(async move {
+            self.require_host_execution("github.pullsSearch").await?;
+            if org.is_empty()
+                || org.len() > 39
+                || !org.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                return Err(Error::InvalidParams(
+                    "org must be a GitHub owner slug".into(),
+                ));
+            }
+            let involvement = github_ops::parse_pr_involvement(filter.as_deref())?;
+            let state = github_ops::parse_pr_state(Some(state.as_deref().unwrap_or("open")))?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let page = sc
+                .list_org_prs(
+                    &org,
+                    intent_sourcecontrol::PrQuery {
+                        state,
+                        involvement,
+                        search: github_ops::normalize_search_query(query),
+                        limit: Some(github_ops::clamp_limit(limit)),
+                        cursor: github_ops::decode_next_token(next_token.as_deref()),
+                        ..intent_sourcecontrol::PrQuery::default()
+                    },
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+            let pulls = page
+                .items
+                .iter()
+                .map(|pr| {
+                    let repo = github_ops::repo_from_html_url(&pr.url)
+                        .filter(|repo| {
+                            *repo == intent_sourcecontrol::RepoRef::new(&org, &repo.name)
+                        })
+                        .ok_or_else(|| {
+                            Error::Internal(
+                                "organization PR search returned an invalid repository URL".into(),
+                            )
+                        })?;
+                    Ok(github_ops::pull_to_json_with_repo(pr, &repo))
+                })
+                .collect::<Result<Vec<_>>>()?;
             Ok(serde_json::json!({
                 "pulls": pulls,
                 "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
@@ -32328,9 +33316,22 @@ impl WorkspaceApi for Services {
         provider: String,
         host: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_auth_status_for_instance(provider, host, None)
+    }
+
+    fn source_control_auth_status_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.authStatus")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             match target {
                 source_control_auth_ops::Target::Github => {
                     let base = self.github_auth_status().await?;
@@ -32380,18 +33381,20 @@ impl WorkspaceApi for Services {
                     let slot = guard
                         .flow
                         .as_ref()
-                        .filter(|f| f.host == host.host())
+                        .filter(|f| f.host == host.logical_base_url())
                         .map(|f| &f.slot);
-                    let device_grant_supported =
-                        client_id.is_some() && !guard.unsupported_hosts.contains(host.host());
-                    Ok(source_control_auth_ops::auth_status_to_wire(
+                    let device_grant_supported = client_id.is_some()
+                        && !guard.unsupported_hosts.contains(host.logical_base_url());
+                    let mut status = source_control_auth_ops::auth_status_to_wire(
                         github_auth_ops::auth_status_to_wire(is_configured, slot),
                         source_control_auth_ops::Provider::Gitlab,
                         host.host(),
                         method,
                         user,
                         device_grant_supported,
-                    ))
+                    );
+                    status["instanceBaseUrl"] = serde_json::json!(host.logical_base_url());
+                    Ok(status)
                 }
             }
         })
@@ -32404,9 +33407,24 @@ impl WorkspaceApi for Services {
         method: Option<String>,
         token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_connect_for_instance(provider, host, method, token, None)
+    }
+
+    fn source_control_connect_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        method: Option<String>,
+        token: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.connect")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             let use_pat = match method.as_deref().map(str::trim) {
                 None | Some("device") => false,
                 Some("pat") => true,
@@ -32451,35 +33469,29 @@ impl WorkspaceApi for Services {
         provider: String,
         host: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_cancel_auth_for_instance(provider, host, None)
+    }
+
+    fn source_control_cancel_auth_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.cancelAuth")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             match target {
                 // Unscoped cancel: `sourceControl.cancelAuth` carries no
                 // `flowId`, so it cancels whichever GitHub flow is pending
                 // (same as `github.cancelAuth` with `flowId` omitted).
                 source_control_auth_ops::Target::Github => self.github_cancel_auth(None).await,
                 source_control_auth_ops::Target::Gitlab { host, .. } => {
-                    // Host-scoped: only a pending flow for exactly this host
-                    // is cancelled; a terminal slot stays until the next
-                    // connect replaces it (same rule as `github.cancelAuth`).
-                    let mut guard = self.gitlab_auth.lock().await;
-                    let starting = guard
-                        .starting
-                        .as_ref()
-                        .is_some_and(|s| s.host == host.host());
-                    let cancelled = matches!(
-                        guard.flow.as_ref(),
-                        Some(f) if f.host == host.host()
-                            && f.slot.phase == github_auth_ops::FlowPhase::Pending
-                    );
-                    if cancelled {
-                        guard.flow = None;
-                    }
-                    if starting {
-                        guard.starting = None;
-                    }
-                    Ok(serde_json::json!({ "ok": true, "cancelled": cancelled || starting }))
+                    self.gitlab_cancel_auth(&host).await
                 }
             }
         })
@@ -32490,16 +33502,26 @@ impl WorkspaceApi for Services {
         provider: String,
         host: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_revoke_for_instance(provider, host, None)
+    }
+
+    fn source_control_revoke_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.revoke")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             match target {
                 source_control_auth_ops::Target::Github => self.github_revoke().await,
                 source_control_auth_ops::Target::Gitlab { host, .. } => {
-                    self.owned_direct_secret_mutation(direct_secret_ops::Mutation::GitlabRevoke(
-                        host,
-                    ))
-                    .await
+                    self.gitlab_revoke_owned(host).await
                 }
             }
         })
@@ -32510,9 +33532,22 @@ impl WorkspaceApi for Services {
         provider: String,
         host: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.source_control_get_user_for_instance(provider, host, None)
+    }
+
+    fn source_control_get_user_for_instance(
+        &self,
+        provider: String,
+        host: Option<String>,
+        instance_base_url: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("sourceControl.getUser")?;
-            let target = self.resolve_source_control_target(&provider, host.as_deref())?;
+            let target = self.resolve_source_control_target_for_instance(
+                &provider,
+                host.as_deref(),
+                instance_base_url.as_deref(),
+            )?;
             match target {
                 source_control_auth_ops::Target::Github => {
                     // An absent credential is `{ user: null }`, a rejected one
@@ -32643,6 +33678,17 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.presence_update_op(connection_id, params).await })
     }
 
+    fn presence_focus_snapshot(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: intent_core::PrincipalId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.presence_focus_snapshot_op(workspace_id, principal_id)
+                .await
+        })
+    }
+
     fn presence_snapshot(
         &self,
         workspace_id: WorkspaceId,
@@ -32723,6 +33769,19 @@ impl WorkspaceApi for Services {
         principal_id: intent_core::PrincipalId,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.host_members_remove_op(&principal_id).await })
+    }
+
+    fn host_invite_search_accounts(
+        &self,
+        provider: String,
+        host: Option<String>,
+        query: String,
+        limit: Option<u8>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.host_invite_search_accounts_op(&provider, host.as_deref(), &query, limit)
+                .await
+        })
     }
 
     fn host_invite_create(
@@ -37071,6 +38130,7 @@ impl Services {
         &self,
         changes: serde_json::Value,
         is_tcp: bool,
+        credential_guard: Option<&source_control_auth_ops::repository_owner::GitlabCredentialGuard>,
     ) -> Result<serde_json::Value> {
         /// Which store a captured old value belongs to, so the rollback
         /// path restores it through the same seam that persisted it.
@@ -37129,9 +38189,25 @@ impl Services {
         }
         // Reject malformed/pinned mixed batches before any secret write.
         self.settings_service().validate_update(&changes)?;
+        let repository_write =
+            self.prepare_gitlab_repository_settings(&changes, credential_guard)?;
+        let settings = self
+            .settings_service()
+            .with_repository_write(repository_write.clone());
         let secrets = if has_secrets {
             drop(revision_guard.take());
-            let secrets = self.settings_service().update_secrets(&changes).await?;
+            let secrets = match settings.update_secrets(&changes).await {
+                Ok(secrets) => secrets,
+                Err(error) => {
+                    self.settle_gitlab_repository_settings(
+                        repository_write.as_deref(),
+                        false,
+                        false,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
             revision_guard = Some(self.settings_revision_gate.write().await);
             secrets
         } else {
@@ -37143,6 +38219,7 @@ impl Services {
         let mut changes = caller_changes;
         self.reresolve_default_model_on_provider_switch(&mut changes);
         let mut secrets_compensated = false;
+        let mut compensation_complete = false;
         let result = async {
                 // Capture ordinary priors for hook-failure compensation. Secret
                 // priors were captured under their account guards before I/O;
@@ -37198,7 +38275,14 @@ impl Services {
                 };
 
                 let port_was_unassigned_before_update = registry.is_some_and(|reg| reg.snapshot().ws_api_port_policy() == WsApiPortPolicy::Unassigned);
-                let mut applied = secrets.merge_applied(self.settings_service().update_non_secrets(&changes).await?);
+                let ordinary = match settings.update_non_secrets_with_outcome(&changes).await {
+                    Ok(applied) => applied,
+                    Err(failure) => {
+                        compensation_complete = failure.no_effect();
+                        return Err(failure.into_error());
+                    }
+                };
+                let mut applied = secrets.merge_applied(ordinary);
                 let port_was_unassigned = registry.is_some_and(|reg| reg.snapshot().ws_api_port_policy() == WsApiPortPolicy::Unassigned);
                 if !applied.is_empty() {
                     // Apply server runtime hooks (§5.12): start/stop the WSS listener
@@ -37218,6 +38302,7 @@ impl Services {
                             // (a single config.toml rewrite + one change publication) instead of
                             // per-key applies.
                             let mut rollback_failed = false;
+                            let mut runtime_compensation_complete = true;
                             let mut port_needs_publication = port_was_unassigned_before_update;
                             let mut compensating_changes = Vec::new();
                             let mut registry_restores: Vec<(String, serde_json::Value)> = Vec::new();
@@ -37277,7 +38362,7 @@ impl Services {
                             // (single config.toml rewrite, single change publication).
                             if !registry_restores.is_empty() {
                                 if let Some(reg) = registry {
-                                    if let Err(rollback_err) = reg.apply(&registry_restores) {
+                                    if let Err(rollback_err) = reg.apply_with_repository_write(&registry_restores, repository_write.as_deref(), None) {
                                         tracing::error!(
                                             error = %rollback_err,
                                             "settings.update registry rollback batch failed"
@@ -37296,7 +38381,7 @@ impl Services {
                                 // before releasing the gate, never exposing new values
                                 // under the previous revision.
                                 self.publish_ws_port_assignment(port_needs_publication).await;
-                                let runtime_before = self.settings_service().server_values().await;
+                                let runtime_before = settings.server_values().await;
                                 drop(revision_guard.take());
                                 rollback_failed |= secrets.rollback(&self.secrets).await;
                                 secrets_compensated = true;
@@ -37305,7 +38390,7 @@ impl Services {
                                 // own port. Only a subsequent compensating assignment
                                 // can now belong to this recovery.
                                 port_needs_publication = registry.is_some_and(|reg| reg.snapshot().ws_api_port_policy() == WsApiPortPolicy::Unassigned);
-                                let runtime_after = self.settings_service().server_values().await;
+                                let runtime_after = settings.server_values().await;
                                 match (runtime_before, runtime_after) {
                                     (Ok(before), Ok(after)) => {
                                         // Ordinary rollback finished before the gate was released.
@@ -37348,7 +38433,7 @@ impl Services {
                                         error = ?compensating_err,
                                         "settings.update compensating hook application failed during rollback"
                                     );
-                                    // Log but don't fail — the persistence rollback succeeded
+                                    runtime_compensation_complete = false;
                                 }
                             }
 
@@ -37364,10 +38449,10 @@ impl Services {
                                         port,
                                         "settings.update rollback: restarted WSS listener on prior settings"
                                     ),
-                                    Err(restart_err) => tracing::error!(
+                                    Err(restart_err) => { runtime_compensation_complete = false; tracing::error!(
                                         error = ?restart_err,
                                         "settings.update rollback: failed to restart WSS listener on prior settings"
-                                    ),
+                                    ); },
                                 }
                             }
 
@@ -37383,10 +38468,10 @@ impl Services {
                                         address = %address,
                                         "settings.update rollback: restarted tailcat tunnel on prior settings"
                                     ),
-                                    Err(restart_err) => tracing::error!(
+                                    Err(restart_err) => { runtime_compensation_complete = false; tracing::error!(
                                         error = ?restart_err,
                                         "settings.update rollback: failed to restart tailcat tunnel on prior settings"
-                                    ),
+                                    ); },
                                 }
                             }
 
@@ -37401,6 +38486,7 @@ impl Services {
                                     "settings.update hook failed ({e}), and rollback was incomplete (see logs)"
                                 )));
                             }
+                            compensation_complete = runtime_compensation_complete;
                             // Return the hook error to the caller
                             return Err(e);
                         }
@@ -37425,17 +38511,30 @@ impl Services {
         // a hook failure already restored them before runtime recovery.
         drop(revision_guard);
         if let Err(error) = result {
-            if !secrets_compensated && secrets.rollback(&self.secrets).await {
+            let rollback_incomplete = !secrets_compensated && secrets.rollback(&self.secrets).await;
+            self.settle_gitlab_repository_settings(
+                repository_write.as_deref(),
+                compensation_complete && !rollback_incomplete,
+                true,
+            )
+            .await;
+            if rollback_incomplete {
                 return Err(Error::Internal(format!(
                         "settings.update failed ({error}), and secret rollback was incomplete (see logs)"
                     )));
             }
             return Err(error);
         }
+        self.settle_gitlab_repository_settings(repository_write.as_deref(), true, false)
+            .await;
         result
     }
 
-    async fn settings_reset_owned(&self, path: String) -> Result<serde_json::Value> {
+    async fn settings_reset_owned(
+        &self,
+        path: String,
+        credential_guard: Option<&source_control_auth_ops::repository_owner::GitlabCredentialGuard>,
+    ) -> Result<serde_json::Value> {
         Self::require_administrator("settings.reset")?;
         // Same serialization and lock order as `settings.update`
         // (credential gate → revision gate): a GitLab credential reset
@@ -37447,11 +38546,24 @@ impl Services {
         } else {
             Some(self.settings_revision_gate.write().await)
         };
-        let (result, changed) = self.settings_service().reset_with_change(&path).await?;
+        let repository_write = self.prepare_gitlab_repository_reset(&path, credential_guard)?;
+        let reset = self
+            .settings_service()
+            .with_repository_write(repository_write.clone())
+            .reset_with_change(&path)
+            .await;
+        let (result, changed) = match reset {
+            Ok(result) => result,
+            Err(error) => {
+                drop(revision_guard);
+                self.settle_gitlab_repository_settings(repository_write.as_deref(), false, false)
+                    .await;
+                return Err(error);
+            }
+        };
         if revision_guard.is_none() {
             revision_guard = Some(self.settings_revision_gate.write().await);
         }
-        let _revision_guard = revision_guard;
         let revision = if changed {
             let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
             publish_event(
@@ -37464,6 +38576,9 @@ impl Services {
         } else {
             self.settings_revision.load(Ordering::SeqCst)
         };
+        drop(revision_guard);
+        self.settle_gitlab_repository_settings(repository_write.as_deref(), true, false)
+            .await;
         let mut result = result;
         result["revision"] = serde_json::json!(revision);
         Ok(result)
@@ -37491,10 +38606,10 @@ impl Services {
         let (response, receiver) = tokio::sync::oneshot::channel();
         if self.settings_tasks.spawn_draining(async move {
             operation.primary_auth_admitted = true;
-            let primary = reset.as_deref().is_some_and(|path| path == intent_sourcecontrol::gitlab_token::SECRET_ACCOUNT)
-                || Self::batch_touches_gitlab_credential(&changes);
-            let _credential_guard = if primary {
-                Some(operation.gitlab_credential_gate.clone().lock_owned().await)
+            let primary = reset.as_deref().is_some_and(|path| path.starts_with("sourceControl.gitlab."))
+                || Self::repository_settings_relevant(&changes);
+            let credential_guard = if primary {
+                Some(Arc::new(operation.gitlab_credential_gate.lock().await))
             } else { None };
             let paths: Vec<&str> = match &reset {
                 Some(path) => vec![path.as_str()],
@@ -37505,11 +38620,12 @@ impl Services {
             // A panic becomes an unknown failure, then actual writes still
             // settle before another same-account operation can proceed.
             let worker = operation.clone();
+            let worker_credential = credential_guard.clone();
             let result = intent_core::spawn_daemon(intent_core::with_caller(caller,
                 intent_core::caller::with_wire_credential(credential, async move {
                     match reset {
-                        Some(path) => worker.settings_reset_owned(path).await,
-                        None => worker.settings_update_owned(changes, is_tcp).await,
+                        Some(path) => worker.settings_reset_owned(path, worker_credential.as_deref()).await,
+                        None => worker.settings_update_owned(changes, is_tcp, worker_credential.as_deref()).await,
                     }
                 })
             )).await.unwrap_or_else(|error| Err(Error::Internal(format!("settings operation failed: {error}; state may be unknown — reconcile before retrying"))));

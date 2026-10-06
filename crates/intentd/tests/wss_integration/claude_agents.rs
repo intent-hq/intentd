@@ -431,7 +431,7 @@ async fn claude_agents_missing_skills_block_creation_and_recover_in_project_scop
         "skills: [code-review, missing-kit]\n",
         "Review.",
     );
-    let installed = home.join(".claude/skills/review/SKILL.md");
+    let installed = home.join(".intent/skills/review/SKILL.md");
     std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
     std::fs::write(
         &installed,
@@ -668,7 +668,15 @@ async fn claude_agents_custom_config_root_discovers_and_watches_agents_and_skill
     ));
     let (daemon, port, cfg) = await_boot(dir.path(), child).await;
     let mut client = connect_ws(port, cfg.clone()).await;
-    let first = wss_rpc(&mut client, 1, "specialist.list", json!({})).await;
+    let native = wss_rpc(&mut client, 1, "specialist.list", json!({})).await;
+    assert_eq!(
+        definition(&native, "configured")["missingSkills"],
+        json!(["config-kit"]),
+        "custom Claude config does not implicitly import personal skills"
+    );
+    std::fs::create_dir_all(home.join(".intent")).unwrap();
+    symlink(target.join("skills"), home.join(".intent/skills")).unwrap();
+    let first = wss_rpc(&mut client, 10, "specialist.list", json!({})).await;
     assert!(
         definition(&first, "configured")
             .get("missingSkills")
@@ -694,6 +702,10 @@ async fn claude_agents_custom_config_root_discovers_and_watches_agents_and_skill
         checkout.to_string_lossy().as_ref()
     );
     stop(daemon, &dir.path().join("intentd.sock")).await;
+    // Logs append across boots. Only the restarted daemon can establish this
+    // test's watch; an earlier process's receipt is not readiness.
+    let log = dir.path().join("daemon.log");
+    let log_start = std::fs::metadata(&log).unwrap().len();
     let child = common::DaemonGuard::process_only(spawn_serve_with_claude_config(
         dir.path(),
         &home,
@@ -725,13 +737,42 @@ async fn claude_agents_custom_config_root_discovers_and_watches_agents_and_skill
         json!({"eventTypes":["specialists:changed"],"workspaceId":workspace_id}),
     )
     .await;
+    // WSS readiness does not await catalog priming or deferred OS enrollment.
+    // This exact root is registered after the initial specialist fingerprint.
+    // Keep readiness plus the actual edit/event within the original 20s bound.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let watched_root = target.join("agents").canonicalize().unwrap();
+    let watched_root = watched_root.to_str().unwrap();
+    tokio::time::timeout_at(deadline, async {
+        let mut poll = tokio::time::interval(Duration::from_millis(25));
+        loop {
+            poll.tick().await;
+            let bytes = std::fs::read(&log).unwrap();
+            let current_boot = &bytes[usize::try_from(log_start).unwrap()..];
+            if String::from_utf8_lossy(current_boot).lines().any(|line| {
+                line.contains("linked directory watch established")
+                    && line
+                        .rsplit_once(" root=")
+                        .is_some_and(|(_, recorded)| recorded == watched_root)
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("original custom agent directory watch did not become live");
     write_agent(
         &target.join("agents/custom.md"),
         "configured",
         "skills: [config-kit]\n",
         "Updated custom root.",
     );
-    let event = next_event(&mut subscription, &["specialists:changed"], 20).await;
+    let event = tokio::time::timeout_at(
+        deadline,
+        next_event(&mut subscription, &["specialists:changed"], 20),
+    )
+    .await
+    .expect("custom agent edit was not delivered within the original budget");
     let after = wss_rpc(&mut client, 4, "specialist.get", json!({"id":"configured"})).await;
     assert!(after["specialist"]["prompt"]
         .as_str()

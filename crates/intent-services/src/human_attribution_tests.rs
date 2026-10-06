@@ -46,6 +46,7 @@ pub(crate) fn assert_preserved_queue_metadata(
     // original key, including nested inert payload, must stay identical.
     assert_eq!(actual["queueInfo"]["queuedMessageId"], original.id);
     expected["queueInfo"] = actual["queueInfo"].clone();
+    expected["submissionIds"] = json!([original.id]);
     assert_eq!(actual, &expected);
 }
 

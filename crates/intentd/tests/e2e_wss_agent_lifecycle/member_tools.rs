@@ -115,8 +115,6 @@ async fn member_provider_enablement_commits_safe_snapshots_over_wss_and_restart(
     .unwrap();
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("GITHUB_TOKEN", ""),
-        ("GH_TOKEN", ""),
         ("GITLAB_TOKEN", ""),
         ("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:9"),
     ];
@@ -335,8 +333,6 @@ async fn member_ai_rejection_emits_safe_diagnostic_and_context_invalidation_over
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
         ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
-        ("GITHUB_TOKEN", ""),
-        ("GH_TOKEN", ""),
         ("GITLAB_TOKEN", ""),
     ];
     let daemon = Daemon {
@@ -471,8 +467,6 @@ async fn member_prompt_survives_sender_disconnect_and_safe_context_events_over_w
     let dir = temp_data_dir();
     let ws = WorkspaceId::new();
     let member_id = seed_member(dir.path(), &ws).await;
-    let gh_dir = dir.path().join("empty-gh");
-    std::fs::create_dir_all(&gh_dir).unwrap();
     std::fs::write(
         dir.path().join("config.toml"),
         "[sourceControl.github]\ntokenSource = 'explicit'\nexposeGitCredentialToChildren = false\n",
@@ -484,15 +478,11 @@ async fn member_prompt_survives_sender_disconnect_and_safe_context_events_over_w
         "assertResult":{"outcome":{"outcome":"selected","optionId":"allow_once"}}}],
         "response":"Member-approved background work completed."})
     .to_string();
-    let gh = gh_dir.to_string_lossy();
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
         ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
         ("INTENTD_PERMISSION_POLICY", "interactive"),
-        ("GH_CONFIG_DIR", gh.as_ref()),
-        ("GITHUB_TOKEN", ""),
-        ("GH_TOKEN", ""),
         ("GITLAB_TOKEN", ""),
     ];
     let _daemon = Daemon {
@@ -575,20 +565,80 @@ async fn member_prompt_survives_sender_disconnect_and_safe_context_events_over_w
     .await;
     assert!(conversation.to_string().contains(member_id.as_str()));
     assert!(!conversation.to_string().contains("forged-owner"));
-    wss_rpc(
+    let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
+    let before = wss_rpc(&mut answer, 7, "host.executionContext", json!({})).await;
+    assert_eq!(before["gitCredentialPolicy"]["managedHelperEnabled"], false);
+    let update = wss_rpc(
         &mut owner,
         7,
         "settings.update",
         json!({"changes":[{"path":"sourceControl.github.exposeGitCredentialToChildren","value":true}]}),
     )
     .await;
-    let event = wss_event(&mut observer, 10).await;
-    assert_eq!(
-        event["params"]["event"]["type"], "host:execution-context-changed",
-        "{event}"
-    );
+    // Match this original update's committed revision, not whichever safe event
+    // happens to have queued first during the earlier permission/work flow.
+    let settings_events = store
+        .query_events(&intent_store::EventQuery {
+            event_types: vec!["settings:changed".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let committed = settings_events
+        .iter()
+        .find(|event| event.data["revision"] == update["revision"])
+        .expect("original committed settings revision");
+    assert_eq!(committed.data["changes"], update["applied"]);
+    let update_order: i64 = sqlx::query_scalar("SELECT rowid FROM event WHERE id = ?")
+        .bind(&committed.id)
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    let event = timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = wss_event(&mut observer, 10).await;
+            let event = &frame["params"]["event"];
+            eprintln!("member context original update={update} event={event}");
+            assert_eq!(event["type"], "host:execution-context-changed", "{frame}");
+            let event_order: i64 = sqlx::query_scalar("SELECT rowid FROM event WHERE id = ?")
+                .bind(event["id"].as_str().unwrap())
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap();
+            let safe = &event["data"];
+            assert_eq!(
+                safe.as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                [
+                    "defaultModelId",
+                    "defaultProviderId",
+                    "enabledProviderIds",
+                    "gitCredentialPolicy",
+                    "repositoryConnections"
+                ]
+                .into_iter()
+                .collect()
+            );
+            if event_order < update_order {
+                assert_eq!(safe["gitCredentialPolicy"]["managedHelperEnabled"], false);
+                continue;
+            }
+            assert!(event_order > update_order);
+            assert_eq!(safe["gitCredentialPolicy"]["managedHelperEnabled"], true);
+            break frame;
+        }
+    })
+    .await
+    .expect("safe post-update event within the original bound");
     let safe = &event["params"]["event"]["data"];
-    assert_eq!(safe["gitCredentialPolicy"]["managedHelperEnabled"], true);
+    assert_eq!(
+        wss_rpc(&mut answer, 8, "host.executionContext", json!({})).await,
+        *safe,
+        "the post-update event equals the original current snapshot"
+    );
     assert_eq!(
         safe.as_object()
             .unwrap()
@@ -619,8 +669,6 @@ async fn member_scripts_respect_managed_helper_policy_and_keep_alternative_helpe
         .status()
         .unwrap()
         .success());
-    let gh_dir = dir.path().join("empty-gh");
-    std::fs::create_dir_all(&gh_dir).unwrap();
     let git_config = dir.path().join("empty-gitconfig");
     std::fs::write(&git_config, "").unwrap();
     // Disposable credentials only; even incidental readiness cannot contact
@@ -633,14 +681,10 @@ async fn member_scripts_respect_managed_helper_policy_and_keep_alternative_helpe
     .unwrap();
     let secrets_file = dir.path().join("secrets.json");
     let secrets_file = secrets_file.to_string_lossy();
-    let gh = gh_dir.to_string_lossy();
     let git_config = git_config.to_string_lossy();
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_SECRETS_FILE", secrets_file.as_ref()),
-        ("GH_CONFIG_DIR", gh.as_ref()),
-        ("GITHUB_TOKEN", ""),
-        ("GH_TOKEN", ""),
         ("GITLAB_TOKEN", ""),
         ("GIT_CONFIG_GLOBAL", git_config.as_ref()),
         ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -768,8 +812,6 @@ async fn member_provider_safe_reads_use_host_cache_and_preserve_administration_o
     let dir = temp_data_dir();
     let ws = WorkspaceId::new();
     let member = seed_member(dir.path(), &ws).await;
-    let gh = dir.path().join("empty-gh");
-    std::fs::create_dir_all(&gh).unwrap();
     let probe = dir.path().join("fake-auggie");
     let calls = dir.path().join("probe-calls");
     let authorized = dir.path().join("authorized");
@@ -783,18 +825,11 @@ async fn member_provider_safe_reads_use_host_cache_and_preserve_administration_o
         ),
     )
     .unwrap();
-    let gh = gh.to_string_lossy();
     let _daemon = Daemon {
         child: spawn_serve(
             dir.path(),
             "both",
-            &[
-                ("INTENTD_AUTH_TOKEN", TOKEN),
-                ("GH_CONFIG_DIR", gh.as_ref()),
-                ("GITHUB_TOKEN", ""),
-                ("GH_TOKEN", ""),
-                ("GITLAB_TOKEN", ""),
-            ],
+            &[("INTENTD_AUTH_TOKEN", TOKEN), ("GITLAB_TOKEN", "")],
         ),
     };
     let socket = dir.path().join("intentd.sock");
@@ -908,7 +943,12 @@ async fn member_provider_safe_reads_use_host_cache_and_preserve_administration_o
     assert!(events
         .iter()
         .any(|row| row.id.as_str() == event["id"].as_str().unwrap() && row.data == context));
-    for method in ["settings.list", "host.env", "host.providerTestPrompt"] {
+    for method in [
+        "settings.list",
+        "host.env",
+        "host.providerTestPrompt",
+        "host.prepareProviderAdapters",
+    ] {
         let denied = wss_rpc_envelope(&mut client, 9, method, json!({})).await;
         assert_eq!(denied["error"]["code"], -32003, "{method}: {denied}");
     }
@@ -967,12 +1007,10 @@ async fn seed_linked_member_pr(data_dir: &Path, ws: &WorkspaceId) {
 }
 
 #[tokio::test]
-async fn member_pr_status_missing_auth_does_not_consume_collaboration_credentials_over_wss() {
+async fn member_pr_read_missing_auth_does_not_consume_collaboration_credentials_over_wss() {
     let dir = temp_data_dir();
     let ws = WorkspaceId::new();
     seed_linked_member_pr(dir.path(), &ws).await;
-    let gh = dir.path().join("empty-gh");
-    std::fs::create_dir_all(&gh).unwrap();
     std::fs::write(
         dir.path().join("secrets.json"),
         json!({"collaboration.github.token":"private-identity-only-token"}).to_string(),
@@ -983,18 +1021,11 @@ async fn member_pr_status_missing_auth_does_not_consume_collaboration_credential
         "[sourceControl.github]\ntokenSource = 'explicit'\nexposeGitCredentialToChildren = false\n",
     )
     .unwrap();
-    let gh = gh.to_string_lossy();
     let _daemon = Daemon {
         child: spawn_serve(
             dir.path(),
             "both",
-            &[
-                ("INTENTD_AUTH_TOKEN", TOKEN),
-                ("GH_CONFIG_DIR", gh.as_ref()),
-                ("GITHUB_TOKEN", ""),
-                ("GH_TOKEN", ""),
-                ("GITLAB_TOKEN", ""),
-            ],
+            &[("INTENTD_AUTH_TOKEN", TOKEN), ("GITLAB_TOKEN", "")],
         ),
     };
     let socket = dir.path().join("intentd.sock");
@@ -1014,7 +1045,13 @@ async fn member_pr_status_missing_auth_does_not_consume_collaboration_credential
     .await;
     let context = wss_rpc(&mut client, 1, "host.executionContext", json!({})).await;
     assert_eq!(context["repositoryConnections"][0]["configured"], false);
-    let reply = wss_rpc_envelope(&mut client, 2, "pr.status", json!({"workspaceId":ws})).await;
+    let reply = wss_rpc_envelope(
+        &mut client,
+        2,
+        "github.pulls.list",
+        json!({"owner":"fake-org","repo":"fake-repo"}),
+    )
+    .await;
     assert_eq!(reply["error"]["code"], -32603);
     assert_eq!(
         reply["error"]["data"],
@@ -1031,7 +1068,13 @@ async fn member_pr_status_missing_auth_does_not_consume_collaboration_credential
     }
     let event = wss_event(&mut observer, 10).await;
     assert_eq!(event["params"]["event"]["data"], context);
-    let legacy = wss_rpc_envelope(&mut owner, 1, "pr.status", json!({"workspaceId":ws})).await;
+    let legacy = wss_rpc_envelope(
+        &mut owner,
+        1,
+        "github.pulls.list",
+        json!({"owner":"fake-org","repo":"fake-repo"}),
+    )
+    .await;
     assert_eq!(legacy["error"]["code"], -32603);
     assert!(legacy["error"]["data"]["executionAuthorization"].is_null());
     assert_eq!(legacy["error"]["message"], "Internal error");
@@ -1095,7 +1138,7 @@ impl PrAuthServer {
                     }
                 }
                 let request = String::from_utf8_lossy(&bytes);
-                if request.contains("/pulls/7 ") {
+                if request.starts_with("GET /repos/fake-org/fake-repo/pulls") {
                     headers.lock().unwrap().push(
                         request
                             .lines()
@@ -1127,7 +1170,7 @@ impl PrAuthServer {
 }
 
 #[intent_test_macros::daemon_test]
-async fn member_pr_status_typed_rejections_are_safe_and_non_auth_errors_stay_legacy_over_wss() {
+async fn member_pr_read_typed_rejections_are_safe_and_non_auth_errors_stay_legacy_over_wss() {
     use intent_services::{EventBus, InMemorySecretStore, SecretStore, Services, SettingsRegistry};
     use intent_transport::{AsyncTokenStore, TokenStore, WsApiServer, WsOptions};
     use std::sync::atomic::Ordering;
@@ -1140,6 +1183,8 @@ async fn member_pr_status_typed_rejections_are_safe_and_non_auth_errors_stay_leg
             Ok(())
         }
     }
+    // Use the uncached list route so rate-limit responses do not pause later
+    // cases through the single-PR read cache. Every case must hit this fixture.
     let fake = PrAuthServer::start().await;
     let dir = temp_data_dir();
     let ws = WorkspaceId::new();
@@ -1217,7 +1262,13 @@ async fn member_pr_status_typed_rejections_are_safe_and_non_auth_errors_stay_leg
     ] {
         fake.status.store(code, Ordering::SeqCst);
         let before_owner = fake.authorization.lock().unwrap().len();
-        let legacy = wss_rpc_envelope(&mut owner, 2, "pr.status", json!({"workspaceId":ws})).await;
+        let legacy = wss_rpc_envelope(
+            &mut owner,
+            2,
+            "github.pulls.list",
+            json!({"owner":"fake-org","repo":"fake-repo"}),
+        )
+        .await;
         let before_member = fake.authorization.lock().unwrap().len();
         assert!(
             before_member > before_owner,
@@ -1238,7 +1289,13 @@ async fn member_pr_status_typed_rejections_are_safe_and_non_auth_errors_stay_leg
             let owner_event = wss_event(&mut observer, 10).await;
             assert_eq!(owner_event["params"]["event"]["data"], context);
         }
-        let reply = wss_rpc_envelope(&mut client, 2, "pr.status", json!({"workspaceId":ws})).await;
+        let reply = wss_rpc_envelope(
+            &mut client,
+            2,
+            "github.pulls.list",
+            json!({"owner":"fake-org","repo":"fake-repo"}),
+        )
+        .await;
         assert!(
             fake.authorization.lock().unwrap().len() > before_member,
             "member PR read must reach the local forge"

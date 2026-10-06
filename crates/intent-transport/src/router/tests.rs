@@ -4,14 +4,13 @@ use intent_core::{
     AgentId, AuthorType, BoxFuture, Comment, CommentAddResult, CommentLocation,
     CommentResolveThreadResult, CommentRespondResult, CommentRespondThread, CommentStatus,
     CommentType, CommentWire, ContentType, Error, Event, EventQueryParams, FileStatus,
-    GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
-    GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteId, NoteMetadata, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, RepoConfig, Result,
-    ScriptCreateParams, ScriptMode, TaskUpdateResult, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
-    WorkspaceUpdate,
+    GitAgentCommitResult, GitBranchStatus, GitBranches, GitFileStatus, GitMergeConflicts,
+    GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult,
+    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility,
+    ReadAssetResult, RepoConfig, Result, ScriptCreateParams, ScriptMode, TaskUpdateResult,
+    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceCreate,
+    WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use serde_json::Value;
 
@@ -89,6 +88,7 @@ fn sample_ws() -> Workspace {
         created_at: "t0".to_string(),
         updated_at: "t0".to_string(),
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -1362,6 +1362,20 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn host_invite_search_accounts(
+        &self,
+        provider: String,
+        host: Option<String>,
+        query: String,
+        limit: Option<u8>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(
+                serde_json::json!({"provider":provider,"host":host,"query":query,"limit":limit,"users":[]}),
+            )
+        })
+    }
+
     fn github_users_search(
         &self,
         query: String,
@@ -1448,23 +1462,6 @@ impl WorkspaceApi for FakeApi {
                 "echoHost": host,
                 "echoProofId": proof_id,
             }))
-        })
-    }
-
-    fn git_commit(
-        &self,
-        _workspace_id: WorkspaceId,
-        message: String,
-        _idempotency_key: Option<String>,
-    ) -> BoxFuture<'_, Result<GitCommitResult>> {
-        Box::pin(async move {
-            if message == "boom" {
-                return Err(Error::Internal("nothing to commit".to_string()));
-            }
-            Ok(GitCommitResult {
-                hash: "abc123".to_string(),
-                files: vec!["src/a.ts".to_string()],
-            })
         })
     }
 
@@ -2168,6 +2165,17 @@ impl WorkspaceApi for FakeApi {
                 return Err(Error::NotFound("workspace".to_string()));
             }
             Ok(())
+        })
+    }
+
+    fn pr_refresh_automatic(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".into()));
+            }
+            Ok(
+                serde_json::json!({"outcome": "skipped", "prNumber": 300, "prUrl": null, "prStatus": "Open", "pullRequests": [{"number": 300}]}),
+            )
         })
     }
 
@@ -4041,7 +4049,11 @@ async fn agent_list_scope_params_are_validated() {
     ] {
         let v = call(frame).await.unwrap();
         assert_eq!(err_code(&v), -32602, "{frame}: {v}");
-        assert_eq!(v["error"]["message"], serde_json::json!(expected), "{frame}");
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!(expected),
+            "{frame}"
+        );
     }
     // `orphanedOnly: false` reads as absent on any scope: the frame passes
     // param validation into the trait default (`Internal` → `-32603`),
@@ -5262,28 +5274,22 @@ async fn github_cancel_auth_forwards_flow_id_and_rejects_non_string() {
 }
 
 #[tokio::test]
-async fn git_commit_returns_ok_hash_and_files() {
-    let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"git.commit","params":{"workspaceId":"ws-1","message":"msg"}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(v["result"]["ok"], serde_json::json!(true));
-    assert_eq!(v["result"]["hash"], serde_json::json!("abc123"));
-    assert_eq!(v["result"]["files"], serde_json::json!(["src/a.ts"]));
-}
-
-#[tokio::test]
-async fn git_commit_missing_message_is_minus_32602() {
-    let v =
-        call(r#"{"jsonrpc":"2.0","id":1,"method":"git.commit","params":{"workspaceId":"ws-1"}}"#)
-            .await
-            .unwrap();
-    assert_eq!(err_code(&v), -32602);
-    assert_eq!(
-        v["error"]["message"],
-        serde_json::json!("Missing required parameter: message")
-    );
+async fn removed_git_commit_is_method_not_found() {
+    for params in [
+        serde_json::json!({"workspaceId":"ws-1","message":"msg","idempotencyKey":"key"}),
+        serde_json::json!({"workspaceId":"ws-1"}),
+        serde_json::Value::Null,
+    ] {
+        let response = call(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "git.commit", "params": params
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32601, "{response}");
+    }
 }
 
 #[tokio::test]
@@ -5395,7 +5401,6 @@ async fn file_tracking_methods_are_routed_not_method_not_found() {
     for method in [
         "file-tracking.getChanges",
         "file-tracking.loadCommits",
-        "file-tracking.getLineStats",
         "file-tracking.getAgentLocks",
     ] {
         let msg = format!(
@@ -5408,11 +5413,7 @@ async fn file_tracking_methods_are_routed_not_method_not_found() {
 
 #[tokio::test]
 async fn file_tracking_reads_require_workspace_id() {
-    for method in [
-        "file-tracking.getChanges",
-        "file-tracking.getLineStats",
-        "file-tracking.getAgentLocks",
-    ] {
+    for method in ["file-tracking.getChanges", "file-tracking.getAgentLocks"] {
         let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#);
         let v = call(&msg).await.unwrap();
         assert_eq!(err_code(&v), -32602);
@@ -5438,43 +5439,23 @@ async fn file_tracking_stage_requires_paths() {
 }
 
 #[tokio::test]
-async fn metrics_methods_are_routed_not_method_not_found() {
-    // `getAllWorkspaceStats` takes no params; the rest carry their required id.
-    for (method, params) in [
-        ("metrics.getWorkspaceStats", r#"{"workspaceId":"ws-1"}"#),
-        ("metrics.getAgentStats", r#"{"agentId":"agent-1"}"#),
-        ("metrics.getAllWorkspaceStats", r"{}"),
-        ("metrics.clearAgentStats", r#"{"agentId":"agent-1"}"#),
-    ] {
-        let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
-        let v = call(&msg).await.unwrap();
-        assert_ne!(err_code(&v), -32601, "{method} should be routed");
-    }
+async fn metrics_agent_stats_is_routed() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"metrics.getAgentStats","params":{"agentId":"agent-1"}}"#)
+        .await
+        .unwrap();
+    assert_ne!(err_code(&v), -32601);
 }
 
 #[tokio::test]
-async fn metrics_workspace_stats_requires_workspace_id() {
-    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"metrics.getWorkspaceStats","params":{}}"#)
+async fn metrics_agent_stats_requires_agent_id() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"metrics.getAgentStats","params":{}}"#)
         .await
         .unwrap();
     assert_eq!(err_code(&v), -32602);
     assert_eq!(
         v["error"]["message"],
-        serde_json::json!("workspaceId is required")
+        serde_json::json!("Missing required parameter: agentId")
     );
-}
-
-#[tokio::test]
-async fn metrics_agent_methods_require_agent_id() {
-    for method in ["metrics.getAgentStats", "metrics.clearAgentStats"] {
-        let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#);
-        let v = call(&msg).await.unwrap();
-        assert_eq!(err_code(&v), -32602);
-        assert_eq!(
-            v["error"]["message"],
-            serde_json::json!("Missing required parameter: agentId")
-        );
-    }
 }
 
 #[tokio::test]
@@ -7347,6 +7328,20 @@ async fn pr_refresh_dispatches_and_returns_service_result() {
 }
 
 #[tokio::test]
+async fn pr_refresh_routes_automatic_and_validates_provenance() {
+    for (value, expected) in [("true", "skipped"), ("false", "linked")] {
+        let request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"pr.refresh","params":{{"workspaceId":"ws-1","automatic":{value}}}}}"#
+        );
+        let result = call(&request).await.unwrap();
+        assert_eq!(result["result"]["outcome"], expected);
+        assert_eq!(result["result"]["prNumber"], 300);
+    }
+    let result = call(r#"{"jsonrpc":"2.0","id":1,"method":"pr.refresh","params":{"workspaceId":"ws-1","automatic":"true"}}"#).await.unwrap();
+    assert_eq!(result["error"]["code"], -32602);
+}
+
+#[tokio::test]
 async fn pr_refresh_missing_workspace_id_is_minus_32602() {
     let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"pr.refresh","params":{}}"#)
         .await
@@ -7862,5 +7857,34 @@ async fn agent_create_validates_and_forwards_remember_specialist() {
         let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"workspaceId":"ws-1","rememberSpecialist":value}});
         let response = call(&request.to_string()).await.unwrap();
         assert_eq!(err_code(&response), -32602);
+    }
+}
+
+#[tokio::test]
+async fn invitation_account_search_routes_and_rejects_malformed_params() {
+    let params =
+        serde_json::json!({"provider":"gitlab","host":"custom.example","query":"al","limit":3});
+    let frame=call(&serde_json::json!({"jsonrpc":"2.0","id":71,"method":"host.invite.searchAccounts","params":params}).to_string()).await.unwrap();
+    assert_eq!(
+        frame["result"],
+        serde_json::json!({"provider":"gitlab","host":"custom.example","query":"al","limit":3,"users":[]})
+    );
+    for patch in [
+        serde_json::json!({"provider":null}),
+        serde_json::json!({"query":3}),
+        serde_json::json!({"host":4}),
+        serde_json::json!({"limit":null}),
+        serde_json::json!({"limit":0}),
+        serde_json::json!({"limit":11}),
+        serde_json::json!({"limit":-1}),
+        serde_json::json!({"limit":1.5}),
+        serde_json::json!({"limit":"3"}),
+    ] {
+        let mut invalid = params.clone();
+        for (k, v) in patch.as_object().unwrap() {
+            invalid[k] = v.clone();
+        }
+        let frame=call(&serde_json::json!({"jsonrpc":"2.0","id":71,"method":"host.invite.searchAccounts","params":invalid}).to_string()).await.unwrap();
+        assert_eq!(err_code(&frame), -32602, "{invalid}");
     }
 }

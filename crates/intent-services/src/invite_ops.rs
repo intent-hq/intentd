@@ -49,6 +49,7 @@ use intent_store::{
     HostInviteJoinOutcome, HostJoinCredential, InviteInsertOutcome, InviteJoinOutcome,
 };
 
+mod account_search;
 mod host;
 use host::ScopedInvite;
 use serde_json::{json, Value};
@@ -758,15 +759,20 @@ impl Services {
     }
 
     async fn invite_preview(&self, invite: &ScopedInvite) -> Result<Value> {
+        let name = self.settings_service().get("sharing.machineName").await?["value"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
         match invite {
-            ScopedInvite::Host(i) => {
-                Ok(json!({"scope":"host", "role":"member", "pinIdentity":i.pin_identity}))
-            }
+            ScopedInvite::Host(i) => Ok(
+                json!({"scope":"host", "role":"member", "pinIdentity":i.pin_identity, "collaborationName":name}),
+            ),
             ScopedInvite::Workspace(i) => {
                 let ws = self.store.get_workspace(&i.workspace_id).await?;
                 Ok(
                     json!({"scope":"workspace", "role":"collaborator", "workspaceId":ws.id,
-                    "workspaceTitle":ws.title, "pinIdentity":i.pin_identity_key()}),
+                    "workspaceTitle":ws.title, "pinIdentity":i.pin_identity_key(), "collaborationName":name}),
                 )
             }
         }

@@ -90,6 +90,7 @@ mod tests {
             created_at: now.clone(),
             updated_at: now,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: Some(repo_path.to_string_lossy().to_string()),

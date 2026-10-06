@@ -53,7 +53,7 @@ use intent_core::{
     now_iso, AgentId, AgentStatus, Error, Hook, HookId, HookState, Result, WorkspaceApi,
     WorkspaceId,
 };
-use intent_store::NewEvent;
+use intent_store::{ActiveHookMetadata, NewEvent};
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -862,7 +862,7 @@ fn bound_wake_text(text: &str) -> String {
 /// Project one active hook into its idle-visibility `waitingOnHooks` entry:
 /// `{ hookId, name, nextRunAt?, expiresAt? }` — light metadata only, no
 /// code/lastState/logs.
-fn waiting_on_hooks_entry(h: Hook) -> Value {
+fn waiting_on_hooks_entry(h: ActiveHookMetadata) -> Value {
     let mut v = json!({
         "hookId": h.hook_id,
         "name": h.name,
@@ -1241,7 +1241,7 @@ impl Services {
     /// empty (visibility is best-effort and must never block an idle emit or
     /// wake delivery).
     pub(crate) async fn active_hooks_for_agent(&self, agent_id: &AgentId) -> Vec<Value> {
-        let hooks = match self.store.list_hooks_by_agent(agent_id).await {
+        let hooks = match self.store.active_hook_metadata_by_agent(agent_id).await {
             Ok(hooks) => hooks,
             Err(e) => {
                 tracing::warn!(
@@ -1252,11 +1252,7 @@ impl Services {
                 return Vec::new();
             }
         };
-        hooks
-            .into_iter()
-            .filter(|h| matches!(h.state, HookState::Scheduled | HookState::Running))
-            .map(waiting_on_hooks_entry)
-            .collect()
+        hooks.into_iter().map(waiting_on_hooks_entry).collect()
     }
 
     /// Workspace-batched variant of
@@ -1268,7 +1264,11 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> HashMap<String, Vec<Value>> {
-        let hooks = match self.store.list_hooks_by_workspace(workspace_id).await {
+        let hooks = match self
+            .store
+            .active_hook_metadata_by_workspace(workspace_id)
+            .await
+        {
             Ok(hooks) => hooks,
             Err(e) => {
                 tracing::warn!(
@@ -1280,10 +1280,7 @@ impl Services {
             }
         };
         let mut by_agent: HashMap<String, Vec<Value>> = HashMap::new();
-        for h in hooks
-            .into_iter()
-            .filter(|h| matches!(h.state, HookState::Scheduled | HookState::Running))
-        {
+        for h in hooks {
             let agent = h.agent_id.0.clone();
             by_agent
                 .entry(agent)
@@ -2496,6 +2493,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -2621,6 +2619,57 @@ mod tests {
             .with_event_bus(bus)
             .with_workspaces_root(root.path().to_path_buf());
         (tmp, root, services, ws, owner)
+    }
+
+    #[tokio::test]
+    async fn self_queue_owner_hook_retains_stale_warning_without_payloads() {
+        let (_db, _root, svc, ws, owner) = setup().await;
+        let mut session = svc.store().get_agent_session(&owner).await.unwrap();
+        session.status = AgentStatus::Idle;
+        svc.store()
+            .update_agent_session(&ws, &session)
+            .await
+            .unwrap();
+        svc.enqueue_message(
+            &owner,
+            "PENDING-SECRET-content".into(),
+            Some(json!([{"type":"image", "data":"PENDING-SECRET-image"}])),
+            Some(json!([{"type":"resource", "uri":"PENDING-SECRET-file"}])),
+            Some(json!({"extra":"PENDING-SECRET-metadata"})),
+            None,
+            false,
+            intent_core::MessageOrigin::Automatic,
+        );
+        {
+            let mut queues = svc.agent_queues.lock().unwrap();
+            queues.get_mut(&owner).unwrap()[0].queued_at = "2020-01-01T00:00:00Z".into();
+        }
+        let before = svc.queue_snapshot(&owner);
+        let out = svc.hook_schedule_op(&ws, &owner, &json!({
+            "name":"stale self queue", "delayMs":600_000,
+            "code": r"
+                for (const opts of [{}, {agentId:'agent-hooks'}]) {
+                    const d = await ws.agent.diagnostics(opts);
+                    const q = d.diagnostics.queues.find(q => q.agentId === 'agent-hooks');
+                    if (q.queueLength !== 1 || q.entries.length !== 0 || JSON.stringify(d).includes('PENDING-SECRET'))
+                        throw new Error('owner hook exposed pending payloads or lost count');
+                    const risk = d.diagnostics.stuckRisks.find(r => r.type === 'stale-queue-entry');
+                    if (!risk || risk.count !== 1 || risk.ageMs <= 300000 || !d.text.includes('stale-queue-entry'))
+                        throw new Error('owner hook lost stale warning');
+                    if (!d.text.includes('contents hidden')) throw new Error('owner hook lost delivery notice');
+                }
+                return {dispatch:false};
+            "
+        })).await.expect("owner hook validation preserves stale warning");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.queue_snapshot(&owner),
+            before,
+            "hook reads never consume"
+        );
     }
 
     /// Fixed deadline for the polling helpers below. Generous on purpose:
@@ -6179,6 +6228,40 @@ mod tests {
         wait_for_task_exit(&svc, &hook.hook_id).await;
         let text = wait_for_wake(&svc, &owner, "timer went off").await;
         assert!(text.contains("now retired"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn provider_policy_hook_uses_owner_identity_and_reloads_live_policy() {
+        let (_tmp, root, base, ws, owner) = setup().await;
+        let store = base.store().clone();
+        let svc = Services::new_with_file_secrets(
+            store.clone(),
+            intent_core::FileSecretStore::with_path(root.path().join("secrets.json")),
+        )
+        .with_event_bus(EventBus::new(store))
+        .with_workspaces_root(root.path().to_owned());
+        let mut session = svc.store().get_agent_session(&owner).await.unwrap();
+        session.provider = Some("claude-code".into());
+        svc.store()
+            .update_agent_session(&ws, &session)
+            .await
+            .unwrap();
+        let file = root.path().join("policy.json");
+        std::fs::write(&file, "{}").unwrap();
+        svc.set_provider_policy_sources(
+            "claude-code",
+            vec![crate::provider_profiles::PolicySource::ClaudeSettings(file)],
+        );
+        let code = "await ws.mcp.listServers(); return {dispatch:true,message:'policy checked'};";
+        let input = json!({"name":"policy hook", "code":code,"delayMs":10000});
+        let first = svc.hook_schedule_op(&ws, &owner, &input).await.unwrap();
+        assert_eq!(first["dispatched"], true);
+        svc.set_provider_policy_sources(
+            "claude-code",
+            vec![crate::provider_profiles::PolicySource::Unavailable],
+        );
+        let error = svc.hook_schedule_op(&ws, &owner, &input).await.unwrap_err();
+        assert!(error.to_string().contains("policy"), "{error}");
     }
 
     #[tokio::test]

@@ -54,8 +54,6 @@ async fn create_as_member(existing: bool, retained: bool) {
             "both",
             &[
                 ("INTENTD_AUTH_TOKEN", TOKEN),
-                ("GH_TOKEN", ""),
-                ("GITHUB_TOKEN", ""),
                 ("GITLAB_TOKEN", ""),
                 ("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:9"),
             ],

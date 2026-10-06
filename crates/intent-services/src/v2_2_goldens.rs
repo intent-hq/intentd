@@ -75,7 +75,7 @@ fn golden_v2_2_workspace_body_hashes() {
     );
     assert_eq!(
         sha256_hex(crate::instructions::V2_2.workspace_agent),
-        "72d41b4bd71060e62d7dad0410c1a12a6fb2341c9e5ba00852721be749325981"
+        "a6c97650b5a0b11bb5fcedd5974fad013c4a962d4fb4520f02e167580caf8cbc"
     );
 }
 

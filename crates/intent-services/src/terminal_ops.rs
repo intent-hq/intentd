@@ -262,6 +262,9 @@ pub(crate) fn injected_git_env(
 /// registry, where the schema default (`true`) applies. Shared with the
 /// `system.gitCredential` UDS RPC (see [`crate::github_git_credential`]).
 pub(crate) fn expose_git_credential(settings: Option<&SettingsRegistry>) -> bool {
+    if intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
+        return false;
+    }
     settings.is_some_and(|r| {
         r.snapshot()
             .effective
@@ -1746,6 +1749,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,

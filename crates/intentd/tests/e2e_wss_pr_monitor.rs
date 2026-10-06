@@ -11,6 +11,8 @@
 
 #![cfg(unix)]
 
+#[path = "e2e_wss_pr_monitor/adaptive.rs"]
+mod adaptive;
 #[path = "e2e_wss_pr_monitor/ancestry.rs"]
 mod ancestry;
 mod common;
@@ -486,6 +488,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,

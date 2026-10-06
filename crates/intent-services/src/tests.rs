@@ -151,6 +151,7 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -1980,7 +1981,12 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
     let mut expected = store.list_workspaces(true).await.unwrap();
     for row in &mut expected {
         row.activity = svc.workspace_activity(&row.id);
-        row.pending_delete_at = svc.pending_workspace_deletes.deadline(row.id.as_str());
+        row.pending_delete_at = svc
+            .pending_workspace_deletes
+            .deadline(&crate::delete_grace::PendingDeleteSubject::Workspace(
+                row.id.clone(),
+            ))
+            .unwrap();
         svc.enrich_workspace_aggregates_with_unread(
             row,
             Some(unread.contains(row.id.as_str())),
@@ -17577,6 +17583,7 @@ mod drafts_events {
 
 pub(crate) mod pr {
     mod accept_member;
+    mod automatic_refresh;
     mod discovery_http;
 
     use std::path::PathBuf;
@@ -17934,6 +17941,7 @@ pub(crate) mod pr {
                     .and_then(|c| c.parse::<u64>().ok())
                     .unwrap_or(1);
                 let repo = Repo {
+                    owner_avatar_url: None,
                     owner: "octocat".into(),
                     name: format!("repo{p}"),
                     url: Some(format!("https://github.com/octocat/repo{p}")),
@@ -17953,6 +17961,7 @@ pub(crate) mod pr {
             }
             Ok(Page {
                 items: vec![Repo {
+                    owner_avatar_url: None,
                     owner: "octocat".into(),
                     name: "hello".into(),
                     url: Some("https://github.com/octocat/hello".into()),
@@ -17971,6 +17980,7 @@ pub(crate) mod pr {
                 return Err(ScError::NotFound("no such repo".into()));
             }
             Ok(Repo {
+                owner_avatar_url: None,
                 owner: owner.into(),
                 name: name.into(),
                 url: Some(format!("https://github.com/{owner}/{name}")),
@@ -19537,9 +19547,57 @@ pub(crate) mod pr {
 
     // ---- ws.pr.snapshot engine (`pr_state`, MCP-only) --------------------
 
+    /// Actual local Git facts for implicit GitHub snapshot routing. Kept local
+    /// to this family so unrelated forge/metadata fixtures remain unchanged.
+    async fn snapshot_git_root(svc: &Services, id: &WorkspaceId) -> tempfile::TempDir {
+        let dir = test_tempdir("snapshot-github-root-");
+        {
+            let repo = git2::Repository::init(dir.path()).unwrap();
+            repo.remote("origin", "https://github.com/o/r").unwrap();
+        }
+        let mut ws = svc.store().get_workspace(id).await.unwrap();
+        ws.worktree_path = Some(dir.path().to_string_lossy().into_owned());
+        svc.store().update_workspace(&ws).await.unwrap();
+        // Make a fresh explicit fixture choice after root setup; current Git
+        // is not evidence of a migrated historical selection.
+        let root = intent_core::RepositoryRootId {
+            workspace_id: id.clone(),
+            kind: intent_core::RepositoryRootKind::Primary,
+        };
+        let original = svc
+            .store()
+            .repository_selection_snapshot(&root)
+            .await
+            .unwrap();
+        let result = svc
+            .store()
+            .write_repository_selection(
+                &original,
+                intent_store::RepositorySelectionChange::Automatic,
+            )
+            .await;
+        assert!(matches!(
+            result.result.unwrap(),
+            intent_store::RepositorySelectionWriteResult::Applied(_)
+        ));
+        let stored = svc
+            .store()
+            .repository_selection_snapshot(&root)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.selection(),
+            Some(&intent_store::RepositoryStoredSelection::Saved(
+                intent_core::SavedReviewSelection::Automatic
+            ))
+        );
+        dir
+    }
+
     #[intent_test_macros::daemon_test]
     async fn state_snapshot_shape_and_counts() {
         let (_t, svc, ws) = setup(false, true).await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["repo"], "o/r");
         assert_eq!(v["prNumber"], 42);
@@ -19590,6 +19648,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
@@ -19608,6 +19667,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeable"], false);
         assert_eq!(v["mergeableState"], "dirty");
@@ -19625,6 +19685,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["state"], "merged");
         assert_eq!(v["isMerged"], true);
@@ -19650,6 +19711,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeableState"], "blocked");
         assert_eq!(v["reviews"]["decision"], "none");
@@ -19671,6 +19733,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeableState"], "clean");
         assert_eq!(v["reviews"]["decision"], "review_required");
@@ -19689,6 +19752,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["reviews"]["decision"], "approved");
         assert_eq!(v["reviews"]["approvals"], 1);
@@ -19704,17 +19768,18 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let err = svc.pr_state(ws, 999, None).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found in o/r")));
     }
 
     #[intent_test_macros::daemon_test]
-    async fn state_snapshot_requires_workspace_repo() {
-        // No repository on the workspace: same "No active PR" guard as the
-        // other pr.* methods (the required prNumber does not bypass it).
+    async fn state_snapshot_unknown_root_uses_fixed_discovery_refusal() {
+        // An absent original Git root cannot infer a provider from metadata or
+        // expose new discovery details through the snapshot error.
         let (_t, svc, ws) = setup(false, false).await;
         let err = svc.pr_state(ws, 42, None).await.unwrap_err();
-        assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+        assert!(matches!(err, Error::Forbidden(m) if m == crate::repository_read_source::REFUSAL));
     }
 
     #[intent_test_macros::daemon_test]
@@ -19746,6 +19811,7 @@ pub(crate) mod pr {
         *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
             assert!(gate.pause_for(std::time::Duration::from_secs(3600), true));
         }));
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws.clone(), 42, None).await.expect("snapshot");
         let until = svc
             .sweep_rate_limit_paused_until()
@@ -20334,86 +20400,9 @@ pub(crate) mod pr {
     }
 
     #[tokio::test]
-    async fn sweep_skips_idle_workspace_between_full_ticks() {
-        // Sweep trimming (§7.7): a workspace with no recent activity is not
-        // refreshed on an in-between tick — only on every
-        // `SWEEP_IDLE_TICK_MULTIPLE`-th (full-sweep) tick.
-        let forge = StubForge {
-            discover: true,
-            ..Default::default()
-        };
-        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
-
-        // Age the workspace well past the active window.
-        let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
-        ws.updated_at =
-            intent_core::iso_minutes_ago(2 * crate::pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES);
-        ws.last_activity = None;
-        svc.store().update_workspace(&ws).await.unwrap();
-
-        // In-between tick: the idle workspace is skipped (no link, no event).
-        svc.refresh_all_workspace_prs(1).await;
-        let after = svc.store().get_workspace(&ws_id).await.unwrap();
-        assert_eq!(after.pr_number, None);
-        let evs = svc.store().events_by_workspace(&ws_id, 10).await.unwrap();
-        assert!(evs.is_empty());
-
-        // Full-sweep tick (multiple of SWEEP_IDLE_TICK_MULTIPLE): refreshed.
-        svc.refresh_all_workspace_prs(crate::pr_ops::SWEEP_IDLE_TICK_MULTIPLE)
-            .await;
-        let after = svc.store().get_workspace(&ws_id).await.unwrap();
-        assert_eq!(after.pr_number, Some(42));
-    }
-
-    #[test]
-    fn sweep_due_tiers_by_recency_and_tick() {
-        use crate::pr_ops::{sweep_due, SWEEP_ACTIVE_WINDOW_MINUTES, SWEEP_IDLE_TICK_MULTIPLE};
-        let cutoff_str = intent_core::iso_minutes_ago(SWEEP_ACTIVE_WINDOW_MINUTES);
-        let cutoff = intent_core::parse_iso(&cutoff_str);
-        assert!(cutoff.is_some());
-        let ws_id = WorkspaceId::new();
-
-        // Recently active (updated_at = now): due on every tick.
-        let active = workspace(&ws_id);
-        assert!(sweep_due(&active, cutoff, 1));
-
-        // Idle (updated_at past the window, no last_activity): due only on
-        // full-sweep ticks (multiples of SWEEP_IDLE_TICK_MULTIPLE, incl. 0).
-        let mut idle = workspace(&ws_id);
-        idle.updated_at = intent_core::iso_minutes_ago(2 * SWEEP_ACTIVE_WINDOW_MINUTES);
-        assert!(!sweep_due(&idle, cutoff, 1));
-        assert!(!sweep_due(&idle, cutoff, SWEEP_IDLE_TICK_MULTIPLE - 1));
-        assert!(sweep_due(&idle, cutoff, 0));
-        assert!(sweep_due(&idle, cutoff, SWEEP_IDLE_TICK_MULTIPLE));
-        assert!(sweep_due(&idle, cutoff, 3 * SWEEP_IDLE_TICK_MULTIPLE));
-
-        // Exact boundary: `ts == cutoff` counts as active (inclusive `>=`).
-        let mut boundary = workspace(&ws_id);
-        boundary.updated_at = cutoff_str.clone();
-        assert!(sweep_due(&boundary, cutoff, 1));
-
-        // A recent last_activity revives an otherwise-idle workspace.
-        let mut revived = idle.clone();
-        revived.last_activity = Some(now_iso());
-        assert!(sweep_due(&revived, cutoff, 1));
-
-        // Malformed timestamps fail open (count as active), on either field.
-        let mut malformed = idle.clone();
-        malformed.updated_at = "not-a-timestamp".to_string();
-        assert!(sweep_due(&malformed, cutoff, 1));
-        let mut malformed_la = idle.clone();
-        malformed_la.last_activity = Some(String::new());
-        assert!(sweep_due(&malformed_la, cutoff, 1));
-
-        // An unparseable cutoff fails open too.
-        assert!(sweep_due(&idle, None, 1));
-    }
-
-    #[tokio::test]
     async fn sweep_refreshes_recently_active_workspace_every_tick() {
-        // Sweep trimming (§7.7): a workspace active within the window is
-        // refreshed even on an in-between tick. `refresh_setup` seeds
-        // `updated_at = now`, i.e. inside `SWEEP_ACTIVE_WINDOW_MINUTES`.
+        // A workspace without a previous attempt is refreshed on its first
+        // sweep, irrespective of the loop tick number.
         let forge = StubForge {
             discover: true,
             ..Default::default()
@@ -21508,7 +21497,8 @@ pub(crate) mod pr {
         std::fs::remove_dir_all(&gone_dir).unwrap();
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1, "{roots:?}");
@@ -21535,7 +21525,8 @@ pub(crate) mod pr {
 
         // Re-sweeping is idempotent: the tracked submodule is not re-upserted
         // (no `gitRoot:registered`/`gitRoot:updated` churn).
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
         let registered = svc
             .store()
             .events_by_type(&ws.id, "gitRoot:registered", 10)
@@ -21590,7 +21581,8 @@ pub(crate) mod pr {
             .unwrap();
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let a = svc
             .store()
@@ -21627,7 +21619,8 @@ pub(crate) mod pr {
             repo.commit(Some("HEAD"), &sig, &sig, "move", &tree, &[&parent])
                 .unwrap();
         }
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
         let a = svc
             .store()
             .get_workspace_git_root(&root_a.id)
@@ -21659,7 +21652,7 @@ pub(crate) mod pr {
         let root = sweep_root(&ws.id, &with_head.dir, None);
         svc.store().upsert_workspace_git_root(&root).await.unwrap();
 
-        svc.sweep_workspace_git_roots(&ws, None).await;
+        svc.sweep_workspace_git_roots(&ws, None, 60, true).await;
 
         let stamped = svc.store().get_workspace_git_root(&root.id).await.unwrap();
         assert_eq!(
@@ -21692,7 +21685,8 @@ pub(crate) mod pr {
 
         let (_t, svc, ws) = sweep_setup(&parent.dir).await;
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1, "{roots:?}");
@@ -21738,7 +21732,8 @@ pub(crate) mod pr {
         );
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         // Restore permissions so the tempdir can be cleaned up.
         std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -21769,7 +21764,8 @@ pub(crate) mod pr {
             discover: true,
             ..Default::default()
         });
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1);
@@ -21793,7 +21789,8 @@ pub(crate) mod pr {
         assert_eq!(updated[0].data["gitRoot"]["prNumber"], 42);
 
         // Identical forge state on the next sweep: no new event.
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
         let updated = svc
             .store()
             .events_by_type(&ws.id, "gitRoot:updated", 10)
@@ -22151,7 +22148,8 @@ pub(crate) mod pr {
             merged_linked: true,
             ..Default::default()
         });
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         let list = roots[0].pull_requests.as_ref().expect("pull_requests");
@@ -23308,6 +23306,7 @@ pub(crate) mod pr {
     async fn pr_state_folds_a_queue_signal_served_from_the_cache() {
         let forge = queue_signal_forge(true);
         let (_t, _root, svc, ws_id) = cached_hover_setup(forge.clone(), None).await;
+        let _git = snapshot_git_root(&svc, &ws_id).await;
         assert_eq!(
             seed_display_status(&svc, &ws_id).await,
             Some(intent_core::WorkspaceDisplayStatus::PrReady)
@@ -23661,7 +23660,7 @@ pub(crate) mod pr {
         let traffic = Traffic::default();
         with_traffic(
             traffic.clone(),
-            svc.sweep_workspace_git_roots(&ws, Some(&sc)),
+            svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true),
         )
         .await;
         assert!(svc.sweeps_rate_limited());
@@ -23677,7 +23676,7 @@ pub(crate) mod pr {
             .all(|(caller, _)| *caller == Caller::GitRootRefresh));
         with_traffic(
             traffic.clone(),
-            svc.sweep_workspace_git_roots(&ws, Some(&sc)),
+            svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true),
         )
         .await;
         assert_eq!(
@@ -23749,7 +23748,8 @@ pub(crate) mod pr {
             ..Default::default()
         });
         let sc_dyn: Arc<dyn SourceControl> = sc.clone();
-        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn), 60, true)
+            .await;
 
         assert_eq!(
             sc.seen_get_pr.lock().unwrap().len(),
@@ -23760,7 +23760,8 @@ pub(crate) mod pr {
 
         // A whole follow-up sweep while paused performs no forge calls and
         // no further reset probes — the condition was reported once.
-        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn), 60, true)
+            .await;
         assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
     }
@@ -23844,6 +23845,18 @@ pub(crate) mod pr {
             ..Default::default()
         });
         let svc = svc.with_source_control(recovered.clone());
+        svc.refresh_all_workspace_prs(1).await;
+        assert!(
+            !svc.sweeps_rate_limited(),
+            "the recovered quota lifts the pause"
+        );
+        assert!(
+            recovered.seen_get_pr.lock().unwrap().is_empty(),
+            "recovery does not bypass automatic retry admission"
+        );
+        // Tick 1 is one minute later in production; quota recovery does not
+        // bypass the new per-workspace automatic attempt cadence.
+        svc.age_automatic_pr_refresh(&ws_id, 60);
         svc.refresh_all_workspace_prs(1).await;
         assert_eq!(
             *recovered.seen_get_pr.lock().unwrap(),
@@ -23979,7 +23992,8 @@ pub(crate) mod pr {
             ..Default::default()
         });
         let sc_dyn: Arc<dyn SourceControl> = sc.clone();
-        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn), 60, true)
+            .await;
 
         assert_eq!(
             sc.seen_get_pr.lock().unwrap().len(),
@@ -31176,6 +31190,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -31326,6 +31341,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -31467,6 +31483,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/worktree".into()),
             repository_path: Some("/test/repo".into()),
@@ -31603,6 +31620,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -31738,6 +31756,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -31878,6 +31897,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -32741,6 +32761,7 @@ mod known_repo {
             created_at: now.clone(),
             updated_at: now.clone(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: Some(repo_path.0.to_string_lossy().to_string()),
@@ -32974,6 +32995,51 @@ mod known_repo {
             "current B candidate emits workspace:updated"
         );
     }
+}
+
+/// Keep the caller regression observable even on hosts that skip `CoW` tests.
+/// Native acceptance additionally requires a real clone and independent contents
+/// on the same volume pair used by the workspace fixture.
+fn cow_fixture_supported(source: &std::path::Path, root: &std::path::Path) -> bool {
+    let support = intent_git::cow_probe(source, root).expect("probe fixture CoW support");
+    eprintln!("CoW fixture probe: {support:?}; source={source:?}; root={root:?}");
+    if support == intent_git::CowSupport::Supported {
+        let src = crate::test_support::test_tempdir_in(
+            source.to_str().expect("fixture source path"),
+            "cow-proof-source-",
+        );
+        let dst = crate::test_support::test_tempdir_in(
+            root.to_str().expect("fixture root path"),
+            "cow-proof-destination-",
+        );
+        let original = src.path().join("payload");
+        let cloned = dst.path().join("clone");
+        std::fs::write(&original, b"original").unwrap();
+        intent_git::cow_clone(src.path(), &cloned).expect("real fixture CoW clone");
+        let copy = cloned.join("payload");
+        assert_eq!(std::fs::read(&copy).unwrap(), b"original");
+        std::fs::write(&copy, b"clone changed").unwrap();
+        assert_eq!(std::fs::read(&original).unwrap(), b"original");
+        std::fs::write(&original, b"source changed").unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), b"clone changed");
+        dst.close().expect("remove CoW proof destination");
+        src.close().expect("remove CoW proof source");
+        eprintln!("CoW fixture clone and independent contents verified");
+        eprintln!("CoW fixture proof scratch cleaned");
+    } else {
+        assert!(
+            std::env::var_os("INTENTD_TEST_REQUIRE_COW").is_none(),
+            "native CoW acceptance requires a supported fixture volume"
+        );
+        // Supplemental regression on unsupported hosts only. Supported-volume
+        // baselines must reach the original service gate and its real refusal.
+        assert_eq!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Daemon),
+            "workspace CoW fixture must bind its daemon caller"
+        );
+    }
+    support == intent_git::CowSupport::Supported
 }
 
 mod worktree_provisioning {
@@ -33638,7 +33704,7 @@ mod worktree_provisioning {
     /// workspace branch from `baseRef`, with `worktreePath`/`baseCommitSha`
     /// populated, `checkoutMode: "cow"` persisted, and untracked source files
     /// carried over.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_provisions_cow_checkout_when_isolation_enabled() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -33646,10 +33712,7 @@ mod worktree_provisioning {
         // Untracked build artifact in the source repo — CoW carries it over.
         std::fs::write(repo_dir.0.join("untracked.log"), "artifact\n").unwrap();
         let root = unique_dir("intentd-cowprov-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -33697,6 +33760,9 @@ mod worktree_provisioning {
         assert_eq!(
             persisted.checkout_mode,
             Some(intent_core::CheckoutMode::Cow)
+        );
+        eprintln!(
+            "CoW fixture assertions passed: create_provisions_cow_checkout_when_isolation_enabled"
         );
     }
 
@@ -33880,16 +33946,13 @@ mod worktree_provisioning {
     /// mirrors the create decision matrix — the duplicate gets a standalone
     /// `CoW` clone with `checkoutMode: "cow"` persisted, and the source repo
     /// gains no branch for the duplicate (the branch lives in the clone).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_provisions_cow_checkout_when_isolation_enabled() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, head_branch) = seed_repo("intentd-cowdup-repo");
         let root = unique_dir("intentd-cowdup-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -33937,6 +34000,7 @@ mod worktree_provisioning {
             persisted.checkout_mode,
             Some(intent_core::CheckoutMode::Cow)
         );
+        eprintln!("CoW fixture assertions passed: duplicate_provisions_cow_checkout_when_isolation_enabled");
     }
 
     /// cowIsolation on + CoW-incapable filesystem: `workspace.duplicate`
@@ -33992,16 +34056,13 @@ mod worktree_provisioning {
     /// unresolvable `baseRef`), the create fails without inserting a row and
     /// without leaving the empty `<root>/<wsId>` dir the probe created behind
     /// — the workspaces root ends up clean.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowfail-repo");
         let root = unique_dir("intentd-cowfail-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -34030,6 +34091,7 @@ mod worktree_provisioning {
                 .is_none(),
             "workspaces root must have no leftover empty <root>/<wsId> dir"
         );
+        eprintln!("CoW fixture assertions passed: create_cleans_up_empty_ws_dir_when_cow_provisioning_fails");
     }
 
     /// monorepo#774, `workspace.duplicate` path: a `CoW` provisioning failure
@@ -34044,16 +34106,13 @@ mod worktree_provisioning {
     /// flow, not a mutation-killing regression test. The #774 regression
     /// coverage lives in the create-path test above and the
     /// `remove_workspace_dir_if_empty` unit test below.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowdupfail-repo");
         let root = unique_dir("intentd-cowdupfail-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -34085,6 +34144,7 @@ mod worktree_provisioning {
             vec![".workspace".to_string()],
             "duplicate ws dir holds only the metadata dir"
         );
+        eprintln!("CoW fixture assertions passed: duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails");
     }
 
     /// The #774 cleanup helper only ever removes *empty* dirs: a non-empty
@@ -39431,13 +39491,11 @@ mod clone_orchestration {
     /// `workspace.cowIsolation` on and a CoW-capable filesystem, the local
     /// create streams the `cow-copy 30` milestone (not `worktree`) with the
     /// echoed `progressId` and one terminal done.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn progress_id_cow_create_streams_cow_copy_milestone() {
         let repo = seed_repo("intentd-prog-cow-src");
         let root = unique_dir("intentd-prog-cow-root");
-        if intent_git::cow_probe(&repo.0, &root.0).unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -39488,6 +39546,9 @@ mod clone_orchestration {
         assert!(
             !frames.iter().any(|f| f.data["phase"] == "worktree"),
             "no worktree milestone on the CoW path: {frames:?}"
+        );
+        eprintln!(
+            "CoW fixture assertions passed: progress_id_cow_create_streams_cow_copy_milestone"
         );
     }
 
@@ -47422,7 +47483,7 @@ mod bulk_delete_pool_pressure {
         let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
         drop(guard);
 
-        assert!(trash.is_none(), "nothing to detach");
+        assert!(trash.0.is_none(), "nothing to detach");
         let loud = capture.at_or_above(tracing::Level::WARN);
         assert!(
             loud.is_empty(),
@@ -47474,7 +47535,7 @@ mod bulk_delete_pool_pressure {
         let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
         drop(guard);
 
-        assert!(trash.is_none(), "nothing detached");
+        assert!(trash.0.is_none(), "nothing detached");
         let loud = capture.at_or_above(tracing::Level::WARN);
         assert!(
             loud.iter()
@@ -47695,7 +47756,11 @@ mod agent_delete_grace_window {
             while h
                 .services
                 .pending_agent_deletes
-                .deadline(h.agent.as_str())
+                .deadline(&crate::delete_grace::PendingDeleteSubject::Agent {
+                    workspace_id: h.ws.clone(),
+                    agent_id: h.agent.clone(),
+                })
+                .unwrap()
                 .is_some()
             {
                 tokio::task::yield_now().await;
@@ -48178,6 +48243,7 @@ mod harness_versioning {
         let (_tmp, svc, ws) = setup().await;
         let created = create_agent(&svc, &ws, None).await;
         let agent = &created["agent"];
+        assert_eq!(agent["harnessVersion"], "3.0");
         assert_eq!(
             agent["harnessVersion"],
             intent_core::CURRENT_HARNESS_VERSION,
@@ -48202,6 +48268,50 @@ mod harness_versioning {
         let persisted = session.harness_features.expect("persisted snapshot");
         assert_eq!(persisted["taskGraph"], serde_json::json!(true));
         assert_eq!(persisted["peerAgents"], serde_json::json!(true));
+        let full = svc.agent_get_session_op(id).await.expect("getSession");
+        assert_eq!(full.harness_version, "3.0");
+        assert_eq!(full.harness_features.as_ref(), Some(&persisted));
+        assert_eq!(agent["harnessFeatures"], persisted);
+    }
+
+    #[tokio::test]
+    async fn child_of_saved_2_9_keeps_parent_stamp_and_snapshot() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let parent_id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let mut saved_features = created["agent"]["harnessFeatures"].clone();
+        saved_features["hostExec"] = serde_json::json!(false);
+        saved_features["peerAgents"] = serde_json::json!(false);
+        sqlx::query(
+            "UPDATE agent_session SET harness_version = '2.9', harness_features = ? WHERE id = ?",
+        )
+        .bind(saved_features.to_string())
+        .bind(&parent_id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+        let child = create_agent(&svc, &ws, Some(parent_id.clone())).await;
+        assert_eq!(child["agent"]["harnessVersion"], "3.0");
+        assert_eq!(child["agent"]["harnessFeatures"]["hostExec"], true);
+        assert_eq!(child["agent"]["harnessFeatures"]["peerAgents"], true);
+        let child_id = AgentId::from(child["agent"]["id"].as_str().unwrap());
+        let child_row = svc.store().get_agent_session(&child_id).await.unwrap();
+        assert_eq!(child_row.harness_version, "3.0");
+        assert_eq!(child_row.parent_agent_id.as_ref(), Some(&parent_id));
+        assert_eq!(
+            child_row.harness_features.as_ref(),
+            Some(&child["agent"]["harnessFeatures"])
+        );
+        let child_full = svc.agent_get_session_op(child_id).await.unwrap();
+        assert_eq!(child_full.harness_version, "3.0");
+        assert_eq!(child_full.harness_features, child_row.harness_features);
+        let parent = svc.store().get_agent_session(&parent_id).await.unwrap();
+        assert_eq!(parent.harness_version, "2.9");
+        assert_eq!(parent.harness_features.as_ref(), Some(&saved_features));
+        assert!(!svc.session_agent_features(&parent).peer_agents);
+        let parent_full = svc.agent_get_session_op(parent_id).await.unwrap();
+        assert_eq!(parent_full.harness_version, "2.9");
+        assert_eq!(parent_full.harness_features.as_ref(), Some(&saved_features));
     }
 
     /// Delegation mints LATEST, never inherits: a child created by a parent

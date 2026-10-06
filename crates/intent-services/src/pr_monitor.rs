@@ -91,6 +91,14 @@ use crate::rate_limit::RATE_LIMIT_MAX_PAUSE;
 use crate::workspace_status::MonitorPrSignals;
 use crate::{publish_event, system_actor, Services};
 
+// Compiled storage/read primitives; the admitted caller directory wires these later.
+#[expect(
+    dead_code,
+    reason = "qualified reads await admitted caller-directory wiring"
+)]
+pub(crate) mod qualified_cache;
+use qualified_cache::{CacheKey, CacheSlot};
+
 use intent_core::config::{
     MAX_PR_CACHE_MAX_AGE_SECONDS, MAX_PR_MONITORS_PER_AGENT, MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
     MAX_PR_MONITOR_QUOTA_SHARE_PERCENT, MIN_PR_CACHE_MAX_AGE_SECONDS,
@@ -116,7 +124,7 @@ pub(crate) const PR_MONITOR_REQUESTS_PER_POLL: u64 = 3;
 /// per hour — `max(poll_secs, ceil(distinct_prs × PR_MONITOR_REQUESTS_PER_POLL
 /// × 3600 / hourly_budget))`. Both inputs are clamped to their floors first
 /// (the budget's ceiling is applied by the settings getter). At the defaults
-/// (30s, 1500/h) up to 4 PRs keep the configured 30s; 10 PRs → 72s, 20 PRs
+/// (60s, 1500/h) up to 8 PRs keep the configured 60s; 10 PRs → 72s, 20 PRs
 /// → 144s. The budget is a cost model that sets the cadence; it is not a
 /// limiter that counts or blocks requests.
 pub(crate) fn effective_pr_monitor_interval_secs(
@@ -296,6 +304,7 @@ fn pr_key_for(repo_ref: &RepoRef, pr_number: i64) -> PrKey {
 pub(crate) struct DueCandidate {
     pub(crate) anchor: Option<time::OffsetDateTime>,
     pub(crate) catch_up: bool,
+    pub(crate) interval: time::Duration,
     pub(crate) monitor: PrMonitor,
 }
 
@@ -320,7 +329,9 @@ fn catch_up_unattempted(
 
 /// Pick the monitors one due-sweep tick polls. Monitors are grouped per
 /// distinct PR: a PR's anchor is the OLDEST anchor among its sibling
-/// monitors and it is due when that anchor is older than `interval` (or
+/// monitors; the fastest interested workspace supplies the idle interval.
+/// A PR is due when its anchor exceeds both that interval and the global
+/// budget/configuration floor `interval` (or
 /// missing, or any sibling is catch-up-unattempted). Due PRs are ordered
 /// oldest anchor first (PR key breaks ties), the first `cap` are kept, and
 /// EVERY active monitor on a kept PR is returned in that order — siblings
@@ -336,6 +347,7 @@ pub(crate) fn select_due_pr_monitors(
     struct Group {
         anchor: Option<time::OffsetDateTime>,
         catch_up: bool,
+        interval: time::Duration,
         monitors: Vec<PrMonitor>,
     }
     let mut index: HashMap<PrKey, usize> = HashMap::new();
@@ -348,6 +360,7 @@ pub(crate) fn select_due_pr_monitors(
                 group.anchor = c.anchor;
             }
             group.catch_up |= c.catch_up;
+            group.interval = group.interval.min(c.interval);
             group.monitors.push(c.monitor);
         } else {
             index.insert(key.clone(), groups.len());
@@ -356,6 +369,7 @@ pub(crate) fn select_due_pr_monitors(
                 Group {
                     anchor: c.anchor,
                     catch_up: c.catch_up,
+                    interval: c.interval,
                     monitors: vec![c.monitor],
                 },
             ));
@@ -363,7 +377,11 @@ pub(crate) fn select_due_pr_monitors(
     }
     let mut due: Vec<(Option<time::OffsetDateTime>, PrKey, Vec<PrMonitor>)> = groups
         .into_iter()
-        .filter(|(_, g)| g.catch_up || g.anchor.is_none_or(|at| now - at >= interval))
+        .filter(|(_, g)| {
+            g.catch_up
+                || g.anchor
+                    .is_none_or(|at| now - at >= interval.max(g.interval))
+        })
         .map(|(key, g)| (g.anchor, key, g.monitors))
         .collect();
     due.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
@@ -770,20 +788,23 @@ impl PrCacheEntry {
 /// completed mid-sweep — and stored a NEWER snapshot — can never be
 /// shadowed by the sweep's older result on later reads.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PrCacheSlot {
+pub(crate) struct LegacyPrCacheSlot {
     generation: u64,
     entry: Option<PrCacheEntry>,
 }
 
-/// The shared PR cache: every PR read's memory of its last full read, keyed
-/// like the in-sweep dedupe ([`PrKey`]). Written by the sweep's polls and by
+/// The shared PR cache: legacy GitHub reads use the in-sweep [`PrKey`];
+/// qualified reads include admitted authority, connection and full target.
+/// The representations share retention bounds but never share an entry.
+/// Written by the sweep's polls and by
 /// every on-demand read alike, so a monitor poll refreshes what the next
 /// on-demand read serves and an on-demand read on an unmonitored PR seeds
 /// the next one. Every write ends with the retention pass
 /// ([`retain_pr_cache`]), which the sweep also runs at the top of each tick
 /// to drop the entries of monitors that have since gone. In-memory only — a
 /// daemon restart starts cold. Shared across [`Services`] clones.
-pub(crate) type PrCache = Arc<Mutex<HashMap<PrKey, PrCacheSlot>>>;
+pub(crate) type PrCacheSlot = CacheSlot<LegacyPrCacheSlot, intent_sourcecontrol::ReviewObservation>;
+pub(crate) type PrCache = Arc<Mutex<HashMap<CacheKey<PrKey>, PrCacheSlot>>>;
 
 /// Background discovery may borrow only a recent record observed in the same
 /// authorization context; it never replaces the full snapshot with list fields.
@@ -819,7 +840,11 @@ fn store_on_demand(
     entry.authorization = authorization;
     entry.record_started_at = record_started_at;
     let mut cache = cache.lock().unwrap();
-    let slot = cache.entry(key).or_default();
+    let slot = cache
+        .entry(CacheKey::Legacy(key))
+        .or_default()
+        .legacy_mut()
+        .expect("legacy key");
     slot.generation += 1;
     slot.entry = Some(entry.clone());
     retain_pr_cache(&mut cache, monitored, now);
@@ -836,34 +861,21 @@ fn store_on_demand(
 /// only in the sweep — is what makes the cap a hard bound: on-demand reads
 /// keep landing while the sweep is skipped by the forge rate-limit pause.
 fn retain_pr_cache(
-    cache: &mut HashMap<PrKey, PrCacheSlot>,
+    cache: &mut qualified_cache::CacheMap<
+        PrKey,
+        LegacyPrCacheSlot,
+        intent_sourcecontrol::ReviewObservation,
+    >,
     monitored: &HashSet<PrKey>,
     now: Instant,
 ) {
-    cache.retain(|key, slot| {
-        monitored.contains(key)
-            || slot.entry.as_ref().is_some_and(|entry| {
-                now.saturating_duration_since(entry.fetched_at) < PR_CACHE_MAX_IDLE
-            })
-    });
-    let mut unmonitored: Vec<(Instant, PrKey)> = cache
-        .iter()
-        .filter(|(key, _)| !monitored.contains(*key))
-        .map(|(key, slot)| {
-            (
-                slot.entry.as_ref().map_or(now, |entry| entry.fetched_at),
-                key.clone(),
-            )
-        })
-        .collect();
-    let excess = unmonitored.len().saturating_sub(PR_CACHE_MAX_ENTRIES);
-    if excess == 0 {
-        return;
-    }
-    unmonitored.sort();
-    for (_, key) in unmonitored.into_iter().take(excess) {
-        cache.remove(&key);
-    }
+    qualified_cache::retain(
+        cache,
+        |slot| slot.entry.as_ref().map(|e| e.fetched_at),
+        |key| monitored.contains(key),
+        (PR_CACHE_MAX_IDLE, PR_CACHE_MAX_ENTRIES),
+        now,
+    );
 }
 
 /// The sweep's retention pass: [`retain_pr_cache`] against the active
@@ -876,7 +888,7 @@ fn prune_pr_cache(cache: &PrCache, monitored: &HashSet<PrKey>) {
 #[cfg(test)]
 fn backdate_pr_cache(cache: &PrCache, by: Duration) {
     for slot in cache.lock().unwrap().values_mut() {
-        if let Some(entry) = slot.entry.as_mut() {
+        if let Some(entry) = slot.legacy_mut().and_then(|s| s.entry.as_mut()) {
             entry.fetched_at = entry.fetched_at.checked_sub(by).unwrap_or(entry.fetched_at);
             entry.refreshed_at = entry
                 .refreshed_at
@@ -892,7 +904,7 @@ fn pr_cache_len(cache: &PrCache) -> usize {
         .lock()
         .unwrap()
         .values()
-        .filter(|slot| slot.entry.is_some())
+        .filter(|slot| slot.legacy().is_some_and(|s| s.entry.is_some()))
         .count()
 }
 
@@ -1103,7 +1115,8 @@ fn cached_pr_within(cache: &PrCache, key: &PrKey, max_age: Duration) -> Option<P
     cache
         .lock()
         .unwrap()
-        .get(key)
+        .get(&CacheKey::Legacy(key.clone()))
+        .and_then(CacheSlot::legacy)
         .and_then(|slot| slot.entry.as_ref())
         .filter(|entry| now.saturating_duration_since(entry.refreshed_at) < max_age)
         .cloned()
@@ -1135,7 +1148,8 @@ async fn poll_pr(
     let generation = cache
         .lock()
         .unwrap()
-        .get(&key)
+        .get(&CacheKey::Legacy(key.clone()))
+        .and_then(CacheSlot::legacy)
         .map_or(0, |slot| slot.generation);
     let observation = observe_pr(sc, repo_ref, number).await?;
     let pr = match &observation {
@@ -1157,7 +1171,11 @@ async fn poll_pr(
     let now = Instant::now();
     let reused = {
         let mut cache = cache.lock().unwrap();
-        match cache.get_mut(&key).and_then(|slot| slot.entry.as_mut()) {
+        match cache
+            .get_mut(&CacheKey::Legacy(key.clone()))
+            .and_then(CacheSlot::legacy_mut)
+            .and_then(|slot| slot.entry.as_mut())
+        {
             Some(entry)
                 if entry.authorization == authorization
                     && entry.record_started_at <= record_started_at
@@ -1201,7 +1219,11 @@ async fn poll_pr(
     entry.authorization = authorization;
     entry.record_started_at = record_started_at;
     let mut cache = cache.lock().unwrap();
-    let slot = cache.entry(key).or_default();
+    let slot = cache
+        .entry(CacheKey::Legacy(key))
+        .or_default()
+        .legacy_mut()
+        .expect("legacy key");
     if slot.generation == generation {
         slot.entry = Some(entry.clone());
     } else {
@@ -1283,12 +1305,25 @@ pub(crate) fn diff_snapshots(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -
     crate::harness::latest().pr_diff_lines(old, new)
 }
 
-/// Whether a row's persisted pending set is what the coalescing poll would
-/// recompute anyway — `diff(baseline, last_snapshot)`. A set that does NOT
-/// survive is a legacy accumulated log (pre-coalescing rows whose upgrade
-/// migration backfilled `baseline_snapshot = last_snapshot`, making their
-/// recomputed diff empty): boot rehydration delivers those as-is instead of
-/// letting the first poll silently discard them.
+/// Retired ancestry deltas can remain in rows persisted by older daemons.
+/// Preserve other legacy lines, which may not be reconstructable from snapshots.
+fn actionable_pending_changes(m: &PrMonitor) -> Vec<String> {
+    m.pending_changes
+        .iter()
+        .filter(|line| {
+            !line.starts_with("branch ancestry:")
+                && !line.starts_with("branch ancestry available:")
+                && line.as_str() != "branch ancestry unavailable"
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether actionable persisted changes survive a coalescing poll's
+/// `diff(baseline, last_snapshot)`. Boot rehydration handles other sets before
+/// polling: obsolete ancestry-only sets are cleared, while legacy accumulated
+/// actionable logs are delivered rather than silently discarded. Pre-coalescing
+/// rows had `baseline_snapshot = last_snapshot` backfilled by migration.
 fn pending_survives_recompute(m: &PrMonitor) -> bool {
     let parse = |s: &Option<String>| -> Option<PrMonitorSnapshot> {
         s.as_deref().and_then(|s| serde_json::from_str(s).ok())
@@ -1299,7 +1334,11 @@ fn pending_survives_recompute(m: &PrMonitor) -> bool {
         // set until it can, so nothing is at risk.
         return true;
     };
-    diff_snapshots(&baseline, &last) == m.pending_changes
+    let pending = actionable_pending_changes(m);
+    // An ancestry-only set should be cleared immediately without a wake.
+    // Mixed coalesced rows still await a fresh poll, folding downtime changes
+    // (including reverts) into one wake rather than replaying a stale alert.
+    !pending.is_empty() && diff_snapshots(&baseline, &last) == pending
 }
 
 /// The `<owner>/<name>#<number>` label every wake and event payload uses.
@@ -3221,7 +3260,8 @@ impl Services {
         };
         let monitors = if skip_fresh {
             let quota = self.pr_monitor_quota_window(&sc, probed).await;
-            self.select_due_pr_monitors(monitors, quota)
+            self.select_due_pr_monitors(monitors, quota, time::OffsetDateTime::now_utc())
+                .await
         } else {
             monitors
         };
@@ -3324,10 +3364,11 @@ impl Services {
     /// spacing has not elapsed since the newest poll
     /// ([`pr_monitor_fetches_per_tick`]), so a stale or catch-up backlog
     /// drains within the planned budget instead of one PR per tick.
-    fn select_due_pr_monitors(
+    async fn select_due_pr_monitors(
         &self,
         monitors: Vec<PrMonitor>,
         quota: Option<QuotaWindow>,
+        now: time::OffsetDateTime,
     ) -> Vec<PrMonitor> {
         let distinct_prs = monitors.iter().map(pr_key).collect::<HashSet<_>>().len();
         let poll_secs = self.pr_monitor_poll_interval().as_secs();
@@ -3353,13 +3394,37 @@ impl Services {
         };
         self.note_pr_monitor_cadence(distinct_prs, effective_secs, poll_secs, budget_secs, quota);
         let interval = time::Duration::seconds(effective_secs.cast_signed());
-        let now = time::OffsetDateTime::now_utc();
+        let workspace_ids: Vec<_> = monitors
+            .iter()
+            .map(|m| m.workspace_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let intervals = match self
+            .workspace_automatic_check_intervals(&workspace_ids, now)
+            .await
+        {
+            Ok(intervals) => intervals,
+            Err(error) => {
+                tracing::warn!(%error, "pr monitor activity read failed; skipping tick");
+                return Vec::new();
+            }
+        };
         let catch_up = self.pr_monitor_catch_up.lock().unwrap().clone();
         let candidates: Vec<DueCandidate> = monitors
             .into_iter()
             .map(|monitor| DueCandidate {
                 anchor: monitor.last_polled_at.as_deref().and_then(parse_iso),
                 catch_up: catch_up_unattempted(&monitor, &catch_up),
+                interval: time::Duration::seconds(
+                    i64::try_from(
+                        intervals
+                            .get(&monitor.workspace_id)
+                            .copied()
+                            .unwrap_or(poll_secs),
+                    )
+                    .unwrap_or(i64::MAX),
+                ),
                 monitor,
             })
             .collect();
@@ -3690,8 +3755,8 @@ impl Services {
     /// debounce state (pending cleared, anchors dropped). Returns `false`
     /// without waking when the guarded clear loses — the row moved (a
     /// concurrent poll recomputed the set, or a flush/cancel/re-register
-    /// landed) between the caller's read and the clear — so no change line is
-    /// ever cleared without having been rendered into a delivered wake; the
+    /// landed) between the caller's read and the clear — so no actionable line
+    /// is cleared without being rendered into a delivered wake; the
     /// surviving pending state re-emits on a later tick. An EMPTY coalesced
     /// set (a PR that fully reverted to its baseline) also returns `false`:
     /// there is nothing to report, so no wake is sent.
@@ -3727,7 +3792,12 @@ impl Services {
             // dropping them; the next poll writes a snapshot and emits.
             return Ok(false);
         };
-        let message = render_change_wake(monitor, &monitor.pending_changes, &snapshot);
+        // Older daemons persisted informational ancestry deltas. Rehydration
+        // and explicit flush can deliver those without a fresh poll: remove
+        // only those retired lines, preserving legacy actionable changes that
+        // cannot necessarily be reconstructed from the stored snapshots.
+        let changes = actionable_pending_changes(monitor);
+        let message = render_change_wake(monitor, &changes, &snapshot);
         let now = now_iso();
         // The delivered snapshot becomes the new emit baseline: the next
         // wake reports only what moves from here.
@@ -3757,6 +3827,17 @@ impl Services {
         emitted.pending_since = None;
         emitted.last_change_at = None;
         emitted.updated_at = now;
+        if changes.is_empty() {
+            // Publish the cleared pending state, but do not wake the owner or
+            // claim an emission when only obsolete informational lines remain.
+            self.emit_pr_monitor_event(
+                PR_MONITOR_CHANGED,
+                &emitted,
+                Some(json!({ "changes": [] })),
+            )
+            .await;
+            return Ok(false);
+        }
         self.wake_pr_monitor_owner(&emitted, &message, "changed")
             .await;
         self.emit_pr_monitor_event(PR_MONITOR_EMITTED, &emitted, None)
@@ -3971,7 +4052,8 @@ impl Services {
                 self.maybe_emit_waiting_changed(&monitor.workspace_id).await;
                 continue;
             }
-            // Upgrade path: deliver a pending set the recompute would lose.
+            // Upgrade path: deliver legacy actionable lines the recompute would
+            // lose, or silently clear retired ancestry-only pending sets.
             // Coalesced-era rows are a fixed point of the recompute and stay
             // on the normal catch-up poll, which folds downtime changes into
             // one consolidated wake.
@@ -4292,6 +4374,8 @@ impl Services {
         agent_id: &AgentId,
         data: &mut Value,
     ) -> Vec<Value> {
+        self.annotate_waiting_on_script_monitors(agent_id, data)
+            .await;
         if let Some(existing) = data.get("waitingOnPrMonitors").and_then(Value::as_array) {
             return existing.clone();
         }
@@ -5088,6 +5172,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -8529,7 +8614,10 @@ mod tests {
             .expect("poll");
         assert_ne!(polled.snapshot.conversation_count, Some(99));
         let guard = cache.lock().unwrap();
-        let slot = guard.get(&key).expect("slot");
+        let slot = guard
+            .get(&CacheKey::Legacy(key))
+            .and_then(CacheSlot::legacy)
+            .expect("slot");
         assert_eq!(slot.generation, 1);
         assert_eq!(
             slot.entry
@@ -9002,7 +9090,7 @@ mod tests {
             .pr_cache
             .lock()
             .unwrap()
-            .contains_key(&pr_key_for(&repo, 42)));
+            .contains_key(&CacheKey::Legacy(pr_key_for(&repo, 42))));
     }
 
     /// Retention: [`PR_CACHE_MAX_ENTRIES`] is a hard bound on the
@@ -9019,7 +9107,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(key, slot)| *key != monitored && slot.entry.is_some())
+                .filter(|(key, slot)| {
+                    *key != &CacheKey::Legacy(monitored.clone())
+                        && slot.legacy().is_some_and(|s| s.entry.is_some())
+                })
                 .count()
         }
         let (_db, _root, svc, forge, ws, owner) = setup().await;
@@ -9061,16 +9152,19 @@ mod tests {
             let cache = svc.pr_cache.lock().unwrap();
             assert_eq!(cache.len(), PR_CACHE_MAX_ENTRIES + 1, "cap + monitored");
             assert!(
-                !cache.contains_key(&pr_key_for(&repo, oldest.cast_signed())),
+                !cache.contains_key(&CacheKey::Legacy(pr_key_for(&repo, oldest.cast_signed()))),
                 "the oldest full fetch went first"
             );
             for number in 1..=overflow as u64 {
                 assert!(
-                    !cache.contains_key(&pr_key_for(&repo, number.cast_signed())),
+                    !cache.contains_key(&CacheKey::Legacy(pr_key_for(&repo, number.cast_signed()))),
                     "#{number} was evicted in fetch order"
                 );
             }
-            assert!(cache.contains_key(&monitored_key), "monitored kept");
+            assert!(
+                cache.contains_key(&CacheKey::Legacy(monitored_key.clone())),
+                "monitored kept"
+            );
         }
         assert!(
             svc.sweep_rate_limit.paused_remaining().is_some(),
@@ -9087,10 +9181,10 @@ mod tests {
         let cache = svc.pr_cache.lock().unwrap();
         assert_eq!(cache.len(), 2, "the fresh write and the monitored entry");
         assert!(
-            cache.contains_key(&monitored_key),
+            cache.contains_key(&CacheKey::Legacy(monitored_key.clone())),
             "monitored survives expiry"
         );
-        assert!(cache.contains_key(&pr_key_for(&repo, oldest.cast_signed())));
+        assert!(cache.contains_key(&CacheKey::Legacy(pr_key_for(&repo, oldest.cast_signed()))));
     }
 
     /// A PR that outgrew the observation's windows falls back to the paged
@@ -9730,6 +9824,258 @@ mod tests {
                 .await
                 .unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn idle_due_selection_has_exact_boundaries_and_quota_precedence() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let mut monitor = register(&svc, &ws, &owner).await;
+        let now = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let ago = |seconds| intent_core::iso_from_unix_secs(now.unix_timestamp() - seconds);
+        for (idle, interval) in [
+            (899, 60),
+            (900, 120),
+            (3599, 120),
+            (3600, 300),
+            (21599, 300),
+            (21600, 600),
+            (86399, 600),
+            (86400, 900),
+        ] {
+            sqlx::query("UPDATE workspace SET last_content_activity = ? WHERE id = ?")
+                .bind(ago(idle))
+                .bind(&ws.0)
+                .execute(svc.store().write_pool())
+                .await
+                .unwrap();
+            monitor.last_polled_at = Some(ago(interval - 1));
+            assert!(
+                svc.select_due_pr_monitors(vec![monitor.clone()], None, now)
+                    .await
+                    .is_empty(),
+                "idle={idle}, before due"
+            );
+            monitor.last_polled_at = Some(ago(interval));
+            assert_eq!(
+                svc.select_due_pr_monitors(vec![monitor.clone()], None, now)
+                    .await
+                    .len(),
+                1,
+                "idle={idle}, exactly due"
+            );
+        }
+        // The 15-minute idle cap never shortens a longer quota or user floor.
+        let quota = Some(QuotaWindow {
+            remaining: 6,
+            reset_in_secs: 1800,
+        });
+        assert!(svc
+            .select_due_pr_monitors(vec![monitor.clone()], quota, now)
+            .await
+            .is_empty());
+        let slower = svc.clone().with_pr_monitor_poll_seconds(1800);
+        assert!(slower
+            .select_due_pr_monitors(vec![monitor.clone()], None, now)
+            .await
+            .is_empty());
+        monitor.last_polled_at = Some(ago(1800));
+        assert_eq!(
+            svc.select_due_pr_monitors(vec![monitor.clone()], quota, now)
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            slower
+                .select_due_pr_monitors(vec![monitor.clone()], None, now)
+                .await
+                .len(),
+            1
+        );
+        // Missing stamps and restart catch-up cannot spend a zero quota share.
+        monitor.last_polled_at = None;
+        svc.pr_monitor_catch_up
+            .lock()
+            .unwrap()
+            .insert(monitor.monitor_id.clone(), now);
+        assert!(svc
+            .select_due_pr_monitors(
+                vec![monitor.clone()],
+                Some(QuotaWindow {
+                    remaining: 0,
+                    reset_in_secs: 1800
+                }),
+                now
+            )
+            .await
+            .is_empty());
+        assert_eq!(
+            svc.select_due_pr_monitors(vec![monitor], None, now)
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_workspace_does_not_poll_at_active_cadence() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let monitor = register(&svc, &ws, &owner).await;
+        sqlx::query("UPDATE workspace SET created_at = '2020-01-01T00:00:00Z', last_content_activity = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(&ws.0)
+            .execute(svc.store().write_pool()).await.unwrap();
+        age_all(&svc, 120).await;
+        forge.take_fetched_numbers();
+        let before = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        svc.poll_due_pr_monitors().await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "a day-idle workspace waits fifteen minutes"
+        );
+        assert_eq!(
+            svc.store()
+                .get_pr_monitor(&monitor.monitor_id)
+                .await
+                .unwrap()
+                .last_polled_at,
+            before.last_polled_at
+        );
+    }
+
+    async fn make_workspace_idle(svc: &Services, ws: &WorkspaceId) {
+        sqlx::query("UPDATE workspace SET created_at = '2020-01-01T00:00:00Z', last_content_activity = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(&ws.0)
+            .execute(svc.store().write_pool()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_monitor_resumes_for_note_conversation_and_running_work() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        register(&svc, &ws, &owner).await;
+        forge.take_fetched_numbers();
+        for work in ["note", "user", "assistant", "running"] {
+            make_workspace_idle(&svc, &ws).await;
+            age_all(&svc, 120).await;
+            svc.poll_due_pr_monitors().await;
+            assert!(
+                forge.take_fetched_numbers().is_empty(),
+                "idle before {work}"
+            );
+            match work {
+                "note" => {
+                    let mut note =
+                        task_note(&ws, "resumed-work", intent_core::TaskStatus::NotStarted);
+                    note.parent_id = None;
+                    svc.store().insert_note(&note).await.unwrap();
+                }
+                "running" => svc.agent_activity_begin(&ws).await,
+                role => {
+                    svc.store()
+                        .append_agent_message(&owner, role, &json!([]), &now_iso())
+                        .await
+                        .unwrap();
+                }
+            }
+            svc.poll_due_pr_monitors().await;
+            assert_eq!(forge.take_fetched_numbers(), vec![42], "resumed by {work}");
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_poll_and_metadata_do_not_reset_content_clock() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        register(&svc, &ws, &owner).await;
+        make_workspace_idle(&svc, &ws).await;
+        age_all(&svc, 901).await;
+        forge.take_fetched_numbers();
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(forge.take_fetched_numbers(), vec![42]);
+        let persisted = svc.store().get_workspace(&ws).await.unwrap();
+        assert_eq!(
+            persisted.last_content_activity.as_deref(),
+            Some("2020-01-01T00:00:00Z")
+        );
+        sqlx::query("UPDATE workspace SET updated_at = ?, last_activity = ? WHERE id = ?")
+            .bind(now_iso())
+            .bind(now_iso())
+            .bind(&ws.0)
+            .execute(svc.store().write_pool())
+            .await
+            .unwrap();
+        age_all(&svc, 120).await;
+        svc.poll_due_pr_monitors().await;
+        assert!(forge.take_fetched_numbers().is_empty());
+        let intervals = svc
+            .workspace_automatic_check_intervals(
+                &[ws.clone(), WorkspaceId::from("missing")],
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(intervals[&ws], 900);
+        assert_eq!(intervals[&WorkspaceId::from("missing")], 60);
+    }
+
+    #[tokio::test]
+    async fn shared_pr_uses_active_workspace_cadence_and_one_fetch() {
+        let (_db, _root, svc, forge, active, owner) = setup().await;
+        register(&svc, &active, &owner).await;
+        let idle = WorkspaceId::new();
+        svc.store()
+            .insert_workspace(&workspace(&idle))
+            .await
+            .unwrap();
+        let idle_owner = AgentId::from("idle-owner");
+        svc.store()
+            .insert_agent_session(&agent(&idle, &idle_owner.0))
+            .await
+            .unwrap();
+        svc.pr_monitor_register(&idle, &idle_owner, "o", "r", 42)
+            .await
+            .unwrap();
+        svc.pr_monitor_register(&idle, &idle_owner, "o", "r", 43)
+            .await
+            .unwrap();
+        make_workspace_idle(&svc, &idle).await;
+        age_all(&svc, 120).await;
+        forge.take_fetched_numbers();
+        let started = time::OffsetDateTime::now_utc();
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(
+            forge.take_fetched_numbers(),
+            vec![42],
+            "active sibling admits one shared fetch; idle-only PR waits"
+        );
+        let rows = svc.store().load_active_pr_monitors().await.unwrap();
+        let shared: Vec<_> = rows.iter().filter(|r| r.pr_number == 42).collect();
+        let a = shared[0]
+            .last_polled_at
+            .as_deref()
+            .and_then(parse_iso)
+            .unwrap();
+        let b = shared[1]
+            .last_polled_at
+            .as_deref()
+            .and_then(parse_iso)
+            .unwrap();
+        assert!(
+            a >= started && b >= started,
+            "both siblings stamped by one tick"
+        );
+        assert!(
+            rows.iter()
+                .find(|r| r.pr_number == 43)
+                .unwrap()
+                .last_polled_at
+                .as_deref()
+                .and_then(parse_iso)
+                .unwrap()
+                < a
+        );
     }
 
     /// Ten distinct PRs at the defaults stretch the interval to 72s, so one
@@ -11455,6 +11801,9 @@ mod tests {
         for id in &ids {
             backdate(&svc, id, &forty_minutes_ago).await;
         }
+        // Idle clocks cannot bypass quota deferral; restart still catches up
+        // immediately once the quota gate opens.
+        make_workspace_idle(&svc, &ws).await;
         // And catch-up marked, as after a daemon restart.
         assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 3);
         assert_eq!(marked(), 3);
@@ -12021,6 +12370,7 @@ mod tests {
         let candidate = |anchor, catch_up, pr| DueCandidate {
             anchor,
             catch_up,
+            interval: time::Duration::ZERO,
             monitor: mk(pr),
         };
         let interval = time::Duration::seconds(60);

@@ -356,7 +356,7 @@ async fn chat_subscription_resets_after_replace_messages_over_wss() {
 /// a fresh snapshot at the next seq that equals `agent.getConversation`
 /// (converged, not mid-turn), then keeps receiving the next turn's deltas.
 #[intent_test_macros::daemon_test]
-async fn chat_subscription_self_heals_over_wss_after_broadcast_lag() {
+async fn twenty_message_chat_subscription_self_heals_over_wss_after_broadcast_lag() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
@@ -373,6 +373,17 @@ async fn chat_subscription_self_heals_over_wss_after_broadcast_lag() {
 
     // A persisted user message anchors the seq-0 snapshot.
     let store = fx.bus.store();
+    for seq in 0..23 {
+        store
+            .append_agent_message(
+                &AgentId::from(agent_id.as_str()),
+                "user",
+                &json!([{ "type": "text", "text": format!("history {seq}") }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append history");
+    }
     let user_id = Uuid::now_v7().to_string();
     store
         .append_agent_message_with_id(
@@ -391,6 +402,13 @@ async fn chat_subscription_self_heals_over_wss_after_broadcast_lag() {
     let snap = next_push(&mut ws, sub_id).await;
     assert_eq!(snap["params"]["kind"], "snapshot");
     assert_eq!(snap["params"]["seq"], 0);
+    assert_eq!(
+        snap["params"]["snapshot"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        20
+    );
 
     // The turn starts normally: the first chunk arrives as delta seq 1.
     let mid = Uuid::now_v7().to_string();
@@ -471,7 +489,7 @@ async fn chat_subscription_self_heals_over_wss_after_broadcast_lag() {
         &mut ws,
         4,
         "agent.getConversation",
-        json!({ "agentId": agent_id }),
+        json!({ "agentId": agent_id, "limit": 20 }),
     )
     .await;
     let mut want = want;
@@ -488,7 +506,25 @@ async fn chat_subscription_self_heals_over_wss_after_broadcast_lag() {
     let messages = recovery["params"]["snapshot"]["messages"]
         .as_array()
         .unwrap();
-    assert_eq!(messages.len(), 2, "user + persisted assistant message");
+    assert_eq!(
+        messages.len(),
+        20,
+        "recovery retains the newest twenty messages"
+    );
+    assert_eq!(messages[0]["seq"], 5);
+    assert_eq!(messages[19]["id"], mid);
+    assert_eq!(want["totalMessages"], 25);
+    let older = wss_rpc(
+        &mut ws,
+        5,
+        "agent.getConversation",
+        json!({ "agentId": agent_id, "limit": 5, "nextToken": want["nextToken"] }),
+    )
+    .await;
+    assert_eq!(older["messages"].as_array().unwrap().len(), 5);
+    assert_eq!(older["messages"][0]["seq"], 0);
+    assert_eq!(older["messages"][4]["seq"], 4);
+    assert!(older["nextToken"].is_null());
     assert!(
         messages.iter().all(|m| m.get("isStreaming").is_none()),
         "the recovered transcript is not stranded mid-turn"

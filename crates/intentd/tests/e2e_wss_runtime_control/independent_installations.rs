@@ -33,18 +33,17 @@ esac
 }
 
 fn spawn_installation(dir: &Path, token: &str) -> GuardedChild {
-    let mut cmd = common::serve_command_fixed_port();
+    let mut cmd = common::hermetic_serve_command_fixed_port(dir);
     // Do not call enable_ws_api: it seeds an explicit numeric port. Do not use
     // serve_command: its env-zero seam bypasses production first selection.
     configure_serve(&mut cmd, dir, "uds", &[("INTENTD_AUTH_TOKEN", token)]);
     cmd.env_remove("INTENTD_TCP_PORT")
         .env_remove("INTENTD_INSECURE")
-        .env("INTENTD_CONFIG", dir.join("config.toml"))
-        .env("INTENTD_SECRETS_FILE", dir.join("secrets.json"));
+        .env("INTENTD_CONFIG", dir.join("config.toml"));
     if dir.join("fake-tailcat.sh").exists() {
         cmd.env("INTENTD_TAILCAT_BIN", dir.join("fake-tailcat.sh"));
     }
-    common::hermetic_github_identity(&mut cmd, dir);
+
     GuardedChild::spawn(&mut cmd).expect("spawn isolated installation")
 }
 
@@ -142,6 +141,7 @@ fn stop(child: &mut GuardedChild) {
 
 #[tokio::test]
 async fn simultaneous_installations_keep_identity_and_saved_ports_across_restart_and_conflict() {
+    let _lease = port_lease::acquire();
     let a_dir = temp_data_dir();
     let b_dir = temp_data_dir();
     for dir in [a_dir.path(), b_dir.path()] {

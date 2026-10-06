@@ -1945,7 +1945,11 @@ impl Services {
                         if settled
                             && matches!(call_site, WatchReconcileCallSite::Registration)
                             && (!self.active_hooks_for_agent(child_id).await.is_empty()
-                                || !self.active_pr_monitors_for_agent(child_id).await.is_empty()
+                                || (!self.active_pr_monitors_for_agent(child_id).await.is_empty()
+                                    || !self
+                                        .active_script_monitors_for_agent(child_id)
+                                        .await
+                                        .is_empty())
                                 || !self.list_event_subscriptions_for_agent(child_id).is_empty())
                         {
                             self.mark_interim_skipped_idle_stale_report(child_id);
@@ -2059,7 +2063,7 @@ impl Services {
         // No-advisory variant: registration-time / boot reconciliation must
         // never fire the monitoring-idle advisory — a deferred idle here
         // leaves the watch armed, exactly as before the advisory existed.
-        self.deliver_completion_to_watches_inner(child_id, &event, false, true, watch_ids)
+        self.deliver_completion_to_watches_inner(child_id, &event, false, true, watch_ids, None)
             .await;
     }
 
@@ -2508,7 +2512,21 @@ impl Services {
         // settled — its group completion must not be recorded yet. Not
         // stamped onto `event_data` (internal classification only), so
         // probed live here, matching the agent-waiting check below.
-        if !completion_reported && !self.active_pr_monitors_for_agent(agent_id).await.is_empty() {
+        if !completion_reported
+            && (!self.active_pr_monitors_for_agent(agent_id).await.is_empty()
+                || !self
+                    .active_script_monitors_for_agent(agent_id)
+                    .await
+                    .is_empty())
+        {
+            return;
+        }
+        if self
+            .store
+            .script_monitor_pending_for_agent(agent_id)
+            .await
+            .unwrap_or(true)
+        {
             return;
         }
         // Agent-waiting deferral (issue intent-hq/monorepo#1468): an idle
@@ -2799,6 +2817,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,

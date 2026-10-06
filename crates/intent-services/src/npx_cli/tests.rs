@@ -69,12 +69,31 @@ fn in_subprocess(test: &str, version: &str) -> bool {
         "#!/bin/sh\nexec \"$INTENT_TEST_REAL_NODE\" \"$@\"\n",
     );
     executable(&bin.join("npx"), NPX);
+    // Public Codex launches now require a canonical installed CLI even when
+    // the pinned adapter itself is mocked. It may only be version-probed.
+    executable(
+        &bin.join("codex"),
+        "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] && [ \"$CODEX_PATH\" = \"$0\" ] || exit 91\nprintf 'codex-cli 1.2.3\\n'\n",
+    );
     let forbidden = "#!/bin/sh\nprintf 'native\\n' >> \"$INTENT_TEST_NPX_ROOT/native\"\nexit 99\n";
     executable(&bin.join("codex-acp"), forbidden);
     executable(&root.join("custom-codex-acp"), forbidden);
     executable(
         &root.join("direct-adapter"),
-        "#!/bin/sh\nprintf 'direct\\n' >> \"$INTENT_TEST_NPX_ROOT/direct\"\nexec \"$INTENT_TEST_REAL_NODE\" \"$INTENT_TEST_NPX_ROOT/adapter.mjs\" \"$@\"\n",
+        r#"#!/bin/sh
+case "$1" in
+  --version) printf '0.35.0\n'; exit 0 ;;
+  --print)
+    printf 'print\n' >> "$INTENT_TEST_NPX_ROOT/direct"
+    cat >/dev/null
+    printf 'fixture reply\n'
+    exit 0 ;;
+  --acp)
+    printf 'acp\n' >> "$INTENT_TEST_NPX_ROOT/direct"
+    exec "$INTENT_TEST_REAL_NODE" "$INTENT_TEST_NPX_ROOT/adapter.mjs" "$@" ;;
+  *) exit 92 ;;
+esac
+"#,
     );
     let log_path = root.join("test.log");
     let log = std::fs::File::create(&log_path).unwrap();
@@ -135,6 +154,14 @@ async fn services(provider: &str) -> Services {
             ("providers.paths".to_string(), json!(paths(provider))),
         ])
         .unwrap();
+    if provider == "auggie" {
+        registry
+            .apply(&[(
+                "context.auggiePath".into(),
+                json!(root().join("direct-adapter")),
+            )])
+            .unwrap();
+    }
     Services::new(Store::open(&root().join("store.db")).await.unwrap())
         .with_settings_registry(registry)
 }
@@ -345,7 +372,9 @@ async fn direct_adapter_skips_stale_npx_probe_and_package_launch() {
     ) {
         return;
     }
-    let services = services("claude-code").await;
+    // Claude/Codex always use their pinned npm adapters. Auggie still has
+    // supported direct completion and ACP test-prompt paths; both skip npx.
+    let services = services("auggie").await;
     assert_eq!(
         completion(&services).await.unwrap()["text"],
         "fixture reply"
@@ -353,16 +382,16 @@ async fn direct_adapter_skips_stale_npx_probe_and_package_launch() {
     assert_eq!(
         crate::provider_test_prompt::provider_test_prompt(
             None,
-            "claude-code",
+            "auggie",
             None,
-            &paths("claude-code"),
+            &paths("auggie"),
             None
         )
         .await
         .unwrap(),
         json!({"ok": true})
     );
-    assert_eq!(lines("direct").len(), 2);
+    assert_eq!(lines("direct"), vec!["print", "acp"]);
     assert!(
         lines("probes").is_empty(),
         "direct adapters must not run npx --version"

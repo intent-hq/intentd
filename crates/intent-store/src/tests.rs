@@ -19,12 +19,48 @@ use crate::{AgentQueueRow, AutoVacuumActivation, EventQuery, NewEvent, Store, MA
 
 mod host_membership;
 mod human_attribution;
+mod script_initialization;
+mod script_monitors;
 mod sharing;
 mod workspace_delete;
 
 mod metadata_key_json;
 mod note_line_attribution;
 mod note_search;
+
+#[tokio::test]
+async fn workspace_content_clocks_project_only_requested_timestamps_in_batches() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.unwrap();
+    assert!(store
+        .workspace_content_clocks(&[])
+        .await
+        .unwrap()
+        .is_empty());
+    let included = WorkspaceId::from("included");
+    let excluded = WorkspaceId::from("excluded");
+    let mut ws = sample_workspace(&included, "included", false);
+    ws.created_at = "2026-01-01T00:00:00Z".into();
+    ws.last_content_activity = Some("2026-01-02T00:00:00Z".into());
+    store.insert_workspace(&ws).await.unwrap();
+    store
+        .insert_workspace(&sample_workspace(&excluded, "excluded", false))
+        .await
+        .unwrap();
+    // More than one SQL batch, including repeated IDs and missing rows.
+    let mut ids: Vec<_> = (0..405)
+        .map(|i| WorkspaceId::from(format!("missing-{i}")))
+        .collect();
+    ids.extend([included.clone(), included.clone()]);
+    let clocks = store.workspace_content_clocks(&ids).await.unwrap();
+    assert_eq!(clocks.len(), 1);
+    assert_eq!(clocks[&included].created_at, ws.created_at);
+    assert_eq!(
+        clocks[&included].last_content_activity,
+        ws.last_content_activity
+    );
+    assert!(!clocks.contains_key(&excluded));
+}
 
 /// A unique temp DB path inside an RAII temp dir: the dir (and with it the
 /// `.db`/`-wal`/`-shm` files) is removed on drop, including on panic; set
@@ -68,6 +104,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         created_at: ts.clone(),
         updated_at: ts.clone(),
         last_activity: Some(ts),
+        last_content_activity: None,
         tags: vec!["alpha".to_string(), "beta".to_string()],
         path: Some("/tmp/ws-meta".to_string()),
         repository_path: Some("/tmp/repo".to_string()),
@@ -6448,6 +6485,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     created_at: ts.clone(),
                     updated_at: ts.clone(),
                     last_activity: None,
+                    last_content_activity: None,
                     tags: vec![],
                     path: Some(format!("/tmp/ws-{i}")),
                     repository_path: None,
@@ -7268,6 +7306,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
         desktop_writes: crate::desktop_repo::DesktopWrites::default(),
         desktop_delete_barrier: std::sync::Arc::default(),
         export_author_barrier: std::sync::Arc::default(),
+        repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
     };
     let ws = WorkspaceId::new();
     store
@@ -8164,6 +8203,39 @@ async fn primary_principal_is_minted_once() {
     assert_eq!(store.list_principals().await.expect("list").len(), 1);
 }
 
+/// Remove only 0144 objects before historical fixtures drop source columns.
+/// Reopening runs the ordinary migration against the seeded legacy rows.
+async fn rewind_repository_authority(store: &Store) {
+    for kind in [
+        "workspace",
+        "principal",
+        "workspace_member",
+        "host_member",
+        "credential",
+    ] {
+        for suffix in ["ai", "ad", "au"] {
+            sqlx::query(&format!(
+                "DROP TRIGGER repository_authority_{kind}_{suffix}"
+            ))
+            .execute(store.write_pool())
+            .await
+            .expect("drop 0144 source trigger");
+        }
+    }
+    for sql in [
+        "DROP TRIGGER repository_authority_revision_no_delete",
+        "DROP TRIGGER repository_authority_revision_no_reset",
+        "DROP TRIGGER repository_authority_revision_monotonic",
+        "DROP TABLE repository_authority_revision",
+        "DELETE FROM _sqlx_migrations WHERE version = 144",
+    ] {
+        sqlx::query(sql)
+            .execute(store.write_pool())
+            .await
+            .expect("rewind 0144 object");
+    }
+}
+
 /// Remove derived 0134 state before a fixture rewinds its source schema. The
 /// real migration must replay after the legacy rows have been seeded.
 async fn rewind_sharing_projection(store: &Store) {
@@ -8201,6 +8273,7 @@ async fn principals_migration_backfills_existing_workspaces() {
     let ws_b = WorkspaceId::from("ws-mig-b");
     {
         let store = Store::open(&tmp.path).await.expect("open store");
+        rewind_repository_authority(&store).await;
         rewind_sharing_projection(&store).await;
         // 0130 re-widens the recreated principal/invite tables; 0133 adds
         // host tables and triggers referencing principal. Rewind both before
@@ -9562,6 +9635,7 @@ async fn principal_identity_migration_backfills_github_rows() {
     {
         let store = Store::open(&tmp.path).await.expect("open store");
         let primary = store.get_primary_principal().await.expect("primary").id;
+        rewind_repository_authority(&store).await;
         rewind_sharing_projection(&store).await;
         for sql in [
             "DELETE FROM _sqlx_migrations WHERE version = 130",
@@ -10763,6 +10837,7 @@ async fn script_lifecycle_legacy_defaults_and_durable_scope() {
     ));
     def.purpose = intent_core::ScriptPurpose::OneOff;
     def.last_run = Some(intent_core::ScriptLastRun {
+        run_id: None,
         outcome: intent_core::ScriptRunOutcome::Failed,
         exit_code: Some(2),
         started_at: Some("t1".into()),
@@ -10909,4 +10984,99 @@ async fn task_list_projects_only_matching_summaries() {
     assert_eq!(result.stats.total, 2);
     assert_eq!(result.stats.completed, 1);
     assert!(store.list_workspace_tasks(&ws, None).await.is_err());
+}
+
+/// Upgrade the actual shipped prefix, including node and script lifecycle data.
+/// The additive repository migrations must not rewrite that data or `SQLx` history.
+#[tokio::test]
+async fn gitlab_upgrade_from_populated_main_preserves_shipped_data_and_checksums() {
+    let tmp = TempDb::new();
+    let pool = crate::connect_write(&tmp.path).await.unwrap();
+    let prefix = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            crate::MIGRATOR
+                .iter()
+                .filter(|m| m.version <= 143)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    assert_eq!(prefix.iter().count(), 143);
+    prefix.run(&pool).await.unwrap();
+    sqlx::raw_sql(r#"
+        INSERT INTO principal(id,created_at,updated_at) VALUES('upgrade-person','original','original');
+        INSERT INTO workspace(id,title,branch,created_at,updated_at,repository_path,repository_owner,repository_name)
+          VALUES('upgrade-workspace','Preserve','main','original','original','/owned/repository','Original','Project');
+        INSERT INTO agent_session(id,workspace_id,name,status,created_at,updated_at)
+          VALUES('upgrade-agent','upgrade-workspace','Preserve','idle','original','original');
+        INSERT INTO workspace_member VALUES('upgrade-workspace','upgrade-person','collaborator','original');
+        INSERT INTO principal_credential(token_hash,principal_id,created_at) VALUES('upgrade-credential','upgrade-person','original');
+        INSERT INTO execution_node VALUES('upgrade-node','head','node-key','{"original":true}');
+        INSERT INTO node_lease(id,node_id,record_json) VALUES('upgrade-lease','upgrade-node','{"original":true}');
+        INSERT INTO node_assignment(agent_id,workspace_id,lease_id,record_json)
+          VALUES('upgrade-agent','upgrade-workspace','upgrade-lease','{"active":true}');
+        INSERT INTO script(id,workspace_id,name,command,mode,source,created_at,purpose,latest_run_id,latest_run_result)
+          VALUES('upgrade-script','upgrade-workspace','Preserve','true','command','user','original','saved','original-run','{"original":true}');
+        INSERT INTO script_monitor(id,workspace_id,agent_id,script_id,run_id,state,row_json,created_at)
+          VALUES('upgrade-monitor','upgrade-workspace','upgrade-agent','upgrade-script','original-run','active','{"original":true}','original');
+        INSERT INTO pr_monitor(monitor_id,workspace_id,agent_id,repo_owner,repo_name,pr_number,state,created_at,updated_at)
+          VALUES('upgrade-pr','upgrade-workspace','upgrade-agent','Original','Project',7,'active','original','original');
+    "#).execute(&pool).await.unwrap();
+    let old_history: Vec<(i64, Vec<u8>)> =
+        sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let queries = [
+        "SELECT record_json FROM execution_node WHERE id='upgrade-node'",
+        "SELECT record_json FROM node_lease WHERE id='upgrade-lease'",
+        "SELECT record_json FROM node_assignment WHERE agent_id='upgrade-agent'",
+        "SELECT json_array(purpose,latest_run_id,latest_run_result,command) FROM script WHERE id='upgrade-script'",
+        "SELECT json_array(state,row_json,run_id,wake_state) FROM script_monitor WHERE id='upgrade-monitor'",
+        "SELECT json_array(title,branch,repository_path,repository_owner,repository_name,created_at,updated_at) FROM workspace WHERE id='upgrade-workspace'",
+        "SELECT json_array(repo_owner,repo_name,pr_number,state,created_at,updated_at) FROM pr_monitor WHERE monitor_id='upgrade-pr'",
+        "SELECT json_array(principal_id,revoked_at,created_at) FROM principal_credential WHERE token_hash='upgrade-credential'",
+    ];
+    let mut original = Vec::new();
+    for query in queries {
+        original.push(
+            sqlx::query_scalar::<_, String>(query)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+        );
+    }
+    pool.close().await;
+    for _ in 0..2 {
+        let store = Store::open(&tmp.path).await.unwrap();
+        assert!(store.migration_status().await.unwrap().is_current());
+        let history: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT version, checksum FROM _sqlx_migrations WHERE version<=143 ORDER BY version",
+        )
+        .fetch_all(store.read_pool())
+        .await
+        .unwrap();
+        assert_eq!(history, old_history);
+        for (query, expected) in queries.into_iter().zip(&original) {
+            assert_eq!(
+                &sqlx::query_scalar::<_, String>(query)
+                    .fetch_one(store.read_pool())
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        let provenance: (String, Option<String>) = sqlx::query_as("SELECT target_provenance,target_provider FROM pr_monitor WHERE monitor_id='upgrade-pr'").fetch_one(store.read_pool()).await.unwrap();
+        assert_eq!(provenance, ("unresolved".into(), None));
+        let selection: (String, Option<String>, Option<String>) = sqlx::query_as("SELECT choice_mode,remote_name,historical_source FROM repository_selection_state WHERE workspace_id='upgrade-workspace' AND root_kind='primary'").fetch_one(store.read_pool()).await.unwrap();
+        assert_eq!(
+            selection,
+            ("unresolved".into(), None, Some("workspace-metadata".into()))
+        );
+        let revision: i64 = sqlx::query_scalar("SELECT revision FROM repository_authority_revision WHERE kind='credential' AND subject_id='upgrade-credential'").fetch_one(store.read_pool()).await.unwrap();
+        assert_eq!(revision, 1);
+        store.read_pool().close().await;
+        store.write_pool().close().await;
+    }
 }

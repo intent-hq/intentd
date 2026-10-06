@@ -198,6 +198,7 @@ mod tests {
 
         fn launch(&self) -> CodexLaunch {
             CodexLaunch {
+                installed: None,
                 selection: ProviderLaunch::Local(ProviderBinary {
                     path: self.adapter.clone(),
                     source: ProviderBinarySource::SettingsOverride,

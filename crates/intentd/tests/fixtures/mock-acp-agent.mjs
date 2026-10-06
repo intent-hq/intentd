@@ -24,6 +24,11 @@ const SESSION_ID = 'mock-session-1';
 // daemon resumes into sees `true`; a fresh `session/new` resets it. Drives the
 // `failPromptIfLoadedRpcError` behavior (monorepo#940 poisoned-session e2e).
 let sessionFromLoad = false;
+// Optional durable provider checkpoint for actual daemon-restart tests. Only
+// completed prompts enter it; unsolicited compaction does not complete a turn.
+let checkpointContext = [];
+const checkpointFile = process.env.MOCK_AGENT_CHECKPOINT_FILE;
+let clientSupportsNotices = false;
 // Optional stateful model selector. Prompts report this accepted state, not
 // the last requested value, so rejected selections expose default-model turns.
 let effectiveModel = null;
@@ -79,7 +84,7 @@ function log(msg) {
 // launches (intent-hq/intent#5738). `argv` records only the arguments passed
 // to this fixture, excluding the Node executable and script path, so tests
 // can verify provider selection. MOCK_AGENT_LOG_CODEX_POLICY opts into only
-// the daemon-owned policy JSON and CODEX_PATH presence, never other env values.
+// the daemon-owned policy JSON and selected CODEX_PATH, never other env values.
 function logSessionCall(method, sessionId, meta, cwd) {
   const path = process.env.MOCK_AGENT_SESSION_LOG;
   if (!path) return;
@@ -94,11 +99,14 @@ function logSessionCall(method, sessionId, meta, cwd) {
         nodeOptions: process.env.NODE_OPTIONS ?? null,
         cwd: cwd ?? null,
         processCwd: process.cwd(),
+        mcpNames: sessionMcpServers.map((server) => server.name),
         argv: process.argv.slice(2),
         ...(process.env.MOCK_AGENT_LOG_CODEX_POLICY === '1'
           ? { codexPolicy: {
               config: process.env.CODEX_CONFIG ? JSON.parse(process.env.CODEX_CONFIG) : null,
               pathPresent: Object.hasOwn(process.env, 'CODEX_PATH'),
+              codexPath: process.env.CODEX_PATH ?? null,
+              home: process.env.CODEX_HOME ?? null,
             } }
           : {}),
       }) + '\n'
@@ -394,7 +402,7 @@ function modelDefaultEffort(behavior) {
 async function handlePrompt(id, params) {
   promptCount += 1;
   // Record every prompt this child receives when MOCK_AGENT_PROMPT_LOG points
-  // at a file — one JSON line per prompt ({ turn, text, blockTypes }) — so
+  // at a file — one JSON line per prompt ({ turn, text, blockTypes, blocks }) — so
   // e2e tests can assert exact outbound prompt assembly (e.g. the
   // FirstTurnPrepend `<system>` block fires on the first turn of a fresh
   // session and never repeats). `blockTypes` lists each prompt content
@@ -410,9 +418,13 @@ async function handlePrompt(id, params) {
         promptLog,
         JSON.stringify({
           turn: promptCount,
+          sessionId: params && params.sessionId,
+          loaded: sessionFromLoad,
+          ...(checkpointFile ? { checkpointContext, sessionFromLoad } : {}),
           ...(effectiveModel !== null ? { effectiveModel, effectiveEffort } : {}),
           text: extractPromptText(params),
           blockTypes: blocks.map((b) => (b && typeof b.type === 'string' ? b.type : '')),
+          blocks,
         }) + '\n',
       );
     } catch (err) {
@@ -424,6 +436,18 @@ async function handlePrompt(id, params) {
     behavior = JSON.parse(process.env.MOCK_AGENT_BEHAVIOR || '{}');
   } catch {
     behavior = {};
+  }
+  // Model the adapter's capability-driven notice/text fallback, including
+  // warnings immediately before a fatal prompt response.
+  for (const notice of behavior.notices || []) {
+    note('session/update', {
+      sessionId: SESSION_ID,
+      update: clientSupportsNotices
+        ? { sessionUpdate: 'notice', ...notice }
+        : { sessionUpdate: 'agent_message_chunk', content: {
+            type: 'text', text: `Warning: ${notice.title}\n\n`,
+          } },
+    });
   }
   // Deterministic mid-turn failure: die while the prompt is in flight for the
   // first N attempts (counter persists across spawns via MOCK_AGENT_ATTEMPT_FILE).
@@ -623,6 +647,11 @@ async function handlePrompt(id, params) {
     behavior.parkIfPromptEndsWith.length > 0 &&
     promptText.trimEnd().endsWith(behavior.parkIfPromptEndsWith)
   ) {
+    // Optional native activity before parking lets restart tests interrupt a
+    // real prompt-owned compaction rather than pre-populating session state.
+    for (const update of behavior.parkedRawUpdates ?? []) {
+      note('session/update', { sessionId: SESSION_ID, update });
+    }
     log('parkIfPromptEndsWith: parking this turn');
     pendingPromptIds.push(id);
     return;
@@ -680,6 +709,11 @@ async function handlePrompt(id, params) {
     while (!fs.existsSync(active.releaseFile)) {
       await new Promise((r) => setTimeout(r, 10));
     }
+  }
+  // A queue-flush rule can fail only the selected batch, after its barrier.
+  // Restart tests boot the same durable queue with the rule removed.
+  if (active !== behavior && active.promptRpcError) {
+    return send({ jsonrpc: '2.0', id, error: active.promptRpcError });
   }
   const toolCalls = Array.isArray(active.toolCalls)
     ? active.toolCalls
@@ -839,6 +873,8 @@ async function handlePrompt(id, params) {
       // collapsed text is truncated and corrupted so neither the resource
       // item nor a parseable {ok, proposal} payload survives — only the
       // turn-attachment registry (deterministic attach) can recover it.
+      // With omitToolOutput, emit a valid status-only terminal update: trusted
+      // registered attachments must survive even without a tool_result block.
       if (result && result.content && Array.isArray(result.content)) {
         let rawOutput = result.content;
         if (active.collapseToolOutput || active.garbleToolOutput) {
@@ -854,8 +890,8 @@ async function handlePrompt(id, params) {
           update: {
             sessionUpdate: 'tool_call_update',
             toolCallId,
-            status: result.isError ? 'error' : 'completed',
-            rawOutput,
+            status: result.isError ? 'failed' : 'completed',
+            ...(active.omitToolOutput ? {} : { rawOutput }),
           },
         });
       }
@@ -895,6 +931,18 @@ async function handlePrompt(id, params) {
   if (active.promptMeta && typeof active.promptMeta === 'object') {
     payload._meta = active.promptMeta;
   }
+  // Test-owned barrier after real output but before completing the first
+  // prompt, so WSS tests can admit and edit queued input without a timing race.
+  const resultGate = process.env.MOCK_AGENT_PROMPT_RESULT_GATE_FILE;
+  if (resultGate && promptCount === 1) {
+    while (!fs.existsSync(resultGate)) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  if (checkpointFile) {
+    checkpointContext.push({ user: extractPromptText(params), assistant: text });
+    fs.writeFileSync(checkpointFile, JSON.stringify(checkpointContext));
+  }
   result(id, payload);
 }
 
@@ -932,6 +980,9 @@ async function dispatch(msg) {
 
   switch (msg.method) {
     case 'initialize':
+      clientSupportsNotices = typeof msg.params?.clientCapabilities?.session?.notices === 'object'
+        && msg.params.clientCapabilities.session.notices !== null
+        && !Array.isArray(msg.params.clientCapabilities.session.notices);
       // Slow cold-start simulation (monorepo#616): delay the initialize reply
       // by `initializeDelayMs` so tests can prove the daemon's handshake
       // timeout tolerates a slow-to-start agent (or trips when pinned lower).
@@ -984,6 +1035,7 @@ async function dispatch(msg) {
         ? msg.params.mcpServers
         : [];
       sessionFromLoad = false;
+      checkpointContext = [];
       logSessionCall('session/new', SESSION_ID, msg.params && msg.params._meta, msg.params && msg.params.cwd);
       return result(msg.id, { sessionId: SESSION_ID, ...sessionConfigOptions(behavior) });
     }
@@ -1008,6 +1060,9 @@ async function dispatch(msg) {
       if (behavior.loadSession === true || behavior.advertiseLoadSession === true) {
         if (behavior.advertiseLoadSession === true) {
           sessionFromLoad = true;
+          if (checkpointFile) {
+            checkpointContext = JSON.parse(fs.readFileSync(checkpointFile, 'utf8'));
+          }
         }
         return result(msg.id, sessionConfigOptions(behavior));
       }
@@ -1100,6 +1155,19 @@ async function dispatch(msg) {
       });
     }
     case 'session/prompt':
+      // Test-owned receipt barrier: turnInFlight can be true before this child
+      // records the prompt. Hold only the selected current prompt, so replayed
+      // history in a fresh child's follow-up cannot accidentally re-enter it.
+      if (behavior.promptReceiptGate &&
+          extractPromptText(msg.params).trimEnd().endsWith(behavior.promptReceiptGate.suffix)) {
+        const gate = behavior.promptReceiptGate;
+        fs.writeFileSync(gate.enteredFile, String(process.pid));
+        const deadline = Date.now() + 5000;
+        while (!fs.existsSync(gate.releaseFile)) {
+          if (Date.now() >= deadline) throw new Error('prompt receipt gate was not released');
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
       return handlePrompt(msg.id, msg.params);
     case 'session/cancel':
       // STAB-124: echo the abort for any tool call parked by `parkMidToolCall`
@@ -1221,6 +1289,7 @@ if (treePidFile) {
 // waking the child on its own (compaction notice, background task output):
 // the daemon must stream the burst as an implicit agent-initiated turn.
 // One-shot per process; the test controls timing by creating the file.
+// MOCK_AGENT_WAKE_JSON=1 interprets each line as a native update object.
 // The literal token `<NEWLINE_ONLY>` on a line emits one chunk whose text is
 // a bare "\n" (the monorepo#3262 incident shape — a whitespace-only wake
 // response); plain whitespace-only lines stay filtered as before.
@@ -1249,7 +1318,9 @@ if (wakeTriggerFile) {
       const text = line === '<NEWLINE_ONLY>' ? '\n' : line;
       note('session/update', {
         sessionId: SESSION_ID,
-        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+        update: process.env.MOCK_AGENT_WAKE_JSON === '1'
+          ? JSON.parse(line)
+          : { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
       });
     }
   }, 25);

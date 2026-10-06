@@ -5,6 +5,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod pending_completion;
+
 use intent_acp::WorkspaceMcpServer;
 use intent_core::{
     now_iso, AgentDelegateInput, AgentId, AgentStatus, Error, MessageOrigin, NoteCreate,
@@ -106,6 +108,7 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -4820,6 +4823,7 @@ async fn app_agents_send_persists_chief_attribution_and_source_link() {
             "fromWorkspaceId": chief_ws.0,
             "sourceMessageId": source_id,
             "sourceUrl": source_url,
+            "submissionIds": [delivered.id],
         }))
     );
 }
@@ -4883,6 +4887,7 @@ async fn app_agents_send_delivers_despite_target_pending_questions() {
         "fromWorkspaceId": chief_ws.0,
         "sourceMessageId": source_id,
         "sourceUrl": source_url,
+        "submissionIds": [result["messageId"]],
     });
     let target_session = svc
         .store()
@@ -5847,6 +5852,119 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
     // with no pending completion watches reports an empty array.
     assert_eq!(v["waitingForAgentIds"], json!([]));
     assert!(v["lastActivity"].is_string());
+}
+
+/// The seq-0 chat snapshot needs activity metadata, never persisted history.
+#[tokio::test]
+async fn snapshot_activity_flags_do_not_read_transcript() {
+    use crate::test_tracing::{capture_sqlx_queries, warm_sqlx_pool};
+
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Snapshot").await;
+    svc.set_test_busy(&id, true);
+    warm_sqlx_pool(svc.store().read_pool()).await;
+
+    for history_size in [0, 32] {
+        for _ in 0..history_size {
+            svc.store()
+                .append_agent_message(
+                    &id,
+                    "assistant",
+                    &json!([{"type": "text", "text": "persisted history"}]),
+                    &now_iso(),
+                )
+                .await
+                .unwrap();
+        }
+        let (flags, queries) = capture_sqlx_queries(svc.agent_activity_flags(id.clone())).await;
+        assert_eq!(
+            flags,
+            json!({
+                "isResponding": true,
+                "isWaitingOnTool": false,
+                "isWaitingForOtherAgents": false,
+                "waitingForAgentIds": [],
+                "turnInFlight": false,
+                "lastStreamActivityAt": null,
+            })
+        );
+        assert_eq!(
+            queries.len(),
+            1,
+            "metadata-only read with {history_size} messages: {queries:?}"
+        );
+        assert!(
+            queries[0].sql.contains("FROM agent_session WHERE"),
+            "{queries:?}"
+        );
+        assert_eq!(queries[0].rows_returned, 1, "{queries:?}");
+    }
+}
+
+#[tokio::test]
+async fn snapshot_activity_flags_preserve_activity_and_liveness() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let idle = json!({
+        "isResponding": false,
+        "isWaitingOnTool": false,
+        "isWaitingForOtherAgents": false,
+        "waitingForAgentIds": [],
+        "turnInFlight": false,
+        "lastStreamActivityAt": null,
+    });
+    assert_eq!(svc.agent_activity_flags(id.clone()).await, idle);
+    assert_eq!(svc.agent_activity_flags(AgentId::new()).await, idle);
+
+    // Duplicate child watches retain one id, and tool waits require a worker.
+    for _ in 0..2 {
+        svc.register_completion_watch(&ws, &ws, id.clone(), "Parent".into(), child.clone(), None)
+            .unwrap();
+    }
+    let tool = json!({"type": "tool_use", "id": "msg:0", "name": "read_file",
+        "input": {}, "toolCallId": "call-1"});
+    svc.set_live_turn(&id, "msg", vec![tool.clone()]);
+    let mut expected = idle.clone();
+    expected["isWaitingForOtherAgents"] = json!(true);
+    expected["waitingForAgentIds"] = json!([child]);
+    assert_eq!(svc.agent_activity_flags(id.clone()).await, expected);
+
+    svc.set_test_busy(&id, true);
+    expected["isResponding"] = json!(true);
+    expected["isWaitingOnTool"] = json!(true);
+    expected["turnInFlight"] = json!(true);
+    expected["lastStreamActivityAt"] = json!(svc.live_turn_activity_at(&id).unwrap());
+    assert_eq!(svc.agent_activity_flags(id.clone()).await, expected);
+
+    svc.set_live_turn(
+        &id,
+        "msg",
+        vec![
+            tool,
+            json!({"type": "tool_result",
+        "id": "msg:1", "tool_use_id": "call-1", "output": "ok", "is_error": false}),
+        ],
+    );
+    expected["isWaitingOnTool"] = json!(false);
+    expected["lastStreamActivityAt"] = json!(svc.live_turn_activity_at(&id).unwrap());
+    assert_eq!(svc.agent_activity_flags(id.clone()).await, expected);
+
+    // Terminal status suppresses even a busy worker, live slot, and child wait.
+    for status in [
+        AgentStatus::Completed,
+        AgentStatus::Error,
+        AgentStatus::Deleted,
+    ] {
+        svc.store()
+            .set_agent_session_status(&ws, &id, status, false, &now_iso(), None)
+            .await
+            .unwrap();
+        assert_eq!(svc.agent_activity_flags(id.clone()).await, idle);
+    }
+    // A failed metadata read keeps the subscription's all-false fallback.
+    svc.store().read_pool().close().await;
+    assert_eq!(svc.agent_activity_flags(id).await, idle);
 }
 
 #[tokio::test]
@@ -7092,6 +7210,92 @@ async fn get_conversation_seeks_around_message_id() {
 /// start of history (no `nextToken`), and a seek that lands on the newest
 /// window carries no `prevToken`. Precedence: `aroundMessageId` wins over a
 /// simultaneously supplied token.
+/// Five-row inclusive seeks must hand off exclusive directional cursors;
+/// re-seeking at the same anchor is not a substitute for following a token.
+#[tokio::test]
+async fn get_conversation_five_message_seek_cursors_progress_in_both_directions() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Five-row cursor walk").await;
+    for i in 0..20 {
+        svc.store()
+            .append_agent_message(
+                &id,
+                "assistant",
+                &json!([{ "type": "text", "text": format!("m{i}") }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append");
+    }
+    let landing = svc
+        .agent_get_conversation_op(id.clone(), Some(5), None, None, None, Some(10), None, false)
+        .await
+        .expect("ordinal seek");
+    let anchor = landing["messages"][2]["id"].as_str().unwrap().to_string();
+    let landing = svc
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(5),
+            None,
+            None,
+            Some(anchor),
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("inclusive message seek");
+    let texts = |page: &serde_json::Value| -> Vec<String> {
+        page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                row["contentBlocks"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+    assert_eq!(texts(&landing), ["m8", "m9", "m10", "m11", "m12"]);
+    for (direction, expected) in [
+        (
+            "nextToken",
+            vec![vec!["m3", "m4", "m5", "m6", "m7"], vec!["m0", "m1", "m2"]],
+        ),
+        (
+            "prevToken",
+            vec![vec!["m13", "m14", "m15", "m16", "m17"], vec!["m18", "m19"]],
+        ),
+    ] {
+        let mut cursor = landing[direction].as_str().unwrap().to_string();
+        for (index, expected_page) in expected.iter().enumerate() {
+            let page = svc
+                .agent_get_conversation_op(
+                    id.clone(),
+                    Some(5),
+                    None,
+                    Some(cursor.clone()),
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("directional page");
+            assert_eq!(texts(&page), *expected_page);
+            if index + 1 == expected.len() {
+                assert!(page[direction].is_null(), "walk must exhaust");
+            } else {
+                let next = page[direction].as_str().expect("next cursor");
+                assert_ne!(next, cursor, "cursor must advance");
+                cursor = next.to_string();
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn get_conversation_seek_clamps_at_edges_and_beats_token() {
     let (_t, svc, ws) = setup().await;
@@ -9368,11 +9572,15 @@ async fn set_model_normalizes_legacy_provider_aliases() {
 /// against the session provider — proving the param changes the outcome.
 #[tokio::test]
 async fn set_model_bare_model_with_explicit_provider_id() {
-    let (_t, svc, ws) = setup().await;
+    let (tmp, svc, ws) = setup().await;
     // The cross-provider switch below runs the availability gate against the
     // target, so pin claude-code to a deterministic executable rather than
     // depending on whether the test host happens to have it installed.
     seed_provider_path(&svc, "claude-code");
+    #[cfg(unix)]
+    let _cli_env = crate::test_support::installed_cli_env(tmp.path.parent().unwrap(), "claude");
+    #[cfg(not(unix))]
+    let _fixture_owner = tmp;
     // Warm caches: claude-code claims `haiku`, auggie's catalog lacks it.
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog.test_store(
@@ -14929,7 +15137,7 @@ async fn send_message_delivers_when_agent_exists() {
 async fn send_message_op_persists_message_metadata() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "MetaRecv").await;
-    let metadata = json!({
+    let mut metadata = json!({
         "type": "agent_message",
         "fromAgentId": "agent-11111111-1111-1111-1111-111111111111",
         "fromAgentName": "Coordinator"
@@ -14948,10 +15156,11 @@ async fn send_message_op_persists_message_metadata() {
     assert_eq!(r["queued"], false);
     let session = svc.store().get_agent_session(&id).await.expect("session");
     assert_eq!(session.messages.len(), 1);
+    metadata["submissionIds"] = json!([session.messages[0].id]);
     assert_eq!(
         session.messages[0].metadata.as_ref(),
         Some(&metadata),
-        "store-only send must persist messageMetadata verbatim"
+        "store-only send must preserve messageMetadata alongside submission identity"
     );
 }
 
@@ -14966,7 +15175,7 @@ async fn send_to_task_store_only_fallback_persists_message_metadata() {
     svc.assign_agent(ws.clone(), note_id.clone(), agent_id.0.clone(), None)
         .await
         .expect("assign");
-    let metadata = json!({
+    let mut metadata = json!({
         "type": "agent_message",
         "fromAgentId": "agent-22222222-2222-2222-2222-222222222222",
         "fromAgentName": "Sender"
@@ -14988,10 +15197,11 @@ async fn send_to_task_store_only_fallback_persists_message_metadata() {
         .await
         .expect("session");
     assert_eq!(session.messages.len(), 1);
+    metadata["submissionIds"] = json!([session.messages[0].id]);
     assert_eq!(
         session.messages[0].metadata.as_ref(),
         Some(&metadata),
-        "store-only sendToTask fallback must persist messageMetadata verbatim"
+        "store-only sendToTask fallback must preserve messageMetadata alongside submission identity"
     );
 }
 
@@ -16965,7 +17175,7 @@ async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
     )
     .await
     .expect("first send");
-    let metadata = answer_metadata(&asked_id);
+    let mut metadata = answer_metadata(&asked_id);
     let r = svc
         .agent_send_message_op(
             id.clone(),
@@ -16978,6 +17188,7 @@ async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
         .await
         .expect("send");
     assert_eq!(r["queued"], true);
+    metadata["submissionIds"] = json!(["dup-id"]);
     assert_eq!(r["queuedMessage"]["messageMetadata"], metadata);
     assert!(
         svc.questions_pending(&id).await,
@@ -16988,9 +17199,22 @@ async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
         .as_str()
         .expect("queued id")
         .to_string();
-    svc.agent_send_queued_message_now_op(id.clone(), queued_id)
+    let drained = svc
+        .agent_send_queued_message_now_op(id.clone(), queued_id.clone())
         .await
         .expect("drain queued answer");
+    assert_ne!(drained["messageId"], "dup-id");
+    let session = svc.store().get_agent_session(&id).await.unwrap();
+    let answer = session.messages.last().unwrap();
+    assert_eq!(json!(answer.id), drained["messageId"]);
+    let answer_metadata = answer.metadata.as_ref().unwrap();
+    assert_eq!(answer_metadata["submissionIds"], json!(["dup-id"]));
+    assert_eq!(answer_metadata["queueInfo"]["queuedMessageId"], queued_id);
+    assert_eq!(
+        session.messages.len(),
+        3,
+        "question, first send, and answer"
+    );
     assert!(
         !svc.questions_pending(&id).await,
         "the drained answer must clear the marker"
@@ -20392,6 +20616,38 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
     );
     let text = result["text"].as_str().expect("text");
     assert!(text.contains("stale-queue-entry"), "text: {text}");
+
+    // Recipient reads retain content-free warnings in both representations.
+    let before = svc.queue_snapshot(&target);
+    for filter in [None, Some(target.clone())] {
+        let own = intent_core::with_caller(
+            intent_core::Caller::Agent {
+                agent_id: target.clone(),
+            },
+            svc.agent_diagnostics_op(ws.clone(), filter, None, None),
+        )
+        .await
+        .expect("recipient diagnostics");
+        let queue = &own["diagnostics"]["queues"][0];
+        assert_eq!(queue["queueLength"], 2);
+        assert_eq!(queue["entries"], json!([]));
+        let own_risk = own["diagnostics"]["stuckRisks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["type"] == "stale-queue-entry")
+            .expect("recipient retains stale-queue-entry warning");
+        assert_eq!(own_risk["entryId"], entry_id);
+        assert_eq!(own_risk["count"], 1);
+        assert!(own["text"].as_str().unwrap().contains("stale-queue-entry"));
+        assert!(own["text"].as_str().unwrap().contains("contents hidden"));
+        assert!(!own.to_string().contains("\"content\""));
+    }
+    assert_eq!(
+        svc.queue_snapshot(&target),
+        before,
+        "diagnostics does not consume"
+    );
 
     // An actively-responding (non-stale) agent legitimately holds its queue
     // until the turn ends: no risk even with the old entry.
@@ -27320,6 +27576,123 @@ async fn status_list_and_diagnostics_surface_waiting_on_hooks() {
     );
 }
 
+/// The internal decoration must not hydrate retired history or active payloads.
+/// `SQLx` reports actual fetched rows, independently of the final wire projection.
+async fn assert_waiting_hooks_read_cost(batched: bool) {
+    use crate::test_tracing::{capture_sqlx_queries, warm_sqlx_pool};
+    use intent_core::{HookId, HookState};
+
+    let (_t, svc, ws) = setup().await;
+    let owner = create_agent(&svc, &ws, "Owner").await;
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    let bare = create_agent(&svc, &ws, "Bare").await;
+    let other_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other_ws))
+        .await
+        .unwrap();
+    let other = create_agent(&svc, &other_ws, "Other workspace").await;
+    let mut later = seed_active_hook(&svc, &ws, &owner, "Later").await;
+    later.created_at = "2026-08-02T13:00:02Z".into();
+    later.code = "c".repeat(16_384);
+    later.last_logs = Some("l".repeat(16_384));
+    later.last_state = Some("s".repeat(16_384));
+    // Replace the seed to control insertion order independently of creation time.
+    sqlx::query("DELETE FROM hook")
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    let mut earlier = later.clone();
+    earlier.hook_id = HookId::new();
+    earlier.name = "Earlier".into();
+    earlier.created_at = "2026-08-02T13:00:01Z".into();
+    earlier.state = HookState::Running;
+    earlier.next_run_at = None;
+    earlier.expires_at = None;
+    let mut peer_hook = later.clone();
+    peer_hook.hook_id = HookId::new();
+    peer_hook.agent_id = peer.clone();
+    let mut foreign_hook = later.clone();
+    foreign_hook.hook_id = HookId::new();
+    foreign_hook.workspace_id = other_ws;
+    foreign_hook.agent_id = other;
+    for hook in [&later, &peer_hook, &foreign_hook, &earlier] {
+        svc.store().insert_hook(hook).await.unwrap();
+    }
+    let expected = vec![
+        json!({"hookId": earlier.hook_id, "name": "Earlier"}),
+        json!({"hookId": later.hook_id, "name": "Later",
+            "nextRunAt": later.next_run_at, "expiresAt": later.expires_at}),
+    ];
+    warm_sqlx_pool(svc.store().read_pool()).await;
+    // Grow retired history twice; neither growth may increase fetched rows.
+    let mut cost_failures = Vec::new();
+    for retired_count in [0, 256, 512] {
+        if retired_count != 0 {
+            let mut tx = svc.store().write_pool().begin().await.unwrap();
+            for n in 0..256 {
+                let state = ["dispatched", "cancelled", "expired", "evicted"][n % 4];
+                sqlx::query("INSERT INTO hook (hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at, last_logs, last_state) VALUES (?, ?, ?, 'Retired', ?, 10000, ?, '2026-01-01', ?, ?)")
+                    .bind(format!("retired-{retired_count}-{n}"))
+                    .bind(&ws.0).bind(&owner.0).bind(&later.code).bind(state)
+                    .bind(&later.last_logs).bind(&later.last_state)
+                    .execute(&mut *tx).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        let ((), queries) = capture_sqlx_queries(async {
+            if batched {
+                let listed = svc.agent_list_op(ws.clone()).await.unwrap();
+                assert_eq!(listed.len(), 3, "other workspace excluded");
+                let row = |id: &AgentId| listed.iter().find(|a| &a.id == id).unwrap();
+                assert_eq!(row(&owner).waiting_on_hooks, expected);
+                assert_eq!(row(&peer).waiting_on_hooks.len(), 1);
+                assert!(serde_json::to_value(row(&bare))
+                    .unwrap()
+                    .get("waitingOnHooks")
+                    .is_none());
+            } else {
+                let row = svc
+                    .agent_get_op(owner.clone(), Some(ws.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(row.waiting_on_hooks, expected);
+            }
+        })
+        .await;
+        let hook_queries: Vec<_> = queries
+            .iter()
+            .filter(|q| q.sql.contains("FROM hook "))
+            .collect();
+        assert_eq!(hook_queries.len(), 1, "one hook read: {queries:?}");
+        let query = hook_queries[0];
+        if query.rows_returned != if batched { 3 } else { 2 } {
+            cost_failures.push(format!("retired history={retired_count}: {query:?}"));
+        }
+        let columns = query.sql.split("FROM").next().unwrap();
+        for heavy in ["code", "last_logs", "last_state"] {
+            if columns.contains(heavy) {
+                cost_failures.push(format!("active {heavy} payload hydration: {query:?}"));
+            }
+        }
+    }
+    assert!(cost_failures.is_empty(), "{}", cost_failures.join("\n"));
+    // Visibility remains best-effort if the store read fails.
+    svc.store().read_pool().close().await;
+    assert!(svc.active_hooks_for_agent(&owner).await.is_empty());
+    assert!(svc.active_hooks_by_agent(&ws).await.is_empty());
+}
+
+#[tokio::test]
+async fn agent_get_waiting_hooks_does_not_hydrate_history_or_payloads() {
+    assert_waiting_hooks_read_cost(false).await;
+}
+
+#[tokio::test]
+async fn agent_list_waiting_hooks_does_not_hydrate_history_or_payloads() {
+    assert_waiting_hooks_read_cost(true).await;
+}
+
 /// Idle-visibility on the read surfaces (unified external-wait, mirrors
 /// `status_list_and_diagnostics_surface_waiting_on_hooks`): `agent.get`/
 /// `agent.list` overlay `waitingOnPrMonitors` for monitor-owning agents
@@ -33925,6 +34298,8 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
     // persisted=true (matching persist_error_and_requeue's behavior).
     let message_id = new_message_id();
     let queued = QueuedMessage {
+        delivery_groups: None,
+        prepend_delivery_groups: None,
         turn_id: message_id.clone(),
         id: message_id,
         content: "failed message".to_string(),
@@ -33944,6 +34319,8 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
         hold_until: None,
         child_agent_id: None,
         merged_submission_ids: Vec::new(),
+        recovery_sources: Vec::new(),
+        correlation_order_known: true,
         edit_appended: String::new(),
         edit_prepended: String::new(),
         editing_message_id: None,
@@ -34510,6 +34887,8 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
     svc.requeue_front(
         &id,
         crate::agent_ops::QueuedMessage {
+            delivery_groups: None,
+            prepend_delivery_groups: None,
             id: requeue_id.clone(),
             turn_id: "turn-before-failure".to_string(),
             content: "requeued".to_string(),
@@ -34529,6 +34908,8 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
             hold_until: None,
             child_agent_id: None,
             merged_submission_ids: Vec::new(),
+            recovery_sources: Vec::new(),
+            correlation_order_known: true,
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
@@ -34967,6 +35348,8 @@ async fn rehydrate_flushes_expired_and_rearms_unexpired_holds() {
 /// resets and preservations are both observable.
 fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
     crate::agent_ops::QueuedMessage {
+        delivery_groups: None,
+        prepend_delivery_groups: None,
         id: id.to_string(),
         turn_id: id.to_string(),
         content: content.to_string(),
@@ -34986,6 +35369,8 @@ fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
         hold_until: None,
         child_agent_id: None,
         merged_submission_ids: Vec::new(),
+        recovery_sources: Vec::new(),
+        correlation_order_known: true,
         edit_appended: String::new(),
         edit_prepended: String::new(),
         editing_message_id: None,
@@ -43346,252 +43731,6 @@ async fn dequeue_ready_batch_user_led_without_user_entry_is_noop() {
     );
 }
 
-/// System-only batch dequeue (`agents.flushQueuedMessages = "systemOnly"`):
-/// ALL ready system-origin entries are pulled out ANYWHERE in the queue,
-/// preserving their relative order, even when interleaved with user-origin
-/// entries — which are left untouched in their original positions.
-#[tokio::test]
-async fn dequeue_system_only_batch_pulls_interleaved_system_entries_in_order() {
-    let (_t, svc, ws) = setup().await;
-    let agent = create_agent(&svc, &ws, "SystemOnlyBatch").await;
-
-    svc.enqueue_message(
-        &agent,
-        "sys-1".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    svc.enqueue_message(
-        &agent,
-        "user-1".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::User,
-    );
-    svc.enqueue_message(
-        &agent,
-        "sys-2".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    svc.enqueue_message(
-        &agent,
-        "user-2".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::User,
-    );
-    svc.enqueue_message(
-        &agent,
-        "sys-3".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-
-    let batch = svc
-        .dequeue_system_only_batch(&agent, 2)
-        .expect("three system entries meet the min");
-    let contents: Vec<_> = batch.iter().map(|m| m.content.as_str()).collect();
-    assert_eq!(
-        contents,
-        vec!["sys-1", "sys-2", "sys-3"],
-        "all system entries batched in relative order, ahead of interleaved user entries"
-    );
-    let snap = svc.queue_snapshot(&agent);
-    let remaining: Vec<_> = snap.iter().map(|v| v["content"].clone()).collect();
-    assert_eq!(
-        remaining,
-        vec![json!("user-1"), json!("user-2")],
-        "user-origin entries stay queued in their original order"
-    );
-}
-
-/// A single ready system entry is below `min_ready`: the batch dequeue is a
-/// no-op, so the single-entry FIFO path handles it alone.
-#[tokio::test]
-async fn dequeue_system_only_batch_returns_none_below_min_ready() {
-    let (_t, svc, ws) = setup().await;
-    let agent = create_agent(&svc, &ws, "SystemOnlyMin").await;
-    svc.enqueue_message(
-        &agent,
-        "sys-only".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-
-    assert!(
-        svc.dequeue_system_only_batch(&agent, 2).is_none(),
-        "one ready system entry < min_ready 2"
-    );
-    assert_eq!(
-        svc.queue_snapshot(&agent).len(),
-        1,
-        "queue untouched on the None path"
-    );
-}
-
-/// `dequeue_flush_batch` dispatches on the mode: `All` behaves like
-/// [`Services::dequeue_ready_batch`], `SystemOnly` like
-/// [`Services::dequeue_system_only_batch`] (but never batches under an
-/// active hold, since the hold's release is by definition a user-origin
-/// entry), and `Off` always returns `None`.
-#[tokio::test]
-async fn dequeue_flush_batch_dispatches_by_mode() {
-    let (_t, svc, ws) = setup().await;
-
-    // `All` batches every ready entry.
-    let agent_all = create_agent(&svc, &ws, "ModeAll").await;
-    svc.enqueue_message(
-        &agent_all,
-        "a".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    svc.enqueue_message(
-        &agent_all,
-        "b".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    let batch = svc
-        .dequeue_flush_batch(
-            &agent_all,
-            intent_core::FlushQueuedMessagesMode::All,
-            false,
-            2,
-        )
-        .expect("all mode batches");
-    assert_eq!(batch.len(), 2);
-
-    // `SystemOnly` batches only system-origin entries.
-    let agent_sys = create_agent(&svc, &ws, "ModeSystemOnly").await;
-    svc.enqueue_message(
-        &agent_sys,
-        "sys-a".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    svc.enqueue_message(
-        &agent_sys,
-        "sys-b".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    let batch = svc
-        .dequeue_flush_batch(
-            &agent_sys,
-            intent_core::FlushQueuedMessagesMode::SystemOnly,
-            false,
-            2,
-        )
-        .expect("systemOnly mode batches system entries");
-    assert_eq!(batch.len(), 2);
-
-    // `SystemOnly` never batches while a hold is active.
-    let agent_hold = create_agent(&svc, &ws, "ModeSystemOnlyHold").await;
-    svc.enqueue_message(
-        &agent_hold,
-        "sys-a".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    svc.enqueue_message(
-        &agent_hold,
-        "sys-b".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    assert!(
-        svc.dequeue_flush_batch(
-            &agent_hold,
-            intent_core::FlushQueuedMessagesMode::SystemOnly,
-            true,
-            2,
-        )
-        .is_none(),
-        "systemOnly never batches under an active hold"
-    );
-
-    // `Off` always returns `None`.
-    let agent_off = create_agent(&svc, &ws, "ModeOff").await;
-    svc.enqueue_message(
-        &agent_off,
-        "a".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    svc.enqueue_message(
-        &agent_off,
-        "b".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        MessageOrigin::Automatic,
-    );
-    assert!(
-        svc.dequeue_flush_batch(
-            &agent_off,
-            intent_core::FlushQueuedMessagesMode::Off,
-            false,
-            2,
-        )
-        .is_none(),
-        "off mode never batches"
-    );
-}
-
 /// `requeue_front_batch` re-inserts a drained remainder at the queue front in
 /// original order (never-lost, persist-failure path).
 #[tokio::test]
@@ -46493,6 +46632,96 @@ mod resume_tail_recap {
         assert_eq!(recap.text.matches("</interrupted_user_message>").count(), 1);
     }
 
+    /// Failure case: interrupted tail recap pools images from multiple user
+    /// rows after all recap text, losing which message each image belongs to.
+    #[test]
+    fn recap_preserves_user_attachment_groups_in_tail_order() {
+        let messages = vec![
+            message(
+                "user",
+                json!([
+                    {"type":"text","text":"first tail group"},
+                    {"type":"image","data":"FIRST","mimeType":"image/png"}
+                ]),
+                None,
+            ),
+            message(
+                "user",
+                json!([
+                    {"type":"text","text":"second tail group"},
+                    {"type":"file","attachmentId":"second","fileName":"second.txt"}
+                ]),
+                None,
+            ),
+            interrupted_assistant("unfinished response"),
+        ];
+        let recap = build_resume_tail_recap(&messages).unwrap();
+        let groups = recap.delivery_groups.unwrap();
+        let first = groups
+            .iter()
+            .position(|g| g.content.contains("first tail group"))
+            .unwrap();
+        let second = groups
+            .iter()
+            .position(|g| g.content.contains("second tail group"))
+            .unwrap();
+        assert!(first < second);
+        assert_eq!(
+            groups[first].image_blocks.as_ref().unwrap()[0]["data"],
+            "FIRST"
+        );
+        assert_eq!(
+            groups[second].file_blocks.as_ref().unwrap()[0]["attachmentId"],
+            "second"
+        );
+        let joined: String = groups.iter().map(|g| g.content.as_str()).collect();
+        for text in [
+            "first tail group",
+            "second tail group",
+            "unfinished response",
+        ] {
+            assert_eq!(joined.matches(text).count(), 1);
+        }
+    }
+
+    /// Attachment-only rows must keep a segment even when a different row
+    /// activates grouped delivery for the restart recap.
+    #[test]
+    fn recap_keeps_attachment_only_user_groups() {
+        let messages = vec![
+            user("text before attachment-only rows"),
+            message(
+                "user",
+                json!([{"type":"image","data":"ONLY","mimeType":"image/png"}]),
+                None,
+            ),
+            message(
+                "user",
+                json!([{"type":"file","attachmentId":"only-file","fileName":"only.txt"}]),
+                None,
+            ),
+            message("assistant", json!([]), Some(json!({"interrupted":true}))),
+        ];
+        let recap = build_resume_tail_recap(&messages).unwrap();
+        let groups = recap.delivery_groups.unwrap();
+        let image = groups
+            .iter()
+            .position(|g| g.image_blocks.is_some())
+            .unwrap();
+        let file = groups.iter().position(|g| g.file_blocks.is_some()).unwrap();
+        assert!(image < file);
+        assert_eq!(
+            groups[image].image_blocks.as_ref().unwrap()[0]["data"],
+            "ONLY"
+        );
+        assert_eq!(
+            groups[file].file_blocks.as_ref().unwrap()[0]["attachmentId"],
+            "only-file"
+        );
+        assert!(groups[image].content.contains("interrupted_user_message"));
+        assert!(groups[file].content.contains("interrupted_user_message"));
+    }
+
     /// Replayed user rows keep their attachment blocks: the recap carries
     /// them so an interrupted attachment-bearing request resumes with the
     /// original image/file, not just its text.
@@ -47945,7 +48174,7 @@ async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
 
 #[tokio::test]
 async fn send_queued_message_now_store_only_processing_requires_successful_persistence() {
-    for outcome in ["new", "persisted", "failure"] {
+    for outcome in ["new", "persisted", "collision", "failure"] {
         let (_tmp, svc, ws, _bus) = setup_with_bus().await;
         let agent = create_agent(&svc, &ws, "Processing").await;
         let queued = svc
@@ -47959,7 +48188,7 @@ async fn send_queued_message_now_store_only_processing_requires_successful_persi
             .await
             .unwrap();
         let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
-        if outcome != "new" {
+        if matches!(outcome, "persisted" | "collision") {
             svc.store
                 .append_agent_message_with_id(
                     &agent,
@@ -47975,10 +48204,25 @@ async fn send_queued_message_now_store_only_processing_requires_successful_persi
         if outcome == "persisted" {
             svc.agent_queues.lock().unwrap().get_mut(&agent).unwrap()[0].persisted = true;
         }
+        if outcome == "failure" {
+            sqlx::query("CREATE TRIGGER fail_queue_delivery BEFORE INSERT ON agent_message BEGIN SELECT RAISE(FAIL, 'queue delivery fault'); END")
+                .execute(svc.store.write_pool())
+                .await
+                .unwrap();
+        }
         let result = svc
             .agent_send_queued_message_now_op(agent.clone(), entry_id.clone())
             .await;
         assert_eq!(result.is_ok(), outcome != "failure");
+        if outcome == "collision" {
+            assert_ne!(result.as_ref().unwrap()["messageId"], entry_id);
+            let session = svc.store.get_agent_session(&agent).await.unwrap();
+            assert_eq!(session.messages.len(), 2);
+            assert_eq!(
+                session.messages[1].metadata.as_ref().unwrap()["submissionIds"],
+                json!([entry_id])
+            );
+        }
         let events: Vec<_> = svc
             .store
             .query_events(&intent_store::EventQuery::default())
@@ -48002,5 +48246,121 @@ async fn send_queued_message_now_store_only_processing_requires_successful_persi
             );
             assert!(svc.queue_snapshot(&agent).is_empty());
         }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel() {
+    for grouped in [false, true] {
+        let (_t, svc, ws) = setup().await;
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        let svc = if grouped {
+            svc
+        } else {
+            svc.with_completion_claim_park(park.clone())
+        };
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        let script = svc
+            .script_create(
+                ws.clone(),
+                intent_core::ScriptCreateParams {
+                    name: "Monitor check".into(),
+                    command: "true".into(),
+                    mode: intent_core::ScriptMode::Command,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let sid = script["id"].as_str().unwrap().to_owned();
+        svc.store
+            .admit_script_run(&ws, &sid, "accepted-reservation")
+            .await
+            .unwrap();
+        let monitor = svc
+            .script_monitor(ws.clone(), child.clone(), sid, json!({"ttlMs":60000}))
+            .await
+            .unwrap();
+        let gid = grouped.then(|| {
+            let gid = svc.get_or_create_delegation_group(&ws, &parent);
+            svc.enroll_child_in_group(&gid, &child);
+            gid
+        });
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            gid,
+        )
+        .unwrap();
+        let mut data = json!({"agentId":child});
+        svc.annotate_waiting_on_pr_monitors(&child, &mut data).await;
+        assert_eq!(
+            data["waitingOnScriptMonitors"][0]["monitorId"],
+            monitor["monitor"]["monitorId"]
+        );
+        svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data.clone()))
+            .await;
+        svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data))
+            .await;
+        assert_eq!(parent_message_count(&svc, &parent).await, 1);
+        assert!(parent_messages_text(&svc, &parent)
+            .await
+            .contains("Monitor check"));
+        assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+        if grouped {
+            svc.handle_completion_event(&completion_event(
+                &ws,
+                AGENT_IDLE,
+                &parent,
+                json!({"agentId":parent}),
+            ))
+            .await;
+        }
+        wait_for_persisted_watches(&svc, 1).await;
+        let cancellation = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws.clone();
+            let child = child.clone();
+            async move {
+                svc.cancel_script_monitors(&ws, Some(&child), "owner-retired")
+                    .await
+                    .unwrap();
+            }
+        });
+        if !grouped {
+            timeout(Duration::from_secs(5), park.entered.notified())
+                .await
+                .expect("cancellation redelivery claims the watch");
+            // The competing idle pass must yield to the existing delivery;
+            // its return does not promise that the winner has retired yet.
+            svc.handle_completion_event(&completion_event(
+                &ws,
+                AGENT_IDLE,
+                &child,
+                json!({"agentId":child}),
+            ))
+            .await;
+            assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+            assert_eq!(parent_message_count(&svc, &parent).await, 1);
+            park.release.notify_one();
+        }
+        timeout(Duration::from_secs(5), cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        // Cancellation and commit_monitor's spawned redelivery race for the
+        // same claim. Await durable retirement by the winner, preserving the
+        // exact final assertions for both individual and after_all watches.
+        wait_for_persisted_watches(&svc, 0).await;
+        assert!(svc.find_watches_for_child(&child).is_empty());
+        assert_eq!(parent_message_count(&svc, &parent).await, 2);
+        assert!(svc
+            .active_script_monitors_for_agent(&child)
+            .await
+            .is_empty());
     }
 }

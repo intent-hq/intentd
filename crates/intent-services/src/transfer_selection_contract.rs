@@ -319,7 +319,10 @@ import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
-const [root, raw, component, mode, output, compiledRevision, compiledGenerator] = process.argv.slice(1);
+const [fixtureRoot, raw, component, mode, output, compiledRevision, compiledGenerator] = process.argv.slice(1);
+// Follow symlinks before resolving parent segments. Use this same physical
+// directory for validator discovery and every fixture read/write below.
+const root = fs.realpathSync.native(fixtureRoot);
 const { assertContract, assertGenerated, assertFresh, normalizeCases, hashJson, resolveGoldenPath } = await import(
   pathToFileURL(path.resolve(root, '../../../../scripts/check-transfer-selection-contract.mjs')));
 const read = p => JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -365,6 +368,106 @@ fn verify(root: &Path, rows: &Path, mode: &str, output: &Path) -> std::process::
         .arg(sha256(SOURCE))
         .output()
         .expect("Node is required to validate the shared transfer-selection contract")
+}
+
+#[test]
+fn validator_accepts_physical_fixture_aliases() {
+    let fixtures = std::fs::canonicalize(fixture_root()).unwrap();
+    let temporary = test_tempdir("transfer-selection-paths-");
+    let rows = temporary.path().join("rows.json");
+    write_json(
+        &rows,
+        &read_json(&fixtures.join("public-sessions.json"))["cases"],
+    );
+    let alias = temporary.path().join("external alias with spaces");
+    std::os::unix::fs::symlink(&fixtures, &alias).unwrap();
+    // A lexical sibling must not replace the physical target after alias/..
+    // traversal. Its malformed input would fail validation if selected.
+    let lexical = temporary.path().join("transfer-selection");
+    std::fs::create_dir(&lexical).unwrap();
+    write_json(&lexical.join("contract.json"), &json!({}));
+    for root in [
+        fixtures,
+        alias.clone(),
+        alias.join(""),
+        alias.join("../transfer-selection"),
+    ] {
+        let result = verify(&root, &rows, "check", Path::new(""));
+        assert!(
+            result.status.success(),
+            "{}: {}",
+            root.display(),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[test]
+fn validator_rejects_corrupt_physical_inputs_despite_valid_lexical_sibling() {
+    let fixtures = std::fs::canonicalize(fixture_root()).unwrap();
+    let temporary = test_tempdir("transfer-selection-corrupt-paths-");
+    let rows = temporary.path().join("rows.json");
+    write_json(
+        &rows,
+        &read_json(&fixtures.join("public-sessions.json"))["cases"],
+    );
+    let physical_checkout = temporary.path().join("physical checkout");
+    let lexical_checkout = temporary.path().join("lexical checkout");
+    let physical = physical_checkout.join("docs/protocol/fixtures/transfer-selection");
+    let lexical = lexical_checkout.join("docs/protocol/fixtures/transfer-selection");
+    // Isolated mutation inputs only; both checkouts use the real shared validator.
+    for (checkout, root) in [
+        (&physical_checkout, &physical),
+        (&lexical_checkout, &lexical),
+    ] {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::create_dir(checkout.join("scripts")).unwrap();
+        std::os::unix::fs::symlink(
+            fixtures.join("../../../../scripts/check-transfer-selection-contract.mjs"),
+            checkout.join("scripts/check-transfer-selection-contract.mjs"),
+        )
+        .unwrap();
+        for file in ["contract.json", "public-sessions.json"] {
+            std::fs::copy(fixtures.join(file), root.join(file)).unwrap();
+        }
+    }
+    let alias = lexical.parent().unwrap().join("alias with spaces");
+    std::os::unix::fs::symlink(&physical, &alias).unwrap();
+    let traversed = alias.join("../transfer-selection");
+    for root in [&physical, &alias, &traversed] {
+        let result = verify(root, &rows, "check", Path::new(""));
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    for (file, diagnostic) in [
+        ("contract.json", "contract keys"),
+        ("public-sessions.json", "generated envelope keys"),
+    ] {
+        let original = std::fs::read(physical.join(file)).unwrap();
+        write_json(&lexical.join(file), &json!({}));
+        let result = verify(&traversed, &rows, "check", Path::new(""));
+        assert!(
+            result.status.success(),
+            "corrupt lexical {file}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        std::fs::write(lexical.join(file), &original).unwrap();
+        write_json(&physical.join(file), &json!({}));
+        for root in [&physical, &alias, &traversed] {
+            let result = verify(root, &rows, "check", Path::new(""));
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                !result.status.success(),
+                "{} accepted corrupt {file}",
+                root.display()
+            );
+            assert!(stderr.contains(diagnostic), "{}: {stderr}", root.display());
+        }
+        std::fs::write(physical.join(file), original).unwrap();
+    }
 }
 
 #[test]

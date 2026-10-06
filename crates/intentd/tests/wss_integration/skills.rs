@@ -72,16 +72,34 @@ async fn wss_skill_list_repo_less_preserves_authorization_and_does_not_provision
 async fn wss_skill_list_configured_keeps_project_precedence() {
     let srv = start(WsOptions::default()).await;
     let project = srv.dir.path().join("project");
-    for (tier, description) in [(".agents", "base"), (".intent", "override")] {
-        let dir = project
-            .join(tier)
-            .join("skills/intent-5862-project-fixture");
+    for (tier, description) in [
+        (".agent/skills", "agent"),
+        (".agents/skills", "agents"),
+        (".codex/skills", "codex"),
+        (".factory/skills", "factory"),
+        (".grok/skills", "grok"),
+        (".opencode/skill", "opencode-singular"),
+        (".opencode/skills", "opencode"),
+        (".pi/skills", "pi"),
+        (".cortex/skills", "cortex"),
+        (".claude/skills", "claude"),
+        (".augment/skills", "augment"),
+        (".intent/skills", "override"),
+    ] {
+        let dir = project.join(tier).join("intent-5862-project-fixture");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("SKILL.md"),
             format!(
                 "---\nname: intent-5862-project-fixture\ndescription: {description}\n---\nBody\n"
             ),
+        )
+        .unwrap();
+        let unique = project.join(tier).join("unique");
+        std::fs::create_dir_all(&unique).unwrap();
+        std::fs::write(
+            unique.join("SKILL.md"),
+            format!("---\nname: intent-6632-{description}\ndescription: project root\n---\nBody\n"),
         )
         .unwrap();
     }
@@ -109,6 +127,15 @@ async fn wss_skill_list_configured_keeps_project_precedence() {
     assert_eq!(matching.len(), 1);
     assert_eq!(matching[0]["scope"], "project");
     assert_eq!(matching[0]["description"], "override");
+    assert_eq!(
+        skills
+            .iter()
+            .filter(|s| s["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("intent-6632-")))
+            .count(),
+        12
+    );
     assert!(skills
         .windows(2)
         .all(|pair| pair[0]["name"].as_str() <= pair[1]["name"].as_str()));

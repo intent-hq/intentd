@@ -1,4 +1,4 @@
-//! Commit creation (`git.commit` / `git.agentCommit`).
+//! Commit creation for agent commits and accept-changes.
 //!
 //! Ports `gitService.commit`: a commit is built from the current index
 //! (already-staged changes) using the repository's configured identity, mirroring
@@ -83,6 +83,19 @@ pub struct CommitOutcome {
 ///
 /// Returns `Error::Internal` if there is nothing staged to commit or another libgit2 operation fails.
 pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
+    commit_observed(worktree_path, message, |_| {})
+}
+
+/// Commit with an original-operation observation immediately after the actual
+/// commit primitive, before fallible attribution and merge cleanup.
+/// The observer records completion only; it must not dispatch another stage.
+/// # Errors
+/// Preserves the ordinary commit errors, including failures after observation.
+pub fn commit_observed(
+    worktree_path: &Path,
+    message: &str,
+    observed: impl FnOnce(&str),
+) -> Result<CommitOutcome> {
     let mut repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let merge_heads = pending_merge_heads(&mut repo)?;
     let mut index = repo.index().map_err(map_git_err)?;
@@ -117,6 +130,7 @@ pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
     let oid = repo
         .commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
         .map_err(map_git_err)?;
+    observed(&oid.to_string());
     if !merge_parents.is_empty() {
         // Drop MERGE_HEAD/MERGE_MSG etc. so the repo leaves the merging
         // state, exactly like `git commit` finishing a merge. The merge
@@ -138,7 +152,7 @@ pub fn commit(worktree_path: &Path, message: &str) -> Result<CommitOutcome> {
 /// Create a commit whose body carries attribution trailers, building the message
 /// via [`build_commit_message`] before committing the staged index. Mirrors
 /// [`commit`] except for the trailer-aware message; used by the agent commit path
-/// while bare [`commit`] backs `git.commit`.
+/// while bare [`commit`] also serves accept-changes.
 ///
 /// # Errors
 ///

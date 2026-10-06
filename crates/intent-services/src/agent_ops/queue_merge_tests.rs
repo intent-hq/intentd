@@ -91,7 +91,7 @@ async fn queue_merge_preserves_edit_hold_and_appended_text_on_save() {
 }
 
 #[tokio::test]
-async fn queue_merge_preserves_metadata_attachments_and_restart_deduplication() {
+async fn queue_merge_preserves_metadata_and_restart_deduplication() {
     let (_tmp, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "Merge").await;
     let first_metadata = json!({"fromPrincipalId":"a","type":"question_answers","answeredQuestionsMessageId":"q1","custom":1});
@@ -100,8 +100,8 @@ async fn queue_merge_preserves_metadata_attachments_and_restart_deduplication() 
         &agent,
         Some("first".into()),
         "one".into(),
-        Some(json!([{"imageRef":"one"}])),
-        Some(json!([{"path":"one"}])),
+        None,
+        None,
         Some(first_metadata.clone()),
         None,
         false,
@@ -111,10 +111,11 @@ async fn queue_merge_preserves_metadata_attachments_and_restart_deduplication() 
         &agent,
         Some("second".into()),
         "two".into(),
-        Some(json!([{"imageRef":"two"}])),
-        Some(json!([{"path":"two"}])),
+        None,
+        None,
         Some(second_metadata.clone()),
         Some(QueuedPrepend {
+            delivery_groups: None,
             content: Some("preempted".into()),
             image_blocks: None,
             file_blocks: None,
@@ -125,14 +126,8 @@ async fn queue_merge_preserves_metadata_attachments_and_restart_deduplication() 
     assert_eq!(merged.id, first.id);
     assert_eq!(position, 0);
     assert_eq!(merged.prepend_content.as_deref(), Some("preempted"));
-    assert_eq!(
-        merged.image_blocks,
-        Some(json!([{"imageRef":"one"},{"imageRef":"two"}]))
-    );
-    assert_eq!(
-        merged.file_blocks,
-        Some(json!([{"path":"one"},{"path":"two"}]))
-    );
+    assert!(merged.image_blocks.is_none());
+    assert!(merged.file_blocks.is_none());
     assert_eq!(
         merged.message_metadata.as_ref().unwrap()[MERGED_MESSAGE_METADATA_KEY],
         json!([first_metadata, second_metadata])
@@ -389,6 +384,7 @@ async fn queue_merge_interrupt_retains_position_and_carryover() {
         None,
         Some(json!({"fromPrincipalId":"a"})),
         Some(QueuedPrepend {
+            delivery_groups: None,
             content: Some("carryover".into()),
             image_blocks: Some(json!([{"imageRef":"carryover"}])),
             file_blocks: None,
@@ -396,10 +392,10 @@ async fn queue_merge_interrupt_retains_position_and_carryover() {
         true,
         MessageOrigin::User,
     );
-    assert_eq!(merged.id, first.id);
-    assert_eq!(position, 1);
-    assert!(!merged.interrupt_priority);
-    assert_eq!(merged.content, "one\n\ntwo");
+    assert_ne!(merged.id, first.id);
+    assert_eq!(position, 0);
+    assert!(merged.interrupt_priority);
+    assert_eq!(merged.content, "two");
     assert_eq!(merged.prepend_content.as_deref(), Some("carryover"));
     assert_eq!(
         merged.prepend_image_blocks,
@@ -409,7 +405,7 @@ async fn queue_merge_interrupt_retains_position_and_carryover() {
 
 #[tokio::test]
 async fn queue_merge_provisional_handback_coalesces_newer_held_input() {
-    for batch in [false, true] {
+    for (batch, attachments) in [(false, false), (true, false), (false, true), (true, true)] {
         let (_tmp, svc, ws) = setup().await;
         let agent = create_agent(&svc, &ws, "Handback").await;
         let first = enqueue(&svc, &agent, "first", "a", "one");
@@ -422,12 +418,12 @@ async fn queue_merge_provisional_handback_coalesces_newer_held_input() {
             .get(&agent)
             .unwrap()
             .is_empty());
-        popped.image_blocks = Some(json!([{"imageRef":"first"}]));
+        popped.image_blocks = attachments.then(|| json!([{"imageRef":"first"}]));
         let (newer, _) = svc.enqueue_message_with_id(
             &agent,
             Some("second".into()),
             "two".into(),
-            Some(json!([{"imageRef":"second"}])),
+            attachments.then(|| json!([{"imageRef":"second"}])),
             None,
             Some(json!({"fromPrincipalId":"a"})),
             None,
@@ -445,15 +441,22 @@ async fn queue_merge_provisional_handback_coalesces_newer_held_input() {
         }
         drop(draining);
         let queue = svc.queue_snapshot(&agent);
-        assert_eq!(queue.len(), 1, "undelivered handback must coalesce");
+        assert_eq!(queue.len(), if attachments { 2 } else { 1 });
         assert_eq!(queue[0]["id"], first.id);
-        assert_eq!(queue[0]["content"], "one\n\ntwo");
-        assert_eq!(queue[0]["editing"], true);
-        assert_eq!(queue[0]["editingMessageId"], newer.id);
-        assert_eq!(
-            queue[0]["imageBlocks"],
-            json!([{"imageRef":"first"},{"imageRef":"second"}])
-        );
+        let held_index = usize::from(attachments);
+        if attachments {
+            assert_eq!(queue[0]["content"], "one");
+            assert_eq!(queue[0]["imageBlocks"], json!([{"imageRef":"first"}]));
+            assert_eq!(queue[1]["id"], newer.id);
+            assert_eq!(queue[1]["content"], "two");
+            assert_eq!(queue[1]["imageBlocks"], json!([{"imageRef":"second"}]));
+            assert_eq!(queue[1]["editingMessageId"], newer.id);
+        } else {
+            assert_eq!(queue[0]["content"], "one\n\ntwo");
+            assert_eq!(queue[0]["editingMessageId"], newer.id);
+            assert!(queue[0].get("imageBlocks").is_none());
+        }
+        assert_eq!(queue[held_index]["editing"], true);
         assert!(matches!(
             svc.claim_parked_recovery_send(&agent),
             RecoverySendClaim::Deferred
@@ -462,25 +465,46 @@ async fn queue_merge_provisional_handback_coalesces_newer_held_input() {
             .agent_edit_queued_message_op(agent.clone(), newer.id, "edited two".into(), Some(false))
             .await
             .unwrap();
-        assert_eq!(saved["queuedMessage"]["content"], "one\n\nedited two");
-        assert!(saved["queuedMessage"].get("editingMessageId").is_none());
-        assert!(svc
-            .agent_edit_queued_message_op(
-                agent.clone(),
-                "second".into(),
-                "stale".into(),
-                Some(false)
-            )
-            .await
-            .is_err());
-        assert_eq!(
-            enqueue(&svc, &agent, "second", "a", "two").content,
+        let edited = if attachments {
+            "edited two"
+        } else {
             "one\n\nedited two"
-        );
-        let RecoverySendClaim::Drained(pair) = svc.claim_parked_recovery_send(&agent) else {
-            panic!("absorbed recovery id must still authorize the survivor")
         };
-        assert_eq!(pair.0.id, first.id);
+        assert_eq!(saved["queuedMessage"]["content"], edited);
+        if attachments {
+            assert_eq!(
+                saved["queuedMessage"]["imageBlocks"],
+                json!([{"imageRef":"second"}])
+            );
+            let first_row = svc.queue_snapshot(&agent)[0].clone();
+            assert_eq!(first_row["content"], "one");
+            assert_eq!(first_row["imageBlocks"], json!([{"imageRef":"first"}]));
+        }
+        assert!(saved["queuedMessage"].get("editingMessageId").is_none());
+        if !attachments {
+            assert!(svc
+                .agent_edit_queued_message_op(
+                    agent.clone(),
+                    "second".into(),
+                    "stale".into(),
+                    Some(false)
+                )
+                .await
+                .is_err());
+        }
+        assert_eq!(enqueue(&svc, &agent, "second", "a", "two").content, edited);
+        let RecoverySendClaim::Drained(pair) = svc.claim_parked_recovery_send(&agent) else {
+            panic!("held recovery id must still authorize its queue row")
+        };
+        assert_eq!(
+            pair.0.id,
+            if attachments {
+                "second".into()
+            } else {
+                first.id
+            }
+        );
+        assert_eq!(pair.0.content, edited);
     }
 }
 
@@ -973,4 +997,234 @@ async fn queue_merge_second_editor_uses_updated_held_baseline_with_prefix_and_su
         saved["queuedMessage"]["content"],
         "prefix\n\nfinal\n\nsuffix"
     );
+}
+
+#[tokio::test]
+async fn submission_correlation_projects_aliases_and_live_merge_target() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Correlation").await;
+    enqueue(&svc, &agent, "a1", "a", "same");
+    enqueue(&svc, &agent, "a2", "a", "same");
+    let snapshot = svc.queue_snapshot(&agent);
+    assert_eq!(snapshot[0]["submissionIds"], json!(["a2", "a1"]));
+    assert_eq!(snapshot[0]["mergeEligible"], true);
+    enqueue(&svc, &agent, "b1", "b", "barrier");
+    let (_, draining) = svc.dequeue_message_draining_provisional(&agent).unwrap();
+    let snapshot = svc.queue_snapshot(&agent);
+    assert_eq!(snapshot[0]["mergeEligible"], false);
+    assert_eq!(snapshot[1]["mergeEligible"], true);
+    drop(draining);
+}
+
+#[tokio::test]
+async fn submission_correlation_strips_forged_metadata_at_all_ingress() {
+    let forged = json!({"submissionIds":["victim"],"recoverySources":[{"messageId":"victim"}],
+        "mergedMessageMetadata":[{"submissionIds":["victim"],"recoverySources":[{}]}]});
+    let stamped = crate::principal_ops::stamp_principal_attribution(Some(forged.clone()))
+        .unwrap()
+        .unwrap();
+    assert!(stamped.get("submissionIds").is_none());
+    assert!(stamped.get("recoverySources").is_none());
+    assert!(stamped["mergedMessageMetadata"][0]
+        .get("submissionIds")
+        .is_none());
+    assert!(stamped["mergedMessageMetadata"][0]
+        .get("recoverySources")
+        .is_none());
+    let stripped = crate::principal_ops::strip_principal_attribution(Some(forged)).unwrap();
+    assert!(stripped.get("submissionIds").is_none());
+    assert!(stripped.get("recoverySources").is_none());
+}
+
+#[tokio::test]
+async fn submission_correlation_replay_checks_source_principal_while_draining() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Correlation").await;
+    enqueue(&svc, &agent, "a1", "a", "same");
+    enqueue(&svc, &agent, "a2", "a", "same");
+    for draining in [false, true] {
+        let guard = draining.then(|| svc.dequeue_message_draining_provisional(&agent).unwrap());
+        let before = svc.queue_snapshot(&agent);
+        let own = svc
+            .submission_replay(&agent, "a2", Some(&json!({"fromPrincipalId":"a"})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(own["queuedMessage"]["content"], "same\n\nsame");
+        assert_eq!(own["submissionIds"], json!(["a2", "a1"]));
+        let foreign = svc.enqueue_submission(
+            &agent,
+            Some("a2".into()),
+            "forged".into(),
+            None,
+            None,
+            Some(json!({"fromPrincipalId":"b"})),
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        assert!(matches!(foreign, Err(Error::InvalidParams(_))));
+        assert_eq!(svc.queue_snapshot(&agent), before);
+        drop(guard);
+    }
+}
+
+#[test]
+fn submission_correlation_recovery_normalization_preserves_scope_and_unknowns() {
+    let leaf = |principal: &str, origin, aliases| RecoverySource {
+        message_id: "original".into(),
+        submission_ids: aliases,
+        author: json!({"principalId":principal}),
+        origin,
+    };
+    let sources = RecoverySource::normalize([
+        leaf("a", MessageOrigin::User, Some(vec!["a1".into()])),
+        leaf("b", MessageOrigin::User, Some(vec!["b1".into()])),
+        leaf(
+            "a",
+            MessageOrigin::User,
+            Some(vec!["a1".into(), "a2".into()]),
+        ),
+        leaf("a", MessageOrigin::Automatic, Some(vec!["wake".into()])),
+    ]);
+    assert_eq!(sources.len(), 3);
+    assert_eq!(
+        sources[0].submission_ids,
+        Some(vec!["a1".into(), "a2".into()])
+    );
+    let normalized = RecoverySource::normalize(sources.clone().into_iter().chain(sources.clone()));
+    assert_eq!(normalized, sources);
+    let unknown = RecoverySource::normalize(sources.into_iter().chain([leaf(
+        "a",
+        MessageOrigin::User,
+        None,
+    )]));
+    assert!(unknown[0].submission_ids.is_none());
+}
+
+#[tokio::test]
+async fn submission_correlation_flags_follow_arrival_and_settled_draining_barriers() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Correlation barriers").await;
+    enqueue(&svc, &agent, "a", "a", "older");
+    svc.agent_edit_queued_message_op(agent.clone(), "a".into(), "older".into(), Some(true))
+        .await
+        .unwrap();
+    assert_eq!(
+        svc.queue_snapshot(&agent)[0]["mergeEligible"],
+        true,
+        "editing does not prevent append"
+    );
+    svc.enqueue_message_with_id(
+        &agent,
+        Some("b".into()),
+        "newer interrupt".into(),
+        None,
+        None,
+        Some(json!({"fromPrincipalId":"b"})),
+        None,
+        true,
+        MessageOrigin::User,
+    );
+    let snapshot = svc.queue_snapshot(&agent);
+    assert_eq!(snapshot[0]["id"], "b");
+    assert_eq!(snapshot[0]["mergeEligible"], true);
+    assert_eq!(snapshot[1]["mergeEligible"], false);
+    let (_, guard) = svc.dequeue_message_draining_provisional(&agent).unwrap();
+    assert!(svc
+        .queue_snapshot(&agent)
+        .iter()
+        .all(|entry| entry["mergeEligible"] == false));
+    svc.commit_queue_history(&agent, "b");
+    let snapshot = svc.queue_snapshot(&agent);
+    assert_eq!(snapshot[0]["id"], "b", "settled overlay remains visible");
+    assert_eq!(snapshot[0]["mergeEligible"], false);
+    assert_eq!(
+        snapshot[1]["mergeEligible"], true,
+        "settled overlay no longer blocks the live candidate"
+    );
+    drop(guard);
+}
+
+#[tokio::test]
+async fn submission_correlation_legacy_order_stays_unknown_across_restarts() {
+    let (_tmp, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "Legacy correlation").await;
+    let mut entry = enqueue(&svc, &agent, "legacy", "a", "legacy");
+    entry.submission_order = 0;
+    let mut payload = serde_json::to_value(entry).unwrap();
+    payload
+        .as_object_mut()
+        .unwrap()
+        .remove("correlationOrderKnown");
+    svc.agent_queues.lock().unwrap().clear();
+    // Use the production snapshot store, then restore an old payload.
+    svc.enqueue_message_with_id(
+        &agent,
+        Some("legacy".into()),
+        "legacy".into(),
+        None,
+        None,
+        Some(json!({"fromPrincipalId":"a"})),
+        None,
+        false,
+        MessageOrigin::User,
+    );
+    svc.persist_queue_snapshot(&agent).await;
+    sqlx::query("UPDATE agent_queue SET payload = ? WHERE agent_id = ?")
+        .bind(payload.to_string())
+        .bind(agent.as_str())
+        .execute(svc.store.write_pool())
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        svc.agent_queues.lock().unwrap().clear();
+        assert_eq!(svc.rehydrate_agent_queues().await.unwrap(), 1);
+        assert_eq!(svc.queue_snapshot(&agent)[0]["mergeEligible"], false);
+        svc.persist_queue_snapshot(&agent).await;
+    }
+}
+
+/// Failure cases: attachments on either side, image-only entries, files,
+/// and zero-output interrupt carry-over merging into an unrelated draft.
+#[tokio::test]
+async fn queue_attachments_and_prepend_attachments_are_merge_barriers() {
+    let (_tmp, svc, ws) = setup().await;
+    for kind in 0..4 {
+        for attachment_first in [false, true] {
+            let agent = create_agent(&svc, &ws, "Attachment barrier").await;
+            let mut entries = Vec::new();
+            for i in 0..2 {
+                let attached = (i == 0) == attachment_first;
+                let images = (attached && kind == 0)
+                    .then(|| json!([{"data":"image","mimeType":"image/png"}]));
+                let files = (attached && kind == 1)
+                    .then(|| json!([{"attachmentId":"att","fileName":"file.txt"}]));
+                let prepend = (attached && kind >= 2).then(|| QueuedPrepend {
+                    delivery_groups: None,
+                    content: Some("older message".into()),
+                    image_blocks: (kind == 2)
+                        .then(|| json!([{"data":"older","mimeType":"image/png"}])),
+                    file_blocks: (kind == 3)
+                        .then(|| json!([{"attachmentId":"old","fileName":"older.txt"}])),
+                });
+                entries.push(
+                    svc.enqueue_message_with_id(
+                        &agent,
+                        Some(format!("entry-{i}")),
+                        format!("text-{i}"),
+                        images,
+                        files,
+                        Some(json!({"fromPrincipalId":"a"})),
+                        prepend,
+                        false,
+                        MessageOrigin::User,
+                    )
+                    .0,
+                );
+            }
+            assert_ne!(entries[0].id, entries[1].id);
+            assert_eq!(svc.queue_snapshot(&agent).len(), 2);
+            assert!(!entries[0].can_merge_pending(&entries[1]));
+        }
+    }
 }

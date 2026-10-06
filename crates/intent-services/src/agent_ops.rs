@@ -1279,6 +1279,49 @@ fn merge_queue_metadata(existing: &mut Option<Value>, incoming: Option<Value>) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecoverySource {
+    pub message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_ids: Option<Vec<String>>,
+    pub author: Value,
+    pub origin: MessageOrigin,
+}
+
+impl RecoverySource {
+    pub(crate) fn normalize(sources: impl IntoIterator<Item = Self>) -> Vec<Self> {
+        let mut result: Vec<Self> = Vec::new();
+        for source in sources {
+            if let Some(existing) = result.iter_mut().find(|existing| {
+                existing.message_id == source.message_id
+                    && existing.origin == source.origin
+                    && match (
+                        existing.author.get("principalId").and_then(Value::as_str),
+                        source.author.get("principalId").and_then(Value::as_str),
+                    ) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => existing.author == source.author,
+                    }
+            }) {
+                match (&mut existing.submission_ids, source.submission_ids) {
+                    (Some(ids), Some(incoming)) => {
+                        for id in incoming {
+                            if !ids.contains(&id) {
+                                ids.push(id);
+                            }
+                        }
+                    }
+                    (ids, _) => *ids = None,
+                }
+            } else {
+                result.push(source);
+            }
+        }
+        result
+    }
+}
+
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
 ///
 /// `editing` marks the entry as "under edit" — excluded from the **ready-to-send**
@@ -1296,6 +1339,13 @@ fn merge_queue_metadata(existing: &mut Option<Value>, incoming: Option<Value>) {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedMessage {
+    /// Ordered message payloads on a combined retry; legacy aggregate fields
+    /// remain for old clients. Stored in the existing queue JSON payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_groups: Option<Vec<QueuedDeliveryGroup>>,
+    /// Ordered zero-output carry-over, internal and prompt-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepend_delivery_groups: Option<Vec<QueuedDeliveryGroup>>,
     pub id: String,
     /// Turn correlation id (monorepo#1022): stable across terminal-failure
     /// requeues so retries of the same logical turn share one id. Fresh
@@ -1309,6 +1359,9 @@ pub(crate) struct QueuedMessage {
     /// Submission ids absorbed into this surviving row (durable retry deduplication).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merged_submission_ids: Vec<String>,
+    /// Original trusted leaves of a combined retry; never supplied by clients.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_sources: Vec<RecoverySource>,
     /// Appends received while the editor holds an older draft. Internal only.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub edit_appended: String,
@@ -1319,6 +1372,8 @@ pub(crate) struct QueuedMessage {
     /// Latest human submission, independent of priority/drain order; persisted for restart.
     #[serde(default)]
     pub submission_order: u64,
+    #[serde(default)]
+    pub correlation_order_known: bool,
     /// True on a draining overlay until its transcript row is durable.
     #[serde(skip)]
     pub provisional: bool,
@@ -1381,8 +1436,7 @@ pub(crate) struct QueuedMessage {
     /// `agent.sendMessage` parked by a queue-fallback path (busy race,
     /// quarantine, append-failure) or a user-typed `agent.queueMessage`
     /// entry (the FE's mid-turn reply front door). A drained user-origin
-    /// entry keeps its originator's semantics (attention-request clear,
-    /// `systemOnly` flush exclusion),
+    /// entry keeps its originator's semantics (attention-request clear),
     /// and a user entry queued into an ARCHIVED workspace is the explicit
     /// resurrection signal its drain gate exempts (intent-hq/intent#3883).
     /// Persisted so the marker survives daemon restarts.
@@ -1454,8 +1508,15 @@ impl QueuedMessage {
             "position": position,
             "author": Value::Null,
         });
+        self.attach_correlation(&mut v);
         if !self.turn_id.is_empty() {
             v["turnId"] = Value::String(self.turn_id.clone());
+        }
+        if let Some(groups) = &self.delivery_groups {
+            v["deliveryGroups"] = json!(groups
+                .iter()
+                .map(QueuedDeliveryGroup::to_value)
+                .collect::<Vec<_>>());
         }
         if let Some(blocks) = &self.image_blocks {
             v["imageBlocks"] = blocks.clone();
@@ -1489,8 +1550,65 @@ impl QueuedMessage {
         v
     }
 
+    pub(crate) fn attach_correlation(&self, value: &mut Value) {
+        if self.recovery_sources.is_empty() {
+            value["submissionIds"] = json!(self.submission_ids());
+            value.as_object_mut().unwrap().remove("recoverySources");
+        } else {
+            value["recoverySources"] = json!(self.recovery_sources);
+            value.as_object_mut().unwrap().remove("submissionIds");
+        }
+    }
+
+    pub(crate) fn stamp_correlation(&mut self) {
+        let mut metadata = self.message_metadata.take().unwrap_or_else(|| json!({}));
+        if !metadata.is_object() {
+            metadata = json!({});
+        }
+        self.attach_correlation(&mut metadata);
+        self.message_metadata = Some(metadata);
+    }
+
     fn matches_submission(&self, id: &str) -> bool {
-        self.id == id || self.merged_submission_ids.iter().any(|alias| alias == id)
+        self.id == id
+            || self.merged_submission_ids.iter().any(|alias| alias == id)
+            || self.recovery_sources.iter().any(|source| {
+                source.message_id == id
+                    || source
+                        .submission_ids
+                        .as_ref()
+                        .is_some_and(|ids| ids.iter().any(|alias| alias == id))
+            })
+    }
+
+    fn validate_replay_author(&self, id: &str, metadata: Option<&Value>) -> Result<()> {
+        let incoming = intent_core::lift_from_principal_id(metadata);
+        let sources: Vec<_> = self
+            .recovery_sources
+            .iter()
+            .filter(|source| {
+                source.message_id == id
+                    || source
+                        .submission_ids
+                        .as_ref()
+                        .is_some_and(|ids| ids.iter().any(|alias| alias == id))
+            })
+            .collect();
+        let matches = if sources.is_empty() {
+            intent_core::lift_from_principal_id(self.message_metadata.as_ref()) == incoming
+        } else {
+            sources.iter().all(|source| {
+                source.author.get("principalId").and_then(Value::as_str)
+                    == incoming.as_ref().map(|p| p.0.as_str())
+            })
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(Error::InvalidParams(
+                "messageId belongs to another principal".into(),
+            ))
+        }
     }
 
     fn is_human_queue_entry(&self) -> bool {
@@ -1500,9 +1618,55 @@ impl QueuedMessage {
             )
     }
 
+    pub(crate) fn has_attachments(&self) -> bool {
+        [
+            self.image_blocks.as_ref(),
+            self.file_blocks.as_ref(),
+            self.prepend_image_blocks.as_ref(),
+            self.prepend_file_blocks.as_ref(),
+        ]
+        .into_iter()
+        .any(|blocks| {
+            blocks
+                .and_then(Value::as_array)
+                .is_some_and(|a| !a.is_empty())
+        }) || self
+            .delivery_groups
+            .as_ref()
+            .is_some_and(|groups| groups.iter().any(QueuedDeliveryGroup::has_attachments))
+            || self
+                .prepend_delivery_groups
+                .as_ref()
+                .is_some_and(|groups| groups.iter().any(QueuedDeliveryGroup::has_attachments))
+    }
+
+    pub(crate) fn ordered_delivery_groups(&self) -> Vec<QueuedDeliveryGroup> {
+        let mut groups = delivery_prepend_groups(
+            self.prepend_delivery_groups.as_ref(),
+            self.prepend_content.as_ref(),
+            self.prepend_image_blocks.as_ref(),
+            self.prepend_file_blocks.as_ref(),
+            self.delivery_groups.as_deref().unwrap_or_default(),
+        );
+        if let Some(current) = &self.delivery_groups {
+            extend_carry_over_groups(&mut groups, current.clone());
+            return groups;
+        }
+        groups.push(QueuedDeliveryGroup {
+            source_id: Some(self.turn_id.clone()),
+            is_prepend: false,
+            content: self.content.clone(),
+            image_blocks: self.image_blocks.clone(),
+            file_blocks: self.file_blocks.clone(),
+        });
+        groups
+    }
+
     fn can_merge_pending(&self, incoming: &Self) -> bool {
         !self.persisted
             && !incoming.persisted
+            && !self.has_attachments()
+            && !incoming.has_attachments()
             && self.is_human_queue_entry()
             && incoming.is_human_queue_entry()
             && !intent_core::human_author::is_unbound_historical_human(
@@ -1520,6 +1684,37 @@ impl QueuedMessage {
     }
 
     fn append_pending(&mut self, incoming: Self) {
+        if !self.recovery_sources.is_empty() || !incoming.recovery_sources.is_empty() {
+            let source = |entry: &Self| {
+                if !entry.recovery_sources.is_empty() {
+                    return entry.recovery_sources.clone();
+                }
+                let author = if let Some(author) =
+                    intent_core::human_author::historical_human_author(
+                        entry.message_metadata.as_ref(),
+                    ) {
+                    author.to_wire()
+                } else if entry.is_human_queue_entry() {
+                    json!({"principalId": intent_core::lift_from_principal_id(entry.message_metadata.as_ref()), "login":null, "displayName":null, "avatarUrl":null})
+                } else {
+                    Value::Null
+                };
+                vec![RecoverySource {
+                    message_id: entry.id.clone(),
+                    submission_ids: entry
+                        .correlation_order_known
+                        .then(|| entry.submission_ids()),
+                    author,
+                    origin: if entry.user_origin {
+                        MessageOrigin::User
+                    } else {
+                        MessageOrigin::Automatic
+                    },
+                }]
+            };
+            self.recovery_sources =
+                RecoverySource::normalize(source(self).into_iter().chain(source(&incoming)));
+        }
         if incoming.user_origin {
             let incoming_time = incoming
                 .latest_human_submission_at
@@ -1550,6 +1745,7 @@ impl QueuedMessage {
             self.edit_appended.push_str("\n\n");
             self.edit_appended.push_str(&incoming.content);
         }
+        self.correlation_order_known |= incoming.correlation_order_known;
         self.submission_order = self.submission_order.max(incoming.submission_order);
         self.content.push_str("\n\n");
         self.content.push_str(&incoming.content);
@@ -1582,7 +1778,13 @@ impl QueuedMessage {
     }
 
     pub(crate) fn submission_ids(&self) -> Vec<String> {
-        let mut ids = self.merged_submission_ids.clone();
+        let mut seen = HashSet::new();
+        let mut ids: Vec<_> = self
+            .merged_submission_ids
+            .iter()
+            .filter(|id| !id.is_empty() && seen.insert((*id).clone()))
+            .cloned()
+            .collect();
         if !ids.contains(&self.id) {
             ids.push(self.id.clone());
         }
@@ -1672,12 +1874,111 @@ impl Drop for DrainingGuard {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedPrepend {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_groups: Option<Vec<QueuedDeliveryGroup>>,
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
     pub image_blocks: Option<Value>,
     #[serde(default)]
     pub file_blocks: Option<Value>,
+}
+
+/// Flat, ordered text-plus-attachment payload. No nested groups or ACLs:
+/// the containing queue row retains its existing identity and permissions.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QueuedDeliveryGroup {
+    /// Durable source identity, private to queue persistence and carry-over.
+    /// Legacy groups have no identity; equal payloads never supply one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    /// Internal replay marker; never emitted on the queue wire shape.
+    #[serde(default)]
+    pub is_prepend: bool,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_blocks: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_blocks: Option<Value>,
+}
+
+/// Explicit groups, including Some(empty), are authoritative for modern
+/// retries. A legacy aggregate with unknown provenance stays readable as its
+/// own group; text/attachment equality cannot prove a captured-source mirror.
+pub(crate) fn delivery_prepend_groups(
+    explicit: Option<&Vec<QueuedDeliveryGroup>>,
+    content: Option<&String>,
+    images: Option<&Value>,
+    files: Option<&Value>,
+    _durable: &[QueuedDeliveryGroup],
+) -> Vec<QueuedDeliveryGroup> {
+    if let Some(groups) = explicit {
+        return groups.clone();
+    }
+    if content.is_none() && images.is_none() && files.is_none() {
+        return Vec::new();
+    }
+    vec![QueuedDeliveryGroup {
+        source_id: None,
+        is_prepend: true,
+        content: content.cloned().unwrap_or_default(),
+        image_blocks: images.cloned(),
+        file_blocks: files.cloned(),
+    }]
+}
+
+/// A captured zero-output turn can include the same original prefix already
+/// stored in a retry. Join that shared boundary once, without deduplicating
+/// independent queue entries or repeated messages elsewhere in the turn.
+pub(crate) fn extend_carry_over_groups(
+    older: &mut Vec<QueuedDeliveryGroup>,
+    newer: Vec<QueuedDeliveryGroup>,
+) {
+    let overlap = (1..=older.len().min(newer.len()))
+        .rev()
+        .find(|&n| {
+            older[older.len() - n..]
+                .iter()
+                .zip(&newer[..n])
+                .all(|(a, b)| {
+                    a.source_id
+                        .as_ref()
+                        .is_some_and(|id| !id.is_empty() && b.source_id.as_ref() == Some(id))
+                })
+        })
+        .unwrap_or(0);
+    // A captured source may have been a prepend in the older payload but
+    // is the current retry source here. Keep the current replay marker so
+    // recreated-session history does not suppress its grouped text.
+    let start = older.len() - overlap;
+    for (saved, current) in older[start..].iter_mut().zip(&newer[..overlap]) {
+        saved.is_prepend &= current.is_prepend;
+    }
+    older.extend(newer.into_iter().skip(overlap));
+}
+
+impl QueuedDeliveryGroup {
+    pub(crate) fn to_value(&self) -> Value {
+        let mut value = json!({"content": self.content});
+        if let Some(blocks) = &self.image_blocks {
+            value["imageBlocks"] = blocks.clone();
+        }
+        if let Some(blocks) = &self.file_blocks {
+            value["fileBlocks"] = blocks.clone();
+        }
+        value
+    }
+
+    pub(crate) fn has_attachments(&self) -> bool {
+        [self.image_blocks.as_ref(), self.file_blocks.as_ref()]
+            .into_iter()
+            .any(|blocks| {
+                blocks
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty())
+            })
+    }
 }
 
 /// Collect the `text` of every `type: "text"` content block in a message's
@@ -2064,18 +2365,25 @@ const AUGGIE_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// `.mjs` shim's `#!/usr/bin/env node` resolves in a packaged-app
 /// environment.
 async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
-    tokio::time::timeout(
-        AUGGIE_MODELS_TIMEOUT,
-        tokio::process::Command::new(auggie)
-            .args(args)
-            .env("PATH", intent_context::discovery::exec_path(auggie))
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
+    let mut cmd = tokio::process::Command::new(auggie);
+    let cwd = std::env::temp_dir();
+    cmd.args(args)
+        .env("PATH", intent_context::discovery::exec_path(auggie))
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let profile = crate::provider_launch::ephemeral_command_profile(
+        "auggie",
+        crate::provider_profiles::LaunchPurpose::ModelProbe,
+        &cmd,
+        &cwd,
     )
-    .await
-    .ok()?
-    .ok()
+    .ok()?;
+    crate::provider_launch::run_utility(cmd, profile, Vec::new(), AUGGIE_MODELS_TIMEOUT)
+        .await
+        .ok()
 }
 
 /// Best-effort `models.list` dynamic fetch (PROTOCOL §5.30), porting the
@@ -3227,6 +3535,14 @@ impl Services {
                 self.active_pr_monitors_by_agent(&workspace_id).await,
             )
         };
+        let mut script_monitors_by_agent: HashMap<String, Vec<Value>> = HashMap::new();
+        for (agent, row) in self
+            .store
+            .script_monitor_waiting(Some(&workspace_id), None)
+            .await?
+        {
+            script_monitors_by_agent.entry(agent).or_default().push(row);
+        }
         let mut rows: Vec<AgentLite> = sessions
             .into_iter()
             .map(|s| {
@@ -3234,7 +3550,15 @@ impl Services {
                 let waiting_on_hooks = hooks_by_agent.remove(&s.id.0).unwrap_or_default();
                 let waiting_on_pr_monitors =
                     pr_monitors_by_agent.remove(&s.id.0).unwrap_or_default();
-                self.project_list_agent(s, &projection, waiting_on_hooks, waiting_on_pr_monitors)
+                let script_waiting = script_monitors_by_agent.remove(&s.id.0).unwrap_or_default();
+                let mut lite = self.project_list_agent(
+                    s,
+                    &projection,
+                    waiting_on_hooks,
+                    waiting_on_pr_monitors,
+                );
+                lite.waiting_on_script_monitors = script_waiting;
+                lite
             })
             .collect();
         // Response-level frame fit (intent-hq/intent#5531): the per-row pass
@@ -3318,6 +3642,7 @@ impl Services {
         let mut lite = self.project_lite_with_flags_from_projection(session, &projection);
         lite.waiting_on_hooks = waiting_on_hooks;
         lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
+        lite.waiting_on_script_monitors = self.active_script_monitors_for_agent(&agent_id).await;
         Ok(lite)
     }
 
@@ -3470,7 +3795,10 @@ impl Services {
         };
         // Delete grace window (§5.5): overlay the pending-deletion deadline
         // from the in-memory registry (O(1) map lookup, never persisted).
-        let pending_delete_at = self.pending_agent_deletes.deadline(session.id.0.as_str());
+        let pending_delete_at = self.pending_agent_deletes.deadline(&crate::delete_grace::PendingDeleteSubject::Agent { workspace_id: session.workspace_id.clone(), agent_id: session.id.clone() }).unwrap_or_else(|error| {
+            tracing::warn!(%error, agent = %session.id, "pending delete display projection unavailable");
+            None
+        });
         let mut lite = project(session);
         lite.is_responding = is_responding;
         lite.is_waiting_on_tool = is_waiting_on_tool;
@@ -4165,6 +4493,11 @@ impl Services {
         // same `author` projection `agent.getConversation` serves, so live
         // subscribers render the sender without a follow-up read.
         if message.role == "user" {
+            for field in ["submissionIds", "recoverySources"] {
+                if let Some(value) = message.metadata.as_ref().and_then(|md| md.get(field)) {
+                    payload[field] = value.clone();
+                }
+            }
             if let Some(author) =
                 crate::principal_ops::MessageAuthorResolver::new(self, workspace_id)
                     .resolve(message.metadata.as_ref())
@@ -5216,6 +5549,20 @@ impl Services {
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<Value> {
+        self.agent_delete_with_claim(agent_id, workspace_id, None)
+            .await
+    }
+
+    async fn agent_delete_with_claim(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        original_claim: Option<crate::delete_grace::PendingDeleteClaim>,
+    ) -> Result<Value> {
+        #[cfg(all(test, unix))]
+        let _completion = self
+            .pending_delete_test_gate
+            .observe_completion(&agent_id.0);
         // Capture the workspace (and name, for the event's `agentName`
         // enrichment — intent-hq/monorepo#2869) before deleting so the
         // post-delete agent:deleted emit can be workspace-scoped. If the
@@ -5223,10 +5570,9 @@ impl Services {
         // failing the idempotent delete. When the caller declares a
         // workspace, reject a cross-workspace bare-id probe by mapping to
         // `NotFound` before touching the store.
-        let session_meta = self
-            .store
-            .get_agent_session(&agent_id)
-            .await
+        let session_observation = self.store.get_agent_session(&agent_id).await;
+        let mut known_completion = matches!(&session_observation, Ok(_) | Err(Error::NotFound(_)));
+        let session_meta = session_observation
             .ok()
             .map(|s| (s.workspace_id, s.name, s.parent_agent_id));
         let session_workspace_id = session_meta.as_ref().map(|(ws, _, _)| ws.clone());
@@ -5236,20 +5582,57 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        // Immediate-delete-while-pending (§5.5): an immediate delete
-        // supersedes a running grace window — drop the pending entry and
-        // abort its timer, then commit now. The timer-fired commit path has
-        // already claimed (removed) its entry before calling here, so this
-        // is a no-op for it.
+        let claim = match original_claim {
+            Some(claim) => {
+                match claim.subject() {
+                    crate::delete_grace::PendingDeleteSubject::Agent {
+                        agent_id: original_id,
+                        workspace_id: original_ws,
+                    } if original_id == &agent_id
+                        && workspace_id.as_ref() == Some(original_ws)
+                        && session_workspace_id
+                            .as_ref()
+                            .is_none_or(|ws| ws == original_ws) => {}
+                    _ => {
+                        return Err(Error::InvalidParams(
+                            "different original deletion subject".into(),
+                        ))
+                    }
+                }
+                Some(claim)
+            }
+            None => match session_workspace_id.as_ref() {
+                Some(ws) => Some(
+                    self.pending_agent_deletes
+                        .take_for_immediate_delete(
+                            crate::delete_grace::PendingDeleteSubject::Agent {
+                                workspace_id: ws.clone(),
+                                agent_id: agent_id.clone(),
+                            },
+                        )
+                        .await?,
+                ),
+                None => None,
+            },
+        };
+        #[cfg(all(test, unix))]
+        self.pending_delete_test_gate
+            .pause("agent-sql", &agent_id.0)
+            .await;
         self.desktop_terminate_agent(&agent_id).await;
-        self.pending_agent_deletes.cancel(agent_id.0.as_str());
         // Route the DELETE through the workspace guard so a stale-caller with the
         // wrong workspace cannot mutate the row even if the pre-check above races
         // with a concurrent workspace move.
         if let Some(session_ws) = session_workspace_id.as_ref() {
-            self.store
+            let retirement = self.agent_retirement_gates.for_agent(&agent_id);
+            let _retirement = retirement.lock().await;
+            self.cancel_script_monitors(session_ws, Some(&agent_id), "owner-deleted")
+                .await?;
+            let deleted = self
+                .store
                 .delete_agent_session(session_ws, &agent_id)
                 .await?;
+            known_completion &= deleted;
             self.invalidate_agent_list_cache(session_ws);
         }
         self.agent_queues
@@ -5324,6 +5707,11 @@ impl Services {
             // the no-op when nothing derived from this session.
             self.maybe_emit_display_status_changed(&workspace_id).await;
         }
+        if known_completion {
+            if let Some(claim) = claim {
+                claim.settle_confirmed();
+            }
+        }
         Ok(json!({ "success": true }))
     }
 
@@ -5354,53 +5742,21 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        let delay_ms = crate::delete_grace::clamp_undo_delay_ms(undo_delay_ms);
-        let delete_at = intent_core::iso_ms_from_now(delay_ms);
-        let key = agent_id.0.clone();
         let timer_services = self.clone();
         let timer_id = agent_id.clone();
         let timer_ws = session_ws.clone();
-        // Idempotent re-schedule (§5.5): the registry arms the timer only
-        // when nothing is pending for this key — the check runs under the
-        // registry lock, so concurrent schedules converge on one deadline
-        // and only the arming call emits `agent:delete-scheduled`.
-        if let Some(existing) =
-            self.pending_agent_deletes
-                .schedule(key, delete_at.clone(), move |generation| {
-                    let tasks = timer_services.pending_delete_tasks.clone();
-                    let stopping = tasks.clone();
-                    tasks.spawn_draining(async move {
-                        tokio::select! {
-                            biased;
-                            () = stopping.closed() => return,
-                            () = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
-                        }
-                        // Claim-or-abstain: only the timer that still owns the
-                        // entry commits. A cancel or an immediate delete that
-                        // raced ahead removed/superseded the entry — do nothing.
-                        if !timer_services
-                            .pending_agent_deletes
-                            .claim(timer_id.0.as_str(), generation)
-                        {
-                            return;
-                        }
-                        // Commit via the existing immediate-delete cascade (same
-                        // events). Best-effort: the caller is long gone, so a
-                        // failure is logged, not surfaced.
-                        if let Err(e) = timer_services
-                            .agent_delete_op(timer_id.clone(), Some(timer_ws))
-                            .await
-                        {
-                            tracing::warn!(
-                                agent = %timer_id.0,
-                                error = %e,
-                                "scheduled agent delete failed at commit"
-                            );
-                        }
-                    }).unwrap_or_else(|| intent_core::spawn_daemon(async {}))
-                })
-        {
-            return Ok(existing);
+        let scheduled = self.pending_agent_deletes.schedule_owned(
+            crate::delete_grace::PendingDeleteSubject::Agent { workspace_id: session_ws.clone(), agent_id: agent_id.clone() },
+            undo_delay_ms,
+            move |claim| intent_core::with_caller(intent_core::Caller::Daemon, async move {
+                if let Err(e) = timer_services.agent_delete_with_claim(timer_id.clone(), Some(timer_ws), Some(claim)).await {
+                    tracing::warn!(agent = %timer_id.0, error = %e, "scheduled agent delete failed at commit");
+                }
+            }),
+        ).await?;
+        let delete_at = scheduled.delete_at;
+        if !scheduled.newly_armed {
+            return Ok(delete_at);
         }
         crate::publish_event(
             self.event_bus.as_ref(),
@@ -5435,7 +5791,13 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        let cancelled = self.pending_agent_deletes.cancel(agent_id.0.as_str());
+        let cancelled = self
+            .pending_agent_deletes
+            .cancel_owned(&crate::delete_grace::PendingDeleteSubject::Agent {
+                workspace_id: session_ws.clone(),
+                agent_id: agent_id.clone(),
+            })
+            .await?;
         if cancelled {
             crate::publish_event(
                 self.event_bus.as_ref(),
@@ -5451,10 +5813,24 @@ impl Services {
     /// cascade (immediate or committed-from-pending), which supersedes them —
     /// every session is deleted right after, emitting `agent:deleted` per
     /// session (§5.5 cascade interaction).
-    pub(crate) fn abort_pending_agent_deletes(&self, sessions: &[AgentSession]) {
+    pub(crate) async fn take_pending_agent_deletes(
+        &self,
+        sessions: &[AgentSession],
+    ) -> Result<Vec<crate::delete_grace::PendingDeleteClaim>> {
+        let mut claims = Vec::new();
         for session in sessions {
-            self.pending_agent_deletes.cancel(session.id.0.as_str());
+            if let Some(claim) = self
+                .pending_agent_deletes
+                .take_for_cascade(&crate::delete_grace::PendingDeleteSubject::Agent {
+                    workspace_id: session.workspace_id.clone(),
+                    agent_id: session.id.clone(),
+                })
+                .await?
+            {
+                claims.push(claim);
+            }
         }
+        Ok(claims)
     }
 
     /// Soft retire (`ws.agent.retire`): set `retired_at` on the session,
@@ -5607,6 +5983,8 @@ impl Services {
         // so a transient probe failure can never publish a spurious
         // `{ none }` through the settle's fallback.
         let before = self.snapshot_workspace_unread(&session.workspace_id).await;
+        self.cancel_script_monitors(&session.workspace_id, Some(&session.id), "owner-retired")
+            .await?;
         // CAS write: only the request that actually flips NULL → set emits
         // the event.
         let transitioned = self
@@ -5796,7 +6174,12 @@ impl Services {
         session.session_corrupted = self.session_poisoned(&session);
         // Delete grace window (§5.5): overlay the pending-deletion deadline
         // from the in-memory registry (O(1) map lookup, never persisted).
-        session.pending_delete_at = self.pending_agent_deletes.deadline(agent_id.0.as_str());
+        session.pending_delete_at = self.pending_agent_deletes.deadline(
+            &crate::delete_grace::PendingDeleteSubject::Agent {
+                workspace_id: session.workspace_id.clone(),
+                agent_id: agent_id.clone(),
+            },
+        )?;
         // Legacy rows (pre-0096): project the current effective agentFeatures
         // on read (never persisted); see `project_lite_with_flags_inner`.
         if session.harness_features.is_none() {
@@ -6600,6 +6983,7 @@ impl Services {
     /// CLI yields an empty model list (the provider CLI owns model
     /// discovery — there is no static fallback catalog).
     pub(crate) async fn agent_get_models_op(&self) -> Result<Value> {
+        self.validate_provider_configuration("auggie")?;
         let models = fetch_auggie_models(self.auggie_bin.clone())
             .await?
             .unwrap_or_default();
@@ -6651,26 +7035,48 @@ impl Services {
         let version_key = antigravity
             .as_ref()
             .map_or_else(|| (source.version_key)(), |s| s.version_key.clone());
-        let resolved = crate::model_catalog::resolve_with_cache(
-            &self.models_catalog,
-            &provider_id,
-            &version_key,
-            force_refresh,
-            crate::model_catalog::ModelCatalogCache::now_ms(),
-            move || {
-                if let Some(antigravity) = antigravity {
-                    Box::pin(async move {
-                        crate::model_catalog::from_provider_fetch(
-                            crate::provider_models::fetch_antigravity_models_at(antigravity.binary)
+        let policy_services = self.clone();
+        let policy_provider = provider_id.clone();
+        let resolved = if intent_providers::installed_cli::InstalledCli::for_provider(&provider_id)
+            .is_some()
+        {
+            self.models_catalog
+                .resolve_installed_with_policy(&provider_id, force_refresh, Some(self.clone()))
+                .await
+        } else {
+            crate::model_catalog::resolve_with_cache(
+                &self.models_catalog,
+                &provider_id,
+                &version_key,
+                force_refresh,
+                crate::model_catalog::ModelCatalogCache::now_ms(),
+                move || {
+                    if let Err(error) =
+                        policy_services.validate_provider_configuration(&policy_provider)
+                    {
+                        return Box::pin(async move {
+                            crate::model_catalog::ModelFetchResult {
+                                models: None,
+                                warning: Some(error.to_string()),
+                            }
+                        });
+                    }
+                    if let Some(antigravity) = antigravity {
+                        Box::pin(async move {
+                            crate::model_catalog::from_provider_fetch(
+                                crate::provider_models::fetch_antigravity_models_at(
+                                    antigravity.binary,
+                                )
                                 .await,
-                        )
-                    })
-                } else {
-                    (source.fetch)()
-                }
-            },
-        )
-        .await;
+                            )
+                        })
+                    } else {
+                        (source.fetch)()
+                    }
+                },
+            )
+            .await
+        };
         match resolved.models {
             Some(models) => {
                 let mut out =
@@ -6714,7 +7120,7 @@ impl Services {
             .models_list_auggie_with(
                 force_refresh,
                 crate::model_catalog::ModelCatalogCache::now_ms(),
-                || Box::pin(fetch_auggie_models_rich(auggie_bin)),
+                move || Box::pin(async move { fetch_auggie_models_rich(auggie_bin).await }),
             )
             .await?;
         if !include_fallback_warning && response["source"] == "static" {
@@ -6748,6 +7154,7 @@ impl Services {
         let version_key = crate::model_catalog::source_for("auggie")
             .map(|s| (s.version_key)())
             .unwrap_or_default();
+        let policy_services = self.clone();
         let resolved = crate::model_catalog::resolve_with_cache(
             &self.models_catalog,
             "auggie",
@@ -6756,6 +7163,12 @@ impl Services {
             now_ms,
             || {
                 Box::pin(async move {
+                    if let Err(error) = policy_services.validate_provider_configuration("auggie") {
+                        return crate::model_catalog::ModelFetchResult {
+                            models: None,
+                            warning: Some(error.to_string()),
+                        };
+                    }
                     match fetch().await {
                         Some(models) => crate::model_catalog::ModelFetchResult {
                             models: Some(models),
@@ -6801,6 +7214,7 @@ impl Services {
     /// attribution-stripped by the router) is captured on the entry so the
     /// drain-time persist writes it onto the user row — a queued
     /// `question_answers` answer thereby resolves the pending question set.
+    #[cfg(test)]
     pub(crate) async fn agent_queue_message_op(
         &self,
         agent_id: AgentId,
@@ -6809,6 +7223,27 @@ impl Services {
         file_blocks: Option<Value>,
         message_metadata: Option<Value>,
     ) -> Result<Value> {
+        self.agent_queue_submission_op(
+            agent_id,
+            None,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+        )
+        .await
+    }
+
+    pub(crate) async fn agent_queue_submission_op(
+        &self,
+        agent_id: AgentId,
+        message_id: Option<String>,
+        content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
+    ) -> Result<Value> {
+        validate_submission_id(message_id.as_deref())?;
         // Attachment-reference validation (PROTOCOL §5.5) before any state
         // change, matching `agent.sendMessage`.
         validate_file_blocks("agent.queueMessage", file_blocks.as_ref())?;
@@ -6820,8 +7255,9 @@ impl Services {
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         self.validate_image_block_refs("agent.queueMessage", image_blocks.as_ref())
             .await?;
-        let (queued, position) = self.enqueue_message(
+        let (queued, position) = self.enqueue_submission(
             &agent_id,
+            message_id,
             content,
             image_blocks,
             file_blocks,
@@ -6829,7 +7265,7 @@ impl Services {
             None,
             false,
             MessageOrigin::User,
-        );
+        )?;
         let result = json!({
             "success": true,
             "queuedMessage": queued.to_value(position),
@@ -6869,6 +7305,16 @@ impl Services {
             }
         }
         let mut queue = self.queue_snapshot(&agent_id);
+        if !intent_core::queue_contents_visible_to(
+            intent_core::current_caller().as_ref(),
+            &agent_id,
+        ) {
+            return Ok(json!({
+                "success": false, "refused": true,
+                "error": intent_core::SELF_QUEUE_DELIVERY_MESSAGE,
+                "queueLength": queue.len(), "queue": [],
+            }));
+        }
         if let Some(ws) = owning_ws.as_ref() {
             crate::principal_ops::MessageAuthorResolver::new(self, ws)
                 .attach_queue(&mut queue)
@@ -7148,6 +7594,28 @@ impl Services {
                 let prepended = std::mem::take(&mut queue[position].edit_prepended);
                 if content != queue[position].content {
                     content = format!("{prepended}{content}{appended}");
+                }
+            }
+            if content != queue[position].content {
+                if let Some(groups) = queue[position].delivery_groups.take() {
+                    let mut images = None;
+                    let mut files = None;
+                    for group in queue[position]
+                        .prepend_delivery_groups
+                        .take()
+                        .into_iter()
+                        .flatten()
+                        .chain(groups)
+                    {
+                        images =
+                            crate::agent_manager::merge_block_arrays(images, group.image_blocks);
+                        files = crate::agent_manager::merge_block_arrays(files, group.file_blocks);
+                    }
+                    queue[position].image_blocks = images;
+                    queue[position].file_blocks = files;
+                    queue[position].prepend_content = None;
+                    queue[position].prepend_image_blocks = None;
+                    queue[position].prepend_file_blocks = None;
                 }
             }
             queue[position].content = content;
@@ -7461,8 +7929,9 @@ impl Services {
         message_id: Option<String>,
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
-        message_metadata: Option<Value>,
+        mut message_metadata: Option<Value>,
     ) -> Result<Value> {
+        validate_submission_id(message_id.as_deref())?;
         // intent-hq/intent#5669: an agent may not message itself — rejected
         // before any state change.
         reject_self_targeted_send("agent.sendMessage", &agent_id, message_metadata.as_ref())?;
@@ -7498,31 +7967,24 @@ impl Services {
         // the transcript row carries them (the conversation view renders them).
         let blocks = user_message_blocks(&content, image_blocks.as_ref(), file_blocks.as_ref());
         let created_at = now_iso();
-        let message = match message_id {
-            Some(id) => {
-                self.store
-                    .append_agent_message_with_id(
-                        &agent_id,
-                        &id,
-                        "user",
-                        &blocks,
-                        message_metadata.as_ref(),
-                        &created_at,
-                    )
-                    .await
-            }
-            None => {
-                self.store
-                    .append_agent_message_with_metadata(
-                        &agent_id,
-                        "user",
-                        &blocks,
-                        message_metadata.as_ref(),
-                        &created_at,
-                    )
-                    .await
-            }
-        };
+        let message_id = message_id.unwrap_or_else(new_message_id);
+        if let Some(result) =
+            self.submission_replay(&agent_id, &message_id, message_metadata.as_ref())?
+        {
+            return Ok(result);
+        }
+        stamp_direct_correlation(&mut message_metadata, &message_id);
+        let message = self
+            .store
+            .append_agent_message_with_id(
+                &agent_id,
+                &message_id,
+                "user",
+                &blocks,
+                message_metadata.as_ref(),
+                &created_at,
+            )
+            .await;
         match message {
             Ok(message) => {
                 self.invalidate_agent_list_cache(&session.workspace_id);
@@ -7556,7 +8018,9 @@ impl Services {
                     self.maybe_emit_display_status_changed(&session.workspace_id)
                         .await;
                 }
-                Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
+                Ok(
+                    json!({ "success": true, "queued": false, "messageId": message.id, "submissionIds": [message.id] }),
+                )
             }
             Err(append_err) => {
                 // Check-then-act race guard (monorepo#564): if the session
@@ -7577,8 +8041,9 @@ impl Services {
                 // answer auto-queued after a failed write must keep its
                 // `question_answers` tag, or the drain persist can no longer
                 // clear the pending-questions marker and the pending set wedges.
-                let (queued, position) = self.enqueue_message(
+                let (queued, position) = self.enqueue_submission(
                     &agent_id,
+                    Some(message_id),
                     content,
                     image_blocks,
                     file_blocks,
@@ -7586,13 +8051,14 @@ impl Services {
                     None,
                     false,
                     MessageOrigin::User,
-                );
-                let result = json!({
+                )?;
+                let mut result = json!({
                     "success": true,
                     "queued": true,
                     "queuedMessage": queued.to_value(position),
                     "turnId": queued.turn_id,
                 });
+                queued.attach_correlation(&mut result);
                 self.publish_queue_updated(&agent_id).await;
                 Ok(result)
             }
@@ -7687,18 +8153,33 @@ impl Services {
             entry.file_blocks.as_ref(),
         );
         let created_at = now_iso();
-        let message = match self
-            .store
-            .append_agent_message_with_provenance(
-                &agent_id,
-                &entry.id,
-                "user",
-                &blocks,
-                entry.message_metadata.as_ref(),
-                &created_at,
-                queued_usage_origin(&entry),
-            )
-            .await
+        let message = match async {
+            // A direct append can fail because its supplied ID already
+            // names a transcript row. Keep that submission ID on the queue
+            // and metadata, but let its fallback delivery use a fresh row ID.
+            let row_id = if self
+                .store
+                .get_agent_message_by_id(&agent_id, &entry.id)
+                .await?
+                .is_some()
+            {
+                new_message_id()
+            } else {
+                entry.id.clone()
+            };
+            self.store
+                .append_agent_message_with_provenance(
+                    &agent_id,
+                    &row_id,
+                    "user",
+                    &blocks,
+                    entry.message_metadata.as_ref(),
+                    &created_at,
+                    queued_usage_origin(&entry),
+                )
+                .await
+        }
+        .await
         {
             Ok(message) => message,
             Err(e) => {
@@ -9843,11 +10324,14 @@ impl Services {
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
-        crate::workspace_mutations::scope(self.agent_delegate_op_admitted(
+        // Keep the admitted future on the heap before passing it through the
+        // mutation scope: its nested persistence path otherwise exhausts a
+        // default-sized runtime thread's stack in unoptimized builds.
+        crate::workspace_mutations::scope(Box::pin(self.agent_delegate_op_admitted(
             workspace_id,
             input,
             parent_agent_id,
-        ))
+        )))
         .await
     }
 
@@ -11438,6 +11922,20 @@ impl Services {
         session: &AgentSession,
     ) -> Result<bool> {
         let agent_id = &session.id;
+        if self
+            .store
+            .script_monitor_pending_for_agent(agent_id)
+            .await?
+        {
+            return Ok(true);
+        }
+        if !self
+            .active_script_monitors_for_agent(agent_id)
+            .await
+            .is_empty()
+        {
+            return Ok(true);
+        }
         if self.has_ready_to_send(agent_id)
             || self.agent_is_busy(agent_id.clone())
             || session.attention_request_kind.is_some()
@@ -12338,8 +12836,7 @@ impl Services {
         session: &AgentSession,
     ) -> Result<AgentSnapshot> {
         let agent_id = &session.id;
-        // Count-only aggregate: `active_hooks_for_agent` would hydrate every
-        // hook row the agent ever owned (code + lastState blobs included).
+        // Count-only aggregate: the snapshot needs no per-hook metadata.
         let hooks = usize::try_from(
             self.store
                 .count_active_hooks_by_agent(agent_id)
@@ -12541,11 +13038,9 @@ impl Services {
     /// in-scope agent with a non-empty queue, each listing its entries in
     /// drain order via [`Services::queue_snapshot_preview`] (content truncated
     /// to [`QUEUE_PREVIEW_MAX_CHARS`] chars, sender attribution preserved in
-    /// `messageMetadata`), projected to the bound caller exactly like
-    /// `agent.getQueue` ([`intent_core::project_queue_for_caller`]: a guest
-    /// collaborator sees only its own entries plus unattributed ones, and a
-    /// queue with nothing left to show it is omitted) — and
-    /// `summary.queuedAgents` counts those agents.
+    /// `messageMetadata`). Humans and other agents see the shared queue;
+    /// the recipient sees its queue count with an empty `entries` array.
+    /// `summary.queuedAgents` includes the recipient's non-empty queue.
     /// A queue whose ready-to-send entries have sat undelivered past
     /// [`STALE_QUEUE_ENTRY_AFTER_MS`] while the target agent is not actively
     /// responding raises a `stale-queue-entry` stuck-risk
@@ -12806,6 +13301,15 @@ impl Services {
         // monitor metadata (`waitingOnPrMonitors`, omitted when empty) from
         // one workspace-wide monitor query.
         let mut pr_monitors_by_agent = self.active_pr_monitors_by_agent(&workspace_id).await;
+        let mut script_monitors_by_agent: HashMap<String, Vec<Value>> = HashMap::new();
+        for (owner, row) in self
+            .store
+            .script_monitor_waiting(Some(&workspace_id), None)
+            .await?
+        {
+            script_monitors_by_agent.entry(owner).or_default().push(row);
+        }
+
         // Per-agent subtree memory attribution (monorepo#2063 A2): resident
         // bytes of each agent's descendant process tree from the runtime
         // manager's tree probe, stamped as `subtreeMemoryBytes` (omitted when
@@ -12915,6 +13419,9 @@ impl Services {
                 if !hooks.is_empty() {
                     row.insert("waitingOnHooks".into(), Value::Array(hooks));
                 }
+            }
+            if let Some(monitors) = script_monitors_by_agent.remove(id.as_str()) {
+                row.insert("waitingOnScriptMonitors".into(), Value::Array(monitors));
             }
             if let Some(monitors) = pr_monitors_by_agent.remove(id.as_str()) {
                 if !monitors.is_empty() {
@@ -13128,6 +13635,15 @@ impl Services {
                 "count": stale.len(),
             }));
         }
+        // Derive content-free stale risks before hiding recipient entries.
+        // Keep queue counts, but remove payloads before assembling either
+        // structured diagnostics or its text (including for owner hooks).
+        for q in &mut queues {
+            let aid = AgentId::from(q["agentId"].as_str().unwrap_or_default());
+            if !intent_core::queue_contents_visible_to(caller.as_ref(), &aid) {
+                q["entries"] = json!([]);
+            }
+        }
         for sub in &subscriptions {
             if sub["orphaned"].as_bool() == Some(true) {
                 let sid = sub["id"].as_str().unwrap_or_default();
@@ -13269,7 +13785,17 @@ impl Services {
                     let aid = q["agentId"].as_str().unwrap_or_default();
                     let name = q["agentName"].as_str().unwrap_or(aid);
                     let len = q["queueLength"].as_u64().unwrap_or(0);
-                    lines.push(format!("- {name} ({aid}): {len} queued message(s)"));
+                    let visibility = if intent_core::queue_contents_visible_to(
+                        caller.as_ref(),
+                        &AgentId::from(aid),
+                    ) {
+                        ""
+                    } else {
+                        " (contents hidden; messages arrive after the current turn)"
+                    };
+                    lines.push(format!(
+                        "- {name} ({aid}): {len} queued message(s){visibility}"
+                    ));
                 }
             }
         }
@@ -14629,6 +15155,115 @@ impl Services {
     }
 
     #[expect(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_submission(
+        &self,
+        agent_id: &AgentId,
+        message_id: Option<String>,
+        content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
+        prepend: Option<QueuedPrepend>,
+        interrupt: bool,
+        origin: MessageOrigin,
+    ) -> Result<(QueuedMessage, usize)> {
+        let draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        if let Some(id) = &message_id {
+            self.submission_replay_locked(agent_id, id, message_metadata.as_ref(), &draining)?;
+        }
+        Ok(self.enqueue_message_with_id_locked(
+            agent_id,
+            message_id,
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+            prepend,
+            interrupt,
+            origin,
+            &draining,
+        ))
+    }
+
+    fn submission_replay_locked(
+        &self,
+        agent_id: &AgentId,
+        id: &str,
+        metadata: Option<&Value>,
+        draining: &HashMap<AgentId, Vec<QueuedMessage>>,
+    ) -> Result<Option<(QueuedMessage, usize)>> {
+        let live = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        for entries in [live.get(agent_id), draining.get(agent_id)]
+            .into_iter()
+            .flatten()
+        {
+            if let Some((position, entry)) = entries
+                .iter()
+                .enumerate()
+                .find(|(_, e)| e.matches_submission(id))
+            {
+                entry.validate_replay_author(id, metadata)?;
+                return Ok(Some((entry.clone(), position)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) async fn recovery_sources(
+        &self,
+        workspace_id: &WorkspaceId,
+        entries: &[QueuedMessage],
+    ) -> Vec<RecoverySource> {
+        let mut resolver = crate::principal_ops::MessageAuthorResolver::new(self, workspace_id);
+        let mut sources = Vec::new();
+        for entry in entries {
+            if entry.recovery_sources.is_empty() {
+                let author = resolver.resolve(entry.message_metadata.as_ref()).await.unwrap_or_else(|| {
+                    if entry.is_human_queue_entry() { json!({"principalId":null,"login":null,"displayName":null,"avatarUrl":null}) } else { Value::Null }
+                });
+                sources.push(RecoverySource {
+                    message_id: entry.id.clone(),
+                    submission_ids: entry
+                        .correlation_order_known
+                        .then(|| entry.submission_ids()),
+                    author,
+                    origin: if entry.user_origin {
+                        MessageOrigin::User
+                    } else {
+                        MessageOrigin::Automatic
+                    },
+                });
+            } else {
+                sources.extend(entry.recovery_sources.clone());
+            }
+        }
+        RecoverySource::normalize(sources)
+    }
+
+    pub(crate) fn submission_replay(
+        &self,
+        agent_id: &AgentId,
+        id: &str,
+        metadata: Option<&Value>,
+    ) -> Result<Option<Value>> {
+        let draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        Ok(self.submission_replay_locked(agent_id, id, metadata, &draining)?.map(|(entry, position)| {
+            let mut result = json!({"success":true,"queued":true,"queuedMessage":entry.to_value(position),"turnId":entry.turn_id});
+            entry.attach_correlation(&mut result);
+            result
+        }))
+    }
+
+    #[expect(clippy::too_many_arguments)]
     fn enqueue_message_with_id_locked(
         &self,
         agent_id: &AgentId,
@@ -14652,7 +15287,7 @@ impl Services {
         if let Some((position, existing)) = queue
             .iter()
             .enumerate()
-            .find(|(_, queued)| queued.id == id || queued.merged_submission_ids.contains(&id))
+            .find(|(_, queued)| queued.matches_submission(&id))
         {
             return (existing.clone(), position);
         }
@@ -14669,6 +15304,8 @@ impl Services {
             return (existing.clone(), position);
         }
         let queued = QueuedMessage {
+            delivery_groups: None,
+            prepend_delivery_groups: prepend.delivery_groups,
             turn_id: id.clone(),
             id,
             content,
@@ -14688,6 +15325,8 @@ impl Services {
             hold_until: None,
             child_agent_id: None,
             merged_submission_ids: Vec::new(),
+            recovery_sources: Vec::new(),
+            correlation_order_known: true,
             edit_appended: String::new(),
             edit_prepended: String::new(),
             editing_message_id: None,
@@ -14750,11 +15389,12 @@ impl Services {
         prepend: Option<QueuedPrepend>,
         interrupt: bool,
         origin: MessageOrigin,
-    ) -> (QueuedMessage, usize) {
+    ) -> Result<(QueuedMessage, usize)> {
         let draining = self
             .draining_queue_entries
             .lock()
             .expect("draining queue registry poisoned");
+        self.submission_replay_locked(agent_id, &message_id, message_metadata.as_ref(), &draining)?;
         let (queued, position) = self.enqueue_message_with_id_locked(
             agent_id,
             Some(message_id),
@@ -14768,7 +15408,7 @@ impl Services {
             &draining,
         );
         self.mark_parked_recovery_send(agent_id, queued.id.clone());
-        (queued, position)
+        Ok((queued, position))
     }
 
     /// Enqueue (or refresh) a **held** entry on an agent's queue: the entry
@@ -14808,6 +15448,8 @@ impl Services {
             } else {
                 let id = new_message_id();
                 let queued = QueuedMessage {
+                    delivery_groups: None,
+                    prepend_delivery_groups: None,
                     turn_id: id.clone(),
                     id,
                     content,
@@ -14827,6 +15469,8 @@ impl Services {
                     hold_until: Some(hold_until.to_string()),
                     child_agent_id: Some(child_agent_id.to_string()),
                     merged_submission_ids: Vec::new(),
+                    recovery_sources: Vec::new(),
+                    correlation_order_known: true,
                     edit_appended: String::new(),
                     edit_prepended: String::new(),
                     editing_message_id: None,
@@ -15262,7 +15906,9 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
-        let idx = queue.iter().position(QueuedMessage::ready_to_send)?;
+        let idx = queue.iter().position(|m| {
+            m.ready_to_send() && !self.script_monitor_export_blocked(m.message_metadata.as_ref())
+        })?;
         Some(queue.remove(idx))
     }
 
@@ -15283,7 +15929,7 @@ impl Services {
         Some(queue.remove(idx))
     }
 
-    /// Batch-flush dequeue (`agents.flushQueuedMessages`, PROTOCOL §5.5): pop
+    /// Batch-flush dequeue (PROTOCOL §5.5): pop
     /// EVERY ready-to-send entry in stored order — which IS the drain order
     /// (interrupt-priority first, then FIFO); `editing: true` entries stay
     /// queued — so the drain can deliver them as one combined provider turn.
@@ -15308,6 +15954,14 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
+        // Preserve each script wake's durable identity and lifecycle fence through worker admission.
+        if queue.iter().any(|m| {
+            m.ready_to_send()
+                && crate::script_monitor::monitor_id(m.message_metadata.as_ref()).is_some()
+        }) {
+            return None;
+        }
+
         let ready = QueuedMessage::ready_to_send;
         if require_user_origin && !queue.iter().any(|m| ready(m) && m.user_origin) {
             return None;
@@ -15325,75 +15979,6 @@ impl Services {
             }
         }
         Some(drained)
-    }
-
-    /// System-only batch dequeue (`agents.flushQueuedMessages = "systemOnly"`):
-    /// scan the WHOLE queue — regardless of interleaving with user-origin
-    /// entries — for ready-to-send (`!editing`) SYSTEM-origin entries
-    /// (`user_origin == false`) and, when at least `min_ready` are found,
-    /// remove ALL of them, preserving their relative order; user-origin
-    /// entries are left untouched in their original queue positions. System
-    /// entries may thus be delivered ahead of earlier-queued, interleaved
-    /// user entries. Returns `None` — leaving the queue untouched — when
-    /// fewer than `min_ready` system entries are ready, so the caller falls
-    /// through to the single-entry drain path.
-    pub(crate) fn dequeue_system_only_batch(
-        &self,
-        agent_id: &AgentId,
-        min_ready: usize,
-    ) -> Option<Vec<QueuedMessage>> {
-        let mut guard = self
-            .agent_queues
-            .lock()
-            .expect("agent queue registry poisoned");
-        let queue = guard.get_mut(agent_id)?;
-        let eligible = |m: &QueuedMessage| m.ready_to_send() && !m.user_origin;
-        if queue.iter().filter(|m| eligible(m)).count() < min_ready {
-            return None;
-        }
-        let mut drained = Vec::new();
-        let mut i = 0;
-        while i < queue.len() {
-            if eligible(&queue[i]) {
-                drained.push(queue.remove(i));
-            } else {
-                i += 1;
-            }
-        }
-        Some(drained)
-    }
-
-    /// Mode-dispatching batch dequeue for `agents.flushQueuedMessages`: `All`
-    /// defers to [`Services::dequeue_ready_batch`] (every ready entry;
-    /// `require_user_origin` under the archived-workspace exemption — the
-    /// flush fires only when a user-origin entry is ready, carrying the
-    /// parked automatic entries along FIFO, intent-hq/intent#3883);
-    /// `SystemOnly` defers to [`Services::dequeue_system_only_batch`]
-    /// (system-origin entries anywhere in the queue) but NEVER batches under
-    /// that exemption (`require_user_origin`) — the exemption's trigger is a
-    /// user-origin entry, which `SystemOnly` by definition excludes; `Off`
-    /// always returns `None` so every caller falls through to the
-    /// single-entry FIFO path.
-    pub(crate) fn dequeue_flush_batch(
-        &self,
-        agent_id: &AgentId,
-        mode: intent_core::FlushQueuedMessagesMode,
-        require_user_origin: bool,
-        min_ready: usize,
-    ) -> Option<Vec<QueuedMessage>> {
-        match mode {
-            intent_core::FlushQueuedMessagesMode::All => {
-                self.dequeue_ready_batch(agent_id, require_user_origin, min_ready)
-            }
-            intent_core::FlushQueuedMessagesMode::SystemOnly => {
-                if require_user_origin {
-                    None
-                } else {
-                    self.dequeue_system_only_batch(agent_id, min_ready)
-                }
-            }
-            intent_core::FlushQueuedMessagesMode::Off => None,
-        }
     }
 
     /// Re-insert a batch of messages at the front of an agent's queue,
@@ -15549,7 +16134,12 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .get(agent_id)
-            .is_some_and(|q| q.iter().any(QueuedMessage::ready_to_send))
+            .is_some_and(|q| {
+                q.iter().any(|m| {
+                    m.ready_to_send()
+                        && !self.script_monitor_export_blocked(m.message_metadata.as_ref())
+                })
+            })
     }
 
     /// `true` iff the agent's queue still holds a ready-to-send entry with
@@ -15795,18 +16385,40 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned");
         let live = live.get(agent_id).map(Vec::as_slice).unwrap_or_default();
-        draining
+        let draining = draining
             .get(agent_id)
-            .into_iter()
-            .flatten()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let candidate = live
+            .iter()
+            .filter(|entry| entry.is_human_queue_entry())
+            .max_by_key(|entry| entry.submission_order);
+        let eligible = candidate
+            .filter(|entry| {
+                entry.correlation_order_known
+                    && entry.can_merge_pending(entry)
+                    && !draining.iter().any(|d| {
+                        d.provisional
+                            && d.is_human_queue_entry()
+                            && d.submission_order > entry.submission_order
+                    })
+            })
+            .map(|entry| entry.id.as_str());
+        draining
+            .iter()
             .filter(|d| {
                 !live
                     .iter()
                     .any(|m| m.matches_submission(&d.id) || m.turn_id == d.turn_id)
             })
-            .chain(live.iter())
+            .map(|m| (m, false))
+            .chain(live.iter().map(|m| (m, eligible == Some(m.id.as_str()))))
             .enumerate()
-            .map(|(i, m)| m.to_value(i))
+            .map(|(i, (m, eligible))| {
+                let mut value = m.to_value(i);
+                value["mergeEligible"] = json!(eligible);
+                value
+            })
             .collect()
     }
 
@@ -15858,23 +16470,6 @@ impl Services {
         )
     }
 
-    /// [`Services::dequeue_flush_batch`] with the same draining registration
-    /// as [`Services::dequeue_message_draining`]; one guard covers the batch.
-    pub(crate) fn dequeue_flush_batch_draining(
-        &self,
-        agent_id: &AgentId,
-        mode: intent_core::FlushQueuedMessagesMode,
-        require_user_origin: bool,
-        min_ready: usize,
-    ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
-        self.pop_draining(
-            agent_id,
-            |s| s.dequeue_flush_batch(agent_id, mode, require_user_origin, min_ready),
-            Vec::as_slice,
-            PopCommit::Delivery,
-        )
-    }
-
     /// [`Services::dequeue_ready_batch`] with the same draining registration
     /// as [`Services::dequeue_message_draining`]; one guard covers the batch.
     pub(crate) fn dequeue_ready_batch_draining(
@@ -15886,21 +16481,6 @@ impl Services {
         self.pop_draining(
             agent_id,
             |s| s.dequeue_ready_batch(agent_id, require_user_origin, min_ready),
-            Vec::as_slice,
-            PopCommit::Delivery,
-        )
-    }
-
-    /// [`Services::dequeue_system_only_batch`] with the same draining
-    /// registration as [`Services::dequeue_message_draining`].
-    pub(crate) fn dequeue_system_only_batch_draining(
-        &self,
-        agent_id: &AgentId,
-        min_ready: usize,
-    ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
-        self.pop_draining(
-            agent_id,
-            |s| s.dequeue_system_only_batch(agent_id, min_ready),
             Vec::as_slice,
             PopCommit::Delivery,
         )
@@ -15975,6 +16555,70 @@ impl Services {
             Some(e) => Err(e),
             None => Ok(popped),
         }
+    }
+
+    /// Validate the complete explicit selection before changing anything. The
+    /// queue and draining locks make concurrent selections and drains exclusive.
+    /// A quarantined session validates with `take = false` and stays untouched.
+    pub(crate) fn take_queued_messages_draining_gated(
+        &self,
+        agent_id: &AgentId,
+        message_ids: &[String],
+        gate: Option<&QueueEntryGate>,
+        take: bool,
+    ) -> Result<(Vec<QueuedMessage>, Option<DrainingGuard>)> {
+        let selected: HashSet<&str> = message_ids.iter().map(String::as_str).collect();
+        if selected.is_empty()
+            || selected.len() != message_ids.len()
+            || selected.iter().any(|id| id.trim().is_empty())
+        {
+            return Err(Error::InvalidParams(
+                "messageIds must contain distinct nonempty IDs".into(),
+            ));
+        }
+        let mut draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        if self
+            .draining_shutdown
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(Error::Internal("daemon is shutting down".into()));
+        }
+        let mut queues = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = queues
+            .get_mut(agent_id)
+            .ok_or_else(|| Error::InvalidParams("queued message not found".into()))?;
+        let entries: Vec<_> = queue
+            .iter()
+            .filter(|m| selected.contains(m.id.as_str()))
+            .cloned()
+            .collect();
+        if entries.len() != selected.len() {
+            return Err(Error::InvalidParams("queued message not found".into()));
+        }
+        for entry in &entries {
+            if let Some(gate) = gate {
+                gate.check(entry)?;
+            }
+            if !entry.ready_to_send()
+                || crate::script_monitor::monitor_id(entry.message_metadata.as_ref()).is_some()
+            {
+                return Err(Error::InvalidParams(
+                    "queued message is not ready to send".into(),
+                ));
+            }
+        }
+        if !take {
+            return Ok((entries, None));
+        }
+        queue.retain(|m| !selected.contains(m.id.as_str()));
+        let guard = self.register_draining(&mut draining, agent_id, &entries);
+        Ok((entries, Some(guard)))
     }
 
     /// Record already-popped `entries` as draining for `agent_id` (a batch a
@@ -16220,8 +16864,19 @@ impl Services {
             if row.payload.get("shutdownRecovery").and_then(Value::as_bool) == Some(true) {
                 recover.insert((row.agent_id.clone(), row.id.clone()));
             }
+            let order_known = row
+                .payload
+                .get("correlationOrderKnown")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| {
+                    row.payload
+                        .get("submissionOrder")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|order| order > 0)
+                });
             match serde_json::from_value::<QueuedMessage>(row.payload) {
                 Ok(mut message) => {
+                    message.correlation_order_known = order_known;
                     if message.submission_order == 0 {
                         message.submission_order = self
                             .queue_submission_order
@@ -16438,7 +17093,11 @@ impl Services {
         let mut queued_messages: Vec<_> = messages
             .iter()
             .enumerate()
-            .map(|(position, entry)| entry.to_value(position))
+            .map(|(position, entry)| {
+                let mut value = entry.to_value(position);
+                value["mergeEligible"] = json!(false);
+                value
+            })
             .collect();
         resolver.attach_queue(&mut queued_messages).await;
         let mut data = json!({
@@ -16898,6 +17557,7 @@ fn resume_continuation_text(interrupted_at: &str, now: time::OffsetDateTime) -> 
 /// emits them on the recreate branch too (the history XML is text-only).
 pub(crate) struct ResumeTailRecap {
     pub(crate) text: String,
+    pub(crate) delivery_groups: Option<Vec<QueuedDeliveryGroup>>,
     /// Replayed user rows' `image` blocks (persisted shape carries the same
     /// `data`/`mimeType` keys prompt assembly reads; the extra `type` key is
     /// ignored). `None` when the replayed rows had none.
@@ -16911,7 +17571,7 @@ pub(crate) struct ResumeTailRecap {
 /// One replayed tail row, in transcript order.
 enum TailSegment {
     /// A user message the provider never committed.
-    User(String),
+    User(String, Vec<Value>, Vec<Value>),
     /// Partial assistant output flushed by an interruption.
     Partial(String),
 }
@@ -16991,13 +17651,13 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
                     }
                 }
                 if !row_images.is_empty() {
-                    image_rows.push(row_images);
+                    image_rows.push(row_images.clone());
                 }
                 if !row_files.is_empty() {
-                    file_rows.push(row_files);
+                    file_rows.push(row_files.clone());
                 }
-                if !text.is_empty() {
-                    segments.push(TailSegment::User(text));
+                if !text.is_empty() || !row_images.is_empty() || !row_files.is_empty() {
+                    segments.push(TailSegment::User(text, row_images, row_files));
                 }
             }
             // Any other tail shape (e.g. a bare `tool` row) is not the
@@ -17025,10 +17685,11 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     // actually abbreviated; untruncated, unelided recaps are byte-identical
     // to before).
     let mut body = String::new();
+    let mut segment_groups = Vec::new();
     let mut truncated_any = false;
     for segment in &segments {
         let (label, tag, text) = match segment {
-            TailSegment::User(text) => (
+            TailSegment::User(text, _, _) => (
                 "The user's message, delivered before the interruption:",
                 "interrupted_user_message",
                 text,
@@ -17043,11 +17704,22 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
         let (text, truncated_attrs) =
             crate::history_xml::truncate_marked(text, RESUME_RECAP_SEGMENT_MAX_CHARS);
         truncated_any |= !truncated_attrs.is_empty();
-        let _ = write!(
-            body,
+        let rendered = format!(
             "{label}\n<{tag}{truncated_attrs}>\n{}\n</{tag}>\n\n",
             crate::history_xml::escape_xml(&text)
         );
+        body.push_str(&rendered);
+        let (images, files) = match segment {
+            TailSegment::User(_, images, files) => (images.clone(), files.clone()),
+            TailSegment::Partial(_) => (Vec::new(), Vec::new()),
+        };
+        segment_groups.push(QueuedDeliveryGroup {
+            source_id: None,
+            is_prepend: true,
+            content: rendered,
+            image_blocks: (!images.is_empty()).then(|| Value::Array(images)),
+            file_blocks: (!files.is_empty()).then(|| Value::Array(files)),
+        });
     }
     let mut recap = String::from(
         "<supervisor>\nRestart recovery: the harness restarted while you were \
@@ -17061,15 +17733,37 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     if elided > 0 {
         let _ = write!(recap, "({elided} older interrupted segment(s) elided.)\n\n");
     }
+    let mut groups = vec![QueuedDeliveryGroup {
+        source_id: None,
+        is_prepend: true,
+        content: recap.clone(),
+        image_blocks: None,
+        file_blocks: None,
+    }];
+    groups.extend(segment_groups);
     recap.push_str(&body);
+    let mut suffix = String::new();
     if !has_partial {
-        recap.push_str(
+        suffix.push_str(
             "Your response was cut off before any output was produced — \
              treat that request as not yet acted on.\n",
         );
     }
-    recap.push_str("</supervisor>");
+    suffix.push_str("</supervisor>");
+    recap.push_str(&suffix);
+    groups.push(QueuedDeliveryGroup {
+        source_id: None,
+        is_prepend: true,
+        content: suffix,
+        image_blocks: None,
+        file_blocks: None,
+    });
+    let delivery_groups = groups
+        .iter()
+        .any(QueuedDeliveryGroup::has_attachments)
+        .then_some(groups);
     Some(ResumeTailRecap {
+        delivery_groups,
         text: recap,
         image_blocks: (!image_blocks.is_empty()).then(|| Value::Array(image_blocks)),
         file_blocks: (!file_blocks.is_empty()).then(|| Value::Array(file_blocks)),
@@ -17567,6 +18261,7 @@ impl Services {
                 let options = match recap {
                     Some(recap) => crate::agent_manager::TurnOptions {
                         reject_on_shutdown: true,
+                        prepend_delivery_groups: recap.delivery_groups,
                         prepend_content: Some(recap.text),
                         prepend_image_blocks: recap.image_blocks,
                         prepend_file_blocks: recap.file_blocks,
@@ -17758,4 +18453,24 @@ fn is_manual_foreground_agent(session: &AgentSession) -> bool {
             .metadata
             .as_ref()
             .is_some_and(is_agent_created_metadata)
+}
+
+/// Bound and validate caller identities before queue or runtime mutation.
+pub(crate) fn validate_submission_id(id: Option<&str>) -> Result<()> {
+    if let Some(id) = id {
+        if id.is_empty() || id.len() > MAX_MESSAGE_ID_LEN {
+            return Err(Error::InvalidParams(format!(
+                "messageId must be nonempty and at most {MAX_MESSAGE_ID_LEN} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn stamp_direct_correlation(metadata: &mut Option<Value>, id: &str) {
+    let value = metadata.get_or_insert_with(|| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.remove("recoverySources");
+        object.insert("submissionIds".into(), json!([id]));
+    }
 }

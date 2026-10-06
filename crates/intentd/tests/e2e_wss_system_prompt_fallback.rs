@@ -66,20 +66,19 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let secrets_file = data_dir.join("secrets.json");
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     for (k, v) in env {
         cmd.env(k, v);
     }
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
     cmd.spawn().expect("spawn intentd serve")
 }
 
@@ -310,6 +309,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,

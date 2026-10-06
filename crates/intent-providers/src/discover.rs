@@ -196,8 +196,22 @@ pub fn discover_providers_with_overrides(
     override_path: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<ProviderAvailability> {
     discover_providers_with_overrides_and_resolver(override_path, &|id, cmd| {
-        find_provider_binary(id, cmd, None)
+        resolve_catalog_binary(id, cmd)
     })
+}
+
+fn resolve_catalog_binary(id: &str, cmd: &str) -> Option<PathBuf> {
+    match (id, cmd) {
+        ("codex", "codex") => crate::installed_cli::InstalledCli::Codex
+            .resolve()
+            .ok()
+            .map(|r| r.path().to_owned()),
+        ("claude", "claude") => crate::installed_cli::InstalledCli::Claude
+            .resolve()
+            .ok()
+            .map(|r| r.path().to_owned()),
+        _ => find_provider_binary(id, cmd, None),
+    }
 }
 
 fn discover_providers_with_overrides_and_resolver(
@@ -231,7 +245,7 @@ pub fn provider_availability_for(
     Some(availability_for(
         provider,
         gated_reason(provider),
-        &|id, cmd| find_provider_binary(id, cmd, None),
+        &resolve_catalog_binary,
         override_path,
     ))
 }
@@ -304,7 +318,11 @@ fn availability_for_with_npx(
         provider.requires_secondary_binary.map(|s| {
             let auto = resolve_auto(s, s);
             let secondary_override =
-                override_path(provider.id).and_then(|p| resolve_explicit_path(provider.id, &p));
+                if crate::installed_cli::InstalledCli::for_provider(provider.id).is_some() {
+                    None
+                } else {
+                    override_path(provider.id).and_then(|p| resolve_explicit_path(provider.id, &p))
+                };
             SecondaryBinary {
                 command: s,
                 resolved: auto.is_some() || secondary_override.is_some(),
@@ -689,16 +707,28 @@ fn find_provider_binary_with_source_and_dirs(
 /// deliberately no auto-discovery fallthrough (managed bin / PATH scan) —
 /// that is what makes the provider npx-only. Shared by the ACP spawn,
 /// discovery's `installed`, the one-shot / test-prompt launches, and the
-/// claude-code ACP auth fallback probe so every launch surface runs the same
-/// adapter (intent-hq/monorepo#4352). The model-catalog fetch is NOT on this
-/// path: it always runs the pinned package (the catalog registry has no
-/// settings access, and the list is not an auth signal).
+/// ACP auth fallback. Codex and Claude do not opt in: legacy adapter overrides
+/// are ignored with a once-per-provider diagnostic, keeping their sessions
+/// and model catalogs on the same reviewed package and installed CLI.
 #[must_use]
 pub fn resolve_npx_only_override(
     provider: &ProviderConfig,
     explicit_path: Option<&str>,
 ) -> Option<PathBuf> {
     if !provider.npx_only_honors_path_override {
+        if crate::installed_cli::InstalledCli::for_provider(provider.id).is_some()
+            && explicit_path.is_some_and(|p| !p.trim().is_empty())
+        {
+            static REPORTED: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+                std::sync::Mutex::new(std::collections::BTreeSet::new());
+            let first = REPORTED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(provider.id);
+            if first {
+                tracing::warn!(provider = provider.id, "legacy adapter path override ignored: remove providers.paths for this provider; install the canonical CLI on PATH. Sessions and catalogs use the reviewed pinned adapter");
+            }
+        }
         return None;
     }
     let key = provider.primary_binary_provider_id();
@@ -892,7 +922,11 @@ fn find_in_dirs(dirs: &[PathBuf], command: &str) -> Option<PathBuf> {
 /// [`find_in_dirs`] parametrized on the platform (test seam — Windows CI is
 /// disabled, so the Windows candidate/executability arm is unit-tested on
 /// POSIX).
-fn find_in_dirs_for(dirs: &[PathBuf], command: &str, is_windows: bool) -> Option<PathBuf> {
+pub(crate) fn find_in_dirs_for(
+    dirs: &[PathBuf],
+    command: &str,
+    is_windows: bool,
+) -> Option<PathBuf> {
     let candidates = name_candidates_for(command, is_windows);
     for dir in dirs {
         for candidate in &candidates {
@@ -1618,7 +1652,10 @@ mod find_provider_binary_tests {
         // Assert against the single discovery snapshot rather than re-resolving
         // npx (no test mutates process-global PATH anymore — monorepo#628 —
         // but the snapshot assertion stays robust regardless).
-        assert_eq!(cc.installed, cc.resolved_path.is_some());
+        assert_eq!(
+            cc.installed,
+            cc.resolved_path.is_some() && cc.secondary_binary.as_ref().is_some_and(|s| s.resolved)
+        );
         if let Some(path) = &cc.resolved_path {
             assert!(path
                 .file_name()
@@ -1658,7 +1695,11 @@ mod find_provider_binary_tests {
             Some(crate::config::CODEX_ACP_NPX_PACKAGE)
         );
         assert!(!codex.has_npx_fallback);
-        assert_eq!(codex.installed, codex.resolved_path.is_some());
+        assert_eq!(
+            codex.installed,
+            codex.resolved_path.is_some()
+                && codex.secondary_binary.as_ref().is_some_and(|s| s.resolved)
+        );
         if let Some(path) = &codex.resolved_path {
             assert!(path
                 .file_name()
@@ -2250,8 +2291,8 @@ mod override_aware_discovery_tests {
         let claude = claude_code_config();
         assert_eq!(
             resolve_npx_only_override(claude, Some(adapter.to_str().unwrap())),
-            Some(adapter.clone()),
-            "valid absolute executable resolves"
+            None,
+            "legacy adapter overrides cannot bypass the reviewed pin"
         );
         assert_eq!(resolve_npx_only_override(claude, None), None);
         assert_eq!(resolve_npx_only_override(claude, Some("   ")), None);
@@ -2324,7 +2365,8 @@ mod override_aware_discovery_tests {
                         &resolve_npx,
                     );
                     assert_eq!(
-                        availability.installed, npx_present,
+                        availability.installed,
+                        npx_present && native_present,
                         "native={native_present}, npx={npx_present}, override={explicit_path:?}"
                     );
                     assert_eq!(availability.resolved_path, resolve_npx());
@@ -2344,13 +2386,16 @@ mod override_aware_discovery_tests {
     /// spawn would succeed) while `resolved_path` stays the auto-detected
     /// npx — never the override path.
     #[test]
-    fn valid_claude_code_override_flips_installed_without_touching_paths() {
+    fn legacy_claude_code_override_cannot_replace_missing_installed_cli() {
         let dir = unique_temp_dir("override-claude-code");
         let adapter = dir.path().join("claude-agent-acp");
         make_executable(&adapter);
         let overrides = |key: &str| (key == "claude-code").then(|| adapter.display().to_string());
         let availability = availability_for(claude_code_config(), None, &|_, _| None, &overrides);
-        assert!(availability.installed, "valid override must flip installed");
+        assert!(
+            !availability.installed,
+            "legacy adapter override cannot supply the installed CLI"
+        );
         assert_ne!(availability.resolved_path.as_ref(), Some(&adapter));
         assert_eq!(
             availability.npx_only_package,
@@ -2366,7 +2411,7 @@ mod override_aware_discovery_tests {
         let missing = dir.path().join("missing");
         let overrides = |key: &str| (key == "claude-code").then(|| missing.display().to_string());
         let availability = availability_for(claude_code_config(), None, &|_, _| None, &overrides);
-        assert_eq!(availability.installed, availability.resolved_path.is_some());
+        assert!(!availability.installed);
     }
 
     /// monorepo#1065: with nothing auto-detected, valid overrides for both

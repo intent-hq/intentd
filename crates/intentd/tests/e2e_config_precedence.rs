@@ -31,9 +31,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
-        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -41,6 +40,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
     cmd.spawn().expect("spawn intentd serve")
 }
 
@@ -396,9 +396,8 @@ fn invalid_config_refuses_startup_with_key_in_error() {
     ] {
         let data_dir = temp_data_dir();
         std::fs::write(data_dir.path().join("config.toml"), body).expect("seed config.toml");
-        let out = common::serve_command()
+        let out = common::hermetic_serve_command(data_dir.path())
             .env("INTENTD_DATA_DIR", data_dir.path())
-            .env("INTENTD_SECRETS_FILE", data_dir.path().join("secrets.json"))
             .output()
             .expect("run intentd serve");
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -424,9 +423,8 @@ fn invalid_config_refuses_startup_with_key_in_error() {
 fn out_of_range_env_pin_refuses_startup() {
     let data_dir = temp_data_dir();
     // The explicit pin overrides the builder's ephemeral seam.
-    let out = common::serve_command()
+    let out = common::hermetic_serve_command(data_dir.path())
         .env("INTENTD_DATA_DIR", data_dir.path())
-        .env("INTENTD_SECRETS_FILE", data_dir.path().join("secrets.json"))
         .env("INTENTD_TCP_PORT", "80")
         .output()
         .expect("run intentd serve");

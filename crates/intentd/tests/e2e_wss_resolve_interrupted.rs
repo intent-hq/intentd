@@ -187,6 +187,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -237,7 +238,7 @@ async fn resolve_interrupted_resume_and_abandon() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(&data_dir);
     cmd.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -559,7 +560,7 @@ async fn resolve_interrupted_invalid_params_validation() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(&data_dir);
     cmd.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)

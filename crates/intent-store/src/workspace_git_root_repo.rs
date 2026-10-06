@@ -123,8 +123,26 @@ impl Store {
         &self,
         root: &WorkspaceGitRoot,
     ) -> Result<(WorkspaceGitRoot, bool)> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT id FROM workspace_git_root WHERE workspace_id=? AND path=?")
+                .bind(&root.workspace_id.0)
+                .bind(&root.path)
+                .fetch_optional(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("read root binding failed: {e}")))?;
+        if existing.is_none() {
+            lifecycle.begin(&[
+                crate::RepositoryLifecycleKey::RootInventory(root.workspace_id.clone()),
+                crate::RepositoryLifecycleKey::GitRoot(root.id.clone()),
+                crate::RepositoryLifecycleKey::Selection {
+                    workspace_id: root.workspace_id.clone(),
+                    git_root_id: Some(root.id.clone()),
+                },
+            ])?;
+        }
         let pool = self.write_pool();
-        crate::with_write_txn_retry(|| async {
+        let result = crate::with_write_txn_retry(|| async {
             let mut tx = pool.begin().await.map_err(|e| {
                 Error::Internal(format!("upsert workspace git root tx failed: {e}"))
             })?;
@@ -212,7 +230,8 @@ impl Store {
             })?;
             Ok((merged, inserted))
         })
-        .await
+        .await;
+        lifecycle.finish(result)
     }
 
     /// Fetch a single git root by id, or `NotFound`.
@@ -353,6 +372,16 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the workspace git root does not exist; `Error::Internal` if the database operation fails.
     pub async fn delete_workspace_git_root(&self, id: &WorkspaceGitRootId) -> Result<()> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let root = self.get_workspace_git_root(id).await?;
+        lifecycle.begin(&[
+            crate::RepositoryLifecycleKey::RootInventory(root.workspace_id.clone()),
+            crate::RepositoryLifecycleKey::GitRoot(root.id.clone()),
+            crate::RepositoryLifecycleKey::Selection {
+                workspace_id: root.workspace_id,
+                git_root_id: Some(root.id),
+            },
+        ])?;
         let res = sqlx::query("DELETE FROM workspace_git_root WHERE id = ?")
             .bind(&id.0)
             .execute(self.write_pool())
@@ -361,6 +390,7 @@ impl Store {
         if res.rows_affected() == 0 {
             return Err(Error::NotFound(format!("workspace git root {id}")));
         }
+        lifecycle.settle();
         Ok(())
     }
 
@@ -611,6 +641,7 @@ mod tests {
             created_at: ts.to_string(),
             updated_at: ts.to_string(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,

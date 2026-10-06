@@ -30,13 +30,15 @@ async fn configured_monitor_quota_scales_one_owner_and_bounds_sweep_reads() {
     let before = forge.fetches();
     let before_sub = sub_fetch_totals(&forge);
     let mut observed = Vec::new();
-    for _ in 0..11 {
+    // At the default 60s tick, 55 distinct PRs and a 1500/h budget give
+    // a 396s interval and ceil(55 * 60 / 396) = 9 reads per tick.
+    for tick in 0..7 {
         svc.poll_due_pr_monitors().await;
         let reads = forge.take_fetched_numbers();
         assert_eq!(
             reads.len(),
-            5,
-            "existing scheduler caps each tick at five distinct reads"
+            if tick == 6 { 1 } else { 9 },
+            "scheduler caps each tick at nine distinct reads until the backlog drains"
         );
         observed.extend(reads);
     }

@@ -41,7 +41,7 @@ fn make_dirs() -> TestDirs {
 
 fn spawn_daemon(dirs: &TestDirs) -> Child {
     let log = std::fs::File::create(dirs.data_dir.join("daemon.log")).expect("create daemon log");
-    common::serve_command()
+    common::hermetic_serve_command(&dirs.data_dir)
         .env("INTENTD_DATA_DIR", &dirs.data_dir)
         .env("INTENTD_WORKSPACES_DIR", &dirs.workspaces)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")

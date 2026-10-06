@@ -287,6 +287,9 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // Freeze process restrictions before runtime/configuration consumers.
+    // Ordinary settings cannot relax an opted-in private test profile.
+    intent_core::process_policy::ProcessPolicy::current();
     // Capture-and-scrub the sitter's update-restart marker before the tokio
     // runtime starts (still single-threaded here, where `env::remove_var` is
     // sound): the daemon's environment is inherited by every subprocess it
@@ -1654,6 +1657,9 @@ async fn cmd_serve(
     // bearer-token enforcement on the TCP path (plain `ws://`), and skips cert
     // provisioning entirely. Dev-only; loudly warned at startup.
     let insecure = insecure || env_flag("INTENTD_INSECURE");
+    if insecure && intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
+        anyhow::bail!("INTENTD_PRIVATE_TEST_PROFILE forbids --insecure / INTENTD_INSECURE");
+    }
     // Resolve the optional locality override (§5.14): `--mode local|remote`
     // forces the value reported over `host.status` regardless of transport;
     // absent ⇒ infer from the transport (UDS local, TCP/WSS remote).
@@ -1897,6 +1903,15 @@ async fn cmd_serve(
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
         .with_hooks_max_per_agent(config.hooks_max_per_agent);
+    #[cfg(feature = "repository-test-fixtures")]
+    let fixture_installed = initialize_gitlab_test_transports(&services).await?;
+    #[cfg(not(feature = "repository-test-fixtures"))]
+    let fixture_installed = false;
+    if !fixture_installed {
+        if let Err(error) = services.initialize_gitlab_repository_binding().await {
+            tracing::debug!(%error, "repository GitLab binding remains unavailable at startup");
+        }
+    }
     // Inject the suspend-overlap query so Task C can recognize sleep-induced
     // turn failures and enroll them for wake-resume. Left unset when wakeResume
     // is disabled, keeping today's terminal behavior for transient disconnects.
@@ -2187,7 +2202,7 @@ async fn cmd_serve(
     // (~30 min). Safe when source control is unconfigured (a sweep with due
     // workspaces logs and swallows the missing-provider error). Aborted on
     // clean shutdown.
-    let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(180));
+    let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60));
     // Centralized PR-monitor loop (`ws.pr.monitor`): every `[prMonitor]
     // pollSeconds` (read live, floor 10s), poll the due active monitors —
     // each PR on an effective interval stretched to fit the `[prMonitor]
@@ -2264,7 +2279,11 @@ async fn cmd_serve(
 
     // Build api Arc early so it can be cloned for runtime control (§5.12).
     // ServerControl is attached after DaemonControl is built via the OnceLock seam.
-    let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
+    let api_services = Arc::new(services.clone());
+    if let Err(error) = api_services.initialize_repository_wire().await {
+        tracing::debug!(%error, "native repository context remains unavailable at startup");
+    }
+    let api: Arc<dyn WorkspaceApi> = api_services;
     // Bridge `file:*` → debounced `changes:git-status` (monorepo#1397): external
     // file edits refresh the FE Changes panel without any in-app git action.
     // Arc'd so the watcher registry's `.git` metadata watches feed the same
@@ -4198,6 +4217,15 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
 }
 
 impl SystemControl for DaemonControl {
+    fn collaboration_name(&self) -> Option<String> {
+        self.settings_registry
+            .snapshot()
+            .effective
+            .sharing
+            .collaboration_name()
+            .map(str::to_owned)
+    }
+
     fn status(&self) -> SystemStatus {
         // Read live port/fingerprint/client count/bind set from runtime state
         // (§5.12 fix). Use try_lock to avoid blocking; if locked, report as
@@ -4453,6 +4481,11 @@ impl intent_core::ServerControl for DaemonControl {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<u16>> + Send + '_>>
     {
         Box::pin(async move {
+            if intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
+                return Err(intent_core::Error::InvalidParams(
+                    "INTENTD_PRIVATE_TEST_PROFILE forbids the WS API listener".into(),
+                ));
+            }
             #[cfg(all(unix, debug_assertions))]
             if let Some(path) = std::env::var_os("INTENTD_TEST_SETTINGS_WS_START_GATE") {
                 use tokio::io::AsyncReadExt;
@@ -4786,6 +4819,11 @@ impl intent_core::ServerControl for DaemonControl {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<String>> + Send + '_>>
     {
         Box::pin(async move {
+            if intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
+                return Err(intent_core::Error::InvalidParams(
+                    "INTENTD_PRIVATE_TEST_PROFILE forbids tunnels".into(),
+                ));
+            }
             // The tunnel forwards to the WSS port, so the listener must be up
             // (clear, actionable error otherwise — the settings hook surfaces it).
             let Some(port) = self.ws_listener_port().await else {
@@ -4857,6 +4895,26 @@ fn apply_startup_pins(
             .pin(path, value, flag)
             .map_err(|e| anyhow::anyhow!("invalid startup override {flag}: {e}"))
     };
+    if intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
+        for (path, value) in [
+            ("server.bindAddress", json!("127.0.0.1")),
+            ("server.wsApi.enabled", json!(false)),
+            ("server.tunnel.enabled", json!(false)),
+            ("server.tls.enabled", json!(true)),
+            ("server.auth.enabled", json!(true)),
+            ("updates.checkOnIdle", json!(false)),
+            (
+                "sourceControl.github.exposeGitCredentialToChildren",
+                json!(false),
+            ),
+        ] {
+            pin(
+                path,
+                value,
+                intent_core::process_policy::PRIVATE_TEST_PROFILE_ENV,
+            )?;
+        }
+    }
     if insecure {
         // Dev mode hard-disables TLS + bearer auth for the process lifetime.
         pin("server.tls.enabled", json!(false), "--insecure")?;
@@ -6214,13 +6272,17 @@ fn spawn_config_watcher_init(
 ) -> tokio::task::JoinHandle<()> {
     intent_core::spawn_daemon(async move {
         let watcher_services = services.clone();
-        let started = intent_services::ConfigWatcher::start(
+        let started = intent_services::ConfigWatcher::start_prepared_reload(
             &hub,
             registry,
             watcher_services.settings_revision_gate(),
-            move |notice| {
+            move |text, expected, admission| {
                 let services = watcher_services.clone();
-                async move { services.apply_external_settings_change(&notice).await }
+                async move {
+                    services
+                        .apply_prepared_settings_reload(text, expected, admission)
+                        .await
+                }
             },
         );
         let mut watcher = match started {
@@ -7761,6 +7823,37 @@ async fn settle_startup_attachment_retention(handle: tokio::task::JoinHandle<()>
     if let Err(error) = handle.await {
         tracing::warn!(%error, "startup attachment retention worker failed");
     }
+}
+
+/// Deliberate test composition only. Neither normal builds nor the private app
+/// profile interprets this environment input as provider authority.
+#[cfg(feature = "repository-test-fixtures")]
+async fn initialize_gitlab_test_transports(services: &Services) -> anyhow::Result<bool> {
+    let Some(raw) = std::env::var_os("INTENTD_REPOSITORY_TEST_TRANSPORTS") else {
+        return Ok(false);
+    };
+    let raw = raw
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid test transport input"))?;
+    anyhow::ensure!(raw.len() <= 4096, "oversized test transport input");
+    let pairs: Vec<(String, String)> = serde_json::from_str(raw)?;
+    anyhow::ensure!(
+        !pairs.is_empty() && pairs.len() <= 8,
+        "invalid test transport count"
+    );
+    let fixtures = pairs
+        .into_iter()
+        .map(|(instance, endpoint)| {
+            intent_sourcecontrol::GitlabDescriptor::with_loopback_endpoint(
+                intent_sourcecontrol::GitlabInstance::parse(&instance)?,
+                &endpoint,
+            )
+        })
+        .collect::<intent_sourcecontrol::Result<Vec<_>>>()?;
+    services
+        .initialize_repository_test_fixtures(fixtures)
+        .await?;
+    Ok(true)
 }
 
 #[cfg(test)]

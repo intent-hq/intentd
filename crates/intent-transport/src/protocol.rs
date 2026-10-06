@@ -690,11 +690,17 @@
 //! stopping its running turn and cancelling wake sources while preserving
 //! conversation history. MCP retirement remains self-only and feature-gated.
 //!
+//! Version 13.1 adds `agent.sendQueuedMessagesNow`: explicit delivery of a
+//! selected ready queue snapshot as one interrupt-priority batch.
+//!
 //! Version 10.11 adds script purpose and durable, workspace-scoped
 //! `script.archive` / `script.restore`, plus the `script.list` archive filter.
 //! An omitted filter preserves the legacy all-definitions list. The
 //! `scriptLifecycle: 1` capability includes atomic command results, one-off
 //! retirement for every settled outcome, and durable admission recovery.
+//!
+//! Version 13.2 adds explicitly addressed read-only PR checks, reviews, and
+//! changed-file pages, including head guards and forge truncation reporting.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -710,7 +716,27 @@ use std::time::{Duration, Instant};
 // events, including committed result/archive state. Presence detects support.
 // Version 11.3 adds workspace-scoped manual specialist preferences; platform
 // support remains independently capability-gated.
-pub const PROTOCOL_VERSION: &str = "11.3";
+// Version 12.0 retires git.diff/git.log aliases, pr.status,
+// file-tracking.getLineStats, metrics.getWorkspaceStats/getAllWorkspaceStats/
+// clearAgentStats, and forward.create/list/close. Canonical git reads,
+// pr.refresh, metrics.getAgentStats, MCP operations and binary /tunnel remain.
+// Version 12.1 adds durable one-shot script monitors with guarded cancellation,
+// bounded output triggers and automatic owner wakes (scriptMonitors: 1).
+// Version 13.0 removes the deprecated keyed git.commit RPC. Human and agent
+// commits continue to use git.agentCommit with its existing permissions and
+// non-idempotent contract; MCP ws.git.commit is unchanged.
+// Version 13.3 adds qualified repository context, selection, native review,
+// companion confirmation, and explicit MR/issue detail-read capabilities.
+// Version 13.4 adds trusted, persisted submission correlation for optimistic
+// display. Support requires exactly submissionCorrelation: 1; discover other
+// extensions through their independent capabilities and permission checks.
+// Version 13.5 adds original-socket GitLab checkout discovery and native
+// private checkout. Clients require gitlabCheckout: 1 before using it.
+// Version 13.6 adds best-effort host.prepareProviderAdapters. Acknowledgement
+// promises admission only; clients tolerate -32601 on older daemons.
+// Version 13.7 adds capability-gated checkout owner-avatar opt-in.
+// Numeric versions do not replace the original connection capability.
+pub const PROTOCOL_VERSION: &str = "13.7";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

@@ -270,6 +270,7 @@ async fn seed_vocab_workspace(fx: &Fixture, readme: &str) -> WorkspaceId {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,

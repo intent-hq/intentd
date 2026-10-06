@@ -101,8 +101,10 @@ pub(super) struct LocalResources {
     pub(super) _mcp_bridge: Option<McpBridge>,
     pub(super) _mcp_config: Option<TempConfigFile>,
     pub(super) _rules_config: Option<TempConfigFile>,
-    pub(super) _pi_extension: Option<PiExtensionDelivery>,
+    pub(super) pi_extension: Option<PiExtensionDelivery>,
+    pub(super) provider_profile: Option<Arc<crate::provider_profiles::ProviderLaunchProfile>>,
     pub(super) npx_launch_dir: Option<NpxLaunchDir>,
+    pub(super) preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
     pub(super) cleanup_lease: Option<tokio::sync::oneshot::Sender<()>>,
     #[cfg(test)]
     pub(super) cleanup_services: Option<crate::Services>,
@@ -332,7 +334,10 @@ pub(super) struct DetachedChild {
     pub(super) child: Option<Child>,
     pub(super) spawn_pid: Option<u32>,
     /// `None` once moved into the owned cleanup task.
+    pi_extension: Option<PiExtensionDelivery>,
+    pub(super) provider_profile: Option<Arc<crate::provider_profiles::ProviderLaunchProfile>>,
     pub(super) npx_launch_dir: Option<NpxLaunchDir>,
+    pub(super) preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
     pub(super) cleanup_lease: Option<tokio::sync::oneshot::Sender<()>>,
     #[cfg(test)]
     pub(super) cleanup_services: Option<crate::Services>,
@@ -351,7 +356,10 @@ impl DetachedChild {
         Some(Self {
             child: Some(child),
             spawn_pid: resources.child_pid,
+            pi_extension: resources.pi_extension.take(),
+            provider_profile: resources.provider_profile.take(),
             npx_launch_dir: resources.npx_launch_dir.take(),
+            preparation_guard: resources.preparation_guard.take(),
             cleanup_lease: resources.cleanup_lease.take(),
             #[cfg(test)]
             cleanup_services: resources.cleanup_services.take(),
@@ -376,6 +384,17 @@ impl DetachedChild {
         #[cfg(test)]
         let services = self.cleanup_services.take();
         let launch_dir = RetainUnlessSwept(self.npx_launch_dir.take());
+        let pi_extension = self.pi_extension.take().map(std::mem::ManuallyDrop::new);
+        let profile = self
+            .provider_profile
+            .take()
+            .map(std::mem::ManuallyDrop::new);
+        // Retain the exclusion if the runtime disappears or tree exit cannot
+        // be confirmed, just as the live launch directory is retained.
+        let preparation_guard = self
+            .preparation_guard
+            .take()
+            .map(std::mem::ManuallyDrop::new);
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             drop(launch_dir);
             drop(child);
@@ -387,8 +406,18 @@ impl DetachedChild {
             if let Some(services) = services {
                 services.hold_periodic_commit("physical-cleanup").await;
             }
-            kill_child_tree(child, spawn_pid).await;
-            launch_dir.remove();
+            if kill_child_tree(child, spawn_pid).await {
+                launch_dir.remove();
+                if let Some(delivery) = pi_extension {
+                    drop(std::mem::ManuallyDrop::into_inner(delivery));
+                }
+                if let Some(profile) = profile {
+                    drop(std::mem::ManuallyDrop::into_inner(profile));
+                }
+                if let Some(guard) = preparation_guard {
+                    drop(std::mem::ManuallyDrop::into_inner(guard));
+                }
+            }
         }))
     }
 
@@ -396,10 +425,20 @@ impl DetachedChild {
     /// launch dir only after the shared sweep completes; a cancelled await
     /// leaves the batch sweep running.
     pub(super) async fn kill_trees(children: Vec<Self>) {
+        let mut guarded = Vec::new();
         let mut trees = Vec::with_capacity(children.len());
         let mut leases = Vec::with_capacity(children.len());
         let mut launch_dirs = Vec::with_capacity(children.len());
         for mut detached in children {
+            // Foreground npm exclusions require confirmed tree exit. Run
+            // those owned sweeps concurrently; preserve the shared batch
+            // sweep for providers without preparation coordination.
+            if detached.preparation_guard.is_some() || detached.provider_profile.is_some() {
+                if let Some(cleanup) = detached.start_cleanup() {
+                    guarded.push(cleanup);
+                }
+                continue;
+            }
             leases.push(detached.cleanup_lease.take());
             if let Some(child) = detached.child.take() {
                 trees.push((child, detached.spawn_pid));
@@ -412,6 +451,9 @@ impl DetachedChild {
         let _ = spawn_owned_cleanup(&runtime, async move {
             let _leases = leases;
             kill_child_trees(trees).await;
+            for cleanup in guarded {
+                let _ = cleanup.await;
+            }
             for dir in launch_dirs {
                 dir.remove();
             }

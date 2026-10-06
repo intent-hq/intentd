@@ -254,7 +254,7 @@ impl Services {
             // A configured API override belongs only to its bound instance.
             // The environment seam supports the hosted-instance hermetic tests.
             let settings = self.effective_settings().source_control.gitlab;
-            let origin = if self.gitlab_host_is_bound(host) {
+            let origin = if self.gitlab_host_is_configured(host) {
                 settings.api_base_url.filter(|s| !s.trim().is_empty())
             } else {
                 None
@@ -282,7 +282,7 @@ impl Services {
                     .github
                     .oauth_client_id,
             ),
-            Target::Gitlab { host } if self.gitlab_host_is_bound(host) => {
+            Target::Gitlab { host } if self.gitlab_host_is_configured(host) => {
                 self.gitlab_client_id(host)
             }
             Target::Gitlab { host } => gitlab_auth::resolve_client_id("", host),

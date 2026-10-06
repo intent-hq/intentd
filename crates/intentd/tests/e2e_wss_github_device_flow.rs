@@ -39,6 +39,120 @@ const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc
 const USER_CODE: &str = "WXYZ-4321";
 const ACCESS_TOKEN: &str = "gho_e2e_device_flow_token";
 
+/// Process containment survives ordinary settings changes and the original
+/// authenticated RPC paths. The production login host is retained for revoke
+/// (which performs no HTTP), while all auth probes use the owned local API.
+#[tokio::test]
+async fn disabled_gh_credentials_survive_settings_and_revoke_over_wss() {
+    use std::os::unix::fs::PermissionsExt;
+    let mock = spawn_mock_github().await;
+    let dir = temp_data_dir();
+    let data = dir.path();
+    let bin = data.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_RECORD\"\nexit 71\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let workspaces = data.join("workspaces");
+    std::fs::create_dir(&workspaces).unwrap();
+    let log = std::fs::File::create(data.join("daemon.log")).unwrap();
+    common::enable_ws_api(data);
+    let mut command = common::hermetic_serve_command(data);
+
+    command
+        .env("HOME", data)
+        .env("INTENTD_DATA_DIR", data)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces)
+        .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
+        .env("INTENTD_LEGACY_APP_DIR", "")
+        .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("INTENTD_DISABLE_GH_CREDENTIALS", "1")
+        .env("INTENTD_GITHUB_LOGIN_BASE_URI", "https://github.com")
+        .env("INTENTD_GITHUB_API_BASE_URI", &mock.base_uri)
+        .env("GH_RECORD", data.join("gh-calls"))
+        .env(
+            "PATH",
+            std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            )))
+            .unwrap(),
+        )
+        .env_remove("GH_HOST")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log));
+    let mut daemon = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
+    let socket = data.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut rpc = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    for (i, source) in ["gh-cli", "auto", "explicit"].into_iter().enumerate() {
+        let id = i64::try_from(i).unwrap() * 10;
+        let changed = wss_rpc(
+            &mut rpc,
+            id + 1,
+            "settings.update",
+            json!({"changes":[{"path":"sourceControl.github.tokenSource","value":source}]}),
+        )
+        .await;
+        assert!(changed.get("error").is_none(), "{changed}");
+        let auth = wss_rpc(&mut rpc, id + 2, "github.authStatus", json!({})).await;
+        assert_eq!(auth["result"]["isConfigured"], false, "{auth}");
+        let auth = wss_rpc(
+            &mut rpc,
+            id + 3,
+            "sourceControl.authStatus",
+            json!({"provider":"github"}),
+        )
+        .await;
+        assert_eq!(auth["result"]["isConfigured"], false, "{auth}");
+    }
+    let changed = wss_rpc(
+        &mut rpc,
+        40,
+        "settings.update",
+        json!({"changes":[{"path":"sourceControl.github.token","value":ACCESS_TOKEN}]}),
+    )
+    .await;
+    assert!(changed.get("error").is_none(), "{changed}");
+    assert!(!changed.to_string().contains(ACCESS_TOKEN));
+    // The legacy authStatus registry ignores the local API override.
+    // Prove the explicit credential through the original local getUser path.
+    let requests = mock.user_requests.load(Ordering::SeqCst);
+    let auth = wss_rpc(&mut rpc, 41, "github.getUser", json!({})).await;
+    assert_eq!(auth["result"]["user"]["login"], "octocat", "{auth}");
+    assert!(mock.user_requests.load(Ordering::SeqCst) > requests);
+    assert!(!auth.to_string().contains(ACCESS_TOKEN));
+    let revoked = wss_rpc(&mut rpc, 42, "github.revoke", json!({})).await;
+    assert_eq!(revoked["result"]["ok"], true, "{revoked}");
+    let auth = wss_rpc(&mut rpc, 43, "github.authStatus", json!({})).await;
+    assert_eq!(auth["result"]["isConfigured"], false, "{auth}");
+    rpc.close(None).await.unwrap();
+    daemon.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
+    let exit = daemon
+        .wait_with_timeout(Duration::from_secs(10))
+        .unwrap()
+        .expect("owned daemon stopped");
+    assert!(exit.success(), "{exit}");
+    assert!(
+        !data.join("gh-calls").exists(),
+        "installed-CLI substitute was invoked"
+    );
+    assert!(!std::fs::read_to_string(data.join("daemon.log"))
+        .unwrap()
+        .contains(ACCESS_TOKEN));
+}
+
 struct Daemon {
     child: Child,
 }
@@ -54,15 +168,19 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-ghdf-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn mock_device_flow_command(
+    data_dir: &Path,
+    listen: &str,
+    env: &[(&str, &str)],
+) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = common::serve_command();
-    common::hermetic_github_identity(&mut cmd, data_dir);
+    let mut cmd = common::hermetic_serve_command(data_dir);
+
     // gh auth token can otherwise select an inherited enterprise credential.
     cmd.env_remove("GH_HOST")
         .env_remove("GH_ENTERPRISE_TOKEN")
@@ -75,6 +193,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
     // Fail before spawning if this fixture could resolve host credentials or
     // contact public GitHub. Diagnostics name contracts, never their values.
     let explicit_env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
@@ -105,7 +224,13 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         isolated_gh && local_login && local_api && owned_secrets && no_host_auth_env,
         "device-auth fixture isolation: disposable GH_CONFIG_DIR={isolated_gh}, local login={local_login}, local API={local_api}, owned secrets={owned_secrets}, removed credential env={no_host_auth_env}"
     );
-    cmd.spawn().expect("spawn intentd serve")
+    cmd
+}
+
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+    mock_device_flow_command(data_dir, listen, env)
+        .spawn()
+        .expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -1001,4 +1126,53 @@ async fn github_rate_limited_surfaces_data_code_over_wss() {
         v["result"],
         json!({ "gistId": GIST_ID, "login": "octocat" })
     );
+}
+
+#[test]
+fn device_flow_command_restores_private_identity_and_preserves_restart_secrets() {
+    use std::ffi::OsStr;
+    let dir = temp_data_dir();
+    let secrets = dir.path().join("secrets.json");
+    std::fs::write(
+        &secrets,
+        json!({"sourceControl.github.token": ACCESS_TOKEN}).to_string(),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let cmd = mock_device_flow_command(
+            dir.path(),
+            "both",
+            &[
+                ("GITHUB_TOKEN", "synthetic-host-token"),
+                ("GH_TOKEN", "synthetic-host-token"),
+                ("GH_CONFIG_DIR", "synthetic-host-config"),
+                ("INTENTD_SECRETS_FILE", "synthetic-host-secrets"),
+                ("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:32123"),
+                ("INTENTD_GITHUB_LOGIN_BASE_URI", "http://127.0.0.1:32123"),
+            ],
+        );
+
+        let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(environment.get(OsStr::new("GH_TOKEN")), Some(&None));
+        for (key, path) in [
+            ("GH_CONFIG_DIR", dir.path().join("gh-config")),
+            ("INTENTD_SECRETS_FILE", dir.path().join("secrets.json")),
+        ] {
+            assert_eq!(
+                environment.get(OsStr::new(key)),
+                Some(&Some(path.as_os_str())),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("gh-config"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(environment.get(OsStr::new("GITHUB_TOKEN")), Some(&None));
+        let state: Value =
+            serde_json::from_str(&std::fs::read_to_string(&secrets).unwrap()).unwrap();
+        assert_eq!(state["sourceControl.github.token"], ACCESS_TOKEN);
+    }
 }

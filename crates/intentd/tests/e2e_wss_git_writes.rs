@@ -63,10 +63,9 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = common::serve_command();
-    common::hermetic_github_identity(&mut cmd, data_dir);
+    let mut cmd = common::hermetic_serve_command(data_dir);
+
     cmd.env("INTENTD_DATA_DIR", data_dir)
-        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -75,6 +74,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
     cmd.spawn().expect("spawn intentd serve")
 }
 

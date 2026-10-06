@@ -54,6 +54,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -2012,7 +2013,7 @@ fn golden_bundled_doctrine_hashes() {
     let expected = vec![
         "task-loop: cc1f40de9643f88529dd5fa61d1f868ae269020aa3ef5d08986a721e19c64c44".to_string(),
         "interactive: 013e064b03286569622d905efd0ee4c2a227fc18f0364d3277a95b548dd1f6c3".to_string(),
-        "workspace-agent: 6dfa5d333a6a2e8f07192595828772dad2aad6868def3737e5cd9c50363a2718"
+        "workspace-agent: a4602194c382d803f1a1143159035a93e76d0793027d469485126efa475e0ac6"
             .to_string(),
         "task-breakdown: 1e9e1e2daf42a8adadd8c31d7697f0bac02bf5a7c818b00ae4e50074e40b9e66"
             .to_string(),

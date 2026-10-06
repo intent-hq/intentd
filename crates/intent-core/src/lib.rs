@@ -21,6 +21,7 @@ pub(crate) mod agent_logs;
 pub mod agent_runtime;
 pub mod caller;
 pub mod chief_cwd;
+pub mod cli_env;
 pub mod clock;
 pub mod config;
 pub mod discovery_cache;
@@ -32,12 +33,21 @@ pub mod host_membership;
 pub mod human_author;
 pub mod ids;
 pub mod model;
+pub mod native_review;
 pub mod nodes;
 pub mod path_utils;
+pub mod process_policy;
 #[doc(hidden)]
 pub mod queue_visibility_contract;
 pub mod replay_preview;
 pub mod repo_ref;
+pub mod script_monitor;
+pub mod script_output;
+pub use script_monitor::{ScriptMonitor, ScriptMonitorTrigger};
+pub mod repository_checkout;
+pub mod repository_context;
+#[doc(hidden)]
+pub mod repository_request;
 pub mod secrets;
 pub mod server_control;
 pub mod settings_file;
@@ -57,9 +67,10 @@ pub use agent_logs::{
 };
 pub use caller::{
     current_caller, is_human_authored_metadata, project_queue_for_caller,
-    queue_attribution_visible_to, queue_attribution_with, queue_entry_attribution,
-    queue_processing_event_attribution, queue_processing_event_metadata, queue_visible_to,
-    spawn_daemon, with_caller, Caller, QueueAttribution, QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY,
+    queue_attribution_visible_to, queue_attribution_with, queue_contents_visible_to,
+    queue_entry_attribution, queue_processing_event_attribution, queue_processing_event_metadata,
+    queue_visible_to, redact_self_queue_events, spawn_daemon, with_caller, Caller,
+    QueueAttribution, QUEUE_AUTHOR_UNKNOWN_HUMAN_KEY, SELF_QUEUE_DELIVERY_MESSAGE,
 };
 pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, sweep_chief_cwd};
 pub use clock::{
@@ -115,8 +126,8 @@ pub use model::{
     CommentType, CommentWire, ContentType, ContextItem, ContextLink, ContextLinkKind, ContextUsage,
     CreatedTaskEntry, DiskUsageBreakdownEntry, Draft, Event, EventActor, EventQueryParams,
     EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult,
-    GitStatus, Hook, HookListRow, HookState, HookSummary, KnownRepo, LineAttributionAuthor,
+    GitBranchStatus, GitBranches, GitFileStatus, GitMergeConflicts, GitPullResult, GitStatus, Hook,
+    HookListRow, HookState, HookSummary, KnownRepo, LineAttributionAuthor,
     LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
     NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
@@ -150,15 +161,30 @@ pub use model::{
     WORKSPACE_LIST_PR_CAP, WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES,
     WORKSPACE_LIST_ROW_KEYS,
 };
+pub use native_review::{
+    NativeReviewBranchIdentity, NativeReviewBranchTarget, NativeReviewDetails,
+    NativeReviewExecuteExtension, NativeReviewExecution, NativeReviewGitReceipt,
+    NativeReviewOutcome, NativeReviewPreparation, NativeReviewPrepareExtension,
+    NativeReviewPublication, NativeReviewStage, NativeReviewState, NativeReviewTransport,
+};
 pub use path_utils::prewarm_login_shell_path;
 pub use repo_ref::RepoRef;
+pub use repository_context::{
+    resolve_review_selection, ExecutionScope, HistoricalTargetProvenance, HistoricalTargetSource,
+    RepositoryAvailability, RepositoryCapability, RepositoryCapabilityState,
+    RepositoryConnectionScope, RepositoryContext, RepositoryContextRevision,
+    RepositoryEndpointResolution, RepositoryOperation, RepositoryProvider, RepositoryRemote,
+    RepositoryRemoteEndpoint, RepositoryResourceKind, RepositoryRootContext, RepositoryRootId,
+    RepositoryRootKind, RepositoryTarget, RepositoryTargetContext, RepositoryUnavailableReason,
+    RepositoryUnresolvedReason, ReviewSelectionOutcome, ReviewSelectionRequiredReason,
+    ReviewSelectionResolution, ReviewSelectionSource, ReviewTarget, SavedReviewSelection,
+};
 pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};
 pub use server_control::{
     InviteLinkBuilder, InviteLinkEnvelope, ResolvedInviteLinkEnvelope, ServerControl,
 };
 pub use settings_file::{
-    FlushQueuedMessagesMode, LegacySettings, SettingsFile, DEFAULT_CONFIG_TEMPLATE,
-    LEGACY_SETTINGS_PATHS,
+    LegacySettings, SettingsFile, DEFAULT_CONFIG_TEMPLATE, LEGACY_SETTINGS_PATHS,
 };
 pub use tilde::{expand_tilde, expand_tilde_string, expand_tilde_with};
 pub use traits::{

@@ -1,5 +1,5 @@
 //! Over-the-wire git write-ops slice: drive `git.status`, `git.agentCommit`, and
-//! `git.commit` against a real worktree through the daemon over a temp UDS.
+//! `git.agentCommit` against a real worktree through the daemon over a temp UDS.
 
 #![cfg(unix)]
 
@@ -71,6 +71,7 @@ fn seed_workspace(id: &WorkspaceId, worktree: &str) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: Some(worktree.to_string()),
         repository_path: None,
@@ -202,10 +203,10 @@ async fn uds_git_write_ops_round_trip() {
         .expect("branch")
         .to_string();
 
-    // (d) git.commit with nothing staged → -32603 (nothing to commit).
+    // (d) git.agentCommit with nothing staged → -32603 (nothing to commit).
     let resp = send(
         &config.socket_path,
-        r#"{"jsonrpc":"2.0","id":4,"method":"git.commit","params":{"workspaceId":"ws-git","message":"empty"}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"git.agentCommit","params":{"workspaceId":"ws-git","message":"empty","userRequested":true}}"#,
     )
     .await;
     assert_eq!(resp["error"]["code"], json!(-32603));
@@ -675,13 +676,13 @@ async fn uds_git_read_ops_round_trip() {
         .any(|l| l["type"] == json!("Addition")
             && l["content"].as_str().unwrap_or("").contains("added")));
 
-    // (b') git.diff alias resolves to the same handler.
+    // (b') Canonical git.diffs retains path filtering.
     let resp = send(
         &config.socket_path,
-        r#"{"jsonrpc":"2.0","id":3,"method":"git.diff","params":{"workspaceId":"ws-gitr","path":"seed.txt"}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"git.diffs","params":{"workspaceId":"ws-gitr","path":"seed.txt"}}"#,
     )
     .await;
-    let arr = resp["result"].as_array().expect("diff alias array");
+    let arr = resp["result"].as_array().expect("filtered diffs array");
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["path"], json!("seed.txt"));
 
@@ -700,10 +701,10 @@ async fn uds_git_read_ops_round_trip() {
     assert_eq!(items[0]["email"], json!("test@example.com"));
     assert_eq!(resp["result"]["nextToken"], Value::Null);
 
-    // (c') git.log alias resolves to the same handler (top-level limit form).
+    // (c') Canonical git.commits also accepts the top-level limit form.
     let resp = send(
         &config.socket_path,
-        r#"{"jsonrpc":"2.0","id":5,"method":"git.log","params":{"workspaceId":"ws-gitr","limit":10}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"git.commits","params":{"workspaceId":"ws-gitr","limit":10}}"#,
     )
     .await;
     assert_eq!(resp["result"]["items"].as_array().expect("items").len(), 1);
