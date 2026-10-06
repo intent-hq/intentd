@@ -421,3 +421,6 @@ mod commit_tests;
 
 #[cfg(test)]
 mod phantom_commit_tests;
+
+#[cfg(test)]
+mod linked_native_phantom_tests;
