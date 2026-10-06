@@ -14597,7 +14597,7 @@ mod workspace_apply_proposal_tests {
     }
 }
 
-/// Navigation attribution through the real workspace_api JS/MCP binding path.
+/// Navigation attribution through the real `workspace_api` JS/MCP binding path.
 mod app_navigation_sender_tests {
     use std::sync::{Arc, Mutex};
 
