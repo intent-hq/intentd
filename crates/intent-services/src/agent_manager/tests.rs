@@ -21407,6 +21407,564 @@ mod harness_wake_tests {
         );
     }
 
+    fn compaction_note(status: &str) -> IncomingNotification {
+        IncomingNotification {
+            method: "session/update".into(),
+            params: json!({
+                "sessionId": "acp-wake",
+                "update": {
+                    "sessionUpdate": if status == "in_progress" { "tool_call" } else { "tool_call_update" },
+                    "toolCallId": "native-compaction",
+                    "kind": "think",
+                    "title": "Compact conversation",
+                    "status": status,
+                }
+            }),
+        }
+    }
+
+    /// Native Codex compaction can report a tool start without a prompt owned
+    /// by the daemon. Silence while that tool runs is not turn completion.
+    #[tokio::test]
+    async fn unfinished_compaction_remains_recoverable_after_wake_quiet_window() {
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        note_tx.send(compaction_note("in_progress")).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:tool:call")
+        })
+        .await;
+
+        // Negative observation across the real settle deadline, not a sleep:
+        // the unfinished tool must emit neither stream:end nor idle.
+        let ended = timeout(super::super::HARNESS_WAKE_SETTLE * 3, async {
+            loop {
+                let events = sub.recv().await.unwrap();
+                if events.iter().any(|e| e.event_type == "agent:stream:end") {
+                    return;
+                }
+            }
+        })
+        .await;
+        let status = mgr
+            .services
+            .store
+            .get_agent_session_status(&id)
+            .await
+            .unwrap();
+        mgr.checkpoint_shutdown().await;
+        let interrupted = mgr.services.store.get_interrupted_agent(&id).await.unwrap();
+        assert!(
+            interrupted.is_some(),
+            "unfinished compaction must be checkpointed for automatic restart recovery; persisted status: {status:?}, stream ended: {}",
+            ended.is_ok()
+        );
+        assert!(
+            ended.is_err(),
+            "silence must not complete an unfinished native tool"
+        );
+        assert_eq!(
+            status,
+            AgentStatus::Active,
+            "crash recovery must also see an active session"
+        );
+        let candidates = mgr.services.prepare_startup_resume().await.unwrap();
+        assert_eq!(candidates.ids(), &[id]);
+    }
+
+    #[tokio::test]
+    async fn native_compaction_terminal_update_releases_wake_turn() {
+        for terminal_status in ["completed", "failed"] {
+            let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+            let mut sub = bus.subscribe(SubscriptionFilter::default());
+            note_tx.send(compaction_note("in_progress")).unwrap();
+            assert!(mgr.wake_listener_tick(&id, &ws).await);
+            let events = collect_until(&mut sub, |seen| {
+                seen.iter().any(|e| e.event_type == "agent:tool:call")
+            })
+            .await;
+            assert!(events.iter().any(|e| e.event_type == "agent:tool:call"));
+            note_tx.send(compaction_note(terminal_status)).unwrap();
+            let events = collect_until(&mut sub, |seen| {
+                seen.iter().any(|e| e.event_type == "agent:idle")
+            })
+            .await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.event_type == "agent:stream:end")
+                    .count(),
+                1
+            );
+            assert!(!mgr.is_busy(&id), "terminal tool update releases ownership");
+            let messages = mgr
+                .services
+                .store
+                .get_agent_messages(&id, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                messages.len(),
+                1,
+                "one compaction turn, no synthetic continuation"
+            );
+            assert_eq!(
+                messages[0].content[0]["metadata"]["status"],
+                if terminal_status == "failed" {
+                    "error"
+                } else {
+                    "completed"
+                }
+            );
+            mgr.checkpoint_shutdown().await;
+            assert!(mgr
+                .services
+                .store
+                .get_interrupted_agent(&id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn unfinished_compaction_stop_and_disconnect_release_wake_turn() {
+        for stop in [true, false] {
+            let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+            let mut sub = bus.subscribe(SubscriptionFilter::default());
+            note_tx.send(compaction_note("in_progress")).unwrap();
+            assert!(mgr.wake_listener_tick(&id, &ws).await);
+            let events = collect_until(&mut sub, |seen| {
+                seen.iter().any(|e| e.event_type == "agent:tool:call")
+            })
+            .await;
+            assert!(events.iter().any(|e| e.event_type == "agent:tool:call"));
+            if stop {
+                assert!(mgr.stop(&id).await);
+            } else {
+                drop(note_tx);
+                let events = collect_until(&mut sub, |seen| {
+                    seen.iter().any(|e| e.event_type == "agent:idle")
+                })
+                .await;
+                assert!(events.iter().any(|e| e.event_type == "agent:idle"));
+            }
+            assert!(
+                !mgr.is_busy(&id),
+                "stop/disconnect must release unfinished tools"
+            );
+            mgr.checkpoint_shutdown().await;
+            assert!(mgr
+                .services
+                .store
+                .get_interrupted_agent(&id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_updates_reset_silence_budget() {
+        let _env = EnvGuard::set_all(&[("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS", "800")]);
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        note_tx.send(compaction_note("in_progress")).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        for _ in 0..2 {
+            let events = collect_until(&mut sub, |seen| {
+                seen.iter().any(|e| e.event_type == "agent:tool:call")
+            })
+            .await;
+            assert!(events.iter().any(|e| e.event_type == "agent:tool:call"));
+            assert!(
+                timeout(Duration::from_millis(500), async {
+                    loop {
+                        let events = sub.recv().await.unwrap();
+                        if events.iter().any(|e| e.event_type == "agent:stream:end") {
+                            return;
+                        }
+                    }
+                })
+                .await
+                .is_err(),
+                "updates must renew the silence budget, not accumulate tool duration"
+            );
+            note_tx.send(compaction_note("in_progress")).unwrap();
+        }
+        note_tx.send(compaction_note("completed")).unwrap();
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:idle")
+        })
+        .await;
+        assert!(events.iter().any(|e| e.event_type == "agent:idle"));
+        assert!(!events.iter().any(|e| e.event_type == "agent:failed"));
+    }
+
+    #[tokio::test]
+    async fn compaction_zero_settle_hands_receiver_to_prompt_owner() {
+        let (_tmp, mgr, _bus, id, ws, note_tx) = wake_setup().await;
+        note_tx.send(compaction_note("completed")).unwrap();
+        let notes = mgr
+            .handles
+            .lock()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .execution
+            .runtime
+            .notifications();
+        let mut notes = notes.lock().await;
+        let outcome = timeout(
+            Duration::from_secs(1),
+            mgr.services.run_harness_wake_turn(
+                &mut notes,
+                compaction_note("in_progress"),
+                &id,
+                &ws,
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("prompt owner must not wait for native tool completion");
+        assert!(!outcome.failed);
+        assert!(
+            notes.try_recv().is_ok(),
+            "terminal update belongs to prompt owner"
+        );
+    }
+
+    /// A fresh Send after the failure event can race provider disposal.
+    /// Exercise the actual wake worker exit, not a synthetic released slot.
+    #[tokio::test]
+    async fn failed_compaction_wake_redrives_send_during_disposal() {
+        let (tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let script = mock_agent_script();
+        let sessions_log = tmp.path.with_extension("sessions.jsonl");
+        let prompt_log = tmp.path.with_extension("prompts.jsonl");
+        let _env = EnvGuard::set_all(&[
+            ("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS", "400"),
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("MOCK_AGENT_SESSION_LOG", sessions_log.to_str().unwrap()),
+            ("MOCK_AGENT_PROMPT_LOG", prompt_log.to_str().unwrap()),
+        ]);
+        mgr.services.attach_agent_manager(&mgr);
+        set_session_provider(&mgr, &ws, &id, "mock").await;
+        let (earlier, _) = mgr.services.enqueue_message(
+            &id,
+            "earlier durable instruction".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        mgr.services
+            .agent_queues
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()[0]
+            .editing = true;
+        mgr.services.persist_queue_snapshot(&id).await;
+        let pause = Arc::new(super::super::TurnStartPause::default());
+        *mgr.failed_wake_disposal_pause.lock().unwrap() = Some(pause.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        note_tx.send(compaction_note("in_progress")).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        timeout(Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("failed wake reaches provider disposal");
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:failed")
+        })
+        .await;
+        assert!(events.iter().any(|e| e.event_type == "agent:failed"));
+        assert!(!events.iter().any(|e| e.event_type == "agent:idle"));
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session_status(&id)
+                .await
+                .unwrap(),
+            AgentStatus::Error
+        );
+        assert!(mgr.is_busy(&id), "disposal still owns the slot");
+        let sent = mgr
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "fresh recovery instruction".into(),
+                None,
+                super::super::TurnOptions {
+                    origin: MessageOrigin::User,
+                    ..super::super::TurnOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent["queued"], true);
+        assert_eq!(
+            mgr.services.parked_recovery_send(&id).as_deref(),
+            sent["queuedMessage"]["id"].as_str()
+        );
+        let durable = mgr.services.store.load_all_agent_queues().await.unwrap();
+        assert_eq!(durable.len(), 2, "both accepted entries survive cleanup");
+        assert!(durable.iter().any(|q| q.id == earlier.id));
+        // Make the older input eligible without another send/drain kick. The
+        // recovery marker must select the fresh Send first, then drain it.
+        mgr.services
+            .agent_queues
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()[0]
+            .editing = false;
+        mgr.services.persist_queue_snapshot(&id).await;
+        pause.resume.notify_one();
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:idle")
+        })
+        .await;
+        assert!(
+            events.iter().any(|e| e.event_type == "agent:idle"),
+            "fresh Send during failed-wake disposal must run without a second send or retry"
+        );
+        assert!(!events
+            .iter()
+            .any(|e| e.event_type == "agent:idle" && e.data["reason"] == "harness_wake_complete"));
+        let prompts: Vec<Value> = std::fs::read_to_string(prompt_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "each instruction reaches the provider exactly once"
+        );
+        assert!(prompts[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("fresh recovery instruction"));
+        assert!(!prompts[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("earlier durable instruction"));
+        assert!(prompts[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("earlier durable instruction"));
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        let user_messages: Vec<_> = messages.iter().filter(|m| m.role == "user").collect();
+        assert_eq!(user_messages.len(), 2);
+        assert!(user_messages[0]
+            .content
+            .to_string()
+            .contains("fresh recovery instruction"));
+        assert!(user_messages[1]
+            .content
+            .to_string()
+            .contains("earlier durable instruction"));
+        assert!(mgr
+            .services
+            .store
+            .load_all_agent_queues()
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(mgr.services.parked_recovery_send(&id).is_none());
+        assert_eq!(
+            std::fs::read_to_string(sessions_log)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "recovery spawns one fresh provider"
+        );
+        mgr.stop(&id).await;
+    }
+
+    #[tokio::test]
+    async fn unfinished_compaction_silence_is_bounded() {
+        let (tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let script = mock_agent_script();
+        let sessions_log = tmp.path.with_extension("sessions.jsonl");
+        let _env = EnvGuard::set_all(&[
+            ("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS", "400"),
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("MOCK_AGENT_SESSION_LOG", sessions_log.to_str().unwrap()),
+        ]);
+        mgr.services.attach_agent_manager(&mgr);
+        set_session_provider(&mgr, &ws, &id, "mock").await;
+        // An entry under edit cannot preempt the wake turn. It must survive
+        // disposing of the stalled provider and remain available for retry.
+        let (queued, _) = mgr.services.enqueue_message(
+            &id,
+            "queued recovery input".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::User,
+        );
+        mgr.services
+            .agent_queues
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()[0]
+            .editing = true;
+        mgr.services.persist_queue_snapshot(&id).await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        note_tx.send(compaction_note("in_progress")).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter()
+                .any(|e| e.event_type == "agent:status-changed" && e.data["status"] == "error")
+        })
+        .await;
+        assert!(
+            events.iter().any(|e| e.event_type == "agent:failed"),
+            "missing completion must surface failure, not successful compaction"
+        );
+        assert!(!events.iter().any(|e| e.event_type == "agent:idle"));
+        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        assert_eq!(session.status, AgentStatus::Error);
+        let errors: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.event_type == "agent:status-changed" && e.data["status"] == "error")
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "timed-out compaction must publish exactly one Error transition"
+        );
+        let (status_index, status_event) = errors[0];
+        let end_index = events
+            .iter()
+            .position(|e| e.event_type == "agent:stream:end")
+            .unwrap();
+        let failed_index = events
+            .iter()
+            .position(|e| e.event_type == "agent:failed")
+            .unwrap();
+        assert!(
+            end_index < status_index && failed_index < status_index,
+            "Error status follows terminal stream and failure events"
+        );
+        assert_eq!(status_event.data["isActive"], false);
+        assert_eq!(status_event.data["stopReason"], json!(session.stop_reason));
+        assert_eq!(
+            status_event.data["stopReasonTimestamp"],
+            json!(session.stop_reason_timestamp)
+        );
+        assert!(session.stop_reason.is_some());
+        assert!(session.stop_reason_timestamp.is_some());
+        assert!(status_event.data.get("sessionCorrupted").is_none());
+        assert_eq!(session.attention_request_kind.as_deref(), Some("blocker"));
+        assert!(session
+            .attention_request_reason
+            .as_deref()
+            .unwrap()
+            .contains("Compact conversation"));
+        timeout(Duration::from_secs(5), async {
+            while mgr.is_busy(&id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed wake must release ownership");
+        assert!(
+            !mgr.contains(&id),
+            "retry needs a fresh provider after a stall"
+        );
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session_status(&id)
+                .await
+                .unwrap(),
+            AgentStatus::Error
+        );
+        let durable = mgr.services.store.load_all_agent_queues().await.unwrap();
+        assert_eq!(durable.len(), 1);
+        assert_eq!(durable[0].id, queued.id);
+        assert_eq!(durable[0].payload["content"], "queued recovery input");
+        assert!(mgr
+            .services
+            .prepare_startup_resume()
+            .await
+            .unwrap()
+            .ids()
+            .is_empty());
+        mgr.services
+            .agent_queues
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()[0]
+            .editing = false;
+        mgr.services.persist_queue_snapshot(&id).await;
+        let retried = mgr.agent_retry(id.clone(), ws.clone()).await.unwrap();
+        assert_eq!(retried["redriven"], true);
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:idle")
+        })
+        .await;
+        assert!(
+            events.iter().any(|e| e.event_type == "agent:idle"),
+            "manual retry completes"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(
+                    |m| m.role == "user" && m.content.to_string().contains("queued recovery input")
+                )
+                .count(),
+            1
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == "assistant"
+                    && m.content.to_string().contains("Compact conversation")),
+            "compaction context survives provider disposal"
+        );
+        assert!(mgr
+            .services
+            .store
+            .load_all_agent_queues()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            std::fs::read_to_string(sessions_log)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "retry creates exactly one fresh provider session"
+        );
+        mgr.stop(&id).await;
+    }
+
     /// The intent-hq/monorepo#3262 incident shape at the tick level: a wake
     /// burst whose whole output is one whitespace-only chunk (the bare "\n")
     /// must NOT be accepted as a successful recovery. The seeded agent is

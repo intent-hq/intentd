@@ -2884,6 +2884,8 @@ pub struct AgentManager {
     user_persist_pause: Mutex<Option<Arc<TurnStartPause>>>,
     #[cfg(test)]
     worker_finish_pause: Mutex<Option<Arc<TurnStartPause>>>,
+    #[cfg(test)]
+    failed_wake_disposal_pause: Mutex<Option<Arc<TurnStartPause>>>,
 }
 
 fn spawn_unsloth_status_publisher(
@@ -2998,6 +3000,8 @@ impl AgentManager {
             user_persist_pause: Mutex::new(None),
             #[cfg(test)]
             worker_finish_pause: Mutex::new(None),
+            #[cfg(test)]
+            failed_wake_disposal_pause: Mutex::new(None),
         }
     }
 
@@ -9509,6 +9513,27 @@ impl AgentManager {
             // here, so the `end_turn` below performs the wake (#5253).
             mgr.registry.mark_idle_slot_held(&id);
             drop(guard);
+            if outcome.failed {
+                // Failure was persisted before its terminal events. Keep Error
+                // and the durable queue intact, dispose of the hung provider,
+                // and never publish a successful idle to completion watchers.
+                #[cfg(test)]
+                {
+                    let pause = mgr.failed_wake_disposal_pause.lock().unwrap().take();
+                    if let Some(pause) = pause {
+                        pause.reached.notify_one();
+                        pause.resume.notified().await;
+                    }
+                }
+                mgr.kill_child_only(&id).await;
+                mgr.clear_worker(&id);
+                mgr.release_in_flight_slot(&id);
+                // A fresh Send can park after Error is published while
+                // disposal still holds the slot. Complete that handoff only
+                // after deregistering this worker and releasing ownership.
+                mgr.redrive_parked_recovery_send(&id, &ws).await;
+                return;
+            }
             // Empty-wake recovery (intent-hq/monorepo#3262): a wake turn
             // that finalized with no meaningful content must not be
             // accepted as a successful completion. Runs while the busy slot
@@ -14807,6 +14832,47 @@ async fn persist_terminal_error_status(
         .await
 }
 
+/// Publish the canonical Error transition only after its store write landed.
+/// Both prompt failures and unsolicited native-tool timeouts call this after
+/// their terminal events; this helper never requeues a synthetic user message.
+pub(crate) async fn publish_terminal_error_status_via_services(
+    services: &Services,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    error: &PersistedTerminalError,
+) {
+    if !error.status_persisted {
+        return;
+    }
+    // Emit agent:status-changed with stopReason + stopReasonTimestamp so live
+    // subscribers get the canonical fields (the timestamp matches the value
+    // persisted alongside stop_reason by `set_agent_session_status`).
+    // `sessionCorrupted: true` is included only when the failure classifies as
+    // corrupted/poisoned (absent otherwise, matching the serialized projections).
+    let mut data = json!({
+        "agentId": agent_id.0,
+        "status": "error",
+        "isActive": false,
+        "stopReason": error.error_text,
+        "stopReasonTimestamp": error.ts,
+    });
+    if error.session_corrupted {
+        data["sessionCorrupted"] = json!(true);
+    }
+    let event = NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: error.ts.clone(),
+        event_type: AGENT_STATUS_CHANGED.to_string(),
+        actor: agent_actor(agent_id),
+        session_id: Some(agent_id.0.clone()),
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    };
+    crate::publish_event(services.event_bus.as_ref(), event).await;
+}
+
 /// Observable half of the terminal-failure path: emit `agent:status-changed`
 /// for the Error persisted by [`persist_terminal_error_status`] and requeue
 /// the failed message to the front of the queue so `agent.retry` — or a
@@ -14836,43 +14902,14 @@ async fn publish_error_status_and_requeue(
     persisted: bool,
     error: PersistedTerminalError,
 ) {
+    publish_terminal_error_status_via_services(&mgr.services, agent_id, workspace_id, &error).await;
     let PersistedTerminalError {
         error_text,
         streak,
-        session_corrupted,
         ts,
-        status_persisted,
+        ..
     } = error;
     let error_text = error_text.as_str();
-    if status_persisted {
-        // Emit agent:status-changed with stopReason + stopReasonTimestamp so live
-        // subscribers get the canonical fields (the timestamp matches the value
-        // persisted alongside stop_reason by `set_agent_session_status`).
-        // `sessionCorrupted: true` is included only when the failure classifies as
-        // corrupted/poisoned (absent otherwise, matching the serialized projections).
-        let mut data = json!({
-            "agentId": agent_id.0,
-            "status": "error",
-            "isActive": false,
-            "stopReason": error_text,
-            "stopReasonTimestamp": ts,
-        });
-        if session_corrupted {
-            data["sessionCorrupted"] = json!(true);
-        }
-        let event = NewEvent {
-            workspace_id: workspace_id.clone(),
-            timestamp: ts.clone(),
-            event_type: AGENT_STATUS_CHANGED.to_string(),
-            actor: agent_actor(agent_id),
-            session_id: Some(agent_id.0.clone()),
-            correlation_id: None,
-            parent_event_id: None,
-            metadata: None,
-            data,
-        };
-        crate::publish_event(mgr.services.event_bus.as_ref(), event).await;
-    }
 
     // Requeue the failed message to the front of the queue. `persisted`
     // carries the CONFIRMED durability of the user row (STAB-51): `true` only
