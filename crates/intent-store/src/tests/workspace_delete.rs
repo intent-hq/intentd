@@ -884,3 +884,66 @@ async fn desktop_write_during_workspace_teardown_cannot_leave_orphan_after_failu
         .await
         .unwrap());
 }
+
+#[tokio::test]
+async fn concurrent_desktop_workspace_deletes_do_not_block_lifecycle_writers() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let workspace = seed_workspace(&store, "desktop-concurrent-delete").await;
+    let agent = AgentId::from("desktop-deleted-agent");
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &workspace))
+        .await
+        .unwrap();
+    let keeper = seed_workspace(&store, "desktop-unrelated-workspace").await;
+    let kept_agent = AgentId::from("desktop-unrelated-agent");
+    let barrier = std::sync::Arc::new(crate::desktop_repo::DeleteBarrier::default());
+    *store.desktop_delete_barrier.lock().unwrap() = Some(barrier.clone());
+
+    // The first deletion owns the desktop guard, has released lifecycle
+    // serialization, and will need it again for its nested agent deletion.
+    let mut first = Box::pin(store.delete_workspace(&workspace));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            () = barrier.entered.notified() => {},
+            result = &mut first => panic!("deletion finished before the barrier: {result:?}"),
+        }
+    })
+    .await
+    .expect("first deletion reaches the desktop sweep barrier");
+    *store.desktop_delete_barrier.lock().unwrap() = None;
+
+    // Poll the competing Store clone to its lock wait without a timing sleep.
+    let second_store = store.clone();
+    let mut second = Box::pin(second_store.delete_workspace(&workspace));
+    std::future::poll_fn(|cx| {
+        assert!(second.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        store.insert_agent_session(&sample_agent_session(&kept_agent, &keeper)),
+    )
+    .await
+    .expect("same-workspace delete waiter must not block unrelated lifecycle writers")
+    .unwrap();
+
+    barrier.release.notify_one();
+    let (first_result, second_result) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("both workspace deletions must settle");
+    first_result.unwrap();
+    assert!(matches!(second_result, Err(Error::NotFound(_))));
+    assert!(matches!(
+        store.get_workspace(&workspace).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(store.get_agent_session_summary(&agent).await.is_err());
+    store.get_agent_session_summary(&kept_agent).await.unwrap();
+}
