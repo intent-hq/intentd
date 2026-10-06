@@ -302,8 +302,8 @@ fn user_codex_dir() -> Option<PathBuf> {
 const CODEX_CONFIG_SEED_KEYS: &[&str] = &["model", "model_reasoning_effort", "model_provider"];
 
 /// Create a fresh temp dir to serve as a probe's `CODEX_HOME` (codex requires
-/// the directory to exist). `auth.json` is copied from `user_codex_dir` so a
-/// logged-in codex stays logged in, and a minimal `config.toml` holding only
+/// the directory to exist). Authentication is attached later by the native
+/// auth bridge, never copied here. A minimal `config.toml` holding only
 /// the [`CODEX_CONFIG_SEED_KEYS`] scalars is seeded so the user's configured
 /// model shows up in the probe's catalog. The user's full `config.toml` is
 /// deliberately NOT copied so user-configured `mcp_servers` never start under
@@ -315,14 +315,6 @@ pub(crate) fn isolated_codex_home(
         .prefix("intentd-codex-home-")
         .tempdir()?;
     if let Some(user_dir) = user_codex_dir {
-        let auth = user_dir.join("auth.json");
-        if auth.is_file() {
-            if let Err(e) = std::fs::copy(&auth, dir.path().join("auth.json")) {
-                tracing::warn!(
-                    "failed to seed auth.json into isolated CODEX_HOME (probe will run logged-out): {e}"
-                );
-            }
-        }
         if let Some(seed) = minimal_codex_config_seed(&user_dir.join("config.toml")) {
             if let Err(e) = std::fs::write(dir.path().join("config.toml"), seed) {
                 tracing::warn!(

@@ -10,6 +10,21 @@ if (process.argv.includes('--version')) {
   process.exit(0);
 }
 const home = process.env.CODEX_HOME;
+// Native credential authority is distinct from each isolated catalog worker.
+// This fixture selects a provider that does not require OpenAI authentication.
+if (role === 'raw' && home === path.join(fixture, 'user')) {
+  if (!process.argv.includes('--strict-config')) process.exit(94);
+  readline.createInterface({input:process.stdin}).on('line', line => {
+    const request = JSON.parse(line);
+    if (!('id' in request)) return;
+    const results = {
+      initialize: {}, 'configRequirements/read': {requirements:null},
+      'config/read': {layers:[]}, getAuthStatus: {requiresOpenaiAuth:false},
+    };
+    if (!(request.method in results)) process.exit(95);
+    process.stdout.write(JSON.stringify({id:request.id,result:results[request.method]})+'\n');
+  });
+} else {
 const record = event => fs.appendFileSync(path.join(fixture, 'events.jsonl'), JSON.stringify({role,...event})+'\n');
 const failure = () => { record({isolationFailure:true}); process.exit(90); };
 const seed = fs.readFileSync(path.join(home, 'config.toml'), 'utf8');
@@ -25,7 +40,7 @@ const isolation = {cwd:fs.realpathSync(process.cwd())===fs.realpathSync(home),ho
   preload:!process.env.NODE_OPTIONS?.includes('intentd-inherited-preload-canary'),
   entry:!process.env.INTENT_CODEX_ENTRY,cache:!fs.existsSync(path.join(home,'models_cache.json'))};
 if (!Object.values(isolation).every(Boolean)) { record({isolation}); failure(); }
-if (role === 'raw' && (process.argv[2] !== 'app-server' || process.argv.length !== 3)) failure();
+if (role === 'raw' && (process.argv[2] !== 'app-server' || (process.argv.length !== 3 && !(process.argv.includes('--strict-config') && process.argv.includes('cli_auth_credentials_store=\"ephemeral\"'))))) failure();
 const authFile = path.join(home, 'auth.json');
 record({started:true,pid:process.pid,home,auth:fs.existsSync(authFile),
   private:process.platform==='win32' || ((fs.statSync(home).mode & 0o077)===0
@@ -84,3 +99,5 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     return send({id:message.id,result:pages[page]});
   }
 });
+
+}

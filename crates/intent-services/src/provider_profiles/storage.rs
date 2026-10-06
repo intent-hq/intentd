@@ -69,18 +69,6 @@ impl ProfileStorage {
     pub(super) fn write(&self, name: &str, bytes: &[u8]) -> Result<(), ProviderProfileError> {
         atomic_write(&self.path.join(name), bytes)
     }
-
-    pub(super) fn seed_once(&self, source: &Path, name: &str) -> Result<(), ProviderProfileError> {
-        let dest = self.path.join(name);
-        reject_symlink(&dest)?;
-        if dest.exists() {
-            return Ok(());
-        }
-        if let Some(data) = read_optional(source)? {
-            self.write(name, &data)?;
-        }
-        Ok(())
-    }
 }
 
 pub(super) fn digest_hex(bytes: &[u8]) -> String {

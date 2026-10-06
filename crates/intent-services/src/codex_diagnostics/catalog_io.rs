@@ -18,10 +18,10 @@ pub(super) const FILE_LIMIT: usize = 64 * 1024;
 pub(super) const OUTPUT_LIMIT: usize = 1024 * 1024;
 pub(super) const PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Never Debug/Serialize: these bytes belong only in the isolated child.
+/// Never Debug/Serialize: native credential values are retained only for redaction.
 #[derive(Default)]
 pub(super) struct Authentication {
-    file: Option<Vec<u8>>,
+    native: Option<(PathBuf, PathBuf, PathBuf)>,
     config: Option<String>,
     env: Vec<(&'static str, OsString)>,
     pub secrets: BTreeSet<String>,
@@ -45,8 +45,30 @@ impl Authentication {
             .into_iter()
             .filter_map(|key| non_empty(key).map(|value| (key, value)))
             .collect();
-        let mut auth = Self::read(source.as_deref(), env).await?;
+        let mut auth = Self::read(None, env).await?;
+        // Native Codex selects the credential backend. A stale or malformed
+        // file must not override a valid keyring login; inspect only to redact.
+        if let Some(source) = &source {
+            if let Ok(bytes) = read_file(&source.join("auth.json")).await {
+                if let Ok(value) = serde_json::from_slice(&bytes) {
+                    collect_secrets(&value, &mut auth.secrets);
+                }
+            }
+        }
+        for (key, saved) in crate::codex_auth::NATIVE_ENV {
+            auth.env.push((saved, non_empty(key).unwrap_or_default()));
+        }
         if let Some(context) = &launch.installed {
+            auth.native = Some((
+                context.runtime.path().to_path_buf(),
+                source
+                    .clone()
+                    .ok_or(CatalogFailure::AuthenticationUnavailable)?,
+                non_empty("HOME")
+                    .or_else(|| non_empty("USERPROFILE"))
+                    .map(PathBuf::from)
+                    .ok_or(CatalogFailure::AuthenticationUnavailable)?,
+            ));
             auth.secrets.extend(context.secret_values());
             let config_path = source.map(|p| p.join("config.toml"));
             auth.config = tokio::task::spawn_blocking(move || {
@@ -97,7 +119,6 @@ impl Authentication {
                         return Err(CatalogFailure::AuthenticationUnavailable);
                     }
                     collect_secrets(&value, &mut auth.secrets);
-                    auth.file = Some(bytes);
                 }
                 Err(CatalogFailure::FileMissing) => {}
                 Err(_) => return Err(CatalogFailure::AuthenticationUnavailable),
@@ -117,21 +138,24 @@ impl Authentication {
         let home = builder
             .tempdir()
             .map_err(|_| CatalogFailure::IsolationFailed)?;
-        if let Some(bytes) = &self.file {
-            private_file(&home.path().join("auth.json"), bytes).await?;
+        if let Some((runtime, native, user_home)) = &self.native {
+            crate::codex_auth::install_wrapper(
+                home.path(),
+                runtime,
+                native,
+                user_home,
+                &std::env::current_exe().map_err(|_| CatalogFailure::IsolationFailed)?,
+            )
+            .map_err(|_| CatalogFailure::IsolationFailed)?;
         }
         // Only the selected routing/auth config; no cached models, MCP or keyring.
         // A package boundary also keeps npm away from ancestor workspaces.
         private_file(&home.path().join("package.json"), b"{\"private\":true}").await?;
-        private_file(
-            &home.path().join("config.toml"),
-            b"cli_auth_credentials_store = \"file\"\n",
-        )
-        .await?;
-        if let Some(config) = &self.config {
-            let content = format!("cli_auth_credentials_store = \"file\"\n{config}");
-            private_file(&home.path().join("config.toml"), content.as_bytes()).await?;
-        }
+        let content = format!(
+            "cli_auth_credentials_store = \"ephemeral\"\n{}",
+            self.config.as_deref().unwrap_or_default()
+        );
+        private_file(&home.path().join("config.toml"), content.as_bytes()).await?;
         Ok(home)
     }
 
@@ -168,8 +192,18 @@ impl Authentication {
         }
         // Match the snapshotted production selection. Config overrides are
         // deliberately not retained: they can reintroduce user MCP servers.
-        if let Ok(Some(runtime)) = launch.runtime_override_path() {
+        if self.native.is_some() {
+            command.env("CODEX_PATH", home.join("codex-native-auth.sh"));
+        } else if let Ok(Some(runtime)) = launch.runtime_override_path() {
             command.env("CODEX_PATH", runtime);
+        }
+    }
+
+    pub fn raw_command(&self, original: Command, home: &Path) -> Command {
+        if self.native.is_some() {
+            Command::new(home.join("codex-native-auth.sh"))
+        } else {
+            original
         }
     }
 

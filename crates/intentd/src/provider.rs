@@ -18,6 +18,19 @@ pub(crate) enum ProviderCommand {
         path: Option<PathBuf>,
     },
     #[command(hide = true)]
+    CodexAuthBridge {
+        #[arg(long)]
+        runtime: PathBuf,
+        #[arg(long)]
+        native_home: PathBuf,
+        #[arg(long)]
+        user_home: PathBuf,
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    #[command(hide = true)]
     AntigravityLoginUrl {
         /// Relayed to the explicit login command, never logged or persisted.
         url: String,
@@ -44,7 +57,8 @@ impl ProviderCommand {
     pub(crate) fn is_internal_helper(&self) -> bool {
         matches!(
             self,
-            Self::AntigravityBrowserGuard { .. }
+            Self::CodexAuthBridge { .. }
+                | Self::AntigravityBrowserGuard { .. }
                 | Self::AntigravityToolGuard { .. }
                 | Self::AntigravityLoginUrl { .. }
         )
@@ -53,6 +67,22 @@ impl ProviderCommand {
 
 pub(crate) async fn run(command: ProviderCommand) -> ExitCode {
     let result = match command {
+        ProviderCommand::CodexAuthBridge {
+            runtime,
+            native_home,
+            user_home,
+            profile,
+            args,
+        } => {
+            let result =
+                intent_services::codex_auth::run(runtime, native_home, user_home, profile, args)
+                    .await;
+            if let Err(error) = &result {
+                eprintln!("{error}");
+            }
+            // A pending Tokio stdin read must not keep this private helper alive.
+            std::process::exit(i32::from(result.is_err()));
+        }
         ProviderCommand::Login { provider: _, path } => {
             return match login(path).await {
                 Ok(()) => ExitCode::SUCCESS,

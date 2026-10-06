@@ -24,6 +24,7 @@ const SESSION_ID = 'mock-session-1';
 // daemon resumes into sees `true`; a fresh `session/new` resets it. Drives the
 // `failPromptIfLoadedRpcError` behavior (monorepo#940 poisoned-session e2e).
 let sessionFromLoad = false;
+let sessionEstablished = false;
 // Optional durable provider checkpoint for actual daemon-restart tests. Only
 // completed prompts enter it; unsolicited compaction does not complete a turn.
 let checkpointContext = [];
@@ -978,6 +979,15 @@ async function dispatch(msg) {
     behavior = {};
   }
 
+  // Test-owned failure marker: a live process can reject setup without
+  // dying, like Codex when account/configuration validation fails.
+  if (behavior.sessionSetupErrorFile &&
+      (msg.method === 'session/load' || msg.method === 'session/new') &&
+      fs.existsSync(behavior.sessionSetupErrorFile)) {
+    return send({ jsonrpc: '2.0', id: msg.id, error: {
+      code: -32603, message: 'failed to load workspace requirements',
+    } });
+  }
   switch (msg.method) {
     case 'initialize':
       clientSupportsNotices = typeof msg.params?.clientCapabilities?.session?.notices === 'object'
@@ -1037,6 +1047,7 @@ async function dispatch(msg) {
       sessionFromLoad = false;
       checkpointContext = [];
       logSessionCall('session/new', SESSION_ID, msg.params && msg.params._meta, msg.params && msg.params.cwd);
+      sessionEstablished = true;
       return result(msg.id, { sessionId: SESSION_ID, ...sessionConfigOptions(behavior) });
     }
     case 'session/load':
@@ -1058,6 +1069,7 @@ async function dispatch(msg) {
       // prompt (monorepo#940). Otherwise reject (capability was advertised
       // false anyway).
       if (behavior.loadSession === true || behavior.advertiseLoadSession === true) {
+        sessionEstablished = true;
         if (behavior.advertiseLoadSession === true) {
           sessionFromLoad = true;
           if (checkpointFile) {
@@ -1155,6 +1167,11 @@ async function dispatch(msg) {
       });
     }
     case 'session/prompt':
+      if (behavior.requireSessionSetup && !sessionEstablished) {
+        return send({ jsonrpc: '2.0', id: msg.id, error: {
+          code: -32603, message: `Session ${msg.params.sessionId} not found`,
+        } });
+      }
       // Test-owned receipt barrier: turnInFlight can be true before this child
       // records the prompt. Hold only the selected current prompt, so replayed
       // history in a fresh child's follow-up cannot accidentally re-enter it.

@@ -479,6 +479,7 @@ impl CodexLaunch {
         let home = tokio::time::timeout_at(deadline, auth.home())
             .await
             .unwrap_or(Err(CatalogFailure::TimedOut))?;
+        command = auth.raw_command(command, home.path());
         auth.isolate(&mut command, self, home.path());
         // app-server defaults to newline-delimited stdio; no thread/turn is created.
         command.arg("app-server");

@@ -47,25 +47,32 @@ pub(super) fn prepare(
         .map_or_else(|| request.home.join(".codex"), Path::to_path_buf);
     let source_config = source_home.join("config.toml");
     let source_doc = document(&source_config)?;
-    profile
-        .storage
-        .seed_once(&source_home.join("auth.json"), "auth.json")?;
+    storage::reject_symlink(&profile.path().join("auth.json"))?;
+    // Authentication remains native-owned; workers use access tokens via the
+    // app-server bridge. Never seed a separately refreshable credential lineage.
+    profile.env.insert(
+        "INTENT_CODEX_NATIVE_HOME".into(),
+        source_home.to_string_lossy().into_owned(),
+    );
+    profile.env.insert(
+        "INTENT_CODEX_USER_HOME".into(),
+        request.home.to_string_lossy().into_owned(),
+    );
     // Reuse the established routing allowlist; never copy MCP, skills, hooks,
     // plugins, trust or permission settings from a writable user config.
     let seed =
         crate::provider_models::minimal_codex_config_seed(&source_config).unwrap_or_default();
     let mut seed: toml_edit::DocumentMut = seed.parse().map_err(|_| config_error())?;
     if let Some(doc) = source_doc {
-        for key in [
-            "cli_auth_credentials_store",
-            "forced_login_method",
-            "forced_chatgpt_workspace_id",
-        ] {
+        for key in ["forced_login_method", "forced_chatgpt_workspace_id"] {
             if let Some(value) = doc.get(key).and_then(toml_edit::Item::as_str) {
                 seed[key] = toml_edit::value(value);
             }
         }
     }
+    // Native managed requirements are still enforced by Codex; an incompatible
+    // enforced storage mode must fail instead of falling back to copied auth.
+    seed["cli_auth_credentials_store"] = toml_edit::value("ephemeral");
     profile
         .storage
         .write("config.toml", seed.to_string().as_bytes())?;

@@ -1,0 +1,397 @@
+use super::*;
+use std::os::unix::fs::PermissionsExt;
+
+struct Fixture {
+    _root: tempfile::TempDir,
+    native: PathBuf,
+    profile: PathBuf,
+    runtime: PathBuf,
+}
+impl Fixture {
+    fn new() -> Self {
+        let root = crate::test_support::test_tempdir("codex-auth-bridge");
+        let native = root.path().join("native");
+        let profile = root.path().join("worker");
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("worker"), "").unwrap();
+        let runtime = root.path().join("codex");
+        std::fs::write(&runtime, include_str!("fixture.py")).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Self {
+            _root: root,
+            native,
+            profile,
+            runtime,
+        }
+    }
+    fn authority(&self) -> Authority {
+        Authority {
+            runtime: self.runtime.clone(),
+            home: self.native.clone(),
+            user_home: self.native.clone(),
+        }
+    }
+    fn bridge(&self) -> Bridge {
+        Bridge {
+            authority: self.authority(),
+            profile: self.profile.clone(),
+            credentials: None,
+        }
+    }
+    fn login(&self, token: &str, next: Option<&str>) {
+        let mut state =
+            json!({"authMethod":"chatgpt","authToken":token,"refresh_token":"synthetic-R0"});
+        if let Some(next) = next {
+            state["next"] = json!(next);
+        }
+        std::fs::write(self.native.join("auth.json"), state.to_string()).unwrap();
+    }
+    fn server(&self) -> Server {
+        Server::spawn(
+            Command::new(&self.runtime)
+                .args([
+                    "app-server",
+                    "--strict-config",
+                    "-c",
+                    "cli_auth_credentials_store=\"ephemeral\"",
+                ])
+                .env("CODEX_HOME", &self.profile)
+                .stderr(Stdio::null()),
+        )
+        .unwrap()
+    }
+}
+fn token(account: &str, user: &str, generation: u64, expired: bool) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = json!({"exp":if expired {1} else {now+3600},"generation":generation,"https://api.openai.com/auth":{"chatgpt_account_id":account,"chatgpt_user_id":user}});
+    format!(
+        "header.{}.signature",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string())
+    )
+}
+fn credentials(token: &str) -> Credentials {
+    Credentials::from_status(
+        &json!({"requiresOpenaiAuth":true,"authMethod":"chatgpt","authToken":token}),
+    )
+    .unwrap()
+    .unwrap()
+}
+#[tokio::test]
+async fn native_relogin_and_logout_are_observed_by_fresh_helpers() {
+    let f = Fixture::new();
+    let a = token("account", "user", 1, false);
+    let b = token("account", "user", 2, false);
+    f.login(&a, None);
+    assert_eq!(f.authority().read(None).await.unwrap().unwrap().token, a);
+    f.login(&b, None);
+    assert_eq!(f.authority().read(None).await.unwrap().unwrap().token, b);
+    std::fs::remove_file(f.native.join("auth.json")).unwrap();
+    assert!(matches!(f.authority().read(None).await, Err(AUTH_ERROR)));
+}
+#[tokio::test]
+async fn refresh_owner_serializes_rotation_and_persists_it_past_probe_cleanup() {
+    let f = Fixture::new();
+    let a = token("account", "user", 1, false);
+    let b = token("account", "user", 2, false);
+    f.login(&a, Some(&b));
+    let first = f.authority();
+    let second = f.authority();
+    let (one, two) = tokio::join!(first.read(Some(&a)), second.read(Some(&a)));
+    assert_eq!(one.unwrap().unwrap().token, b);
+    assert_eq!(two.unwrap().unwrap().token, b);
+    assert_eq!(
+        std::fs::read_to_string(f.native.join("consumed"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    std::fs::remove_dir_all(&f.profile).unwrap();
+    assert_eq!(f.authority().read(None).await.unwrap().unwrap().token, b);
+    let persisted: Value =
+        serde_json::from_slice(&std::fs::read(f.native.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(persisted["refresh_token"], "synthetic-R0-next");
+}
+#[tokio::test]
+async fn unchanged_rejected_and_expired_tokens_never_become_refresh_success() {
+    let f = Fixture::new();
+    let a = token("account", "user", 1, false);
+    f.login(&a, None); // models upstream swallowing a transient or permanent refresh error
+    assert!(matches!(
+        f.authority().read(Some(&a)).await,
+        Err(AUTH_ERROR)
+    ));
+    f.login(&token("account", "user", 2, true), None);
+    assert!(matches!(f.authority().read(None).await, Err(AUTH_ERROR)));
+}
+#[tokio::test]
+async fn expired_access_token_refreshes_through_native_authority_before_worker_login() {
+    let f = Fixture::new();
+    let expired = token("account", "user", 1, true);
+    let fresh = token("account", "user", 2, false);
+    f.login(&expired, Some(&fresh));
+    assert_eq!(
+        f.authority().read(None).await.unwrap().unwrap().token,
+        fresh
+    );
+    let persisted: Value =
+        serde_json::from_slice(&std::fs::read(f.native.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(persisted["refresh_token"], "synthetic-R0-next");
+    assert!(!f.profile.join("auth.json").exists());
+}
+#[tokio::test]
+async fn invalid_native_config_does_not_export_default_file_credentials() {
+    let f = Fixture::new();
+    f.login(&token("account", "user", 1, false), None);
+    std::fs::write(f.native.join("invalid-config"), "keyring config invalid").unwrap();
+    assert!(f.authority().read(None).await.is_err());
+    assert!(!f.native.join("requests").exists());
+    assert!(!f.profile.join("injected").exists());
+}
+#[tokio::test]
+async fn local_logout_terminates_worker_without_native_or_worker_logout() {
+    let f = Fixture::new();
+    f.login(&token("account", "user", 1, false), None);
+    let mut server = f.server();
+    let input =
+        b"{\"id\":1,\"method\":\"account/read\"}\n{\"id\":2,\"method\":\"account/logout\"}\n";
+    let mut output = Vec::new();
+    f.bridge()
+        .proxy(&mut server, &mut Frames::new(&input[..]), &mut output)
+        .await
+        .unwrap();
+    assert!(server.child.try_wait().unwrap().is_some());
+    assert!(!f.native.join("revoked").exists());
+    assert!(!f.profile.join("revoked").exists());
+    assert!(!f.profile.join("auth.json").exists());
+    assert!(String::from_utf8(output)
+        .unwrap()
+        .contains("\"id\":2,\"result\":{}"));
+}
+#[test]
+fn expired_legacy_identity_migrates_but_account_or_user_changes_do_not() {
+    for (account, user, allowed) in [
+        ("account", "user", true),
+        ("other", "user", false),
+        ("account", "other", false),
+    ] {
+        let f = Fixture::new();
+        std::fs::write(f.profile.join("auth.json"), json!({"tokens":{"access_token":token("account", "user", 0, true),"refresh_token":"stale-secret"}}).to_string()).unwrap();
+        std::fs::write(f.profile.join("session"), "preserved").unwrap();
+        install_wrapper(
+            &f.profile,
+            &f.runtime,
+            &f.native,
+            &f.native,
+            Path::new("/intentd"),
+        )
+        .unwrap();
+        assert!(!f.profile.join("auth.json").exists());
+        assert_eq!(
+            f.bridge()
+                .accept_identity(&credentials(&token(account, user, 1, false)))
+                .is_ok(),
+            allowed
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.profile.join("session")).unwrap(),
+            "preserved"
+        );
+        if allowed {
+            assert_eq!(
+                f.bridge()
+                    .accept_identity(&credentials(&token("other", "user", 2, false))),
+                Err(ACCOUNT_ERROR)
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn worker_refresh_receives_only_access_token_and_persists_native_rotation() {
+    let f = Fixture::new();
+    let a = token("account", "user", 1, false);
+    let b = token("account", "user", 2, false);
+    f.login(&a, Some(&b));
+    let mut server = f.server();
+    let mut bridge = f.bridge();
+    bridge
+        .synchronize(&mut server, &mut Vec::new())
+        .await
+        .unwrap();
+    bridge
+        .refresh(
+            &json!({"id":9,"params":{"previousAccountId":"account"}}),
+            &mut server,
+        )
+        .await
+        .unwrap();
+    assert_eq!(bridge.credentials.unwrap().token, b);
+    assert!(!f.profile.join("auth.json").exists());
+    server.stop().await;
+    assert_eq!(f.authority().read(None).await.unwrap().unwrap().token, b);
+}
+#[tokio::test]
+async fn account_switch_blocks_new_steering_before_worker_receives_it() {
+    let f = Fixture::new();
+    f.login(&token("account", "user", 1, false), None);
+    let mut server = f.server();
+    let mut bridge = f.bridge();
+    bridge
+        .synchronize(&mut server, &mut Vec::new())
+        .await
+        .unwrap();
+    f.login(&token("other", "user", 2, false), None);
+    let input = b"{\"id\":2,\"method\":\"turn/steer\"}\n";
+    let mut output = Vec::new();
+    bridge
+        .proxy(&mut server, &mut Frames::new(&input[..]), &mut output)
+        .await
+        .unwrap();
+    server.stop().await;
+    assert!(String::from_utf8(output).unwrap().contains(ACCOUNT_ERROR));
+    assert!(!std::fs::read_to_string(f.profile.join("requests"))
+        .unwrap()
+        .contains("turn/steer"));
+}
+#[tokio::test]
+async fn lock_contention_is_bounded_and_cancellation_releases_authority() {
+    let f = Fixture::new();
+    f.login(&token("account", "user", 1, false), None);
+    let lock = auth_lock(&f.native).await.unwrap();
+    let start = tokio::time::Instant::now();
+    assert!(f.authority().read(None).await.is_err());
+    assert!(start.elapsed() < Duration::from_secs(4));
+    drop(lock);
+    std::fs::write(f.native.join("delay"), "30").unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), f.authority().read(None))
+            .await
+            .is_err()
+    );
+    std::fs::remove_file(f.native.join("delay")).unwrap();
+    assert!(f.authority().read(None).await.is_ok());
+}
+
+#[test]
+fn managed_storage_never_silently_overrides_worker_ephemeral_mode() {
+    for mode in ["file", "keyring", "auto"] {
+        let requirements = json!({"requirements":{"cliAuthCredentialsStore":mode}});
+        assert_eq!(
+            worker_policy(&requirements, &json!({"layers":[]})),
+            Err(POLICY_ERROR)
+        );
+        for kind in [
+            "mdm",
+            "enterpriseManaged",
+            "legacyManagedConfigTomlFromFile",
+            "legacyManagedConfigTomlFromMdm",
+        ] {
+            assert_eq!(
+                worker_policy(
+                    &json!({"requirements":null}),
+                    &json!({"layers":[{"name":{"type":kind},"config":{"cli_auth_credentials_store":mode}}]})
+                ),
+                Err(POLICY_ERROR)
+            );
+        }
+    }
+    assert!(worker_policy(&json!({"requirements":null}), &json!({"layers":[{"name":{"type":"user"},"config":{"cli_auth_credentials_store":"keyring"}}]})).is_ok());
+    assert_eq!(
+        worker_policy(&json!({"requirements":{}}), &json!({"layers":[]})),
+        Err(CONTRACT_ERROR)
+    );
+}
+
+#[tokio::test]
+async fn delayed_refresh_callback_fails_within_upstream_deadline() {
+    let f = Fixture::new();
+    let a = token("account", "user", 1, false);
+    f.login(&a, None);
+    let mut bridge = f.bridge();
+    bridge.credentials = Some(credentials(&a));
+    let mut server = f.server();
+    std::fs::write(f.native.join("delay"), "30").unwrap();
+    let lock = auth_lock(&f.native).await.unwrap();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        drop(lock);
+    });
+    let start = tokio::time::Instant::now();
+    bridge
+        .refresh(
+            &json!({"id":"refresh","params":{"previousAccountId":"account"}}),
+            &mut server,
+        )
+        .await
+        .unwrap();
+    assert!(start.elapsed() < Duration::from_secs(9));
+    tokio::time::timeout(Duration::from_secs(1), server.output.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(f.profile.join("refresh-outcome")).unwrap(),
+        "error"
+    );
+    assert_eq!(bridge.credentials.unwrap().token, a);
+    server.stop().await;
+    release.await.unwrap();
+}
+
+#[test]
+fn custom_provider_api_key_and_unsupported_modes_have_explicit_boundaries() {
+    assert!(
+        Credentials::from_status(&json!({"requiresOpenaiAuth":false}))
+            .unwrap()
+            .is_none()
+    );
+    let key = Credentials::from_status(
+        &json!({"requiresOpenaiAuth":true,"authMethod":"apikey","authToken":"synthetic-key"}),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        key.login(),
+        json!({"type":"apiKey","apiKey":"synthetic-key"})
+    );
+    assert!(key.refresh().is_err());
+    let f = Fixture::new();
+    f.bridge().accept_identity(&key).unwrap();
+    let rotated = Credentials::from_status(
+        &json!({"requiresOpenaiAuth":true,"authMethod":"apikey","authToken":"rotated-key"}),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(f.bridge().accept_identity(&rotated), Err(ACCOUNT_ERROR));
+    assert!(matches!(
+        Credentials::from_status(
+            &json!({"requiresOpenaiAuth":true,"authMethod":"agentIdentity","authToken":"never-echo-this"})
+        ),
+        Err(CONTRACT_ERROR)
+    ));
+}
+
+#[tokio::test]
+async fn cancelled_partial_frame_is_retained_and_malformed_payload_is_redacted() {
+    let (mut write, read) = tokio::io::duplex(128);
+    let mut frames = Frames::new(BufReader::new(read));
+    write.write_all(b"{\"id\":7,").await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), frames.next())
+            .await
+            .is_err()
+    );
+    write
+        .write_all(b"\"result\":{}}\n{never-echo-this}\n")
+        .await
+        .unwrap();
+    assert_eq!(
+        frames.next().await.unwrap(),
+        Some(json!({"id":7,"result":{}}))
+    );
+    assert_eq!(frames.next().await, Err(CONTRACT_ERROR));
+}

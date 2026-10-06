@@ -1,0 +1,258 @@
+//! Exercise the shipped helper executable, owned launcher, and private stdio.
+#![cfg(unix)]
+mod common;
+use base64::Engine;
+use serde_json::{json, Value};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+struct Client {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+}
+impl Client {
+    async fn start(profile: &Path, native: &Path, runtime: &Path) -> Self {
+        let wrapper = intent_services::codex_auth::install_wrapper(
+            profile,
+            runtime,
+            native,
+            native,
+            Path::new(env!("CARGO_BIN_EXE_intentd")),
+        )
+        .unwrap();
+        let mut child = Command::new(wrapper)
+            .arg("app-server")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", native)
+            .env("XDG_CONFIG_HOME", profile)
+            .env("INTENT_CODEX_NATIVE_XDG_CONFIG_HOME", native.join("config"))
+            .env(
+                "INTENT_CODEX_NATIVE_DBUS_SESSION_BUS_ADDRESS",
+                "synthetic-native-bus",
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = BufReader::new(child.stdout.take().unwrap());
+        let mut client = Self {
+            child,
+            input,
+            output,
+        };
+        assert!(client
+            .call(1, "initialize", json!({"capabilities":{}}))
+            .await
+            .get("result")
+            .is_some());
+        client
+    }
+    async fn call(&mut self, id: u64, method: &str, params: Value) -> Value {
+        self.input
+            .write_all(format!("{}\n", json!({"id":id,"method":method,"params":params})).as_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let mut line = String::new();
+                assert_ne!(
+                    self.output.read_line(&mut line).await.unwrap(),
+                    0,
+                    "bridge ended before response"
+                );
+                let value: Value = serde_json::from_str(&line).unwrap();
+                if value["id"] == id {
+                    return value;
+                }
+            }
+        })
+        .await
+        .expect("bridge response deadline")
+    }
+}
+fn token(generation: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = json!({"exp":now+3600,"generation":generation,"https://api.openai.com/auth":{"chatgpt_account_id":"account","chatgpt_user_id":"user"}});
+    format!(
+        "header.{}.signature",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string())
+    )
+}
+#[tokio::test]
+async fn startup_error_cleanup_preserves_native_login_and_retry_uses_relogin() {
+    let root = common::test_tempdir("codex-auth-binary");
+    let native = root.path().join("native");
+    std::fs::create_dir(&native).unwrap();
+    let runtime = root.path().join("codex");
+    std::fs::write(
+        &runtime,
+        include_str!("../../intent-services/src/codex_auth/fixture.py"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(native.join("expected-env"), json!({"XDG_CONFIG_HOME":native.join("config"),"DBUS_SESSION_BUS_ADDRESS":"synthetic-native-bus","HOME":native}).to_string()).unwrap();
+    let a = token(1);
+    let b = token(2);
+    for (i, error) in [
+        "failed to load workspace requirements",
+        "cloud requirements failed",
+        "please log out and try again",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let profile = root.path().join(format!("worker-{i}"));
+        std::fs::create_dir(&profile).unwrap();
+        std::fs::write(profile.join("worker"), "").unwrap();
+        std::fs::write(profile.join("session"), "existing-conversation").unwrap();
+        let login = |access: &str| {
+            std::fs::write(
+                native.join("auth.json"),
+                json!({"authMethod":"chatgpt","authToken":access,"refresh_token":"native-only"})
+                    .to_string(),
+            )
+            .unwrap();
+        };
+        login(&a);
+        std::fs::write(profile.join("setup-error"), error).unwrap();
+        let mut client = Client::start(&profile, &native, &runtime).await;
+        let failed = client
+            .call(
+                2,
+                "thread/resume",
+                json!({"threadId":"existing-conversation"}),
+            )
+            .await;
+        assert_eq!(failed["error"]["message"], *error);
+        assert_eq!(
+            client.call(3, "account/logout", json!({})).await["result"],
+            json!({})
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), client.child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert!(!native.join("revoked").exists());
+        assert!(!profile.join("revoked").exists());
+        assert!(!profile.join("auth.json").exists());
+        login(&b);
+        std::fs::remove_file(profile.join("setup-error")).unwrap();
+        let mut retry = Client::start(&profile, &native, &runtime).await;
+        assert!(retry
+            .call(
+                2,
+                "thread/resume",
+                json!({"threadId":"existing-conversation"})
+            )
+            .await
+            .get("result")
+            .is_some());
+        assert_eq!(
+            std::fs::read_to_string(profile.join("injected")).unwrap(),
+            b
+        );
+        assert_eq!(
+            std::fs::read_to_string(profile.join("session")).unwrap(),
+            "existing-conversation"
+        );
+        retry.call(3, "account/logout", json!({})).await;
+        retry.child.wait().await.unwrap();
+    }
+    let methods = std::fs::read_to_string(native.join("requests")).unwrap();
+    assert!(!methods.contains("logout"));
+    assert!(!methods.contains("thread/"));
+}
+
+#[tokio::test]
+async fn managed_storage_rejection_happens_before_worker_bootstrap() {
+    let root = common::test_tempdir("codex-auth-policy");
+    let native = root.path().join("native");
+    let profile = root.path().join("worker");
+    std::fs::create_dir(&native).unwrap();
+    std::fs::create_dir(&profile).unwrap();
+    std::fs::write(profile.join("worker"), "").unwrap();
+    let runtime = root.path().join("codex");
+    std::fs::write(
+        &runtime,
+        include_str!("../../intent-services/src/codex_auth/fixture.py"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        native.join("auth.json"),
+        json!({"authMethod":"chatgpt","authToken":token(1)}).to_string(),
+    )
+    .unwrap();
+    for mode in ["file", "keyring", "auto"] {
+        std::fs::write(native.join("managed-store"), mode).unwrap();
+        let wrapper = intent_services::codex_auth::install_wrapper(
+            &profile,
+            &runtime,
+            &native,
+            &native,
+            Path::new(env!("CARGO_BIN_EXE_intentd")),
+        )
+        .unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            Command::new(wrapper)
+                .arg("app-server")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Managed Codex credential storage")
+        );
+        assert!(
+            !profile.join("requests").exists(),
+            "worker must not start under an overriding store policy"
+        );
+        assert!(!profile.join("injected").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires INTENTD_PROFILE_CODEX_BIN; isolated installed-runtime and loopback issuer contract"]
+fn installed_codex_native_auth_contract_and_bridge() {
+    let runtime =
+        std::env::var_os("INTENTD_PROFILE_CODEX_BIN").expect("set installed Codex executable");
+    let output = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/codex-auth-contract.py"
+        ))
+        .arg(runtime)
+        .arg(env!("CARGO_BIN_EXE_intentd"))
+        .env_remove("NODE_OPTIONS")
+        .output()
+        .unwrap();
+    // Harness outputs only named assertions; subprocess credential frames are private.
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

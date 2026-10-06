@@ -15228,6 +15228,10 @@ async fn handle_terminal_spawn_failure(
     if mgr.is_shutting_down() {
         return;
     }
+    // Failed load/new never established the persisted ID in this child. Retire
+    // it before publishing Error so a fresh send must establish a new session.
+    // The caller already collected the final stderr hint; keep history intact.
+    mgr.kill_child_only(agent_id).await;
     let error_text = error.to_string();
     if discard_failure_for_vanished_session(mgr, agent_id, &error_text).await {
         return;

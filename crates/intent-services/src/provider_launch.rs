@@ -52,7 +52,7 @@ pub(crate) fn prepare(
         .find(|(k, _)| *k == "OPENCODE_CONFIG_CONTENT")
         .and_then(|(_, v)| v)
         .and_then(|v| serde_json::from_str(&v.to_string_lossy()).ok());
-    let profile = crate::provider_profiles::prepare_provider_profile(ProviderProfileRequest {
+    let mut profile = crate::provider_profiles::prepare_provider_profile(ProviderProfileRequest {
         provider_id: provider,
         detected_version: None,
         purpose,
@@ -70,6 +70,34 @@ pub(crate) fn prepare(
         trusted_launch_config: routing.as_ref(),
     })
     .map_err(|e| Error::InvalidInput(e.to_string()))?;
+    if provider == "codex" {
+        let runtime = command_env(command, "CODEX_PATH")
+            .map(PathBuf::from)
+            .or_else(|| {
+                intent_providers::installed_cli::InstalledCli::Codex
+                    .resolve()
+                    .ok()
+                    .map(|r| r.path().to_path_buf())
+            })
+            .ok_or_else(|| {
+                Error::InvalidInput(
+                    "Install Codex on this daemon host before starting an agent.".into(),
+                )
+            })?;
+        let native = profile
+            .env
+            .get("INTENT_CODEX_NATIVE_HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| Error::Internal("Missing native Codex home".into()))?;
+        let helper = std::env::current_exe()
+            .map_err(|_| Error::Internal("Cannot locate Codex authentication helper".into()))?;
+        let wrapper =
+            crate::codex_auth::install_wrapper(profile.path(), &runtime, &native, &home, &helper)
+                .map_err(Error::InvalidInput)?;
+        profile
+            .env
+            .insert("CODEX_PATH".into(), wrapper.to_string_lossy().into_owned());
+    }
     for d in &profile.diagnostics {
         tracing::warn!(
             provider,
