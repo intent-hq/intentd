@@ -400,17 +400,6 @@ impl PtyHost {
         let writer = pair.master.take_writer().map_err(internal)?;
         #[cfg(not(unix))]
         let reader = pair.master.try_clone_reader().map_err(internal)?;
-        let child = pair.slave.spawn_command(cmd).map_err(internal)?;
-        // Keep the parent-side slave open (monorepo#587): if we dropped it
-        // here, a fast-exiting child would close the *last* slave fd before
-        // the reader thread's first read(), and macOS discards buffered PTY
-        // output on last-slave close — the child's output would be lost
-        // entirely. The exit watcher releases it once the child is reaped and
-        // the reader has drained the queue, so the reader still observes EOF
-        // and its thread exits (no fd or thread leak).
-
-        let pid = child.process_id();
-        let killer = child.clone_killer();
 
         let (tx, _rx) = broadcast::channel(FANOUT_CAPACITY);
         let fanout = Arc::new(Mutex::new(Fanout {
@@ -424,15 +413,35 @@ impl PtyHost {
         let writer = Arc::new(Mutex::new(writer));
         let reader_fanout = Arc::clone(&fanout);
         #[cfg(windows)]
-        let reader_writer = Arc::clone(&writer);
-        let handle = std::thread::spawn(move || {
-            read_loop(
-                reader,
-                &reader_fanout,
+        let handle = {
+            // ConPTY can request its startup reply while the child is attaching.
+            let reader_writer = Arc::clone(&writer);
+            std::thread::spawn(move || read_loop(reader, &reader_fanout, &reader_writer))
+        };
+        let child = match pair.slave.spawn_command(cmd) {
+            Ok(child) => child,
+            Err(error) => {
                 #[cfg(windows)]
-                &reader_writer,
-            );
-        });
+                {
+                    drop(pair);
+                    drop(writer);
+                    let _ = handle.join();
+                }
+                return Err(internal(error));
+            }
+        };
+        // Keep the parent-side slave open (monorepo#587): if we dropped it
+        // here, a fast-exiting child would close the *last* slave fd before
+        // the reader thread's first read(), and macOS discards buffered PTY
+        // output on last-slave close — the child's output would be lost
+        // entirely. The exit watcher releases it once the child is reaped and
+        // the reader has drained the queue, so the reader still observes EOF
+        // and its thread exits (no fd or thread leak).
+
+        let pid = child.process_id();
+        let killer = child.clone_killer();
+        #[cfg(not(windows))]
+        let handle = std::thread::spawn(move || read_loop(reader, &reader_fanout));
 
         let cwd = spec
             .cwd

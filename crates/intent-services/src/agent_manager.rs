@@ -20303,7 +20303,7 @@ mod pi_extension_delivery_tests {
     //! Unit tests for the pi-extension MCP delivery spawn assembly: the two
     //! per-agent temp files (bundled extension + 0755 wrapper), the two spawn
     //! env vars, and the capability gate that leaves non-pi providers alone.
-    //! Unix wrapper coverage; native Windows delivery is exercised by the Pi runtime E2E.
+    //! Unix factory coverage; native Pi runtime E2E exercises the shared Windows CMD asset.
 
     use super::*;
     use std::os::unix::fs::PermissionsExt;

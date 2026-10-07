@@ -112,7 +112,7 @@ async fn next_json(socket: &mut Socket) -> Value {
     }
 }
 
-async fn rpc(socket: &mut Socket, id: i64, method: &str, params: Value) -> Value {
+async fn rpc_response(socket: &mut Socket, id: i64, method: &str, params: Value) -> Value {
     socket
         .send(Message::Text(
             json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params})
@@ -125,10 +125,15 @@ async fn rpc(socket: &mut Socket, id: i64, method: &str, params: Value) -> Value
         let frame = next_json(socket).await;
         if frame["id"] == id {
             assert_eq!(frame["jsonrpc"], "2.0");
-            assert!(frame.get("error").is_none(), "{method}: {frame}");
-            return frame["result"].clone();
+            return frame;
         }
     }
+}
+
+async fn rpc(socket: &mut Socket, id: i64, method: &str, params: Value) -> Value {
+    let frame = rpc_response(socket, id, method, params).await;
+    assert!(frame.get("error").is_none(), "{method}: {frame}");
+    frame["result"].clone()
 }
 
 fn seed_repo(path: &Path) {
@@ -286,6 +291,26 @@ async fn setup_finishes_without_terminal_client_input() {
             .iter()
             .all(|entry| entry["id"] != terminal_id));
         evidence.push(json!({"case":case,"completion":completed,"terminalId":terminal_id,"marker":marker,"buffer":buffer}));
+        if case == "success" {
+            let missing = data.path().join("missing terminal command.exe");
+            let failure = timeout(
+                common::test_timeout(Duration::from_secs(10)),
+                rpc_response(
+                    &mut client,
+                    40,
+                    "terminal.create",
+                    json!({"workspaceId":id,"cols":80,"rows":24,"command":missing.to_string_lossy()}),
+                ),
+            )
+            .await
+            .expect("failed terminal launch did not finish its reader cleanup");
+            assert_eq!(failure["error"]["code"], -32603, "{failure}");
+            let terminals = rpc(&mut client, 41, "terminal.list", json!({"workspaceId":id})).await;
+            assert!(terminals["terminals"].as_array().unwrap().is_empty());
+            evidence.push(
+                json!({"case":"failed_terminal_launch","response":failure,"terminals":terminals}),
+            );
+        }
     }
     let evidence_dir = std::env::var_os("INTENTD_SETUP_EVIDENCE_DIR")
         .map_or_else(|| data.path().to_path_buf(), std::path::PathBuf::from);
