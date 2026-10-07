@@ -23245,3 +23245,147 @@ async fn port_assignment_stop_cancels_scan_without_commit_or_socket_leak() {
     );
     ws.stop().await;
 }
+
+/// There is deliberately no new recovery wire method: call the same
+/// `WorkspaceApi` seam as MCP, then inspect real authenticated WSS reads.
+#[intent_test_macros::daemon_test]
+async fn wss_explicit_blocker_recovery_scope_generation_and_task_states() {
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", json!("auggie"));
+    let created = wss_call(srv.port,srv.cfg.clone(),r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Recovery Scope"}}"#).await;
+    let ws = WorkspaceId(
+        created["result"]["workspace"]["id"]
+            .as_str()
+            .unwrap()
+            .into(),
+    );
+    let created = wss_call(srv.port,srv.cfg.clone(),&json!({"jsonrpc":"2.0","id":2,"method":"agent.create","params":{"workspaceId":ws.0,"name":"recovery-owner"}}).to_string()).await;
+    let agent = intent_core::AgentId::from(created["result"]["agent"]["id"].as_str().unwrap());
+    assert!(srv
+        .api
+        .agent_resolve_blocker(ws.clone(), "evidence".into(), None)
+        .await
+        .is_err());
+    assert!(srv
+        .api
+        .agent_resolve_blocker(
+            WorkspaceId("wrong-workspace".into()),
+            "evidence".into(),
+            Some(agent.clone())
+        )
+        .await
+        .is_err());
+    for reason in ["", "  \n "] {
+        assert!(srv
+            .api
+            .agent_resolve_blocker(ws.clone(), reason.into(), Some(agent.clone()))
+            .await
+            .is_err());
+    }
+    let no_op = srv
+        .api
+        .agent_resolve_blocker(ws.clone(), "nothing pending".into(), Some(agent.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        no_op,
+        json!({"ok":true,"resolved":false,"reason":"nothing pending"})
+    );
+    srv.store
+        .set_attention_request(&ws, &agent, "blocker", "old request", "old-generation")
+        .await
+        .unwrap();
+    srv.store
+        .set_attention_request(
+            &ws,
+            &agent,
+            "blocker",
+            "replacement request",
+            "new-generation",
+        )
+        .await
+        .unwrap();
+    assert!(!srv
+        .store
+        .clear_blocker_request_if_matches(
+            &ws,
+            &agent,
+            "old request",
+            Some("old-generation"),
+            "resolved-at"
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        srv.store
+            .get_agent_session(&agent)
+            .await
+            .unwrap()
+            .attention_request_reason
+            .as_deref(),
+        Some("replacement request")
+    );
+    srv.store
+        .set_attention_request(
+            &ws,
+            &agent,
+            "discussion",
+            "decision pending",
+            "discussion-generation",
+        )
+        .await
+        .unwrap();
+    assert!(!srv
+        .api
+        .agent_resolve_blocker(ws.clone(), "environment works".into(), Some(agent.clone()))
+        .await
+        .unwrap()["resolved"]
+        .as_bool()
+        .unwrap());
+    for (status, want) in [
+        ("blocked", "in_progress"),
+        ("complete", "complete"),
+        ("cancelled", "cancelled"),
+        ("waiting", "waiting"),
+        ("discussion_needed", "discussion_needed"),
+    ] {
+        let created = wss_call(srv.port,srv.cfg.clone(),&json!({"jsonrpc":"2.0","id":3,"method":"note.create","params":{"workspaceId":ws.0,"title":status,"content":"target"}}).to_string()).await;
+        let note_id = created["result"]["note"]["id"].as_str().unwrap();
+        let marked = wss_call(srv.port,srv.cfg.clone(),&json!({"jsonrpc":"2.0","id":4,"method":"task.markAsTask","params":{"workspaceId":ws.0,"noteId":note_id,"status":status}}).to_string()).await;
+        assert!(marked.get("error").is_none(), "{marked}");
+        let mut note = srv
+            .store
+            .get_note(&ws, &intent_core::NoteId(note_id.into()))
+            .await
+            .unwrap();
+        note.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![agent.clone()];
+        srv.store.update_note_metadata(&note).await.unwrap();
+        let mut session = srv.store.get_agent_session(&agent).await.unwrap();
+        session.task_note_id = Some(intent_core::NoteId(note_id.into()));
+        srv.store.update_agent_session(&ws, &session).await.unwrap();
+        srv.store
+            .set_attention_request(&ws, &agent, "blocker", "environment unavailable", status)
+            .await
+            .unwrap();
+        let result = srv
+            .api
+            .agent_resolve_blocker(
+                ws.clone(),
+                "  probe succeeded  ".into(),
+                Some(agent.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            json!({"ok":true,"resolved":true,"reason":"probe succeeded"})
+        );
+        let got = wss_call(srv.port,srv.cfg.clone(),&json!({"jsonrpc":"2.0","id":5,"method":"note.get","params":{"workspaceId":ws.0,"noteId":note_id}}).to_string()).await;
+        assert_eq!(
+            got["result"]["note"]["metadata"]["task"]["status"], want,
+            "{got}"
+        );
+    }
+}

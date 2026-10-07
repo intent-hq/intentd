@@ -176,6 +176,13 @@ details**. These are counts of recorded notices, not total attempts or proof tha
 all failures belong to the same request. A historical notice alone does not mean
 the agent is still failing; check the current status and latest response.
 
+<!-- Sources: packages/intentd/crates/intent-services/src/agent_ops.rs (agent_resolve_blocker_op); packages/cloudlands-fe/src/shared/utils/agent-attention.ts. -->
+
+A current blocker warning means an agent reported a problem that prevents work.
+After confirming recovery, the agent can clear its warning while a release or
+scheduled check is still pending. A recorded blocker notice can remain in the
+conversation after the current warning clears.
+
 Follow specific recovery guidance when shown: **Retry with [model]** uses the
 offered available model; **Retry on [provider]** switches away from a provider
 whose usage limit was reached. For sign-in errors, run the displayed CLI login

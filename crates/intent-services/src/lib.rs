@@ -1086,6 +1086,7 @@ pub struct Services {
     /// through the ordinary list/get reads). Shared across clones so the
     /// raising op and the turn worker observe the same map.
     deferred_attention: Arc<Mutex<HashMap<AgentId, Vec<DeferredAttention>>>>,
+    attention_mutation_gates: agent_ops::AttentionMutationGates,
     /// Per-note debouncers for `attribute_lines` recomputes (PROTOCOL §5.2.1,
     /// FE parity with `LineAttributionService.scheduleComputation`). Every
     /// content-changing `note.*` mutation schedules a delayed recompute
@@ -1701,6 +1702,7 @@ impl Services {
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),
+            attention_mutation_gates: agent_ops::AttentionMutationGates::default(),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
             last_activity_debounce_gen: Arc::new(Mutex::new(0)),
@@ -31299,6 +31301,19 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
             self.agent_request_attention_op(workspace_id, kind, reason, caller_agent_id)
+                .await
+        })
+    }
+
+    fn agent_resolve_blocker(
+        &self,
+        workspace_id: WorkspaceId,
+        reason: String,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            self.agent_resolve_blocker_op(workspace_id, reason, caller_agent_id)
                 .await
         })
     }

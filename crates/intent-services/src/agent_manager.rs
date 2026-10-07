@@ -5439,11 +5439,10 @@ impl AgentManager {
         // context/naming/reminder, after only the fire-once FirstTurnPrepend.
         // Rebuilt every turn for ALL agents (specialist and
         // non-specialist, unlike the role reminder) and never persisted.
-        // `agent_state_snapshot_line` gates on the session's captured
-        // harness feature snapshot (`agentFeatures.stateSnapshot`, like
-        // every other toggle) and returns `None` when the toggle is off or
-        // the snapshot is trivial (all counts zero, no pending attention),
-        // leaving the prompt byte-identical to pre-feature output.
+        // Counts follow the captured stateSnapshot feature. A pending
+        // blocker also gets live recovery guidance when attentionRequests
+        // is enabled, including pinned harnesses with stateSnapshot off.
+        // Neither decoration dismisses an attention request.
         let snapshot_line = self.services.agent_state_snapshot_line(agent_id).await;
         // Workspace setup-stage notice (§6.5): sits between the snapshot line
         // and the Context block, ahead of the user content, so an agent whose
@@ -7212,6 +7211,8 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) {
+        let gate = self.services.attention_mutation_gates.for_agent(agent_id);
+        let _guard = gate.lock().await;
         let ts = now_iso();
         match self
             .services
