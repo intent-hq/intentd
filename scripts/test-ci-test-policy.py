@@ -227,5 +227,155 @@ class CiPolicyTests(unittest.TestCase):
             self.assertTrue(any(script in error for error in violations(workflow, "1")))
 
 
+class CallbackDiscoveryTests(unittest.TestCase):
+    """Execute the actual workflow shell; stub only Cargo and selection inputs."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+        cls.job = cls.workflow["jobs"]["coverage-changed"]
+        cls.step = next(s for s in cls.job["steps"] if s.get("name") == "Run callback fixture composition under llvm-cov")
+
+    def probe(self, *, target=None, coverage_target=None, listing="exact", failure=None, style="wrapper"):
+        with tempfile.TemporaryDirectory(prefix="callback-discovery-") as tmp:
+            root = Path(tmp)
+            stub = root / "cargo"
+            stub.write_text(f"#!{sys.executable} -S\n" + r'''import json, os, shlex, sys
+args = sys.argv[1:]
+keys = ["RUSTFLAGS", "RUSTC_WRAPPER", "CARGO_TARGET_DIR", "CARGO_LLVM_COV_TARGET_DIR",
+        "CARGO_LLVM_COV_SHOW_ENV", "LLVM_PROFILE_FILE", "INTENTD_ASSERT_BOUND_CALLER",
+        "INTENTD_TEST_TIMEOUT_MULTIPLIER", "__CARGO_LLVM_COV_RUSTC_WRAPPER"]
+with open(os.environ["CHILD_LOG"], "a") as log:
+    log.write(json.dumps({"args": args, "env": {k: os.environ.get(k) for k in keys}}) + "\n")
+if args[0] == "metadata":
+    print(json.dumps({"target_directory": os.environ.get("CARGO_TARGET_DIR", os.environ["RUNNER_TEMP"] + "/target")}))
+elif args[:2] == ["llvm-cov", "show-env"]:
+    if os.environ["FAILURE"] == "show-env": sys.exit(9)
+    target = os.environ.get("CARGO_LLVM_COV_TARGET_DIR", os.environ.get("CARGO_TARGET_DIR", os.environ["RUNNER_TEMP"] + "/target"))
+    exports = {"CARGO_LLVM_COV_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", os.environ["RUNNER_TEMP"] + "/target"), "CARGO_LLVM_COV_SHOW_ENV": "1", "LLVM_PROFILE_FILE": target + "/test.profraw"}
+    if os.environ["STYLE"] == "wrapper":
+        exports.update(RUSTC_WRAPPER="coverage-wrapper", __CARGO_LLVM_COV_RUSTC_WRAPPER="1")
+    else:
+        exports["RUSTFLAGS"] = os.environ.get("RUSTFLAGS", "") + " -C instrument-coverage --cfg=coverage"
+    for key, value in exports.items(): print("export " + key + "=" + shlex.quote(value))
+elif args[:2] == ["nextest", "list"]:
+    if os.environ["FAILURE"] == "list": sys.exit(10)
+    names = os.environ["CALLBACK_FIXTURE_TESTS"].split()
+    mode = os.environ["LISTING"]
+    if mode == "missing": names.pop()
+    if mode == "extra": names.append("unexpected_test")
+    if mode == "wrong": names[-1] = "wrong_test"
+    if mode == "empty": names = []
+    cases = {n: {"filter-match": {"status": "matches"}} for n in names}
+    cases["unselected_test"] = {"filter-match": {"status": "mismatch"}}
+    suites = {"unit": {"testcases": cases}}
+    if mode == "duplicate": suites["duplicate"] = {"testcases": {names[0]: cases[names[0]]}}
+    print(json.dumps({"rust-suites": suites}))
+elif args[:3] == ["llvm-cov", "--no-report", "nextest"]:
+    sys.exit(11 if os.environ["FAILURE"] == "run" else 0)
+else:
+    sys.exit("unexpected cargo invocation: " + str(args))
+''')
+            stub.chmod(0o755)
+            env = {k: v for k, v in os.environ.items() if not k.startswith(("CARGO_", "RUST", "LLVM_", "__CARGO_"))}
+            env.update({k: str(v) for k, v in self.job["env"].items()})
+            env.update({k: str(v) for k, v in self.step["env"].items()})
+            env.update(PATH=str(root) + os.pathsep + os.environ["PATH"], RUNNER_TEMP=tmp,
+                       CHILD_LOG=str(root / "calls"), LISTING=listing, FAILURE=failure or "", STYLE=style,
+                       RUSTFLAGS="--cfg=existing", RUSTC_WRAPPER="existing-wrapper")
+            if target: env["CARGO_TARGET_DIR"] = str(root / target)
+            if coverage_target: env["CARGO_LLVM_COV_TARGET_DIR"] = str(root / coverage_target)
+            result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", self.step["run"]],
+                                    env=env, cwd=root, capture_output=True, text=True, timeout=10)
+            calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+            expected_target = str(root / (coverage_target or ((target or "target") + "/llvm-cov-target")))
+            return result, calls, expected_target
+
+    def test_instrumented_discovery_reuses_execution_build_without_environment_leak(self):
+        for target, override in ((None, None), ("slot target", None), ("slot target", "coverage override")):
+            for style in ("wrapper", "flags"):
+                with self.subTest(target=target, override=override, style=style):
+                    result, calls, target_dir = self.probe(target=target, coverage_target=override, style=style)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    listing = next(c for c in calls if c["args"][:2] == ["nextest", "list"])
+                    run = next(c for c in calls if c["args"][:3] == ["llvm-cov", "--no-report", "nextest"])
+                    self.assertEqual(listing["env"]["CARGO_LLVM_COV_SHOW_ENV"], "1")
+                    self.assertEqual(listing["args"][listing["args"].index("--target-dir") + 1], target_dir)
+                    self.assertEqual(run["env"]["CARGO_LLVM_COV_TARGET_DIR"], target_dir)
+                    self.assertEqual(run["env"]["RUSTFLAGS"], "--cfg=existing")
+                    self.assertEqual(run["env"]["RUSTC_WRAPPER"], "existing-wrapper")
+                    for key in ("CARGO_LLVM_COV_SHOW_ENV", "LLVM_PROFILE_FILE", "__CARGO_LLVM_COV_RUSTC_WRAPPER"):
+                        self.assertIsNone(run["env"][key], key)
+                    if style == "wrapper":
+                        self.assertEqual(listing["env"]["RUSTC_WRAPPER"], "coverage-wrapper")
+                    else:
+                        self.assertEqual(listing["env"]["RUSTFLAGS"].count("instrument-coverage"), 1)
+                    for call in (listing, run):
+                        args = call["args"]
+                        self.assertEqual([args[i + 1] for i, arg in enumerate(args) if arg == "-p"], ["intent-acp", "intent-services"])
+                        self.assertIn("--lib", args)
+                        for flag in ("--release", "--cargo-profile", "--profile", "--features", "--all-features", "--no-default-features", "--target"):
+                            self.assertNotIn(flag, args)
+                        self.assertEqual(call["env"]["INTENTD_ASSERT_BOUND_CALLER"], "1")
+                        self.assertEqual(call["env"]["INTENTD_TEST_TIMEOUT_MULTIPLIER"], "3")
+                    self.assertEqual(listing["args"][listing["args"].index("-E") + 1], run["args"][run["args"].index("-E") + 1])
+                    self.assertEqual(run["args"][run["args"].index("--retries") + 1], "0")
+                    self.assertIn("--no-fail-fast", run["args"])
+
+    def test_exact_selection_and_discovery_failures_prevent_execution(self):
+        for mode in ("missing", "extra", "wrong", "empty", "duplicate"):
+            with self.subTest(mode=mode):
+                result, calls, _ = self.probe(listing=mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(any(c["args"][:3] == ["llvm-cov", "--no-report", "nextest"] for c in calls))
+        for failure, code in (("show-env", 9), ("list", 10), ("run", 11)):
+            with self.subTest(failure=failure):
+                result, calls, _ = self.probe(failure=failure)
+                self.assertEqual(result.returncode, code, result.stderr)
+                if failure != "run":
+                    self.assertFalse(any(c["args"][:3] == ["llvm-cov", "--no-report", "nextest"] for c in calls))
+
+    def test_callback_inventory_is_exact(self):
+        self.assertEqual(self.job["env"]["CALLBACK_FIXTURE_TESTS"].split(), [
+            "callback_registration::tests::actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_old_result",
+            "callback_registration::tests::actual_adapter_replacement_rejects_old_query_and_disabled_never_registers",
+            "agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_actual_created_3_1_reaches_original_guidance_boundary",
+            "agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_saved_legacy_and_disabled_outbound_messages_remain_ordinary",
+            "agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_load_and_failed_load_new_keep_original_producers_and_capture",
+            "agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_successful_zero_pending_absent_and_failed_never_conflate",
+        ])
+
+    def test_callback_inventory_names_exist_in_source(self):
+        sources = "\n".join((ROOT / path).read_text() for path in (
+            "crates/intent-acp/src/callback_registration/tests.rs",
+            "crates/intent-services/src/agent_manager/repository_origin/callback_delivery/tests.rs",
+        ))
+        for name in self.job["env"]["CALLBACK_FIXTURE_TESTS"].split():
+            with self.subTest(test=name):
+                self.assertIsNotNone(re.search(r"\bfn\s+" + re.escape(name.rsplit("::", 1)[-1]) + r"\s*\(", sources), name)
+
+    def test_callback_selection_routing(self):
+        select = next(s for s in self.job["steps"] if s.get("id") == "select")
+        self.assertEqual(self.step["if"], "steps.select.outputs.callback_fixture_changed == 'true'")
+        for fixture, changed in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(fixture=fixture, changed=changed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "scripts").mkdir()
+                script = root / "scripts/changed-tests.sh"
+                script.write_text("#!/bin/sh\n" + ("echo 'cargo llvm-cov --no-report nextest -p other'\n" if changed else "echo 'No changed tests'\n"))
+                script.chmod(0o755)
+                git = root / "git"
+                git.write_text("#!/bin/sh\nexit " + ("1" if fixture else "0") + "\n")
+                git.chmod(0o755)
+                env = {**os.environ, **{k: str(v) for k, v in self.job["env"].items()},
+                       "PATH": str(root) + os.pathsep + os.environ["PATH"], "RUNNER_TEMP": tmp,
+                       "GITHUB_OUTPUT": str(root / "output"), "GITHUB_STEP_SUMMARY": str(root / "summary"), "BASE_SHA": "base"}
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", select["run"]],
+                                        env=env, cwd=root, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((root / "output").read_text().splitlines(),
+                                 ["callback_fixture_changed=" + str(fixture).lower(), "has_selection=" + str(fixture or changed).lower()])
+
+
 if __name__ == "__main__":
     unittest.main()
