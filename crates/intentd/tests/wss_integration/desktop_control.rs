@@ -1,4 +1,6 @@
 //! Real TLS/WSS desktop routing, native reverse replies, consent and no reconnect replay.
+#[path = "desktop_control/cursor_move.rs"]
+mod cursor_move;
 #[path = "desktop_control/hello_probe.rs"]
 mod hello_probe;
 #[path = "desktop_control/start_timeout.rs"]
@@ -24,7 +26,7 @@ async fn executor_reply(socket: &mut Socket, request: Value, calls: &mut Vec<Val
         p["operation"] == "prepareCommand"
             && matches!(
                 p["action"]["kind"].as_str(),
-                Some("screenshot" | "click" | "scroll" | "drag")
+                Some("screenshot" | "move" | "click" | "scroll" | "drag")
             )
     }) {
         let action = &p["action"];
@@ -41,6 +43,13 @@ async fn executor_reply(socket: &mut Socket, request: Value, calls: &mut Vec<Val
             Some(("desktop-display-selection-required","Multiple displays are available. Call ws.desktop.listDisplay() and ask the user which screen to use, then retry with displayId."))
         } else if action.get("layoutId").is_some_and(|layout| layout != "l") {
             Some(("desktop-stale-layout", "Display layout changed."))
+        } else if action["kind"] == "move"
+            && (action["x"].as_f64().unwrap() >= 1920.0 || action["y"].as_f64().unwrap() >= 1080.0)
+        {
+            Some((
+                "invalid-params",
+                "Coordinates are outside the selected display.",
+            ))
         } else {
             None
         };

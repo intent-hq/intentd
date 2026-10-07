@@ -115,6 +115,7 @@ pub fn validate_action(kind: &str, args: &Value) -> DesktopResult<Value> {
     let allowed: &[&str] = match kind {
         "startControl" | "endControl" | "listDisplay" => &[],
         "screenshot" => &["displayId", "layoutId"],
+        "move" => &["displayId", "layoutId", "x", "y"],
         "click" => &["displayId", "layoutId", "x", "y", "button", "clickCount"],
         "type" => &["text"],
         "keypress" => &["key", "modifiers"],
@@ -133,10 +134,12 @@ pub fn validate_action(kind: &str, args: &Value) -> DesktopResult<Value> {
     if object.contains_key("layoutId") && !nonempty("layoutId") {
         return Err(invalid());
     }
-    if matches!(kind, "click" | "scroll" | "drag") && !nonempty("layoutId") {
+    if matches!(kind, "move" | "click" | "scroll" | "drag") && !nonempty("layoutId") {
         return Err(invalid());
     }
-    if matches!(kind, "click" | "scroll") && (!coordinate(&args["x"]) || !coordinate(&args["y"])) {
+    if matches!(kind, "move" | "click" | "scroll")
+        && (!coordinate(&args["x"]) || !coordinate(&args["y"]))
+    {
         return Err(invalid());
     }
     match kind {
@@ -242,6 +245,7 @@ mod tests {
             "endControl",
             "listDisplay",
             "screenshot",
+            "move",
             "click",
             "type",
             "keypress",
@@ -264,9 +268,9 @@ mod tests {
     fn display_selection_is_optional_but_never_empty_or_identity_controlled() {
         assert!(validate_action("listDisplay", &json!({})).is_ok());
         assert!(validate_action("listDisplay", &json!({"displayId":"screen"})).is_err());
-        for kind in ["screenshot", "click", "scroll", "drag"] {
+        for kind in ["screenshot", "move", "click", "scroll", "drag"] {
             let mut args = match kind {
-                "click" => json!({"layoutId":"layout","x":0,"y":0}),
+                "move" | "click" => json!({"layoutId":"layout","x":0,"y":0}),
                 "scroll" => json!({"layoutId":"layout","x":0,"y":0,"deltaX":0,"deltaY":1}),
                 "drag" => json!({"layoutId":"layout","from":{"x":0,"y":0},"to":{"x":1,"y":1}}),
                 _ => json!({}),
@@ -278,6 +282,39 @@ mod tests {
                 args["displayId"] = invalid;
                 assert!(validate_action(kind, &args).is_err());
             }
+        }
+    }
+    #[test]
+    fn move_requires_finite_nonnegative_coordinates_and_rejects_button_semantics() {
+        let valid = json!({"layoutId":"layout","x":0,"y":1.5});
+        assert_eq!(
+            validate_action("move", &valid).unwrap(),
+            json!({"kind":"move","layoutId":"layout","x":0,"y":1.5})
+        );
+        for field in ["x", "y", "layoutId"] {
+            let mut args = valid.clone();
+            args.as_object_mut().unwrap().remove(field);
+            assert!(validate_action("move", &args).is_err());
+        }
+        for field in ["x", "y"] {
+            for value in [
+                json!(-1),
+                json!("1"),
+                json!(null),
+                json!(true),
+                json!(f64::NAN),
+                json!(f64::INFINITY),
+                json!(f64::NEG_INFINITY),
+            ] {
+                let mut args = valid.clone();
+                args[field] = value;
+                assert!(validate_action("move", &args).is_err(), "{args}");
+            }
+        }
+        for field in ["button", "clickCount", "from", "to", "modifiers"] {
+            let mut args = valid.clone();
+            args[field] = json!(1);
+            assert!(validate_action("move", &args).is_err(), "{field}");
         }
     }
     #[test]

@@ -304,6 +304,7 @@ API:
   ws.desktop.endControl() → { ended, withdrawn }  // Release active control promptly; withdraw pending consent if needed. An ordinary turn boundary does not end ongoing desktop work. Never automatically retry after user Stop.
   ws.desktop.listDisplay() → { layoutId, displays }  // Enumerate display IDs and geometry without capturing pixels. Requires active desktop control.
   ws.desktop.screenshot({ displayId?, layoutId? }?) → { capturedAt, layoutId, displays }  // Capture one display as a saved workspace asset. An optional layoutId must still match. Omit displayId only when exactly one display is connected; otherwise list displays and ask the user which to use. Never choose an arbitrary display or fall back from a stale ID.
+  ws.desktop.move({ displayId?, layoutId, x, y }) → { ok: true }  // Move the cursor without clicking or pressing/releasing buttons. Requires active control and current layout; omit displayId only for one connected display. Coordinates are display-local image pixels.
   ws.desktop.click({ displayId?, layoutId, x, y, button?, clickCount? }) → { ok: true }  // Omit displayId only for one connected display; otherwise ask the user. button is left or right; clickCount is 1 or 2.
   ws.desktop.type({ text }) → { ok: true }  // Insert exact Unicode, up to 16384 UTF-8 bytes; no implicit Enter.
   ws.desktop.keypress({ key, modifiers? }) → { ok: true }  // Printable scalar or named key; unique Shift, Control, Alt, Meta modifiers.
@@ -584,6 +585,7 @@ API:
   ws.desktop.endControl() → { ended, withdrawn }  // Release active control promptly; withdraw pending consent if needed. An ordinary turn boundary does not end ongoing desktop work. Never automatically retry after user Stop.
   ws.desktop.listDisplay() → { layoutId, displays }  // Enumerate display IDs and geometry without capturing pixels. Requires active desktop control.
   ws.desktop.screenshot({ displayId?, layoutId? }?) → { capturedAt, layoutId, displays }  // Capture one display as a saved workspace asset. An optional layoutId must still match. Omit displayId only when exactly one display is connected; otherwise list displays and ask the user which to use. Never choose an arbitrary display or fall back from a stale ID.
+  ws.desktop.move({ displayId?, layoutId, x, y }) → { ok: true }  // Move the cursor without clicking or pressing/releasing buttons. Requires active control and current layout; omit displayId only for one connected display. Coordinates are display-local image pixels.
   ws.desktop.click({ displayId?, layoutId, x, y, button?, clickCount? }) → { ok: true }  // Omit displayId only for one connected display; otherwise ask the user. button is left or right; clickCount is 1 or 2.
   ws.desktop.type({ text }) → { ok: true }  // Insert exact Unicode, up to 16384 UTF-8 bytes; no implicit Enter.
   ws.desktop.keypress({ key, modifiers? }) → { ok: true }  // Printable scalar or named key; unique Shift, Control, Alt, Meta modifiers.

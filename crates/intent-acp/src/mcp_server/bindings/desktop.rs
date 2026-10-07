@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::sync::Arc;
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
-    ws.desktop = Object.fromEntries(['startControl','endControl','listDisplay','screenshot','click','type','keypress','scroll','drag'].map(method => [method, (...args) => {
+    ws.desktop = Object.fromEntries(['startControl','endControl','listDisplay','screenshot','move','click','type','keypress','scroll','drag'].map(method => [method, (...args) => {
         if (args.length > 1) throw new Error('Desktop methods accept at most one argument');
         return host({method: 'desktop.' + method, args: args.length ? args[0] : {}});
     }]));
@@ -20,6 +20,7 @@ pub(crate) async fn dispatch(
         "endControl" => "endControl",
         "listDisplay" => "listDisplay",
         "screenshot" => "screenshot",
+        "move" => "move",
         "click" => "click",
         "type" => "type",
         "keypress" => "keypress",
@@ -43,6 +44,7 @@ mod tests {
             let enabled = super::super::prelude_for_bridge(&features, delegated);
             assert!(enabled.contains("'startControl'"));
             assert!(enabled.contains("'listDisplay'"));
+            assert!(enabled.contains("'move'"));
             let disabled = super::super::prelude_for_bridge(
                 &AgentFeaturesSettings {
                     desktop_control: false,
@@ -52,6 +54,7 @@ mod tests {
             );
             assert!(!disabled.contains("'startControl'"));
             assert!(!disabled.contains("'listDisplay'"));
+            assert!(!disabled.contains("'move'"));
             assert!(!disabled.contains("ws.desktop ="));
         }
     }
