@@ -6,7 +6,7 @@ use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 use serde_json::{json, Value};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::ops::Range;
 
 struct Output<'a> {
@@ -302,6 +302,231 @@ fn raw_projection(code: &Code, range: &Range<usize>) -> Option<Range<usize>> {
     result
 }
 
+// Only parser-confirmed container delimiters belong to the document. Child
+// envelopes remain opaque, so text, links, code and atoms never become omitted
+// merely because another mapping producer does not support them.
+fn document_delimiters(source: &str, events: &[(Event<'_>, Range<usize>)]) -> Vec<Range<usize>> {
+    struct Frame {
+        full: Range<usize>,
+        children: Vec<Range<usize>>,
+        container: bool,
+        item: bool,
+    }
+    fn gaps(mut frame: Frame, output: &mut Vec<Range<usize>>) {
+        if !frame.container {
+            return;
+        }
+        frame.children.sort_by_key(|range| (range.start, range.end));
+        let mut at = frame.full.start;
+        for child in frame
+            .children
+            .into_iter()
+            .chain(std::iter::once(frame.full.end..frame.full.end))
+        {
+            if at < child.start {
+                output.push(at..child.start);
+            }
+            at = at.max(child.end);
+        }
+    }
+    let mut stack = vec![Frame {
+        full: 0..source.len(),
+        children: Vec::new(),
+        container: true,
+        item: false,
+    }];
+    let mut result = Vec::new();
+    for (event, range) in events {
+        if matches!(event, Event::End(_)) {
+            gaps(stack.pop().expect("balanced parser events"), &mut result);
+            continue;
+        }
+        let marker = matches!(event, Event::TaskListMarker(_));
+        let parent = if marker {
+            stack
+                .iter()
+                .rposition(|frame| frame.item)
+                .expect("checkbox belongs to an item")
+        } else {
+            stack.len() - 1
+        };
+        stack[parent].children.push(range.clone());
+        if marker {
+            // The parser emits an explicit checkbox token with no text payload.
+            result.push(range.clone());
+        }
+        if let Event::Start(tag) = event {
+            stack.push(Frame {
+                full: range.clone(),
+                children: Vec::new(),
+                container: matches!(tag, Tag::List(_) | Tag::Item | Tag::BlockQuote(_)),
+                item: matches!(tag, Tag::Item),
+            });
+        }
+    }
+    gaps(stack.pop().expect("document frame"), &mut result);
+    result
+}
+
+// Tight lists and table cells omit paragraph tags. Retain only consecutive
+// direct inline children of each parser container as evidence for the native
+// paragraph the schema inserts. Block children and task markers end a group.
+fn implicit_paragraph_groups(
+    events: &[(Event<'_>, Range<usize>)],
+) -> BTreeMap<usize, Vec<Vec<Range<usize>>>> {
+    struct Frame {
+        event: usize,
+        container: bool,
+        pending: Vec<Range<usize>>,
+    }
+    fn flush(frame: &mut Frame, groups: &mut BTreeMap<usize, Vec<Vec<Range<usize>>>>) {
+        if !frame.pending.is_empty() {
+            groups
+                .entry(frame.event)
+                .or_default()
+                .push(std::mem::take(&mut frame.pending));
+        }
+    }
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut groups = BTreeMap::new();
+    for (index, (event, range)) in events.iter().enumerate() {
+        if matches!(event, Event::End(_)) {
+            let mut frame = stack.pop().expect("balanced parser events");
+            flush(&mut frame, &mut groups);
+            continue;
+        }
+        let inline = matches!(
+            event,
+            Event::Start(
+                Tag::Emphasis
+                    | Tag::Strong
+                    | Tag::Strikethrough
+                    | Tag::Link { .. }
+                    | Tag::Image { .. }
+                    | Tag::Superscript
+                    | Tag::Subscript
+            ) | Event::Text(_)
+                | Event::Code(_)
+                | Event::SoftBreak
+                | Event::HardBreak
+                | Event::InlineHtml(_)
+        );
+        if let Some(parent) = stack.last_mut().filter(|frame| frame.container) {
+            if inline && !range.is_empty() {
+                parent.pending.push(range.clone());
+            } else {
+                flush(parent, &mut groups);
+            }
+        }
+        if let Event::Start(tag) = event {
+            stack.push(Frame {
+                event: index,
+                container: matches!(tag, Tag::Item | Tag::TableCell),
+                pending: Vec::new(),
+            });
+        }
+    }
+    groups
+}
+
+// Match the full editor's existing task-list grouping without changing parser
+// source coordinates or the text/code mapping path. Ordinary lists are untouched.
+fn task_list_html(
+    events: &[(Event<'_>, Range<usize>)],
+) -> (BTreeMap<usize, String>, BTreeMap<usize, Range<usize>>) {
+    let mut parents: Vec<usize> = Vec::new();
+    let mut items = BTreeMap::<usize, Vec<usize>>::new();
+    let mut checked = BTreeMap::new();
+    let mut ends = BTreeMap::new();
+    let mut markers = Vec::new();
+    for (index, (event, _)) in events.iter().enumerate() {
+        match event {
+            Event::Start(tag) => {
+                if matches!(tag, Tag::Item) {
+                    let list = *parents
+                        .iter()
+                        .rev()
+                        .find(|&&parent| matches!(events[parent].0, Event::Start(Tag::List(_))))
+                        .expect("list item parent");
+                    items.entry(list).or_default().push(index);
+                }
+                parents.push(index);
+            }
+            Event::End(_) => {
+                ends.insert(parents.pop().expect("balanced parser events"), index);
+            }
+            Event::TaskListMarker(value) => {
+                let item = *parents
+                    .iter()
+                    .rev()
+                    .find(|&&parent| matches!(events[parent].0, Event::Start(Tag::Item)))
+                    .expect("checkbox item");
+                checked.insert(item, *value);
+                markers.push(index);
+            }
+            _ => {}
+        }
+    }
+    let mut html = BTreeMap::new();
+    let mut list_ranges = BTreeMap::new();
+    let opening = |task| {
+        if task {
+            "<ul data-type=\"taskList\">\n"
+        } else {
+            "<ul>\n"
+        }
+    };
+    for (list, children) in items {
+        if !children.iter().any(|item| checked.contains_key(item)) {
+            continue;
+        }
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for item in children {
+            if groups
+                .last()
+                .is_none_or(|group| checked.contains_key(&group[0]) != checked.contains_key(&item))
+            {
+                groups.push(Vec::new());
+            }
+            groups.last_mut().unwrap().push(item);
+        }
+        html.insert(
+            list,
+            opening(checked.contains_key(&groups[0][0])).to_owned(),
+        );
+        html.insert(ends[&list], "</ul>\n".into());
+        for (group_index, group) in groups.iter().enumerate() {
+            let first = group[0];
+            let last = *group.last().unwrap();
+            let event = if group_index == 0 { list } else { first };
+            list_ranges.insert(event, events[first].1.start..events[last].1.end);
+            for &item in group {
+                let mut start = if item == first && group_index > 0 {
+                    format!("</ul>\n{}", opening(checked.contains_key(&item)))
+                } else {
+                    String::new()
+                };
+                if let Some(value) = checked.get(&item) {
+                    write!(
+                        start,
+                        "<li data-type=\"taskItem\" data-checked=\"{value}\" data-status=\"{}\">",
+                        if *value { "done" } else { "todo" }
+                    )
+                    .expect("String output cannot fail");
+                } else {
+                    start.push_str("<li>");
+                }
+                html.insert(item, start);
+                html.insert(ends[&item], "</li>\n".into());
+            }
+        }
+    }
+    for marker in markers {
+        html.insert(marker, String::new());
+    }
+    (html, list_ranges)
+}
+
 pub(crate) fn append_codes(
     source: &str,
     units: &[usize],
@@ -320,9 +545,11 @@ pub(crate) fn append_codes(
         .iter()
         .map(|(event, range)| (event.clone(), prepared.original(range)))
         .collect();
+    let mut document_ranges = document_delimiters(source, &events);
     let primitive_starts: BTreeSet<_> = events.iter().enumerate().filter_map(|(index, (event, _))| {
         matches!(event, Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) if format!("language-{info}").split_ascii_whitespace().any(|class| matches!(class, "language-diff" | "language-mermaid"))).then_some(index)
     }).collect();
+    let (task_html, task_list_ranges) = task_list_html(&events);
     let current = Cell::new(0);
     let mut output = Output {
         html: String::new(),
@@ -359,6 +586,9 @@ pub(crate) fn append_codes(
                 // preserves raw code rather than the exact-language base64.
                 let escape = |value: &str| value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#039;");
                 return Event::Html(format!("<pre><code class=\"language-{}\">{}</code></pre>\n", escape(language), escape(body)).into());
+            }
+            if let Some(html) = task_html.get(&index) {
+                return Event::Html(html.clone().into());
             }
             // The Markdown entry path treats source HTML as literal text. Only
             // the explicit generated primitive above creates native HTML atoms.
@@ -538,13 +768,15 @@ pub(crate) fn append_codes(
         .enumerate()
         .filter_map(|(event, range)| range.as_ref().filter(|r| !r.is_empty()).map(|r| (r, event)))
         .collect();
-    let original_at = |opening: &Range<usize>| {
+    let original_event_at = |opening: &Range<usize>| {
         let index = generated_ranges.partition_point(|(range, _)| range.end <= opening.start);
         generated_ranges
             .get(index)
             .filter(|(range, _)| range.start <= opening.start)
-            .map(|(_, event)| events[*event].1.clone())
+            .map(|(_, event)| *event)
     };
+    let original_at =
+        |opening: &Range<usize>| original_event_at(opening).map(|event| events[event].1.clone());
     let mut owner_ranges = BTreeMap::<usize, Range<usize>>::new();
     let mut explicit = BTreeSet::new();
     for &id in &active {
@@ -592,7 +824,87 @@ pub(crate) fn append_codes(
             }
         }
     }
+    let inline_groups = implicit_paragraph_groups(&events);
+    let mut repaired_paragraphs = BTreeMap::<usize, Vec<Range<usize>>>::new();
+    for (&owner, range) in &mut owner_ranges {
+        if explicit.contains(&owner) || tree.nodes[owner].kind != "paragraph" {
+            continue;
+        }
+        let Some(parent) = tree.nodes[owner].parent else {
+            continue;
+        };
+        if !matches!(
+            tree.nodes[parent].kind,
+            "listItem" | "taskItem" | "tableCell" | "tableHeader"
+        ) {
+            continue;
+        }
+        let Some(parent_event) = tree.nodes[parent]
+            .source
+            .as_ref()
+            .and_then(|source| source.opening.as_ref())
+            .and_then(original_event_at)
+        else {
+            continue;
+        };
+        let Some(groups) = inline_groups.get(&parent_event) else {
+            continue;
+        };
+        let candidates: Vec<_> = groups
+            .iter()
+            .filter(|pieces| {
+                let start = pieces.first().expect("nonempty group").start;
+                let end = pieces.last().expect("nonempty group").end;
+                start <= range.start && range.end <= end
+            })
+            .collect();
+        if let [pieces] = candidates.as_slice() {
+            *range = pieces.first().unwrap().start..pieces.last().unwrap().end;
+            repaired_paragraphs.insert(owner, (*pieces).clone());
+        }
+    }
+    // Existing block owners retain their exact source envelopes and omissions.
+    // Subtract those envelopes from parser-confirmed delimiter candidates to
+    // avoid assigning the same delimiter to two canonical owners.
+    let mut blocks: Vec<_> = owner_ranges.values().cloned().collect();
+    blocks.sort_by_key(|range| (range.start, range.end));
+    document_ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in document_ranges {
+        if let Some(last) = merged.last_mut() {
+            if range.start <= last.end {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+        }
+        if !range.is_empty() {
+            merged.push(range);
+        }
+    }
+    let mut document_ranges = Vec::new();
+    let mut first_block = 0;
+    for range in merged {
+        while first_block < blocks.len() && blocks[first_block].end <= range.start {
+            first_block += 1;
+        }
+        let mut at = range.start;
+        for block in blocks[first_block..]
+            .iter()
+            .take_while(|block| block.start < range.end)
+        {
+            if at < block.start {
+                document_ranges.push(at..block.start);
+            }
+            at = at.max(block.end);
+        }
+        if at < range.end {
+            document_ranges.push(at..range.end);
+        }
+    }
     let mut retained = BTreeSet::new();
+    if !document_ranges.is_empty() || source.is_empty() {
+        retained.insert(0);
+    }
     for &owner in owner_ranges.keys() {
         let mut pending = vec![owner];
         while let Some(id) = pending.pop() {
@@ -674,7 +986,7 @@ pub(crate) fn append_codes(
     let mut native_attributes = BTreeMap::new();
     for &id in &retained {
         let node = &tree.nodes[id];
-        let pieces = pieces_by_leaf.remove(&id).unwrap_or_default();
+        let mut pieces = pieces_by_leaf.remove(&id).unwrap_or_default();
         let literal = pieces
             .iter()
             .cloned()
@@ -685,9 +997,24 @@ pub(crate) fn append_codes(
             generated_ranges
                 .get(index)
                 .filter(|(range, _)| range.start <= opening.start)
-                .map(|(_, event)| events[*event].1.clone())
+                .map(|(_, event)| {
+                    if matches!(node.kind, "taskList" | "bulletList" | "orderedList") {
+                        task_list_ranges
+                            .get(event)
+                            .cloned()
+                            .unwrap_or_else(|| events[*event].1.clone())
+                    } else {
+                        events[*event].1.clone()
+                    }
+                })
         });
-        let range = literal.or(owner_range).unwrap_or(0..0);
+        let repaired_paragraph = repaired_paragraphs.get(&id);
+        let range = if let Some(receipts) = repaired_paragraph {
+            pieces.clone_from(receipts);
+            owner_ranges[&id].clone()
+        } else {
+            literal.or(owner_range).unwrap_or(0..0)
+        };
         let attributes_start = entries.rows.len();
         let attrs = entries.context_attributes(&if node.attributes.is_null() {
             json!({})
@@ -722,7 +1049,9 @@ pub(crate) fn append_codes(
         if !node.marks.is_empty() {
             native["marksRef"] = json!(entries.context_attributes(&json!(node.marks)));
         }
-        if pieces.windows(2).any(|pair| pair[0].end != pair[1].start) {
+        if repaired_paragraph.is_some()
+            || pieces.windows(2).any(|pair| pair[0].end != pair[1].start)
+        {
             let reference = format!("d:{}:pieces", ids[&id]);
             for (position, piece) in pieces.iter().enumerate() {
                 let piece_id = entries.id();
@@ -758,6 +1087,39 @@ pub(crate) fn append_codes(
             ));
         }
         entries.rows.push((format!("d:{}", ids[&id]), 0, native));
+    }
+    if !document_ranges.is_empty() || source.is_empty() {
+        let document_id = entries.id();
+        let mut owner = json!({"kind":"boundary","id":document_id,"construct":"markdownDocument",
+            "profile":"canonicalNote","profileVersion":1,"entryPath":"markdown",
+            "sourceRange":{"start":0,"end":units[source.len()]},
+            "nativeRef":format!("d:{}",ids[&0]),"attributesRef":native_attributes[&0]});
+        entries
+            .rows
+            .push((format!("d:{document_id}"), 0, owner.clone()));
+        owner["sourceMapRef"] = json!(format!("h:{document_id}"));
+        if source.is_empty() {
+            descriptors.push((0, 0, document_id.clone(), owner.clone()));
+        }
+        for (position, range) in document_ranges.into_iter().enumerate() {
+            let id = entries.id();
+            entries.rows.push((
+                format!("h:{document_id}"),
+                position,
+                json!({"kind":"sourceMap","id":id,
+                "profile":"canonicalNote","profileVersion":1,"ownerRef":format!("d:{document_id}"),
+                "textNodeId":null,"textNodeRef":null,"sourceRange":range_value(&range),
+                "renderedRange":{"start":0,"end":0},"mapping":"omitted","textRef":null}),
+            ));
+            // Admit this full-source owner only where its own indexed gaps meet
+            // the requested window; never pull preceding blocks into a seek.
+            descriptors.push((
+                units[range.start],
+                units[range.end],
+                document_id.clone(),
+                owner.clone(),
+            ));
+        }
     }
     let mut block_maps = BTreeMap::<usize, Vec<(Option<usize>, TextMapping)>>::new();
     let mut block_excluded = BTreeMap::<usize, Vec<Range<usize>>>::new();
@@ -896,6 +1258,42 @@ pub(crate) fn append_codes(
             let text_ref =
                 (!map.text.is_empty()).then(|| entries.fragment("renderedText", &map.text));
             entries.rows.push((format!("h:{owner}"),position,json!({"kind":"sourceMap","id":id,"profile":"canonicalNote","profileVersion":1,"ownerRef":format!("d:{owner}"),"textNodeId":leaf.map(|id|ids[&id].clone()),"textNodeRef":leaf.map(|id|format!("d:{}",ids[&id])),"sourceRange":range_value(&map.raw),"renderedRange":{"start":map.rendered.start,"end":map.rendered.end},"mapping":map.mapping,"textRef":text_ref})));
+        }
+    }
+}
+
+#[cfg(test)]
+mod delimiter_tests {
+    use super::*;
+
+    #[test]
+    fn indexed_markdown_source_maps_preserve_parser_children() {
+        for source in [
+            "- [ ] [First task](intent://local/task/first)\n\n- [ ] [Second task](intent://local/task/second)\n",
+            "- outer\n\n  - [ ] nested café 🙂\n\n  - next\n",
+            "> first café 🙂\n>\n> second\n\n> third\n",
+            "> **bold** &amp; [link](https://example.test) `code` ![alt](image.png)\n\n- [x] literal &amp; `code`\n",
+        ] {
+            let events: Vec<_> = Parser::new_ext(source, super::super::markdown_source::options())
+                .into_offset_iter().collect();
+            let omitted = document_delimiters(source, &events);
+            let protected: Vec<_> = events.iter().filter(|(event, _)| matches!(event,
+                Event::Text(_) | Event::Code(_) | Event::Html(_) | Event::InlineHtml(_) |
+                Event::Start(Tag::Link { .. } | Tag::Image { .. } | Tag::CodeBlock(_))
+            )).collect();
+            for range in &omitted {
+                assert!(source.is_char_boundary(range.start) && source.is_char_boundary(range.end));
+                for (event, child) in &protected {
+                    assert!(range.end <= child.start || range.start >= child.end,
+                        "delimiter {range:?} overlaps {event:?} child {child:?} in {source:?}");
+                }
+            }
+            let utf16 = |range: &Range<usize>| json!({"start":source[..range.start].encode_utf16().count(),"end":source[..range.end].encode_utf16().count()});
+            eprintln!("MARKDOWN_DELIMITER_RECEIPT {}", json!({
+                "source":source,
+                "events":events.iter().map(|(event,range)|json!({"event":format!("{event:?}"),"sourceRange":utf16(range)})).collect::<Vec<_>>(),
+                "delimiterCandidates":omitted.iter().map(|range|json!({"sourceRange":utf16(range),"source":&source[range.clone()]})).collect::<Vec<_>>()
+            }));
         }
     }
 }

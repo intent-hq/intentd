@@ -780,8 +780,10 @@ impl<'a> NativeTree<'a> {
             "p" => Some("paragraph"),
             "blockquote" => Some("blockquote"),
             "pre" => Some("codeBlock"),
+            "ul" if attr("data-type").as_deref() == Some("taskList") => Some("taskList"),
             "ul" => Some("bulletList"),
             "ol" => Some("orderedList"),
+            "li" if attr("data-type").as_deref() == Some("taskItem") => Some("taskItem"),
             "li" => Some("listItem"),
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => Some("heading"),
             "img" => Some("image"),
@@ -799,6 +801,10 @@ impl<'a> NativeTree<'a> {
                 "tableCell" | "tableHeader" => {
                     json!({"align":attr("align").filter(|a|matches!(a.as_str(),"left"|"center"|"right")),"colspan":1,"rowspan":1,"colwidth":null})
                 }
+                "taskItem" => {
+                    let checked = attr("data-checked").as_deref() == Some("true");
+                    json!({"checked":checked,"status":attr("data-status").filter(|value| !value.is_empty()).unwrap_or_else(||"todo".into()),"delegatedAgentId":attr("data-delegated-agent-id").filter(|value| !value.is_empty())})
+                }
                 "heading" => json!({"level":tag.as_bytes()[1]-b'0'}),
                 "orderedList" => {
                     json!({"start":attr("start").and_then(|n|n.parse::<i64>().ok()).unwrap_or(1),"type":null})
@@ -813,7 +819,7 @@ impl<'a> NativeTree<'a> {
             for child in node.children.borrow().iter() {
                 self.visit(child, id, &[]);
             }
-            if matches!(kind, "tableCell" | "tableHeader" | "listItem")
+            if matches!(kind, "tableCell" | "tableHeader" | "listItem" | "taskItem")
                 && self.nodes[id].children.is_empty()
             {
                 self.add(Some(id), "paragraph", None, Value::Null);
@@ -894,6 +900,31 @@ mod tests {
         }
         found
     }
+    #[test]
+    fn indexed_markdown_tasks_match_sanitized_full_editor_html() {
+        let fixtures: Vec<Value> =
+            serde_json::from_str(include_str!("tests/fixtures/note_task_native.json")).unwrap();
+        for fixture in fixtures {
+            assert_eq!(
+                canonical(fixture["html"].as_str().unwrap()).json(0),
+                fixture["native"],
+                "{}",
+                fixture["name"]
+            );
+        }
+        for (raw, checked) in [("false", false), ("true", true), ("TRUE", false)] {
+            let tree = canonical(&format!("<ul data-type=\"taskList\"><li data-type=\"taskItem\" data-checked=\"{raw}\" data-status=\"\" data-delegated-agent-id=\"\"><p>task</p></li></ul>")).json(0);
+            assert_eq!(
+                tree["content"][0]["content"][0]["attrs"],
+                json!({"checked":checked,"status":"todo","delegatedAgentId":null})
+            );
+        }
+        let ordinary = canonical("<ul><li data-checked=\"true\">ordinary</li></ul>").json(0);
+        assert_eq!(ordinary["content"][0]["type"], "bulletList");
+        assert_eq!(ordinary["content"][0]["content"][0]["type"], "listItem");
+        assert!(ordinary["content"][0]["content"][0].get("attrs").is_none());
+    }
+
     #[test]
     fn canonical_block_whitespace_preserves_positions_and_literal_tail() {
         let tree = canonical("<h2>Before</h2>\n<div data-type=\"diff-block\" data-diff-code=\"abc\"></div>\n<p>After</p>");

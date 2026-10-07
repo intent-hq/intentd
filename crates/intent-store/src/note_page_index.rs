@@ -371,9 +371,19 @@ fn context_entries(text: &str, parts: &[Piece], entries: &mut Entries) {
             }
             continue;
         }
-        if let Some(Parent { first, last, .. }) = parents.last_mut() {
-            first.get_or_insert(range.start);
-            *last = range.end;
+        // In a loose list, pulldown emits the checkbox after Paragraph Start,
+        // but its source precedes that paragraph. The marker belongs to the
+        // list item, just as it does in a tight list.
+        let owner = if matches!(event, Event::TaskListMarker(_)) {
+            parents
+                .iter()
+                .rposition(|parent| descriptors[parent.index].3["construct"] == "listItem")
+        } else {
+            parents.len().checked_sub(1)
+        };
+        if let Some(Parent { first, last, .. }) = owner.map(|i| &mut parents[i]) {
+            *first = Some(first.map_or(range.start, |start| start.min(range.start)));
+            *last = (*last).max(range.end);
         }
         let id = entries.id();
         let start = units[range.start];
@@ -421,7 +431,7 @@ fn context_entries(text: &str, parts: &[Piece], entries: &mut Entries) {
             }
             _ => {}
         }
-        if let Some(Parent { index: parent, .. }) = parents.last() {
+        if let Some(Parent { index: parent, .. }) = owner.map(|i| &parents[i]) {
             descriptor["parentRef"] = json!(format!("d:{}", descriptors[*parent].2));
         }
         if let Event::Start(tag) = &event {
@@ -447,7 +457,10 @@ fn context_entries(text: &str, parts: &[Piece], entries: &mut Entries) {
             if part.start >= end && end != start {
                 break;
             }
-            if descriptor["construct"] == "htmlDocument" {
+            if matches!(
+                descriptor["construct"].as_str(),
+                Some("htmlDocument" | "markdownDocument")
+            ) {
                 if let Some(index) = document_occurrences.get(&i) {
                     let admission = &mut entries.rows[*index].2["_admissionRange"];
                     let old_start = admission["start"].as_u64().expect("admission start");

@@ -2,6 +2,7 @@
 //! persistent database secret, while bounded snapshot leases are process-local.
 mod token;
 use crate::Store;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
 use intent_core::{
@@ -13,6 +14,9 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use sqlx::{Acquire, Row, SqliteConnection};
 use std::{collections::BTreeMap, sync::Mutex, time::Instant};
+
+// Shared with query-plan tests so they exercise the production admission SQL.
+pub(crate) const CONTEXT_WINDOW_SQL: &str = "SELECT position,value FROM note_page_entry AS occurrence WHERE workspace_id=?1 AND note_id=?2 AND collection=?3 AND position>=?4 AND ((source_start<?5 AND source_end>?6) OR (source_start=source_end AND source_start>=?7 AND source_start<=?8)) AND (json_extract(value,'$.construct') IS NOT 'markdownDocument' OR (json_extract(value,'$.sourceRange.start')=0 AND json_extract(value,'$.sourceRange.end')=0 AND ?9=0 AND ?10=0) OR (?9<?10 AND (SELECT gap.source_start FROM note_page_entry AS gap WHERE gap.workspace_id=occurrence.workspace_id AND gap.note_id=occurrence.note_id AND gap.collection='h:' || json_extract(occurrence.value,'$.id') AND gap.source_end>?9 ORDER BY gap.source_end,gap.position LIMIT 1) < ?10)) ORDER BY position LIMIT ?11";
 
 const MAX_SNAPSHOTS: usize = 256;
 const SNAPSHOT_SECONDS: u64 = 300;
@@ -648,7 +652,10 @@ impl Store {
         let sql = if fragment {
             "SELECT position,value FROM note_page_entry WHERE workspace_id=? AND note_id=? AND collection=? AND position<=? ORDER BY position DESC LIMIT 1"
         } else if context_window {
-            "SELECT position,value FROM note_page_entry WHERE workspace_id=? AND note_id=? AND collection=? AND position>=? AND ((source_start<? AND source_end>?) OR (source_start=source_end AND source_start>=? AND source_start<=?)) ORDER BY position LIMIT ?"
+            // A document occurrence's piece-level hull is only a candidate. Its
+            // sorted disjoint gap collection supplies exact admission in one
+            // indexed seek, without scanning gaps or changing cursor positions.
+            CONTEXT_WINDOW_SQL
         } else if map_window {
             // Identity/omitted runs need positive half-open overlap. Keep the
             // separately indexed projection and non-bijective seam candidates,
@@ -708,6 +715,8 @@ impl Store {
             query = query
                 .bind(signed(end)?)
                 .bind(signed(start)?)
+                .bind(signed(start)?)
+                .bind(signed(end)?)
                 .bind(signed(start)?)
                 .bind(signed(end)?);
         }
