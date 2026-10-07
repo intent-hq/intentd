@@ -141,6 +141,22 @@ conversation. Read its status and last response before sending a follow-up. Use
 choose a specialist and model where offered. A specialist defines reusable behavior;
 an agent is a particular conversation doing work.
 
+## Restore workspace browser use
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/store/renderer/slices/browser-clients/browser-clients-selectors.ts; messages/en.json. -->
+
+The workspace sidebar warns when its primary browser client is offline, even if
+the workspace has no browser tabs yet. Hover over the warning for recovery help:
+agent browser tabs and tunnels fail until that client reconnects or another
+connected, browser-capable client is set as primary.
+
+To switch, open the workspace in the client you want to use, open the workspace
+sidebar's menu, choose **Set Current Client as Primary**, and confirm **Set as
+Primary**. This moves agent-owned tabs to that client without preserving page
+state; tabs you opened yourself stay where they are. The action depends on the
+current client's browser capability and your access. Do not promise automatic
+failover or change the primary client without the user's instruction.
+
 ## Add context, run a task, and find results
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/MultiSelectTabbedSidebar.svelte; sidebar/{AddContextSection,ContextPanel,NotesPanel}.svelte; NoteMetadataBar.svelte (sidebar/ and NoteMetadataBar paths relative to the same workspace component directory); messages/en.json. -->
