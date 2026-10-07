@@ -16,6 +16,9 @@ struct Executor {
     hold_start: std::sync::atomic::AtomicBool,
     start_seen: tokio::sync::Notify,
     release_start: tokio::sync::Notify,
+    hold_end: std::sync::atomic::AtomicBool,
+    end_seen: tokio::sync::Notify,
+    release_end: tokio::sync::Notify,
     result: Mutex<Option<Value>>,
 }
 impl AgentReverseDispatch for Executor {
@@ -81,6 +84,12 @@ impl AgentReverseDispatch for Executor {
                     .clone()
                     .unwrap_or_else(|| error("desktop-execution-failed", "Native failure")));
             }
+            if params["operation"] == "endControl"
+                && self.hold_end.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.end_seen.notify_one();
+                self.release_end.notified().await;
+            }
             Ok(match params["operation"].as_str().unwrap() {
                 "prepare" => {
                     json!({"computerId":if connection.client_id.as_str()=="primary" {"physical"} else {"second-physical"},"computerName":connection.client_id,"platform":"macos"})
@@ -137,6 +146,9 @@ impl Harness {
             hold_start: std::sync::atomic::AtomicBool::default(),
             start_seen: tokio::sync::Notify::default(),
             release_start: tokio::sync::Notify::default(),
+            hold_end: std::sync::atomic::AtomicBool::default(),
+            end_seen: tokio::sync::Notify::default(),
+            release_end: tokio::sync::Notify::default(),
             result: Mutex::new(None),
         });
         let settings =

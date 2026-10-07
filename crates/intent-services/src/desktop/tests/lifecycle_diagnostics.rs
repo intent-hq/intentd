@@ -38,6 +38,115 @@ fn visible_text(message: &Value) -> String {
 }
 
 #[tokio::test]
+async fn desktop_lifecycle_explicit_release_ignores_late_environment_report() {
+    for during_teardown in [false, true] {
+        let h = Harness::new().await;
+        h.remember().await;
+        let active = h.agent("startControl", json!({})).await.unwrap();
+        let session = active["sessionId"].as_str().unwrap();
+        *h.executor.result.lock().unwrap() = Some(json!({
+            "capturedAt":"2026-10-02T09:00:00Z", "layoutId":"layout",
+            "displays":[{"displayId":"screen","width":1920,"height":1080,
+                "originX":0,"originY":0,"scaleFactor":1.0,"assetId":"asset",
+                "url":format!("workspace-asset://{}/asset",h.workspace),"mimeType":"image/png"}]
+        }));
+        h.agent("screenshot", json!({})).await.unwrap();
+        h.executor
+            .hold_end
+            .store(during_teardown, std::sync::atomic::Ordering::Relaxed);
+        let release = h.agent("endControl", json!({}));
+        let late_report = async {
+            if during_teardown {
+                h.executor.end_seen.notified().await;
+            }
+            let result = h
+                .client(
+                    "revoke",
+                    json!({"sessionId":session,"reason":"unsupported_environment"}),
+                )
+                .await
+                .unwrap();
+            h.executor.release_end.notify_one();
+            assert_eq!(result, json!({"revoked":false,"reported":false}));
+        };
+        let ended = if during_teardown {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let (ended, ()) = tokio::join!(release, late_report);
+                ended
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        } else {
+            let ended = release.await.unwrap();
+            late_report.await;
+            ended
+        };
+        assert_eq!(ended, json!({"ended":true,"withdrawn":false}));
+        assert_eq!(
+            h.services
+                .store
+                .desktop_terminal(session)
+                .await
+                .unwrap()
+                .unwrap()["reason"],
+            "agent_end"
+        );
+        let notifications: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM settings WHERE key GLOB 'desktop.v1/outbox/*' AND json_extract(value,'$.payload.sessionId')=?")
+            .bind(session).fetch_one(h.services.store.read_pool()).await.unwrap();
+        assert_eq!(
+            notifications, 0,
+            "a completed explicit release must not emit a late failure wake"
+        );
+        assert_eq!(
+            h.agent("endControl", json!({})).await.unwrap(),
+            json!({"ended":false,"withdrawn":false})
+        );
+        assert_eq!(
+            h.agent("screenshot", json!({})).await.unwrap_err().code,
+            "desktop-not-active"
+        );
+    }
+}
+
+#[tokio::test]
+async fn desktop_lifecycle_environment_report_before_release_preserves_real_failure() {
+    let h = Harness::new().await;
+    h.remember().await;
+    let active = h.agent("startControl", json!({})).await.unwrap();
+    let session = active["sessionId"].as_str().unwrap();
+    assert_eq!(
+        h.client(
+            "revoke",
+            json!({"sessionId":session,"reason":"unsupported_environment"})
+        )
+        .await
+        .unwrap(),
+        json!({"revoked":true,"reported":false})
+    );
+    assert_eq!(
+        h.agent("endControl", json!({})).await.unwrap(),
+        json!({"ended":false,"withdrawn":false})
+    );
+    assert_eq!(
+        h.services
+            .store
+            .desktop_terminal(session)
+            .await
+            .unwrap()
+            .unwrap()["reason"],
+        "unsupported_environment"
+    );
+    let message = outcome(&h, "sessionId", session).await;
+    assert_eq!(message["metadata"]["reason"], "unsupported_environment");
+    assert!(visible_text(&message).contains("Do not automatically restart"));
+    assert_eq!(
+        h.agent("screenshot", json!({})).await.unwrap_err().code,
+        "desktop-not-active"
+    );
+}
+
+#[tokio::test]
 async fn desktop_lifecycle_executor_revocation_exposes_reason_without_claiming_user_stop() {
     for reason in [
         "screen_locked",
