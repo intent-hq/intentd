@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.27] - 2026-10-06
+
+### 🚀 Features
+
+- Ground Assistant answers in a maintained app guide ([#2315](https://github.com/intent-hq/intentd/pull/2315))
+
+
 ## [0.10.26] - 2026-10-06
 
 ### 🐛 Bug Fixes
