@@ -1791,3 +1791,21 @@ fn only_grok_requires_terminal_shell_by_default() {
         }
     }
 }
+
+#[test]
+fn provider_access_token_kinds_match_adapter_environment() {
+    for (id, kind, env) in [
+        ("claude-code", "claudeSetupToken", "CLAUDE_CODE_OAUTH_TOKEN"),
+        ("codex", "codexAccessToken", "CODEX_ACCESS_TOKEN"),
+    ] {
+        let token = find_provider(id).unwrap().access_token().unwrap();
+        assert_eq!(token.kind.wire_name(), kind);
+        assert_eq!(token.kind.env_var(), env);
+        assert_eq!(token.setting_path, format!("providers.{id}.accessToken"));
+    }
+    for provider in ACP_PROVIDERS {
+        if !matches!(provider.id, "claude-code" | "codex") {
+            assert_eq!(provider.access_token(), None);
+        }
+    }
+}
