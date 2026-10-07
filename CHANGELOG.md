@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.30] - 2026-10-07
+
+### 📚 Documentation
+
+- Explain conversation failure recovery ([#2341](https://github.com/intent-hq/intentd/pull/2341))
+
+
 ## [0.10.29] - 2026-10-07
 
 ### 🚀 Features
