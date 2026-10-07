@@ -2,7 +2,9 @@
 //! Only the first query belongs to startup; later queries belong to the terminal
 //! application and remain in its output for an attached renderer to answer.
 
-use std::io::{self, Write};
+use std::io;
+#[cfg(test)]
+use std::io::Write;
 
 const QUERY: &[u8] = b"\x1b[6n";
 
@@ -13,7 +15,19 @@ pub(super) struct CursorHandshake {
 }
 
 impl CursorHandshake {
+    #[cfg(test)]
     pub(super) fn filter(&mut self, input: &[u8], writer: &mut impl Write) -> io::Result<Vec<u8>> {
+        self.filter_with_reply(input, |reply| {
+            writer.write_all(reply)?;
+            writer.flush()
+        })
+    }
+
+    pub(super) fn filter_with_reply(
+        &mut self,
+        input: &[u8],
+        mut reply: impl FnMut(&[u8]) -> io::Result<()>,
+    ) -> io::Result<Vec<u8>> {
         let mut output = Vec::with_capacity(input.len());
         for &byte in input {
             if self.answered {
@@ -26,8 +40,7 @@ impl CursorHandshake {
                     // There is no parent terminal cursor to inherit: each PTY
                     // starts at its own origin. Consume the query so a later UI
                     // attach cannot send a second reply into application stdin.
-                    writer.write_all(b"\x1b[1;1R")?;
-                    writer.flush()?;
+                    reply(b"\x1b[1;1R")?;
                     self.matched = 0;
                     self.answered = true;
                 }

@@ -1053,7 +1053,11 @@ fn read_loop(
             Ok(0) => break,
             Ok(n) => {
                 #[cfg(windows)]
-                let output = match handshake.filter(&buf[..n], &mut *writer.lock().unwrap()) {
+                let output = match handshake.filter_with_reply(&buf[..n], |reply| {
+                    let mut writer = writer.lock().unwrap();
+                    writer.write_all(reply)?;
+                    writer.flush()
+                }) {
                     Ok(output) => output,
                     Err(error) => {
                         tracing::warn!(%error, "failed to answer ConPTY startup cursor query");

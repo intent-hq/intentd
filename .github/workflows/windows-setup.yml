@@ -9,6 +9,7 @@ on:
       - crates/intent-services/src/lib.rs
       - crates/intent-services/src/setup_runner/**
       - crates/intentd/tests/e2e_wss_setup_headless.rs
+      - crates/intentd/tests/fixtures/pty-io-backpressure.cjs
       - crates/intentd/tests/common/**
       - Cargo.toml
       - Cargo.lock
@@ -37,6 +38,9 @@ jobs:
       INTENTD_SETUP_EVIDENCE_DIR: ${{ github.workspace }}/setup-headless-evidence
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
       - name: Put Git Bash first on PATH
         shell: cmd
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"

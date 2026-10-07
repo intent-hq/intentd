@@ -136,6 +136,30 @@ async fn rpc(socket: &mut Socket, id: i64, method: &str, params: Value) -> Value
     frame["result"].clone()
 }
 
+async fn wait_for_output(socket: &mut Socket, terminal_id: &str, markers: &[&str]) -> String {
+    timeout(common::test_timeout(Duration::from_secs(30)), async {
+        loop {
+            let result = rpc(
+                socket,
+                50,
+                "terminal.getBuffer",
+                json!({"terminalId":terminal_id}),
+            )
+            .await;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(result["data"].as_str().unwrap())
+                .unwrap();
+            let output = String::from_utf8_lossy(&bytes).into_owned();
+            if markers.iter().all(|marker| output.contains(marker)) {
+                break output;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal output did not reach its completion markers")
+}
+
 fn seed_repo(path: &Path) {
     for args in [
         vec!["init", "--initial-branch=main"],
@@ -310,6 +334,54 @@ async fn setup_finishes_without_terminal_client_input() {
             evidence.push(
                 json!({"case":"failed_terminal_launch","response":failure,"terminals":terminals}),
             );
+
+            let preload = data.path().join("terminal io fixture.cjs");
+            std::fs::write(&preload, include_str!("fixtures/pty-io-backpressure.cjs")).unwrap();
+            let node_options = format!(
+                "--require {}",
+                serde_json::to_string(&preload.to_string_lossy()).unwrap()
+            );
+            let terminal = rpc(
+                &mut client,
+                42,
+                "terminal.create",
+                json!({"workspaceId":id,"cols":80,"rows":24,"command":"node","env":{"NODE_OPTIONS":node_options}}),
+            )
+            .await;
+            let terminal_id = terminal["terminalId"].as_str().unwrap();
+            wait_for_output(&mut client, terminal_id, &["IO_READY"]).await;
+            let line_end = if cfg!(windows) { "\r" } else { "\n" };
+            let input = format!("{}{line_end}", "x".repeat(1024)).repeat(128);
+            let write = timeout(
+                common::test_timeout(Duration::from_secs(30)),
+                rpc(
+                    &mut client,
+                    43,
+                    "terminal.write",
+                    json!({"terminalId":terminal_id,"data":base64::engine::general_purpose::STANDARD.encode(input.as_bytes())}),
+                ),
+            )
+            .await
+            .expect("simultaneous terminal input and output blocked");
+            assert_eq!(write["ok"], true);
+            let output = wait_for_output(
+                &mut client,
+                terminal_id,
+                &["IO_INPUT_DONE", "IO_OUTPUT_DONE"],
+            )
+            .await;
+            rpc(
+                &mut client,
+                44,
+                "terminal.kill",
+                json!({"terminalId":terminal_id}),
+            )
+            .await;
+            let terminals = rpc(&mut client, 45, "terminal.list", json!({"workspaceId":id})).await;
+            assert!(terminals["terminals"].as_array().unwrap().is_empty());
+            let tail = output.chars().rev().take(512).collect::<String>();
+            let tail = tail.chars().rev().collect::<String>();
+            evidence.push(json!({"case":"simultaneous_terminal_io","terminalId":terminal_id,"inputBytes":input.len(),"inputLines":128,"bufferTail":tail,"terminals":terminals}));
         }
     }
     let evidence_dir = std::env::var_os("INTENTD_SETUP_EVIDENCE_DIR")
