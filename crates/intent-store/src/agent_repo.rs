@@ -6061,6 +6061,9 @@ impl Store {
     /// crossing the stored-byte budget, so no fetched/enriched suffix is thrown
     /// away and even an oversized single message makes progress. At most eight
     /// rows are materialized; no payload side-table bodies are hydrated.
+    /// Returns the trigger-maintained count from the same read snapshot, so an
+    /// append cannot land between the count and newest-row boundary. Reading
+    /// the count never scans the transcript, including on continuation batches.
     ///
     /// # Errors
     /// Returns an error if the database read or row decoding fails.
@@ -6069,7 +6072,17 @@ impl Store {
         agent_id: &AgentId,
         before_seq: Option<i64>,
         limit: usize,
-    ) -> Result<Vec<AgentMessage>> {
+    ) -> Result<(Vec<AgentMessage>, u64)> {
+        let mut tx = self.begin_read_snapshot().await?;
+        let total =
+            sqlx::query_scalar::<_, i64>("SELECT message_count FROM agent_session WHERE id = ?")
+                .bind(agent_id.as_str())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("read history count failed: {e}")))?
+                .unwrap_or(0)
+                .max(0)
+                .cast_unsigned();
         let sql = format!(
             "WITH candidates AS (SELECT {MESSAGE_COLUMNS} FROM agent_message \
              WHERE agent_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?), \
@@ -6085,10 +6098,11 @@ impl Store {
             .bind(before_seq.unwrap_or(i64::MAX))
             .bind(i64::try_from(limit.clamp(1, 8)).unwrap_or(8))
             .bind(i64::try_from(intent_core::SLIM_PAGE_BUDGET_BYTES).unwrap_or(i64::MAX))
-            .fetch_all(self.read_pool())
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("read history batch failed: {e}")))?;
-        rows.iter().map(map_message_row).collect()
+        let messages = rows.iter().map(map_message_row).collect::<Result<_>>()?;
+        Ok((messages, total))
     }
 
     /// The shared page SELECT behind [`Store::get_agent_messages_page`]

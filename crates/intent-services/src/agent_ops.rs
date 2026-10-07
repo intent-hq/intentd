@@ -4276,14 +4276,11 @@ impl Services {
         limit: usize,
     ) -> Result<Value> {
         let session = self.store.get_agent_session_summary(&agent_id).await?;
-        let total = self.store.count_agent_messages(&agent_id).await?;
-        let mut page: Vec<_> = self
+        let (messages, total) = self
             .store
             .get_agent_history_batch(&agent_id, before_seq, limit)
-            .await?
-            .into_iter()
-            .map(project_served_message)
-            .collect();
+            .await?;
+        let mut page: Vec<_> = messages.into_iter().map(project_served_message).collect();
         crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
             .attach_typed(&mut page)
             .await;

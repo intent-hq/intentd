@@ -417,6 +417,14 @@ impl InitialHistory {
         target: usize,
     ) -> Result<(Value, Self), Error> {
         let mut snapshot = api.agent_history_batch(agent_id.clone(), None, 1).await?;
+        // Capture the persisted boundary before the live overlay can replace
+        // this row. Synthetic live ordinals must never decide which persisted
+        // rows remain eligible (a count can lag an append on other API impls).
+        let persisted = snapshot["messages"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .map(|row| (row["id"].clone(), row["seq"].as_i64().unwrap_or(0)));
+
         overlay_live_state(
             api,
             agent_id,
@@ -427,10 +435,13 @@ impl InitialHistory {
         .await;
         let rows = snapshot["messages"].as_array().expect("history messages");
         let received = rows.len();
-        let before_seq = rows
-            .first()
-            .and_then(|row| row["seq"].as_i64())
-            .unwrap_or(0);
+        let before_seq = persisted.map_or(0, |(id, seq)| {
+            if rows.first().is_some_and(|row| row["id"] == id) {
+                seq
+            } else {
+                seq.saturating_add(1)
+            }
+        });
         let history = Self {
             target,
             received,

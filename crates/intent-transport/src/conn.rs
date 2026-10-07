@@ -1912,6 +1912,43 @@ async fn forward_chat_subscription(
     subscriptions::trace_chat_forwarder_exit(&scope, &subscription_id, reason);
 }
 
+/// Keep seq-0 reads, retry delays and outbound backpressure inside the same
+/// cancellation boundary as the live tail. A queued own-unshare wins even
+/// when the read or outbound reservation is ready on the same poll.
+async fn wait_for_chat_initial<T>(
+    work: impl std::future::Future<Output = T>,
+    out_tx: &mpsc::Sender<String>,
+    gate: &mut Option<events::MembershipGate>,
+    membership_events: &mut Option<Subscription>,
+    agent_workspace: Option<&str>,
+) -> Result<T, &'static str> {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            () = out_tx.closed() => return Err("client_closed"),
+            maybe = async { membership_events.as_mut().expect("guarded").recv().await },
+                if membership_events.is_some() =>
+            {
+                match (maybe, gate.as_mut()) {
+                    (Some(batch), Some(gate)) => {
+                        for event in &batch {
+                            gate.observe_membership_event(event);
+                            if gate.is_own_unshare(event)
+                                && agent_workspace.is_none_or(|workspace| workspace == event.workspace_id.as_str())
+                            {
+                                return Err("membership_revoked");
+                            }
+                        }
+                    }
+                    _ => *membership_events = None,
+                }
+            },
+            result = &mut work => return Ok(result),
+        }
+    }
+}
+
 /// The snapshot-then-tail loop behind [`forward_chat_subscription`], returning
 /// the fixed-vocabulary reason it exited for the lifecycle record:
 /// `client_closed` (the outbound lane is gone), `bus_closed`, or
@@ -1943,64 +1980,98 @@ async fn chat_subscription_loop(
     // workspace): the subscriber's own unshare of THAT workspace ends the
     // forwarder. Resolved at subscribe time through the guarded `agent.get`
     // so a member removed BEFORE the agent's first stream event is still
-    // torn down; a refused read (non-member) leaves it unknown until a
-    // stream event names the workspace, by which point the gate admits it.
-    let mut agent_workspace: Option<String> = match gate {
-        Some(_) => api
-            .agent_get(agent_id.clone(), None)
-            .await
-            .ok()
-            .map(|agent| agent.workspace_id.as_str().to_string()),
-        None => None,
-    };
-    let mut initial_history = None;
-    let mut snapshot = if progressive_history && since_message_id.is_none() {
-        Value::Null
-    } else {
-        subscriptions::chat_snapshot(
-            api.as_ref(),
-            &agent_id,
-            since_message_id.as_deref(),
-            projection,
-            limit,
+    // torn down. Until the workspace is known (including a failed lookup),
+    // any own-unshare cancels startup conservatively: it must not be consumed
+    // and ignored merely because the scope lookup has not succeeded.
+    let mut agent_workspace: Option<String> = if gate.is_some() {
+        match wait_for_chat_initial(
+            api.agent_get(agent_id.clone(), None),
+            &out_tx,
+            &mut gate,
+            &mut membership_events,
+            None,
         )
         .await
+        {
+            Ok(agent) => agent
+                .ok()
+                .map(|agent| agent.workspace_id.as_str().to_string()),
+            Err(reason) => return reason,
+        }
+    } else {
+        None
     };
-    if progressive_history {
-        if snapshot["resumed"] == true {
-            subscriptions::stamp_history_complete(&mut snapshot, limit);
+    let initial = async {
+        let mut initial_history = None;
+        let mut snapshot = if progressive_history && since_message_id.is_none() {
+            Value::Null
         } else {
-            loop {
-                match subscriptions::InitialHistory::start(api.as_ref(), &agent_id, limit).await {
-                    Ok((mut first, history)) => {
-                        if since_message_id.is_some() {
-                            first["resumed"] = json!(false);
+            subscriptions::chat_snapshot(
+                api.as_ref(),
+                &agent_id,
+                since_message_id.as_deref(),
+                projection,
+                limit,
+            )
+            .await
+        };
+        if progressive_history {
+            if snapshot["resumed"] == true {
+                subscriptions::stamp_history_complete(&mut snapshot, limit);
+            } else {
+                loop {
+                    match subscriptions::InitialHistory::start(api.as_ref(), &agent_id, limit).await
+                    {
+                        Ok((mut first, history)) => {
+                            if since_message_id.is_some() {
+                                first["resumed"] = json!(false);
+                            }
+                            snapshot = first;
+                            if snapshot["initialHistory"]["complete"] != true {
+                                initial_history = Some(history);
+                            }
+                            break;
                         }
-                        snapshot = first;
-                        if snapshot["initialHistory"]["complete"] != true {
-                            initial_history = Some(history);
+                        Err(intent_core::Error::Forbidden(_) | intent_core::Error::NotFound(_)) => {
+                            return Err("membership_revoked");
                         }
-                        break;
-                    }
-                    Err(intent_core::Error::Forbidden(_) | intent_core::Error::NotFound(_)) => {
-                        return "membership_revoked"
-                    }
-                    Err(_) => {
-                        // A read failure is not history exhaustion. Retry without
-                        // emitting a misleading complete/empty snapshot.
-                        tokio::select! {
-                            () = out_tx.closed() => return "client_closed",
-                            () = tokio::time::sleep(CHAT_RECOVERY_RETRY) => {}
+                        Err(_) => {
+                            // A read failure is not history exhaustion. The outer
+                            // selection also cancels this retry delay on revocation.
+                            tokio::time::sleep(CHAT_RECOVERY_RETRY).await;
                         }
                     }
                 }
             }
         }
-    }
+        Ok((snapshot, initial_history))
+    };
+    let (mut snapshot, mut initial_history) = match wait_for_chat_initial(
+        initial,
+        &out_tx,
+        &mut gate,
+        &mut membership_events,
+        agent_workspace.as_deref(),
+    )
+    .await
+    {
+        Ok(Ok(initial)) => initial,
+        Ok(Err(reason)) | Err(reason) => return reason,
+    };
     subscriptions::stamp_delta_encoding(&mut snapshot, delta_encoding);
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
-    if out_tx.send(frame).await.is_err() {
-        return "client_closed";
+    match wait_for_chat_initial(
+        out_tx.reserve(),
+        &out_tx,
+        &mut gate,
+        &mut membership_events,
+        agent_workspace.as_deref(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit.send(frame),
+        Ok(Err(_)) => return "client_closed",
+        Err(reason) => return reason,
     }
     // Logged only after the frame is queued, so a full/closed lane never
     // leaves a snapshot record overstating progress (the `client_closed`
@@ -2075,7 +2146,7 @@ async fn chat_subscription_loop(
                         for event in &batch {
                             gate.observe_membership_event(event);
                             if gate.is_own_unshare(event)
-                                && agent_workspace.as_deref() == Some(event.workspace_id.as_str())
+                                && agent_workspace.as_deref().is_none_or(|workspace| workspace == event.workspace_id.as_str())
                             {
                                 return "membership_revoked";
                             }

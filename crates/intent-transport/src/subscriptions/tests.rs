@@ -6197,6 +6197,40 @@ fn resource_context_keeps_unsubscribe_dispatch_and_chat_selectors() {
 }
 
 mod progressive_history {
+
+    #[tokio::test]
+    async fn progressive_history_live_overlay_retains_newest_row_when_count_lags_the_read() {
+        struct RacedCount;
+        impl WorkspaceApi for RacedCount {
+            fn agent_history_batch(
+                &self,
+                _: AgentId,
+                before: Option<i64>,
+                limit: usize,
+            ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
+                Box::pin(async move {
+                    let rows:Vec<_>=(0..6).rev().filter(|seq|*seq<before.unwrap_or(6)).take(limit.min(8)).map(|seq|json!({"id":format!("m{seq}"),"seq":seq,"role":"user","contentBlocks":[]})).collect();
+                    // Real service counts first, then reads the newest row on a separate connection.
+                    Ok(json!({"messages":rows,"totalMessages":if before.is_none(){5}else{6}}))
+                })
+            }
+            fn agent_is_busy(&self, _: AgentId) -> bool {
+                true
+            }
+            fn agent_live_turn(&self, _: AgentId) -> Option<Value> {
+                Some(
+                    json!({"messageId":"live","contentBlocks":[{"id":"live:0","type":"text","text":"current"}]}),
+                )
+            }
+        }
+        let api = RacedCount;
+        let agent = AgentId::from("a");
+        let (snapshot, mut history) = InitialHistory::start(&api, &agent, 4).await.unwrap();
+        assert_eq!(snapshot["messages"][0]["id"], "live");
+        let first_older = history.next(&api, &agent).await.unwrap();
+        assert_eq!(first_older["message"]["id"],"m5","Newest persisted row was read for seq-0, then dropped because the stale count became the exclusive history boundary");
+    }
+
     use super::*;
     use intent_core::BoxFuture;
     use std::sync::atomic::{AtomicBool, Ordering};
