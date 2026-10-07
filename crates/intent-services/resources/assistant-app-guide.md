@@ -70,7 +70,9 @@ Open Settings and use these sidebar labels (English labels shown):
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
-For MCP configuration, open **Connections → MCP servers**; its reference route is `/settings?tab=connections#mcp-servers`.
+<!-- Source: packages/intentd/crates/intent-services/src/mcp_servers.rs. -->
+
+For MCP configuration, open **Connections → MCP servers**; its reference route is `/settings?tab=connections#mcp-servers`. When MCP is enabled, saving edits to an enabled server reconnects the daemon using the saved settings, including a changed URL. Disabled servers stay disabled; an unreachable URL shows a connection error.
 
 ## Choose a model or change agent behavior
 
@@ -147,6 +149,33 @@ unless you scroll away; older-history loading becomes available when that initia
 window finishes. Older clients may show the initial messages together.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/ChatPanel.svelte; packages/intentd/crates/intent-transport/src/{conn,subscriptions}.rs. -->
+
+## Inspect a failed response and recover
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,ChatPanel}.svelte; messages/en.json. -->
+
+In the existing conversation, **Couldn't complete this response** summarizes a
+stopped response. Open **Details** to inspect the technical error, then **Copy
+details** to copy it. **Needs attention** means action is needed; choose **Retry**
+when offered. **Queued** means a message is in the queue, not that a retry is
+scheduled. Inspect that message and use its available controls before sending
+another copy. Active work keeps its normal **Thinking** or activity status; do not
+infer a retry from that status alone. Controls depend on the conversation's state
+and your access.
+
+Earlier failures may appear as **1 recorded failure** or **N recorded failures**.
+Expand that label to inspect the saved errors and timestamps and use **Copy
+details**. These are counts of recorded notices, not total attempts or proof that
+all failures belong to the same request. A historical notice alone does not mean
+the agent is still failing; check the current status and latest response.
+
+Follow specific recovery guidance when shown: **Retry with [model]** uses the
+offered available model; **Retry on [provider]** switches away from a provider
+whose usage limit was reached. For sign-in errors, run the displayed CLI login
+command; signing in to the Claude desktop app does not sign in its CLI. For
+**Agent session corrupted**, retry starts a fresh session and carries over the
+conversation history. Do not promise a model or provider switch unless the UI
+offers it; inspect **Settings → Providers** for setup problems.
 
 ## Restore workspace browser use
 

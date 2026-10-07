@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.29] - 2026-10-07
+
+### 🚀 Features
+
+- Add optional provider access token settings ([#2342](https://github.com/intent-hq/intentd/pull/2342))
+
+### 🐛 Bug Fixes
+
+- Reconnect enabled MCP servers when saving edits ([#2340](https://github.com/intent-hq/intentd/pull/2340))
+
+
 ## [0.10.28] - 2026-10-07
 
 ### 📚 Documentation
