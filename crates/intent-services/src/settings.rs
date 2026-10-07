@@ -3384,7 +3384,7 @@ impl<'a> SettingsService<'a> {
             def.validate(&value)?;
             if intent_providers::ACP_PROVIDERS
                 .iter()
-                .filter_map(|p| p.access_token())
+                .filter_map(intent_providers::ProviderConfig::access_token)
                 .any(|token| token.setting_path == path)
                 && value.as_str().is_some_and(|token| token.trim().is_empty())
             {
