@@ -6057,6 +6057,40 @@ impl Store {
         rows.iter().map(map_message_row).collect::<Result<_>>()
     }
 
+    /// Bounded keyset read for progressive history. Admission includes the row
+    /// crossing the stored-byte budget, so no fetched/enriched suffix is thrown
+    /// away and even an oversized single message makes progress. At most eight
+    /// rows are materialized; no payload side-table bodies are hydrated.
+    ///
+    /// # Errors
+    /// Returns an error if the database read or row decoding fails.
+    pub async fn get_agent_history_batch(
+        &self,
+        agent_id: &AgentId,
+        before_seq: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<AgentMessage>> {
+        let sql = format!(
+            "WITH candidates AS (SELECT {MESSAGE_COLUMNS} FROM agent_message \
+             WHERE agent_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?), \
+             bounded AS (SELECT *, SUM(length(CAST(content AS BLOB)) + \
+             COALESCE(length(CAST(metadata AS BLOB)), 0)) OVER \
+             (ORDER BY seq DESC ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) \
+             AS preceding_bytes FROM candidates) \
+             SELECT {MESSAGE_COLUMNS} FROM bounded \
+             WHERE COALESCE(preceding_bytes, 0) < ? ORDER BY seq DESC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(agent_id.as_str())
+            .bind(before_seq.unwrap_or(i64::MAX))
+            .bind(i64::try_from(limit.clamp(1, 8)).unwrap_or(8))
+            .bind(i64::try_from(intent_core::SLIM_PAGE_BUDGET_BYTES).unwrap_or(i64::MAX))
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("read history batch failed: {e}")))?;
+        rows.iter().map(map_message_row).collect()
+    }
+
     /// The shared page SELECT behind [`Store::get_agent_messages_page`]
     /// (hydrating, runs inside a snapshot transaction) and
     /// [`Store::get_agent_messages_page_as_stored`] (single statement, plain

@@ -1497,6 +1497,7 @@ pub(crate) async fn handle_sub_fast_path(
                     agent_id,
                     since_message_id,
                     delta_encoding,
+                    progressive_history,
                     projection,
                     replace_group,
                 } = p;
@@ -1571,6 +1572,7 @@ pub(crate) async fn handle_sub_fast_path(
                     out_tx.clone(),
                     timer,
                     limit,
+                    progressive_history,
                 ));
                 subs.insert(subscription_id, handle, replace_group, Some(lifecycle));
                 true
@@ -1889,6 +1891,7 @@ async fn forward_chat_subscription(
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
     limit: usize,
+    progressive_history: bool,
 ) {
     let scope = agent_id.as_str().to_string();
     let reason = chat_subscription_loop(
@@ -1903,6 +1906,7 @@ async fn forward_chat_subscription(
         out_tx,
         timer,
         limit,
+        progressive_history,
     )
     .await;
     subscriptions::trace_chat_forwarder_exit(&scope, &subscription_id, reason);
@@ -1926,6 +1930,7 @@ async fn chat_subscription_loop(
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
     limit: usize,
+    progressive_history: bool,
 ) -> &'static str {
     // Everything this forwarder emits travels on the bulk lane; conflation
     // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
@@ -1948,14 +1953,50 @@ async fn chat_subscription_loop(
             .map(|agent| agent.workspace_id.as_str().to_string()),
         None => None,
     };
-    let mut snapshot = subscriptions::chat_snapshot(
-        api.as_ref(),
-        &agent_id,
-        since_message_id.as_deref(),
-        projection,
-        limit,
-    )
-    .await;
+    let mut initial_history = None;
+    let mut snapshot = if progressive_history && since_message_id.is_none() {
+        Value::Null
+    } else {
+        subscriptions::chat_snapshot(
+            api.as_ref(),
+            &agent_id,
+            since_message_id.as_deref(),
+            projection,
+            limit,
+        )
+        .await
+    };
+    if progressive_history {
+        if snapshot["resumed"] == true {
+            subscriptions::stamp_history_complete(&mut snapshot, limit);
+        } else {
+            loop {
+                match subscriptions::InitialHistory::start(api.as_ref(), &agent_id, limit).await {
+                    Ok((mut first, history)) => {
+                        if since_message_id.is_some() {
+                            first["resumed"] = json!(false);
+                        }
+                        snapshot = first;
+                        if snapshot["initialHistory"]["complete"] != true {
+                            initial_history = Some(history);
+                        }
+                        break;
+                    }
+                    Err(intent_core::Error::Forbidden(_) | intent_core::Error::NotFound(_)) => {
+                        return "membership_revoked"
+                    }
+                    Err(_) => {
+                        // A read failure is not history exhaustion. Retry without
+                        // emitting a misleading complete/empty snapshot.
+                        tokio::select! {
+                            () = out_tx.closed() => return "client_closed",
+                            () = tokio::time::sleep(CHAT_RECOVERY_RETRY) => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
     subscriptions::stamp_delta_encoding(&mut snapshot, delta_encoding);
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
     if out_tx.send(frame).await.is_err() {
@@ -1987,9 +2028,32 @@ async fn chat_subscription_loop(
     // Some(skipped) while a recovery snapshot is owed; zero denotes an
     // explicit transcript invalidation rather than a lag marker.
     let mut pending_recovery: Option<u64> = None;
+    let mut history_frame: Option<Value> = None;
+    let mut history_retry_at = tokio::time::Instant::now();
+    let mut history_read: Option<intent_core::BoxFuture<'static, intent_core::Result<Value>>> =
+        None;
+    let mut held_events = std::collections::VecDeque::new();
     loop {
+        if let Some(history) = initial_history.as_mut() {
+            if history_frame.is_none() && history_read.is_none() {
+                history_frame = history.next_frame();
+                if let Some((before, remaining)) = history.batch_request() {
+                    let api = api.clone();
+                    let agent_id = agent_id.clone();
+                    history_read = Some(Box::pin(async move {
+                        tokio::time::sleep_until(history_retry_at).await;
+                        api.agent_history_batch(agent_id, Some(before), remaining)
+                            .await
+                    }));
+                }
+            }
+        }
+        let replay_held = initial_history.is_none();
+        // Membership retains priority. Ready history frames/reads precede the
+        // live backlog, and a pending read survives unrelated bus deliveries.
         tokio::select! {
             biased;
+            () = out_tx.closed() => return "client_closed",
             // Drain a buffered conflated delta as soon as the lane has room.
             permit = out_tx.reserve(), if !buffer.is_empty() => match permit {
                 Ok(permit) => {
@@ -2020,17 +2084,39 @@ async fn chat_subscription_loop(
                     _ => membership_events = None,
                 }
             },
+            permit = out_tx.reserve(), if history_frame.is_some() => {
+                let Ok(permit) = permit else { return "client_closed"; };
+                let history = history_frame.take().expect("guarded");
+                if let Some(message) = history.get("message") { state.seed_history_message(message); }
+                permit.send(subscriptions::build_history_push(&subscription_id, seq, &history));
+                seq += 1;
+                if history["complete"] == true { initial_history = None; }
+            }
+            result = async { history_read.as_mut().expect("guarded").await }, if history_read.is_some() => {
+                history_read = None;
+                match result {
+                    Ok(batch) => initial_history.as_mut().expect("active read").accept_batch(batch),
+                    Err(intent_core::Error::Forbidden(_) | intent_core::Error::NotFound(_)) => return "membership_revoked",
+                    Err(_) => history_retry_at = tokio::time::Instant::now() + CHAT_RECOVERY_RETRY,
+                }
+            }
             // A pending recovery with a quiet bus: retry on a timer so the
             // client is not left stale until the next event happens to arrive.
             () = tokio::time::sleep(CHAT_RECOVERY_RETRY), if pending_recovery.is_some() => {
                 if !attempt_chat_recovery(
                     api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
-                    &mut seq, &out_tx, &mut state, &mut pending_recovery, limit,
+                    &mut seq, &out_tx, &mut state, &mut pending_recovery, limit, progressive_history,
                 ).await {
                     return "client_closed";
                 }
             }
-            maybe = subscription.recv_delivery() => {
+            maybe = async {
+                if replay_held && !held_events.is_empty() {
+                    Some(Delivery::Batch(held_events.drain(..).collect()))
+                } else {
+                    subscription.recv_delivery().await
+                }
+            } => {
                 let Some(delivery) = maybe else {
                     let _ = buffer
                         .drain_all(&out_tx, |item| {
@@ -2048,7 +2134,7 @@ async fn chat_subscription_loop(
                     Delivery::Batch(_) if pending_recovery.is_some() => {
                         if !attempt_chat_recovery(
                             api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
-                            &mut seq, &out_tx, &mut state, &mut pending_recovery, limit,
+                            &mut seq, &out_tx, &mut state, &mut pending_recovery, limit, progressive_history,
                         ).await {
                             return "client_closed";
                         }
@@ -2078,13 +2164,17 @@ async fn chat_subscription_loop(
                             skipped,
                             "chat subscription lagged; re-emitting a fresh snapshot to converge"
                         );
+                        initial_history = None;
+                        history_frame = None;
+                        history_read = None;
+                        held_events.clear();
                         buffer = ConflationBuffer::new();
                         pending_recovery = Some(
                             pending_recovery.unwrap_or(0).saturating_add(skipped),
                         );
                         if !attempt_chat_recovery(
                             api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
-                            &mut seq, &out_tx, &mut state, &mut pending_recovery, limit,
+                            &mut seq, &out_tx, &mut state, &mut pending_recovery, limit, progressive_history,
                         ).await {
                             return "client_closed";
                         }
@@ -2103,13 +2193,31 @@ async fn chat_subscription_loop(
                             || event.data.get("replacedCount").is_some())
                 }) {
                     while subscription.try_recv_delivery().is_some() {}
+                    initial_history = None;
+                    history_frame = None;
+                    history_read = None;
+                    held_events.clear();
                     buffer = ConflationBuffer::new();
                     pending_recovery = Some(0);
                     if !attempt_chat_recovery(
                         api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
-                        &mut seq, &out_tx, &mut state, &mut pending_recovery, limit,
+                        &mut seq, &out_tx, &mut state, &mut pending_recovery, limit, progressive_history,
                     ).await {
                         return "client_closed";
+                    }
+                    continue;
+                }
+                if initial_history.is_some() {
+                    // Preserve ordered live handoff without letting historical
+                    // rows overwrite newer live deltas. Bound the hold queue;
+                    // overflow converges through the existing recovery path.
+                    held_events.extend(batch.into_iter().filter(|event| event.session_id.as_deref() == Some(agent_id.as_str())));
+                    if held_events.len() > 256 {
+                        initial_history = None;
+                        history_frame = None;
+                        history_read = None;
+                        held_events.clear();
+                        pending_recovery = Some(0);
                     }
                     continue;
                 }
@@ -2187,6 +2295,8 @@ async fn chat_subscription_loop(
                     }
                 }
             }
+
+
         }
     }
 }
@@ -2214,6 +2324,7 @@ async fn attempt_chat_recovery(
     state: &mut subscriptions::ChatDeltaState,
     pending_recovery: &mut Option<u64>,
     limit: usize,
+    progressive_history: bool,
 ) -> bool {
     let Some(mut snapshot) =
         subscriptions::chat_recovery_snapshot(api, agent_id, projection, limit).await
@@ -2224,6 +2335,9 @@ async fn attempt_chat_recovery(
         );
         return true;
     };
+    if progressive_history {
+        subscriptions::stamp_history_complete(&mut snapshot, limit);
+    }
     subscriptions::stamp_delta_encoding(&mut snapshot, delta_encoding);
     // Recovery invalidates the whole cached transcript, including older pages.
     // Lag may itself have swallowed a truncation event, so this also applies
@@ -2912,3 +3026,7 @@ mod tests {
 #[cfg(test)]
 #[path = "conn_terminal_replay_tests.rs"]
 mod terminal_replay_tests;
+
+#[cfg(test)]
+#[path = "conn_progressive_history_tests.rs"]
+mod progressive_history_tests;

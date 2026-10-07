@@ -141,6 +141,13 @@ conversation. Read its status and last response before sending a follow-up. Use
 choose a specialist and model where offered. A specialist defines reusable behavior;
 an agent is a particular conversation doing work.
 
+On desktop, recent conversation messages appear progressively, newest first, while
+older messages in the initial window load. The conversation stays bottom-aligned
+unless you scroll away; older-history loading becomes available when that initial
+window finishes. Older clients may show the initial messages together.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/ChatPanel.svelte; packages/intentd/crates/intent-transport/src/{conn,subscriptions}.rs. -->
+
 ## Restore workspace browser use
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/store/renderer/slices/browser-clients/browser-clients-selectors.ts; messages/en.json. -->

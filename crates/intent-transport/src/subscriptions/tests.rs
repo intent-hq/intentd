@@ -6195,3 +6195,114 @@ fn resource_context_keeps_unsubscribe_dispatch_and_chat_selectors() {
     assert_eq!(plain.projection, routed.projection);
     assert_eq!(plain.replace_group, routed.replace_group);
 }
+
+mod progressive_history {
+    use super::*;
+    use intent_core::BoxFuture;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn validates_history_delivery_without_changing_legacy_default() {
+        for (value, want) in [
+            (Value::Null, false),
+            (json!("snapshot"), false),
+            (json!("progressive"), true),
+        ] {
+            let p = json!({"agentId":"a","historyDelivery":value});
+            assert_eq!(
+                parse_chat_subscribe_params(p.as_object().unwrap())
+                    .unwrap()
+                    .progressive_history,
+                want
+            );
+        }
+        for value in [json!("typo"), json!(1), json!(true)] {
+            let p = json!({"agentId":"a","historyDelivery":value});
+            assert!(parse_chat_subscribe_params(p.as_object().unwrap()).is_err());
+        }
+    }
+
+    struct HistoryApi {
+        total: std::sync::atomic::AtomicI64,
+        fail: AtomicBool,
+        live: bool,
+    }
+    impl WorkspaceApi for HistoryApi {
+        fn agent_history_batch(
+            &self,
+            _: AgentId,
+            before: Option<i64>,
+            limit: usize,
+        ) -> BoxFuture<'_, intent_core::Result<Value>> {
+            Box::pin(async move {
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err(Error::Internal("read failed".into()));
+                }
+                let total = self.total.load(Ordering::SeqCst);
+                let rows: Vec<_> = (0..total).rev().filter(|seq| *seq < before.unwrap_or(total)).take(limit.min(2)).map(|seq|json!({"id":format!("m{seq}"),"seq":seq,"role":"user","contentBlocks":[]})).collect();
+                Ok(json!({"messages":rows,"totalMessages":total}))
+            })
+        }
+        fn agent_is_busy(&self, _: AgentId) -> bool {
+            self.live
+        }
+        fn agent_live_turn(&self, _: AgentId) -> Option<Value> {
+            self.live.then(||json!({"messageId":"live","contentBlocks":[{"type":"text","id":"live:0","text":"prefix"}]}))
+        }
+    }
+
+    #[tokio::test]
+    async fn preserves_boundary_counts_live_once_and_retries_failures() {
+        let api = HistoryApi {
+            total: std::sync::atomic::AtomicI64::new(5),
+            fail: AtomicBool::new(false),
+            live: true,
+        };
+        let agent = AgentId::from("a");
+        let (snapshot, mut history) = InitialHistory::start(&api, &agent, 4).await.unwrap();
+        assert_eq!(snapshot["messages"][0]["id"], "live");
+        assert_eq!(snapshot["initialHistory"]["received"], 1);
+        assert!(snapshot["nextToken"].is_null());
+        api.fail.store(true, Ordering::SeqCst);
+        assert!(history.next(&api, &agent).await.is_err());
+        api.fail.store(false, Ordering::SeqCst);
+        for (id, received) in [("m4", 2), ("m3", 3), ("m2", 4)] {
+            let frame = history.next(&api, &agent).await.unwrap();
+            assert_eq!(frame["message"]["id"], id);
+            assert_eq!(frame["received"], received);
+            assert_eq!(frame["complete"], false);
+        }
+        let done = history.next(&api, &agent).await.unwrap();
+        assert_eq!(done["complete"], true);
+        assert_eq!(done["received"], 4);
+        assert_eq!(
+            done["nextToken"],
+            intent_services::pagination::remint_backward_token(2).unwrap()
+        );
+    }
+    #[tokio::test]
+    async fn new_messages_do_not_extend_the_captured_history_window() {
+        let api = HistoryApi {
+            total: std::sync::atomic::AtomicI64::new(5),
+            fail: AtomicBool::new(false),
+            live: false,
+        };
+        let agent = AgentId::from("a");
+        let (snapshot, mut history) = InitialHistory::start(&api, &agent, 4).await.unwrap();
+        assert_eq!(snapshot["messages"][0]["id"], "m4");
+        api.total.store(8, Ordering::SeqCst);
+        for id in ["m3", "m2", "m1"] {
+            assert_eq!(
+                history.next(&api, &agent).await.unwrap()["message"]["id"],
+                id
+            );
+        }
+        let terminal = history.next(&api, &agent).await.unwrap();
+        assert_eq!(terminal["received"], 4);
+        assert_eq!(terminal["totalMessages"], 5);
+        assert_eq!(
+            terminal["nextToken"],
+            intent_services::pagination::remint_backward_token(1).unwrap()
+        );
+    }
+}

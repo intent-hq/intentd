@@ -127,6 +127,7 @@ pub(crate) struct ChatSubscribeParams {
     pub agent_id: String,
     pub since_message_id: Option<String>,
     pub delta_encoding: DeltaEncoding,
+    pub progressive_history: bool,
     pub projection: Option<ConversationProjection>,
     pub replace_group: Option<String>,
 }
@@ -336,6 +337,14 @@ pub(crate) fn parse_chat_subscribe_params(
         Some(Value::String(s)) => Some(s.clone()),
         Some(_) => return Err("sinceMessageId must be a string".to_string()),
     };
+    let progressive_history = match params.get("historyDelivery") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) if s == "snapshot" => false,
+        Some(Value::String(s)) if s == "progressive" => true,
+        Some(_) => {
+            return Err("historyDelivery must be \"snapshot\" or \"progressive\"".to_string())
+        }
+    };
     let delta_encoding = match params.get("deltaEncoding") {
         None | Some(Value::Null) => DeltaEncoding::Full,
         Some(Value::String(s)) if s == "full" => DeltaEncoding::Full,
@@ -357,6 +366,7 @@ pub(crate) fn parse_chat_subscribe_params(
         agent_id,
         since_message_id,
         delta_encoding,
+        progressive_history,
         projection,
         replace_group: replace_group(params),
     })
@@ -381,6 +391,116 @@ pub(crate) fn stamp_delta_encoding(snapshot: &mut Value, encoding: DeltaEncoding
             obj.insert("deltaEncoding".to_string(), json!("incremental"));
         }
     }
+}
+
+/// Echo negotiated history delivery on an atomic resume/recovery snapshot.
+pub(crate) fn stamp_history_complete(snapshot: &mut Value, target: usize) {
+    let received = snapshot["messages"].as_array().map_or(0, Vec::len);
+    snapshot["historyDelivery"] = json!("progressive");
+    snapshot["initialHistory"] = json!({"target":target,"received":received,"complete":true});
+}
+
+/// One bounded initial generation. Rows are held only until their individual
+/// frame has been queued; subsequent reads walk below the captured boundary.
+pub(crate) struct InitialHistory {
+    target: usize,
+    received: usize,
+    before_seq: i64,
+    total: Value,
+    rows: std::collections::VecDeque<Value>,
+}
+
+impl InitialHistory {
+    pub(crate) async fn start(
+        api: &dyn WorkspaceApi,
+        agent_id: &AgentId,
+        target: usize,
+    ) -> Result<(Value, Self), Error> {
+        let mut snapshot = api.agent_history_batch(agent_id.clone(), None, 1).await?;
+        overlay_live_state(
+            api,
+            agent_id,
+            &mut snapshot,
+            Some(ConversationProjection::Slim),
+            1,
+        )
+        .await;
+        let rows = snapshot["messages"].as_array().expect("history messages");
+        let received = rows.len();
+        let before_seq = rows
+            .first()
+            .and_then(|row| row["seq"].as_i64())
+            .unwrap_or(0);
+        let history = Self {
+            target,
+            received,
+            before_seq,
+            total: snapshot["totalMessages"].clone(),
+            rows: std::collections::VecDeque::new(),
+        };
+        snapshot["historyDelivery"] = json!("progressive");
+        snapshot["initialHistory"] =
+            json!({"target":target,"received":received,"complete":received == 0});
+        snapshot["nextToken"] = Value::Null;
+        snapshot["truncated"] = json!(false);
+        Ok((snapshot, history))
+    }
+
+    pub(crate) fn batch_request(&self) -> Option<(i64, usize)> {
+        (self.received < self.target && self.before_seq > 0 && self.rows.is_empty())
+            .then_some((self.before_seq, self.target - self.received))
+    }
+
+    pub(crate) fn accept_batch(&mut self, mut batch: Value) {
+        self.rows = batch["messages"]
+            .as_array_mut()
+            .expect("history messages")
+            .drain(..)
+            .collect();
+        if self.rows.is_empty() {
+            self.before_seq = 0;
+        }
+    }
+
+    #[cfg(test)]
+    async fn next(&mut self, api: &dyn WorkspaceApi, agent_id: &AgentId) -> Result<Value, Error> {
+        if let Some((before, limit)) = self.batch_request() {
+            self.accept_batch(
+                api.agent_history_batch(agent_id.clone(), Some(before), limit)
+                    .await?,
+            );
+        }
+        Ok(self.next_frame().expect("batch loaded"))
+    }
+
+    pub(crate) fn next_frame(&mut self) -> Option<Value> {
+        if self.batch_request().is_some() {
+            return None;
+        }
+
+        if self.received < self.target {
+            if let Some(row) = self.rows.pop_front() {
+                self.before_seq = row["seq"].as_i64().expect("history seq");
+                self.received += 1;
+                return Some(
+                    json!({"message":row,"target":self.target,"received":self.received,"complete":false}),
+                );
+            }
+        }
+        let next_token = intent_services::pagination::remint_backward_token(
+            usize::try_from(self.before_seq).unwrap_or(0),
+        );
+        Some(
+            json!({"target":self.target,"received":self.received,"complete":true,"nextToken":next_token,"truncated":next_token.is_some(),"totalMessages":self.total}),
+        )
+    }
+}
+
+pub(crate) fn build_history_push(subscription_id: &str, seq: u64, history: &Value) -> String {
+    json!({"jsonrpc":"2.0","method":"subscription.push","params":{
+        "subscriptionId":subscription_id,"kind":"history","seq":seq,"history":history
+    }})
+    .to_string()
 }
 
 /// Build a `subscription.push { kind: "snapshot", seq, snapshot }` notification
@@ -1238,21 +1358,7 @@ impl ChatDeltaState {
         };
         self.snapshot_text.clear();
         for msg in messages {
-            if let Some(blocks) = msg.get("contentBlocks").and_then(Value::as_array) {
-                for block in blocks {
-                    if matches!(
-                        block.get("type").and_then(Value::as_str),
-                        Some("text" | "thinking")
-                    ) {
-                        if let (Some(id), Some(text)) = (
-                            block.get("id").and_then(Value::as_str),
-                            block.get("text").and_then(Value::as_str),
-                        ) {
-                            self.snapshot_text.insert(id.to_string(), text.to_string());
-                        }
-                    }
-                }
-            }
+            self.seed_history_message(msg);
         }
         let Some(msg) = messages
             .iter()
@@ -1298,6 +1404,26 @@ impl ChatDeltaState {
         // chunk, which takes the same `{messageId}:0` id.
         if !seeded {
             self.remember_text_marker(&format!("{message_id}:0"), "text");
+        }
+    }
+
+    /// Historical rows share snapshot/live overlap protection, but must never
+    /// replace the currently active turn's accumulation or streaming state.
+    pub(crate) fn seed_history_message(&mut self, msg: &Value) {
+        if let Some(blocks) = msg.get("contentBlocks").and_then(Value::as_array) {
+            for block in blocks {
+                if matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("text" | "thinking")
+                ) {
+                    if let (Some(id), Some(text)) = (
+                        block.get("id").and_then(Value::as_str),
+                        block.get("text").and_then(Value::as_str),
+                    ) {
+                        self.snapshot_text.insert(id.to_string(), text.to_string());
+                    }
+                }
+            }
         }
     }
 

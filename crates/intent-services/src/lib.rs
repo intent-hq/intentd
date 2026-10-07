@@ -30277,6 +30277,19 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_history_batch(
+        &self,
+        agent_id: AgentId,
+        before_seq: Option<i64>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.agent_history_batch_op(agent_id, before_seq, limit)
+                .await
+        })
+    }
+
     fn agent_get_message_block(
         &self,
         agent_id: AgentId,

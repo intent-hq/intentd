@@ -4267,6 +4267,41 @@ impl Services {
         Ok(result)
     }
 
+    /// Progressive history has its own bounded reader: page RPC byte trimming
+    /// must not repeatedly enrich/discard rows or reduce the requested target.
+    pub(crate) async fn agent_history_batch_op(
+        &self,
+        agent_id: AgentId,
+        before_seq: Option<i64>,
+        limit: usize,
+    ) -> Result<Value> {
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
+        let total = self.store.count_agent_messages(&agent_id).await?;
+        let mut page: Vec<_> = self
+            .store
+            .get_agent_history_batch(&agent_id, before_seq, limit)
+            .await?
+            .into_iter()
+            .map(project_served_message)
+            .collect();
+        crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
+            .attach_typed(&mut page)
+            .await;
+        let ids: Vec<_> = page.iter().map(|m| m.id.clone()).collect();
+        let thumbnails = self
+            .store
+            .get_agent_message_thumbnails(&agent_id, &ids)
+            .await?;
+        let page: Vec<_> = page
+            .into_iter()
+            .map(|m| {
+                let thumbs = thumbnails.get(&m.id);
+                apply_slim_projection(m, thumbs)
+            })
+            .collect();
+        Ok(json!({"agentId":agent_id,"messages":page,"totalMessages":total}))
+    }
+
     /// `agent.getMessageBlock` (PROTOCOL §5.5): one FULL content block of one
     /// persisted message, by block id — the on-demand counterpart of the slim
     /// conversation projection. The row is served through the same
