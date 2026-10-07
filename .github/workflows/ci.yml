@@ -1398,7 +1398,7 @@ jobs:
       CALLBACK_FIXTURE_TESTS: |
         callback_registration::tests::actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_old_result
         callback_registration::tests::actual_adapter_replacement_rejects_old_query_and_disabled_never_registers
-        agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_actual_created_3_0_reaches_original_guidance_boundary
+        agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_actual_created_3_1_reaches_original_guidance_boundary
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_saved_legacy_and_disabled_outbound_messages_remain_ordinary
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_load_and_failed_load_new_keep_original_producers_and_capture
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_successful_zero_pending_absent_and_failed_never_conflate
@@ -1616,8 +1616,22 @@ jobs:
         run: |
           set -euo pipefail
           filter=$(printf '%s\n' "$CALLBACK_FIXTURE_TESTS" | sed '/^$/d;s/^/test(=/;s/$/)/' | paste -sd '|' -)
-          cargo nextest list -p intent-acp -p intent-services --lib \
-            -E "$filter" --message-format json > "$RUNNER_TEMP/callback-fixture-tests.json"
+          # show-env defaults to Cargo's target dir, but llvm-cov nextest adds
+          # llvm-cov-target. Share the latter explicitly so discovery builds
+          # exactly the instrumented binaries execution will reuse.
+          if [ -z "${CARGO_LLVM_COV_TARGET_DIR:-}" ]; then
+            target_dir=$(cargo metadata --no-deps --format-version 1 | python3 -I -B -S -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+            export CARGO_LLVM_COV_TARGET_DIR="$target_dir/llvm-cov-target"
+          fi
+          (
+            # Keep coverage flags/wrappers out of the later llvm-cov invocation.
+            # show-env exports Cargo metadata's target dir even with a coverage override.
+            coverage_env=$(CARGO_TARGET_DIR="$CARGO_LLVM_COV_TARGET_DIR" cargo llvm-cov show-env --sh)
+            eval "$coverage_env"
+            cargo nextest list -p intent-acp -p intent-services --lib \
+              --target-dir "$CARGO_LLVM_COV_TARGET_DIR" \
+              -E "$filter" --message-format json > "$RUNNER_TEMP/callback-fixture-tests.json"
+          )
           python3 -I -B -S - "$RUNNER_TEMP/callback-fixture-tests.json" <<'PYTHON'
           import json, os, sys
           expected = os.environ["CALLBACK_FIXTURE_TESTS"].split()
