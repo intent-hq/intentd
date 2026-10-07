@@ -304,6 +304,7 @@ pub enum ProviderAccessTokenKind {
 }
 
 impl ProviderAccessTokenKind {
+    #[must_use]
     pub const fn wire_name(self) -> &'static str {
         match self {
             Self::ClaudeSetupToken => "claudeSetupToken",
@@ -312,6 +313,7 @@ impl ProviderAccessTokenKind {
     }
 
     /// Environment variable consumed by the provider CLI through its pinned adapter.
+    #[must_use]
     pub const fn env_var(self) -> &'static str {
         match self {
             Self::ClaudeSetupToken => "CLAUDE_CODE_OAUTH_TOKEN",
@@ -332,6 +334,7 @@ pub struct ProviderAccessToken {
 
 impl ProviderConfig {
     /// Only advertise credential kinds verified through the pinned adapters.
+    #[must_use]
     pub fn access_token(&self) -> Option<ProviderAccessToken> {
         match self.id {
             "claude-code" => Some(ProviderAccessToken {

@@ -4186,7 +4186,9 @@ async fn collaboration_machine_name_reaches_both_invite_previews_and_refreshes()
 #[tokio::test]
 async fn provider_access_tokens_are_administrator_only() {
     let tmp = TempDb::new();
-    let (f, _, _) = capped_fixture(&tmp, 10).await;
+    let (mut f, _registry, _cfg) = capped_fixture(&tmp, 10).await;
+    let secrets = Arc::new(crate::settings::InMemorySecretStore::default());
+    f.services = f.services.with_secret_store(secrets.clone());
     let owner = Caller::Wire {
         principal_id: f.owner.clone(),
         host_role: intent_core::HostRole::Owner,
@@ -4222,6 +4224,12 @@ async fn provider_access_tokens_are_administrator_only() {
                 assert!(matches!(result, Err(Error::Forbidden(_))), "{result:?}");
             }
         }
+        assert_eq!(
+            crate::settings::SecretStore::load(secrets.as_ref(), path)
+                .unwrap()
+                .as_deref(),
+            Some("synthetic-owner-token")
+        );
         let read = with_caller(owner.clone(), f.services.settings_get(path.into()))
             .await
             .unwrap();
