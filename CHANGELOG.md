@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.31] - 2026-10-07
+
+### 📚 Documentation
+
+- Explain assistant thread title editing ([#2345](https://github.com/intent-hq/intentd/pull/2345))
+
+
 ## [0.10.30] - 2026-10-07
 
 ### 📚 Documentation
