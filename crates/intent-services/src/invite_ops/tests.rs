@@ -4182,3 +4182,58 @@ async fn collaboration_machine_name_reaches_both_invite_previews_and_refreshes()
         }
     }
 }
+
+#[tokio::test]
+async fn provider_access_tokens_are_administrator_only() {
+    let tmp = TempDb::new();
+    let (f, _, _) = capped_fixture(&tmp, 10).await;
+    let owner = Caller::Wire {
+        principal_id: f.owner.clone(),
+        host_role: intent_core::HostRole::Owner,
+    };
+    for path in [
+        "providers.claude-code.accessToken",
+        "providers.codex.accessToken",
+    ] {
+        with_caller(
+            owner.clone(),
+            f.services.settings_update(json!([
+                {"path":path,"value":"synthetic-owner-token"}
+            ])),
+        )
+        .await
+        .unwrap();
+        for role in [intent_core::HostRole::Member, intent_core::HostRole::Guest] {
+            let caller = Caller::Wire {
+                principal_id: f.collaborator.clone(),
+                host_role: role,
+            };
+            for result in [
+                with_caller(
+                    caller.clone(),
+                    f.services
+                        .settings_update(json!([{ "path":path,"value":"intruder" }])),
+                )
+                .await,
+                with_caller(caller.clone(), f.services.settings_get(path.into())).await,
+                with_caller(caller.clone(), f.services.settings_list()).await,
+                with_caller(caller, f.services.settings_reset(path.into())).await,
+            ] {
+                assert!(matches!(result, Err(Error::Forbidden(_))), "{result:?}");
+            }
+        }
+        let read = with_caller(owner.clone(), f.services.settings_get(path.into()))
+            .await
+            .unwrap();
+        assert_eq!(read["value"], "********");
+        with_caller(owner.clone(), f.services.settings_reset(path.into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            with_caller(owner.clone(), f.services.settings_get(path.into()))
+                .await
+                .unwrap()["value"],
+            Value::Null
+        );
+    }
+}

@@ -1671,3 +1671,107 @@ fn assert_error_envelope(resp: &Value, id: i64, code: i64) {
         "{resp}"
     );
 }
+
+/// The real TLS/bearer/origin/fingerprint path shares the sensitive settings
+/// contract: credentials persist only in SecretStore, never in wire responses.
+#[tokio::test]
+async fn provider_access_tokens_settings_contract_over_wss() {
+    let dir = temp_data_dir();
+    let data_dir = dir.path().to_path_buf();
+    let secrets_file = data_dir.join("secrets.json");
+    let secrets_path = secrets_file.to_string_lossy().into_owned();
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_SECRETS_FILE", secrets_path.as_str()),
+    ];
+    let _daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    let ack = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({"eventTypes":["settings:changed"]}),
+    )
+    .await;
+    assert_success_envelope(&ack, 1);
+    let catalog = wss_rpc(&mut ws, 2, "providers.catalog", json!({})).await;
+    assert_success_envelope(&catalog, 2);
+    for row in catalog["result"]["providers"].as_array().unwrap() {
+        let id = row["id"].as_str().unwrap();
+        if !matches!(id, "claude-code" | "codex") {
+            assert!(row.get("accessToken").is_none());
+            continue;
+        }
+        let descriptor = &row["accessToken"];
+        assert_eq!(
+            descriptor["kind"],
+            if id == "codex" {
+                "codexAccessToken"
+            } else {
+                "claudeSetupToken"
+            }
+        );
+        let path = descriptor["settingPath"].as_str().unwrap();
+        assert_eq!(path, format!("providers.{id}.accessToken"));
+        for token in ["synthetic-first-token", "synthetic-replacement-token"] {
+            let saved = wss_rpc(
+                &mut ws,
+                3,
+                "settings.update",
+                json!({"changes":[{"path":path,"value":token}]}),
+            )
+            .await;
+            assert_success_envelope(&saved, 3);
+            assert_eq!(
+                saved["result"]["applied"],
+                json!([{"path":path,"value":"********"}])
+            );
+            assert_eq!(stored_secret(&secrets_file, path).as_deref(), Some(token));
+            let changes = next_settings_changed(&mut sub).await;
+            assert_eq!(changes, json!([{"path":path,"value":"********"}]));
+            let read = wss_rpc(&mut ws, 4, "settings.get", json!({"path":path})).await;
+            assert_success_envelope(&read, 4);
+            assert_eq!(read["result"]["value"], "********");
+            let list = wss_rpc(&mut ws, 5, "settings.list", json!({})).await;
+            assert_success_envelope(&list, 5);
+            assert!(!list.to_string().contains(token));
+            if let Ok(config) = std::fs::read_to_string(data_dir.join("config.toml")) {
+                assert!(!config.contains(token));
+            }
+        }
+        let reset = wss_rpc(&mut ws, 6, "settings.reset", json!({"path":path})).await;
+        assert_success_envelope(&reset, 6);
+        assert_eq!(stored_secret(&secrets_file, path), None);
+        let changes = next_settings_changed(&mut sub).await;
+        assert!(!changes.to_string().contains("synthetic-"));
+        let read = wss_rpc(&mut ws, 7, "settings.get", json!({"path":path})).await;
+        assert_success_envelope(&read, 7);
+        assert_eq!(read["result"]["value"], Value::Null);
+    }
+    for path in [
+        "providers.auggie.accessToken",
+        "providers.unknown.accessToken",
+    ] {
+        let rejected = wss_rpc(
+            &mut ws,
+            8,
+            "settings.update",
+            json!({"changes":[{"path":path,"value":"synthetic-unsupported"}]}),
+        )
+        .await;
+        assert_eq!(rejected["id"], 8);
+        assert_eq!(rejected["jsonrpc"], "2.0");
+        assert_eq!(rejected["error"]["code"], -32602);
+        assert!(!rejected.to_string().contains("synthetic-unsupported"));
+        assert_eq!(stored_secret(&secrets_file, path), None);
+    }
+}

@@ -1679,7 +1679,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         None,
     );
     providers_active.read_only = true;
-    vec![
+    let mut definitions = vec![
         // --- Group A: providers / agents -----------------------------------
         providers_active,
         object(
@@ -2599,7 +2599,17 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(86_400.0),
             120.0,
         ),
-    ]
+    ];
+    definitions.extend(
+        intent_providers::ACP_PROVIDERS
+            .iter()
+            .filter_map(|provider| {
+                provider.access_token().map(|token| {
+                    secret(token.setting_path, token.label, token.guidance, "providers")
+                })
+            }),
+    );
+    definitions
 }
 
 /// The effective `workspace.branchPrefix` (default empty) — prepended to
@@ -3372,6 +3382,16 @@ impl<'a> SettingsService<'a> {
                 return Err(Error::InvalidParams(format!("{path} is read-only")));
             }
             def.validate(&value)?;
+            if intent_providers::ACP_PROVIDERS
+                .iter()
+                .filter_map(|p| p.access_token())
+                .any(|token| token.setting_path == path)
+                && value.as_str().is_some_and(|token| token.trim().is_empty())
+            {
+                return Err(Error::InvalidParams(format!(
+                    "{path}: token must not be blank; use settings.reset to remove it"
+                )));
+            }
             let value = if path == "sharing.machineName" {
                 let name = value.as_str().expect("string validated above");
                 json!(
@@ -3843,6 +3863,100 @@ async fn join_all_pinned<T>(
 
 #[cfg(test)]
 mod tests {
+    #[intent_test_macros::daemon_test]
+    async fn provider_access_tokens_store_replace_remove_and_redact() {
+        let dir = crate::test_support::test_tempdir("provider-token-settings");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let registry = SettingsRegistry::load(dir.path().join("config.toml")).unwrap();
+        let raw = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(raw.clone());
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+        raw.store("unrelated.apiKey", "existing-api-key").unwrap();
+        for path in [
+            "providers.claude-code.accessToken",
+            "providers.codex.accessToken",
+        ] {
+            assert_eq!(svc.get(path).await.unwrap()["value"], Value::Null);
+            let missing = svc
+                .update(&json!([{ "path": path, "value": REDACTED_PLACEHOLDER }]))
+                .await;
+            assert!(matches!(missing, Err(Error::InvalidParams(_))));
+            for token in ["synthetic-original-token", "synthetic-replacement-token"] {
+                let applied = svc
+                    .update(&json!([{ "path": path, "value": token }]))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    applied,
+                    vec![json!({"path":path,"value":REDACTED_PLACEHOLDER})]
+                );
+                assert_eq!(raw.load(path).unwrap().as_deref(), Some(token));
+                assert_eq!(store.get_setting(path).await.unwrap(), None);
+                assert_eq!(registry.get(path), None);
+                let read = svc.get(path).await.unwrap();
+                assert_eq!(read["value"], REDACTED_PLACEHOLDER);
+                assert_eq!(read["definition"]["sensitive"], true);
+                let list = svc.list().await.unwrap();
+                assert!(!list.to_string().contains(token));
+                assert_eq!(
+                    list["settings"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|s| s["path"] == path)
+                        .unwrap()["value"],
+                    REDACTED_PLACEHOLDER
+                );
+                svc.update(&json!([{ "path": path, "value": REDACTED_PLACEHOLDER }]))
+                    .await
+                    .unwrap();
+                assert_eq!(raw.load(path).unwrap().as_deref(), Some(token));
+            }
+            for invalid in [
+                Value::Null,
+                json!(42),
+                json!(""),
+                json!("  \n\t"),
+                json!({"token":"synthetic-invalid"}),
+            ] {
+                assert!(matches!(
+                    svc.update(&json!([{ "path": path, "value": invalid }]))
+                        .await,
+                    Err(Error::InvalidParams(_))
+                ));
+                assert_eq!(
+                    raw.load(path).unwrap().as_deref(),
+                    Some("synthetic-replacement-token")
+                );
+            }
+            svc.reset(path).await.unwrap();
+            assert_eq!(raw.load(path).unwrap(), None);
+            assert_eq!(svc.get(path).await.unwrap()["value"], Value::Null);
+            svc.reset(path).await.unwrap();
+        }
+        assert_eq!(
+            raw.load("unrelated.apiKey").unwrap().as_deref(),
+            Some("existing-api-key")
+        );
+        for path in [
+            "providers.auggie.accessToken",
+            "providers.unknown.accessToken",
+            "providers.claude.accessToken",
+        ] {
+            assert!(matches!(svc.get(path).await, Err(Error::InvalidParams(_))));
+            assert!(matches!(
+                svc.update(&json!([{ "path": path, "value": "synthetic-unsupported" }]))
+                    .await,
+                Err(Error::InvalidParams(_))
+            ));
+            assert!(matches!(
+                svc.reset(path).await,
+                Err(Error::InvalidParams(_))
+            ));
+            assert_eq!(raw.load(path).unwrap(), None);
+        }
+    }
+
     use super::*;
 
     #[intent_test_macros::daemon_test]
