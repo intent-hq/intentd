@@ -53,6 +53,7 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
   const piStderr = join(root, 'pi-stderr.log');
   const clients = [];
   const sockets = new Set();
+  const retiringSockets = new WeakSet();
   const requests = [];
   const bridgeRequests = [];
   const modelEvents = new EventEmitter();
@@ -61,7 +62,8 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
   const agentDir = join(home, '.pi', 'agent');
   const runId = randomUUID();
   const evidence = { runId, root, platform: process.platform, node: process.version, adapterEntry, piEntry,
-    commandKind, requests, bridgeRequests, clients: [], sessions: [] };
+    commandKind, requests, bridgeRequests, streamErrors: [], clients: [], sessions: [] };
+  const retireSocket = socket => { retiringSockets.add(socket); socket.destroy(); };
   expectedEvidence.set(commandKind, { runId, root });
   let modelServer;
   let bridge;
@@ -77,7 +79,7 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
       if (failures.length) throw new AggregateError(failures.map(result => result.reason));
     },
     async closeLifetime() {
-      for (const socket of sockets) socket.destroy();
+      for (const socket of sockets) retireSocket(socket);
       modelServer?.closeAllConnections();
       await Promise.all([modelServer, bridge].filter(server => server?.listening).map(server =>
         bounded(new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())), 'fixture server close')));
@@ -96,8 +98,13 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
     bridge = createTcpServer(socket => {
       sockets.add(socket);
       socket.on('close', () => sockets.delete(socket));
-      socket.on('error', () => {});
-      createInterface({ input: socket }).on('line', line => {
+      socket.on('error', error => evidence.streamErrors.push({
+        stream: 'MCP socket', code: error.code, message: error.message,
+        expected: retiringSockets.has(socket) && ['ECONNRESET', 'EPIPE'].includes(error.code),
+      }));
+      const lines = createInterface({ input: socket });
+      lines.on('error', () => lines.close());
+      lines.on('line', line => {
         const message = JSON.parse(line);
         bridgeRequests.push(message);
         if (message.id === undefined) return;
@@ -185,7 +192,7 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
           return { outcome: { outcome: 'selected', optionId: allow.optionId } };
         },
       }), ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout)));
-      let stopped = false;
+      let stopPromise;
       const client = {
         record,
         async call(method, params) {
@@ -194,18 +201,20 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
           try { call.result = await bounded(connection[method](params), method); return call.result; }
           catch (error) { call.error = String(error); throw error; }
         },
-        async stop() {
-          if (stopped) return;
-          if (windows) {
-            if (child.exitCode === null) {
-              const killed = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { timeout: 20_000 });
-              assert.equal(killed.status, 0, `taskkill: ${killed.stderr}`);
+        stop() {
+          return stopPromise ??= (async () => {
+            for (const socket of sockets) retiringSockets.add(socket);
+            if (windows) {
+              if (child.exitCode === null) {
+                const killed = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { timeout: 20_000 });
+                assert.equal(killed.status, 0, `taskkill: ${killed.stderr}`);
+              }
+            } else {
+              try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
             }
-          } else {
-            try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-          }
-          await bounded(closed, 'adapter and real Pi tree shutdown');
-          stopped = true;
+            await bounded(closed, 'adapter and real Pi tree shutdown');
+            record.shutdown = { exitCode: child.exitCode, signalCode: child.signalCode };
+          })();
         },
       };
       clients.push(client);
@@ -248,7 +257,7 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
       const replay = client.record.updates.slice(updateStart).filter(event => event.update.sessionUpdate === 'user_message_chunk');
       assert.deepEqual(replay.map(event => event.update.content.text), [`${label}:created`]);
       // Exercise the bundled extension's reconnect path with the real Pi tool executor.
-      for (const socket of sockets) socket.destroy();
+      for (const socket of sockets) retireSocket(socket);
       assert.equal((await client.call('prompt', { sessionId, prompt: [{ type: 'text', text: `${label}:resumed` }] })).stopReason, 'end_turn');
     }
     const { sessionId } = evidence.sessions[0];
@@ -295,6 +304,7 @@ test('independent cleanup audit for real Pi compatibility', async () => {
     const record = process.env.PI_ACP_EVIDENCE_DIR
       ? JSON.parse(readFileSync(join(process.env.PI_ACP_EVIDENCE_DIR, `runtime-${commandKind}.json`), 'utf8')) : completedEvidence.get(commandKind);
     assertCleanupComplete(record, expected);
+    assert.deepEqual(record.streamErrors.filter(error => !error.expected), [], 'Unexpected MCP stream error');
     assert.equal(record.result, 'passed', record.error);
   }
 });
