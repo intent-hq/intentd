@@ -43,16 +43,6 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `intent-services` (§3.2 rule 3). The default bodies return an internal error
 /// so downstream stubs compile until they override these methods.
 pub trait WorkspaceApi: Send + Sync {
-    /// Internal host-policy gate for tool-free provider utilities. Not exposed
-    /// as a workspace binding or wire method; callers cannot supply policy.
-    fn provider_configuration_preflight(&self, _provider: String) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async {
-            Err(Error::Forbidden(
-                "Provider policy context unavailable".into(),
-            ))
-        })
-    }
-
     fn repository_checkout_capture(
         &self,
         _query: crate::repository_checkout::CheckoutCaptureQuery,
@@ -6765,9 +6755,7 @@ pub trait WorkspaceApi: Send + Sync {
     fn mcp_list_servers(
         &self,
         workspace_id: Option<WorkspaceId>,
-        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = caller_agent_id;
         let _ = workspace_id;
         Box::pin(async {
             Err(Error::Internal(
@@ -6785,9 +6773,7 @@ pub trait WorkspaceApi: Send + Sync {
         &self,
         server_id: String,
         workspace_id: Option<WorkspaceId>,
-        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = caller_agent_id;
         let _ = (server_id, workspace_id);
         Box::pin(async {
             Err(Error::Internal(
@@ -6808,9 +6794,7 @@ pub trait WorkspaceApi: Send + Sync {
         args: serde_json::Value,
         timeout_ms: Option<u64>,
         workspace_id: Option<WorkspaceId>,
-        caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = caller_agent_id;
         let _ = (server_id, tool_name, args, timeout_ms, workspace_id);
         Box::pin(async {
             Err(Error::Internal(

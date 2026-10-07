@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use intent_core::{
-    GitRemoteUrl, PublishEvent, RepoRef, Workspace, WorkspaceApi, WorkspaceId, WorkspaceStatus,
+    AgentId, GitRemoteUrl, PublishEvent, RepoRef, Workspace, WorkspaceApi, WorkspaceId,
+    WorkspaceStatus,
 };
 use serde_json::{json, Value};
 
@@ -36,6 +37,7 @@ pub(crate) const PRELUDE: &str = r"
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
@@ -52,7 +54,7 @@ pub(crate) async fn dispatch(
         "create" => create(api, args).await,
         "archive" => archive(api, args).await,
         "delete" => delete(api, args).await,
-        "open" => open(api, workspace_id, args).await,
+        "open" => open(api, workspace_id, caller_agent_id, args).await,
         "bulkArchive" => bulk_archive(api, args).await,
         "bulkDelete" => bulk_delete(api, args).await,
         other => Err(format!("host: unknown method `app.workspaces.{other}`")),
@@ -324,6 +326,7 @@ fn summarize_workspace(ws: &Workspace) -> Value {
 async fn open(
     api: &Arc<dyn WorkspaceApi>,
     caller_workspace_id: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let id = args
@@ -346,10 +349,16 @@ async fn open(
     // not the target workspace. App-level UI events are subscribed to via
     // the chief workspace context so subscribers can observe all workspace
     // navigation.
-    let event_data = json!({
+    let mut event_data = json!({
         "workspaceId": id,
         "openInNewWindow": open_in_new_window,
     });
+    if let Some(agent_id) = caller_agent_id {
+        event_data
+            .as_object_mut()
+            .unwrap()
+            .insert("agentId".to_string(), json!(agent_id.as_str()));
+    }
     let event = PublishEvent {
         workspace_id: caller_workspace_id.clone(),
         event_type: intent_core::events::APP_WORKSPACE_OPEN.to_string(),
@@ -1311,7 +1320,7 @@ mod tests {
     async fn test_dispatch_rejects_non_chief_workspace() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let non_chief_id = WorkspaceId::from_string("amber-forest");
-        let result = dispatch(&api, &non_chief_id, "list", &json!({})).await;
+        let result = dispatch(&api, &non_chief_id, None, "list", &json!({})).await;
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
@@ -1326,6 +1335,7 @@ mod tests {
         let denied = dispatch(
             &api,
             &WorkspaceId::new(),
+            None,
             "transfer",
             &json!({"id": "ws-1"}),
         )
@@ -1344,7 +1354,7 @@ mod tests {
             json!({"id": "ws-1", "archiveSource": false}),
         ] {
             assert!(
-                dispatch(&api, &WorkspaceId::chief(), "transfer", &args)
+                dispatch(&api, &WorkspaceId::chief(), None, "transfer", &args)
                     .await
                     .is_err(),
                 "{args}"
@@ -1374,9 +1384,15 @@ mod tests {
             ("pending", "cannot be transferred"),
             ("pathless", "no source path"),
         ] {
-            let error = dispatch(&api, &WorkspaceId::chief(), "transfer", &json!({"id": id}))
-                .await
-                .unwrap_err();
+            let error = dispatch(
+                &api,
+                &WorkspaceId::chief(),
+                None,
+                "transfer",
+                &json!({"id": id}),
+            )
+            .await
+            .unwrap_err();
             assert!(error.contains(message), "{error}");
         }
         assert!(fake.plan_calls.lock().unwrap().is_empty());
@@ -1393,6 +1409,7 @@ mod tests {
         let first = dispatch(
             &api,
             &WorkspaceId::chief(),
+            None,
             "transfer",
             &json!({"id": "ws-1", "destination": "  Laptop  "}),
         )
@@ -1401,6 +1418,7 @@ mod tests {
         let second = dispatch(
             &api,
             &WorkspaceId::chief(),
+            None,
             "transfer",
             &json!({"id": "ws-1"}),
         )
@@ -1477,6 +1495,7 @@ mod tests {
         let result = dispatch(
             &api,
             &WorkspaceId::chief(),
+            None,
             "transfer",
             &json!({"id": "ws-1"}),
         )
@@ -1502,6 +1521,7 @@ mod tests {
         let error = dispatch(
             &api,
             &WorkspaceId::chief(),
+            None,
             "transfer",
             &json!({"id": "ws-1"}),
         )
@@ -1522,7 +1542,9 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = fake;
 
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "list", &json!({})).await.unwrap();
+        let result = dispatch(&api, &chief_id, None, "list", &json!({}))
+            .await
+            .unwrap();
         let workspaces = result.as_array().unwrap();
 
         // __chief__ should not appear in results
@@ -1536,7 +1558,7 @@ mod tests {
     async fn test_get_missing_workspace_returns_error() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "get", &json!({ "id": "missing-ws" })).await;
+        let result = dispatch(&api, &chief_id, None, "get", &json!({ "id": "missing-ws" })).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -1553,7 +1575,7 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = fake;
 
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "get", &json!({ "id": "__chief__" })).await;
+        let result = dispatch(&api, &chief_id, None, "get", &json!({ "id": "__chief__" })).await;
         // Even if chief exists in the list, get should reject it
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Workspace not found: __chief__");
@@ -1569,7 +1591,9 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = fake;
 
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "list", &json!({})).await.unwrap();
+        let result = dispatch(&api, &chief_id, None, "list", &json!({}))
+            .await
+            .unwrap();
         let workspaces = result.as_array().unwrap();
         assert_eq!(workspaces.len(), 1);
 
@@ -1603,6 +1627,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "list",
             &json!({ "filter": { "status": ["active"] } }),
         )
@@ -1644,6 +1669,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "list",
             &json!({ "filter": { "repositoryOwner": "Intent-HQ" } }),
         )
@@ -1655,6 +1681,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "list",
             &json!({ "filter": { "repositoryName": "IntentD" } }),
         )
@@ -1666,6 +1693,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "list",
             &json!({ "filter": { "repositoryOwner": "INTENT-HQ", "repositoryName": "IntentD" } }),
         )
@@ -1677,6 +1705,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "list",
             &json!({ "filter": { "repositoryOwner": "someone-else" } }),
         )
@@ -1755,6 +1784,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "list",
             &json!({ "sort": { "by": "title", "order": "asc" } }),
         )
@@ -1782,7 +1812,7 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = fake;
 
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "get", &json!({ "id": "ws-1" }))
+        let result = dispatch(&api, &chief_id, None, "get", &json!({ "id": "ws-1" }))
             .await
             .unwrap();
 
@@ -1805,9 +1835,15 @@ mod tests {
     async fn test_create_returns_proposal() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "create", &json!({ "title": "New WS" }))
-            .await
-            .unwrap();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            None,
+            "create",
+            &json!({ "title": "New WS" }),
+        )
+        .await
+        .unwrap();
 
         // Should have proposal and content items
         assert!(result.get("ok").unwrap().as_bool().unwrap());
@@ -1833,7 +1869,9 @@ mod tests {
     async fn create_proposal_with(fake: Arc<FakeApi>, args: serde_json::Value) -> Value {
         let api: Arc<dyn WorkspaceApi> = fake;
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "create", &args).await.unwrap();
+        let result = dispatch(&api, &chief_id, None, "create", &args)
+            .await
+            .unwrap();
         result.get("proposal").unwrap().clone()
     }
 
@@ -2582,7 +2620,14 @@ mod tests {
     async fn test_archive_rejects_chief_workspace() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "archive", &json!({ "id": "__chief__" })).await;
+        let result = dispatch(
+            &api,
+            &chief_id,
+            None,
+            "archive",
+            &json!({ "id": "__chief__" }),
+        )
+        .await;
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
@@ -2594,7 +2639,14 @@ mod tests {
     async fn test_archive_validates_workspace_exists() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "archive", &json!({ "id": "missing-ws" })).await;
+        let result = dispatch(
+            &api,
+            &chief_id,
+            None,
+            "archive",
+            &json!({ "id": "missing-ws" }),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2611,7 +2663,7 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = fake;
 
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "archive", &json!({ "id": "ws-1" }))
+        let result = dispatch(&api, &chief_id, None, "archive", &json!({ "id": "ws-1" }))
             .await
             .unwrap();
 
@@ -2638,7 +2690,14 @@ mod tests {
     async fn test_delete_rejects_chief_workspace() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "delete", &json!({ "id": "__chief__" })).await;
+        let result = dispatch(
+            &api,
+            &chief_id,
+            None,
+            "delete",
+            &json!({ "id": "__chief__" }),
+        )
+        .await;
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
@@ -2650,7 +2709,14 @@ mod tests {
     async fn test_delete_validates_workspace_exists() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "delete", &json!({ "id": "missing-ws" })).await;
+        let result = dispatch(
+            &api,
+            &chief_id,
+            None,
+            "delete",
+            &json!({ "id": "missing-ws" }),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2667,7 +2733,7 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = fake;
 
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "delete", &json!({ "id": "ws-1" }))
+        let result = dispatch(&api, &chief_id, None, "delete", &json!({ "id": "ws-1" }))
             .await
             .unwrap();
 
@@ -2692,7 +2758,7 @@ mod tests {
     async fn test_bulk_archive_rejects_empty_array() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "bulkArchive", &json!({ "ids": [] })).await;
+        let result = dispatch(&api, &chief_id, None, "bulkArchive", &json!({ "ids": [] })).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "ids must be a non-empty array");
     }
@@ -2704,6 +2770,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "bulkArchive",
             &json!({ "ids": ["ws-1", "__chief__"] }),
         )
@@ -2728,6 +2795,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "bulkArchive",
             &json!({ "ids": ["ws-1", "ws-2"] }),
         )
@@ -2750,6 +2818,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "bulkArchive",
             &json!({ "ids": ["ws-1", "ws-2"] }),
         )
@@ -2780,7 +2849,7 @@ mod tests {
     async fn test_bulk_delete_rejects_empty_array() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "bulkDelete", &json!({ "ids": [] })).await;
+        let result = dispatch(&api, &chief_id, None, "bulkDelete", &json!({ "ids": [] })).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "ids must be a non-empty array");
     }
@@ -2795,9 +2864,15 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = fake;
 
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "bulkDelete", &json!({ "ids": ["ws-1"] }))
-            .await
-            .unwrap();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            None,
+            "bulkDelete",
+            &json!({ "ids": ["ws-1"] }),
+        )
+        .await
+        .unwrap();
 
         let proposal = result.get("proposal").unwrap();
         assert_eq!(proposal.get("kind").unwrap().as_str().unwrap(), "bulk-op");
@@ -2822,7 +2897,7 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = fake;
 
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "archive", &json!({ "id": "ws-1" }))
+        let result = dispatch(&api, &chief_id, None, "archive", &json!({ "id": "ws-1" }))
             .await
             .unwrap();
 
@@ -2853,7 +2928,7 @@ mod tests {
     async fn test_open_rejects_chief_workspace() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "open", &json!({ "id": "__chief__" })).await;
+        let result = dispatch(&api, &chief_id, None, "open", &json!({ "id": "__chief__" })).await;
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
@@ -2865,7 +2940,14 @@ mod tests {
     async fn test_open_validates_workspace_exists() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "open", &json!({ "id": "missing-ws" })).await;
+        let result = dispatch(
+            &api,
+            &chief_id,
+            None,
+            "open",
+            &json!({ "id": "missing-ws" }),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Workspace not found"));
     }
@@ -2880,7 +2962,7 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = Arc::new(fake.clone());
 
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "open", &json!({ "id": "ws-1" }))
+        let result = dispatch(&api, &chief_id, None, "open", &json!({ "id": "ws-1" }))
             .await
             .unwrap();
 
@@ -2919,6 +3001,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "open",
             &json!({ "id": "ws-1", "openInNewWindow": true }),
         )

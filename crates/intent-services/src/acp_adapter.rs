@@ -182,8 +182,6 @@ pub fn live_adapters() -> usize {
 /// How to launch an ephemeral ACP adapter.
 #[derive(Clone)]
 pub(crate) struct AcpAdapterCommand {
-    profile_provider: Option<String>,
-    profile: Option<Arc<crate::provider_profiles::ProviderLaunchProfile>>,
     installed_cli: Option<intent_providers::installed_cli::InstalledCli>,
     installed: Option<Arc<PreparedInstalled>>,
     program: PathBuf,
@@ -202,77 +200,6 @@ pub(crate) struct AcpAdapterCommand {
 }
 
 impl AcpAdapterCommand {
-    pub(crate) fn for_provider(mut self, provider: &str) -> Self {
-        self.profile_provider = Some(provider.into());
-        self
-    }
-
-    pub(crate) async fn prepare_profile(
-        mut self,
-        purpose: crate::provider_profiles::LaunchPurpose,
-        sources: Vec<crate::provider_profiles::PolicySource>,
-    ) -> Result<Self, String> {
-        if self.profile.is_some() {
-            return Ok(self);
-        }
-        let provider = self.profile_provider.clone().or_else(|| {
-            self.installed_cli.map(|cli| match cli {
-                intent_providers::installed_cli::InstalledCli::Codex => "codex".into(),
-                intent_providers::installed_cli::InstalledCli::Claude => "claude-code".into(),
-            })
-        });
-        let Some(provider) = provider else {
-            return Ok(self);
-        };
-        let cwd = self.working_dir();
-        let mut command = self.command_in(&cwd);
-        if let Some(installed) = &self.installed {
-            installed.apply(&mut command);
-            // Inventory the original home, not the older probe's temporary seed.
-            if provider == "codex" {
-                if let Some(home) = installed.context.codex_home() {
-                    command.env("CODEX_HOME", home);
-                }
-            }
-        }
-        let profile = tokio::task::spawn_blocking(move || {
-            let root = tempfile::Builder::new()
-                .prefix("intent-provider-run-")
-                .tempdir()
-                .map_err(|e| e.to_string())?;
-            let mut profile = crate::provider_launch::prepare(
-                &provider,
-                purpose,
-                &command,
-                root.path(),
-                &cwd,
-                &cwd,
-                None,
-                &intent_acp::NormalizedMcpServers::new(),
-                &sources,
-            )
-            .map_err(|e| e.to_string())?;
-            if provider == "pi" {
-                crate::provider_launch::pi_native_wrapper(&mut profile)?;
-            }
-            // Profile owns its temporary leaf; keep the parent with that lease.
-            profile.hold_parent(root);
-            Ok::<_, String>(Arc::new(profile))
-        })
-        .await
-        .map_err(|_| "Provider profile preparation failed")??;
-        self.profile = Some(profile);
-        Ok(self)
-    }
-
-    pub(crate) fn merge_profile_meta(&self, meta: Option<Value>) -> Option<Value> {
-        let mut value = meta.unwrap_or_else(|| json!({}));
-        if let Some(profile) = &self.profile {
-            profile.merge_session_meta(&mut value);
-        }
-        (value != json!({})).then_some(value)
-    }
-
     fn command_in(&self, process_cwd: &std::path::Path) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(&self.program);
         command
@@ -419,11 +346,9 @@ impl AcpAdapterCommand {
     }
 
     pub(crate) fn probe_session_meta(&self) -> Option<Value> {
-        self.merge_profile_meta(
-            (self.installed_cli == Some(intent_providers::installed_cli::InstalledCli::Claude))
-                .then(|| crate::complete_ops::one_shot_session_shape("claude-code", "", None).1)
-                .flatten(),
-        )
+        (self.installed_cli == Some(intent_providers::installed_cli::InstalledCli::Claude))
+            .then(|| crate::complete_ops::one_shot_session_shape("claude-code", "", None).1)
+            .flatten()
     }
 
     /// Check the selected npx runtime before launch. Direct adapters never
@@ -441,9 +366,6 @@ impl AcpAdapterCommand {
     /// it to the adapter).
     pub(crate) fn npx(npx: PathBuf, package: &str) -> Self {
         Self {
-            profile: None,
-            profile_provider: (package == intent_providers::PI_ACP_NPX_PACKAGE)
-                .then(|| "pi".into()),
             installed_cli: match package {
                 intent_providers::CODEX_ACP_NPX_PACKAGE => {
                     Some(intent_providers::installed_cli::InstalledCli::Codex)
@@ -472,8 +394,6 @@ impl AcpAdapterCommand {
     /// Run a resolved adapter binary with the given args.
     pub(crate) fn binary(bin: PathBuf, args: Vec<String>) -> Self {
         Self {
-            profile: None,
-            profile_provider: None,
             installed_cli: None,
             installed: None,
             program: bin,
@@ -625,7 +545,6 @@ struct HeldWhileLive {
     npx_launch_dir: Option<Arc<NpxLaunchDir>>,
     slot: OwnedSemaphorePermit,
     installed: Option<Arc<PreparedInstalled>>,
-    profile: Option<Arc<crate::provider_profiles::ProviderLaunchProfile>>,
     preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
 }
 
@@ -676,10 +595,9 @@ impl AdapterChild {
             npx_launch_dir,
             slot,
             installed,
-            profile,
             preparation_guard,
         } = held;
-        let launch_dir = RetainUnlessSwept(npx_launch_dir, installed, profile);
+        let launch_dir = RetainUnlessSwept(npx_launch_dir, installed);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             drop(launch_dir);
             drop(child);
@@ -687,9 +605,8 @@ impl AdapterChild {
             return None;
         };
         Some(handle.spawn(async move {
-            if reap_child(&mut child, spawn_pid).await {
-                launch_dir.remove();
-            }
+            reap_child(&mut child, spawn_pid).await;
+            launch_dir.remove();
             drop(child);
             drop(slot);
             drop(preparation_guard);
@@ -725,17 +642,12 @@ impl Drop for AdapterChild {
 /// deletes it once the tree has been reaped; dropping the wrapper any other
 /// way (the cleanup future dropped unpolled on a shutting-down runtime, or
 /// never scheduled at all) retains the directory instead of deleting it.
-struct RetainUnlessSwept(
-    Option<Arc<NpxLaunchDir>>,
-    Option<Arc<PreparedInstalled>>,
-    Option<Arc<crate::provider_profiles::ProviderLaunchProfile>>,
-);
+struct RetainUnlessSwept(Option<Arc<NpxLaunchDir>>, Option<Arc<PreparedInstalled>>);
 
 impl RetainUnlessSwept {
     fn remove(mut self) {
         drop(self.0.take());
         drop(self.1.take());
-        drop(self.2.take());
     }
 }
 
@@ -747,9 +659,6 @@ impl Drop for RetainUnlessSwept {
                 "retaining npx launch dir: adapter cleanup could not finish"
             );
             std::mem::forget(dir);
-        }
-        if let Some(profile) = self.2.take() {
-            std::mem::forget(profile);
         }
         if let Some(installed) = self.1.take() {
             // Its isolated auth profile must also survive an unfinished sweep.
@@ -885,9 +794,6 @@ fn spawn_admitted_adapter(
         installed.apply(&mut command);
     }
 
-    if let Some(profile) = &cmd.profile {
-        profile.apply_to_command(&mut command);
-    }
     let mut child = command
         .spawn()
         .map_err(|e| format!("{}: {e}", cmd.program.display()))?;
@@ -924,7 +830,6 @@ fn spawn_admitted_adapter(
                 npx_launch_dir,
                 slot,
                 installed: cmd.installed.clone(),
-                profile: cmd.profile.clone(),
                 preparation_guard,
             }),
         },
@@ -1141,7 +1046,7 @@ const TERM_GRACE: Duration = Duration::from_millis(500);
 /// snapshot-before-kill rationale. The snapshot is taken only while the
 /// leader is unreaped: a reaped leader's descendants have already reparented
 /// (nothing to find), and its pid may already be reused.
-pub(crate) async fn reap_child(child: &mut tokio::process::Child, spawn_pid: u32) -> bool {
+pub(crate) async fn reap_child(child: &mut tokio::process::Child, spawn_pid: u32) {
     #[cfg(not(unix))]
     let _ = spawn_pid;
     #[cfg(unix)]
@@ -1168,18 +1073,7 @@ pub(crate) async fn reap_child(child: &mut tokio::process::Child, spawn_pid: u32
     let _ = child.kill().await;
     let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
     #[cfg(unix)]
-    {
-        sweep_escaped_descendants(&descendants).await;
-        crate::agent_manager::confirm_tree_exit(
-            child,
-            nix::unistd::Pid::from_raw(spawn_pid.cast_signed()),
-            &descendants,
-            Duration::from_secs(2),
-        )
-        .await
-    }
-    #[cfg(not(unix))]
-    matches!(child.try_wait(), Ok(Some(_)))
+    sweep_escaped_descendants(&descendants).await;
 }
 
 /// Unit tests for the daemon-wide adapter bound itself (monorepo#2062).

@@ -1,7 +1,7 @@
 //! Skills directory watcher → `skills:changed` events.
 //!
-//! Watches the same personal and project roots used by skill discovery and
-//! emits `skills:changed` events when SKILL.md files are created, modified, or
+//! Watches the 8-tier skills scan roots (4 user-tier + 4 project-tier per workspace)
+//! and emits `skills:changed` events when SKILL.md files are created, modified, or
 //! deleted — or when a tier directory itself appears or disappears (#612).
 //! User-tier changes affect all workspaces; project-tier changes are scoped
 //! to their workspace. Debounce is 500ms per workspace to coalesce rapid edits.
@@ -31,8 +31,9 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// Holds watchers for all skills directories (user-tier + project-tier).
 /// Dropping this tears down all watchers.
 ///
-/// Each personal tier keeps one [`RootWatch`] shared per daemon, so these
-/// do not scale with the workspace count. Project tiers ride the shared
+/// The four user tiers keep a [`RootWatch`] each — they are shared once per
+/// daemon, so they do not scale with the workspace count. The four project
+/// tiers per workspace no longer own streams at all: they ride the shared
 /// workspace-root stream via [`watch_tiers`].
 pub(crate) struct SkillsWatcher {
     hub: Arc<SharedWatchHub>,
@@ -64,8 +65,11 @@ impl SkillsWatcher {
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<SkillsMsg>();
 
         // Start user-tier watchers (affect all workspaces)
-        let home = crate::skills::skill_home_dir();
-        let user_watchers = start_user_watches(hub, home.as_deref(), &raw_tx);
+        let mut user_watchers = Vec::new();
+        let user_roots = get_user_skill_roots();
+        for root in user_roots {
+            user_watchers.push(watch_directory(hub, root, None, raw_tx.clone()));
+        }
 
         // Start project-tier watchers (per-workspace)
         let mut workspace_watchers: HashMap<WorkspaceId, TierWatch> = HashMap::new();
@@ -175,20 +179,9 @@ impl SkillsWatcher {
     }
 }
 
-/// Personal watches share discovery's roots and notify every workspace.
-fn start_user_watches(
-    hub: &Arc<SharedWatchHub>,
-    home: Option<&Path>,
-    raw_tx: &mpsc::UnboundedSender<SkillsMsg>,
-) -> Vec<RootWatch> {
-    crate::skills::skill_roots(None, home)
-        .into_iter()
-        .map(|root| watch_directory(hub, root.root, None, raw_tx.clone()))
-        .collect()
-}
-
-/// Watch all project skill roots over one shared workspace-root subscription.
-/// Derive relative tiers from discovery so newly added roots cannot drift.
+/// Watch all four project-tier skill roots of one workspace over the shared
+/// workspace-root stream — one subscription, no streams of its own (previously
+/// four [`RootWatch`]es, each its own stream even when the tier was missing).
 fn start_project_watch(
     hub: &Arc<SharedWatchHub>,
     workspace_id: &WorkspaceId,
@@ -197,15 +190,15 @@ fn start_project_watch(
 ) -> TierWatch {
     let ws_id = workspace_id.clone();
     let tx = raw_tx.clone();
-    let roots = crate::skills::skill_roots(Some(Path::new("")), None);
-    let subpaths: Vec<_> = roots
-        .iter()
-        .map(|root| root.root.to_string_lossy())
-        .collect();
-    let subpaths: Vec<_> = subpaths.iter().map(AsRef::as_ref).collect();
-    watch_tiers(hub, workspace_path, &subpaths, is_skill_md, move || {
-        let _ = tx.send(SkillsMsg::Change(Some(ws_id.clone())));
-    })
+    watch_tiers(
+        hub,
+        workspace_path,
+        PROJECT_SKILL_TIERS,
+        is_skill_md,
+        move || {
+            let _ = tx.send(SkillsMsg::Change(Some(ws_id.clone())));
+        },
+    )
 }
 
 /// Linked targets are scoped to workspace lifetime, like the ordinary tiers.
@@ -280,6 +273,36 @@ fn is_skill_md(path: &Path) -> bool {
         || path
             .symlink_metadata()
             .is_ok_and(|metadata| metadata.is_symlink())
+}
+
+fn get_user_skill_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = home_dir() {
+        roots.push(home.join(".agents").join("skills"));
+        roots.push(crate::skills::claude_config_dir(&home).join("skills"));
+        roots.push(home.join(".intent").join("skills"));
+        roots.push(home.join(".augment").join("skills"));
+    } else if let Some(config) =
+        std::env::var_os("CLAUDE_CONFIG_DIR").filter(|path| !path.is_empty())
+    {
+        roots.push(PathBuf::from(config).join("skills"));
+    }
+    roots
+}
+
+/// Project-tier skill roots, relative to the workspace root.
+const PROJECT_SKILL_TIERS: &[&str] = &[
+    ".agents/skills",
+    ".claude/skills",
+    ".intent/skills",
+    ".augment/skills",
+];
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
 }
 
 /// Debounce loop that coalesces rapid skill file changes per workspace.
@@ -572,140 +595,6 @@ mod tests {
 
     fn skill_md(name: &str) -> String {
         format!("---\nname: {name}\ndescription: d\n---\n\nbody")
-    }
-
-    /// Await a user-tier invalidation, then drain duplicate backend events so
-    /// the next mutation must produce its own notification.
-    async fn expect_user_change(raw_rx: &mut mpsc::UnboundedReceiver<SkillsMsg>) {
-        let message = timeout(LIVENESS, raw_rx.recv())
-            .await
-            .expect("personal skill change must reach the shared watcher channel")
-            .expect("personal skill watcher channel closed");
-        assert!(matches!(message, SkillsMsg::Change(None)), "{message:?}");
-        while let Ok(Some(message)) = timeout(DEBOUNCE, raw_rx.recv()).await {
-            assert!(matches!(message, SkillsMsg::Change(None)), "{message:?}");
-        }
-    }
-
-    #[tokio::test]
-    #[expect(clippy::await_holding_lock)]
-    async fn shared_personal_root_watches_creation_edit_and_removal() {
-        let _serial = crate::events::WATCHER_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let home = crate::test_support::test_tempdir("skills-personal-watch-");
-        let root = home.path().join(".agents/skills");
-        std::fs::create_dir_all(&root).unwrap();
-        let (raw_tx, mut raw_rx) = mpsc::unbounded_channel();
-        let watches = start_user_watches(&SharedWatchHub::new(), Some(home.path()), &raw_tx);
-        assert_eq!(watches.len(), 2, "shared and Intent personal roots");
-        for watch in &watches {
-            watch.wait_established(LIVENESS).await;
-        }
-        // The existing root sends a registration catch-up before edits start.
-        expect_user_change(&mut raw_rx).await;
-        for name in ["find-skills", "ios-device-build"] {
-            let dir = root.join(name);
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("SKILL.md");
-            std::fs::write(&path, skill_md(name)).unwrap();
-            expect_user_change(&mut raw_rx).await;
-
-            std::fs::write(
-                &path,
-                skill_md(name).replace("description: d", "description: edited"),
-            )
-            .unwrap();
-            expect_user_change(&mut raw_rx).await;
-
-            std::fs::remove_file(&path).unwrap();
-            expect_user_change(&mut raw_rx).await;
-        }
-        std::fs::remove_dir_all(&root).unwrap();
-        expect_user_change(&mut raw_rx).await;
-    }
-
-    #[tokio::test]
-    #[expect(clippy::await_holding_lock)]
-    async fn shared_personal_root_created_after_watching_promotes_from_ancestor() {
-        let _serial = crate::events::WATCHER_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let home = crate::test_support::test_tempdir("skills-personal-late-root-");
-        let root = home.path().join(".agents/skills");
-        let (raw_tx, mut raw_rx) = mpsc::unbounded_channel();
-        let watches = start_user_watches(&SharedWatchHub::new(), Some(home.path()), &raw_tx);
-        assert_eq!(watches.len(), 2);
-        for watch in &watches {
-            watch.wait_established(LIVENESS).await;
-            assert_eq!(watch.watched(), Some((home.path().to_path_buf(), false)));
-        }
-        assert!(!root.exists(), "watching must not create personal roots");
-        assert!(raw_rx.try_recv().is_err());
-
-        let skill_dir = root.join("find-skills");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        let skill_path = skill_dir.join("SKILL.md");
-        std::fs::write(&skill_path, skill_md("find-skills")).unwrap();
-        expect_user_change(&mut raw_rx).await;
-        assert!(watches
-            .iter()
-            .any(|watch| watch.watched() == Some((root.clone(), true))));
-
-        std::fs::write(
-            &skill_path,
-            skill_md("find-skills").replace("description: d", "description: edited"),
-        )
-        .unwrap();
-        expect_user_change(&mut raw_rx).await;
-        std::fs::remove_file(&skill_path).unwrap();
-        expect_user_change(&mut raw_rx).await;
-    }
-
-    #[tokio::test]
-    #[expect(clippy::await_holding_lock)]
-    async fn newly_created_provider_roots_emit_and_refresh_catalog() {
-        let _serial = crate::events::WATCHER_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (_db, bus, mut sub) = bus_and_sub().await;
-        let ws = crate::test_support::test_tempdir("skills-new-provider-roots-");
-        let id = WorkspaceId::from("skills-new-provider-roots");
-        let watcher = SkillsWatcher::start(
-            &SharedWatchHub::new(),
-            bus,
-            vec![(id.clone(), ws.path().to_path_buf())],
-        );
-        watcher.wait_established(LIVENESS).await;
-        watcher.barrier().await;
-        for (index, root) in [
-            ".agent/skills",
-            ".codex/skills",
-            ".factory/skills",
-            ".grok/skills",
-            ".opencode/skill",
-            ".opencode/skills",
-            ".pi/skills",
-            ".cortex/skills",
-        ]
-        .iter()
-        .enumerate()
-        {
-            let name = format!("new-provider-root-{index}");
-            let skill = ws.path().join(root).join(&name);
-            std::fs::create_dir_all(&skill).unwrap();
-            std::fs::write(skill.join("SKILL.md"), skill_md(&name)).unwrap();
-            let events = drain_skills_events(&mut sub, Duration::from_millis(100), LIVENESS).await;
-            assert!(
-                events.iter().any(|event| event.workspace_id == id),
-                "missing event for {root}"
-            );
-            let skills = crate::skills::discover_skills(&ws.path().to_string_lossy()).await;
-            assert!(
-                skills.iter().any(|skill| skill.name == name),
-                "missing skill from {root}"
-            );
-        }
     }
 
     #[tokio::test]

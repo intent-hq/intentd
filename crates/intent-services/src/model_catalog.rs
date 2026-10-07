@@ -647,21 +647,10 @@ impl ModelCatalogCache {
             .map(|s| s.key.clone())
     }
 
-    #[cfg(test)]
     pub(crate) async fn resolve_installed(
         self: &Arc<Self>,
         provider: &str,
         force: bool,
-    ) -> ResolvedModels {
-        self.resolve_installed_with_policy(provider, force, None)
-            .await
-    }
-
-    pub(crate) async fn resolve_installed_with_policy(
-        self: &Arc<Self>,
-        provider: &str,
-        force: bool,
-        policy_services: Option<crate::Services>,
     ) -> ResolvedModels {
         let requested = tokio::time::Instant::now();
         let lock = self
@@ -685,17 +674,6 @@ impl ModelCatalogCache {
             }) {
                 prior
             } else {
-                // Identity observation can spawn the native CLI too. Gate it only
-                // when refreshing the selection, never on a fresh cache read.
-                if let Some(services) = &policy_services {
-                    if let Err(error) = services.validate_provider_configuration(provider) {
-                        return ResolvedModels {
-                            models: None,
-                            stale: false,
-                            warning: Some(error.to_string()),
-                        };
-                    }
-                }
                 let command = crate::provider_models::installed_model_command(provider).await;
                 let key = command
                     .as_ref()
@@ -720,14 +698,6 @@ impl ModelCatalogCache {
         let fetch_key = key.clone();
         let result = resolve_with_cache(self, provider, &key, force, Self::now_ms(), move || {
             Box::pin(async move {
-                if let Some(services) = policy_services {
-                    if let Err(error) = services.validate_provider_configuration(&provider_owned) {
-                        return ModelFetchResult {
-                            models: None,
-                            warning: Some(error.to_string()),
-                        };
-                    }
-                }
                 let command = match selection.command {
                     Ok(c) => c,
                     Err(reason) => {

@@ -86,9 +86,7 @@ pub fn sweep_agent_configs(dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
-            if is_npx_launch_dir_name(&entry.file_name())
-                || entry.file_name() == "provider-profiles-v1"
-            {
+            if is_npx_launch_dir_name(&entry.file_name()) {
                 tracing::debug!(
                     path = %entry.path().display(),
                     "keeping npx launch dir retained by a previous run"
@@ -177,14 +175,5 @@ mod tests {
     fn sweep_missing_dir_is_noop() {
         let base = std::env::temp_dir().join(format!("intentd-agent-cfg-{}", uuid::Uuid::new_v4()));
         sweep_agent_configs(&agent_configs_root(&base)).unwrap();
-    }
-    #[test]
-    fn startup_sweep_preserves_provider_session_profiles() {
-        let dir = tempfile::tempdir().unwrap();
-        let profile = dir.path().join("provider-profiles-v1/session-example");
-        std::fs::create_dir_all(&profile).unwrap();
-        std::fs::write(profile.join("config.toml"), "session-state").unwrap();
-        sweep_agent_configs(dir.path()).unwrap();
-        assert!(profile.join("config.toml").is_file());
     }
 }
