@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.28] - 2026-10-07
+
+### 📚 Documentation
+
+- Explain primary browser client offline recovery ([#2337](https://github.com/intent-hq/intentd/pull/2337))
+
+
 ## [0.10.27] - 2026-10-06
 
 ### 🚀 Features
