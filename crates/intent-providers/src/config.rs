@@ -326,7 +326,7 @@ impl ProviderAccessTokenKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderAccessToken {
     pub kind: ProviderAccessTokenKind,
-    /// Also the SecretStore account. Never a config.toml setting.
+    /// Also the `SecretStore` account. Never a config.toml setting.
     pub setting_path: &'static str,
     pub label: &'static str,
     pub guidance: &'static str,
