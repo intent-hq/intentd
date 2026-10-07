@@ -1673,7 +1673,7 @@ fn assert_error_envelope(resp: &Value, id: i64, code: i64) {
 }
 
 /// The real TLS/bearer/origin/fingerprint path shares the sensitive settings
-/// contract: credentials persist only in SecretStore, never in wire responses.
+/// contract: credentials persist only in `SecretStore`, never in wire responses.
 #[tokio::test]
 async fn provider_access_tokens_settings_contract_over_wss() {
     let dir = temp_data_dir();
