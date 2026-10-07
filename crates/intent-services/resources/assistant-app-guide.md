@@ -143,6 +143,13 @@ conversation. Read its status and last response before sending a follow-up. Use
 choose a specialist and model where offered. A specialist defines reusable behavior;
 an agent is a particular conversation doing work.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/HomeAssistantThreads.svelte; src/lib/components/layout/sidebar-nav/cards/ChiefCard.svelte; src/lib/components/chat/AssistantThreadTitle.svelte. -->
+
+In **Home → Assistant**, select a thread in the sidebar. To rename it, click its
+title in the conversation header. The title field uses the available header width.
+Press **Enter** or click away to save; press **Escape** to cancel. Sidebar titles
+select conversations and cannot be edited there.
+
 ## Inspect a failed response and recover
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,ChatPanel}.svelte; messages/en.json. -->
