@@ -3,12 +3,11 @@
 // this does not claim live-provider authentication or full-daemon coverage.
 // PI_ACP_TEST_ENTRY=<adapter dist/index.js> PI_CLI_TEST_ENTRY=<pi dist/cli.js>
 // PI_ACP_EVIDENCE_DIR=<artifact directory> node --test <this file>
-// Unix only: Intent's production extension delivery requires a sh wrapper.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { createServer as createTcpServer } from 'node:net';
@@ -20,13 +19,13 @@ import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assertCleanupComplete, finishCleanup } from './pi-session-cleanup.mjs';
 
-assert.notEqual(process.platform, 'win32', 'Intent MCP extension delivery is Unix-only');
+const windows = process.platform === 'win32';
 assert.ok(process.env.PI_ACP_TEST_ENTRY && process.env.PI_CLI_TEST_ENTRY, 'Select the real adapter and Pi CLI');
 const adapterEntry = resolve(process.env.PI_ACP_TEST_ENTRY);
 const piEntry = resolve(process.env.PI_CLI_TEST_ENTRY);
 const { ClientSideConnection, ndJsonStream } = await import(pathToFileURL(createRequire(adapterEntry).resolve('@agentclientprotocol/sdk')).href);
 const launchEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
-  ['path', 'temp', 'tmp'].includes(key.toLowerCase())));
+  ['path', 'systemroot', 'windir', 'comspec', 'pathext', 'temp', 'tmp'].includes(key.toLowerCase())));
 const quoteSh = value => `'${value.replaceAll("'", "'\\''")}'`;
 function bounded(promise, description) {
   let timer;
@@ -44,29 +43,33 @@ const filesUnder = root => readdirSync(root, { withFileTypes: true }).flatMap(en
   const path = join(root, entry.name);
   return entry.isDirectory() ? filesUnder(path) : [path];
 });
-let evidence;
-let expected;
+const completedEvidence = new Map();
+const expectedEvidence = new Map();
+const runtimes = [];
 
-const runtime = test('published adapter with real minimum Pi: lifecycle, models, thinking and MCP', { timeout: 180_000 }, async t => {
+for (const commandKind of windows ? ['bare', 'absolute'] : ['unix']) {
+runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, thinking and MCP (${commandKind})`, { timeout: 180_000 }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'intent-pi-runtime-'));
+  const piStderr = join(root, 'pi-stderr.log');
   const clients = [];
   const sockets = new Set();
   const requests = [];
   const bridgeRequests = [];
   const modelEvents = new EventEmitter();
-  const cwd = join(root, 'workspace & (session)');
-  const home = join(root, 'home');
+  const cwd = join(root, 'workspace & (session) ^ 100% !PI_PATH_TOKEN! %PI_PATH_TOKEN%');
+  const home = join(root, 'home & (session) ^ 100% !PI_PATH_TOKEN! %PI_PATH_TOKEN%');
   const agentDir = join(home, '.pi', 'agent');
   const runId = randomUUID();
-  evidence = { runId, root, platform: process.platform, node: process.version, adapterEntry, piEntry,
-    requests, bridgeRequests, clients: [], sessions: [] };
-  expected = { runId, root };
+  const evidence = { runId, root, platform: process.platform, node: process.version, adapterEntry, piEntry,
+    commandKind, requests, bridgeRequests, clients: [], sessions: [] };
+  expectedEvidence.set(commandKind, { runId, root });
   let modelServer;
   let bridge;
   t.after(() => finishCleanup(evidence, {
     async stopClients() {
       const results = await Promise.allSettled(clients.map(client => client.stop()));
       const failures = results.filter(result => result.status === 'rejected');
+      evidence.piStderr = existsSync(piStderr) ? readFileSync(piStderr, 'utf8') : '';
       if (failures.length) throw new AggregateError(failures.map(result => result.reason));
     },
     async closeLifetime() {
@@ -78,9 +81,10 @@ const runtime = test('published adapter with real minimum Pi: lifecycle, models,
   }, record => {
     if (process.env.PI_ACP_EVIDENCE_DIR) {
       mkdirSync(process.env.PI_ACP_EVIDENCE_DIR, { recursive: true });
-      writeFileSync(join(process.env.PI_ACP_EVIDENCE_DIR, 'runtime.json'), JSON.stringify(record, null, 2));
+      writeFileSync(join(process.env.PI_ACP_EVIDENCE_DIR, `runtime-${commandKind}.json`), JSON.stringify(record, null, 2));
     }
-    t.diagnostic(JSON.stringify({ runId, root, cleanup: record.cleanup }));
+    completedEvidence.set(commandKind, record);
+    t.diagnostic(JSON.stringify({ commandKind, runId, root, cleanup: record.cleanup }));
   }));
   try {
     mkdirSync(cwd, { recursive: true });
@@ -136,13 +140,25 @@ const runtime = test('published adapter with real minimum Pi: lifecycle, models,
       compat: { supportsDeveloperRole: false, supportsReasoningEffort: true },
       models: [{ id: 'reasoner', reasoning: true }, { id: 'plain', reasoning: false }],
     } } }));
-    const extension = join(root, 'intent extension.ts');
+    const extension = join(home, 'intent extension & (a) ^ 100% !PI_PATH_TOKEN! %PI_PATH_TOKEN%.ts');
     copyFileSync(fileURLToPath(new URL('../../../intent-services/src/pi_mcp_extension.ts', import.meta.url)), extension);
-    const wrapper = join(root, 'pi');
-    writeFileSync(wrapper, `#!/bin/sh\nexec ${[process.execPath, piEntry, '-e', extension].map(quoteSh).join(' ')} "$@"\n`);
-    chmodSync(wrapper, 0o755);
+    const wrapper = join(home, windows ? 'intent-pi.cmd' : 'pi');
+    const realPi = join(home, 'pi.cmd');
+    if (windows) {
+      copyFileSync(fileURLToPath(new URL('../../../intent-services/src/pi_mcp_wrapper.cmd', import.meta.url)), wrapper);
+      writeFileSync(realPi, '@echo off\r\nsetlocal DisableDelayedExpansion\r\n"%INTENTD_TEST_NODE%" "%INTENTD_TEST_PI_ENTRY%" %* 2>>"%INTENTD_TEST_PI_STDERR%"\r\n');
+    } else {
+      writeFileSync(wrapper, `#!/bin/sh\nexec ${[process.execPath, piEntry, '-e', extension].map(quoteSh).join(' ')} "$@" 2>>${quoteSh(piStderr)}\n`);
+      chmodSync(wrapper, 0o755);
+    }
+    mkdirSync(join(agentDir, 'extensions'));
+    writeFileSync(join(agentDir, 'extensions', 'user.ts'), 'export default pi => pi.registerTool({ name: "user_echo", label: "User echo", description: "User extension", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: "user extension" }] }; } });\n');
     const env = { ...launchEnv, HOME: home, USERPROFILE: home, PI_CODING_AGENT_DIR: agentDir,
       PI_ACP_PI_COMMAND: wrapper, INTENTD_MCP_BRIDGE_ADDR: `127.0.0.1:${bridge.address().port}`,
+      INTENTD_PI_COMMAND: commandKind === 'bare' ? 'pi' : realPi, INTENTD_PI_EXTENSION: extension,
+      INTENTD_TEST_NODE: process.execPath, INTENTD_TEST_PI_ENTRY: piEntry,
+      INTENTD_TEST_PI_STDERR: piStderr,
+      PI_PATH_TOKEN: 'UNEXPECTED_EXPANSION', PATH: `${home}${windows ? ';' : ':'}${launchEnv.PATH ?? launchEnv.Path ?? ''}`,
       NODE_OPTIONS: '', NODE_DISABLE_COMPILE_CACHE: '1' };
     const version = spawnSync(process.execPath, [piEntry, '--version'], { env, encoding: 'utf8', timeout: 20_000 });
     assert.equal(version.status, 0, version.stderr);
@@ -150,7 +166,7 @@ const runtime = test('published adapter with real minimum Pi: lifecycle, models,
     const config = readFileSync(fileURLToPath(new URL('../../../intent-providers/src/config.rs', import.meta.url)), 'utf8');
     assert.equal(evidence.piVersion, config.match(/pub const PI_CLI_MIN_VERSION: &str = "([^"]+)";/)[1]);
     const start = async () => {
-      const child = spawn(process.execPath, [adapterEntry], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+      const child = spawn(process.execPath, [adapterEntry], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: !windows });
       const closed = once(child, 'close');
       closed.catch(() => {});
       const record = { pid: child.pid, stderr: '', calls: [], updates: [], permissions: [] };
@@ -176,7 +192,14 @@ const runtime = test('published adapter with real minimum Pi: lifecycle, models,
         },
         async stop() {
           if (stopped) return;
-          try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+          if (windows) {
+            if (child.exitCode === null) {
+              const killed = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { timeout: 20_000 });
+              assert.equal(killed.status, 0, `taskkill: ${killed.stderr}`);
+            }
+          } else {
+            try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+          }
           await bounded(closed, 'adapter and real Pi tree shutdown');
           stopped = true;
         },
@@ -243,6 +266,7 @@ const runtime = test('published adapter with real minimum Pi: lifecycle, models,
     assert.ok(bridgeRequests.filter(request => request.method === 'initialize').length >= 4, 'MCP reconnects handshake again');
     assert.ok(requests.every(request => request.path === '/v1/chat/completions' && request.body.model === 'reasoner' && request.body.reasoning_effort === 'high'));
     assert.ok(requests.some(request => request.body.tools.some(tool => tool.function.name === 'intent_echo')), 'Real extension registers the tool with Pi');
+    assert.ok(requests.every(request => request.body.tools.some(tool => tool.function.name === 'user_echo')), 'User extensions remain enabled');
     assert.ok(requests.some(request => request.body.messages.some(message => message.role === 'tool' && message.content.includes('echo:first:created'))), 'MCP output reaches the real Pi model conversation');
     evidence.histories = filesUnder(join(agentDir, 'sessions')).filter(file => file.endsWith('.jsonl')).map(file => ({ file, entries: jsonLines(file) }));
     assert.equal(evidence.histories.length, 2);
@@ -258,11 +282,15 @@ const runtime = test('published adapter with real minimum Pi: lifecycle, models,
     evidence.error = String(error.stack ?? error);
     throw error;
   }
-});
+}));
+}
 
 test('independent cleanup audit for real Pi compatibility', async () => {
-  await runtime;
-  const record = process.env.PI_ACP_EVIDENCE_DIR
-    ? JSON.parse(readFileSync(join(process.env.PI_ACP_EVIDENCE_DIR, 'runtime.json'), 'utf8')) : evidence;
-  assertCleanupComplete(record, expected);
+  await Promise.all(runtimes);
+  for (const [commandKind, expected] of expectedEvidence) {
+    const record = process.env.PI_ACP_EVIDENCE_DIR
+      ? JSON.parse(readFileSync(join(process.env.PI_ACP_EVIDENCE_DIR, `runtime-${commandKind}.json`), 'utf8')) : completedEvidence.get(commandKind);
+    assertCleanupComplete(record, expected);
+    assert.equal(record.result, 'passed', record.error);
+  }
 });

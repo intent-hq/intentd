@@ -168,7 +168,10 @@ per provider — pick exactly one delivery path:
   `PI_ACP_PI_COMMAND=<wrapper>` and `INTENTD_MCP_BRIDGE_ADDR=<bridge host:port>` in
   the spawn env; the extension dials the bridge over TCP and registers the tools
   with pi. Only the reserved workspace bridge is delivered this way (no user
-  `mcp.servers` translation).
+  `mcp.servers` translation). Unix uses an executable sh wrapper; Windows uses
+  the bundled `pi_mcp_wrapper.cmd` with paths supplied in `INTENTD_PI_COMMAND`
+  and `INTENTD_PI_EXTENSION`. The Windows wrapper disables delayed expansion
+  and forwards arguments without `CALL` to avoid expanding path characters again.
 
 **Verify tools actually reach the agent** — adapters differ in which session-setup fields
 they honor; do not assume wiring works because the spawn succeeded. Unit-test the

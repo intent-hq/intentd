@@ -854,6 +854,21 @@ jobs:
                   assert "running 1 test" in output.splitlines(), output
                   assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in output, output
           PYTHON
+      - name: Headless workspace setup (Windows runtime)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
+        timeout-minutes: 20
+        shell: bash
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+          INTENTD_SETUP_EVIDENCE_DIR: ${{ github.workspace }}/setup-headless-evidence
+          INTENTD_SETUP_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
+        run: rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test -p intentd --test e2e_wss_setup_headless --target ${{ matrix.target }} -- --nocapture
+      - uses: actions/upload-artifact@v7
+        if: always() && needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
+        with:
+          name: setup-headless-windows
+          path: setup-headless-evidence
+          if-no-files-found: error
       # Execute the Windows Job Object fixtures on the native runner. They use
       # this test executable as the child, so no Node/npm/account setup is needed.
       - name: Codex diagnostic process ownership (Windows runtime)
@@ -1945,7 +1960,7 @@ jobs:
 
   # Exercise the shipping Pi ACP package through real session/new, prompt and
   # session/load traffic. CMD quoting needs native Windows, not compilation or
-  # Linux platform simulation. The Unix matrix also covers extension forwarding.
+  # Linux platform simulation. Both platforms also cover extension forwarding.
   # The shipping-pin matrix is strict and required by CI Gate.
   pi-session-paths:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -1980,13 +1995,11 @@ jobs:
         if: ${{ !cancelled() }}
         run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-session-cleanup.test.mjs | tee pi-path-evidence/cleanup-checks.tap
       - name: Install the real minimum Pi CLI
-        if: runner.os == 'Linux'
         run: |
           minimum=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; const s = readFileSync("crates/intent-providers/src/config.rs", "utf8"); const m = s.match(/pub const PI_CLI_MIN_VERSION: &str = "([^"]+)";/); if (!m) throw new Error("Missing Pi CLI minimum"); console.log(m[1]);')
-          npm install --prefix .pi-runtime-test --no-save --ignore-scripts --no-audit --no-fund "@earendil-works/pi-coding-agent@$minimum"
+          npm install --prefix .pi-runtime-test --no-save --ignore-scripts --no-audit --no-fund "@earendil-works/pi-coding-agent@$minimum" "@earendil-works/pi-agent-core@$minimum" "@earendil-works/pi-ai@$minimum" "@earendil-works/pi-tui@$minimum"
           cp .pi-runtime-test/node_modules/.package-lock.json pi-path-evidence/pi-package-lock.json
       - name: Test real Pi lifecycle and supported MCP extension delivery
-        if: runner.os == 'Linux'
         env:
           PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
           PI_CLI_TEST_ENTRY: ${{ github.workspace }}/.pi-runtime-test/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
