@@ -1,0 +1,14 @@
+error[E0599]: the method `as_ref` exists for reference `&StorePool`, but its trait bounds were not satisfied
+ --> tests/ui/store_pool_as_ref.rs:2:37
+  |
+2 |     let _: &sqlx::SqlitePool = pool.as_ref();
+  |                                     ^^^^^^ method cannot be called on `&StorePool` due to unsatisfied trait bounds
+  |
+ ::: src/store_pool.rs
+  |
+  | pub struct StorePool {
+  | -------------------- doesn't satisfy `StorePool: AsRef<_>`
+  |
+  = note: the following trait bounds were not satisfied:
+          `StorePool: AsRef<_>`
+          which is required by `&StorePool: AsRef<_>`

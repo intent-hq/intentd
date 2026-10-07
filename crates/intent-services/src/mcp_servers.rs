@@ -340,6 +340,9 @@ struct HubInner {
     bus: Mutex<Option<EventBus>>,
     oauth_store: Option<Store>,
     next_generation: AtomicU64,
+    background_stop: tokio::sync::watch::Sender<bool>,
+    #[cfg(test)]
+    before_reap: Mutex<Option<Arc<crate::CompletionClassifyPark>>>,
 }
 
 /// Runtime manager for external MCP servers (the `ServerManager` + `HealthMonitor`
@@ -375,8 +378,20 @@ impl McpHub {
                 bus: Mutex::new(None),
                 oauth_store,
                 next_generation: AtomicU64::new(1),
+                background_stop: tokio::sync::watch::channel(false).0,
+                #[cfg(test)]
+                before_reap: Mutex::new(None),
             }),
         }
+    }
+
+    /// Fence boot starts and health ticks while their current operation settles.
+    pub fn begin_background_shutdown(&self) {
+        self.inner.background_stop.send_replace(true);
+    }
+
+    fn background_stopping(&self) -> bool {
+        *self.inner.background_stop.borrow()
     }
 
     fn next_generation(&self) -> u64 {
@@ -431,6 +446,14 @@ impl McpHub {
         let rs = self.inner.servers.lock().unwrap().remove(id);
         match rs {
             Some(mut rs) => {
+                #[cfg(test)]
+                {
+                    let park = self.inner.before_reap.lock().unwrap().take();
+                    if let Some(park) = park {
+                        park.entered.notify_one();
+                        park.release.notified().await;
+                    }
+                }
                 reap(&mut rs).await;
                 true
             }
@@ -482,7 +505,7 @@ impl McpHub {
                     failures: 0,
                     generation: self.next_generation(),
                 };
-                self.inner.servers.lock().unwrap().insert(id, rs);
+                self.register_runtime(id, rs).await;
                 self.publish_status(&status).await;
                 status
             }
@@ -507,9 +530,18 @@ impl McpHub {
             failures: 0,
             generation: self.next_generation(),
         };
-        self.inner.servers.lock().unwrap().insert(id, rs);
+        self.register_runtime(id, rs).await;
         self.publish_status(&status).await;
         status
+    }
+
+    /// A concurrent start can register during our handshake. Keep its displaced
+    /// runtime owned until cleanup finishes, without holding the map lock.
+    async fn register_runtime(&self, id: String, server: RunningServer) {
+        let displaced = self.inner.servers.lock().unwrap().insert(id, server);
+        if let Some(mut displaced) = displaced {
+            reap(&mut displaced).await;
+        }
     }
 
     /// Restart `config`: stop-then-start (emits `stopped` then `running`/`error`).
@@ -546,6 +578,9 @@ impl McpHub {
         // so slow endpoints cannot serialize the sweep and starve stdio pings.
         let mut remote_probes = tokio::task::JoinSet::new();
         for (id, probe) in targets {
+            if self.background_stopping() {
+                break;
+            }
             let conn = match probe {
                 Probe::Remote(config) => {
                     let hub = self.clone();
@@ -570,7 +605,7 @@ impl McpHub {
                     None => continue,
                 }
             };
-            if failures >= MAX_FAILURES {
+            if failures >= MAX_FAILURES && !self.background_stopping() {
                 tracing::warn!(server = %id, "mcp server unhealthy; restarting");
                 self.restart(config, true).await;
             }
@@ -609,13 +644,25 @@ impl McpHub {
     /// Spawn the periodic health-monitor loop (ping + auto-restart). The first
     /// sweep runs after one interval; missed ticks are skipped.
     pub fn spawn_health_monitor(&self) -> tokio::task::JoinHandle<()> {
+        self.spawn_health_monitor_with_interval(HEALTH_INTERVAL)
+    }
+
+    fn spawn_health_monitor_with_interval(
+        &self,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
         let hub = self.clone();
+        let mut stopping = self.inner.background_stop.subscribe();
         intent_core::spawn_daemon(async move {
-            let mut ticker = tokio::time::interval(HEALTH_INTERVAL);
+            let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    biased;
+                    _ = stopping.wait_for(|stop| *stop) => break,
+                    _ = ticker.tick() => {}
+                }
                 hub.health_tick().await;
             }
         })
@@ -888,8 +935,13 @@ async fn spawn_stdio(config: &Value) -> Result<(Child, Option<u32>, Connection, 
         .take()
         .map(|s| Box::new(s) as Box<dyn AsyncRead + Unpin + Send>);
     let conn = Connection::new(stdin, stdout, stderr, ConnectionHooks::default());
-    let tool_count = mcp_handshake(&conn).await?;
-    Ok((child, pid, conn, tool_count))
+    match mcp_handshake(&conn).await {
+        Ok(tool_count) => Ok((child, pid, conn, tool_count)),
+        Err(error) => {
+            reap_child(&mut child, pid).await;
+            Err(error)
+        }
+    }
 }
 
 /// Run the MCP `initialize` → `notifications/initialized` → `tools/list`
@@ -1405,9 +1457,13 @@ async fn reap(rs: &mut RunningServer) {
     let ServerRuntime::Stdio { child, pid, .. } = &mut rs.runtime else {
         return;
     };
+    reap_child(child, *pid).await;
+}
+
+async fn reap_child(child: &mut Child, pid: Option<u32>) {
     #[cfg(unix)]
     {
-        if let Some(pid) = *pid {
+        if let Some(pid) = pid {
             let descendants = intent_acp::descendant_pids(pid).await;
             let _ = kill_group(pid, nix::sys::signal::Signal::SIGTERM);
             let mut exited = false;
@@ -1432,6 +1488,8 @@ async fn reap(rs: &mut RunningServer) {
         let _ = pid;
         let _ = child.kill().await;
     }
+    // SIGKILL is a signal, not a join: retain ownership through actual exit.
+    let _ = child.wait().await;
 }
 
 /// Signal a whole process group by its leader pid (pgid == pid via `process_group`).
@@ -1559,7 +1617,7 @@ impl<'a> McpServersService<'a> {
     }
 
     /// `mcp.servers.update` → replace an existing definition; `{ server }`
-    /// (redacted). A running server is restarted to apply the new config.
+    /// (redacted). An eligible enabled server reconnects, even if stopped.
     ///
     /// `env`/`headers` values equal to the redaction placeholder (what `list`
     /// returns) keep the stored secret for that key; a placeholder for a key
@@ -1576,13 +1634,17 @@ impl<'a> McpServersService<'a> {
         let normalized = merge_redacted_secrets(normalize_config(config, Some(server_id))?, stored);
         configs.insert(server_id.to_string(), normalized.clone());
         write_configs(self.secrets, &configs).await?;
-        // Apply live: any tracked server (running, or a remote in `error` or
-        // `auth_required`) picks up the new definition on restart. A failed
-        // remote must re-probe updated credentials, not keep the old config.
-        let tracked = self.hub.status(server_id)["state"] != "stopped";
-        if tracked {
-            let enable = enable_user_servers(&self.effective());
-            self.hub.restart(normalized.clone(), enable).await;
+        // Apply the saved definition using configured eligibility, not the
+        // transient runtime state. An enabled server may have no hub entry
+        // after creation or a failed launch; saving must reconnect it too.
+        let settings = self.effective();
+        let enabled = normalized["enabled"].as_bool().unwrap_or(false)
+            && enable_user_servers(&settings)
+            && !disabled_servers(&settings).iter().any(|id| id == server_id);
+        if enabled {
+            self.hub.restart(normalized.clone(), true).await;
+        } else {
+            self.hub.stop(server_id).await;
         }
         Ok(json!({ "server": redact_config(&normalized) }))
     }
@@ -1686,7 +1748,7 @@ impl<'a> McpServersService<'a> {
     /// user deleted/disabled/updated mid-sweep is never left running from this
     /// task's stale snapshot.
     pub(crate) async fn start_enabled(&self) {
-        if !enable_user_servers(&self.effective()) {
+        if self.hub.background_stopping() || !enable_user_servers(&self.effective()) {
             return;
         }
         let ids: Vec<String> = read_configs(self.secrets)
@@ -1695,10 +1757,19 @@ impl<'a> McpServersService<'a> {
             .map(String::from)
             .collect();
         for id in ids {
+            if self.hub.background_stopping() {
+                break;
+            }
             let Some(config) = self.eligible_config(&id).await else {
                 continue;
             };
+            if self.hub.background_stopping() {
+                break;
+            }
             self.hub.start(config.clone(), true).await;
+            if self.hub.background_stopping() {
+                break;
+            }
             // A mutation that landed during the handshake found no hub entry to
             // stop or restart, so reconcile it here.
             match self.eligible_config(&id).await {
@@ -2264,6 +2335,241 @@ mod tests {
         let h = McpHub::new();
         let status = h.restart(stdio_cfg("r1", BOGUS_CMD), false).await;
         assert_eq!(status, status_stopped("r1"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overlapping_starts_reap_displaced_child_and_descendant() {
+        use nix::sys::signal::{kill, killpg, Signal};
+        use nix::unistd::Pid;
+        use tokio::io::AsyncWriteExt;
+        struct Cleanup(Vec<i32>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for pid in &self.0 {
+                    let _ = killpg(Pid::from_raw(*pid), Signal::SIGKILL);
+                    let _ = kill(Pid::from_raw(*pid), Signal::SIGKILL);
+                }
+            }
+        }
+        let dir = crate::test_support::test_tempdir("mcp-overlapping-starts");
+        let path = dir.path().join("state.db");
+        let store = Store::open(&path).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let hub = McpHub::new();
+        hub.set_event_bus(bus.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let script = r"import json,os,signal,socket,subprocess,sys
+child=subprocess.Popen(['sleep','3600'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+def stop(signum, frame):
+    child.wait()
+    sys.exit(0)
+signal.signal(signal.SIGTERM,stop)
+for line in sys.stdin:
+    req=json.loads(line)
+    if req.get('method')=='initialize':
+        host,port=sys.argv[1].rsplit(':',1)
+        with socket.create_connection((host,int(port))) as control:
+            control.sendall((str(os.getpid())+' '+str(child.pid)+'\n').encode())
+            control.recv(1)
+    if 'id' in req:
+        result={'tools':[]} if req.get('method')=='tools/list' else {}
+        print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':result}),flush=True)
+";
+        let config = json!({"id":"overlap", "transport":"stdio", "command":"python3", "args":["-u","-c",script,address]});
+        let mut cleanup = Cleanup(Vec::new());
+        let mut starts = Vec::new();
+        let mut controls = Vec::new();
+        for _ in 0..2 {
+            let worker = hub.clone();
+            let config = config.clone();
+            starts.push(tokio::spawn(
+                async move { worker.start(config, true).await },
+            ));
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let (read, write) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let pids: Vec<i32> = line
+                .split_whitespace()
+                .map(|pid| pid.parse().unwrap())
+                .collect();
+            assert_eq!(pids.len(), 2);
+            cleanup.0.extend(pids);
+            controls.push(write);
+        }
+        for pid in &cleanup.0 {
+            assert!(kill(Pid::from_raw(*pid), None).is_ok());
+        }
+        // B registers while A is still positively held in initialize.
+        controls[1].write_all(b"x").await.unwrap();
+        let second = starts.pop().unwrap();
+        let second_status = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_status["state"], "running");
+        assert_eq!(hub.status("overlap")["pid"], cleanup.0[2]);
+        controls[0].write_all(b"x").await.unwrap();
+        let first_status = tokio::time::timeout(Duration::from_secs(5), starts.pop().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_status["state"], "running");
+        hub.begin_background_shutdown();
+        hub.shutdown().await;
+        let settled = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if cleanup
+                    .0
+                    .iter()
+                    .all(|pid| kill(Pid::from_raw(*pid), None) == Err(nix::errno::Errno::ESRCH))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            settled,
+            "overlapping MCP starts discarded a child or descendant before reap"
+        );
+        cleanup.0.clear();
+        bus.shutdown().await.unwrap();
+        store.close().await;
+        let reopened = Store::open(&path).await.unwrap();
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.data["serverId"] == "overlap"
+                    && event.data["status"]["state"] == "running")
+                .count(),
+            2
+        );
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn health_shutdown_joins_removed_child_reap_and_status() {
+        use tokio::io::AsyncWriteExt;
+        let dir = crate::test_support::test_tempdir("mcp-health-drain");
+        let path = dir.path().join("state.db");
+        let store = Store::open(&path).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let (hub, read, mut write) = stdio_hub_with_duplex("held-health");
+        hub.set_event_bus(bus.clone());
+        let pid = {
+            let mut map = hub.inner.servers.lock().unwrap();
+            let server = map.get_mut("held-health").unwrap();
+            server.failures = MAX_FAILURES - 1;
+            server.config = stdio_cfg("held-health", BOGUS_CMD);
+            let ServerRuntime::Stdio { child, .. } = &server.runtime else {
+                unreachable!()
+            };
+            child.id().unwrap()
+        };
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        *hub.inner.before_reap.lock().unwrap() = Some(park.clone());
+        let mut monitor = hub.spawn_health_monitor_with_interval(Duration::from_millis(1));
+        let mut reader = tokio::io::BufReader::new(read);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "ping");
+        let response = json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":-32603,"message":"controlled ping failure"}});
+        write
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), park.entered.notified())
+            .await
+            .unwrap();
+        assert!(!hub
+            .inner
+            .servers
+            .lock()
+            .unwrap()
+            .contains_key("held-health"));
+        hub.begin_background_shutdown();
+        let pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(
+                std::future::Future::poll(std::pin::Pin::new(&mut monitor), cx).is_pending(),
+            )
+        })
+        .await;
+        assert!(pending, "health monitor discarded a removed child");
+        park.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), monitor)
+            .await
+            .unwrap()
+            .unwrap();
+        hub.shutdown().await;
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        bus.shutdown().await.unwrap();
+        store.close().await;
+        let reopened = Store::open(&path).await.unwrap();
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.data["serverId"] == "held-health"
+                    && event.data["status"]["state"] == "error")
+                .count(),
+            1
+        );
+        reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn start_enabled_refuses_after_background_stop() {
+        let dir = crate::test_support::test_tempdir("mcp-boot-refusal");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let secrets = mem_async();
+        let hub = McpHub::new();
+        hub.set_event_bus(bus.clone());
+        let mut configs = Map::new();
+        configs.insert("refused".into(), stdio_cfg("refused", BOGUS_CMD));
+        write_configs(&secrets, &configs).await.unwrap();
+        hub.begin_background_shutdown();
+        svc(None, &secrets, &hub).start_enabled().await;
+        let monitor = hub.spawn_health_monitor();
+        tokio::time::timeout(Duration::from_secs(1), monitor)
+            .await
+            .unwrap()
+            .unwrap();
+        hub.shutdown().await;
+        bus.shutdown().await.unwrap();
+        assert!(store
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap()
+            .is_empty());
+        store.close().await;
     }
 
     #[tokio::test]
@@ -3447,6 +3753,185 @@ mod tests {
         assert_eq!(h.status("r-upd")["state"], json!("running"));
     }
 
+    // Verify forwarding, not just the saved definition or lifecycle status.
+    async fn assert_endpoint(s: &McpServersService<'_>, id: &str, endpoint: &str) {
+        let tools = s.agent_list_tools(None, id).await.unwrap();
+        assert_eq!(tools["tools"][0]["name"], "t1");
+        let result = s
+            .agent_call_tool(None, id, "t1", json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], endpoint);
+    }
+
+    #[tokio::test]
+    async fn url_save_switches_live_tool_endpoint() {
+        let (a, guard_a) = http_tool_stub_named(None, None, "endpoint-a").await;
+        let (b, guard_b) = http_tool_stub_named(None, None, "endpoint-b").await;
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let s = svc(None, &secrets, &h);
+        s.create(remote_cfg("edit", "http", &a)).await.unwrap();
+        s.toggle("edit", true).await.unwrap();
+        assert_endpoint(&s, "edit", "endpoint-a").await;
+        s.update("edit", remote_cfg("edit", "http", &b))
+            .await
+            .unwrap();
+        assert_endpoint(&s, "edit", "endpoint-b").await;
+        guard_a.abort();
+        guard_b.abort();
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn url_save_reconnects_enabled_stopped_server() {
+        use intent_core::WorkspaceApi;
+        let (a, guard_a) = http_tool_stub_named(None, None, "endpoint-a").await;
+        let (b, guard_b) = http_tool_stub_named(None, None, "endpoint-b").await;
+        let dir = crate::test_support::test_tempdir("mcp-stopped-url-save-");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let services = crate::Services::new_with_file_secrets(
+            store,
+            intent_core::FileSecretStore::with_path(dir.path().join("secrets.json")),
+        );
+        // The settings client's create path persists enabled=true without
+        // toggling it. Editing that saved server must apply its new endpoint.
+        services
+            .mcp_servers_create(remote_cfg("edit", "http", &a))
+            .await
+            .unwrap();
+        assert_eq!(
+            services
+                .mcp_servers_get_status("edit".into())
+                .await
+                .unwrap()["status"]["state"],
+            "stopped"
+        );
+        let saved = services
+            .mcp_servers_update("edit".into(), remote_cfg("edit", "http", &b))
+            .await
+            .unwrap();
+        assert_eq!(saved["server"]["url"], b);
+        assert_endpoint(&services.mcp_servers_service(), "edit", "endpoint-b").await;
+        services.shutdown_store_writers().await;
+        services.mcp_hub.stop("edit").await;
+        services.store.close().await;
+        guard_a.abort();
+        guard_b.abort();
+    }
+
+    #[tokio::test]
+    async fn url_save_reports_unreachable_endpoint_and_recovers() {
+        let (a, guard_a) = http_tool_stub_named(None, None, "endpoint-a").await;
+        let (b, guard_b) = http_tool_stub_named(None, None, "endpoint-b").await;
+        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = format!("http://{}", unavailable.local_addr().unwrap());
+        drop(unavailable);
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let s = svc(None, &secrets, &h);
+        s.create(remote_cfg("edit", "http", &a)).await.unwrap();
+        s.toggle("edit", true).await.unwrap();
+        assert_endpoint(&s, "edit", "endpoint-a").await;
+        s.update("edit", remote_cfg("edit", "http", &dead))
+            .await
+            .unwrap();
+        assert_eq!(h.status("edit")["state"], "error");
+        assert!(s
+            .agent_call_tool(None, "edit", "t1", json!({}), None)
+            .await
+            .is_err());
+        s.update("edit", remote_cfg("edit", "http", &b))
+            .await
+            .unwrap();
+        assert_endpoint(&s, "edit", "endpoint-b").await;
+        guard_a.abort();
+        guard_b.abort();
+    }
+
+    #[tokio::test]
+    async fn url_save_preserves_disable_gates() {
+        for (gate, running) in [
+            ("server", false),
+            ("master", false),
+            ("disabled-list", false),
+            ("server", true),
+            ("master", true),
+            ("disabled-list", true),
+        ] {
+            let (url, guard) = http_tool_stub_named(None, None, "endpoint-b").await;
+            let (reg, _cfg) = temp_registry();
+            let secrets = mem_async();
+            let h = McpHub::new();
+            let s = svc(Some(&reg), &secrets, &h);
+            let mut config = remote_cfg("edit", "http", &url);
+            s.create(config.clone()).await.unwrap();
+            if running {
+                s.toggle("edit", true).await.unwrap();
+                assert_endpoint(&s, "edit", "endpoint-b").await;
+            }
+            if gate == "server" {
+                config["enabled"] = json!(false);
+            }
+            if gate == "master" {
+                reg.apply(&[("mcp.enableUserServers".into(), json!(false))])
+                    .unwrap();
+            }
+            if gate == "disabled-list" {
+                set_disabled_servers(Some(&reg), &["edit".into()]).unwrap();
+            }
+            config["url"] = json!(format!("{url}/saved"));
+            let saved = s.update("edit", config.clone()).await.unwrap();
+            assert_eq!(saved["server"]["enabled"], config["enabled"], "{gate}");
+            assert_eq!(h.status("edit")["state"], "stopped", "{gate}");
+            assert!(
+                s.agent_call_tool(None, "edit", "t1", json!({}), None)
+                    .await
+                    .is_err(),
+                "{gate}"
+            );
+            guard.abort();
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn url_save_concurrent_requests_keep_saved_and_live_endpoints_aligned() {
+        use intent_core::WorkspaceApi;
+        let (a, guard_a) = http_tool_stub_named(None, None, "endpoint-a").await;
+        let (b, guard_b) = http_tool_stub_named(None, None, "endpoint-b").await;
+        let dir = crate::test_support::test_tempdir("mcp-url-save-");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let services = crate::Services::new_with_file_secrets(
+            store,
+            intent_core::FileSecretStore::with_path(dir.path().join("secrets.json")),
+        );
+        services
+            .mcp_servers_create(remote_cfg("edit", "http", &a))
+            .await
+            .unwrap();
+        services
+            .mcp_servers_toggle("edit".into(), true, None)
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            services.mcp_servers_update("edit".into(), remote_cfg("edit", "http", &b)),
+            services.mcp_servers_update("edit".into(), remote_cfg("edit", "http", &a)),
+        );
+        first.unwrap();
+        second.unwrap();
+        let saved = services.mcp_servers_list(None).await.unwrap();
+        let expected = if saved["servers"][0]["url"] == a {
+            "endpoint-a"
+        } else {
+            "endpoint-b"
+        };
+        assert_endpoint(&services.mcp_servers_service(), "edit", expected).await;
+        services.shutdown_store_writers().await;
+        services.mcp_hub.stop("edit").await;
+        services.store.close().await;
+        guard_a.abort();
+        guard_b.abort();
+    }
+
     #[tokio::test]
     async fn update_restart_receives_merged_secrets_not_placeholder() {
         // The hub restart on update must get the merged (real-secret) config:
@@ -3954,6 +4439,14 @@ mod tests {
         required_auth: Option<&str>,
         denied_request: Option<&str>,
     ) -> (String, tokio::task::JoinHandle<()>) {
+        http_tool_stub_named(required_auth, denied_request, "http-ok").await
+    }
+
+    async fn http_tool_stub_named(
+        required_auth: Option<&str>,
+        denied_request: Option<&str>,
+        endpoint: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let required_auth = required_auth.map(String::from);
@@ -3997,7 +4490,11 @@ mod tests {
                                 )
                             } else {
                                 ok_json_response(
-                                    r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"http-ok"}]}}"#,
+                                    &json!({
+                                        "jsonrpc": "2.0", "id": 2,
+                                        "result": {"content": [{"type": "text", "text": endpoint}]},
+                                    })
+                                    .to_string(),
                                 )
                             }
                         } else {

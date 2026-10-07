@@ -299,14 +299,13 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
     common::enable_ws_api(&data_dir);
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let mut cmd = common::serve_command();
-    common::hermetic_github_identity(&mut cmd, &data_dir);
+    let mut cmd = common::hermetic_serve_command(&data_dir);
+
     // gh auth token can otherwise select an inherited enterprise credential.
     cmd.env_remove("GH_HOST")
         .env_remove("GH_ENTERPRISE_TOKEN")
         .env_remove("GITHUB_ENTERPRISE_TOKEN")
         .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
@@ -488,6 +487,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,

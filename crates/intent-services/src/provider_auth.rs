@@ -426,13 +426,9 @@ fn opencode_models_ready(stdout: &str) -> bool {
 /// `override_path` is the raw `providers.paths` value for the provider's
 /// [`override_key`]. `program` (the install-gate binary from
 /// [`resolve_probe_binary`]) already reflects it where it applies; the
-/// claude-code arm additionally resolves it as the ADAPTER override
-/// ([`intent_providers::resolve_npx_only_override`]) so the ACP fallback probe
-/// runs the same adapter binary a session spawn would (monorepo#4352). That
-/// resolution happens INSIDE the fallback closure — only when the CLI verdict
-/// is inconclusive and the adapter is actually spawned — so an invalid
-/// override warns on a real spawn attempt (parity with `resolve_spawn` and
-/// the one-shot launches), not on every conclusive 60s-TTL probe.
+/// Claude ACP fallback always uses the pinned adapter and canonical installed
+/// CLI. Legacy adapter overrides are rejected on the fallback path, just as
+/// they are for persistent sessions and one-shot launches.
 async fn probe_provider(
     provider_id: &'static str,
     program: std::ffi::OsString,
@@ -551,9 +547,8 @@ fn resolve_auggie_override(path: &str) -> Option<std::path::PathBuf> {
 /// command the key describes. The special-case gates (claude-code, codex, pi)
 /// probe a binary that is not their registry primary (`claude-agent-acp`,
 /// `codex-acp`, `pi-acp`), so an adapter override must not shadow or stand in
-/// for the real CLI there; those gates ignore the override for the CLI check
-/// (claude-code's ADAPTER override is applied separately, in
-/// [`probe_provider`]'s ACP fallback — monorepo#4352). A valid applied
+/// for the real CLI there; those gates ignore the override for the CLI check.
+/// Claude also rejects legacy adapter overrides in its ACP fallback. A valid applied
 /// override wins (and is what the probe spawns — pi never gets here); an
 /// invalid one warns and falls through to the auto-detection tiers. auggie's
 /// override is validated with checkAuggie
@@ -1311,47 +1306,164 @@ mod tests {
         }
     }
 
-    /// monorepo#4352: `probe_provider`'s claude-code arm hands the resolved
-    /// `providers.paths["claude-code"]` adapter override to the ACP fallback
-    /// probe, which then runs the override binary instead of the pinned npx
-    /// package. Drives the real wiring end to end: an inconclusive
-    /// `claude auth status` stub (exit 0, no `loggedIn`) forces the fallback,
-    /// and an override stub that answers `initialize` with the adapter's
-    /// auth-required RPC error records its invocation and yields the
-    /// conclusive `Some(false)` — a regression that dropped the argument
-    /// (back to pinned npx) would neither touch the marker nor demote.
+    /// Run this wiring test in a separate process so its canonical CLI, npm
+    /// discovery and login-shell caches cannot affect other tests or host auth.
+    #[cfg(unix)]
+    fn claude_fallback_subprocess() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        if std::env::var_os("INTENT_TEST_AUTH_FALLBACK_CHILD").is_some() {
+            return false;
+        }
+        let dir = unique_temp_dir("claude-pinned-fallback");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let scripts = [
+            ("shell", "#!/bin/sh\nexit 0\n".to_owned()),
+            ("node", "#!/bin/sh\nexit 99\n".to_owned()),
+            (
+                "claude-agent-acp",
+                "#!/bin/sh\n: > \"$HOME/legacy-ran\"\nexit 99\n".to_owned(),
+            ),
+            (
+                "claude",
+                r#"#!/bin/sh
+case "$*" in
+  'auth status') printf 'auth\n' >> "$HOME/cli-calls"; cat "$HOME/auth-reply" ;;
+  --version)
+    [ "$CLAUDE_CODE_EXECUTABLE" = "$0" ] || exit 91
+    printf 'version\n' >> "$HOME/cli-calls"
+    printf '2.1.0 (Claude Code)\n' ;;
+  *) exit 92 ;;
+esac
+"#
+                .to_owned(),
+            ),
+            (
+                "npx",
+                format!(
+                    r#"#!/bin/sh
+if [ "$#" = 1 ] && [ "$1" = --version ]; then
+  printf '11.0.0\n'
+  exit 0
+fi
+[ "$#" = 3 ] && [ "$1" = --workspaces=false ] && [ "$2" = -y ] && [ "$3" = '{}' ] || exit 93
+[ "$CLAUDE_CODE_EXECUTABLE" = "$HOME/bin/claude" ] || exit 94
+printf '%s\n' "$*" >> "$HOME/packages"
+IFS= read -r request
+printf '%s\n' "$request" >> "$HOME/requests"
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"error":{{"code":-32000,"message":"Authentication required"}}}}'
+while IFS= read -r unexpected; do exit 95; done
+"#,
+                    intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
+                ),
+            ),
+        ];
+        for (name, script) in scripts {
+            let path = bin.join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let log_path = dir.path().join("test.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "provider_auth::tests::claude_code_probe_uses_pinned_fallback_and_ignores_override",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
+            .env("INTENT_TEST_AUTH_FALLBACK_CHILD", "1")
+            .env("HOME", dir.path())
+            .env("USERPROFILE", dir.path())
+            .env("SHELL", bin.join("shell"))
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("CLAUDE_CODE_EXECUTABLE", bin.join("claude-agent-acp"))
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log));
+        let mut child = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
+        let status = child
+            .wait_with_timeout(Duration::from_secs(60))
+            .unwrap()
+            .expect("isolated auth wiring test timed out");
+        assert!(
+            status.success(),
+            "{}",
+            std::fs::read_to_string(log_path).unwrap()
+        );
+        true
+    }
+
+    /// Conclusive CLI reports skip ACP. An inconclusive report uses the pinned
+    /// package with the canonical installed CLI, never a legacy adapter override.
+    /// Only an explicit ACP authentication error demotes the unknown verdict.
     #[cfg(unix)]
     #[tokio::test]
-    async fn claude_code_probe_hands_override_to_acp_fallback() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = unique_temp_dir("claude-override-fallback");
-        let claude = dir.path().join("claude");
-        std::fs::write(&claude, "#!/bin/sh\necho '{}'\nexit 0\n").unwrap();
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let marker = dir.path().join("override-ran");
-        let adapter = dir.path().join("claude-agent-acp");
-        std::fs::write(
-            &adapter,
-            format!(
-                "#!/bin/sh\nIFS= read -r _init\n: > '{}'\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":-32000,\"message\":\"Authentication required\"}}}}'\nexit 1\n",
-                marker.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let verdict = probe_provider(
-            "claude-code",
-            claude.into_os_string(),
-            Some(adapter.to_str().unwrap()),
-        )
-        .await;
-        assert!(
-            marker.exists(),
-            "the ACP fallback must spawn the override adapter"
+    async fn claude_code_probe_uses_pinned_fallback_and_ignores_override() {
+        if claude_fallback_subprocess() {
+            return;
+        }
+        let root = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let claude = root.join("bin/claude");
+        let legacy = root.join("bin/claude-agent-acp");
+        let override_path = Some(legacy.to_str().unwrap());
+        assert_eq!(
+            resolve_probe_binary("claude-code", override_path),
+            Some(claude.clone().into_os_string())
         );
+        for logged_in in [true, false] {
+            std::fs::write(
+                root.join("auth-reply"),
+                json!({"loggedIn": logged_in}).to_string(),
+            )
+            .unwrap();
+            let verdict = probe_provider(
+                "claude-code",
+                claude.clone().into_os_string(),
+                override_path,
+            )
+            .await;
+            assert_eq!(verdict.authenticated, Some(logged_in));
+            assert!(
+                !root.join("packages").exists(),
+                "conclusive CLI auth must skip ACP"
+            );
+        }
+        std::fs::write(root.join("auth-reply"), "{}").unwrap();
+        let verdict = probe_provider("claude-code", claude.into_os_string(), override_path).await;
         assert_eq!(verdict.authenticated, Some(false));
         assert!(verdict.identity.is_none());
+        assert_eq!(
+            std::fs::read_to_string(root.join("packages")).unwrap(),
+            format!(
+                "--workspaces=false -y {}\n",
+                intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
+            )
+        );
+        let requests = std::fs::read_to_string(root.join("requests")).unwrap();
+        let requests: Vec<Value> = requests
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            requests.len(),
+            1,
+            "auth fallback must never send a paid prompt"
+        );
+        assert_eq!(requests[0]["method"], "initialize");
+        // Catalog preparation observes the selected CLI, then the adapter
+        // launch revalidates it before spawning the pinned package.
+        assert_eq!(
+            std::fs::read_to_string(root.join("cli-calls")).unwrap(),
+            "auth\nauth\nauth\nversion\nversion\n"
+        );
+        assert!(
+            !root.join("legacy-ran").exists(),
+            "legacy override must never execute"
+        );
     }
 
     #[tokio::test]

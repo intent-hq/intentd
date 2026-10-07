@@ -5,6 +5,20 @@ guide first for the cross-package workflow (submodule PR → monorepo bump, conv
 commits). This file covers conventions specific to `packages/intentd`, the
 Rust backend daemon.
 
+**Assistant app guide:** When adding, changing, moving, renaming, or removing a
+user-facing feature, update the affected section of
+[`crates/intent-services/resources/assistant-app-guide.md`](crates/intent-services/resources/assistant-app-guide.md)
+in the same change. This is the single bundled guide; keep it concise and replace
+obsolete paths, labels, and prerequisites, including changes coordinated with the frontend.
+Keep the guide and user-facing help focused on features ready for users. Do not promote
+unfinished, experimental, Labs-only, internal, or unreleased features as normal options;
+code or tool availability is not proof of readiness. When explicitly asked about such
+a feature, or assigned to develop or test it, discuss it honestly and label its status.
+Update the guide and its source pointers when readiness or UI behavior changes.
+Before opening a PR, record the affected guide section (and companion intentd PR
+for frontend changes), or explain why the change has no user-help impact. Coordinate
+companion releases; this checkpoint does not require simultaneous cross-repo merges.
+
 > **Merge permission**: never merge a PR or arm auto-merge without explicit permission
 > from a human — approved + green is not enough. See the
 > [root `AGENTS.md`](../../AGENTS.md) for the full rule.
@@ -173,17 +187,17 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
   `cache_path_for`, never `join(".repo-cache")`. `repo_cache_path_lint.rs` fails the
   suite on a literal `".repo-cache"` in test code unless the line ends with
   `// repo-cache-path: allow — <reason>`.
-- **Daemon spawns** — build them with `common::serve_command()` (the `intentd` binary,
-  `serve`, and the `INTENTD_TCP_PORT=0` ephemeral-port seam so WSS daemons never race for
-  the port `enable_ws_api` seeded), or `common::serve_command_fixed_port()` only when the
-  test must bind the settings-file port. `serve_spawn_lint.rs` is a bounded textual
-  backstop: it fails the suite on a single-statement
-  `Command::new(env!("CARGO_BIN_EXE_intentd")) … "serve"` (30-line cap), and on a file
-  whose code calls `enable_ws_api(` without `serve_command` in code (comments stripped;
-  a split-statement raw spawn beside a genuine builder call is not detected). Opt out
-  with `// serve-spawn: allow — <reason>` — on the offending statement's line for the
-  first rule, anywhere in the file for the second (wrapper-program launchers only;
-  reason required).
+- **Daemon spawns** — use `common::hermetic_serve_command(data_dir)`, or
+  `hermetic_serve_command_fixed_port(data_dir)` when the settings-file port is required.
+  Both remove `GITHUB_TOKEN`, `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`,
+  `GITHUB_ENTERPRISE_TOKEN`, and `GH_HOST`, and select private gh config/secrets under the
+  owned directory; retain it through shutdown. Reapply `hermetic_fixture_identity` after
+  generic environment overrides. Intentional mock identity uses `common::mock_github_token`
+  with a local `// fixture-identity: allow — <private mock reason>` comment.
+  `serve_spawn_lint.rs` checks raw/retired builders and identity mutations on simple command
+  bindings, including split statements beside safe calls. The wrapper/port marker
+  `// serve-spawn: allow — <reason>` never exempts identity. Its module docs describe the
+  bounded analysis: no alias, interprocedural, macro, or control-flow proof.
 
 ### Asserting the protocol contract
 
@@ -244,7 +258,7 @@ down (the lint fails until a fixed file's entry is removed or lowered).
 | `raw_child_lint` | a test file naming `std::process::Child` as a type instead of holding an `intentd_test_support::GuardedChild` (borrows and `use` paths are not hits) | `// raw-child: allow — <reason>` on the line above; the lint's `BASELINE` |
 | `tmp_hygiene_lint` | a raw `PathBuf::from("/tmp")` / `Path::new("/tmp")` / `temp_dir().join(..)` in test code instead of `test_tempdir` | trailing `// tmp-hygiene: allow — <reason>` |
 | `repo_cache_path_lint` | a literal `".repo-cache"` in test code instead of `intent_git::repo_cache::cache_root_for` / `cache_path_for` | trailing `// repo-cache-path: allow — <reason>` |
-| `serve_spawn_lint` | a single-statement `Command::new(env!("CARGO_BIN_EXE_intentd")) … "serve"`, or a file calling `enable_ws_api(` without `serve_command` in code | `// serve-spawn: allow — <reason>` on the statement line, or anywhere in the file for the second rule |
+| `serve_spawn_lint` | raw/retired daemon builders, missing WSS builder calls, or identity overrides on tracked commands without a later complete reset | `serve-spawn: allow` for launch mechanics only; `fixture-identity: allow` for named mock helper calls only; both require a reason (see module docs) |
 | `agent_hidden_field_egress_lint` | a `mcp_server/bindings/` file that reads session/event rows (`AgentLite` / `Event`, `agent_get(` / `agent_list(` / `event_query(` …) without a `SCRUBBED_BINDINGS` row (scrubs with `strip_agent_hidden_fields` + `EGRESS_REGISTRY` entries), or an `intent-services` fn copying `.data` wholesale into `json!` without a `WAKE_METADATA_BUILDERS` row; allowlist rows and registry entries are cross-checked for staleness | `HAND_PICKED_BINDINGS` / `SAFE_DATA_COPIES` rows in the lint (reason required) |
 | `queue_entry_egress_lint` | a non-test `queue_snapshot(` / `queue_snapshot_preview(` call whose enclosing fn, or an `event_type: <const>` publish of any const whose string value in `crates/intent-core/src/events.rs` starts with `agent:queue:` (the watched set is derived from that file, so a new `agent:queue:*` constant is watched without editing the lint) whose const, is named by no `REGISTERED_EGRESS` row (the row maps it to a `QueueSurface` variant in `crates/intent-core/src/queue_visibility_contract.rs`, so the contract harnesses drive it); outside `events.rs`, any other reference to a watched const (helper argument, local binding, `json!` value, comparison; `use` items excepted) or an `"agent:queue:*"` string literal whose enclosing fn is named by no `Key::Fn` row; a variant no row claims, or a row naming a variant / fn / const that no longer exists, also fails (multiplayer queue visibility, intentd#2068) | `// queue-egress: allow — <reason>` on the line above the call / reference or its statement, only when no entry leaves the daemon (a consumer matching on the type) |
 | `source_lint_discovery_lint` | a `*_lint.rs` file the glob does not select, a ci.yml `check` job with no non-comment `run:` line invoking the glob, or a `*_lint.rs` file defining its own `fn lex(` / `markers_by_line(` / `blank_cfg_test_items(` / `cfg_test_item_ranges(` / `split_statements(` instead of importing `intentd_test_support::source_lint` (the #2073 fixes had to be re-applied per private copy) | `// source-lint-scaffolding: allow — <reason>` on the line above the definition; none for the first two rules |

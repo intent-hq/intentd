@@ -1,8 +1,9 @@
 # Pure forwarder for the Rust gates. The recipes live in the intent monorepo
 # root Makefile (https://github.com/intent-hq/intent), where this repo is the
 # packages/intentd submodule; nothing is duplicated here and cargo is never
-# invoked directly. Each gate target runs `make -C ../.. <target>` when this
-# checkout is that submodule, so command-line variables (RESUME=1,
+# invoked directly. Requested gate targets run together in one root make when
+# this checkout is that submodule, so their shared prerequisite ordering and
+# command-line variables (RESUME=1,
 # GATE_FORCE=1, BASE=<ref>, DRY_RUN=1, ARGS=...) reach the root make through
 # MAKEFLAGS. In a standalone clone the same targets exit 2 and name the
 # monorepo command. Unknown targets keep make's ordinary "No rule" failure.
@@ -22,14 +23,18 @@ help:
 	@echo ""
 	@echo "Targets: $(FORWARDED_TARGETS)"
 	@echo ""
-	@echo "Each runs 'make -C $(MONOREPO_ROOT) <target>' when this checkout is the monorepo's"
+	@echo "Requested targets run together in 'make -C $(MONOREPO_ROOT) <targets>' in the monorepo's"
 	@echo "packages/intentd submodule ($(MONOREPO_ROOT)/Makefile exists and $(MONOREPO_ROOT)/.gitmodules"
 	@echo "names packages/intentd); RESUME=1, GATE_FORCE=1, BASE=<ref>, DRY_RUN=1 and ARGS=..."
 	@echo "pass through. In a standalone clone the targets exit 2 and name the monorepo command."
 
 ifneq ($(MONOREPO_PRESENT),)
-$(FORWARDED_TARGETS):
-	$(MAKE) -C $(MONOREPO_ROOT) $@
+# One shared prerequisite preserves MAKECMDGOALS and deduplicates root work,
+# including for `make -j gate check` and `make -j check gate`.
+.PHONY: forward-gates
+$(FORWARDED_TARGETS): forward-gates
+forward-gates:
+	$(MAKE) -C $(MONOREPO_ROOT) $(filter $(FORWARDED_TARGETS),$(MAKECMDGOALS))
 else
 $(FORWARDED_TARGETS):
 	@echo "make $@: the Rust gates live in the intent monorepo root Makefile — run 'make -C <monorepo-root> $@' from a monorepo checkout (https://github.com/intent-hq/intent)" >&2

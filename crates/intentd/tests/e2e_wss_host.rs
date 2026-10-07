@@ -59,7 +59,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -68,6 +68,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
     cmd.spawn().expect("spawn intentd serve")
 }
 
@@ -838,6 +839,7 @@ async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: Some(root.to_string_lossy().into_owned()),
         repository_path: None,
@@ -2494,5 +2496,154 @@ async fn host_discovery_cache_positive_and_negative_over_wss() {
         "repeated providerDiscovery call serves cached result: {discovery_cached}"
     );
 
+    drop(daemon);
+}
+
+/// A real wire acknowledgement must not wait for even the npx version probe,
+/// let alone a blocked package download. No adapter/provider code may execute.
+#[tokio::test]
+async fn prepare_provider_adapters_acknowledges_pending_work_over_wss() {
+    use std::os::unix::fs::PermissionsExt;
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let bin = data_dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::copy(
+        intent_providers::find_node().expect("Node toolchain"),
+        bin.join("node"),
+    )
+    .unwrap();
+    let npx = bin.join("npx");
+    std::fs::write(
+        &npx,
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then
+  printf started > "$PREPARATION_PROBE_STARTED"
+  # // timing-guard: version probe is held until acknowledgement arrives
+  while [ ! -f "$PREPARATION_PROBE_RELEASE" ]; do /bin/sleep 0.01; done
+  printf '10.0.0\n'; exit
+fi
+printf '%s\n' "$@" > "$PREPARATION_REPORT"
+printf '%s' "$$" > "$PREPARATION_STARTED"
+# // timing-guard: hold fake npm until the test observes prompt acknowledgements
+while [ ! -f "$PREPARATION_RELEASE" ]; do /bin/sleep 0.01; done
+exit 1
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let codex = bin.join("codex");
+    std::fs::write(
+        &codex,
+        "#!/bin/sh\nprintf executed > \"$PROVIDER_EXECUTED\"\nexit 99\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let report = data_dir.join("preparation-args");
+    let started = data_dir.join("preparation-started");
+    let release = data_dir.join("preparation-release");
+    let executed = data_dir.join("provider-executed");
+    let probe_started = data_dir.join("probe-started");
+    let probe_release = data_dir.join("probe-release");
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("PATH", path.as_str()),
+        ("PREPARATION_REPORT", report.to_str().unwrap()),
+        ("PREPARATION_PROBE_STARTED", probe_started.to_str().unwrap()),
+        ("PREPARATION_PROBE_RELEASE", probe_release.to_str().unwrap()),
+        ("PREPARATION_STARTED", started.to_str().unwrap()),
+        ("PREPARATION_RELEASE", release.to_str().unwrap()),
+        ("PROVIDER_EXECUTED", executed.to_str().unwrap()),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let daemon = Daemon {
+        child,
+        _data_dir_guard: data_dir_guard,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut ws = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    let sessions_before = store.list_all_agent_sessions().await.unwrap().len();
+    for (id, params, code) in [
+        (1, json!({"providerIds":[]}), None),
+        (2, json!({"providerIds":["unknown","auggie"]}), None),
+        (3, json!({"providerIds":[],"command":"bad"}), Some(-32602)),
+        (4, json!({"providerIds":[""]}), Some(-32602)),
+        (5, json!({"providerIds":["codex","codex"]}), None),
+    ] {
+        ws.send(Message::Text(json!({"jsonrpc":"2.0","id":id,"method":"host.prepareProviderAdapters","params":params}).to_string().into())).await.unwrap();
+        let reply = timeout(Duration::from_secs(5), wss_expect_error(&mut ws, id))
+            .await
+            .expect("ack must not wait for npm");
+        if let Some(code) = code {
+            assert_eq!(reply["error"]["code"], code);
+        } else {
+            assert_eq!(
+                reply,
+                json!({"jsonrpc":"2.0","id":id,"result":{"accepted":true}})
+            );
+        }
+    }
+    assert!(
+        !probe_release.exists(),
+        "acknowledgement must precede version probe completion"
+    );
+    timeout(Duration::from_secs(10), async {
+        while !probe_started.exists() {
+            // timing-guard: poll the explicitly held version probe
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("version probe started");
+    std::fs::write(&probe_release, "go").unwrap();
+    timeout(Duration::from_secs(10), async {
+        while !started.exists() {
+            // timing-guard: poll fake npm's observable start marker
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background download started");
+    let args = std::fs::read_to_string(&report).unwrap();
+    assert!(args.contains(&format!(
+        "--package={}",
+        intent_providers::CODEX_ACP_NPX_PACKAGE
+    )));
+    assert!(args.contains("--ignore-scripts\n"));
+    assert!(args.contains("\nnode\n"));
+    assert!(!executed.exists(), "no CLI auth/session/version execution");
+    for id in 10..20 {
+        assert_eq!(
+            wss_rpc_with_timeout(
+                &mut ws,
+                id,
+                "host.prepareProviderAdapters",
+                json!({"providerIds":["codex"]}),
+                Duration::from_secs(5)
+            )
+            .await,
+            json!({"accepted":true})
+        );
+    }
+    assert!(!release.exists(), "all replies arrived while npm was held");
+    assert_eq!(
+        store.list_all_agent_sessions().await.unwrap().len(),
+        sessions_before,
+        "preparation creates no agent session"
+    );
+    std::fs::write(&release, "finish").unwrap();
+    drop(ws);
     drop(daemon);
 }

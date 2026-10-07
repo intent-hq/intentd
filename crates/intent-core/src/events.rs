@@ -252,6 +252,11 @@ pub(crate) const TERMINAL_CWD: &str = "terminal:cwd";
 // (start, exit, auto-restart, URL detection) as `script:state`, and definition
 // mutations as `script:changed`. All payloads carry the `scriptId`.
 pub const SCRIPT_OUTPUT: &str = "script:output";
+pub const SCRIPT_MONITOR_REGISTERED: &str = "scriptMonitor:registered";
+pub const SCRIPT_MONITOR_COMPLETED: &str = "scriptMonitor:completed";
+pub const SCRIPT_MONITOR_EXPIRED: &str = "scriptMonitor:expired";
+pub const SCRIPT_MONITOR_TRIGGERED: &str = "scriptMonitor:triggered";
+pub const SCRIPT_MONITOR_CANCELLED: &str = "scriptMonitor:cancelled";
 pub const SCRIPT_STATE: &str = "script:state";
 pub const SCRIPT_CHANGED: &str = "script:changed";
 
@@ -361,6 +366,8 @@ pub(crate) const GOAL_UPDATED: &str = "goal:updated";
 
 // Comment events.
 pub const COMMENT_ADDED: &str = "comment:added";
+/// A durable deletion; retain the thread identity after the row is gone.
+pub const COMMENT_DELETED: &str = "comment:deleted";
 // Emitted by `comment.resolveThread` when a thread is (un)resolved. The
 // self-sufficient payload `{ noteId, threadId, resolved }` lets a client flip
 // the thread's resolved state without a follow-up read.
@@ -624,6 +631,11 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SCRIPT_OUTPUT,
     SCRIPT_STATE,
     SCRIPT_CHANGED,
+    SCRIPT_MONITOR_REGISTERED,
+    SCRIPT_MONITOR_COMPLETED,
+    SCRIPT_MONITOR_EXPIRED,
+    SCRIPT_MONITOR_TRIGGERED,
+    SCRIPT_MONITOR_CANCELLED,
     HOOK_SCHEDULED,
     HOOK_RUN_STARTED,
     HOOK_RUN_COMPLETED,
@@ -662,6 +674,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SPEC_UPDATED,
     GOAL_UPDATED,
     COMMENT_ADDED,
+    COMMENT_DELETED,
     COMMENT_RESOLVED,
     PRESENCE_CHANGED,
     NOTE_PRESENCE,
@@ -820,7 +833,7 @@ pub fn is_known_event_type(event_type: &str) -> bool {
 /// Owner-only by design (never listed): `terminal:*` (raw PTY bytes),
 /// `host:exec:*` (host command output), `script:*` (host process output /
 /// state), `browser:*` (the owner's tabs), `hook:run-*` (hook code and carried state),
-/// `agent:permission:*` (tool-permission prompts are the owner's to answer),
+/// `agent:permission:*` (separately admitted for current workspace managers),
 /// `workspace:transfer:*` and `git:clone:*` (host paths / transfer
 /// progress), `gitRoot:*` (host paths), `test:*` / `build:*` (host process
 /// results), `app:*` (steers a client's UI; owner clients only, like reverse
@@ -868,6 +881,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (CLIENT_DISCONNECTED, "Authenticated devices: same audience as client.list; final connection departed."),
     (CLIENT_UPDATED, "Authenticated devices: full row after metadata, profile or role changes; same audience as client.list."),
     (COMMENT_ADDED, "Comment: a comment landed on a note."),
+    (COMMENT_DELETED, "Comment: a comment was deleted from a note."),
     (COMMENT_RESOLVED, "Comment: a thread was resolved."),
     (DRAFT_CHANGED, "Draft: a client's composer draft exists or was cleared; { workspaceId, agentId, clientId, hasDraft } — never the text."),
     (FILE_CHANGED, "File: a watched file changed; payload paths are workspace-relative (`events::watcher::relative_path`), never absolute."),
@@ -899,6 +913,11 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (PR_MONITOR_EMITTED, "PR monitor: a debounced report was delivered; PR checklist state."),
     (PR_MONITOR_REGISTERED, "PR monitor: a monitor was registered; monitor and PR identity."),
     (PRESENCE_CHANGED, "Presence: the online members of a member workspace with their focus in that workspace and typing targets; principal profile fields already exposed by workspace.members.list. Transient."),
+    (SCRIPT_MONITOR_CANCELLED, "Script monitor: cancelled; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_COMPLETED, "Script monitor: completed; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_EXPIRED, "Script monitor: expired; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_REGISTERED, "Script monitor: registered; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
+    (SCRIPT_MONITOR_TRIGGERED, "Script monitor: triggered; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
     (SEARCH_DONE, "Search: a workspace-scoped search finished; correlated by the caller's requestId."),
     (SEARCH_RESULT, "Search: a page of workspace-scoped search matches; correlated by the caller's requestId."),
     (SKILLS_CHANGED, "Skills: the discovered skill set of a workspace changed; { workspaceId } only."),
@@ -941,7 +960,8 @@ pub fn is_collaborator_event_type(event_type: &str) -> bool {
 
 /// Additional types available to active host members. Workspace types still
 /// require effective access to the referenced ordinary workspace; global
-/// membership/context notifications have explicit delivery rules.
+/// membership/context notifications have explicit delivery rules. Permission
+/// types also admit guests with current workspace-management authority.
 pub const MEMBER_EVENT_TYPES: &[&str] = &[
     AGENT_PERMISSION_REQUEST,
     AGENT_PERMISSION_RESOLVED,
@@ -981,4 +1001,14 @@ pub const MEMBER_EVENT_TYPES: &[&str] = &[
 #[must_use]
 pub fn is_member_execution_event_type(event_type: &str) -> bool {
     MEMBER_EVENT_TYPES.contains(&event_type)
+}
+
+/// Permission events use the current workspace-management grant, including
+/// retained guest ownership, rather than general host execution authority.
+#[must_use]
+pub fn is_permission_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        AGENT_PERMISSION_REQUEST | AGENT_PERMISSION_RESOLVED
+    )
 }

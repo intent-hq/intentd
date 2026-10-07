@@ -18,6 +18,25 @@ use std::cell::Cell;
 /// buffer cap in `MainProcessTerminalManager.ts`.
 pub(crate) const DEFAULT_SCROLLBACK_BYTES: usize = 512 * 1024;
 
+/// Raw output bytes and their absolute half-open position in one PTY stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputChunk {
+    /// Raw output bytes (never input queued for the PTY).
+    pub bytes: Vec<u8>,
+    /// Inclusive byte position, counted from process creation.
+    pub start_offset: u64,
+    /// Exclusive byte position, unaffected by scrollback eviction.
+    pub end_offset: u64,
+}
+
+impl std::ops::Deref for OutputChunk {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// A contiguous snapshot of an oldest-indexed line window in the retained
 /// scrollback. `bytes` contains `start_line..end_line`, preserving the raw
 /// newline separators between those lines. When the window starts inside an
@@ -148,6 +167,27 @@ impl Scrollback {
         self.copy_range(self.buf.len().saturating_sub(max_bytes), self.buf.len())
     }
 
+    /// Snapshot bytes and positions together; the caller holds the fanout lock.
+    ///
+    /// # Panics
+    /// Panics if a retained buffer length cannot fit in `u64`.
+    #[must_use]
+    pub fn positioned_snapshot(&self, max_bytes: usize) -> OutputChunk {
+        let bytes = self.snapshot_tail(max_bytes);
+        OutputChunk {
+            start_offset: self.stream_offset
+                - u64::try_from(bytes.len()).expect("buffer length fits in u64"),
+            end_offset: self.stream_offset,
+            bytes,
+        }
+    }
+
+    /// Exclusive absolute byte position, including evicted output.
+    #[must_use]
+    pub fn end_offset(&self) -> u64 {
+        self.stream_offset
+    }
+
     /// Snapshot an oldest-indexed line window ending at `end_line` (or the
     /// current newest line when omitted), bounded to at most `max_lines`.
     /// Newline positions are maintained on append, so locating the requested
@@ -270,6 +310,17 @@ impl Scrollback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn positioned_snapshot_is_exact_above_javascript_integer_precision() {
+        let mut sb = Scrollback::new(8);
+        sb.stream_offset = 9_007_199_254_740_993;
+        sb.push(b"abcd");
+        let snapshot = sb.positioned_snapshot(2);
+        assert_eq!(snapshot.start_offset.to_string(), "9007199254740995");
+        assert_eq!(snapshot.end_offset.to_string(), "9007199254740997");
+        assert_eq!(snapshot.bytes, b"cd");
+    }
 
     #[test]
     fn retains_only_recent_bytes_when_over_budget() {

@@ -998,6 +998,29 @@ mod tests {
         assert_eq!(cell(&missing), "not-found");
     }
 
+    #[tokio::test]
+    async fn task_list_preserves_member_gate() {
+        let tmp = TempDb::new();
+        let f = fixture(&tmp).await;
+        for role in ROLES {
+            let result = f.run(role, f.services.task_list(f.ws.clone(), None)).await;
+            let expected = if matches!(role, Role::NonMember) {
+                "not-found"
+            } else {
+                "ok"
+            };
+            assert_eq!(cell(&result), expected, "task.list as {role:?}");
+        }
+        // Authorization precedes both status validation and the projected read.
+        let denied = f
+            .run(
+                Role::NonMember,
+                f.services.task_list(f.ws.clone(), Some("invalid".into())),
+            )
+            .await;
+        assert_eq!(cell(&denied), "not-found");
+    }
+
     /// Owner-only: the owner and every bound unconstrained caller pass; a
     /// collaborator member is `Forbidden`; a non-member stays `NotFound`.
     #[tokio::test]

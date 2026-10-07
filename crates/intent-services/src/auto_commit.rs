@@ -216,8 +216,19 @@ impl Services {
                 ..Default::default()
             };
             let mut sub = bus.subscribe(filter);
-            while let Some(events) = sub.recv().await {
+            loop {
+                let events = tokio::select! {
+                    biased;
+                    () = services.settings_tasks.closed() => break,
+                    events = sub.recv() => events,
+                };
+                let Some(events) = events else {
+                    break;
+                };
                 for event in events {
+                    if services.settings_tasks.is_closed() {
+                        break;
+                    }
                     services.handle_agent_idle_auto_commit(&event).await;
                 }
             }

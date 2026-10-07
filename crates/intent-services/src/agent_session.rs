@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use intent_acp::callback_registration::{CallbackClient, CallbackQuery, CallbackToolRoutes};
 use intent_acp::session::{
     self, ContentBlock, InitializeResponse, MappedToolCall, MappedUpdate, McpServer, Meta,
     SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
@@ -28,7 +29,7 @@ use intent_core::{
     now_epoch_ms, now_iso, ActorType, AgentId, AgentSession, ContextUsage, Error, EventActor,
     MessageOrigin, Result, UsageCost, WorkspaceId, WorkspaceStatus,
 };
-use intent_store::NewEvent;
+use intent_store::{NewEvent, RepositoryAcpCompatibilityResult};
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -37,7 +38,47 @@ use crate::agent_ops::{
     last_response_and_digest_from_blocks, live_response_and_digest_from_blocks,
 };
 use crate::image_dimensions::{self, ProbeContext};
+use crate::repository_admission::lifecycle::physical_owner::{
+    RepositoryCreationOwner, RepositoryPhysicalOwner,
+};
 use crate::{file_ops, token_usage, usage_stats, Services};
+
+/// Preserve live provider diagnostics without adding assistant content or
+/// changing turn/failure state. Also used when a notice arrives while idle.
+pub(crate) fn log_provider_notice(
+    notice: &session::Notice,
+    acp_session_id: Option<&str>,
+    agent_id: &AgentId,
+    workspace_id: Option<&WorkspaceId>,
+) {
+    use session::NoticeSeverity;
+    let severity = match &notice.severity {
+        NoticeSeverity::Info => "info",
+        NoticeSeverity::Warning => "warning",
+        NoticeSeverity::Error => "error",
+        NoticeSeverity::Other(value) => value.as_str(),
+        _ => "unknown",
+    };
+    macro_rules! log_notice {
+        ($level:expr) => {
+            tracing::event!(
+                $level,
+                agent = %agent_id,
+                workspace = workspace_id.map(WorkspaceId::as_str),
+                acp_session_id,
+                severity,
+                title = %notice.title,
+                description = notice.description.as_deref(),
+                "ACP provider notice"
+            )
+        };
+    }
+    match notice.severity {
+        NoticeSeverity::Info => log_notice!(tracing::Level::INFO),
+        NoticeSeverity::Error => log_notice!(tracing::Level::ERROR),
+        _ => log_notice!(tracing::Level::WARN),
+    }
+}
 
 /// Derive the cross-layer, content-free stream correlation value used only in
 /// diagnostics. The input is an existing wire `turnId` (or the assistant
@@ -136,8 +177,9 @@ pub(crate) const PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX: &str =
 pub(crate) const PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX: &str = "[turn streamed output]";
 
 /// Prefix marking a `session/prompt` failure that was recognized as
-/// sleep-induced (Task C): the turn died with a transient upstream disconnect
-/// (per [`intent_acp::is_transient_upstream_disconnect`]) whose active window
+/// sleep-induced: the turn died with a transient upstream disconnect or provider
+/// fetch failure (per [`intent_acp::is_transient_upstream_disconnect`] /
+/// [`intent_acp::is_transient_provider_fetch_failure`]) whose active window
 /// overlapped a detected host suspend (per the injected [`SuspendOverlapQuery`]).
 /// [`Services::run_prompt_turn`] enrolls such a turn as interrupted (persisting
 /// the partial with [`InterruptReason::SystemSuspend`] + an `interrupted_agent`
@@ -273,7 +315,38 @@ fn transient_prompt_retry_base_ms() -> u64 {
 /// A candidate session that has not changed the canonical stored ACP identity.
 pub(crate) struct PreparedAcpSession {
     pub response: session::NewSessionResponse,
+    pub query: Option<CallbackQuery>,
     stored: AgentSession,
+}
+
+/// Ordinary session response and independently confirmed original ownership.
+/// A failed ownership check must not replace a completed session response.
+pub(crate) struct RepositorySessionOutcome<T> {
+    pub response: T,
+    pub owner: Result<RepositoryPhysicalOwner>,
+    pub query: Option<CallbackQuery>,
+}
+
+struct PreparedAcpLoad {
+    response: session::LoadSessionResponse,
+    query: Option<CallbackQuery>,
+    stored: AgentSession,
+    session_id: String,
+}
+
+enum RepositoryLoadAttempt {
+    Skipped,
+    Failed(Error),
+}
+
+/// Preserve the legacy returned ID, including a descriptive submitted fallback.
+/// This value is never used as proof of physical ownership.
+pub(crate) fn compatibility_session_id(result: RepositoryAcpCompatibilityResult) -> String {
+    match result {
+        RepositoryAcpCompatibilityResult::Observed { session_id }
+        | RepositoryAcpCompatibilityResult::SubmittedFallback { session_id }
+        | RepositoryAcpCompatibilityResult::Committed { session_id, .. } => session_id,
+    }
 }
 
 /// Result of opening or resuming an ACP session: the canonical `acpSessionId`
@@ -352,6 +425,7 @@ impl ThoughtLevelOption {
 /// one (Zed's model), so thoughts interleave with text/tool blocks in stream
 /// order.
 struct Transcript {
+    callback_routes: Arc<CallbackToolRoutes>,
     /// Assistant `AgentMessage` id minted at turn start (the block-id prefix).
     message_id: String,
     blocks: Vec<Value>,
@@ -424,6 +498,7 @@ struct RecordedToolBlocks {
 impl Transcript {
     fn new(message_id: String) -> Self {
         Self {
+            callback_routes: Arc::default(),
             message_id,
             blocks: Vec::new(),
             text: String::new(),
@@ -440,6 +515,11 @@ impl Transcript {
             media_scan_pos: 0,
             media_refs_seen: 0,
         }
+    }
+
+    fn with_callback_routes(mut self, routes: Arc<CallbackToolRoutes>) -> Self {
+        self.callback_routes = routes;
+        self
     }
 
     /// Enable the Markdown image dimension probe for this turn's text blocks.
@@ -621,9 +701,10 @@ impl Transcript {
     ///
     /// `registered` is the canonical resource-item batch claimed from the
     /// turn-attachment registry (§7.1 deterministic attach) for this
-    /// completed call, if any. On a registry hit the batch is attached
-    /// directly and echo parsing is skipped; otherwise the legacy
-    /// lift/wrap-repair fallback inspects the echoed output.
+    /// terminal call, if any. On a registry hit the batch is attached even
+    /// after a later JS error or a status-only update, and echo parsing is
+    /// skipped; otherwise only a successful call's legacy lift/wrap-repair
+    /// inspects the echoed output.
     fn record_tool(
         &mut self,
         tc: &MappedToolCall,
@@ -751,51 +832,55 @@ impl Transcript {
                         .insert(tc.tool_call_id.clone(), rindex);
                     result_index = Some(rindex);
                 }
-                // §7.1: attach the standalone resource block(s) so the FE can
-                // render them directly (the items also stay in
-                // `tool_result.output` when the provider echoed them). The
-                // registry-claimed canonical batch wins (deterministic attach —
-                // no echo parsing); otherwise fall back to lifting a
-                // proposal-MIME resource item out of the echoed output.
-                // Gated on `completed` only — an errored tool must not surface
-                // an actionable ProposalCard. Asymmetry: a re-completion whose
-                // output DROPS the item leaves a previously appended block in
-                // place (the transcript is append-only; index-derived ids
-                // preclude removal).
-                if tc.status == "completed" {
-                    let items = if registered.is_empty() {
-                        crate::tool_block::lift_proposal_resource(output)
-                            .into_iter()
-                            .collect()
+            }
+            // §7.1: attach the standalone resource block(s) so the FE can
+            // render them directly (the items also stay in
+            // `tool_result.output` when the provider echoed them). The
+            // registry-claimed canonical batch wins (deterministic attach —
+            // no echo parsing); otherwise fall back to lifting a
+            // proposal-MIME resource item out of the echoed output.
+            // An errored tool may attach an already-created, registered
+            // proposal (the JS can throw after the binding succeeds), but
+            // must never lift an actionable card from an error's echo.
+            // Asymmetry: a re-completion whose
+            // output DROPS the item leaves a previously appended block in
+            // place (the transcript is append-only; index-derived ids
+            // preclude removal).
+            if tc.status == "completed" || !registered.is_empty() {
+                let items = if registered.is_empty() {
+                    tc.output
+                        .as_ref()
+                        .and_then(crate::tool_block::lift_proposal_resource)
+                        .into_iter()
+                        .collect()
+                } else {
+                    registered
+                };
+                for (i, item) in items.into_iter().enumerate() {
+                    // The first item upserts via `proposal_index` (patch
+                    // on re-completion); batch extras append. A claim
+                    // consumes its registry batch, so extras cannot
+                    // re-attach on a re-completion echo.
+                    if let Some(&pi) = (i == 0)
+                        .then(|| self.proposal_index.get(&tc.tool_call_id))
+                        .flatten()
+                    {
+                        let id = self.block_id(pi);
+                        self.blocks[pi] =
+                            crate::tool_block::build_proposal_resource_block(&id, &item);
+                        proposal_indices.push(pi);
                     } else {
-                        registered
-                    };
-                    for (i, item) in items.into_iter().enumerate() {
-                        // The first item upserts via `proposal_index` (patch
-                        // on re-completion); batch extras append. A claim
-                        // consumes its registry batch, so extras cannot
-                        // re-attach on a re-completion echo.
-                        if let Some(&pi) = (i == 0)
-                            .then(|| self.proposal_index.get(&tc.tool_call_id))
-                            .flatten()
-                        {
-                            let id = self.block_id(pi);
-                            self.blocks[pi] =
-                                crate::tool_block::build_proposal_resource_block(&id, &item);
-                            proposal_indices.push(pi);
-                        } else {
-                            self.flush_text();
-                            let pindex = self.blocks.len();
-                            let pid = self.block_id(pindex);
-                            self.blocks
-                                .push(crate::tool_block::build_proposal_resource_block(
-                                    &pid, &item,
-                                ));
-                            if i == 0 {
-                                self.proposal_index.insert(tc.tool_call_id.clone(), pindex);
-                            }
-                            proposal_indices.push(pindex);
+                        self.flush_text();
+                        let pindex = self.blocks.len();
+                        let pid = self.block_id(pindex);
+                        self.blocks
+                            .push(crate::tool_block::build_proposal_resource_block(
+                                &pid, &item,
+                            ));
+                        if i == 0 {
+                            self.proposal_index.insert(tc.tool_call_id.clone(), pindex);
                         }
+                        proposal_indices.push(pindex);
                     }
                 }
             }
@@ -1343,6 +1428,10 @@ pub(crate) struct HarnessWakeOutcome {
     /// signature of a failed post-interrupt recovery wake (a single bare
     /// newline accepted as `harness_wake_complete`).
     pub empty_response: bool,
+    /// An unfinished native tool exceeded the ordinary open-tool silence
+    /// budget. Error and failure events are already durable/published; the
+    /// manager must dispose of the provider without emitting successful idle.
+    pub failed: bool,
     /// Content-free correlation for the separately published idle stage.
     pub lifecycle: HarnessWakeLifecycle,
 }
@@ -1799,6 +1888,11 @@ fn build_session_meta(
         }
         _ => None,
     }
+}
+
+pub(crate) struct LocalPromptInput<'a> {
+    pub(crate) connection: &'a Connection,
+    pub(crate) captured: Option<crate::agent_manager::RepositoryPromptInput>,
 }
 
 impl Services {
@@ -2676,6 +2770,18 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<PreparedAcpSession> {
+        self.prepare_acp_session_with_callbacks(conn, None, agent_id, cwd, mcp_servers)
+            .await
+    }
+
+    pub(crate) async fn prepare_acp_session_with_callbacks(
+        &self,
+        conn: &Connection,
+        callbacks: Option<&CallbackClient>,
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<PreparedAcpSession> {
         // Load the session up front so the store write is scoped to the owning
         // workspace (the store's `set_acp_session_id` now requires it as a
         // defense-in-depth guard). This call is only reached after the caller
@@ -2709,11 +2815,22 @@ impl Services {
             "info",
         )
         .await;
-        let resp = session::new_session(conn, cwd, mcp_servers, meta)
-            .await
-            .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
+        let opened = if let Some(callbacks) = callbacks {
+            callbacks.new_session(cwd, mcp_servers, meta).await
+        } else {
+            session::new_session(conn, cwd, mcp_servers, meta)
+                .await
+                .map(
+                    |response| intent_acp::callback_registration::CallbackSession {
+                        response,
+                        query: None,
+                    },
+                )
+        }
+        .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
         Ok(PreparedAcpSession {
-            response: resp,
+            response: opened.response,
+            query: opened.query,
             stored,
         })
     }
@@ -2725,60 +2842,45 @@ impl Services {
         prepared: PreparedAcpSession,
         expected_old: Option<&str>,
     ) -> Result<AcpSessionOpened> {
-        let PreparedAcpSession {
-            response: resp,
-            stored,
-        } = prepared;
-        let candidate = resp.session_id.0.to_string();
+        let candidate = prepared.response.session_id.0.to_string();
         if candidate.is_empty() {
             return Err(Error::InvalidParams(
                 "Antigravity returned an empty session ID".into(),
             ));
         }
-        let workspace_id = &stored.workspace_id;
-        let agent_id = &stored.id;
-        // Use the existing transactional CAS even for first-set: an empty
-        // expected id cannot match a valid established session, while the
-        // store's None branch atomically initializes an unclaimed session.
         let canonical = self
             .store
             .replace_acp_session_id(
-                workspace_id,
-                agent_id,
+                &prepared.stored.workspace_id,
+                &prepared.stored.id,
                 expected_old.unwrap_or(""),
                 &candidate,
             )
             .await?;
-        if canonical != candidate {
+        self.finish_antigravity_acp_session(prepared, expected_old, canonical)
+            .await
+    }
+
+    /// Finish the original Antigravity candidate after its one persistence
+    /// operation. A canonical loser is never paired with this candidate's config.
+    pub(crate) async fn finish_antigravity_acp_session(
+        &self,
+        prepared: PreparedAcpSession,
+        expected_old: Option<&str>,
+        canonical: String,
+    ) -> Result<AcpSessionOpened> {
+        if canonical != prepared.response.session_id.0.as_ref() {
             return Err(Error::Conflict {
                 current: json!({"acpSessionId": canonical}),
             });
         }
-        if expected_old.is_some() {
-            self.clear_context_usage(agent_id);
-        }
-        self.persist_effective_model(
-            workspace_id,
-            agent_id,
-            stored.model.as_deref(),
-            resp.config_options.as_deref(),
-        )
-        .await;
-        let thought_level = discover_thought_level(resp.config_options.as_deref());
-        self.persist_session_effort_levels(workspace_id, agent_id, thought_level.as_ref())
-            .await;
-        Ok(AcpSessionOpened {
-            session_id: candidate,
-            modes: resp.modes,
-            config_options: resp.config_options.map(|options| json!(options)),
-            thought_level,
-        })
+        Ok(self
+            .finish_created_acp_session(prepared, canonical, expected_old.is_some())
+            .await)
     }
 
-    /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
-    /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
-    /// modes the provider advertised in `session/new` (used by the caller to
-    /// pick a permissive `session/set_mode` target from `availableModes`).
+    /// Open the first session with the ordinary write-once behavior when no
+    /// original repository creation context was available to the physical handle.
     pub(crate) async fn open_acp_session(
         &self,
         conn: &Connection,
@@ -2786,45 +2888,20 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<AcpSessionOpened> {
-        let PreparedAcpSession {
-            response: resp,
-            stored,
-        } = self
+        let prepared = self
             .prepare_acp_session(conn, agent_id, cwd, mcp_servers)
             .await?;
-        let workspace_id = stored.workspace_id.clone();
-        let acp_session_id = resp.session_id.0.to_string();
+        let session_id = prepared.response.session_id.0.to_string();
         self.store
-            .set_acp_session_id(&workspace_id, agent_id, &acp_session_id)
+            .set_acp_session_id(&prepared.stored.workspace_id, agent_id, &session_id)
             .await?;
-        self.persist_effective_model(
-            &workspace_id,
-            agent_id,
-            stored.model.as_deref(),
-            resp.config_options.as_deref(),
-        )
-        .await;
-        let thought_level = discover_thought_level(resp.config_options.as_deref());
-        self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
-            .await;
-        Ok(AcpSessionOpened {
-            session_id: acp_session_id,
-            modes: resp.modes,
-            config_options: resp.config_options.map(|options| json!(options)),
-            thought_level,
-        })
+        Ok(self
+            .finish_created_acp_session(prepared, session_id, false)
+            .await)
     }
 
-    /// Open a FRESH ACP session that REPLACES a lost/unsupported stored id (the
-    /// resume-impossible fallback): `session/new` then compare-and-swap the
-    /// persisted `acpSessionId` from `expected_old` (the id we just failed to
-    /// load) to the fresh one. Unlike [`open_acp_session`] (write-once first-set)
-    /// this is used ONLY when resume is impossible — `loadSession` unsupported or
-    /// `session/load` failed (§6.5). The CAS keeps the id canonical: if a
-    /// concurrent recreate already swapped it, the stored value is returned and
-    /// reused instead of being clobbered. Returns the canonical `acpSessionId`
-    /// with modes only when the freshly-opened session won the CAS — otherwise
-    /// the modes belong to some other session and callers must not act on them.
+    /// Preserve the original recreate/CAS result and accounting without an
+    /// original repository context. A losing candidate never supplies modes.
     pub(crate) async fn recreate_acp_session(
         &self,
         conn: &Connection,
@@ -2833,54 +2910,100 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<AcpSessionOpened> {
+        let prepared = self
+            .prepare_acp_session(conn, agent_id, cwd, mcp_servers)
+            .await?;
+        let canonical = self
+            .store
+            .replace_acp_session_id(
+                &prepared.stored.workspace_id,
+                agent_id,
+                expected_old,
+                &prepared.response.session_id.0,
+            )
+            .await?;
+        Ok(self
+            .finish_created_acp_session(prepared, canonical, true)
+            .await)
+    }
+
+    /// The original creator owns the actual ACP future and sole compatible
+    /// Store transaction. Neither a second SQL call nor a canonical ID supplies
+    /// ownership; its independently consumed owner stays with the caller.
+    pub(crate) async fn create_repository_acp_session(
+        &self,
+        conn: (&Connection, Option<&CallbackClient>),
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+        creation: RepositoryCreationOwner,
+        replacing: bool,
+    ) -> Result<RepositorySessionOutcome<AcpSessionOpened>> {
+        let (conn, callbacks) = conn;
+        let outcome = creation
+            .initialize_compatible(|| async {
+                let prepared = self
+                    .prepare_acp_session_with_callbacks(conn, callbacks, agent_id, cwd, mcp_servers)
+                    .await?;
+                Ok::<_, Error>((prepared.response.session_id.0.to_string(), prepared))
+            })
+            .await;
+        let mut prepared = outcome.producer?;
+        let query = prepared.query.take();
+        let canonical = compatibility_session_id(outcome.result?);
+        let response = self
+            .finish_created_acp_session(prepared, canonical, replacing)
+            .await;
+        Ok(RepositorySessionOutcome {
+            response,
+            owner: outcome.owner,
+            query,
+        })
+    }
+
+    async fn finish_created_acp_session(
+        &self,
+        prepared: PreparedAcpSession,
+        canonical: String,
+        replacing: bool,
+    ) -> AcpSessionOpened {
         let PreparedAcpSession {
             response: resp,
             stored,
-        } = self
-            .prepare_acp_session(conn, agent_id, cwd, mcp_servers)
-            .await?;
-        let workspace_id = stored.workspace_id.clone();
-        let new_acp_session_id = resp.session_id.0.to_string();
-        let canonical = self
-            .store
-            .replace_acp_session_id(&workspace_id, agent_id, expected_old, &new_acp_session_id)
-            .await?;
-        // On CAS loss the canonical id belongs to a session we did not open;
-        // our modes are meaningless for it and would target the wrong sid.
-        // The effective-model, thought-level, and effort-levels resolutions
-        // are skipped for the same reason — in particular the loser must NOT
-        // persist (or clear) `effort_levels`: its `None` means "CAS lost /
-        // unknown", not "the provider advertised no selector", and writing it
-        // would clobber what the winner just persisted.
-        let (modes, thought_level) = if canonical == new_acp_session_id {
-            // The old ACP session is gone: its last context-occupancy report
-            // no longer describes anything live, so drop it rather than serve
-            // a stale snapshot until the new session's first `usage_update`
-            // (intent-hq/intent#3797). Skipped on CAS loss — the winner owns
-            // the canonical session and this cleanup with it.
-            self.clear_context_usage(agent_id);
+            query: _,
+        } = prepared;
+        // On CAS loss the provider metadata belongs to the losing candidate.
+        // Preserve the winner's usage, effective model and effort metadata.
+        let (modes, thought_level) = if canonical == resp.session_id.0.as_ref() {
+            if replacing {
+                self.clear_context_usage(&stored.id);
+            }
             self.persist_effective_model(
-                &workspace_id,
-                agent_id,
+                &stored.workspace_id,
+                &stored.id,
                 stored.model.as_deref(),
                 resp.config_options.as_deref(),
             )
             .await;
             let thought_level = discover_thought_level(resp.config_options.as_deref());
-            self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
-                .await;
+            self.persist_session_effort_levels(
+                &stored.workspace_id,
+                &stored.id,
+                thought_level.as_ref(),
+            )
+            .await;
             (resp.modes, thought_level)
         } else {
             (None, None)
         };
-        Ok(AcpSessionOpened {
-            config_options: (canonical == new_acp_session_id)
+        AcpSessionOpened {
+            config_options: (canonical == resp.session_id.0.as_ref())
                 .then(|| json!(resp.config_options))
                 .filter(|v| !v.is_null()),
             session_id: canonical,
             modes,
             thought_level,
-        })
+        }
     }
 
     /// Resume the agent's persisted `acpSessionId` via `session/load`, but only
@@ -2895,6 +3018,60 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Option<AcpSessionOpened>> {
+        let Some(prepared) = self
+            .prepare_acp_load(conn, None, init, agent_id, cwd, mcp_servers)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.finish_acp_load(prepared).await))
+    }
+
+    pub(crate) async fn resume_repository_acp_session(
+        &self,
+        conn: (&Connection, Option<&CallbackClient>),
+        init: &InitializeResponse,
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+        creation: RepositoryCreationOwner,
+    ) -> Result<Option<RepositorySessionOutcome<AcpSessionOpened>>> {
+        let (conn, callbacks) = conn;
+        let outcome = creation
+            .initialize_compatible(|| async {
+                let prepared = self
+                    .prepare_acp_load(conn, callbacks, init, agent_id, cwd, mcp_servers)
+                    .await
+                    .map_err(RepositoryLoadAttempt::Failed)?
+                    .ok_or(RepositoryLoadAttempt::Skipped)?;
+                Ok((prepared.session_id.clone(), prepared))
+            })
+            .await;
+        let mut prepared = match outcome.producer {
+            Ok(prepared) => prepared,
+            Err(RepositoryLoadAttempt::Skipped) => return Ok(None),
+            Err(RepositoryLoadAttempt::Failed(error)) => return Err(error),
+        };
+        // session/load already returned its original response. The optional
+        // ownership read does not replace it or write another ACP session ID.
+        let query = prepared.query.take();
+        let response = self.finish_acp_load(prepared).await;
+        Ok(Some(RepositorySessionOutcome {
+            response,
+            owner: outcome.owner,
+            query,
+        }))
+    }
+
+    async fn prepare_acp_load(
+        &self,
+        conn: &Connection,
+        callbacks: Option<&CallbackClient>,
+        init: &InitializeResponse,
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<Option<PreparedAcpLoad>> {
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
         let Some(acp_session_id) = stored.acp_session_id.clone() else {
@@ -2969,25 +3146,56 @@ impl Services {
             "info",
         )
         .await;
-        let resp = session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta)
-            .await
-            .map_err(|e| map_acp_session_error("session/load", &e, &provider_id))?;
+        let opened = if let Some(callbacks) = callbacks {
+            callbacks
+                .load_session(&acp_session_id, cwd, mcp_servers, meta)
+                .await
+        } else {
+            session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta)
+                .await
+                .map(
+                    |response| intent_acp::callback_registration::CallbackSession {
+                        response,
+                        query: None,
+                    },
+                )
+        }
+        .map_err(|e| map_acp_session_error("session/load", &e, &provider_id))?;
+        Ok(Some(PreparedAcpLoad {
+            response: opened.response,
+            query: opened.query,
+            stored,
+            session_id: acp_session_id,
+        }))
+    }
+
+    async fn finish_acp_load(&self, prepared: PreparedAcpLoad) -> AcpSessionOpened {
+        let PreparedAcpLoad {
+            response: resp,
+            stored,
+            session_id,
+            query: _,
+        } = prepared;
         self.persist_effective_model(
-            &workspace_id,
-            agent_id,
+            &stored.workspace_id,
+            &stored.id,
             stored.model.as_deref(),
             resp.config_options.as_deref(),
         )
         .await;
         let thought_level = discover_thought_level(resp.config_options.as_deref());
-        self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
-            .await;
-        Ok(Some(AcpSessionOpened {
-            session_id: acp_session_id,
+        self.persist_session_effort_levels(
+            &stored.workspace_id,
+            &stored.id,
+            thought_level.as_ref(),
+        )
+        .await;
+        AcpSessionOpened {
+            session_id,
             modes: resp.modes,
             config_options: resp.config_options.map(|options| json!(options)),
             thought_level,
-        }))
+        }
     }
 
     /// Discard the `session/update` burst that `session/load` replays after a
@@ -2999,6 +3207,9 @@ impl Services {
     /// into the transcript. Draining them here mirrors TS's "drop `session/update`
     /// when there is no active streaming handler" gate (acp-provider.ts).
     ///
+    /// Live notices are preserved in diagnostics; only replay/cancelled content
+    /// is discarded. Neither kind opens a turn or changes failure state.
+    ///
     /// Bounded so it cannot hang: empty whatever is already buffered with
     /// non-blocking `try_recv`, then wait out a short settle window for stragglers
     /// that may land just after `load_session` resolved (a per-message `recv`
@@ -3007,21 +3218,39 @@ impl Services {
     /// resume path is acceptable.
     pub(crate) async fn drain_replay_notifications(
         notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
+        agent_id: &AgentId,
+        workspace_id: Option<&WorkspaceId>,
     ) {
         use tokio::time::{timeout, Duration, Instant};
         const SETTLE: Duration = Duration::from_millis(50);
         const CAP: Duration = Duration::from_millis(500);
+        let log_notice = |note: IncomingNotification| {
+            // Notices are live diagnostics, never replayed conversation. Avoid
+            // parsing/accumulating the discarded historical text and tool payloads.
+            if note.params["update"]["sessionUpdate"] == "notice" {
+                if let Some(MappedUpdate::Notice(notice)) = session::map_notification(&note) {
+                    log_provider_notice(
+                        &notice,
+                        note.params["sessionId"].as_str(),
+                        agent_id,
+                        workspace_id,
+                    );
+                }
+            }
+        };
         let deadline = Instant::now() + CAP;
         loop {
-            while notifications.try_recv().is_ok() {}
+            while let Ok(note) = notifications.try_recv() {
+                log_notice(note);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match timeout(SETTLE.min(remaining), notifications.recv()).await {
-                Ok(Some(_)) => {} // a straggler arrived → keep draining
-                Ok(None) | Err(_) => break, // channel closed
-                                   // quiet for the settle window → done
+                Ok(Some(note)) => log_notice(note), // a straggler arrived → keep draining
+                Ok(None) | Err(_) => break,         // channel closed
+                                                     // quiet for the settle window → done
             }
         }
     }
@@ -3047,11 +3276,45 @@ impl Services {
         prompt: Vec<ContentBlock>,
         turn_id: Option<&str>,
     ) -> Result<StopReason> {
+        self.run_prompt_turn_captured(
+            conn,
+            notifications,
+            agent_id,
+            workspace_id,
+            acp_session_id,
+            prompt,
+            turn_id,
+            None,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the ordinary turn inputs with one owned original prompt capture"
+    )]
+    pub(crate) async fn run_prompt_turn_captured(
+        &self,
+        conn: &crate::agent_manager::runtime::Runtime<'_>,
+        notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        acp_session_id: &str,
+        prompt: Vec<ContentBlock>,
+        turn_id: Option<&str>,
+        mut local: Option<LocalPromptInput<'_>>,
+    ) -> Result<StopReason> {
         // Mint the assistant message id at turn START (CS-0 D1) so streaming
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();
         trace_stream_correlation_mapping(&message_id, turn_id);
         let mut transcript = Transcript::new(message_id.clone())
+            .with_callback_routes(
+                local
+                    .as_ref()
+                    .map(|input| input.connection.callback_tool_routes())
+                    .unwrap_or_default(),
+            )
             .with_probe_context(self.image_probe_context(agent_id, workspace_id).await);
         // Turn wall-clock start, for the global usage-stats longest-run MAX.
         let turn_started = std::time::Instant::now();
@@ -3191,63 +3454,83 @@ impl Services {
         );
         let mut stall_emitted = false;
         let result = loop {
-            let prompt_fut = conn.prompt(acp_session_id, prompt.clone(), &activity);
-            tokio::pin!(prompt_fut);
-            let attempt_result = loop {
-                tokio::select! {
-                    res = &mut prompt_fut => break res,
-                    maybe = notifications.recv(), if !closed => match maybe {
-                        Some(note) => {
-                            activity.touch();
-                            self.clear_stream_stall(&mut stall_emitted, workspace_id, agent_id)
-                                .await;
-                            any_update_received = true;
-                            updates_applied |= self
-                                .route_notification(&note, agent_id, workspace_id, &mut transcript)
-                                .await;
-                        }
-                        None => closed = true,
-                    },
-                    () = tokio::time::sleep(stall_check) => {
-                        let silent_ms = activity.idle_ms();
-                        let tool_call_open = transcript.open_tool_call_count() > 0;
-                        let advisory_threshold_ms = if tool_call_open {
-                            open_tool_stall_ms
-                        } else {
-                            stall_threshold_ms
+            let attempt_result = {
+                let prompt_fut = async {
+                    if let Some(input) = local.as_mut() {
+                        let guidance = match input.captured.as_mut() {
+                            Some(original) => original.prepare().await,
+                            None => None,
                         };
-                        if !stall_emitted && silent_ms >= advisory_threshold_ms {
-                            stall_emitted = true;
-                            tracing::warn!(
-                                agent = %agent_id,
-                                silent_ms,
-                                tool_call_open,
-                                "mid-turn stream stall — no session/update past threshold (monorepo#3402)"
-                            );
-                            self.publish_stalled_status_event(workspace_id, agent_id, silent_ms)
-                                .await;
-                        }
-                        let terminal_ms = if tool_call_open {
-                            open_tool_terminal_ms
-                        } else {
-                            stall_terminal_ms
-                        };
-                        if silent_ms >= terminal_ms {
-                            let open_tool_call = transcript.open_tool_call_label();
-                            tracing::warn!(
-                                agent = %agent_id,
-                                silent_ms,
-                                terminal_ms,
-                                open_tool_call = open_tool_call.as_deref().unwrap_or("none"),
-                                "provider stall — no session/update past the terminal threshold; failing the turn (intent#5395)"
-                            );
-                            break Err(AcpError::ProviderStall {
-                                silent: Duration::from_millis(silent_ms),
-                                open_tool_call,
-                            });
+                        session::prompt_with_guidance(
+                            input.connection,
+                            acp_session_id,
+                            prompt.clone(),
+                            &activity,
+                            guidance,
+                        )
+                        .await
+                    } else {
+                        conn.prompt(acp_session_id, prompt.clone(), &activity).await
+                    }
+                };
+                tokio::pin!(prompt_fut);
+                let attempt_result = loop {
+                    tokio::select! {
+                        res = &mut prompt_fut => break res,
+                        maybe = notifications.recv(), if !closed => match maybe {
+                            Some(note) => {
+                                activity.touch();
+                                self.clear_stream_stall(&mut stall_emitted, workspace_id, agent_id)
+                                    .await;
+                                any_update_received = true;
+                                updates_applied |= self
+                                    .route_notification(&note, agent_id, workspace_id, &mut transcript)
+                                    .await;
+                            }
+                            None => closed = true,
+                        },
+                        () = tokio::time::sleep(stall_check) => {
+                            let silent_ms = activity.idle_ms();
+                            let tool_call_open = transcript.open_tool_call_count() > 0;
+                            let advisory_threshold_ms = if tool_call_open {
+                                open_tool_stall_ms
+                            } else {
+                                stall_threshold_ms
+                            };
+                            if !stall_emitted && silent_ms >= advisory_threshold_ms {
+                                stall_emitted = true;
+                                tracing::warn!(
+                                    agent = %agent_id,
+                                    silent_ms,
+                                    tool_call_open,
+                                    "mid-turn stream stall — no session/update past threshold (monorepo#3402)"
+                                );
+                                self.publish_stalled_status_event(workspace_id, agent_id, silent_ms)
+                                    .await;
+                            }
+                            let terminal_ms = if tool_call_open {
+                                open_tool_terminal_ms
+                            } else {
+                                stall_terminal_ms
+                            };
+                            if silent_ms >= terminal_ms {
+                                let open_tool_call = transcript.open_tool_call_label();
+                                tracing::warn!(
+                                    agent = %agent_id,
+                                    silent_ms,
+                                    terminal_ms,
+                                    open_tool_call = open_tool_call.as_deref().unwrap_or("none"),
+                                    "provider stall — no session/update past the terminal threshold; failing the turn (intent#5395)"
+                                );
+                                break Err(AcpError::ProviderStall {
+                                    silent: Duration::from_millis(silent_ms),
+                                    open_tool_call,
+                                });
+                            }
                         }
                     }
-                }
+                };
+                attempt_result
             };
             // Drain updates buffered before this attempt settled BEFORE the
             // retry decision: `prompt_fut` can win the `select!` with streamed
@@ -3286,6 +3569,10 @@ impl Services {
                         delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                         "transient provider fetch failure — retrying session/prompt (monorepo#3007)"
                     );
+                    if let Some(original) = local.as_mut().and_then(|input| input.captured.as_mut())
+                    {
+                        original.recapture();
+                    }
                     tokio::time::sleep(delay).await;
                     // Re-drain after the backoff: a straggling update (or a
                     // channel close) can land DURING the sleep, and
@@ -3437,9 +3724,9 @@ impl Services {
         // append consumes `blocks`, used for the pending-proposals recording
         // below (PROTOCOL §5.5).
         let proposal_ids = crate::tool_block::proposal_ids_in(&blocks);
-        // Sleep-induced turn failure (Task C): the turn died with a transient
-        // upstream disconnect AND a detected host suspend overlapped its active
-        // window `[turn_started, now]`. Enroll it as interrupted (so the wake
+        // Sleep-induced turn failure: the turn died with a transient upstream
+        // disconnect or provider-fetch failure AND a host suspend overlapped
+        // its active window `[turn_started, now]`. Enroll it as interrupted (so the wake
         // orchestrator in Task D can resume it via `session/load`) instead of
         // surfacing a hard terminal failure. Gated on an injected
         // [`SuspendOverlapQuery`]: absent (read-only / unit wiring, or
@@ -3450,7 +3737,9 @@ impl Services {
         // resume preserves the partial turn, which a fresh-child redrive would
         // not. `PromptIdleTimeout` is classified non-transient, so an idle
         // timeout never routes here.
-        let suspend_interrupt = matches!(&result, Err(e) if intent_acp::is_transient_upstream_disconnect(e))
+        let suspend_interrupt = matches!(&result, Err(e)
+            if intent_acp::is_transient_upstream_disconnect(e)
+                || intent_acp::is_transient_provider_fetch_failure(e))
             && self
                 .suspend_tracker
                 .as_ref()
@@ -3717,7 +4006,7 @@ impl Services {
                 .lock()
                 .ok()
                 .and_then(|mut chain| chain.remove(agent_id));
-            let handle = intent_core::spawn_daemon(async move {
+            let handle = self.store_tasks.spawn_draining(async move {
                 if let Some(prev) = prev {
                     let _ = prev.await;
                 }
@@ -3766,8 +4055,10 @@ impl Services {
                         .await;
                 }
             });
-            if let Ok(mut chain) = self.turn_bookkeeping.lock() {
-                chain.insert(agent_id.clone(), handle);
+            if let Some(handle) = handle {
+                if let Ok(mut chain) = self.turn_bookkeeping.lock() {
+                    chain.insert(agent_id.clone(), handle);
+                }
             }
         }
         // Post-output transient fetch failure (intent-hq/intent#5419): the
@@ -4263,8 +4554,23 @@ impl Services {
         })
     }
 
-    /// Enroll a sleep-induced turn failure (Task C): a transient upstream
-    /// disconnect whose active window overlapped a detected host suspend. The
+    pub(crate) fn schedule_suspend_self_heal(&self, debounce: Duration) -> bool {
+        let services = self.clone();
+        let tasks = self.settings_tasks.clone();
+        self.settings_tasks
+            .spawn_draining(async move {
+                tokio::select! {
+                    biased;
+                    () = tasks.closed() => return,
+                    () = tokio::time::sleep(debounce) => {}
+                }
+                services.resume_suspend_interrupted_agents().await;
+            })
+            .is_some()
+    }
+
+    /// Enroll a sleep-induced turn failure: a transient upstream disconnect or
+    /// provider-fetch failure whose active window overlapped a host suspend. The
     /// partial turn is persisted tagged [`InterruptReason::SystemSuspend`]
     /// (empty blocks still record a row — every interruption is durably
     /// anchored), an `interrupted_agent` row is written with `prev_status` = the
@@ -4365,12 +4671,7 @@ impl Services {
                 // delivered by the worker's own end-of-turn drain
                 // (intent-hq/intent#4972). The row's atomic claim dedupes
                 // against a racing wake sweep / `resolveInterrupted`.
-                let services = self.clone();
-                let debounce = wake_resume_self_heal_debounce();
-                intent_core::spawn_daemon(async move {
-                    tokio::time::sleep(debounce).await;
-                    services.resume_suspend_interrupted_agents().await;
-                });
+                self.schedule_suspend_self_heal(wake_resume_self_heal_debounce());
             }
             Err(e) => {
                 // Fail-soft: the interrupted terminal state is still emitted
@@ -4455,6 +4756,13 @@ impl Services {
     /// (`None` when the burst persisted nothing), the empty-response
     /// classification (intent-hq/monorepo#3262), and the content-free
     /// correlation needed by the caller's later idle diagnostic.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retain the ordinary driver for callers without a connection route table"
+        )
+    )]
     pub(crate) async fn run_harness_wake_turn(
         &self,
         notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
@@ -4463,9 +4771,30 @@ impl Services {
         workspace_id: &WorkspaceId,
         settle: std::time::Duration,
     ) -> HarnessWakeOutcome {
+        self.run_harness_wake_turn_with_routes(
+            notifications,
+            first,
+            agent_id,
+            workspace_id,
+            settle,
+            Arc::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn run_harness_wake_turn_with_routes(
+        &self,
+        notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
+        first: IncomingNotification,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        settle: std::time::Duration,
+        routes: Arc<CallbackToolRoutes>,
+    ) -> HarnessWakeOutcome {
         let turn_started = Instant::now();
         let message_id = Uuid::now_v7().to_string();
         let mut transcript = Transcript::new(message_id.clone())
+            .with_callback_routes(routes)
             .with_probe_context(self.image_probe_context(agent_id, workspace_id).await);
         // Live-turn slot + abort-safe guard, same contract as a prompt turn:
         // a `chat.subscribe` arriving mid-wake reconstructs the partial
@@ -4485,22 +4814,38 @@ impl Services {
         let mut updates_applied = self
             .route_notification(&first, agent_id, workspace_id, &mut transcript)
             .await;
-        // Drain until quiescence: each received notification re-arms the
-        // settle window; the window elapsing (or the channel closing)
-        // finalizes the turn. Polled in short ticks so a user send that
+        // Drain until quiescence, but an unfinished native tool (including
+        // Codex compaction) is still work during silence. Keep its ownership
+        // recoverable until a terminal update or the existing open-tool
+        // silence budget. Every notification resets that budget. A zero
+        // settle window still hands the receiver straight to a prompt owner.
+        // Polled in short ticks so a user send that
         // raced in (queued behind this turn's slot) preempts promptly —
         // finalize first, then the caller hands the receiver off to the
         // drained prompt turn.
         let mut last_update = tokio::time::Instant::now();
+        let open_tool_timeout = Duration::from_millis(open_tool_call_terminal_ms());
+        let mut failure = None;
         loop {
-            if self.has_ready_to_send(agent_id) {
+            if settle.is_zero() || self.has_ready_to_send(agent_id) {
                 break;
             }
+            let tool_open = transcript.open_tool_call_count() > 0;
+            let quiet_window = if tool_open { open_tool_timeout } else { settle };
             let elapsed = last_update.elapsed();
-            if elapsed >= settle {
+            if elapsed >= quiet_window {
+                if tool_open {
+                    failure = Some(
+                        AcpError::ProviderStall {
+                            silent: elapsed,
+                            open_tool_call: transcript.open_tool_call_label(),
+                        }
+                        .to_string(),
+                    );
+                }
                 break;
             }
-            let tick = settle
+            let tick = quiet_window
                 .saturating_sub(elapsed)
                 .min(std::time::Duration::from_millis(50));
             match tokio::time::timeout(tick, notifications.recv()).await {
@@ -4612,6 +4957,26 @@ impl Services {
         }
         // Pin-respecting, same as the prompt-turn end above (monorepo#2110).
         self.clear_unpinned_live_turn(agent_id);
+        let persisted_error = if let Some(error) = &failure {
+            let persisted = crate::agent_manager::persist_terminal_error_status_via_services(
+                self,
+                agent_id,
+                workspace_id,
+                error,
+            )
+            .await;
+            if let Err(raise_error) = self.agent_request_attention_op(
+                workspace_id.clone(),
+                "blocker".to_string(),
+                format!("Unsolicited provider activity stopped: {error}. Retry the agent to continue."),
+                Some(agent_id.clone()),
+            ).await {
+                tracing::warn!(agent = %agent_id, error = %raise_error, "failed to raise attention for stalled native tool");
+            }
+            Some(persisted)
+        } else {
+            None
+        };
         let mut end_data = json!({ "agentId": agent_id.0 });
         if message_persisted {
             end_data["messageId"] = json!(message_id);
@@ -4625,13 +4990,37 @@ impl Services {
             "agent_stream_end",
             Some(turn_started.elapsed()),
             block_count,
-            "complete",
+            if failure.is_some() {
+                "failed"
+            } else {
+                "complete"
+            },
         );
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
+        if let Some(error) = &failure {
+            self.flush_deferred_attention(agent_id, workspace_id).await;
+            self.publish_agent_event(
+                workspace_id,
+                agent_id,
+                AGENT_FAILED,
+                json!({ "agentId": agent_id.0, "error": error }),
+            )
+            .await;
+        }
+        if let Some(error) = &persisted_error {
+            crate::agent_manager::publish_terminal_error_status_via_services(
+                self,
+                agent_id,
+                workspace_id,
+                error,
+            )
+            .await;
+        }
         HarnessWakeOutcome {
             message_id: message_persisted.then_some(message_id.clone()),
             empty_response,
+            failed: failure.is_some(),
             lifecycle: HarnessWakeLifecycle {
                 correlation_id: message_id,
                 block_count,
@@ -5222,7 +5611,9 @@ impl Services {
         workspace_id: &WorkspaceId,
         transcript: &mut Transcript,
     ) -> bool {
-        let Some(mapped) = session::map_notification(note) else {
+        let Some(mapped) =
+            session::map_notification_with_callback_routes(note, &transcript.callback_routes)
+        else {
             return false;
         };
         let message_id = transcript.message_id.clone();
@@ -5265,6 +5656,12 @@ impl Services {
                     "blockId": transcript.block_id(block_index),
                     "blockType": block_type,
                 });
+                if let Some(t) = &text {
+                    // UTF-8 byte position within this block, not the turn.
+                    // A recovery snapshot can already contain this chunk by
+                    // the time a standing subscriber consumes its event.
+                    delta["textOffset"] = json!(transcript.text.len() - t.len());
+                }
                 if let Some(media) = media {
                     delta["media"] = Value::Object(media);
                 }
@@ -5296,6 +5693,16 @@ impl Services {
                     .await;
                 }
             }
+            MappedUpdate::Notice(notice) => {
+                log_provider_notice(
+                    &notice,
+                    note.params["sessionId"].as_str(),
+                    agent_id,
+                    Some(workspace_id),
+                );
+                // Diagnostics are not output: preserve silent-redrive eligibility.
+                return false;
+            }
             MappedUpdate::Usage(usage) => {
                 // Context-window occupancy (intent-hq/intent#3797): recorded
                 // latest-wins in the in-memory per-agent registry — a signal
@@ -5317,7 +5724,7 @@ impl Services {
             }
             MappedUpdate::ToolCall(tc) => {
                 // §7.1 deterministic attach: claim the pending `AtToolResult`
-                // registry batch for this completed call (nonce match against
+                // registry batch for this terminal call (nonce match against
                 // the echoed output, `workspace_api` FIFO fallback). A hit
                 // yields the canonical resource items to attach — no echo
                 // parsing; a miss falls back to the legacy lift inside
@@ -5327,7 +5734,7 @@ impl Services {
                 // freshest input — withheld once the call was identified
                 // authoritatively (intent-hq/intent#4491).
                 let known = transcript.tool_name_for(&tc.tool_call_id).is_some();
-                let registered: Vec<Value> = if tc.status == "completed" {
+                let registered: Vec<Value> = if matches!(tc.status, "completed" | "error") {
                     let name = transcript
                         .tool_name_for(&tc.tool_call_id)
                         .unwrap_or(&tc.tool_name)

@@ -275,6 +275,10 @@ impl Services {
         if added {
             let _ = self.host_membership_event(intent_core::events::HOST_MEMBERS_CHANGED,
                 json!({"revision":revision,"principalId":principal.id,"hostRole":"member","action":"added"})).await;
+            // Remaining workspace guests cannot receive the global event.
+            // An offline promotion can leave both the online roster and member
+            // count unchanged, but they still need to refresh effective roles.
+            self.emit_presence_for_memberships(&principal.id).await;
         }
         self.host_invite_event(&invite.id, "redeemed").await;
         Ok(

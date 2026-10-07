@@ -56,6 +56,7 @@ pub(crate) enum HostMethod {
     FindApp,
     ListInstalledEditors,
     ProviderDiscovery,
+    PrepareProviderAdapters,
     /// Daemon-owned provider auth probes (`host.providerAuthStatus`, §5.14):
     /// `{ providerId?, force? }` → `{ providers: [{ id, authenticated,
     /// identity? }] }` with `authenticated: true | false | null` and the
@@ -130,6 +131,7 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
         "host.findApp" => HostMethod::FindApp,
         "host.listInstalledEditors" => HostMethod::ListInstalledEditors,
         "host.providerDiscovery" => HostMethod::ProviderDiscovery,
+        "host.prepareProviderAdapters" => HostMethod::PrepareProviderAdapters,
         "host.providerAuthStatus" => HostMethod::ProviderAuthStatus,
         "host.providerTestPrompt" => HostMethod::ProviderTestPrompt,
         "host.openInEditor" => HostMethod::OpenInEditor,
@@ -215,7 +217,16 @@ pub(crate) async fn handle(
     is_local: bool,
     reverse: &ReverseChannel,
 ) -> Option<String> {
-    handle_with_host_environment(req, api, bus, None, is_local, reverse).await
+    handle_with_host_environment(
+        req,
+        api,
+        bus,
+        None,
+        is_local,
+        reverse,
+        &intent_services::host_exec::HostExecRuntime::default(),
+    )
+    .await
 }
 
 pub(crate) async fn handle_with_host_environment(
@@ -225,6 +236,7 @@ pub(crate) async fn handle_with_host_environment(
     host_environment: Option<HostEnvironment>,
     is_local: bool,
     reverse: &ReverseChannel,
+    exec_runtime: &intent_services::host_exec::HostExecRuntime,
 ) -> Option<String> {
     let HostRequest {
         method,
@@ -416,6 +428,28 @@ pub(crate) async fn handle_with_host_environment(
                 .await
                 .unwrap_or_else(|_| json!({ "tools": {} }));
             success_frame(&id_echo, &result)
+        }
+        HostMethod::PrepareProviderAdapters => {
+            let ids = params.get("providerIds").and_then(Value::as_array);
+            let valid = params.len() == 1
+                && ids.is_some_and(|ids| {
+                    ids.len() <= 32
+                        && ids.iter().all(|id| {
+                            id.as_str()
+                                .is_some_and(|id| !id.is_empty() && id.len() <= 64)
+                        })
+                });
+            if !valid {
+                return id_present.then(|| error_frame(&id_echo, -32602, "Expected only providerIds: at most 32 non-empty strings of at most 64 bytes"));
+            }
+            api.prepare_provider_adapters(
+                ids.unwrap()
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            );
+            success_frame(&id_echo, &json!({"accepted": true}))
         }
         HostMethod::ProviderDiscovery => {
             // `providers.paths` overrides live in settings, above the
@@ -638,7 +672,7 @@ pub(crate) async fn handle_with_host_environment(
                     return Some(error_frame(&id_echo, e.code, &e.message));
                 }
             };
-            match intent_services::host_exec::run_default(api, parsed).await {
+            match exec_runtime.run(api, parsed).await {
                 Ok(v) => success_frame(&id_echo, &v),
                 Err(e) => error_frame(&id_echo, e.code, &e.message),
             }

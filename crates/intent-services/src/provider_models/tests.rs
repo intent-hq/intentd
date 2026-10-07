@@ -1930,7 +1930,7 @@ fn codex_probe_launch_enforces_both_subagent_settings() {
     let cmd = super::codex_probe_launch(Some(std::path::PathBuf::from("/usr/local/bin/npx")))
         .expect("npx must produce a probe command");
     let removed = cmd.removed_env_vars();
-    assert!(removed.iter().any(|k| k == "CODEX_PATH"));
+    assert!(!removed.iter().any(|k| k == "CODEX_PATH"));
     assert!(!removed.iter().any(|k| k == "CODEX_CONFIG"));
     let config = cmd
         .env_vars()
@@ -2081,6 +2081,36 @@ fn exit_attribution_rewrites_generic_errors_on_unsuccessful_exit() {
     // The tail must include the actual cause, not just npm's final log-path line.
     assert!(detail.contains("ENOENT"), "detail: {detail}");
     assert!(detail.contains("complete log"), "detail: {detail}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn probe_preserves_npm_missing_package_cause_before_boilerplate() {
+    use super::probe::{run_acp_probe, AcpProbeCommand};
+    // Reproduce the captured npm output without invoking npm or touching a cache.
+    let script = r"cat >&2 <<'STDERR'
+npm error code ENOENT
+npm error syscall open
+npm error path /Users/clement/.npm/_npx/39d488c67d3fe4d0/package.json
+npm error errno -2
+npm error enoent Could not read package.json: Error: ENOENT: no such file or directory, open '/Users/clement/.npm/_npx/39d488c67d3fe4d0/package.json'
+npm error enoent This is related to npm not being able to find a file.
+npm error enoent
+npm error A complete log of this run can be found in: /Users/clement/.npm/_logs/2026-10-04T23_21_43_314Z-debug-0.log
+STDERR
+exit 254";
+    let cmd = AcpProbeCommand::binary("/bin/sh".into(), vec!["-c".into(), script.into()]);
+    let fetch = finish("codex", run_acp_probe(cmd, |_| Vec::new()).await);
+    assert!(fetch.models.is_none());
+    let warning = fetch.warning.expect("failed probe must have a warning");
+    assert!(warning.starts_with("codex: adapter exited before reporting models"));
+    assert!(warning.contains("254"), "{warning}");
+    assert!(warning.contains("ENOENT"), "{warning}");
+    assert!(warning.contains("open"), "{warning}");
+    assert!(
+        warning.contains("/Users/clement/.npm/_npx/39d488c67d3fe4d0/package.json"),
+        "{warning}"
+    );
 }
 
 #[cfg(unix)]
@@ -2434,4 +2464,47 @@ fn auth_required_detection() {
     assert!(is_auth_required_error(-32000, "please sign in first"));
     assert!(!is_auth_required_error(-32000, "internal error"));
     assert!(!is_auth_required_error(0, "model not found"));
+}
+
+#[test]
+fn installed_cli_probe_copies_routing_credentials_but_not_tools_or_hooks() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"
+profile = "gateway"
+[profiles.gateway]
+model = "new-model"
+model_provider = "gateway"
+model_reasoning_effort = "high"
+[model_providers.gateway]
+name = "Gateway"
+base_url = "https://gateway.example/v1"
+env_key = "GATEWAY_TOKEN"
+wire_api = "responses"
+[model_providers.gateway.env_http_headers]
+X-Token = "HEADER_TOKEN"
+[mcp_servers.untrusted]
+command = "must-not-run"
+[hooks]
+command = "must-not-run"
+"#,
+    )
+    .unwrap();
+    let seed = super::minimal_codex_config_seed(&path).unwrap();
+    let parsed: toml_edit::DocumentMut = seed.parse().unwrap();
+    assert_eq!(parsed["model"].as_str(), Some("new-model"));
+    assert_eq!(parsed["model_reasoning_effort"].as_str(), Some("high"));
+    assert_eq!(parsed["model_provider"].as_str(), Some("gateway"));
+    assert_eq!(
+        parsed["model_providers"]["gateway"]["env_key"].as_str(),
+        Some("GATEWAY_TOKEN")
+    );
+    assert_eq!(
+        parsed["model_providers"]["gateway"]["env_http_headers"]["X-Token"].as_str(),
+        Some("HEADER_TOKEN")
+    );
+    assert!(parsed.get("mcp_servers").is_none());
+    assert!(parsed.get("hooks").is_none());
 }

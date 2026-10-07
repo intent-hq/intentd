@@ -115,6 +115,14 @@ pub type IdentityGuard = Arc<
         + Sync,
 >;
 
+/// Optional daemon-owned persistence. The opaque grant and lease must be
+/// registered with a completion owner before executing their blocking write.
+pub type GrantPersistence = Arc<
+    dyn Fn(GithubGrant, Option<IdentityLease>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Opaque in-flight flow handle returned by [`start`]. Holds the secret
 /// `device_code` privately; intentionally no `Debug`/`Serialize`.
 pub struct DeviceFlow {
@@ -126,6 +134,7 @@ pub struct DeviceFlow {
     /// Optional pre-persist hook plus the API base its client talks to
     /// (`None` = api.github.com).
     identity_guard: Option<(Option<String>, IdentityGuard)>,
+    persistence: Option<GrantPersistence>,
 }
 
 /// The production login host the device flow talks to.
@@ -172,6 +181,30 @@ pub async fn start_at(
     client_id: &str,
     scopes: &[&str],
 ) -> Result<(DeviceAuthorization, DeviceFlow)> {
+    start_at_store(base_uri, client_id, scopes, None).await
+}
+
+/// Start a flow with its destination fixed before construction, without
+/// consulting or migrating the machine's default secret store.
+///
+/// # Errors
+///
+/// Returns the same configuration and HTTP errors as [`start_at`].
+pub async fn start_at_with_store(
+    base_uri: &str,
+    client_id: &str,
+    scopes: &[&str],
+    store: FileSecretStore,
+) -> Result<(DeviceAuthorization, DeviceFlow)> {
+    start_at_store(base_uri, client_id, scopes, Some(store)).await
+}
+
+async fn start_at_store(
+    base_uri: &str,
+    client_id: &str,
+    scopes: &[&str],
+    store: Option<FileSecretStore>,
+) -> Result<(DeviceAuthorization, DeviceFlow)> {
     if client_id.trim().is_empty() {
         return Err(Error::Config(
             "github device flow requires a non-empty oauth client id \
@@ -193,8 +226,9 @@ pub async fn start_at(
         client_id,
         device_code: SecretString::from(codes.device_code),
         interval: codes.interval,
-        store: FileSecretStore::new(),
+        store: store.unwrap_or_default(),
         identity_guard: None,
+        persistence: None,
     };
     Ok((auth, flow))
 }
@@ -212,6 +246,15 @@ impl DeviceFlow {
     #[must_use]
     pub fn with_identity_guard(mut self, api_base_uri: Option<&str>, guard: IdentityGuard) -> Self {
         self.identity_guard = Some((api_base_uri.map(str::to_string), guard));
+        self
+    }
+
+    /// Install an owner that retains the actual write result and required
+    /// continuation beyond caller wait budgets. The default bounded API stays
+    /// unchanged when no owner is installed.
+    #[must_use]
+    pub fn with_persistence(mut self, persistence: GrantPersistence) -> Self {
+        self.persistence = Some(persistence);
         self
     }
 
@@ -249,7 +292,11 @@ impl DeviceFlow {
                         }
                     }
                 }
-                grant.commit(lease).await?;
+                if let Some(persist) = &self.persistence {
+                    persist(grant, lease).await?;
+                } else {
+                    grant.commit(lease).await?;
+                }
                 Ok(PollStatus::Authorized)
             }
             GithubExchange::Pending => Ok(PollStatus::Pending),
@@ -263,6 +310,13 @@ impl DeviceFlow {
     pub fn with_store(mut self, store: FileSecretStore) -> Self {
         self.store = store;
         self
+    }
+
+    /// Effective destination of this flow's opaque credential write. Allows
+    /// isolated callers to verify their override before polling a grant.
+    #[must_use]
+    pub fn persistence_path(&self) -> &std::path::Path {
+        self.store.path()
     }
 
     /// Exchange without persisting: cancellation and account verification happen
@@ -321,6 +375,25 @@ pub struct GithubGrant {
 }
 
 impl GithubGrant {
+    /// Transfer this opaque write into a registered blocking-completion owner.
+    /// The token never escapes the closure; the lease is released only after
+    /// physical persistence and authorization-cache invalidation finish.
+    pub fn into_persistence(
+        self,
+        lease: Option<IdentityLease>,
+    ) -> impl FnOnce() -> intent_core::Result<()> + Send + 'static {
+        move || {
+            let result = self
+                .store
+                .store(SECRET_ACCOUNT, self.access_token.expose_secret());
+            if result.is_ok() {
+                crate::cache_scope::invalidate_authorization();
+            }
+            drop(lease);
+            result
+        }
+    }
+
     /// Verify the account using the new token, including observed permissions.
     ///
     /// # Errors

@@ -18,9 +18,10 @@ use crate::error::{Error, Result};
 use crate::model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
-    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
-    PrObservation, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Review,
-    ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
+    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrAncestry,
+    PrAncestryIdentity, PrInvolvement, PrObservation, PrPatch, PrQuery, PrState, PullRequest,
+    PullRequestFile, PullRequestFilesPage, PullRequestReview, RateLimitStatus, Repo, RepoRef,
+    Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
     ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
 };
 use crate::SourceControl;
@@ -218,6 +219,20 @@ impl GitHubSourceControl {
         per_page: u64,
         page_no: u64,
     ) -> Result<Vec<Value>> {
+        let v = self.search_issues_response(q, per_page, page_no).await?;
+        Ok(serde_json::from_value(
+            v.get("items")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+        )?)
+    }
+
+    async fn search_issues_response(
+        &self,
+        q: String,
+        per_page: u64,
+        page_no: u64,
+    ) -> Result<Value> {
         let params: Vec<(&str, String)> = vec![
             ("q", q),
             ("sort", "updated".to_string()),
@@ -225,12 +240,10 @@ impl GitHubSourceControl {
             ("per_page", per_page.to_string()),
             ("page", page_no.to_string()),
         ];
-        let v: Value = self.client().get("/search/issues", Some(&params)).await?;
-        Ok(serde_json::from_value(
-            v.get("items")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new())),
-        )?)
+        self.client()
+            .get("/search/issues", Some(&params))
+            .await
+            .map_err(Into::into)
     }
 
     /// [`Self::search_issues_page`] over a repo `scope`, tolerant of
@@ -492,6 +505,7 @@ pub(crate) fn map_issue_at_number(value: Value, number: u64) -> Result<Issue> {
 pub(crate) fn map_repo(value: Value) -> Result<Repo> {
     let r: dto::Repo = serde_json::from_value(value)?;
     Ok(Repo {
+        owner_avatar_url: None,
         owner: r.owner.and_then(|o| o.login).unwrap_or_default(),
         name: r.name.unwrap_or_default(),
         url: r.html_url,
@@ -593,7 +607,19 @@ pub(crate) fn build_pr_search_query(
     involvement: Option<PrInvolvement>,
     search: Option<&str>,
 ) -> String {
-    let mut q = format!("is:pr {} is:{state}", repo_qualifiers(repos));
+    build_pr_search_with_scope(&repo_qualifiers(repos), state, involvement, search)
+}
+
+fn build_pr_search_with_scope(
+    scope: &str,
+    state: &str,
+    involvement: Option<PrInvolvement>,
+    search: Option<&str>,
+) -> String {
+    let mut q = format!("is:pr {scope}");
+    if state != "all" {
+        let _ = write!(q, " is:{state}");
+    }
     if let Some(involvement) = involvement {
         let involve = match involvement {
             PrInvolvement::Created => "author:@me",
@@ -1152,6 +1178,7 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checks
       isDraft
       headRefName
       headRefOid
+      headRepository { id }
       author { login }
       mergeable
       createdAt
@@ -1168,6 +1195,7 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checks
       }
       reviewDecision
       baseRefName
+      baseRef { target { oid } }
       commits(last: 1) {
         nodes {
           commit {
@@ -1253,6 +1281,19 @@ fn map_graphql_pull(pr: &Value) -> Result<PullRequest> {
         created_at: owned("createdAt"),
         updated_at: owned("updatedAt"),
     })
+}
+
+fn parse_ancestry_identity(pr: &Value) -> Option<PrAncestryIdentity> {
+    let identity = PrAncestryIdentity {
+        base_sha: pr.pointer("/baseRef/target/oid")?.as_str()?.to_string(),
+        head_sha: pr.get("headRefOid")?.as_str()?.to_string(),
+        target_branch: pr.get("baseRefName")?.as_str()?.to_string(),
+        head_repository: pr
+            .pointer("/headRepository/id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    };
+    identity.is_valid().then_some(identity)
 }
 
 /// `author { login }` → login, `"unknown"` for a deleted account (`null`
@@ -1950,6 +1991,57 @@ impl SourceControl for GitHubSourceControl {
         Ok(Page { items, next_cursor })
     }
 
+    async fn list_org_prs(&self, org: &str, query: PrQuery) -> Result<Page<PullRequest>> {
+        // Validate at the engine boundary too: the owner is search syntax,
+        // not free text, and must never inject qualifiers into the query.
+        if org.is_empty()
+            || org.len() > 39
+            || !org.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(Error::Config("org must be a GitHub owner slug".into()));
+        }
+        if !query.extra_repos.is_empty()
+            || query.base.is_some()
+            || query.head.is_some()
+            || query.author.is_some()
+        {
+            return Err(Error::Config(
+                "organization PR search does not accept repository filters".into(),
+            ));
+        }
+        let state = match query.state {
+            Some(PrState::Open) => "open",
+            Some(PrState::Closed) => "closed",
+            Some(PrState::Merged) => "merged",
+            None => "all",
+        };
+        let per_page = rest_per_page(query.limit.unwrap_or(30));
+        let page_no = rest_page(query.cursor.as_deref());
+        let q = build_pr_search_with_scope(
+            &format!("user:{org}"),
+            state,
+            query.involvement,
+            query.search.as_deref(),
+        );
+        let response = self.search_issues_response(q, per_page, page_no).await?;
+        if response.get("incomplete_results").and_then(Value::as_bool) == Some(true) {
+            return Err(Error::Api(
+                "GitHub organization search returned incomplete results; retry or narrow the query"
+                    .into(),
+            ));
+        }
+        let items: Vec<Value> =
+            serde_json::from_value(response.get("items").cloned().unwrap_or_else(|| json!([])))?;
+        let next_cursor = rest_next_cursor(page_no, items.len(), per_page);
+        Ok(Page {
+            items: items
+                .into_iter()
+                .map(map_pull)
+                .collect::<Result<Vec<_>>>()?,
+            next_cursor,
+        })
+    }
+
     async fn update_pr(&self, repo: &RepoRef, number: u64, patch: PrPatch) -> Result<PullRequest> {
         let mut body = serde_json::Map::new();
         if let Some(title) = patch.title {
@@ -2045,6 +2137,63 @@ impl SourceControl for GitHubSourceControl {
         map_review(v)
     }
 
+    async fn pull_files(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        page: PageParams,
+    ) -> Result<PullRequestFilesPage> {
+        let per_page = rest_per_page(page.limit);
+        let page_no = rest_page(page.cursor.as_deref());
+        let route = Self::repo_path(repo, &format!("/pulls/{number}/files"));
+        let params = [
+            ("per_page", per_page.to_string()),
+            ("page", page_no.to_string()),
+        ];
+        let items: Vec<PullRequestFile> = self.client().get(&route, Some(&params)).await?;
+        // GitHub never serves more than 3,000 PR files. Treat reaching that
+        // boundary conservatively as incomplete, even when it is exactly full.
+        let truncated = page_no
+            .saturating_sub(1)
+            .saturating_mul(per_page)
+            .saturating_add(items.len() as u64)
+            >= 3_000;
+        let next_cursor = if truncated {
+            None
+        } else {
+            rest_next_cursor(page_no, items.len(), per_page)
+        };
+        Ok(PullRequestFilesPage {
+            items,
+            next_cursor,
+            truncated,
+        })
+    }
+
+    async fn pull_reviews(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        page: PageParams,
+    ) -> Result<Page<PullRequestReview>> {
+        let per_page = rest_per_page(page.limit);
+        let page_no = rest_page(page.cursor.as_deref());
+        let route = Self::repo_path(repo, &format!("/pulls/{number}/reviews"));
+        let params = [
+            ("per_page", per_page.to_string()),
+            ("page", page_no.to_string()),
+        ];
+        let rows: Vec<Value> = self.client().get(&route, Some(&params)).await?;
+        let next_cursor = rest_next_cursor(page_no, rows.len(), per_page);
+        let items = rows.into_iter().map(|row| {
+            serde_json::from_value(json!({
+                "id": row["id"], "author": row.pointer("/user/login").and_then(Value::as_str).unwrap_or(""),
+                "state": row["state"], "body": row["body"], "submittedAt": row["submitted_at"], "url": row["html_url"],
+            })).map_err(Error::from)
+        }).collect::<Result<Vec<PullRequestReview>>>()?;
+        Ok(Page { items, next_cursor })
+    }
+
     async fn list_reviews(&self, repo: &RepoRef, number: u64) -> Result<Vec<Review>> {
         let route = Self::repo_path(repo, &format!("/pulls/{number}/reviews"));
         self.rest_collect_all(&route, false, |v| v, map_review)
@@ -2124,12 +2273,46 @@ impl SourceControl for GitHubSourceControl {
             .ok_or_else(|| Error::NotFound(format!("PR #{number} not found")))?;
         Ok(Some(PrObservation {
             pr: map_graphql_pull(pr)?,
+            ancestry_identity: parse_ancestry_identity(pr),
             signals: parse_merge_requirement_signals(&data),
             reviews: parse_observed_reviews(pr),
             threads: parse_observed_threads(pr),
             // Saturated like `list_comments`' single page below.
             conversation_count: observed_count(pr.get("comments")),
         }))
+    }
+
+    async fn pr_ancestry(
+        &self,
+        repo: &RepoRef,
+        identity: &PrAncestryIdentity,
+    ) -> Result<PrAncestry> {
+        if !identity.is_valid() {
+            return Ok(PrAncestry::Unknown);
+        }
+        // Validated full hashes contain only hex; no symbolic refs or path
+        // characters can reach this route. Fork commits use the base repo's
+        // network, and inaccessible commits fail rather than becoming current.
+        let route = Self::repo_path(
+            repo,
+            &format!(
+                "/compare/{}...{}?per_page=1&page=1",
+                identity.base_sha, identity.head_sha
+            ),
+        );
+        let value: Value = self
+            .transport
+            .comparison_client()
+            .get(&route, None::<&()>)
+            .await?;
+        Ok(match value.get("behind_by").and_then(Value::as_u64) {
+            Some(behind_by) => PrAncestry::Known {
+                base_sha: identity.base_sha.clone(),
+                head_sha: identity.head_sha.clone(),
+                behind_by,
+            },
+            None => PrAncestry::Unknown,
+        })
     }
 
     // Known ceiling: a single `per_page=100` page (newest first), not a full
@@ -2440,10 +2623,24 @@ impl GitHubSourceControl {
             .ok_or_else(|| invalid("missing head"))?
             .to_string();
         let mut page = data.clone();
+        let ancestry_identity = data
+            .pointer("/repository/pullRequest")
+            .and_then(parse_ancestry_identity);
         let mut contexts = Vec::new();
         let mut cursors = std::collections::HashSet::new();
         let mut expected_total = None;
         for _ in 0..MAX_PAGES {
+            if page
+                .pointer("/repository/pullRequest")
+                .and_then(parse_ancestry_identity)
+                != ancestry_identity
+            {
+                // A moving base, retarget or changed fork must not attach a
+                // comparison to mixed observations. Preserve unrelated checks.
+                if let Some(pr) = data.pointer_mut("/repository/pullRequest") {
+                    pr.as_object_mut().expect("PR object").remove("baseRef");
+                }
+            }
             if page
                 .pointer("/repository/pullRequest/headRefOid")
                 .and_then(Value::as_str)
@@ -2777,6 +2974,8 @@ mod tests {
 
     #[test]
     fn pr_observation_query_embeds_the_probe_and_strips_the_same_way() {
+        assert!(PR_OBSERVATION_QUERY.contains("baseRef { target { oid } }"));
+        assert!(!PR_OBSERVATION_QUERY.contains("baseRefOid"));
         // The folded read carries every probe selection verbatim (so the
         // same parser serves both) and the schema fallback strips exactly
         // the merge-queue lines from it too.

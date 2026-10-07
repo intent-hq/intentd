@@ -4,7 +4,7 @@
 //! reordered pages below are controlled experiments, not observed GitHub churn.
 
 #[path = "../../../../intent-sourcecontrol/tests/support/qwen.rs"]
-mod qwen;
+pub(super) mod qwen;
 
 use std::collections::BTreeMap;
 
@@ -797,7 +797,7 @@ async fn silent_discovery_with_pending_changes(outcome: &str) {
     assert!(learned
         .pending_changes
         .iter()
-        .any(|c| c == "branch is now behind its base"));
+        .any(|c| c == "forge branch-update requirement available: required before merging"));
     assert!(!learned
         .pending_changes
         .iter()
@@ -1784,7 +1784,9 @@ async fn shared_discovery_repair_authorization_changes_during_monitor_poll() {
     );
     let cached = svc.pr_cache.lock().unwrap();
     assert_ne!(
-        cached[&pr_key_for(&repo, 10978)]
+        cached[&super::super::qualified_cache::CacheKey::Legacy(pr_key_for(&repo, 10978))]
+            .legacy()
+            .unwrap()
             .entry
             .as_ref()
             .unwrap()

@@ -41,7 +41,7 @@ fn assert_isolated(command: &Command, data_dir: &Path) {
 #[test]
 fn ordinary_command_isolates_identity_and_roots() {
     let data_dir = super::common::test_tempdir("itd-woc-command-");
-    let command = super::serve_command(data_dir.path(), "both", &[]);
+    let command = super::fixture_command(data_dir.path(), "both", &[]);
     assert_isolated(&command, data_dir.path());
 }
 
@@ -66,7 +66,7 @@ fn host_canaries_cannot_override_fixture_isolation() {
         ("GH_CONFIG_DIR", "synthetic-host/gh"),
         ("INTENTD_ASSERT_HERMETIC_ROOT", "0"),
     ];
-    let command = super::serve_command(data_dir.path(), "both", &canaries);
+    let command = super::fixture_command(data_dir.path(), "both", &canaries);
     assert_isolated(&command, data_dir.path());
 }
 
@@ -81,7 +81,7 @@ fn fixture_command_preserves_mock_provider_inputs() {
             r#"{"promptRpcError":{"code":-32603}}"#,
         ),
     ];
-    let command = super::serve_command(data_dir.path(), "both", &inputs);
+    let command = super::fixture_command(data_dir.path(), "both", &inputs);
     let environment: HashMap<_, _> = command.get_envs().collect();
     for (key, value) in inputs {
         assert!(
@@ -146,7 +146,7 @@ async fn saved_host_credentials_are_not_used_by_daemon() {
     // a forge. The real daemon below uses exactly the same builder and inputs.
     let command_root = super::common::test_tempdir("itd-woc-command-");
     assert_isolated(
-        &super::serve_command(command_root.path(), "both", &inputs),
+        &super::fixture_command(command_root.path(), "both", &inputs),
         command_root.path(),
     );
     let (daemon, _, _, port, fingerprint) =

@@ -139,6 +139,13 @@ pub(crate) fn context() -> Context {
     })
 }
 
+/// Capture the current accounting scope before handing a finite operation to
+/// another task. Call this at the task admission point, inside the caller scope.
+pub fn inherit_context<T>(future: impl Future<Output = T>) -> impl Future<Output = T> {
+    let captured = context();
+    CONTEXT.scope(captured, future)
+}
+
 /// Scope a caller without leaking labels between concurrent futures. Spawned
 /// tasks must explicitly re-enter a scope (Tokio task locals are not inherited).
 pub fn with_caller<T>(caller: Caller, future: impl Future<Output = T>) -> impl Future<Output = T> {

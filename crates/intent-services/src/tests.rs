@@ -15,7 +15,9 @@ use intent_store::Store;
 
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
+mod line_attribution_retry;
 mod skill_list;
+mod task_list_latency;
 pub(crate) mod workspace_delete;
 
 /// Runs before `main()` — and therefore before any test threads exist, making
@@ -149,6 +151,7 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -1978,7 +1981,12 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
     let mut expected = store.list_workspaces(true).await.unwrap();
     for row in &mut expected {
         row.activity = svc.workspace_activity(&row.id);
-        row.pending_delete_at = svc.pending_workspace_deletes.deadline(row.id.as_str());
+        row.pending_delete_at = svc
+            .pending_workspace_deletes
+            .deadline(&crate::delete_grace::PendingDeleteSubject::Workspace(
+                row.id.clone(),
+            ))
+            .unwrap();
         svc.enrich_workspace_aggregates_with_unread(
             row,
             Some(unread.contains(row.id.as_str())),
@@ -11989,6 +11997,254 @@ mod change_event_parity {
     }
 
     #[intent_test_macros::daemon_test]
+    async fn comment_delete_publishes_only_after_authorized_scoped_mutation() {
+        use intent_core::{with_caller, Caller, HostRole};
+        let h = harness().await;
+        let tn = note(&h.ws, "n-delete", "hello world");
+        h.store.insert_note(&tn).await.unwrap();
+        let other_note = note(&h.ws, "other-note", "hello world");
+        h.store.insert_note(&other_note).await.unwrap();
+        let added = h
+            .services
+            .comment_add(
+                h.ws.clone(),
+                tn.id.clone(),
+                "hello world".into(),
+                "hello".into(),
+                "root".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let reply = h
+            .services
+            .comment_respond(
+                h.ws.clone(),
+                tn.id.clone(),
+                Some(added.comment_id.clone()),
+                None,
+                "reply".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let outsider = guest_principal(&h, "outsider").await;
+        let member = seat_collaborator(&h, "member").await;
+        let caller = |id| Caller::Wire {
+            principal_id: id,
+            host_role: HostRole::Guest,
+        };
+        let mut sub = subscribe(&h);
+        let denied = with_caller(
+            caller(outsider),
+            h.services
+                .comment_delete(h.ws.clone(), tn.id.clone(), added.comment_id.clone()),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(intent_core::Error::NotFound(_))),
+            "{denied:?}"
+        );
+        let wrong_note = with_caller(
+            caller(member.clone()),
+            h.services
+                .comment_delete(h.ws.clone(), other_note.id, added.comment_id.clone()),
+        )
+        .await;
+        assert!(
+            wrong_note.is_err(),
+            "a comment in another note must survive"
+        );
+        assert!(h.store.get_comment(&added.comment_id).await.is_ok());
+        // Successful root deletion is the event-stream barrier for the failed
+        // attempts. Retain the original thread ID while the reply survives.
+        with_caller(
+            caller(member.clone()),
+            h.services
+                .comment_delete(h.ws.clone(), tn.id.clone(), added.comment_id.clone()),
+        )
+        .await
+        .unwrap();
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "comment:deleted");
+        assert_eq!(ev["workspaceId"], h.ws.as_str());
+        assert!(ev["id"].is_string());
+        assert!(ev["timestamp"].is_string());
+        assert_eq!(
+            ev["actor"],
+            json!({"type":"user","id":member,"name":"member"})
+        );
+        assert_eq!(
+            ev["data"],
+            json!({"noteId":tn.id,"commentId":added.comment_id,"threadId":added.comment_id})
+        );
+        assert!(h.store.get_comment(&added.comment_id).await.is_err());
+        let threads = h
+            .services
+            .comment_list(h.ws.clone(), tn.id.clone(), None, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(threads.threads[0].thread_id, added.comment_id);
+        assert_eq!(threads.total_comments, 1);
+        // Repeated deletion fails and publishes nothing; the reply's deletion
+        // is the next observable event (no timeout-as-success assertion).
+        assert!(with_caller(
+            caller(member.clone()),
+            h.services
+                .comment_delete(h.ws.clone(), tn.id.clone(), added.comment_id.clone())
+        )
+        .await
+        .is_err());
+        with_caller(
+            caller(member),
+            h.services
+                .comment_delete(h.ws.clone(), tn.id.clone(), reply.comment.id.clone()),
+        )
+        .await
+        .unwrap();
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({"noteId":tn.id,"commentId":reply.comment.id,"threadId":added.comment_id})
+        );
+        assert!(h
+            .services
+            .comment_list(h.ws.clone(), tn.id, None, None, None, true)
+            .await
+            .unwrap()
+            .threads
+            .is_empty());
+        let persisted = h
+            .store
+            .events_by_type(&h.ws, "comment:deleted", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted.len(),
+            2,
+            "only successful deletes are durable events"
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn comment_delete_replacement_on_other_note_survives() {
+        comment_delete_replacement_race(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn comment_delete_replacement_on_same_note_emits_current_thread() {
+        comment_delete_replacement_race(true).await;
+    }
+
+    async fn comment_delete_replacement_race(same_note: bool) {
+        let h = harness().await;
+        let original = note(&h.ws, "original", "hello world");
+        let other = note(&h.ws, "other", "hello world");
+        h.store.insert_note(&original).await.unwrap();
+        h.store.insert_note(&other).await.unwrap();
+        let added = h
+            .services
+            .comment_add(
+                h.ws.clone(),
+                original.id.clone(),
+                "hello world".into(),
+                "hello".into(),
+                "root".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let reply = h
+            .services
+            .comment_respond(
+                h.ws.clone(),
+                original.id.clone(),
+                Some(added.comment_id.clone()),
+                None,
+                "reply".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let comment_id = reply.comment.id;
+        let mut subscription = subscribe(&h);
+        // As in the credential-revoke regression, hold the sole writer and
+        // drive deletion past its read-pool lookup while writes remain gated.
+        let mut held = h.store.write_pool().acquire().await.unwrap();
+        let mut deletion =
+            h.services
+                .comment_delete(h.ws.clone(), original.id.clone(), comment_id.clone());
+        let completed = super::poll_until(&mut deletion, 20, || async {
+            assert!(h.store.get_comment(&comment_id).await.is_ok());
+            false
+        })
+        .await;
+        assert!(!completed);
+        let replacement_note = if same_note { &original.id } else { &other.id };
+        // SQLite REPLACE deletes/reinserts the same client-supplied UUID,
+        // modeling another successful deletion followed by recreation while
+        // this request is parked. The original was a reply in thread R;
+        // the replacement is a root C with id == thread_id and no parent,
+        // as comment.add(commentId=C) creates after C has been deleted.
+        sqlx::query(
+            "INSERT OR REPLACE INTO comment
+            (id, thread_id, note_id, kind, content, author, author_type, status,
+             parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at, workspace_id)
+            SELECT id, id, ?, kind, content, author, author_type, status,
+             NULL, anchor_json, anchor_text, extra_json, created_at, updated_at, workspace_id
+            FROM comment WHERE id = ?",
+        )
+        .bind(replacement_note.as_str())
+        .bind(&comment_id)
+        .execute(&mut *held)
+        .await
+        .unwrap();
+        drop(held);
+        let result = deletion.await;
+        if same_note {
+            assert!(result.is_ok(), "{result:?}");
+            let event = recv_one(&mut subscription).await;
+            assert_eq!(event["type"], "comment:deleted");
+            assert_eq!(
+                event["data"],
+                json!({"noteId":original.id,"commentId":comment_id,"threadId":comment_id})
+            );
+            assert!(h.store.get_comment(&comment_id).await.is_err());
+        } else {
+            assert!(
+                result.is_err(),
+                "replacement on a different note must survive"
+            );
+            let remaining = h.store.get_comment(&comment_id).await.unwrap();
+            assert_eq!(remaining.note_id, Some(other.id));
+            assert_eq!(remaining.thread_id, comment_id);
+            assert!(remaining.parent_id.is_none());
+            assert!(h
+                .store
+                .events_by_type(&h.ws, "comment:deleted", 10)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
     async fn comment_resolved_payload() {
         let h = harness().await;
         let tn = note(&h.ws, "n-1", "hello world");
@@ -17327,6 +17583,7 @@ mod drafts_events {
 
 pub(crate) mod pr {
     mod accept_member;
+    mod automatic_refresh;
     mod discovery_http;
 
     use std::path::PathBuf;
@@ -17684,6 +17941,7 @@ pub(crate) mod pr {
                     .and_then(|c| c.parse::<u64>().ok())
                     .unwrap_or(1);
                 let repo = Repo {
+                    owner_avatar_url: None,
                     owner: "octocat".into(),
                     name: format!("repo{p}"),
                     url: Some(format!("https://github.com/octocat/repo{p}")),
@@ -17703,6 +17961,7 @@ pub(crate) mod pr {
             }
             Ok(Page {
                 items: vec![Repo {
+                    owner_avatar_url: None,
                     owner: "octocat".into(),
                     name: "hello".into(),
                     url: Some("https://github.com/octocat/hello".into()),
@@ -17721,6 +17980,7 @@ pub(crate) mod pr {
                 return Err(ScError::NotFound("no such repo".into()));
             }
             Ok(Repo {
+                owner_avatar_url: None,
                 owner: owner.into(),
                 name: name.into(),
                 url: Some(format!("https://github.com/{owner}/{name}")),
@@ -19287,9 +19547,57 @@ pub(crate) mod pr {
 
     // ---- ws.pr.snapshot engine (`pr_state`, MCP-only) --------------------
 
+    /// Actual local Git facts for implicit GitHub snapshot routing. Kept local
+    /// to this family so unrelated forge/metadata fixtures remain unchanged.
+    async fn snapshot_git_root(svc: &Services, id: &WorkspaceId) -> tempfile::TempDir {
+        let dir = test_tempdir("snapshot-github-root-");
+        {
+            let repo = git2::Repository::init(dir.path()).unwrap();
+            repo.remote("origin", "https://github.com/o/r").unwrap();
+        }
+        let mut ws = svc.store().get_workspace(id).await.unwrap();
+        ws.worktree_path = Some(dir.path().to_string_lossy().into_owned());
+        svc.store().update_workspace(&ws).await.unwrap();
+        // Make a fresh explicit fixture choice after root setup; current Git
+        // is not evidence of a migrated historical selection.
+        let root = intent_core::RepositoryRootId {
+            workspace_id: id.clone(),
+            kind: intent_core::RepositoryRootKind::Primary,
+        };
+        let original = svc
+            .store()
+            .repository_selection_snapshot(&root)
+            .await
+            .unwrap();
+        let result = svc
+            .store()
+            .write_repository_selection(
+                &original,
+                intent_store::RepositorySelectionChange::Automatic,
+            )
+            .await;
+        assert!(matches!(
+            result.result.unwrap(),
+            intent_store::RepositorySelectionWriteResult::Applied(_)
+        ));
+        let stored = svc
+            .store()
+            .repository_selection_snapshot(&root)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.selection(),
+            Some(&intent_store::RepositoryStoredSelection::Saved(
+                intent_core::SavedReviewSelection::Automatic
+            ))
+        );
+        dir
+    }
+
     #[intent_test_macros::daemon_test]
     async fn state_snapshot_shape_and_counts() {
         let (_t, svc, ws) = setup(false, true).await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["repo"], "o/r");
         assert_eq!(v["prNumber"], 42);
@@ -19340,6 +19648,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["comments"]["conversationCount"], 1);
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
@@ -19358,6 +19667,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeable"], false);
         assert_eq!(v["mergeableState"], "dirty");
@@ -19375,6 +19685,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["state"], "merged");
         assert_eq!(v["isMerged"], true);
@@ -19400,6 +19711,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeableState"], "blocked");
         assert_eq!(v["reviews"]["decision"], "none");
@@ -19421,6 +19733,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["mergeableState"], "clean");
         assert_eq!(v["reviews"]["decision"], "review_required");
@@ -19439,6 +19752,7 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws, 42, None).await.expect("snapshot");
         assert_eq!(v["reviews"]["decision"], "approved");
         assert_eq!(v["reviews"]["approvals"], 1);
@@ -19454,17 +19768,18 @@ pub(crate) mod pr {
             true,
         )
         .await;
+        let _git = snapshot_git_root(&svc, &ws).await;
         let err = svc.pr_state(ws, 999, None).await.unwrap_err();
         assert!(matches!(err, Error::Internal(m) if m.contains("PR #999 not found in o/r")));
     }
 
     #[intent_test_macros::daemon_test]
-    async fn state_snapshot_requires_workspace_repo() {
-        // No repository on the workspace: same "No active PR" guard as the
-        // other pr.* methods (the required prNumber does not bypass it).
+    async fn state_snapshot_unknown_root_uses_fixed_discovery_refusal() {
+        // An absent original Git root cannot infer a provider from metadata or
+        // expose new discovery details through the snapshot error.
         let (_t, svc, ws) = setup(false, false).await;
         let err = svc.pr_state(ws, 42, None).await.unwrap_err();
-        assert!(matches!(err, Error::Internal(m) if m == "No active PR"));
+        assert!(matches!(err, Error::Forbidden(m) if m == crate::repository_read_source::REFUSAL));
     }
 
     #[intent_test_macros::daemon_test]
@@ -19496,6 +19811,7 @@ pub(crate) mod pr {
         *forge.on_list_comments.lock().unwrap() = Some(Box::new(move || {
             assert!(gate.pause_for(std::time::Duration::from_secs(3600), true));
         }));
+        let _git = snapshot_git_root(&svc, &ws).await;
         let v = svc.pr_state(ws.clone(), 42, None).await.expect("snapshot");
         let until = svc
             .sweep_rate_limit_paused_until()
@@ -20084,86 +20400,9 @@ pub(crate) mod pr {
     }
 
     #[tokio::test]
-    async fn sweep_skips_idle_workspace_between_full_ticks() {
-        // Sweep trimming (§7.7): a workspace with no recent activity is not
-        // refreshed on an in-between tick — only on every
-        // `SWEEP_IDLE_TICK_MULTIPLE`-th (full-sweep) tick.
-        let forge = StubForge {
-            discover: true,
-            ..Default::default()
-        };
-        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
-
-        // Age the workspace well past the active window.
-        let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
-        ws.updated_at =
-            intent_core::iso_minutes_ago(2 * crate::pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES);
-        ws.last_activity = None;
-        svc.store().update_workspace(&ws).await.unwrap();
-
-        // In-between tick: the idle workspace is skipped (no link, no event).
-        svc.refresh_all_workspace_prs(1).await;
-        let after = svc.store().get_workspace(&ws_id).await.unwrap();
-        assert_eq!(after.pr_number, None);
-        let evs = svc.store().events_by_workspace(&ws_id, 10).await.unwrap();
-        assert!(evs.is_empty());
-
-        // Full-sweep tick (multiple of SWEEP_IDLE_TICK_MULTIPLE): refreshed.
-        svc.refresh_all_workspace_prs(crate::pr_ops::SWEEP_IDLE_TICK_MULTIPLE)
-            .await;
-        let after = svc.store().get_workspace(&ws_id).await.unwrap();
-        assert_eq!(after.pr_number, Some(42));
-    }
-
-    #[test]
-    fn sweep_due_tiers_by_recency_and_tick() {
-        use crate::pr_ops::{sweep_due, SWEEP_ACTIVE_WINDOW_MINUTES, SWEEP_IDLE_TICK_MULTIPLE};
-        let cutoff_str = intent_core::iso_minutes_ago(SWEEP_ACTIVE_WINDOW_MINUTES);
-        let cutoff = intent_core::parse_iso(&cutoff_str);
-        assert!(cutoff.is_some());
-        let ws_id = WorkspaceId::new();
-
-        // Recently active (updated_at = now): due on every tick.
-        let active = workspace(&ws_id);
-        assert!(sweep_due(&active, cutoff, 1));
-
-        // Idle (updated_at past the window, no last_activity): due only on
-        // full-sweep ticks (multiples of SWEEP_IDLE_TICK_MULTIPLE, incl. 0).
-        let mut idle = workspace(&ws_id);
-        idle.updated_at = intent_core::iso_minutes_ago(2 * SWEEP_ACTIVE_WINDOW_MINUTES);
-        assert!(!sweep_due(&idle, cutoff, 1));
-        assert!(!sweep_due(&idle, cutoff, SWEEP_IDLE_TICK_MULTIPLE - 1));
-        assert!(sweep_due(&idle, cutoff, 0));
-        assert!(sweep_due(&idle, cutoff, SWEEP_IDLE_TICK_MULTIPLE));
-        assert!(sweep_due(&idle, cutoff, 3 * SWEEP_IDLE_TICK_MULTIPLE));
-
-        // Exact boundary: `ts == cutoff` counts as active (inclusive `>=`).
-        let mut boundary = workspace(&ws_id);
-        boundary.updated_at = cutoff_str.clone();
-        assert!(sweep_due(&boundary, cutoff, 1));
-
-        // A recent last_activity revives an otherwise-idle workspace.
-        let mut revived = idle.clone();
-        revived.last_activity = Some(now_iso());
-        assert!(sweep_due(&revived, cutoff, 1));
-
-        // Malformed timestamps fail open (count as active), on either field.
-        let mut malformed = idle.clone();
-        malformed.updated_at = "not-a-timestamp".to_string();
-        assert!(sweep_due(&malformed, cutoff, 1));
-        let mut malformed_la = idle.clone();
-        malformed_la.last_activity = Some(String::new());
-        assert!(sweep_due(&malformed_la, cutoff, 1));
-
-        // An unparseable cutoff fails open too.
-        assert!(sweep_due(&idle, None, 1));
-    }
-
-    #[tokio::test]
     async fn sweep_refreshes_recently_active_workspace_every_tick() {
-        // Sweep trimming (§7.7): a workspace active within the window is
-        // refreshed even on an in-between tick. `refresh_setup` seeds
-        // `updated_at = now`, i.e. inside `SWEEP_ACTIVE_WINDOW_MINUTES`.
+        // A workspace without a previous attempt is refreshed on its first
+        // sweep, irrespective of the loop tick number.
         let forge = StubForge {
             discover: true,
             ..Default::default()
@@ -21258,7 +21497,8 @@ pub(crate) mod pr {
         std::fs::remove_dir_all(&gone_dir).unwrap();
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1, "{roots:?}");
@@ -21285,7 +21525,8 @@ pub(crate) mod pr {
 
         // Re-sweeping is idempotent: the tracked submodule is not re-upserted
         // (no `gitRoot:registered`/`gitRoot:updated` churn).
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
         let registered = svc
             .store()
             .events_by_type(&ws.id, "gitRoot:registered", 10)
@@ -21340,7 +21581,8 @@ pub(crate) mod pr {
             .unwrap();
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let a = svc
             .store()
@@ -21377,7 +21619,8 @@ pub(crate) mod pr {
             repo.commit(Some("HEAD"), &sig, &sig, "move", &tree, &[&parent])
                 .unwrap();
         }
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
         let a = svc
             .store()
             .get_workspace_git_root(&root_a.id)
@@ -21409,7 +21652,7 @@ pub(crate) mod pr {
         let root = sweep_root(&ws.id, &with_head.dir, None);
         svc.store().upsert_workspace_git_root(&root).await.unwrap();
 
-        svc.sweep_workspace_git_roots(&ws, None).await;
+        svc.sweep_workspace_git_roots(&ws, None, 60, true).await;
 
         let stamped = svc.store().get_workspace_git_root(&root.id).await.unwrap();
         assert_eq!(
@@ -21442,7 +21685,8 @@ pub(crate) mod pr {
 
         let (_t, svc, ws) = sweep_setup(&parent.dir).await;
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1, "{roots:?}");
@@ -21488,7 +21732,8 @@ pub(crate) mod pr {
         );
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         // Restore permissions so the tempdir can be cleaned up.
         std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -21519,7 +21764,8 @@ pub(crate) mod pr {
             discover: true,
             ..Default::default()
         });
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1);
@@ -21543,7 +21789,8 @@ pub(crate) mod pr {
         assert_eq!(updated[0].data["gitRoot"]["prNumber"], 42);
 
         // Identical forge state on the next sweep: no new event.
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
         let updated = svc
             .store()
             .events_by_type(&ws.id, "gitRoot:updated", 10)
@@ -21901,7 +22148,8 @@ pub(crate) mod pr {
             merged_linked: true,
             ..Default::default()
         });
-        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true)
+            .await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         let list = roots[0].pull_requests.as_ref().expect("pull_requests");
@@ -23058,6 +23306,7 @@ pub(crate) mod pr {
     async fn pr_state_folds_a_queue_signal_served_from_the_cache() {
         let forge = queue_signal_forge(true);
         let (_t, _root, svc, ws_id) = cached_hover_setup(forge.clone(), None).await;
+        let _git = snapshot_git_root(&svc, &ws_id).await;
         assert_eq!(
             seed_display_status(&svc, &ws_id).await,
             Some(intent_core::WorkspaceDisplayStatus::PrReady)
@@ -23411,7 +23660,7 @@ pub(crate) mod pr {
         let traffic = Traffic::default();
         with_traffic(
             traffic.clone(),
-            svc.sweep_workspace_git_roots(&ws, Some(&sc)),
+            svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true),
         )
         .await;
         assert!(svc.sweeps_rate_limited());
@@ -23427,7 +23676,7 @@ pub(crate) mod pr {
             .all(|(caller, _)| *caller == Caller::GitRootRefresh));
         with_traffic(
             traffic.clone(),
-            svc.sweep_workspace_git_roots(&ws, Some(&sc)),
+            svc.sweep_workspace_git_roots(&ws, Some(&sc), 60, true),
         )
         .await;
         assert_eq!(
@@ -23499,7 +23748,8 @@ pub(crate) mod pr {
             ..Default::default()
         });
         let sc_dyn: Arc<dyn SourceControl> = sc.clone();
-        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn), 60, true)
+            .await;
 
         assert_eq!(
             sc.seen_get_pr.lock().unwrap().len(),
@@ -23510,7 +23760,8 @@ pub(crate) mod pr {
 
         // A whole follow-up sweep while paused performs no forge calls and
         // no further reset probes — the condition was reported once.
-        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn), 60, true)
+            .await;
         assert_eq!(sc.seen_get_pr.lock().unwrap().len(), 1);
         assert_eq!(*sc.seen_reset_probes.lock().unwrap(), 1);
     }
@@ -23594,6 +23845,18 @@ pub(crate) mod pr {
             ..Default::default()
         });
         let svc = svc.with_source_control(recovered.clone());
+        svc.refresh_all_workspace_prs(1).await;
+        assert!(
+            !svc.sweeps_rate_limited(),
+            "the recovered quota lifts the pause"
+        );
+        assert!(
+            recovered.seen_get_pr.lock().unwrap().is_empty(),
+            "recovery does not bypass automatic retry admission"
+        );
+        // Tick 1 is one minute later in production; quota recovery does not
+        // bypass the new per-workspace automatic attempt cadence.
+        svc.age_automatic_pr_refresh(&ws_id, 60);
         svc.refresh_all_workspace_prs(1).await;
         assert_eq!(
             *recovered.seen_get_pr.lock().unwrap(),
@@ -23729,7 +23992,8 @@ pub(crate) mod pr {
             ..Default::default()
         });
         let sc_dyn: Arc<dyn SourceControl> = sc.clone();
-        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn)).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc_dyn), 60, true)
+            .await;
 
         assert_eq!(
             sc.seen_get_pr.lock().unwrap().len(),
@@ -24540,6 +24804,102 @@ mod file_tracking {
         };
         assert_eq!(stage_of("a.txt"), "committed");
         assert_eq!(stage_of("b.txt"), "unstaged");
+    }
+
+    /// An index-refresh failure must not discard a successful receipt or skip
+    /// attribution/events. A later HEAD cannot substitute for the original SHA.
+    #[intent_test_macros::daemon_test]
+    async fn agent_commit_reports_created_sha_when_index_refresh_fails() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        let bus = crate::events::EventBus::new(svc.store().clone());
+        let svc = svc.with_event_bus(bus);
+        std::fs::write(repo.dir.join("prestaged.txt"), "other actor\n").unwrap();
+        intent_git::stage::stage(&repo.dir, &["prestaged.txt".to_string()]).unwrap();
+        std::fs::write(repo.dir.join("a.txt"), "agent a\n").unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "a.txt", "unstaged", Some("agent-a")))
+            .await
+            .unwrap();
+        let git = git2::Repository::open(&repo.dir).unwrap();
+        let parent = git.head().unwrap().target().unwrap();
+        let index_before = std::fs::read(git.path().join("index")).unwrap();
+        std::fs::write(git.path().join("index.lock"), "held by test\n").unwrap();
+
+        let (entered, release) = crate::periodic_shutdown_tests::hold(&svc, "git");
+        let committing = svc.clone();
+        let workspace_id = ws.clone();
+        let operation = tokio::spawn(intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            async move {
+                committing
+                    .git_agent_commit(
+                        workspace_id,
+                        "agent a only".to_string(),
+                        Some(AgentId::from("agent-a")),
+                        None,
+                        None,
+                        false,
+                        None,
+                    )
+                    .await
+            },
+        ));
+        crate::periodic_shutdown_tests::entered(entered).await;
+        let committed = git.head().unwrap().peel_to_commit().unwrap();
+        assert_ne!(committed.id(), parent);
+        assert_eq!(committed.parent_id(0).unwrap(), parent);
+        assert_eq!(
+            std::fs::read(git.path().join("index")).unwrap(),
+            index_before
+        );
+        assert!(committed
+            .tree()
+            .unwrap()
+            .get_name("prestaged.txt")
+            .is_none());
+        // Advance HEAD while the service holds the original outcome. Keep the
+        // stale index intact so the emitted status must still report its state.
+        let sig = git.signature().unwrap();
+        let later = git
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "later commit",
+                &committed.tree().unwrap(),
+                &[&committed],
+            )
+            .unwrap();
+        release.send(()).unwrap();
+        let outcome = operation.await.unwrap().unwrap();
+        assert_eq!(outcome.hash, committed.id().to_string());
+        assert_ne!(outcome.hash, later.to_string());
+        assert_eq!(outcome.files, vec!["a.txt".to_string()]);
+        assert_eq!(outcome.file_count, 1);
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r.path == "a.txt").unwrap().stage,
+            "committed"
+        );
+        let events = svc
+            .store()
+            .events_by_type(&ws, "git:commit", 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["commit"], outcome.hash);
+        assert_eq!(events[0].data["files"], serde_json::json!(["a.txt"]));
+        let status_events = svc
+            .store()
+            .events_by_type(&ws, "changes:git-status", 10)
+            .await
+            .unwrap();
+        assert_eq!(status_events.len(), 1);
+        assert_eq!(
+            status_events[0].data["status"],
+            serde_json::to_value(intent_git::status::status(&repo.dir).unwrap()).unwrap()
+        );
     }
 
     /// A path another actor already staged is not swept into the
@@ -29012,11 +29372,152 @@ mod search_adapters {
         let svc = Services::new(store);
         // No workspaceId param — global search.
         let r = svc
-            .search_notes("alpha".into(), Some("srch-n".into()))
+            .search_notes(
+                "alpha".into(),
+                None,
+                None,
+                None,
+                true,
+                Some("srch-n".into()),
+            )
             .await
             .unwrap();
         assert_eq!(r["requestId"], "srch-n");
         assert_eq!(r["matches"].as_array().unwrap().len(), 2);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_uses_tokens_tags_and_readable_ranked_snippets() {
+        let (_tmp, store, ws) = store_with_ws().await;
+        let mut body = note(
+            &ws,
+            "body",
+            &format!("{} café running\n  checklist", "padding ".repeat(50)),
+        );
+        body.title = "Plain title".into();
+        body.tags = vec!["tagonly".into()];
+        store.insert_note(&body).await.unwrap();
+        let svc = Services::new(store);
+        for query in ["CAFÉ run", "run checklist", "tagonly", "café:(checkl"] {
+            let result = svc
+                .search_notes(query.into(), None, None, None, true, None)
+                .await
+                .unwrap();
+            assert_eq!(result["indexed"], true);
+            let hit = &result["matches"][0];
+            assert_eq!(hit["noteId"], "body", "{query}: {result}");
+            assert_eq!(hit["workspaceId"], ws.as_str());
+            assert!(hit["score"].is_number());
+            let preview = hit["preview"].as_str().unwrap();
+            assert!(preview.chars().count() <= 162);
+            assert!(!preview.contains('\n'));
+            if query != "tagonly" {
+                assert!(preview.contains("checklist"), "{preview}");
+            }
+        }
+        // FTS operators are literal search tokens, never parser instructions.
+        assert!(svc
+            .search_notes("café OR nonexistent".into(), None, None, None, true, None)
+            .await
+            .unwrap()["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_propagates_index_failure() {
+        let (_tmp, store, _) = store_with_ws().await;
+        sqlx::query("DROP TABLE note_fts")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        let svc = Services::new(store);
+        assert!(svc
+            .search_notes("needle".into(), None, None, None, true, None)
+            .await
+            .is_err());
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_validates_typed_scope_and_limit_before_empty_queries() {
+        let (_tmp, store, _) = store_with_ws().await;
+        let svc = Services::new(store);
+        assert!(matches!(
+            svc.search_notes(String::new(), None, None, Some(-1), true, None)
+                .await,
+            Err(intent_core::Error::InvalidParams(_))
+        ));
+        for (hard, soft) in [
+            (Some(WorkspaceId::from("")), None),
+            (None, Some(WorkspaceId::from(""))),
+        ] {
+            assert!(matches!(
+                svc.search_notes(String::new(), hard, soft, None, true, None)
+                    .await,
+                Err(intent_core::Error::InvalidParams(_))
+            ));
+        }
+        assert!(matches!(
+            svc.search_notes(
+                String::new(),
+                Some(WorkspaceId::from("missing")),
+                None,
+                Some(0),
+                true,
+                None
+            )
+            .await,
+            Err(intent_core::Error::NotFound(_))
+        ));
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn notes_search_preserves_rank_ties_and_soft_preference() {
+        let (_tmp, store, ws1) = store_with_ws().await;
+        let ws2 = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws2)).await.unwrap();
+        for ws in [&ws1, &ws2] {
+            for id in ["z", "a"] {
+                let mut row = note(ws, id, "identicalterm");
+                row.title = "Same title".into();
+                row.updated_at = "2026-01-01T00:00:00Z".into();
+                store.insert_note(&row).await.unwrap();
+            }
+        }
+        let svc = Services::new(store);
+        let ranked = svc
+            .search_notes(
+                "identicalterm".into(),
+                None,
+                Some(ws2.clone()),
+                Some(3),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let hits = ranked["matches"].as_array().unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0]["workspaceId"], ws2.as_str());
+        assert_eq!(hits[0]["noteId"], "a");
+        assert_eq!(hits[1]["workspaceId"], ws2.as_str());
+        assert_eq!(hits[1]["noteId"], "z");
+        assert_eq!(hits[2]["workspaceId"], ws1.as_str());
+        assert!(hits[0]["score"].as_f64().unwrap() > hits[2]["score"].as_f64().unwrap());
+        let scoped = svc
+            .search_notes(
+                "identicalterm".into(),
+                Some(ws1.clone()),
+                Some(ws2),
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(scoped["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(scoped["matches"][0]["workspaceId"], ws1.as_str());
     }
 
     /// A fake [`ContextEngine`] so the engine-available and graceful-degradation
@@ -30689,6 +31190,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -30839,6 +31341,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -30980,6 +31483,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/worktree".into()),
             repository_path: Some("/test/repo".into()),
@@ -31116,6 +31620,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -31251,6 +31756,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -31391,6 +31897,7 @@ mod rules {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
@@ -32254,6 +32761,7 @@ mod known_repo {
             created_at: now.clone(),
             updated_at: now.clone(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: Some(repo_path.0.to_string_lossy().to_string()),
@@ -32487,6 +32995,51 @@ mod known_repo {
             "current B candidate emits workspace:updated"
         );
     }
+}
+
+/// Keep the caller regression observable even on hosts that skip `CoW` tests.
+/// Native acceptance additionally requires a real clone and independent contents
+/// on the same volume pair used by the workspace fixture.
+fn cow_fixture_supported(source: &std::path::Path, root: &std::path::Path) -> bool {
+    let support = intent_git::cow_probe(source, root).expect("probe fixture CoW support");
+    eprintln!("CoW fixture probe: {support:?}; source={source:?}; root={root:?}");
+    if support == intent_git::CowSupport::Supported {
+        let src = crate::test_support::test_tempdir_in(
+            source.to_str().expect("fixture source path"),
+            "cow-proof-source-",
+        );
+        let dst = crate::test_support::test_tempdir_in(
+            root.to_str().expect("fixture root path"),
+            "cow-proof-destination-",
+        );
+        let original = src.path().join("payload");
+        let cloned = dst.path().join("clone");
+        std::fs::write(&original, b"original").unwrap();
+        intent_git::cow_clone(src.path(), &cloned).expect("real fixture CoW clone");
+        let copy = cloned.join("payload");
+        assert_eq!(std::fs::read(&copy).unwrap(), b"original");
+        std::fs::write(&copy, b"clone changed").unwrap();
+        assert_eq!(std::fs::read(&original).unwrap(), b"original");
+        std::fs::write(&original, b"source changed").unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), b"clone changed");
+        dst.close().expect("remove CoW proof destination");
+        src.close().expect("remove CoW proof source");
+        eprintln!("CoW fixture clone and independent contents verified");
+        eprintln!("CoW fixture proof scratch cleaned");
+    } else {
+        assert!(
+            std::env::var_os("INTENTD_TEST_REQUIRE_COW").is_none(),
+            "native CoW acceptance requires a supported fixture volume"
+        );
+        // Supplemental regression on unsupported hosts only. Supported-volume
+        // baselines must reach the original service gate and its real refusal.
+        assert_eq!(
+            intent_core::current_caller(),
+            Some(intent_core::Caller::Daemon),
+            "workspace CoW fixture must bind its daemon caller"
+        );
+    }
+    support == intent_git::CowSupport::Supported
 }
 
 mod worktree_provisioning {
@@ -33151,7 +33704,7 @@ mod worktree_provisioning {
     /// workspace branch from `baseRef`, with `worktreePath`/`baseCommitSha`
     /// populated, `checkoutMode: "cow"` persisted, and untracked source files
     /// carried over.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_provisions_cow_checkout_when_isolation_enabled() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -33159,10 +33712,7 @@ mod worktree_provisioning {
         // Untracked build artifact in the source repo — CoW carries it over.
         std::fs::write(repo_dir.0.join("untracked.log"), "artifact\n").unwrap();
         let root = unique_dir("intentd-cowprov-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -33210,6 +33760,9 @@ mod worktree_provisioning {
         assert_eq!(
             persisted.checkout_mode,
             Some(intent_core::CheckoutMode::Cow)
+        );
+        eprintln!(
+            "CoW fixture assertions passed: create_provisions_cow_checkout_when_isolation_enabled"
         );
     }
 
@@ -33393,16 +33946,13 @@ mod worktree_provisioning {
     /// mirrors the create decision matrix — the duplicate gets a standalone
     /// `CoW` clone with `checkoutMode: "cow"` persisted, and the source repo
     /// gains no branch for the duplicate (the branch lives in the clone).
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_provisions_cow_checkout_when_isolation_enabled() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, head_branch) = seed_repo("intentd-cowdup-repo");
         let root = unique_dir("intentd-cowdup-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -33450,6 +34000,7 @@ mod worktree_provisioning {
             persisted.checkout_mode,
             Some(intent_core::CheckoutMode::Cow)
         );
+        eprintln!("CoW fixture assertions passed: duplicate_provisions_cow_checkout_when_isolation_enabled");
     }
 
     /// cowIsolation on + CoW-incapable filesystem: `workspace.duplicate`
@@ -33505,16 +34056,13 @@ mod worktree_provisioning {
     /// unresolvable `baseRef`), the create fails without inserting a row and
     /// without leaving the empty `<root>/<wsId>` dir the probe created behind
     /// — the workspaces root ends up clean.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn create_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowfail-repo");
         let root = unique_dir("intentd-cowfail-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -33543,6 +34091,7 @@ mod worktree_provisioning {
                 .is_none(),
             "workspaces root must have no leftover empty <root>/<wsId> dir"
         );
+        eprintln!("CoW fixture assertions passed: create_cleans_up_empty_ws_dir_when_cow_provisioning_fails");
     }
 
     /// monorepo#774, `workspace.duplicate` path: a `CoW` provisioning failure
@@ -33557,16 +34106,13 @@ mod worktree_provisioning {
     /// flow, not a mutation-killing regression test. The #774 regression
     /// coverage lives in the create-path test above and the
     /// `remove_workspace_dir_if_empty` unit test below.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowdupfail-repo");
         let root = unique_dir("intentd-cowdupfail-root");
-        if intent_git::cow_probe(&repo_dir.0, &root.0)
-            .unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo_dir.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -33598,6 +34144,7 @@ mod worktree_provisioning {
             vec![".workspace".to_string()],
             "duplicate ws dir holds only the metadata dir"
         );
+        eprintln!("CoW fixture assertions passed: duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails");
     }
 
     /// The #774 cleanup helper only ever removes *empty* dirs: a non-empty
@@ -35178,6 +35725,203 @@ mod setup_lifecycle_events {
 mod file_ops_service {
     use super::*;
 
+    #[intent_test_macros::daemon_test]
+    async fn file_read_registered_root_preserves_content_and_confinement() {
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.unwrap();
+        let dir = test_tempdir("intentd-file-read-roots-");
+        let primary = dir.path().join("primary");
+        let external = dir.path().join("external");
+        let sandbox = dir.path().join("sandbox");
+        for path in [&primary, &external, &sandbox] {
+            std::fs::create_dir_all(path).unwrap();
+            git2::Repository::init(path).unwrap();
+        }
+        let ws = WorkspaceId::new();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(primary.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.unwrap();
+        let caller = AgentId::new();
+        let mut session = super::turn_end_unread_gate::session(&caller, &ws);
+        session.sandbox_path = Some(sandbox.to_string_lossy().into_owned());
+        store.insert_agent_session(&session).await.unwrap();
+        let svc = Services::new(store);
+        let root = svc
+            .git_root_register(
+                ws.clone(),
+                external.to_string_lossy().into_owned(),
+                caller.clone(),
+            )
+            .await
+            .unwrap();
+        let root_id = intent_core::WorkspaceGitRootId::from(root["id"].as_str().unwrap());
+        std::fs::write(primary.join("new.txt"), "primary").unwrap();
+        std::fs::write(sandbox.join("new.txt"), "sandbox").unwrap();
+        std::fs::write(external.join("new.txt"), "external λ\n").unwrap();
+        for (agent, root, expected) in [
+            (None, None, "primary"),
+            (Some(caller.clone()), None, "sandbox"),
+            (None, Some(root_id.clone()), "external λ\n"),
+            (Some(caller), Some(root_id.clone()), "external λ\n"),
+        ] {
+            assert_eq!(
+                svc.file_read(ws.clone(), "new.txt".into(), agent.clone(), root.clone())
+                    .await
+                    .unwrap(),
+                serde_json::json!(expected)
+            );
+            let chunk = svc
+                .file_read_chunk(ws.clone(), "new.txt".into(), 0, 100, agent, root)
+                .await
+                .unwrap();
+            assert_eq!(
+                chunk["content"],
+                base64::engine::general_purpose::STANDARD.encode(expected)
+            );
+            assert_eq!(chunk["bytesRead"], expected.len());
+        }
+        // Existing full-text behavior has no chunk-size cap and no truncation.
+        let large = "x".repeat(crate::file_ops::READ_CHUNK_MAX_BYTES + 1);
+        std::fs::write(external.join("large.txt"), &large).unwrap();
+        assert_eq!(
+            svc.file_read(ws.clone(), "large.txt".into(), None, Some(root_id.clone()))
+                .await
+                .unwrap(),
+            serde_json::json!(large)
+        );
+        std::fs::write(external.join("empty.txt"), "").unwrap();
+        assert_eq!(
+            svc.file_read(ws.clone(), "empty.txt".into(), None, Some(root_id.clone()))
+                .await
+                .unwrap(),
+            serde_json::json!("")
+        );
+        std::fs::write(external.join("binary.bin"), [0xff, 0xfe]).unwrap();
+        for (offset, length, expected) in [
+            (0, 1, vec![0xff]),
+            (1, 16, vec![0xfe]),
+            (2, 16, vec![]),
+            (20, 16, vec![]),
+        ] {
+            let chunk = svc
+                .file_read_chunk(
+                    ws.clone(),
+                    "binary.bin".into(),
+                    offset,
+                    length,
+                    None,
+                    Some(root_id.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                chunk,
+                serde_json::json!({"content": base64::engine::general_purpose::STANDARD.encode(&expected), "bytesRead": expected.len(), "size": 2})
+            );
+        }
+        for length in [0, crate::file_ops::READ_CHUNK_MAX_BYTES as u64 + 1] {
+            assert!(matches!(
+                svc.file_read_chunk(
+                    ws.clone(),
+                    "binary.bin".into(),
+                    0,
+                    length,
+                    None,
+                    Some(root_id.clone())
+                )
+                .await,
+                Err(Error::InvalidParams(_))
+            ));
+        }
+        for path in ["missing.txt", "../primary/new.txt"] {
+            assert!(matches!(
+                svc.file_read_chunk(ws.clone(), path.into(), 0, 16, None, Some(root_id.clone()))
+                    .await,
+                Err(Error::Internal(_))
+            ));
+        }
+        assert!(matches!(
+            svc.file_read_chunk(ws.clone(), ".".into(), 0, 16, None, Some(root_id.clone()))
+                .await,
+            Err(Error::InvalidParams(_))
+        ));
+        for path in ["binary.bin", "missing.txt", ".", "../primary/new.txt"] {
+            assert!(
+                matches!(
+                    svc.file_read(ws.clone(), path.into(), None, Some(root_id.clone()))
+                        .await,
+                    Err(Error::Internal(_))
+                ),
+                "{path}"
+            );
+        }
+        let outside = primary.join("new.txt").to_string_lossy().into_owned();
+        assert!(matches!(
+            svc.file_read_chunk(
+                ws.clone(),
+                outside.clone(),
+                0,
+                16,
+                None,
+                Some(root_id.clone())
+            )
+            .await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            svc.file_read(ws.clone(), outside, None, Some(root_id.clone()))
+                .await,
+            Err(Error::Internal(_))
+        ));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(primary.join("new.txt"), external.join("escape.txt"))
+                .unwrap();
+            std::os::unix::fs::symlink(external.join("new.txt"), external.join("alias.txt"))
+                .unwrap();
+            assert!(matches!(
+                svc.file_read(ws.clone(), "escape.txt".into(), None, Some(root_id.clone()))
+                    .await,
+                Err(Error::Internal(_))
+            ));
+            assert!(matches!(
+                svc.file_read_chunk(
+                    ws.clone(),
+                    "escape.txt".into(),
+                    0,
+                    16,
+                    None,
+                    Some(root_id.clone())
+                )
+                .await,
+                Err(Error::Internal(_))
+            ));
+            let chunk = svc
+                .file_read_chunk(
+                    ws.clone(),
+                    "alias.txt".into(),
+                    0,
+                    100,
+                    None,
+                    Some(root_id.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                chunk["content"],
+                base64::engine::general_purpose::STANDARD.encode("external λ\n")
+            );
+            assert_eq!(
+                svc.file_read(ws, "alias.txt".into(), None, Some(root_id))
+                    .await
+                    .unwrap(),
+                serde_json::json!("external λ\n")
+            );
+        }
+    }
+
     /// `file.*` wired through `WorkspaceApi`: the workspace root resolves from
     /// `worktreePath`, writes/reads round-trip, and an out-of-workspace path
     /// surfaces as `Error::Internal` (→ `-32603`).
@@ -35209,7 +35953,7 @@ mod file_ops_service {
         );
 
         let read = svc
-            .file_read(ws.clone(), "notes/x.txt".to_string(), None)
+            .file_read(ws.clone(), "notes/x.txt".to_string(), None, None)
             .await
             .expect("read");
         assert_eq!(read, serde_json::Value::String("hi".to_string()));
@@ -35224,7 +35968,7 @@ mod file_ops_service {
         );
 
         let denied = svc
-            .file_read(ws.clone(), "../escape".to_string(), None)
+            .file_read(ws.clone(), "../escape".to_string(), None, None)
             .await;
         assert!(matches!(denied, Err(Error::Internal(_))));
     }
@@ -38747,13 +39491,11 @@ mod clone_orchestration {
     /// `workspace.cowIsolation` on and a CoW-capable filesystem, the local
     /// create streams the `cow-copy 30` milestone (not `worktree`) with the
     /// echoed `progressId` and one terminal done.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn progress_id_cow_create_streams_cow_copy_milestone() {
         let repo = seed_repo("intentd-prog-cow-src");
         let root = unique_dir("intentd-prog-cow-root");
-        if intent_git::cow_probe(&repo.0, &root.0).unwrap_or(intent_git::CowSupport::Unsupported)
-            != intent_git::CowSupport::Supported
-        {
+        if !super::cow_fixture_supported(&repo.0, &root.0) {
             eprintln!("Skipping test: CoW not supported on this filesystem");
             return;
         }
@@ -38804,6 +39546,9 @@ mod clone_orchestration {
         assert!(
             !frames.iter().any(|f| f.data["phase"] == "worktree"),
             "no worktree milestone on the CoW path: {frames:?}"
+        );
+        eprintln!(
+            "CoW fixture assertions passed: progress_id_cow_create_streams_cow_copy_milestone"
         );
     }
 
@@ -46321,7 +47066,7 @@ mod delete_grace_window {
     use crate::{EventBus, Services};
 
     struct Harness {
-        _tmp: TempDb,
+        tmp: TempDb,
         _ws_root: WorkspacesRoot,
         services: Services,
         bus: EventBus,
@@ -46339,12 +47084,29 @@ mod delete_grace_window {
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
         Harness {
-            _tmp: tmp,
+            tmp,
             _ws_root: ws_root,
             services,
             bus,
             ws,
         }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_discards_unclaimed_delete_undo_wait() {
+        let h = harness().await;
+        h.services
+            .schedule_workspace_delete(h.ws.clone(), 60_000)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), h.services.shutdown_store_writers())
+            .await
+            .unwrap();
+        h.bus.shutdown().await.unwrap();
+        h.services.store.close().await;
+        let reopened = Store::open(&h.tmp.path).await.unwrap();
+        assert!(reopened.get_workspace(&h.ws).await.is_ok());
+        reopened.close().await;
     }
 
     /// Bounded poll until the workspace row is gone (the timer commit is
@@ -46721,7 +47483,7 @@ mod bulk_delete_pool_pressure {
         let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
         drop(guard);
 
-        assert!(trash.is_none(), "nothing to detach");
+        assert!(trash.0.is_none(), "nothing to detach");
         let loud = capture.at_or_above(tracing::Level::WARN);
         assert!(
             loud.is_empty(),
@@ -46773,7 +47535,7 @@ mod bulk_delete_pool_pressure {
         let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
         drop(guard);
 
-        assert!(trash.is_none(), "nothing detached");
+        assert!(trash.0.is_none(), "nothing detached");
         let loud = capture.at_or_above(tracing::Level::WARN);
         assert!(
             loud.iter()
@@ -46898,7 +47660,7 @@ mod agent_delete_grace_window {
     use crate::{EventBus, Services};
 
     struct Harness {
-        _tmp: TempDb,
+        tmp: TempDb,
         _ws_root: WorkspacesRoot,
         services: Services,
         bus: EventBus,
@@ -46972,13 +47734,72 @@ mod agent_delete_grace_window {
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone());
         Harness {
-            _tmp: tmp,
+            tmp,
             _ws_root: ws_root,
             services,
             bus,
             ws,
             agent,
         }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn shutdown_retains_claimed_agent_delete() {
+        let h = harness().await;
+        h.services.shutdown_group_persistence().await;
+        h.services
+            .agent_schedule_delete_op(h.agent.clone(), None, 50)
+            .await
+            .unwrap();
+        let held = h.services.store.write_pool().acquire().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h
+                .services
+                .pending_agent_deletes
+                .deadline(&crate::delete_grace::PendingDeleteSubject::Agent {
+                    workspace_id: h.ws.clone(),
+                    agent_id: h.agent.clone(),
+                })
+                .unwrap()
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timer claimed its cascade");
+        let shutdown = h.services.shutdown_store_writers();
+        tokio::pin!(shutdown);
+        let returned_early = tokio::select! {
+            biased;
+            () = &mut shutdown => true,
+            () = std::future::ready(()) => false,
+        };
+        drop(held);
+        if !returned_early {
+            tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
+                .await
+                .unwrap();
+        }
+        assert!(
+            !returned_early,
+            "shutdown abandoned a claimed agent-delete cascade"
+        );
+        h.bus.shutdown().await.unwrap();
+        h.services.store.close().await;
+        let reopened = Store::open(&h.tmp.path).await.unwrap();
+        assert!(matches!(
+            reopened.get_agent_session(&h.agent).await,
+            Err(Error::NotFound(_))
+        ));
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "agent:deleted"));
+        reopened.close().await;
     }
 
     /// Bounded poll until the session row is gone (the timer commit is
@@ -47422,6 +48243,7 @@ mod harness_versioning {
         let (_tmp, svc, ws) = setup().await;
         let created = create_agent(&svc, &ws, None).await;
         let agent = &created["agent"];
+        assert_eq!(agent["harnessVersion"], "3.1");
         assert_eq!(
             agent["harnessVersion"],
             intent_core::CURRENT_HARNESS_VERSION,
@@ -47446,6 +48268,50 @@ mod harness_versioning {
         let persisted = session.harness_features.expect("persisted snapshot");
         assert_eq!(persisted["taskGraph"], serde_json::json!(true));
         assert_eq!(persisted["peerAgents"], serde_json::json!(true));
+        let full = svc.agent_get_session_op(id).await.expect("getSession");
+        assert_eq!(full.harness_version, "3.1");
+        assert_eq!(full.harness_features.as_ref(), Some(&persisted));
+        assert_eq!(agent["harnessFeatures"], persisted);
+    }
+
+    #[tokio::test]
+    async fn child_of_saved_2_9_keeps_parent_stamp_and_snapshot() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let parent_id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let mut saved_features = created["agent"]["harnessFeatures"].clone();
+        saved_features["hostExec"] = serde_json::json!(false);
+        saved_features["peerAgents"] = serde_json::json!(false);
+        sqlx::query(
+            "UPDATE agent_session SET harness_version = '2.9', harness_features = ? WHERE id = ?",
+        )
+        .bind(saved_features.to_string())
+        .bind(&parent_id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+        let child = create_agent(&svc, &ws, Some(parent_id.clone())).await;
+        assert_eq!(child["agent"]["harnessVersion"], "3.1");
+        assert_eq!(child["agent"]["harnessFeatures"]["hostExec"], true);
+        assert_eq!(child["agent"]["harnessFeatures"]["peerAgents"], true);
+        let child_id = AgentId::from(child["agent"]["id"].as_str().unwrap());
+        let child_row = svc.store().get_agent_session(&child_id).await.unwrap();
+        assert_eq!(child_row.harness_version, "3.1");
+        assert_eq!(child_row.parent_agent_id.as_ref(), Some(&parent_id));
+        assert_eq!(
+            child_row.harness_features.as_ref(),
+            Some(&child["agent"]["harnessFeatures"])
+        );
+        let child_full = svc.agent_get_session_op(child_id).await.unwrap();
+        assert_eq!(child_full.harness_version, "3.1");
+        assert_eq!(child_full.harness_features, child_row.harness_features);
+        let parent = svc.store().get_agent_session(&parent_id).await.unwrap();
+        assert_eq!(parent.harness_version, "2.9");
+        assert_eq!(parent.harness_features.as_ref(), Some(&saved_features));
+        assert!(!svc.session_agent_features(&parent).peer_agents);
+        let parent_full = svc.agent_get_session_op(parent_id).await.unwrap();
+        assert_eq!(parent_full.harness_version, "2.9");
+        assert_eq!(parent_full.harness_features.as_ref(), Some(&saved_features));
     }
 
     /// Delegation mints LATEST, never inherits: a child created by a parent

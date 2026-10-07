@@ -1,0 +1,225 @@
+[
+  {
+    "id": "new-workspace",
+    "tab": "",
+    "label": "New workspace",
+    "route": "/workspace/new",
+    "category": "navigation",
+    "description": "Create-workspace flow."
+  },
+  {
+    "id": "utility-default-model",
+    "tab": "providers",
+    "scrollSelector": "#utility-default-model",
+    "highlightSelector": "[data-highlight-id=\"utility-default-model\"]",
+    "label": "Settings: Default model",
+    "route": "/settings?tab=providers#utility-default-model",
+    "description": "Default AI behavior model selection.",
+    "hashAliases": [
+      "utility-default-model",
+      "default-model",
+      "quickActions.defaultModel",
+      "backgroundAgents.defaultModel"
+    ],
+    "category": "settings"
+  },
+  {
+    "id": "global-instructions",
+    "tab": "agent-behavior",
+    "scrollSelector": "#global-instructions",
+    "highlightSelector": "[data-highlight-id=\"global-instructions\"]",
+    "label": "Settings: Agent Behavior",
+    "route": "/settings?tab=agent-behavior#global-instructions",
+    "description": "Global agent instructions and defaults.",
+    "hashAliases": [
+      "global-instructions",
+      "agents",
+      "specialists",
+      "all-agents"
+    ],
+    "category": "settings"
+  },
+  {
+    "id": "create-specialist",
+    "tab": "specialists",
+    "scrollSelector": "#create-specialist",
+    "highlightSelector": "[data-highlight-id=\"create-specialist\"]",
+    "label": "Settings: Create specialist",
+    "route": "/settings?tab=specialists&view=create-specialist#create-specialist",
+    "description": "Create-specialist entry point.",
+    "hashAliases": [
+      "create-specialist"
+    ],
+    "category": "settings"
+  },
+  {
+    "id": "providers",
+    "tab": "providers",
+    "scrollSelector": "#providers",
+    "highlightSelector": "[data-highlight-id=\"providers\"]",
+    "label": "Settings: AI coding CLIs",
+    "route": "/settings?tab=providers#providers",
+    "description": "Provider/account selector settings.",
+    "hashAliases": [
+      "providers"
+    ],
+    "category": "settings"
+  },
+  {
+    "id": "integrations",
+    "tab": "connections",
+    "scrollSelector": "#integrations",
+    "highlightSelector": "[data-highlight-id=\"integrations\"]",
+    "label": "Settings: Connections",
+    "route": "/settings?tab=connections#integrations",
+    "description": "Connected integrations settings.",
+    "hashAliases": [
+      "integrations"
+    ],
+    "category": "settings"
+  },
+  {
+    "id": "devices",
+    "tab": "devices",
+    "scrollSelector": "#devices",
+    "highlightSelector": "#devices",
+    "label": "Settings: Devices",
+    "route": "/settings?tab=devices#devices",
+    "description": "Saved remote device settings.",
+    "hashAliases": [
+      "devices",
+      "machines"
+    ],
+    "category": "settings"
+  },
+  {
+    "id": "mobile",
+    "tab": "mobile",
+    "scrollSelector": "#mobile",
+    "highlightSelector": "[data-highlight-id=\"mobile\"]",
+    "label": "Settings: Mobile",
+    "route": "/settings?tab=mobile#mobile",
+    "description": "Intent Mobile pairing and Remote Access for the active connection.",
+    "hashAliases": [
+      "mobile"
+    ],
+    "category": "settings"
+  },
+  {
+    "id": "websocket-api",
+    "tab": "mobile",
+    "scrollSelector": "#websocket-api",
+    "highlightSelector": "[data-highlight-id=\"websocket-api\"]",
+    "label": "Settings: Remote Access",
+    "route": "/settings?tab=mobile#websocket-api",
+    "description": "For mobile or iPhone pairing, open Settings → Mobile → Intent Mobile → Show QR Code. Select the local machine first for local pairing. Remote Access must be enabled; TLS and tunnel switches are not required to display the controls.",
+    "hashAliases": [
+      "websocket-api",
+      "remote-access"
+    ],
+    "category": "settings"
+  },
+  {
+    "id": "workspace-card",
+    "tab": "",
+    "highlightSelector": "[data-highlight-id^=\"workspace-\"]",
+    "label": "Workspace card",
+    "category": "workspace",
+    "description": "A workspace card on workspace list surfaces.",
+    "dynamic": true,
+    "idPattern": "workspace-{workspaceId}",
+    "hashAliases": [
+      "workspace-card"
+    ]
+  },
+  {
+    "id": "specialist-entry",
+    "tab": "specialists",
+    "highlightSelector": "[data-highlight-id^=\"specialist-\"]",
+    "label": "Specialist entry",
+    "route": "/settings?tab=specialists&specialist={specialistId}#specialist-{specialistId}",
+    "category": "specialist",
+    "description": "A specific specialist row in settings.",
+    "dynamic": true,
+    "idPattern": "specialist-{specialistId}"
+  },
+  {
+    "id": "appearance",
+    "tab": "display",
+    "hashAliases": [
+      "appearance",
+      "theme"
+    ],
+    "scrollSelector": "#theme",
+    "highlightSelector": "[data-highlight-id=\"appearance\"]",
+    "label": "Settings: Appearance",
+    "route": "/settings?tab=display#theme",
+    "description": "Theme mode controls.",
+    "category": "settings"
+  },
+  {
+    "id": "notifications",
+    "tab": "app-behavior",
+    "hashAliases": [
+      "notifications"
+    ],
+    "scrollSelector": "#notifications",
+    "highlightSelector": "[data-highlight-id=\"notifications\"]",
+    "label": "Settings: Notifications",
+    "route": "/settings?tab=app-behavior#notifications",
+    "description": "Notification preferences.",
+    "category": "settings"
+  },
+  {
+    "id": "keyboard-shortcuts",
+    "tab": "input",
+    "hashAliases": [
+      "keyboard-shortcuts"
+    ],
+    "scrollSelector": "#keyboard-shortcuts",
+    "highlightSelector": "[data-highlight-id=\"keyboard-shortcuts\"]",
+    "label": "Settings: Keyboard Shortcuts",
+    "route": "/settings?tab=input#keyboard-shortcuts",
+    "description": "Keyboard shortcuts reference.",
+    "category": "settings"
+  },
+  {
+    "id": "mcp-servers",
+    "tab": "connections",
+    "hashAliases": [
+      "mcp-servers"
+    ],
+    "scrollSelector": "#mcp-servers",
+    "highlightSelector": "[data-highlight-id=\"mcp-servers\"]",
+    "label": "Settings: MCP Servers",
+    "route": "/settings?tab=connections#mcp-servers",
+    "description": "MCP server configuration.",
+    "category": "settings"
+  },
+  {
+    "id": "git-workspace",
+    "tab": "setup",
+    "hashAliases": [
+      "git-workspace"
+    ],
+    "scrollSelector": "#git-workspace",
+    "highlightSelector": "[data-highlight-id=\"git-workspace\"]",
+    "label": "Settings: Git & Workspace",
+    "route": "/settings?tab=setup#git-workspace",
+    "description": "Git and workspace defaults.",
+    "category": "settings"
+  },
+  {
+    "id": "workspace-api",
+    "tab": "advanced",
+    "hashAliases": [
+      "workspace-api"
+    ],
+    "scrollSelector": "#workspace-api",
+    "highlightSelector": "[data-highlight-id=\"workspace-api\"]",
+    "label": "Settings: Tool Output & Retention",
+    "route": "/settings?tab=advanced#workspace-api",
+    "description": "Tool output size and retention settings.",
+    "category": "settings"
+  }
+]

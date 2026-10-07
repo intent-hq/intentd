@@ -388,7 +388,7 @@ async fn specialist_provider_explicit_choices_and_effort_stay_authoritative() {
     );
 }
 
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn specialist_provider_uses_merged_tiers_and_preserves_an_explicit_clear() {
     let (tmp, svc, ws) = setup().await;
     let root = tmp.path.parent().unwrap();
@@ -559,4 +559,39 @@ async fn specialist_provider_invalid_pins_leave_no_creation_side_effects() {
         .await;
         assert!(model_only["agent"]["provider"].is_null());
     }
+}
+
+/// Decoration must use the resolved row even after its backing file changes.
+/// This deterministically catches reopening per scalar without timing thresholds.
+#[tokio::test]
+async fn specialist_preview_decorates_the_resolved_definition_without_rereading() {
+    let (tmp, svc, _ws) = setup().await;
+    let mut row = svc.specialists_service().get("pin-alias", None).unwrap()["specialist"].clone();
+    write_specialist(
+        &tmp.path.parent().unwrap().join("specialists"),
+        "pinned",
+        "codingAgent: grok\nmodel: default-model\nreasoningEffort: low\n",
+    );
+    crate::decorate_specialist_resolved(&svc, &mut row, None);
+    assert_eq!(row["resolvedProvider"], "auggie");
+    assert_eq!(row["resolvedModel"], "pinned-model");
+    assert_eq!(row["resolvedReasoningEffort"], "high");
+
+    let mut overridden = row.clone();
+    overridden
+        .as_object_mut()
+        .unwrap()
+        .remove("resolvedReasoningEffort");
+    crate::decorate_specialist_resolved(&svc, &mut overridden, Some("grok"));
+    assert_eq!(overridden["resolvedProvider"], "grok");
+    assert_eq!(overridden["resolvedModel"], "default-model");
+    assert_eq!(overridden["resolvedReasoningEffort"], "low");
+
+    let fresh = svc
+        .specialist_get("pinned".into(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(fresh["specialist"]["resolvedProvider"], "grok");
+    assert_eq!(fresh["specialist"]["resolvedModel"], "default-model");
+    assert_eq!(fresh["specialist"]["resolvedReasoningEffort"], "low");
 }

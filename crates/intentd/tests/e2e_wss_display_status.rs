@@ -389,6 +389,7 @@ async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestSta
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,

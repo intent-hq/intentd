@@ -11,6 +11,10 @@ pub fn install(data_dir: &Path, script: &str) -> Vec<(String, String)> {
     let bin = data_dir.join("codex-toolchain");
     std::fs::create_dir_all(&bin).expect("create fake toolchain");
     for (name, body) in [
+        (
+            "codex",
+            "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'codex-cli 1.0.0\\n'\n",
+        ),
         ("node", "#!/bin/sh\nexec \"$MOCK_AGENT_NODE\" \"$@\"\n"),
         (
             "npx",

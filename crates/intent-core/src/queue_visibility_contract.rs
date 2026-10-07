@@ -1,16 +1,18 @@
-//! The per-user queue visibility / mutation contract as ONE data table
+//! The shared queue visibility / mutation contract as ONE data table
 //! (multiplayer, intentd#2068): every (caller class × attribution tier ×
 //! surface) cell of the policy with its expected outcome, so the services
 //! and transport contract harnesses and the queue-entry egress lint read a
 //! single source of truth and fail by cell name.
 //!
-//! The outcomes encode the policy as merged in #2068 — the doc comments on
-//! [`crate::queue_attribution_visible_to`], `QueueEntryGate::check`
-//! (intent-services), `project_queue_event_for_current_caller`
-//! (intent-transport) and [`crate::project_queue_for_caller`] — plus the
-//! `agent.diagnostics` decision: its queue entries are projected per caller
-//! exactly like `agent.getQueue`, so the [`QueueSurface::Diagnostics`] rows
-//! mirror the [`QueueSurface::GetQueue`] rows.
+//! Read surfaces share all entries among admitted human workspace participants.
+//! The table's Agent caller inspects another agent. Recipient reads have an
+//! additional target-aware restriction (`queue_contents_visible_to`): status
+//! and diagnostics retain counts with empty entries, explicit getQueue refuses
+//! contents, and queue event history drops payloads. Hook reads use their owner
+//! agent identity. Delivery and the human mutation policy are unchanged.
+//! Mutation cells are intentionally independent: editing is author-only and
+//! the existing guest send-now/delete restrictions remain. Workspace-owner
+//! delete moderation has an additional services regression fixture.
 //!
 //! This module carries no behavior: the predicate stays in [`crate::caller`],
 //! and a unit test here cross-checks every pure-policy cell against it.
@@ -36,7 +38,7 @@ pub enum CallerClass {
     AuthorGuest,
     /// Wire guest looking at someone else's entry.
     ForeignGuest,
-    /// [`Caller::Agent`] calling back through `workspace_api`.
+    /// [`Caller::Agent`] inspecting a different agent through `workspace_api`.
     Agent,
     /// [`Caller::Daemon`] (hook runs, background work).
     Daemon,
@@ -341,8 +343,7 @@ pub const QUEUE_VISIBILITY_CONTRACT: &[Cell] = &[
     cell(C::Administrator, T::Unattributed, S::RemoveQueuedMessage, E::Allowed),
     cell(C::Administrator, T::Unattributed, S::SendQueuedMessageNow, E::Allowed),
     cell(C::Administrator, T::Unattributed, S::Diagnostics, E::Visible),
-    // AuthorGuest: own stamped entries and unattributed ones; an
-    // unknown-human entry is withheld like a foreign one.
+    // AuthorGuest: shared reads, own/nonhuman mutations only.
     cell(C::AuthorGuest, T::PrincipalStamped, S::GetQueue, E::Visible),
     cell(C::AuthorGuest, T::PrincipalStamped, S::QueueUpdatedEvent, E::Visible),
     cell(C::AuthorGuest, T::PrincipalStamped, S::QueueProcessingEvent, E::Visible),
@@ -350,13 +351,13 @@ pub const QUEUE_VISIBILITY_CONTRACT: &[Cell] = &[
     cell(C::AuthorGuest, T::PrincipalStamped, S::RemoveQueuedMessage, E::Allowed),
     cell(C::AuthorGuest, T::PrincipalStamped, S::SendQueuedMessageNow, E::Allowed),
     cell(C::AuthorGuest, T::PrincipalStamped, S::Diagnostics, E::Visible),
-    cell(C::AuthorGuest, T::UnknownHuman, S::GetQueue, E::Hidden),
-    cell(C::AuthorGuest, T::UnknownHuman, S::QueueUpdatedEvent, E::Hidden),
-    cell(C::AuthorGuest, T::UnknownHuman, S::QueueProcessingEvent, E::ContentRedacted),
+    cell(C::AuthorGuest, T::UnknownHuman, S::GetQueue, E::Visible),
+    cell(C::AuthorGuest, T::UnknownHuman, S::QueueUpdatedEvent, E::Visible),
+    cell(C::AuthorGuest, T::UnknownHuman, S::QueueProcessingEvent, E::Visible),
     cell(C::AuthorGuest, T::UnknownHuman, S::EditQueuedMessage, E::NotFound),
     cell(C::AuthorGuest, T::UnknownHuman, S::RemoveQueuedMessage, E::NotFound),
     cell(C::AuthorGuest, T::UnknownHuman, S::SendQueuedMessageNow, E::NotFound),
-    cell(C::AuthorGuest, T::UnknownHuman, S::Diagnostics, E::Hidden),
+    cell(C::AuthorGuest, T::UnknownHuman, S::Diagnostics, E::Visible),
     cell(C::AuthorGuest, T::Unattributed, S::GetQueue, E::Visible),
     cell(C::AuthorGuest, T::Unattributed, S::QueueUpdatedEvent, E::Visible),
     cell(C::AuthorGuest, T::Unattributed, S::QueueProcessingEvent, E::Visible),
@@ -364,22 +365,21 @@ pub const QUEUE_VISIBILITY_CONTRACT: &[Cell] = &[
     cell(C::AuthorGuest, T::Unattributed, S::RemoveQueuedMessage, E::Allowed),
     cell(C::AuthorGuest, T::Unattributed, S::SendQueuedMessageNow, E::Allowed),
     cell(C::AuthorGuest, T::Unattributed, S::Diagnostics, E::Visible),
-    // ForeignGuest: only unattributed entries; everything human-authored by
-    // someone else (or by nobody anyone can name) reads as absent.
-    cell(C::ForeignGuest, T::PrincipalStamped, S::GetQueue, E::Hidden),
-    cell(C::ForeignGuest, T::PrincipalStamped, S::QueueUpdatedEvent, E::Hidden),
-    cell(C::ForeignGuest, T::PrincipalStamped, S::QueueProcessingEvent, E::ContentRedacted),
+    // ForeignGuest: shared reads never grant foreign human mutation rights.
+    cell(C::ForeignGuest, T::PrincipalStamped, S::GetQueue, E::Visible),
+    cell(C::ForeignGuest, T::PrincipalStamped, S::QueueUpdatedEvent, E::Visible),
+    cell(C::ForeignGuest, T::PrincipalStamped, S::QueueProcessingEvent, E::Visible),
     cell(C::ForeignGuest, T::PrincipalStamped, S::EditQueuedMessage, E::NotFound),
     cell(C::ForeignGuest, T::PrincipalStamped, S::RemoveQueuedMessage, E::NotFound),
     cell(C::ForeignGuest, T::PrincipalStamped, S::SendQueuedMessageNow, E::NotFound),
-    cell(C::ForeignGuest, T::PrincipalStamped, S::Diagnostics, E::Hidden),
-    cell(C::ForeignGuest, T::UnknownHuman, S::GetQueue, E::Hidden),
-    cell(C::ForeignGuest, T::UnknownHuman, S::QueueUpdatedEvent, E::Hidden),
-    cell(C::ForeignGuest, T::UnknownHuman, S::QueueProcessingEvent, E::ContentRedacted),
+    cell(C::ForeignGuest, T::PrincipalStamped, S::Diagnostics, E::Visible),
+    cell(C::ForeignGuest, T::UnknownHuman, S::GetQueue, E::Visible),
+    cell(C::ForeignGuest, T::UnknownHuman, S::QueueUpdatedEvent, E::Visible),
+    cell(C::ForeignGuest, T::UnknownHuman, S::QueueProcessingEvent, E::Visible),
     cell(C::ForeignGuest, T::UnknownHuman, S::EditQueuedMessage, E::NotFound),
     cell(C::ForeignGuest, T::UnknownHuman, S::RemoveQueuedMessage, E::NotFound),
     cell(C::ForeignGuest, T::UnknownHuman, S::SendQueuedMessageNow, E::NotFound),
-    cell(C::ForeignGuest, T::UnknownHuman, S::Diagnostics, E::Hidden),
+    cell(C::ForeignGuest, T::UnknownHuman, S::Diagnostics, E::Visible),
     cell(C::ForeignGuest, T::Unattributed, S::GetQueue, E::Visible),
     cell(C::ForeignGuest, T::Unattributed, S::QueueUpdatedEvent, E::Visible),
     cell(C::ForeignGuest, T::Unattributed, S::QueueProcessingEvent, E::Visible),
@@ -387,7 +387,7 @@ pub const QUEUE_VISIBILITY_CONTRACT: &[Cell] = &[
     cell(C::ForeignGuest, T::Unattributed, S::RemoveQueuedMessage, E::Allowed),
     cell(C::ForeignGuest, T::Unattributed, S::SendQueuedMessageNow, E::Allowed),
     cell(C::ForeignGuest, T::Unattributed, S::Diagnostics, E::Visible),
-    // Agent: acts on its own authority; sees and may mutate everything.
+    // Agent: inspecting a different recipient; existing read/mutation behavior.
     cell(C::Agent, T::PrincipalStamped, S::GetQueue, E::Visible),
     cell(C::Agent, T::PrincipalStamped, S::QueueUpdatedEvent, E::Visible),
     cell(C::Agent, T::PrincipalStamped, S::QueueProcessingEvent, E::Visible),
@@ -463,6 +463,21 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn recipient_read_restriction_is_independent_of_sender_attribution() {
+        let recipient = AgentId::from(AGENT_CALLER);
+        for class in CallerClass::ALL {
+            assert_eq!(
+                crate::queue_contents_visible_to(class.caller().as_ref(), &recipient),
+                *class != CallerClass::Agent,
+            );
+            assert!(crate::queue_contents_visible_to(
+                class.caller().as_ref(),
+                &AgentId::from("other")
+            ));
+        }
+    }
+
+    #[test]
     fn contract_is_complete_and_unique() {
         let mut seen = HashSet::new();
         for c in QUEUE_VISIBILITY_CONTRACT {
@@ -518,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_cells_hide_exactly_what_the_predicate_hides() {
+    fn mutation_cells_remain_restricted_independently_of_visibility() {
         for c in QUEUE_VISIBILITY_CONTRACT
             .iter()
             .filter(|c| !c.surface.is_pure_policy())
@@ -532,12 +547,14 @@ mod tests {
                 c.name(),
                 c.expected
             );
-            assert_eq!(
-                c.expected == Expected::NotFound,
-                !predicate_visible(*c),
-                "{}: NotFound iff the predicate hides the entry",
-                c.name()
-            );
+            assert!(predicate_visible(*c), "shared reads: {}", c.name());
+            if c.expected == Expected::NotFound {
+                assert!(matches!(
+                    c.caller,
+                    CallerClass::AuthorGuest | CallerClass::ForeignGuest
+                ));
+                assert_ne!(c.tier, AttributionTier::Unattributed);
+            }
             if c.expected == Expected::AuthorOnly {
                 assert_eq!(c.surface, QueueSurface::EditQueuedMessage, "{}", c.name());
                 assert_eq!(c.caller, CallerClass::Administrator, "{}", c.name());
@@ -586,7 +603,7 @@ mod tests {
             c.name(),
             "(ForeignGuest, PrincipalStamped, QueueProcessingEvent)"
         );
-        assert_eq!(c.expected, Expected::ContentRedacted);
+        assert_eq!(c.expected, Expected::Visible);
         let c = contract_cell(
             CallerClass::Administrator,
             AttributionTier::UnknownHuman,

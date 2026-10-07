@@ -22,6 +22,8 @@
 //! hosts' identities come from fake `GITLAB_TOKEN` / `GITHUB_TOKEN` values the
 //! mock recognises; the guests never authenticate — their proof snippets are
 //! scripted straight into the mock, as the GitHub suite scripts gists.
+//! Repository-backed GitLab host cases additionally require the explicit
+//! `repository-test-fixtures` transport registration; CI selects that feature.
 //! Hermetic: no live network, secrets land in a temp `INTENTD_SECRETS_FILE`.
 
 #![cfg(unix)]
@@ -117,21 +119,44 @@ esac
     path
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
+fn mock_gitlab_command(data_dir: &Path, env: &[(&str, &str)]) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    std::fs::write(
-        data_dir.join("config.toml"),
-        "[server.tunnel]\nenabled = true\n",
-    )
-    .expect("seed config.toml with server.tunnel.enabled");
+    let config = data_dir.join("config.toml");
+    let fresh_config = !config.exists();
+    // Restart must retain settings written through the real settings API.
+    if fresh_config {
+        std::fs::write(&config, "[server.tunnel]\nenabled = true\n")
+            .expect("seed config.toml with server.tunnel.enabled");
+    }
     common::enable_ws_api(data_dir);
     // The GitHub resolution chain ends at `gh auth token`; point the CLI at an
     // empty config dir so a developer's own `gh auth login` is never borrowed.
-    let gh_config_dir = data_dir.join("gh-config");
-    std::fs::create_dir_all(&gh_config_dir).expect("mkdir hermetic gh config dir");
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
+    // The owned mock is a finite test transport, never ambient production authority.
+    #[cfg(feature = "repository-test-fixtures")]
+    {
+        let endpoint = env
+            .iter()
+            .find_map(|(key, value)| (*key == "INTENTD_GITLAB_API_BASE_URI").then_some(*value))
+            .expect("owned GitLab mock");
+        let transports = serde_json::to_string(&[
+            ("https://gitlab.com", endpoint),
+            ("https://gitlab.custom.example:8443", endpoint),
+        ])
+        .unwrap();
+        if fresh_config {
+            let original = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(
+                &config,
+                format!("{original}\n[sourceControl.gitlab]\napiBaseUrl = {endpoint:?}\n"),
+            )
+            .unwrap();
+        }
+        cmd.env("INTENTD_REPOSITORY_TEST_TRANSPORTS", transports);
+    }
+    cmd.env("INTENTD_DISABLE_GH_CREDENTIALS", "1");
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -139,13 +164,25 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
         .env_remove("GITLAB_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
-        .env("GH_CONFIG_DIR", &gh_config_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     for (k, v) in env {
         cmd.env(k, v);
     }
-    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
+    if let Some((_, token)) = env.iter().find(|(key, _)| *key == "GITHUB_TOKEN") {
+        assert_eq!(
+            *token, OWNER_GH_TOKEN,
+            "only the fixture-owned GitHub owner token is supported"
+        );
+        // fixture-identity: allow — mixed-forge invites and rekey use OWNER_GH_TOKEN against the local forge mock.
+        common::mock_github_token(&mut cmd, data_dir, token);
+    }
+    cmd
+}
+
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
+    GuardedChild::spawn(&mut mock_gitlab_command(data_dir, env)).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -345,14 +382,18 @@ struct MockForge {
     /// answering only a bearer the instance knows.
     private_snippets: Arc<AtomicBool>,
     /// When set, the GitLab snippet routes answer `503` to every read.
+    #[cfg(feature = "repository-test-fixtures")]
     snippet_server_error: Arc<AtomicBool>,
     /// Nonzero status scripts public GitLab pin lookup failures (401 permits
     /// same-instance authenticated fallback).
+    #[cfg(feature = "repository-test-fixtures")]
     user_lookup_status: Arc<AtomicUsize>,
     /// The switches scripting github.com's `GET /user`.
+    #[cfg(feature = "repository-test-fixtures")]
     github_user: GithubUser,
     snippets: Snippets,
     /// Snippet reads (metadata or raw) that carried a bearer token.
+    #[cfg(feature = "repository-test-fixtures")]
     authenticated_snippet_reads: Arc<AtomicUsize>,
 }
 
@@ -391,6 +432,7 @@ impl GithubUser {
     }
 
     /// Wait until `n` reads in total have arrived while held.
+    #[cfg(feature = "repository-test-fixtures")]
     async fn held_reads(&self, n: usize) {
         let mut rx = self.held.subscribe();
         timeout(Duration::from_secs(30), rx.wait_for(|held| *held >= n))
@@ -543,10 +585,14 @@ async fn spawn_mock_forge() -> MockForge {
         base_uri: format!("http://127.0.0.1:{port}"),
         requests,
         private_snippets,
+        #[cfg(feature = "repository-test-fixtures")]
         snippet_server_error,
+        #[cfg(feature = "repository-test-fixtures")]
         user_lookup_status,
+        #[cfg(feature = "repository-test-fixtures")]
         github_user,
         snippets,
+        #[cfg(feature = "repository-test-fixtures")]
         authenticated_snippet_reads,
     }
 }
@@ -620,6 +666,16 @@ async fn serve_conn(
     };
     let (status, body) = if path_only == "/user" {
         github_user.answer(&bearer).await
+    } else if path_only == "/search/users" {
+        assert!(
+            bearer.is_empty(),
+            "invitation search must not use repository credentials"
+        );
+        assert!(query.contains("per_page=") && query.contains("page=1"));
+        (
+            200,
+            Body::Json(json!({"items":[gh_user_json("gh-guest",9001)]})),
+        )
     } else if path_only == "/users/gh-guest" {
         (200, Body::Json(gh_user_json("gh-guest", 9001)))
     } else if let Some(id) = path_only.strip_prefix("/gists/") {
@@ -646,7 +702,12 @@ async fn serve_conn(
                 .split('&')
                 .find_map(|kv| kv.strip_prefix("username="))
                 .unwrap_or_default();
-            let users: Vec<Value> = gl_user_for_username(username).into_iter().collect();
+            let users: Vec<Value> = if query.split('&').any(|kv| kv.starts_with("search=")) {
+                assert!(query.contains("per_page=") && query.contains("page=1"));
+                vec![gl_user_json(GUEST_GL_LOGIN, GUEST_GL_ID)]
+            } else {
+                gl_user_for_username(username).into_iter().collect()
+            };
             (200, Body::Json(Value::Array(users)))
         }
     } else if let Some(rest) = path_only.strip_prefix("/api/v4/snippets/") {
@@ -810,6 +871,7 @@ async fn next_event(ws: &mut Ws, event_type: &str, secs: u64) -> Value {
 
 /// True when no `events.event` of type `event_type` reaches `ws` within
 /// `window_ms` (a negative assertion: the socket stayed quiet).
+#[cfg(feature = "repository-test-fixtures")]
 async fn stays_quiet(ws: &mut Ws, event_type: &str, window_ms: u64) -> bool {
     timeout(Duration::from_millis(window_ms), async {
         loop {
@@ -835,6 +897,7 @@ async fn stays_quiet(ws: &mut Ws, event_type: &str, window_ms: u64) -> bool {
 }
 
 /// Subscribe `ws` to `principal:identity-changed` (global: no workspace).
+#[cfg(feature = "repository-test-fixtures")]
 async fn subscribe_identity_changed(ws: &mut Ws, id: i64) {
     let v = wss_rpc(
         ws,
@@ -850,6 +913,7 @@ async fn subscribe_identity_changed(ws: &mut Ws, id: i64) {
 }
 
 /// `settings.update` of `identity.provider` to `value` over WSS.
+#[cfg(feature = "repository-test-fixtures")]
 async fn set_identity_provider(owner: &mut Ws, id: i64, value: Value) {
     let v = wss_rpc(
         owner,
@@ -946,7 +1010,7 @@ async fn assert_preview_pin_identity_over_wss(method: &str) {
         let mut expected_result = json!({
             "workspaceId": ws_id, "workspaceTitle": "Preview requirements",
             "scope":"workspace", "role":"collaborator",
-            "hostname": r["hostname"], "prettyHostname": r["prettyHostname"],
+            "hostname": r["hostname"], "prettyHostname": r["prettyHostname"], "collaborationName": null,
             "pinIdentity": expected,
         });
         assert!(r["hostname"].is_string(), "{r}");
@@ -1131,6 +1195,7 @@ async fn preview_pin_identity_keeps_provider_host_and_account_enforcement_over_w
 
 /// (a) + (c): a GitLab-only host mints invites and admits a GitLab guest;
 /// its own account is refused as a guest.
+#[cfg(feature = "repository-test-fixtures")]
 #[tokio::test]
 async fn gitlab_only_host_mints_invites_and_admits_gitlab_guest_over_wss() {
     let mock = spawn_mock_forge().await;
@@ -1384,6 +1449,7 @@ async fn gitlab_only_host_mints_invites_and_admits_gitlab_guest_over_wss() {
 /// host, keeps the nonce, and succeeds once the snippet is public. An
 /// instance answering a server error is `github-unreachable` (the code is
 /// kept for both providers) and the same nonce succeeds on retry.
+#[cfg(feature = "repository-test-fixtures")]
 #[tokio::test]
 async fn restricted_snippet_needs_the_hosts_own_connection_over_wss() {
     let mock = spawn_mock_forge().await;
@@ -1525,6 +1591,7 @@ async fn restricted_snippet_needs_the_hosts_own_connection_over_wss() {
 /// still qualifying nothing changes and nothing is published. A probe that
 /// outlives the next write is superseded: neither its `401` (unlink) nor
 /// its `200` (link) commits over the identity the newer write applied.
+#[cfg(feature = "repository-test-fixtures")]
 #[tokio::test]
 async fn identity_provider_write_rekeys_the_primary_over_wss() {
     let mock = spawn_mock_forge().await;
@@ -1747,3 +1814,49 @@ async fn identity_provider_write_rekeys_the_primary_over_wss() {
 
 #[path = "invite_join/host.rs"]
 mod invite_host;
+
+#[test]
+fn mock_gitlab_command_contract_keeps_private_secrets_across_restart() {
+    use std::ffi::OsStr;
+    let dir = temp_data_dir();
+    let secrets = dir.path().join("secrets.json");
+    let state = r#"{"sourceControl.gitlab.token":"synthetic-gitlab-token"}"#;
+    std::fs::write(&secrets, state).unwrap();
+    for _ in 0..2 {
+        let cmd = mock_gitlab_command(
+            dir.path(),
+            &[
+                ("GITHUB_TOKEN", OWNER_GH_TOKEN),
+                ("GH_TOKEN", "synthetic-host-token"),
+                ("GH_CONFIG_DIR", "synthetic-host-config"),
+                ("INTENTD_SECRETS_FILE", "synthetic-host-secrets"),
+                ("INTENTD_GITLAB_API_BASE_URI", "http://127.0.0.1:32123"),
+                ("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:32123"),
+                ("INTENTD_GITHUB_LOGIN_BASE_URI", "http://127.0.0.1:32123"),
+            ],
+        );
+        let environment: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        for key in ["GH_TOKEN", "GITLAB_TOKEN"] {
+            assert_eq!(environment.get(OsStr::new(key)), Some(&None), "{key}");
+        }
+        for (key, path) in [
+            ("GH_CONFIG_DIR", dir.path().join("gh-config")),
+            ("INTENTD_SECRETS_FILE", secrets.clone()),
+        ] {
+            assert_eq!(
+                environment.get(OsStr::new(key)),
+                Some(&Some(path.as_os_str())),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            environment.get(OsStr::new("INTENTD_GITLAB_API_BASE_URI")),
+            Some(&Some(OsStr::new("http://127.0.0.1:32123")))
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GITHUB_TOKEN")),
+            Some(&Some(OsStr::new(OWNER_GH_TOKEN)))
+        );
+        assert_eq!(std::fs::read_to_string(&secrets).unwrap(), state);
+    }
+}

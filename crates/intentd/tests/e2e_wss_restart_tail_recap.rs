@@ -230,7 +230,7 @@ fn spawn_daemon(
     // the explicit `agent.resolveInterrupted` call (the `auto` default resumes
     // on headless hosts, which would race the assertions below).
     common::disable_resume_on_start(data_dir);
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
@@ -317,6 +317,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,

@@ -378,18 +378,47 @@ async fn resource_context_agent_queue_rename_stop_and_metrics() {
             stats,
             json!({"additions":12,"deletions":3,"filesChanged":2})
         );
-        rpc(
-            &mut c,
-            "metrics.clearAgentStats",
-            p(json!({"agentId":agent})),
-        )
-        .await;
+        srv.api
+            .metrics_clear_agent_stats(agent.as_str().unwrap().to_string())
+            .await
+            .unwrap();
         assert!(
             rpc(&mut c, "metrics.getAgentStats", p(json!({"agentId":agent})))
                 .await
                 .is_null()
         );
     }
+    c.close().await;
+    srv.ws.stop().await;
+}
+
+/// Keep the active metrics read independently covered when the obsolete
+/// workspace-wide reads and clear RPC are retired.
+#[intent_test_macros::daemon_test]
+async fn retained_agent_stats_read_over_wss() {
+    let srv = start(WsOptions::default()).await;
+    let ws = workspace(&srv).await;
+    let mut c = client(&srv).await;
+    let created = rpc(
+        &mut c,
+        "agent.create",
+        json!({"workspaceId":ws,"name":"stats","provider":"mock","model":"default"}),
+    )
+    .await;
+    let agent = created["agent"]["id"].as_str().unwrap();
+    assert!(
+        rpc(&mut c, "metrics.getAgentStats", json!({"agentId":agent}))
+            .await
+            .is_null()
+    );
+    srv.store
+        .upsert_agent_metrics(&ws, agent, 12, 3, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        rpc(&mut c, "metrics.getAgentStats", json!({"agentId":agent})).await,
+        json!({"additions":12,"deletions":3,"filesChanged":2})
+    );
     c.close().await;
     srv.ws.stop().await;
 }
@@ -1029,7 +1058,6 @@ async fn resource_context_cannot_grant_access_to_another_workspaces_resources() 
             json!({"agentId":agent,"name":"unauthorized"}),
         ),
         ("metrics.getAgentStats", json!({"agentId":agent})),
-        ("metrics.clearAgentStats", json!({"agentId":agent})),
         (
             "file.attachmentUpload.chunk",
             json!({"uploadId":upload,"seq":0,"data":"ZGF0YQ=="}),

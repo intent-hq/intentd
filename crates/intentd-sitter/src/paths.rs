@@ -16,6 +16,7 @@
 //! ├── tmp/                               # in-flight downloads/extractions
 //! ├── config.toml                        # user-editable channel pin
 //! ├── state.json                         # persisted sitter state
+//! ├── sitter.lock                        # exclusive serve ownership (never removed)
 //! └── sitter.pid                         # serve-mode sitter pid (while running)
 //! ```
 

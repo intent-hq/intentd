@@ -363,18 +363,73 @@ pub(crate) fn check_envelope(value: &Value) -> EnvelopeCheck<'_> {
 /// Handle one JSON-RPC frame. Returns `Some(response)` for requests and `None`
 /// for notifications (including unknown / failed ones, per §3.4).
 pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<String> {
+    prepare_message(api, message)
+        .await
+        .map(PreparedReply::into_frame)
+}
+
+/// Classification comes from dispatch/encoding, never from response JSON.
+pub(crate) struct PreparedReply {
+    pub(crate) frame: String,
+    pub(crate) service: Option<(
+        intent_core::repository_request::RepositoryReadReplyKind,
+        Value,
+    )>,
+}
+
+impl PreparedReply {
+    pub(crate) fn transport(frame: String) -> Self {
+        Self {
+            frame,
+            service: None,
+        }
+    }
+
+    pub(crate) fn into_frame(self) -> String {
+        self.frame
+    }
+}
+
+fn prepared_error(id: &Value, code: i32, message: &str, data: Option<Value>) -> PreparedReply {
+    PreparedReply::transport(error_string(id, code, message, data))
+}
+
+/// A final local refusal uses the existing domain-error encoder and size cap.
+pub(crate) fn delivery_error(id: &Value, error: Error) -> String {
+    encode_dispatch_result(
+        id,
+        "",
+        false,
+        Err(domain_to_rpc(error)),
+        crate::MAX_OUTBOUND_MESSAGE_BYTES,
+    )
+    .frame
+    .expect("a request error has a frame")
+}
+
+pub(crate) async fn prepare_message(
+    api: &dyn WorkspaceApi,
+    message: &str,
+) -> Option<PreparedReply> {
     let value: Value = match serde_json::from_str(message) {
         Ok(v) => v,
         // Parse errors are always answered with id null (§9), even for
         // would-be notifications — notification status is not yet known.
-        Err(_) => return Some(error_string(&Value::Null, PARSE_ERROR, "Parse error", None)),
+        Err(_) => {
+            return Some(prepared_error(
+                &Value::Null,
+                PARSE_ERROR,
+                "Parse error",
+                None,
+            ))
+        }
     };
 
     // Envelope validation (-32600). Answered even for notification-shaped
     // frames: notification status is not trusted until the envelope is valid.
     let (echo_id, method, is_notification) = match check_envelope(&value) {
         EnvelopeCheck::NotObject => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &Value::Null,
                 INVALID_REQUEST,
                 "Invalid Request: expected an object",
@@ -382,7 +437,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             ))
         }
         EnvelopeCheck::BadJsonRpc { echo_id } => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &echo_id,
                 INVALID_REQUEST,
                 "Invalid Request: jsonrpc must be \"2.0\"",
@@ -390,7 +445,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             ))
         }
         EnvelopeCheck::BadMethod { echo_id } => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &echo_id,
                 INVALID_REQUEST,
                 "Invalid Request: method must be a non-empty string",
@@ -398,7 +453,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             ))
         }
         EnvelopeCheck::BadId => {
-            return Some(error_string(
+            return Some(prepared_error(
                 &Value::Null,
                 INVALID_REQUEST,
                 "Invalid Request: id must be a string, number, or null",
@@ -421,7 +476,7 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
             if is_notification {
                 return None;
             }
-            return Some(error_string(
+            return Some(prepared_error(
                 &echo_id,
                 INVALID_PARAMS,
                 "Invalid params",
@@ -449,6 +504,11 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
     let profile_span = span.clone();
     async move {
         let result = dispatch(api, method, &params).await;
+        let kind = if result.is_ok() {
+            intent_core::repository_request::RepositoryReadReplyKind::Result
+        } else {
+            intent_core::repository_request::RepositoryReadReplyKind::ServiceError
+        };
         let encode_started = Instant::now();
         let encoded = encode_dispatch_result(
             &echo_id,
@@ -469,7 +529,16 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         profile_span.record("encode_elapsed_ms", encode_elapsed_ms);
         profile_span.record("oversized_replacement", encoded.oversized_replacement);
         profile_span.record("encode_failed", encoded.encode_failed);
-        encoded.frame
+        encoded.frame.map(|frame| {
+            if encoded.oversized_replacement || encoded.encode_failed {
+                PreparedReply::transport(frame)
+            } else {
+                PreparedReply {
+                    frame,
+                    service: Some((kind, echo_id)),
+                }
+            }
+        })
     }
     .instrument(span)
     .await
@@ -537,6 +606,104 @@ async fn dispatch(
     params: &Map<String, Value>,
 ) -> Result<Value, RpcErr> {
     match method {
+        "workspace.repositorySelection.capture" => {
+            let input: intent_core::repository_request::RepositorySelectionQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_capture(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.save" => {
+            let input: intent_core::repository_request::RepositorySelectionSaveQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_save(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.reset" => {
+            let input: intent_core::repository_request::RepositorySelectionBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_reset(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.reconcile" => {
+            let input: intent_core::repository_request::RepositorySelectionBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_reconcile(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "workspace.repositorySelection.release" => {
+            let input: intent_core::repository_request::RepositorySelectionBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|e| invalid_params(e.to_string()))?;
+            let r = api
+                .repository_selection_release(input)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(r))
+        }
+        "sourceControl.read.capture" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_capture(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.detail" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_detail(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.release" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_release(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "workspace.repositoryContext.capture" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_context_capture(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "workspace.repositoryContext" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_context(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "workspace.repositoryContext.release" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_context_release(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
         "workspace.list" => {
             let include_archived = params
                 .get("includeArchived")
@@ -776,6 +943,24 @@ async fn dispatch(
             .await
             .map_err(domain_to_rpc),
         "host.executionContext" => api.host_execution_context().await.map_err(domain_to_rpc),
+        "host.invite.searchAccounts" => {
+            let provider = require_str_param(params, "provider")?;
+            let host = opt_str_strict(params, "host")?;
+            let query = require_str_param(params, "query")?;
+            let limit = params
+                .get("limit")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .filter(|n| (1..=10).contains(n))
+                        .map(|n| u8::try_from(n).expect("bounded limit"))
+                        .ok_or_else(|| invalid_params("limit must be an integer from 1 to 10"))
+                })
+                .transpose()?;
+            api.host_invite_search_accounts(provider, host, query, limit)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "host.invite.list" => api.host_invite_list().await.map_err(domain_to_rpc),
         "host.invite.revoke" => api
             .host_invite_revoke(require_str_param(params, "inviteId")?)
@@ -1773,6 +1958,10 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "agent.getCreationPreferences" => api
+            .agent_get_creation_preferences(require_ws_note(params)?)
+            .await
+            .map_err(domain_to_rpc),
         "agent.create" => {
             // Agent ids are server-assigned: reject stale clients that still
             // send `agentId` before the request reaches the service (checked
@@ -1812,6 +2001,8 @@ async fn dispatch(
             // default. The blank is dropped downstream, so the persisted
             // field is still `NULL` either way.
             let extra = AgentCreateExtra {
+                remember_specialist: opt_bool_strict(params, "rememberSpecialist")?
+                    .unwrap_or(false),
                 provider: opt_nonempty_str(params, "provider"),
                 reasoning_effort: opt_str(params, "reasoningEffort"),
                 agent_type: opt_nonempty_str(params, "agentType"),
@@ -1917,6 +2108,18 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.sendQueuedMessagesNow" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = require_ws_note(params)?;
+            let ids = params
+                .get("messageIds")
+                .ok_or_else(|| invalid_params("messageIds is required"))?;
+            let message_ids: Vec<String> =
+                serde_json::from_value(ids.clone()).map_err(|e| invalid_params(e.to_string()))?;
+            api.agent_send_queued_messages_now(ws, agent_id, message_ids)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "agent.sendQueuedMessageNow" => {
             let agent_id = require_agent_id(params)?;
             let message_id = require_str_param(params, "messageId")?;
@@ -1983,6 +2186,11 @@ async fn dispatch(
         }
         "agent.queueMessage" => {
             let agent_id = require_agent_id(params)?;
+            let message_id = match params.get("messageId") {
+                None => None,
+                Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+                Some(_) => return Err(invalid_params("messageId must be a nonempty string")),
+            };
             let content = require_str_param(params, "content")?;
             let image_blocks = opt_value(params, "imageBlocks");
             let file_blocks = opt_value(params, "fileBlocks");
@@ -1999,8 +2207,9 @@ async fn dispatch(
                 Some(_) => return Err(invalid_params("messageMetadata must be an object")),
             };
             let result = api
-                .agent_queue_message(
+                .agent_queue_submission(
                     agent_id,
+                    message_id,
                     content,
                     image_blocks,
                     file_blocks,
@@ -2735,16 +2944,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "git.commit" => {
-            let ws = require_ws_note(params)?;
-            let message = require_str_param(params, "message")?;
-            let idempotency_key = opt_str(params, "idempotencyKey");
-            let r = api
-                .git_commit(ws, message, idempotency_key)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(json!({ "ok": true, "hash": r.hash, "files": r.files }))
-        }
         "git.agentCommit" => {
             let ws = require_ws_note(params)?;
             let message = require_str_param(params, "message")?;
@@ -2788,8 +2987,7 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        // `git.diff` is accepted as an alias for the wire-canonical `git.diffs`.
-        "git.diffs" | "git.diff" => {
+        "git.diffs" => {
             let ws = require_ws_note(params)?;
             // §5.6 extension: `paths` narrows the diff to exactly those
             // workspace-relative files (literal matching). The legacy single
@@ -2827,8 +3025,7 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        // `git.log` is accepted as an alias for the wire-canonical `git.commits`.
-        "git.commits" | "git.log" => {
+        "git.commits" => {
             let ws = require_ws_note(params)?;
             // §5.5 page params arrive nested under `page` ({ continuationToken,
             // limit }); fall back to top-level `limit`/`nextToken` for parity
@@ -2907,14 +3104,15 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
-        "pr.status" => {
-            let ws = require_ws_note(params)?;
-            let r = api.pr_status(ws).await.map_err(domain_to_rpc)?;
-            Ok(r)
-        }
         "pr.refresh" => {
             let ws = require_ws_note(params)?;
-            let r = api.pr_refresh(ws).await.map_err(workspace_err)?;
+            let automatic = opt_bool_strict(params, "automatic")?.unwrap_or(false);
+            let r = if automatic {
+                api.pr_refresh_automatic(ws).await
+            } else {
+                api.pr_refresh(ws).await
+            }
+            .map_err(workspace_err)?;
             Ok(r)
         }
         // `github.*` explicit-addressing surface (PROTOCOL §5.27): every data
@@ -2988,6 +3186,38 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "github.pulls.checks" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let number = require_u64(params, "number")?;
+            api.github_pulls_checks(owner, repo, number)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "github.pulls.reviews" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let number = require_u64(params, "number")?;
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let next_token = opt_str(params, "nextToken");
+            api.github_pulls_reviews(owner, repo, number, limit, next_token)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "github.pulls.files" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let number = require_u64(params, "number")?;
+            let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
+            let next_token = opt_str(params, "nextToken");
+            api.github_pulls_files(
+                owner,
+                repo,
+                number,
+                limit,
+                next_token,
+                opt_str(params, "expectedHeadSha"),
+            )
+            .await
+            .map_err(domain_to_rpc)
+        }
         "github.pulls.get" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
@@ -3044,13 +3274,29 @@ async fn dispatch(
             Ok(r)
         }
         "github.pulls.search" => {
-            let (owner, repo) = require_repo_slug(params)?;
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
             let query = opt_str(params, "query");
-            let repos = opt_repo_refs(params, "repos")?;
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
+            if params.contains_key("org") {
+                let org = require_str_param(params, "org")?;
+                validate_repo_slug_part("org", &org, true)?;
+                if ["owner", "repo", "repos"]
+                    .iter()
+                    .any(|key| params.contains_key(*key))
+                {
+                    return Err(invalid_params(
+                        "org cannot be combined with owner, repo, or repos".to_string(),
+                    ));
+                }
+                return api
+                    .github_org_pulls_search(org, filter, state, query, limit, next_token)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
+            let (owner, repo) = require_repo_slug(params)?;
+            let repos = opt_repo_refs(params, "repos")?;
             let r = api
                 .github_pulls_search(owner, repo, filter, state, query, repos, limit, next_token)
                 .await
@@ -3330,11 +3576,75 @@ async fn dispatch(
         }
         // `host` names the forge, never an intentd routing destination.
         // Optional `workspaceId` leaves provider/host credential selection intact.
+        "sourceControl.checkout.capture" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_capture(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.projects" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_projects(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.project" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_project(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.branches" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_branches(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.repoConfig" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_repo_config(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.warm" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_warm(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
+        "sourceControl.checkout.release" => {
+            let query = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(e.to_string()))?;
+            let result = api
+                .repository_checkout_release(query)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!(result))
+        }
         "sourceControl.authStatus" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let r = api
-                .source_control_auth_status(provider, host)
+                .source_control_auth_status_for_instance(provider, host, instance_base_url)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3342,10 +3652,17 @@ async fn dispatch(
         "sourceControl.connect" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let method = opt_str_strict(params, "method")?;
             let token = opt_str_strict(params, "token")?;
             let r = api
-                .source_control_connect(provider, host, method, token)
+                .source_control_connect_for_instance(
+                    provider,
+                    host,
+                    method,
+                    token,
+                    instance_base_url,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3353,8 +3670,9 @@ async fn dispatch(
         "sourceControl.cancelAuth" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let r = api
-                .source_control_cancel_auth(provider, host)
+                .source_control_cancel_auth_for_instance(provider, host, instance_base_url)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3362,8 +3680,9 @@ async fn dispatch(
         "sourceControl.revoke" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let r = api
-                .source_control_revoke(provider, host)
+                .source_control_revoke_for_instance(provider, host, instance_base_url)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3371,8 +3690,9 @@ async fn dispatch(
         "sourceControl.getUser" => {
             let provider = require_str_param(params, "provider")?;
             let host = opt_str_strict(params, "host")?;
+            let instance_base_url = opt_str_strict(params, "instanceBaseUrl")?;
             let r = api
-                .source_control_get_user(provider, host)
+                .source_control_get_user_for_instance(provider, host, instance_base_url)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3603,14 +3923,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "file-tracking.getLineStats" => {
-            let ws = require_ws_note(params)?;
-            let r = api
-                .file_tracking_get_line_stats(ws)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
         "file-tracking.stage" => {
             let ws = require_ws_note(params)?;
             require_present(params, "paths")?;
@@ -3631,33 +3943,10 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "metrics.getWorkspaceStats" => {
-            let ws = require_ws_note(params)?;
-            let r = api
-                .metrics_get_workspace_stats(ws)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
         "metrics.getAgentStats" => {
             let agent_id = require_str_param(params, "agentId")?;
             let r = api
                 .metrics_get_agent_stats(agent_id)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "metrics.getAllWorkspaceStats" => {
-            let r = api
-                .metrics_get_all_workspace_stats()
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "metrics.clearAgentStats" => {
-            let agent_id = require_str_param(params, "agentId")?;
-            let r = api
-                .metrics_clear_agent_stats(agent_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3781,6 +4070,15 @@ async fn dispatch(
             Ok(r)
         }
         "accept-changes.prepare" => {
+            if params.contains_key("review") {
+                let input: intent_core::repository_request::NativeReviewPrepareQuery =
+                    serde_json::from_value(Value::Object(params.clone()))
+                        .map_err(|_| invalid_params("Invalid native review parameters"))?;
+                return api
+                    .native_review_prepare(input)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
             let ws = require_ws_note(params)?;
             let action = require_str_param(params, "action")?;
             let files = opt_str_array(params, "files");
@@ -3791,6 +4089,15 @@ async fn dispatch(
             Ok(r)
         }
         "accept-changes.execute" => {
+            if params.contains_key("review") {
+                let input: intent_core::repository_request::NativeReviewExecuteQuery =
+                    serde_json::from_value(Value::Object(params.clone()))
+                        .map_err(|_| invalid_params("Invalid native review parameters"))?;
+                return api
+                    .native_review_execute(input)
+                    .await
+                    .map_err(domain_to_rpc);
+            }
             let ws = require_ws_note(params)?;
             require_str_param(params, "action")?;
             let r = api
@@ -3798,6 +4105,22 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
+        }
+        "accept-changes.reconcile" => {
+            let input: intent_core::repository_request::NativeReviewBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid native review parameters"))?;
+            api.native_review_reconcile(input)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "accept-changes.release" => {
+            let input: intent_core::repository_request::NativeReviewBoundQuery =
+                serde_json::from_value(Value::Object(params.clone()))
+                    .map_err(|_| invalid_params("Invalid native review parameters"))?;
+            api.native_review_release(input)
+                .await
+                .map_err(domain_to_rpc)
         }
         "accept-changes.mergePR" => {
             let ws = require_ws_note(params)?;
@@ -3884,10 +4207,34 @@ async fn dispatch(
         }
         "search.notes" => {
             let query = require_str_param(params, "query")?;
-            let request_id = opt_str(params, "requestId");
-            api.search_notes(query, request_id)
-                .await
-                .map_err(domain_to_rpc)
+            let workspace_id = opt_str_strict(params, "workspaceId")?;
+            let prefer_workspace_id = opt_str_strict(params, "preferWorkspaceId")?;
+            for (name, id) in [
+                ("workspaceId", &workspace_id),
+                ("preferWorkspaceId", &prefer_workspace_id),
+            ] {
+                if id.as_ref().is_some_and(String::is_empty) {
+                    return Err(invalid_params(format!("{name} must not be empty")));
+                }
+            }
+            let limit = match params.get("limit") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(value.as_i64().filter(|n| *n >= 0).ok_or_else(|| {
+                    invalid_params("limit must be a nonnegative signed 64-bit integer")
+                })?),
+            };
+            let include_archived = opt_bool_strict(params, "includeArchived")?.unwrap_or(true);
+            let request_id = opt_str_strict(params, "requestId")?;
+            api.search_notes(
+                query,
+                workspace_id.map(WorkspaceId::from),
+                prefer_workspace_id.map(WorkspaceId::from),
+                limit,
+                include_archived,
+                request_id,
+            )
+            .await
+            .map_err(domain_to_rpc)
         }
         "search.codebase" => {
             let ws = require_ws_note(params)?;
@@ -3954,14 +4301,16 @@ async fn dispatch(
         "file.read" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
-            api.file_read(ws, path, None).await.map_err(domain_to_rpc)
+            api.file_read(ws, path, None, opt_git_root_id(params))
+                .await
+                .map_err(domain_to_rpc)
         }
         "file.readChunk" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
             let offset = require_u64(params, "offset")?;
             let length = require_u64(params, "length")?;
-            api.file_read_chunk(ws, path, offset, length, None)
+            api.file_read_chunk(ws, path, offset, length, None, opt_git_root_id(params))
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -4153,17 +4502,57 @@ async fn dispatch(
         }
         "script.list" => {
             let ws = require_ws_note(params)?;
-            api.script_list(ws).await.map_err(domain_to_rpc)
+            let archive = params
+                .get("archive")
+                .map(|value| {
+                    serde_json::from_value::<intent_core::ScriptArchiveFilter>(value.clone())
+                })
+                .transpose()
+                .map_err(|e| invalid_params(e.to_string()))?
+                .unwrap_or_default();
+            api.script_list_filtered(ws, archive)
+                .await
+                .map_err(domain_to_rpc)
         }
         "script.create" => {
             let ws = require_ws_note(params)?;
             let create = parse_script_create(params)?;
             api.script_create(ws, create).await.map_err(domain_to_rpc)
         }
+        "script.archive" | "script.restore" => {
+            let ws = require_workspace_id(params)?;
+            let ids = params
+                .get("scriptIds")
+                .ok_or_else(|| invalid_params("scriptIds is required"))?;
+            let ids: Vec<String> =
+                serde_json::from_value(ids.clone()).map_err(|e| invalid_params(e.to_string()))?;
+            if ids.is_empty() || ids.len() > 1000 || ids.iter().any(|id| id.trim().is_empty()) {
+                return Err(invalid_params("scriptIds must contain 1–1000 nonempty IDs"));
+            }
+            if method == "script.archive" {
+                api.script_archive(ws, ids).await.map_err(domain_to_rpc)
+            } else {
+                api.script_restore(ws, ids).await.map_err(domain_to_rpc)
+            }
+        }
         "script.remove" => {
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             api.script_remove(ws, script_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "scriptMonitor.list" => {
+            let ws = require_ws_note(params)?;
+            let agent = opt_str(params, "agentId").map(intent_core::AgentId::from);
+            api.script_monitor_list(ws, agent)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "scriptMonitor.cancel" | "scriptMonitor.cancelRun" => {
+            let ws = require_ws_note(params)?;
+            let id = require_str_param(params, "monitorId")?;
+            api.script_monitor_cancel(ws, id, None, method == "scriptMonitor.cancelRun")
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -4293,14 +4682,17 @@ async fn dispatch(
             }
         }
         "specialist.list" => {
-            // Optional workspaceId is routing-only. This method merges
-            // user > bundled tiers only (the project tier is not part of the live
-            // wire contract iOS calls). `specialist.get` still accepts an optional
-            // `workspacePath` for the project tier (PROTOCOL §5.11). The optional
-            // `provider` supplies the resolution context for the additive
-            // `resolvedModel`/`resolvedProvider` preview fields.
+            let workspace_path = if opt_bool_strict(params, "includeProject")?.unwrap_or(false) {
+                let workspace = api
+                    .get_workspace(require_workspace_id(params)?)
+                    .await
+                    .map_err(workspace_err)?;
+                workspace.effective_path().map(str::to_owned)
+            } else {
+                None
+            };
             let provider = opt_str(params, "provider");
-            match api.specialist_list(None, provider).await {
+            match api.specialist_list(workspace_path, provider).await {
                 Ok(v) => Ok(v),
                 // Unknown provider → -32602 with the raw message.
                 Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
@@ -4865,6 +5257,11 @@ fn parse_script_create(params: &Map<String, Value>) -> Result<ScriptCreateParams
         }
     };
     Ok(ScriptCreateParams {
+        purpose: params
+            .get("purpose")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|e| invalid_params(format!("Invalid purpose: {e}")))?,
         name,
         command,
         mode,

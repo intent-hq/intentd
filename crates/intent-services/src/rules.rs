@@ -468,51 +468,60 @@ pub(crate) async fn assemble_system_prompt(
     // (previews, background one-shots) resolve to the latest.
     let entry = session_harness_entry(agent_session);
     let harness = entry.harness;
+    let assistant = agent_session
+        .map(|session| &session.workspace_id)
+        .or_else(|| workspace.map(|workspace| &workspace.id))
+        .filter(|id| id.is_chief())
+        .and(entry.doctrine.instructions.assistant);
     let overrides = read_overrides(store).await;
     let mut parts: Vec<String> = Vec::new();
     if let Some(c) = enabled_override(&overrides, "base-system-prompt") {
         parts.push(c);
     }
-    let specialization = get_specialization_rules_for(
-        entry.doctrine.instructions,
-        store,
-        workspace_path,
-        agent_type,
-        agent_features,
-    )
-    .await;
-    if !specialization.trim().is_empty() {
-        parts.push(specialization);
-    }
-    if let Some(c) = enabled_override(&overrides, "workspace") {
-        parts.push(c);
-    }
-    if let Some(path) = workspace_path {
-        if let Some((content, source)) = load_workspace_rules(path, None) {
-            if !content.trim().is_empty() {
-                parts.push(harness.user_rules_wrapper(&content, &source));
-            }
+    if let Some(instructions) = assistant {
+        parts.push(instructions.to_string());
+    } else {
+        let specialization = get_specialization_rules_for(
+            entry.doctrine.instructions,
+            store,
+            workspace_path,
+            agent_type,
+            agent_features,
+        )
+        .await;
+        if !specialization.trim().is_empty() {
+            parts.push(specialization);
         }
-    }
-    // Repo config instructions (FE parity: instruction-service.ts L1019-1022):
-    // append repo-level instructions from `.intent/config.json` when present.
-    if let Some(ws) = workspace {
-        if let Some(repo_path) = crate::git_ops::worktree_path(ws) {
-            let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
-            if let Some(instructions) = repo_config.instructions {
-                if !instructions.trim().is_empty() {
-                    let source = format!("{}/.intent/config.json", repo_path.display());
-                    parts.push(harness.user_rules_wrapper(&instructions, &source));
+        if let Some(c) = enabled_override(&overrides, "workspace") {
+            parts.push(c);
+        }
+        if let Some(path) = workspace_path {
+            if let Some((content, source)) = load_workspace_rules(path, None) {
+                if !content.trim().is_empty() {
+                    parts.push(harness.user_rules_wrapper(&content, &source));
                 }
             }
         }
-    }
-    // RTK layer: when rtk.enabled is true and rtk is detected with ≥1 usable
-    // subcommand, append the instruction line (worded by the session's pinned
-    // harness). Placed after workspace-rules, before skills / isolation hint /
-    // specialist role.
-    if let Some(rtk_instruction) = build_rtk_instruction(harness, rtk_enabled).await {
-        parts.push(rtk_instruction);
+        // Repo config instructions (FE parity: instruction-service.ts L1019-1022):
+        // append repo-level instructions from `.intent/config.json` when present.
+        if let Some(ws) = workspace {
+            if let Some(repo_path) = crate::git_ops::worktree_path(ws) {
+                let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                if let Some(instructions) = repo_config.instructions {
+                    if !instructions.trim().is_empty() {
+                        let source = format!("{}/.intent/config.json", repo_path.display());
+                        parts.push(harness.user_rules_wrapper(&instructions, &source));
+                    }
+                }
+            }
+        }
+        // RTK layer: when rtk.enabled is true and rtk is detected with ≥1 usable
+        // subcommand, append the instruction line (worded by the session's pinned
+        // harness). Placed after workspace-rules, before skills / isolation hint /
+        // specialist role.
+        if let Some(rtk_instruction) = build_rtk_instruction(harness, rtk_enabled).await {
+            parts.push(rtk_instruction);
+        }
     }
     // Skills catalog layer (reference layer 4.7: after specialization rules, user
     // rules, and skills — before isolation hint / specialist role). When a
@@ -547,8 +556,10 @@ pub(crate) async fn assemble_system_prompt(
     // sandboxing for implementors and parallel delegation safety for coordinators
     // when appropriate, before the specialist role section so the specialist
     // behavior prompt can reference them.
-    if let Some(hint) = build_isolation_hint(workspace, agent_session, specialist) {
-        parts.push(hint);
+    if assistant.is_none() {
+        if let Some(hint) = build_isolation_hint(workspace, agent_session, specialist) {
+            parts.push(hint);
+        }
     }
     // Specialist role section (reference layer 4.8: after specialization
     // rules, user rules, and skills — before the parent-only layers).
@@ -559,12 +570,13 @@ pub(crate) async fn assemble_system_prompt(
     {
         parts.push(harness.specialist_role_section(bp));
     }
-    // Commit-policy layer: one status-neutral clause, injected for every agent
-    // (top-level and sub-agents alike) regardless of the auto-commit state.
+    // Repository agents retain the commit policy; the Assistant uses app proposals.
     // The prompt no longer branches on the effective auto-commit state — the
     // OFF-state gate in `git_ops` and the auto-commit-on-idle subscriber
     // enforce the actual behavior.
-    parts.push(harness.commit_policy_clause());
+    if assistant.is_none() {
+        parts.push(harness.commit_policy_clause());
+    }
     // Mandatory-actions footer (reference layer 9 / `getMandatoryActionsFooter`,
     // pinned to the VERY END of the prompt to leverage recency bias). Three
     // independent sub-blocks, joined with `---` like every other layer:
@@ -600,7 +612,9 @@ pub(crate) async fn assemble_system_prompt(
         // commit-policy clause above is deliberately status-neutral.
         let effective_auto_commit =
             auto_commit_enabled && !agent_session.is_some_and(|s| s.skip_auto_commit);
-        parts.push(harness.suggested_next_steps_block(effective_auto_commit));
+        if assistant.is_none() {
+            parts.push(harness.suggested_next_steps_block(effective_auto_commit));
+        }
     }
     if parts.is_empty() {
         None
@@ -768,6 +782,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts,
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: Some(repo_path.to_string_lossy().to_string()),
             repository_path: Some(repo_path.to_string_lossy().to_string()),

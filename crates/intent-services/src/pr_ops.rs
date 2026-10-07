@@ -15,12 +15,28 @@ use std::sync::Arc;
 
 use intent_core::{parse_iso, Error, PullRequestInfo, PullRequestStatus, Result, Workspace};
 use intent_sourcecontrol::{
-    CheckRun, CheckState, MergeMethod, MergeRequirementSignals, Page, PageParams, PrObservation,
-    PrQuery, PrState, PullRequest, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread,
-    ReviewThreadComment, ReviewVerdict, RollupCheck, RollupCheckKind, SourceControl,
+    CheckRun, CheckState, MergeMethod, MergeRequirementSignals, Page, PageParams, PrAncestry,
+    PrObservation, PrQuery, PrState, PullRequest, RepoRef, Review, ReviewComment, ReviewDecision,
+    ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck, RollupCheckKind, SourceControl,
     SourceControlRegistry, SourceControlSettings,
 };
 use time::OffsetDateTime;
+
+mod qualified_snapshot;
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::allow_attributes,
+        reason = "The frozen helper must compile both before and after consumer integration"
+    ),
+    allow(dead_code, reason = "qualified read consumer is integrated separately")
+)]
+pub(crate) fn qualified_review_snapshot(
+    target: &intent_core::ReviewTarget,
+    observation: &intent_sourcecontrol::ReviewObservation,
+) -> intent_core::Result<serde_json::Value> {
+    qualified_snapshot::qualified_review_snapshot(target, observation)
+}
 
 /// TS `NO_ACTIVE_PR_ERROR`; every active-PR-scoped method needs one (§5.7).
 pub(crate) const NO_ACTIVE_PR: &str = "No active PR";
@@ -75,36 +91,18 @@ pub(crate) fn parse_repo_slug(slug: &str) -> Result<(String, String)> {
     )))
 }
 
-/// Background-sweep activity window (§7.6/§7.7): workspaces whose
-/// `updatedAt`/`lastActivity` is within this many minutes are refreshed on
-/// every sweep tick; colder workspaces only refresh on every
-/// [`SWEEP_IDLE_TICK_MULTIPLE`]-th tick, trimming steady forge load.
-pub(crate) const SWEEP_ACTIVE_WINDOW_MINUTES: i64 = 30;
-
-/// Idle workspaces refresh on every Nth sweep tick (~30 minutes at the 180s
-/// base interval wired in `intentd/src/main.rs`).
-pub(crate) const SWEEP_IDLE_TICK_MULTIPLE: u64 = 10;
-
-/// Whether the background sweep should refresh `ws` on this `tick` (§7.6 with
-/// the §7.7 "defer non-urgent refreshes" trimming): every
-/// [`SWEEP_IDLE_TICK_MULTIPLE`]-th tick (including tick 0, the first sweep
-/// after startup) refreshes every workspace; ticks in between refresh only
-/// workspaces active since `active_cutoff` (parsed once per sweep by the
-/// caller). A sweep that persists a PR delta bumps `updatedAt`, so workspaces
-/// with churning PRs stay on the every-tick cadence while quiet ones cool
-/// down. Malformed workspace timestamps — and a `None` cutoff — fail open
-/// (count as active) so a bad record never slows its own refreshes.
-pub(crate) fn sweep_due(ws: &Workspace, active_cutoff: Option<OffsetDateTime>, tick: u64) -> bool {
-    if tick.is_multiple_of(SWEEP_IDLE_TICK_MULTIPLE) {
+/// Keep local checkout scans on their existing three-minute active and
+/// thirty-minute idle cadence, independently of forge admission. `tick` now
+/// advances once a minute. These metadata clocks schedule local work only.
+pub(crate) fn local_root_maintenance_due(ws: &Workspace, tick: u64, now: OffsetDateTime) -> bool {
+    if tick.is_multiple_of(30) {
         return true;
     }
-    let Some(cutoff) = active_cutoff else {
-        return true;
-    };
-    let active = |ts: &str| match parse_iso(ts) {
-        Some(t) => t >= cutoff,
-        None => true,
-    };
+    if !tick.is_multiple_of(3) {
+        return false;
+    }
+    let cutoff = now - time::Duration::minutes(30);
+    let active = |ts: &str| parse_iso(ts).is_none_or(|at| at >= cutoff);
     active(&ws.updated_at) || ws.last_activity.as_deref().is_some_and(active)
 }
 
@@ -129,7 +127,8 @@ pub(crate) fn active_pr_number(ws: &Workspace) -> Result<u64> {
 /// (if any) the caller emitted; `Skipped`/`Unchanged` emit nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrRefreshOutcome {
-    /// Not eligible (remote/archived workspace, no repo, or no branch).
+    /// Not eligible (remote/archived workspace, no repo, or no branch),
+    /// or an automatic refresh deferred by idle/quota admission.
     /// Git-root refreshes still run the repo-scoped stale-pool heal on a
     /// branchless root ([`refresh_stale_pool_entries`]), upgrading to
     /// `Updated` when it changed the pool.
@@ -1125,8 +1124,14 @@ pub struct MergeRequirements {
     pub is_draft: bool,
     /// True when the forge reports merge conflicts.
     pub has_conflicts: bool,
-    /// True when the PR branch is behind its base.
+    /// Legacy forge BEHIND verdict (REST OR GraphQL), not measured ancestry.
     pub is_behind: bool,
+    /// Measured ancestry of the observed live base/head, unknown on old baselines.
+    #[serde(default)]
+    pub ancestry: PrAncestry,
+    /// Forge-required update, independent of ancestry. Absent means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_update_required: Option<bool>,
     /// The forge's mergeability tri-state (`None` = still computing).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mergeable: Option<bool>,
@@ -1352,6 +1357,22 @@ pub(crate) fn merge_requirements(
     // `mergeable_state`; either reporting the condition is enough.
     let has_conflicts = mergeable_state == "dirty" || raw_status == "DIRTY";
     let is_behind = mergeable_state == "behind" || raw_status == "BEHIND";
+    let branch_update_required = if is_behind {
+        Some(true)
+    } else {
+        let statuses: Vec<_> = [pr.mergeable_state.as_deref(), merge_state_status.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!statuses.is_empty()
+            && statuses.iter().all(|status| {
+                matches!(
+                    status.to_ascii_uppercase().as_str(),
+                    "CLEAN" | "UNSTABLE" | "HAS_HOOKS"
+                )
+            }))
+        .then_some(false)
+    };
 
     let rollup: Option<&[RollupCheck]> = signals
         .filter(|s| s.checks_known)
@@ -1387,6 +1408,8 @@ pub(crate) fn merge_requirements(
         is_draft: state == "draft",
         has_conflicts,
         is_behind,
+        ancestry: PrAncestry::Unknown,
+        branch_update_required,
         mergeable: pr.mergeable,
         checks,
         approvals,
@@ -1637,7 +1660,19 @@ pub(crate) async fn merge_requirements_from_observation(
     complete &= threads_complete;
 
     let merge_queue_reported = signals.is_in_merge_queue;
-    let requirements = merge_requirements(pr, Some(&signals), &fallback_runs, &agg, unresolved);
+    let mut requirements = merge_requirements(pr, Some(&signals), &fallback_runs, &agg, unresolved);
+    if let Some(identity) = observation.ancestry_identity.as_ref().filter(|identity| {
+        pr.state == PrState::Open
+            && identity.is_valid()
+            && pr.head_sha.as_deref() == Some(identity.head_sha.as_str())
+            && pr.target_branch == identity.target_branch
+    }) {
+        // Ordinary comparison failure is itself a bounded cached unknown,
+        // not an incomplete checklist forcing a retry on every cheap poll.
+        requirements.ancestry =
+            degrade_unless_rate_limited(sc.pr_ancestry(repo_ref, identity).await)?
+                .unwrap_or_default();
+    }
     Ok(MergeRequirementsRead {
         requirements,
         review_comment_count: review_comments,
@@ -2588,6 +2623,45 @@ mod tests {
         ReviewAggregate {
             approval_count: approvals,
             changes_requested_count: changes,
+        }
+    }
+
+    #[test]
+    fn ancestry_contract_distinguishes_unknown_from_current_and_forge_updates() {
+        for (rest, graphql, expected) in [
+            (Some("clean"), Some("CLEAN"), Some(false)),
+            (None, Some("UNSTABLE"), Some(false)),
+            (Some("has_hooks"), None, Some(false)),
+            (Some("behind"), Some("CLEAN"), Some(true)),
+            (Some("clean"), Some("BEHIND"), Some(true)),
+            (Some("dirty"), Some("BEHIND"), Some(true)),
+            (Some("dirty"), Some("CLEAN"), None),
+            (Some("clean"), Some("BLOCKED"), None),
+            (Some("unknown"), Some("CLEAN"), None),
+            (None, Some("FUTURE_STATE"), None),
+            (None, None, None),
+        ] {
+            let p = pr(PrState::Open, false, Some(true), rest);
+            let signals = MergeRequirementSignals {
+                merge_state_status: graphql.map(str::to_string),
+                ..Default::default()
+            };
+            let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), Some(0));
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["ancestry"], serde_json::json!({"status":"unknown"}));
+            assert_eq!(
+                wire.get("branchUpdateRequired"),
+                expected.map(serde_json::Value::Bool).as_ref(),
+                "{rest:?}/{graphql:?}"
+            );
+            assert_eq!(
+                req.is_behind,
+                rest == Some("behind") || graphql == Some("BEHIND")
+            );
+            assert_eq!(
+                req.has_conflicts,
+                rest == Some("dirty") || graphql == Some("DIRTY")
+            );
         }
     }
 

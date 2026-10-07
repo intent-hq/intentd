@@ -835,3 +835,6 @@ pub(crate) fn is_auth_enabled(configured: Option<bool>, tcp: bool) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod repository_authority_tests;

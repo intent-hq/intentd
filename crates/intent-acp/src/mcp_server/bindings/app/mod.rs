@@ -49,7 +49,8 @@ pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
 /// this router is reached).
 /// `caller_agent_id` threads the tool-call's agent context to the
 /// caller-aware `agents` methods (`waitFor`) and to `question.ask` (the
-/// turn-attachment registry keys pending questions by agent);
+/// turn-attachment registry keys pending questions by agent), and attributes
+/// navigation and workspace-open events;
 /// `turn_attachments` is the registry `question.ask` registers into.
 pub(crate) async fn try_dispatch(
     api: &Arc<dyn WorkspaceApi>,
@@ -63,7 +64,7 @@ pub(crate) async fn try_dispatch(
         return question::dispatch(turn_attachments, caller_agent_id, rest, args).map(Some);
     }
     if let Some(rest) = method.strip_prefix("workspaces.") {
-        return workspaces::dispatch(api, workspace_id, rest, args)
+        return workspaces::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
     }
@@ -86,7 +87,9 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("ui.") {
-        return ui::dispatch(api, workspace_id, rest, args).await.map(Some);
+        return ui::dispatch(api, workspace_id, caller_agent_id, rest, args)
+            .await
+            .map(Some);
     }
     Ok(None)
 }

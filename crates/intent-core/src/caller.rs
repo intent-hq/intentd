@@ -37,6 +37,71 @@ pub enum Caller {
     Daemon,
 }
 
+/// Queue contents reach the recipient through normal delivery, never through
+/// its own read tools. Human, daemon and other-agent inspection is unchanged.
+#[must_use]
+pub fn queue_contents_visible_to(caller: Option<&Caller>, target: &AgentId) -> bool {
+    !matches!(caller, Some(Caller::Agent { agent_id }) if agent_id == target)
+}
+
+/// Explanation shared by explicit self queue reads at both boundaries.
+pub const SELF_QUEUE_DELIVERY_MESSAGE: &str =
+    "Your queued messages will be delivered after the current turn. Their contents cannot be read early; queueLength reports the pending count.";
+
+/// Remove payload copies from the recipient's queue event history. Applies
+/// to old snapshots too: delivery belongs to the transcript, and consulting
+/// historical queue events must not recover messages still pending now.
+/// Preserve event rows and page tokens; never modify the stored event.
+pub fn redact_self_queue_events(value: &mut serde_json::Value, agent_id: &AgentId) {
+    use serde_json::{json, Value};
+    match value {
+        Value::Array(rows) => {
+            for row in rows {
+                redact_self_queue_events(row, agent_id);
+            }
+        }
+        Value::Object(obj) => {
+            let queue_event = obj
+                .get("type")
+                .or_else(|| obj.get("eventType"))
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.starts_with("agent:queue:"));
+            let target = obj
+                .get("data")
+                .and_then(|d| d.get("agentId"))
+                .and_then(Value::as_str)
+                .or_else(|| obj.get("sessionId").and_then(Value::as_str))
+                .or_else(|| {
+                    obj.get("actor")
+                        .and_then(|a| a.get("id"))
+                        .and_then(Value::as_str)
+                });
+            if queue_event && target == Some(agent_id.as_str()) {
+                let data = obj.get("data");
+                let count = data
+                    .and_then(|d| d.get("queueLength"))
+                    .and_then(Value::as_u64)
+                    .or_else(|| {
+                        data.and_then(|d| d.get("queue").or_else(|| d.get("queuedMessages")))
+                            .and_then(Value::as_array)
+                            .map(|q| q.len() as u64)
+                    });
+                let mut projected = json!({"agentId": agent_id});
+                if let Some(count) = count {
+                    projected["queueLength"] = json!(count);
+                }
+                obj.insert("data".into(), projected);
+                obj.remove("metadata");
+            } else {
+                for child in obj.values_mut() {
+                    redact_self_queue_events(child, agent_id);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 impl Caller {
     /// The bound principal for a wire caller; `None` for agents and the
     /// daemon, which act on their own authority rather than a person's.
@@ -68,7 +133,7 @@ fn host_members_are_not_administrators() {
         host_role: crate::HostRole::Member,
     };
     assert!(!member.is_administrator());
-    assert!(!queue_attribution_visible_to(
+    assert!(queue_attribution_visible_to(
         &member,
         &QueueAttribution::UnknownHuman
     ));
@@ -167,6 +232,26 @@ where
     tokio::spawn(with_caller(Caller::Daemon, f))
 }
 
+/// Spawn work with the current caller and wire credential captured at spawn.
+/// Unlike daemon-internal work, a request's child must not acquire daemon
+/// authority. An absent caller stays absent, including for standalone tools.
+/// Dropping the returned handle detaches the task, just like `tokio::spawn`;
+/// resource owners can therefore finish cleanup after their waiter is canceled.
+pub fn spawn_with_current_caller<F>(f: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let caller = current_caller();
+    let credential = current_wire_credential();
+    tokio::spawn(with_wire_credential(credential, async move {
+        match caller {
+            Some(caller) => with_caller(caller, f).await,
+            None => f.await,
+        }
+    }))
+}
+
 /// Who a queued-message entry is attributed to under the per-user queue
 /// visibility rule (multiplayer): the three tiers of the `agent.getQueue`
 /// contract, resolved by [`queue_attribution_with`] from the entry's
@@ -179,8 +264,8 @@ pub enum QueueAttribution {
     /// An unstamped entry of human origin (a legacy pre-attribution row)
     /// whose workspace fallback could not be resolved (no owner / legacy
     /// author, or the read failed): SOMEONE wrote it, nobody knows who.
-    /// Fails closed — withheld from every non-administrator wire caller,
-    /// never surfaced to a guest as author-less.
+    /// Visible in the shared queue, but never confers authorship for editing
+    /// or same-author merging.
     UnknownHuman,
     /// No human author at all: an agent-sent or automatic (hook / monitor /
     /// system) entry. Public to every caller.
@@ -195,6 +280,10 @@ pub enum QueueAttribution {
 /// non-object metadata reads as human (a legacy typed message).
 #[must_use]
 pub fn is_human_authored_metadata(message_metadata: Option<&serde_json::Value>) -> bool {
+    // The daemon's authenticated stamp takes precedence over client labels.
+    if crate::lift_from_principal_id(message_metadata).is_some() {
+        return true;
+    }
     let Some(serde_json::Value::Object(obj)) = message_metadata else {
         return true;
     };
@@ -237,28 +326,11 @@ pub fn queue_attribution_with(
     }
 }
 
-/// Whether a queue entry with `attribution` may be shown to `caller`. A
-/// non-administrator wire principal (a guest collaborator) sees only entries
-/// attributed to itself plus [`QueueAttribution::Unattributed`] ones — an
-/// [`QueueAttribution::UnknownHuman`] entry is withheld like a foreign one;
-/// the administrator (workspace owner), agents and the daemon see the full
-/// queue. The one predicate behind `agent.getQueue`, the
-/// `agent:queue:updated` / `agent:queue:processing` projections and the
-/// per-id mutation gate.
+/// Queue reads are shared by all callers admitted to the workspace. This is
+/// an egress policy, not authorization to mutate someone else's entry.
 #[must_use]
-pub fn queue_attribution_visible_to(caller: &Caller, attribution: &QueueAttribution) -> bool {
-    let Caller::Wire {
-        principal_id,
-        host_role: crate::HostRole::Member | crate::HostRole::Guest,
-    } = caller
-    else {
-        return true;
-    };
-    match attribution {
-        QueueAttribution::Principal(author) => author == principal_id,
-        QueueAttribution::UnknownHuman => false,
-        QueueAttribution::Unattributed => true,
-    }
+pub fn queue_attribution_visible_to(_caller: &Caller, _attribution: &QueueAttribution) -> bool {
+    true
 }
 
 /// The attribution of a queued-message entry in wire shape (`author` already
@@ -333,27 +405,14 @@ pub fn queue_processing_event_attribution(
     QueueAttribution::Unattributed
 }
 
-/// Egress projection of a queue snapshot for `caller`: drops the entries
-/// [`queue_visible_to`] hides, keeping drain order and the entries'
-/// `position` values as they are (no renumbering). `None` (no bound caller)
-/// filters nothing.
+/// Shared queue projection. Workspace admission is checked before this egress;
+/// authorship is enforced separately by each mutation.
 #[must_use]
 pub fn project_queue_for_caller(
-    caller: Option<&Caller>,
+    _caller: Option<&Caller>,
     queue: Vec<serde_json::Value>,
 ) -> Vec<serde_json::Value> {
-    match caller {
-        Some(
-            caller @ Caller::Wire {
-                host_role: crate::HostRole::Member | crate::HostRole::Guest,
-                ..
-            },
-        ) => queue
-            .into_iter()
-            .filter(|entry| queue_visible_to(caller, entry))
-            .collect(),
-        Some(Caller::Wire { .. } | Caller::Agent { .. } | Caller::Daemon) | None => queue,
-    }
+    queue
 }
 
 #[cfg(test)]
@@ -404,11 +463,11 @@ mod tests {
     }
 
     #[test]
-    fn guest_sees_own_and_unattributed_entries_only() {
+    fn guest_sees_shared_queue_including_foreign_and_unknown_humans() {
         let guest = wire(false);
         let queue = mixed_queue();
         assert!(queue_visible_to(&guest, &queue[0]), "own entry");
-        assert!(!queue_visible_to(&guest, &queue[1]), "foreign entry");
+        assert!(queue_visible_to(&guest, &queue[1]), "foreign entry");
         assert!(
             queue_visible_to(&guest, &queue[2]),
             "agent-sent, null author"
@@ -418,17 +477,20 @@ mod tests {
             "system, absent author key"
         );
         assert!(
-            !queue_visible_to(&guest, &queue[4]),
+            queue_visible_to(&guest, &queue[4]),
             "unstamped human entry the resolver could not attribute"
         );
 
         let projected = project_queue_for_caller(Some(&guest), queue);
-        assert_eq!(ids(&projected), ["own", "agent", "system"]);
+        assert_eq!(
+            ids(&projected),
+            ["own", "foreign", "agent", "system", "unknown-human"]
+        );
         let positions: Vec<u64> = projected
             .iter()
             .map(|e| e["position"].as_u64().unwrap())
             .collect();
-        assert_eq!(positions, [0, 2, 3], "positions are not renumbered");
+        assert_eq!(positions, [0, 1, 2, 3, 4], "positions are not renumbered");
     }
 
     #[test]
@@ -491,14 +553,14 @@ mod tests {
     }
 
     #[test]
-    fn attribution_predicate_fails_closed_on_unknown_human() {
+    fn read_visibility_includes_unknown_humans() {
         let guest = wire(false);
         let own = QueueAttribution::Principal(PrincipalId("p-1".into()));
         let foreign = QueueAttribution::Principal(PrincipalId("p-2".into()));
         assert!(queue_attribution_visible_to(&guest, &own), "own");
-        assert!(!queue_attribution_visible_to(&guest, &foreign), "foreign");
+        assert!(queue_attribution_visible_to(&guest, &foreign), "foreign");
         assert!(
-            !queue_attribution_visible_to(&guest, &QueueAttribution::UnknownHuman),
+            queue_attribution_visible_to(&guest, &QueueAttribution::UnknownHuman),
             "unknown human"
         );
         assert!(
@@ -532,7 +594,7 @@ mod tests {
             json!({ "id": "e", "author": {} }),
             json!({ "id": "b", "author": { "principalId": "" } }),
         ] {
-            assert!(!queue_visible_to(&guest, &e), "human origin, no stamp: {e}");
+            assert!(queue_visible_to(&guest, &e), "human origin, no stamp: {e}");
         }
         assert!(
             queue_visible_to(
@@ -550,7 +612,7 @@ mod tests {
             "own stamp on the entry metadata"
         );
         assert!(
-            !queue_visible_to(
+            queue_visible_to(
                 &guest,
                 &json!({ "id": "f", "author": Value::Null,
                     "messageMetadata": { FROM_PRINCIPAL_ID_KEY: "p-2" } })
@@ -622,6 +684,163 @@ mod tests {
     async fn spawn_daemon_binds_the_daemon_caller() {
         let seen = spawn_daemon(async { current_caller() }).await.unwrap();
         assert_eq!(seen, Some(Caller::Daemon));
+        assert_eq!(current_caller(), None);
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_preserves_identity_and_absence() {
+        for caller in [
+            wire(true),
+            wire(false),
+            Caller::Agent {
+                agent_id: AgentId("worker".into()),
+            },
+            Caller::Daemon,
+        ] {
+            // Return the handle as data; join it only after the parent scope ends.
+            let (task,) = with_caller(caller.clone(), async {
+                (spawn_with_current_caller(async {
+                    tokio::task::yield_now().await;
+                    (current_caller(), current_wire_credential().is_none())
+                }),)
+            })
+            .await;
+            let observed = with_caller(Caller::Daemon, task).await.unwrap();
+            assert_eq!(observed, (Some(caller), true));
+            assert_eq!(current_caller(), None);
+        }
+        let task = spawn_with_current_caller(async {
+            (current_caller(), current_wire_credential().is_none())
+        });
+        assert_eq!(
+            with_caller(Caller::Daemon, task).await.unwrap(),
+            (None, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_preserves_wire_credential() {
+        let credential = WireCredential::Principal {
+            principal_id: PrincipalId("p-1".into()),
+            token_hash: "fixture-hash".into(),
+        };
+        let (task,) = with_wire_credential(
+            Some(credential),
+            with_caller(wire(false), async {
+                (spawn_with_current_caller(async {
+                    tokio::task::yield_now().await;
+                    (current_caller(), current_wire_credential())
+                }),)
+            }),
+        )
+        .await;
+        let (caller, credential) = task.await.unwrap();
+        assert_eq!(caller, Some(wire(false)));
+        let Some(WireCredential::Principal {
+            principal_id,
+            token_hash,
+        }) = credential
+        else {
+            panic!("request credential must survive the task boundary");
+        };
+        assert_eq!(principal_id, PrincipalId("p-1".into()));
+        assert_eq!(token_hash, "fixture-hash");
+        assert!(current_wire_credential().is_none());
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_credential_alone_never_creates_a_caller() {
+        let credential = WireCredential::Principal {
+            principal_id: PrincipalId("p-1".into()),
+            token_hash: "fixture-hash".into(),
+        };
+        let (task,) = with_wire_credential(Some(credential), async {
+            (spawn_with_current_caller(async {
+                (
+                    current_caller(),
+                    current_wire_credential().map(|c| c.principal_id().clone()),
+                )
+            }),)
+        })
+        .await;
+        assert_eq!(task.await.unwrap(), (None, Some(PrincipalId("p-1".into()))));
+        assert!(current_caller().is_none());
+        assert!(current_wire_credential().is_none());
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_keeps_legacy_authority_revocable() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        struct Authority(AtomicBool);
+        impl LegacyCredentialAuthority for Authority {
+            fn authorize(&self) -> crate::BoxFuture<'_, crate::Result<CredentialLease>> {
+                Box::pin(async {
+                    if self.0.load(Ordering::SeqCst) {
+                        Ok(Box::new(()) as CredentialLease)
+                    } else {
+                        Err(crate::Error::Forbidden("fixture credential revoked".into()))
+                    }
+                })
+            }
+        }
+        let authority = Arc::new(Authority(AtomicBool::new(true)));
+        assert!(authority.authorize().await.is_ok());
+        let expected: Arc<dyn LegacyCredentialAuthority> = authority.clone();
+        let credential = WireCredential::Legacy {
+            principal_id: PrincipalId("p-1".into()),
+            authority: expected.clone(),
+        };
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (task,) = with_wire_credential(
+            Some(credential),
+            with_caller(wire(false), async {
+                (spawn_with_current_caller(async move {
+                    released.await.unwrap();
+                    let Some(WireCredential::Legacy {
+                        principal_id,
+                        authority,
+                    }) = current_wire_credential()
+                    else {
+                        panic!("legacy authority must survive the task boundary");
+                    };
+                    assert_eq!(principal_id, PrincipalId("p-1".into()));
+                    assert!(Arc::ptr_eq(&authority, &expected));
+                    let result = authority.authorize().await;
+                    (
+                        current_caller(),
+                        matches!(result, Err(crate::Error::Forbidden(_))),
+                    )
+                }),)
+            }),
+        )
+        .await;
+        authority.0.store(false, Ordering::SeqCst);
+        release.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), (Some(wire(false)), true));
+    }
+
+    #[tokio::test]
+    async fn spawn_with_current_caller_detached_owner_finishes_without_elevation() {
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        let (owner,) = with_caller(wire(false), async {
+            (spawn_with_current_caller(async move {
+                released.await.unwrap();
+                finished.send(current_caller()).unwrap();
+            }),)
+        })
+        .await;
+        drop(owner);
+        release.send(()).unwrap();
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(1), completion)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed, Some(wire(false)));
         assert_eq!(current_caller(), None);
     }
 

@@ -31,9 +31,8 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
-        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -41,6 +40,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
     cmd.spawn().expect("spawn intentd serve")
 }
 
@@ -285,8 +285,8 @@ async fn legacy_listen_mode_is_discarded_and_stripped_on_boot() {
 /// refuse startup — the daemon boots, DISCARDS both values (neither has a
 /// catalog entry since monorepo#1000), and strips both from the file with a
 /// comment-preserving rewrite. Over the wire the retired path is unknown to
-/// `settings.get` but tolerated-and-ignored by `settings.update` (old-client
-/// compatibility). A second boot then reads the clean file untouched.
+/// `settings.get` and `settings.update`. A second boot then reads the clean
+/// file untouched.
 #[tokio::test]
 async fn legacy_workspace_overrides_discards_and_strips_on_boot() {
     let data_dir_guard = temp_data_dir();
@@ -320,8 +320,7 @@ async fn legacy_workspace_overrides_discards_and_strips_on_boot() {
             "retired path must be unknown to settings.get: {get}"
         );
 
-        // But settings.update from an old client is tolerated-and-ignored:
-        // the batch succeeds with nothing applied.
+        // An old client cannot recreate the retired key through settings.update.
         let update = uds_rpc(
             &socket,
             2,
@@ -332,9 +331,9 @@ async fn legacy_workspace_overrides_discards_and_strips_on_boot() {
         )
         .await;
         assert_eq!(
-            update["result"]["applied"],
-            json!([]),
-            "retired path must be ignored, not applied: {update}"
+            update["error"]["code"],
+            json!(-32602),
+            "retired path must be rejected: {update}"
         );
 
         // The retired [ai] table is discarded: no catalog entry, so the wire
@@ -397,9 +396,8 @@ fn invalid_config_refuses_startup_with_key_in_error() {
     ] {
         let data_dir = temp_data_dir();
         std::fs::write(data_dir.path().join("config.toml"), body).expect("seed config.toml");
-        let out = common::serve_command()
+        let out = common::hermetic_serve_command(data_dir.path())
             .env("INTENTD_DATA_DIR", data_dir.path())
-            .env("INTENTD_SECRETS_FILE", data_dir.path().join("secrets.json"))
             .output()
             .expect("run intentd serve");
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -425,9 +423,8 @@ fn invalid_config_refuses_startup_with_key_in_error() {
 fn out_of_range_env_pin_refuses_startup() {
     let data_dir = temp_data_dir();
     // The explicit pin overrides the builder's ephemeral seam.
-    let out = common::serve_command()
+    let out = common::hermetic_serve_command(data_dir.path())
         .env("INTENTD_DATA_DIR", data_dir.path())
-        .env("INTENTD_SECRETS_FILE", data_dir.path().join("secrets.json"))
         .env("INTENTD_TCP_PORT", "80")
         .output()
         .expect("run intentd serve");

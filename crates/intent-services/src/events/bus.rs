@@ -118,7 +118,8 @@ pub(crate) type WriterRequest = (NewEvent, oneshot::Sender<Result<Event>>);
 pub struct EventBus {
     store: Store,
     tx: broadcast::Sender<Arc<Event>>,
-    writer_tx: mpsc::Sender<WriterRequest>,
+    writer_tx: Arc<Mutex<Option<mpsc::Sender<WriterRequest>>>>,
+    writer: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
     /// Attribution names by principal, each with its load time; entries
     /// older than [`ATTRIBUTION_NAME_TTL`] are reloaded on next use.
     attribution_names: Arc<Mutex<HashMap<PrincipalId, (Instant, String)>>>,
@@ -131,11 +132,12 @@ impl EventBus {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_CAPACITY);
         // Spawn the writer task that drains events and batch-persists them.
-        intent_core::spawn_daemon(writer_task(store.clone(), writer_rx, tx.clone()));
+        let writer = intent_core::spawn_daemon(writer_task(store.clone(), writer_rx, tx.clone()));
         Self {
             store,
             tx,
-            writer_tx,
+            writer_tx: Arc::new(Mutex::new(Some(writer_tx))),
+            writer: Arc::new(tokio::sync::Mutex::new(Some(writer))),
             attribution_names: Arc::default(),
         }
     }
@@ -144,6 +146,29 @@ impl EventBus {
     #[must_use]
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Refuse new durable publications and drain every admitted event before
+    /// the composition root closes the store. Producers must settle first.
+    /// A publisher cancelled after enqueue does not revoke its event.
+    ///
+    /// # Errors
+    /// Returns an error if the writer panicked or was cancelled.
+    ///
+    /// # Panics
+    /// Panics if the admission mutex is poisoned.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.writer_tx.lock().unwrap().take();
+        let mut writer = self.writer.lock().await;
+        if let Some(handle) = writer.as_mut() {
+            // Retain the handle across the await so cancelling this shutdown
+            // caller cannot make a later caller mistake an unfinished drain
+            // for completion.
+            let result = handle.await;
+            writer.take();
+            result.map_err(|error| Error::Internal(format!("event writer failed: {error}")))?;
+        }
+        Ok(())
     }
 
     /// Number of live subscribers (active delivery tasks). Read-only
@@ -182,7 +207,19 @@ impl EventBus {
     /// # Errors
     ///
     /// Returns `Error::Internal` if the event writer task has shut down or dropped the response.
+    ///
+    /// # Panics
+    /// Panics if the writer admission mutex is poisoned.
     pub async fn publish(&self, ev: &NewEvent) -> Result<Event> {
+        // Admission also covers the attribution lookup, which uses the store.
+        // The admitted sender keeps the receiver alive through enqueue; no
+        // new sender can be obtained once shutdown takes the shared sender.
+        let writer_tx = self
+            .writer_tx
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| Error::Internal("event writer task closed".to_string()))?;
         let attributed = self.attribute_to_caller(ev).await;
         let ev = attributed.as_ref().unwrap_or(ev);
         if is_transient_file_event(ev) {
@@ -199,10 +236,11 @@ impl EventBus {
         }
         let (tx, rx) = oneshot::channel();
         let req = (ev.clone(), tx);
-        self.writer_tx
+        writer_tx
             .send(req)
             .await
             .map_err(|_| Error::Internal("event writer task closed".to_string()))?;
+        drop(writer_tx);
         rx.await
             .map_err(|_| Error::Internal("event writer task dropped response".to_string()))?
     }

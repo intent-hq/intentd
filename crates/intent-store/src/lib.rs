@@ -22,7 +22,11 @@ mod client_repo;
 mod comment_repo;
 mod completion_wake_delivery_repo;
 mod completion_watch_repo;
+mod daemon_ownership;
 mod delegation_group_repo;
+mod diagnostics;
+mod store_pool;
+pub use store_pool::{StorePool, StorePoolOptions};
 mod diffs_repo;
 mod draft_repo;
 mod event_repo;
@@ -38,14 +42,21 @@ mod metrics_repo;
 mod node_repo;
 mod note_line_attribution_repo;
 mod note_repo;
+mod note_search_repo;
 mod note_version_repo;
 mod pr_monitor_repo;
+mod presence_focus_repo;
 mod principal_repo;
+mod repository_authority_repo;
+mod repository_lifecycle;
+mod repository_selection_repo;
 mod sandbox_repo;
+mod script_monitor_repo;
 mod script_repo;
 mod settings_repo;
 mod sharing_projection;
 mod stop_redelivery_repo;
+mod subscription_agent_repo;
 mod task_agent_link_repo;
 mod tracked_changes_repo;
 mod transfer_authorship;
@@ -58,6 +69,16 @@ mod workspace_mcp_repo;
 mod workspace_repo;
 mod workspace_ui_context_repo;
 
+pub use repository_lifecycle::{
+    RepositoryAcpCompatibilityEffect, RepositoryAcpCompatibilityOutcome,
+    RepositoryAcpCompatibilityPersistence, RepositoryAcpCompatibilityResult,
+    RepositoryAcpInitialization, RepositoryInitializationBinding, RepositoryInitializationClaim,
+    RepositoryInitializationConfirmation, RepositoryInitializationObservation,
+    RepositoryInitializationOutcome, RepositoryInitializationPersistence,
+    RepositoryInitializationTicket, RepositoryLifecycleKey, RepositoryLifecycleMutationTicket,
+    RepositoryLifecycleObserver, RepositoryPendingDeleteGuard,
+};
+
 pub use agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;
 pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
@@ -69,29 +90,47 @@ pub use agent_repo::{
 pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
 pub use completion_watch_repo::PersistedCompletionWatch;
 pub use delegation_group_repo::PersistedDelegationGroup;
+pub use diagnostics::DiagnosticStore;
 pub use diffs_repo::NewDiff;
 pub use event_repo::{EventQuery, NewEvent};
 pub use event_subscription_repo::PersistedEventSubscription;
+pub use hook_repo::ActiveHookMetadata;
 pub use host_membership_repo::{
     HostInviteJoinOutcome, HostJoinCredential, HostMemberRemoval, HostMembersSnapshot,
     OwnerQueuePermit,
 };
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
+pub use note_search_repo::{NoteFtsMatch, NoteFtsOptions};
 #[cfg(test)]
 pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
 pub use pr_monitor_repo::{
-    pr_monitor_pause_error, PrMonitorListEntry, PrMonitorPollUpdate, WorkspacePrMonitorReads,
-    PR_MONITOR_PAUSE_MARKER,
+    pr_monitor_pause_error, MonitorQualificationOutcome, MonitorTargetProvenance,
+    MonitorTargetUnresolvedReason, PersistedMonitorTarget, PrMonitorListEntry, PrMonitorPollUpdate,
+    QualifiedPrMonitor, WorkspacePrMonitorReads, PR_MONITOR_PAUSE_MARKER,
 };
 pub use principal_repo::{
     ArchivedGuestSweep, CollaboratorAddOutcome, EffectiveWorkspaceMember, InviteInsertOutcome,
     InviteJoinOutcome, WorkspaceAuthorFallback, WorkspaceGuestCount,
 };
+pub use repository_authority_repo::{
+    AuthorityRevision, RepositoryAuthoritySnapshot, RepositoryCredentialAuthority,
+    RepositoryHostAuthoritySnapshot, RepositoryPrincipalAuthority, RepositoryWorkspaceAuthority,
+    RepositoryWorkspaceAuthoritySnapshot, VersionedAuthority,
+};
+pub use repository_selection_repo::{
+    RepositoryRootIncarnation, RepositorySelectionBinding, RepositorySelectionChange,
+    RepositorySelectionPersistence, RepositorySelectionRevision, RepositorySelectionSnapshot,
+    RepositorySelectionWriteOutcome, RepositorySelectionWriteResult, RepositoryStoredSelection,
+};
 pub use sandbox_repo::{Sandbox, SandboxStatus};
+pub use subscription_agent_repo::SubscriptionAgentProjection;
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 pub use transfer_repo::TRANSFER_TABLES;
 pub use usage_rate_repo::{UsageRateDelta, UsageRateRow};
 pub use usage_stats_repo::{LocalStamp, UsageStatsDelta, UsageStatsRow};
+pub use workspace_repo::{
+    RepositoryWorkspaceDeleteDisposition, RepositoryWorkspaceDeleteOutcome, WorkspaceContentClock,
+};
 
 /// Total retry window for the `SQLITE_BUSY` retry helpers (monorepo#1139).
 const BUSY_RETRY_DEADLINE: Duration = Duration::from_secs(30);
@@ -324,8 +363,11 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// constraint. See `connect_write` / `connect_read` for the pool configurations.
 #[derive(Clone)]
 pub struct Store {
-    write_pool: SqlitePool,
-    read_pool: SqlitePool,
+    // Also retained by connection options and SQLite handles; see retain_owner.
+    _daemon_owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+    write_pool: StorePool,
+    read_pool: StorePool,
+    repository_lifecycle: std::sync::Arc<repository_lifecycle::LifecycleDomain>,
     /// Process-local `displayed` overlay of the browser tab registry; see
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
@@ -343,8 +385,24 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database cannot be opened or created, a migration fails, or the migration ledger records a version newer than this build (downgrade).
     pub async fn open(db_path: &Path) -> Result<Self> {
-        let write_pool = connect_write(db_path).await?;
-        let read_pool = connect_read(db_path).await?;
+        Self::open_with_owner(db_path, None).await
+    }
+
+    async fn open_with_owner(
+        db_path: &Path,
+        owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+    ) -> Result<Self> {
+        let write_pool = match &owner {
+            Some(_) => connect_write_owned(db_path, WRITE_ACQUIRE_TIMEOUT, owner.clone()).await?,
+            None => connect_write(db_path).await?,
+        };
+        let repository_lifecycle = repository_lifecycle::domain_for(db_path)?;
+        let mut lifecycle = repository_lifecycle.write().await?;
+        lifecycle.begin(&[RepositoryLifecycleKey::Database])?;
+        let read_pool = match &owner {
+            Some(_) => connect_read_owned(db_path, owner.clone()).await?,
+            None => connect_read(db_path).await?,
+        };
         // Run migrations on the write pool (migrations are write operations).
         MIGRATOR.run(&write_pool).await.map_err(|e| match e {
             sqlx::migrate::MigrateError::VersionMissing(version) => Error::Internal(format!(
@@ -354,16 +412,78 @@ impl Store {
             )),
             _ => Error::Internal(format!("migrations failed: {e}")),
         })?;
-        // Reap `agent_message_payload` rows pre-staged (0109,
-        // intent-hq/intent#3884 part 2) by a turn that died with the daemon
-        // before appending its envelope. Only valid at open, before any turn
-        // runs — a live turn's staged rows are envelope-less by design. The
-        // 0109 stats delete trigger rebalances `conversation_bytes`.
+        lifecycle.settle();
+        Ok(Self {
+            repository_lifecycle,
+            write_pool: StorePool::new(write_pool, owner.is_some()),
+            read_pool: StorePool::new(read_pool, owner.is_some()),
+            _daemon_owner: owner,
+            browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
+            #[cfg(test)]
+            export_author_barrier: std::sync::Arc::default(),
+        })
+    }
+
+    /// Open for exclusive daemon startup, sweeping dead-turn payloads before
+    /// returning a usable Store. Ownership survives every Store/pool clone and
+    /// checked-out or detached connection, including pending `SQLite` worker work.
+    /// Close and drop all handles to release it; closed pool options still retain it.
+    /// Ordinary opens never perform this sweep. The lock file must not be removed.
+    ///
+    /// # Errors
+    /// Returns an error if another daemon owns this database, locking is unsupported,
+    /// or opening/migrating/sweeping the database fails.
+    pub async fn open_for_daemon(db_path: &Path) -> Result<Self> {
+        // Resolve symlinks (including parent aliases for a new DB) before deriving
+        // the lock path, so different config paths cannot acquire different locks.
+        // exists() follows symlinks: a dangling final alias would otherwise get
+        // a different lock name before and after SQLite creates its target.
+        if std::fs::symlink_metadata(db_path).is_ok_and(|m| m.file_type().is_symlink())
+            && !db_path.exists()
+        {
+            return Err(Error::Internal(
+                "daemon database path is a dangling symlink".into(),
+            ));
+        }
+        let physical = if db_path.exists() {
+            std::fs::canonicalize(db_path)
+        } else {
+            db_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .canonicalize()
+                .map(|parent| parent.join(db_path.file_name().unwrap_or_default()))
+        }
+        .map_err(|e| Error::Internal(format!("resolve daemon database path: {e}")))?;
+        let mut lock_path = physical.as_os_str().to_os_string();
+        lock_path.push(".daemon.lock");
+        let owner = daemon_ownership::DaemonOwnership::acquire(Path::new(&lock_path))?;
+        // SQLx installs connection callbacks after its initial PRAGMAs. Keep
+        // initialization owned even if the caller cancels while those run.
+        // Dropping a JoinHandle detaches this startup task; no Store escapes
+        // until migrations and cleanup finish. Its result is dropped if the
+        // caller has gone away.
+        tokio::spawn(Self::finish_owned_startup(
+            physical,
+            std::sync::Arc::new(owner),
+        ))
+        .await
+        .map_err(|e| Error::Internal(format!("daemon database initialization task failed: {e}")))?
+    }
+
+    async fn finish_owned_startup(
+        physical: std::path::PathBuf,
+        owner: std::sync::Arc<daemon_ownership::DaemonOwnership>,
+    ) -> Result<Self> {
+        let store = Self::open_with_owner(&physical, Some(owner)).await?;
+        // No Store has escaped this constructor yet, and the OS lock excludes
+        // competing daemon startups. The delete trigger rebalances byte counts.
         let reaped = sqlx::query(
             "DELETE FROM agent_message_payload WHERE NOT EXISTS \
              (SELECT 1 FROM agent_message m WHERE m.id = agent_message_payload.message_id)",
         )
-        .execute(&write_pool)
+        .execute(store.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("orphaned payload sweep failed: {e}")))?
         .rows_affected();
@@ -373,24 +493,22 @@ impl Store {
                 "reaped orphaned pre-staged agent_message_payload rows"
             );
         }
-        Ok(Self {
-            write_pool,
-            read_pool,
-            browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
-            #[cfg(test)]
-            export_author_barrier: std::sync::Arc::default(),
-        })
+        Ok(store)
     }
 
     /// Borrow the write pool (single connection, for INSERT/UPDATE/DELETE/BEGIN).
+    ///
+    /// Acquisition and queries retain ownership throughout initialization.
+    /// The facade exposes read-only settings, not a raw pool or mutable options.
     #[must_use]
-    pub fn write_pool(&self) -> &SqlitePool {
+    pub fn write_pool(&self) -> &StorePool {
         &self.write_pool
     }
 
     /// Borrow the read pool (32 connections, intended for read/SELECT queries).
+    /// The ownership and exported-options boundary is the same as [`Self::write_pool`].
     #[must_use]
-    pub fn read_pool(&self) -> &SqlitePool {
+    pub fn read_pool(&self) -> &StorePool {
         &self.read_pool
     }
 
@@ -398,7 +516,7 @@ impl Store {
     /// explicit `read_pool()` / `write_pool()` usage.
     #[deprecated(since = "0.1.0", note = "use read_pool() or write_pool() explicitly")]
     #[must_use]
-    pub fn pool(&self) -> &SqlitePool {
+    pub fn pool(&self) -> &StorePool {
         &self.read_pool
     }
 
@@ -487,6 +605,8 @@ impl Store {
         // (TEXT primary key), which key the rowid-mapped `agent_message_fts`
         // index (0074) — rebuild it so the mapping stays correct.
         self.rebuild_agent_message_fts().await?;
+        // note_fts (0141) uses note_search_ctx.search_id, an explicit INTEGER
+        // PRIMARY KEY preserved by VACUUM, so it needs no recovery/rebuild.
         let duration = started.elapsed();
         let pages_after = self.page_count().await?;
         Ok(AutoVacuumActivation::Activated {
@@ -539,12 +659,39 @@ impl Store {
     /// This ensures WAL changes are visible to subsequent daemon instances
     /// (regression: persisted settings must survive app relaunches in sidecar mode).
     pub async fn close(&self) {
+        let started = std::time::Instant::now();
+        self.log_close_phase("wal_checkpoint", "started", 0);
         // Best-effort WAL checkpoint before closing the pools (via write pool).
-        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&self.write_pool)
+        // SQLite can return a busy checkpoint as a successful query. Inspect
+        // its existing result row so that this is not logged as a full checkpoint.
+        let result = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&self.write_pool)
             .await;
+        let state = match result.and_then(|row| row.try_get::<i64, _>(0)) {
+            Ok(0) => "completed",
+            Ok(_) => "busy",
+            Err(_) => "failed",
+        };
+        self.log_close_phase("wal_checkpoint", state, elapsed_ms(started));
+        let started = std::time::Instant::now();
+        self.log_close_phase("write_pool_close", "started", 0);
         self.write_pool.close().await;
+        self.log_close_phase("write_pool_close", "completed", elapsed_ms(started));
+        let started = std::time::Instant::now();
+        self.log_close_phase("read_pool_close", "started", 0);
         self.read_pool.close().await;
+        self.log_close_phase("read_pool_close", "completed", elapsed_ms(started));
+    }
+
+    fn log_close_phase(&self, phase: &'static str, state: &'static str, elapsed_ms: u64) {
+        // Independent SQLx snapshots, not a coherent accounting of checkouts.
+        // In particular num_idle may temporarily remain nonzero after close.
+        tracing::info!(target: "intent_store::close", phase, state, elapsed_ms,
+            write_pool_size = self.write_pool.size(),
+            write_pool_idle = self.write_pool.num_idle(),
+            read_pool_size = self.read_pool.size(),
+            read_pool_idle = self.read_pool.num_idle(),
+            "store close phase");
     }
 
     /// Compare the migrations embedded in the binary against the versions
@@ -591,10 +738,10 @@ pub struct MigrationStatus {
 }
 
 impl MigrationStatus {
-    /// True when every embedded migration version has been applied.
+    /// True when the applied versions exactly match this build, including no newer versions.
     #[must_use]
     pub fn is_current(&self) -> bool {
-        self.expected.iter().all(|v| self.applied.contains(v))
+        self.expected == self.applied
     }
 }
 
@@ -654,19 +801,31 @@ pub(crate) async fn connect_write_with_acquire_timeout(
     db_path: &Path,
     acquire_timeout: Duration,
 ) -> Result<SqlitePool> {
+    connect_write_owned(db_path, acquire_timeout, None).await
+}
+
+async fn connect_write_owned(
+    db_path: &Path,
+    acquire_timeout: Duration,
+    owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
-        .auto_vacuum(SqliteAutoVacuum::Incremental)
-        .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_secs(5))
-        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+        .busy_timeout(Duration::from_secs(5));
+    let opts = if owner.is_none() {
+        opts.auto_vacuum(SqliteAutoVacuum::Incremental)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+    } else {
+        opts
+    };
 
-    SqlitePoolOptions::new()
+    retain_pool_owner(SqlitePoolOptions::new(), owner.clone(), true)
         .max_connections(1)
         .acquire_timeout(acquire_timeout)
-        .connect_with(opts)
+        .connect_with(retain_owner(opts, owner))
         .await
         .map_err(|e| match e {
             sqlx::Error::PoolTimedOut => {
@@ -705,18 +864,37 @@ pub(crate) async fn connect_write_with_acquire_timeout(
 /// concurrent-agent read load, so the pool doubles to 32 to preserve the
 /// pool/agent-cap headroom ratio.
 pub(crate) async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
+    connect_read_owned(db_path, None).await
+}
+
+async fn connect_read_owned(
+    db_path: &Path,
+    owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+) -> Result<SqlitePool> {
+    connect_read_owned_timeout(db_path, owner, Duration::from_secs(10)).await
+}
+
+async fn connect_read_owned_timeout(
+    db_path: &Path,
+    owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+    acquire_timeout: Duration,
+) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(false)
-        .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_secs(5))
-        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+        .busy_timeout(Duration::from_secs(5));
+    let opts = if owner.is_none() {
+        opts.journal_mode(SqliteJournalMode::Wal)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+    } else {
+        opts
+    };
 
-    SqlitePoolOptions::new()
+    retain_pool_owner(SqlitePoolOptions::new(), owner.clone(), false)
         .max_connections(32)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect_with(opts)
+        .acquire_timeout(acquire_timeout)
+        .connect_with(retain_owner(opts, owner))
         .await
         .map_err(|e| match e {
             sqlx::Error::PoolTimedOut => {
@@ -724,6 +902,58 @@ pub(crate) async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
             }
             _ => Error::Internal(format!("failed to open read pool: {e}")),
         })
+}
+
+/// Install ownership before any database PRAGMA can block. `SQLx` runs connection
+/// option PRAGMAs before this hook, so owned options contain only local settings.
+/// Internal acquisition timeouts may cancel this future; the `SQLite` destructor
+/// then retains the lease until the actual busy worker finishes and closes.
+fn retain_pool_owner(
+    options: SqlitePoolOptions,
+    owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+    write: bool,
+) -> SqlitePoolOptions {
+    match owner {
+        Some(owner) => options.after_connect(move |connection, _metadata| {
+            let owner = owner.clone();
+            Box::pin(async move {
+                connection.lock_handle().await?.create_collation(
+                    "intent_daemon_ownership",
+                    move |left, right| {
+                        let _keep_alive = &owner;
+                        left.cmp(right)
+                    },
+                )?;
+                let pragmas = if write {
+                    "PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL"
+                } else {
+                    "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL"
+                };
+                sqlx::query(pragmas).execute(connection).await?;
+                Ok(())
+            })
+        }),
+        None => options,
+    }
+}
+
+/// Attach the lease to both future connection creation and the actual `SQLite`
+/// handle. `SQLx`'s collation registration uses `sqlite3_create_collation_v2`: its
+/// destructor drops the captured Arc only when `SQLite` destroys the connection,
+/// even after `PoolConnection::detach` or cancellation of the Rust query future.
+/// A pool-only `after_connect` capture would miss those lifetimes. This private
+/// collation is never selected by our schema/queries, so it changes no ordering.
+fn retain_owner(
+    options: SqliteConnectOptions,
+    owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+) -> SqliteConnectOptions {
+    match owner {
+        Some(owner) => options.collation("intent_daemon_ownership", move |left, right| {
+            let _keep_alive = &owner;
+            left.cmp(right)
+        }),
+        None => options,
+    }
 }
 
 /// Legacy test helper: builds a single pool (`max_connections=20`) for tests
@@ -778,4 +1008,8 @@ pub(crate) fn enum_to_db<T: serde::Serialize>(v: &T) -> Result<String> {
 pub(crate) fn enum_from_db<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
     serde_json::from_value(serde_json::Value::String(s.to_string()))
         .map_err(|e| Error::Internal(format!("failed to decode enum '{s}': {e}")))
+}
+
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }

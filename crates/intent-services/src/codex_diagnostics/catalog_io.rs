@@ -22,6 +22,7 @@ pub(super) const PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Default)]
 pub(super) struct Authentication {
     file: Option<Vec<u8>>,
+    config: Option<String>,
     env: Vec<(&'static str, OsString)>,
     pub secrets: BTreeSet<String>,
 }
@@ -30,7 +31,10 @@ impl Authentication {
     pub async fn capture(launch: &CodexLaunch) -> Result<Self, CatalogFailure> {
         // Also protect this boundary if a future caller bypasses fresh_catalogs.
         super::process::ensure_supported()?;
-        let command = intent_acp::spawn::build_command(&launch.spawn_options());
+        let mut command = intent_acp::spawn::build_command(&launch.spawn_options());
+        if let Some(context) = &launch.installed {
+            context.apply(&mut command);
+        }
         let non_empty = |name| super::effective_env(&command, name).filter(|s| !s.is_empty());
         let source = non_empty("CODEX_HOME").map(PathBuf::from).or_else(|| {
             non_empty("HOME")
@@ -41,7 +45,36 @@ impl Authentication {
             .into_iter()
             .filter_map(|key| non_empty(key).map(|value| (key, value)))
             .collect();
-        Self::read(source.as_deref(), env).await
+        let mut auth = Self::read(source.as_deref(), env).await?;
+        if let Some(context) = &launch.installed {
+            auth.secrets.extend(context.secret_values());
+            let config_path = source.map(|p| p.join("config.toml"));
+            auth.config = tokio::task::spawn_blocking(move || {
+                config_path.and_then(|p| crate::provider_models::minimal_codex_config_seed(&p))
+            })
+            .await
+            .map_err(|_| CatalogFailure::IsolationFailed)?;
+            if let Some(config) = &auth.config {
+                if let Ok(doc) = config.parse::<toml_edit::DocumentMut>() {
+                    if let Some(providers) =
+                        doc.get("model_providers").and_then(|v| v.as_table_like())
+                    {
+                        for (_, provider) in providers.iter() {
+                            if let Some(headers) =
+                                provider.get("http_headers").and_then(|v| v.as_table_like())
+                            {
+                                auth.secrets.extend(
+                                    headers
+                                        .iter()
+                                        .filter_map(|(_, v)| v.as_str().map(str::to_owned)),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(auth)
     }
 
     pub async fn read(
@@ -87,7 +120,7 @@ impl Authentication {
         if let Some(bytes) = &self.file {
             private_file(&home.path().join("auth.json"), bytes).await?;
         }
-        // No user config, profiles, cached models, MCP definitions, or keyring.
+        // Only the selected routing/auth config; no cached models, MCP or keyring.
         // A package boundary also keeps npm away from ancestor workspaces.
         private_file(&home.path().join("package.json"), b"{\"private\":true}").await?;
         private_file(
@@ -95,6 +128,10 @@ impl Authentication {
             b"cli_auth_credentials_store = \"file\"\n",
         )
         .await?;
+        if let Some(config) = &self.config {
+            let content = format!("cli_auth_credentials_store = \"file\"\n{config}");
+            private_file(&home.path().join("config.toml"), content.as_bytes()).await?;
+        }
         Ok(home)
     }
 
@@ -125,6 +162,9 @@ impl Authentication {
         }
         for (key, value) in &self.env {
             command.env(key, value);
+        }
+        if let Some(context) = &launch.installed {
+            context.apply_isolated(command);
         }
         // Match the snapshotted production selection. Config overrides are
         // deliberately not retained: they can reintroduce user MCP servers.

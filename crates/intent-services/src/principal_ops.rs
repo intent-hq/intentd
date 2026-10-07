@@ -249,35 +249,58 @@ pub(crate) fn principal_attribution_name(principal: &Principal) -> String {
 pub(crate) fn stamp_principal_attribution(
     message_metadata: Option<Value>,
 ) -> Result<Option<Value>> {
-    let metadata = match message_metadata {
-        None => None,
-        Some(Value::Object(mut obj)) => {
-            obj.remove(intent_core::human_author::HUMAN_AUTHOR_KEY);
-            Some(obj)
-        }
+    let mut obj = match message_metadata {
+        None if stamping_principal_id().is_none() => return Ok(None),
+        None => serde_json::Map::new(),
+        Some(Value::Object(obj)) => obj,
         Some(_) => {
             return Err(Error::InvalidParams(
                 "messageMetadata must be an object".to_string(),
             ))
         }
     };
-    Ok(match (metadata, stamping_principal_id()) {
-        (Some(mut obj), Some(principal_id)) => {
+    // Canonical metadata is round-tripped by Retry. Preserve answer/custom tags,
+    // but authenticate each contribution exactly as the enclosing message.
+    if let Some(contributions) = obj.get_mut(crate::agent_ops::MERGED_MESSAGE_METADATA_KEY) {
+        let entries = contributions.as_array_mut().ok_or_else(|| {
+            Error::InvalidParams("mergedMessageMetadata must be an array of objects or null".into())
+        })?;
+        for entry in entries {
+            match entry {
+                Value::Object(contribution) => {
+                    contribution.remove(crate::agent_ops::MERGED_MESSAGE_METADATA_KEY);
+                    stamp_metadata_object(contribution);
+                }
+                Value::Null => {}
+                _ => {
+                    return Err(Error::InvalidParams(
+                        "mergedMessageMetadata must be an array of objects or null".into(),
+                    ))
+                }
+            }
+        }
+    }
+    stamp_metadata_object(&mut obj);
+    Ok(Some(Value::Object(obj)))
+}
+
+fn stamp_metadata_object(obj: &mut serde_json::Map<String, Value>) {
+    obj.remove("submissionIds");
+    obj.remove("recoverySources");
+    obj.remove(intent_core::human_author::HUMAN_AUTHOR_KEY);
+    match stamping_principal_id() {
+        Some(principal_id) => {
             obj.remove("fromAgentId");
             obj.remove("fromAgentName");
             obj.insert(
                 FROM_PRINCIPAL_ID_KEY.to_string(),
                 Value::String(principal_id.0),
             );
-            Some(Value::Object(obj))
         }
-        (Some(mut obj), None) => {
+        None => {
             obj.remove(FROM_PRINCIPAL_ID_KEY);
-            Some(Value::Object(obj))
         }
-        (None, Some(principal_id)) => Some(json!({ FROM_PRINCIPAL_ID_KEY: principal_id.0 })),
-        (None, None) => None,
-    })
+    }
 }
 
 /// `true` when a queue entry / message payload carries the daemon's human
@@ -294,8 +317,11 @@ pub(crate) fn carries_principal_stamp(message_metadata: Option<&Value>) -> bool 
 pub(crate) fn strip_principal_attribution(message_metadata: Option<Value>) -> Option<Value> {
     match message_metadata {
         Some(Value::Object(mut obj)) => {
+            obj.remove("submissionIds");
+            obj.remove("recoverySources");
             obj.remove(FROM_PRINCIPAL_ID_KEY);
             obj.remove(intent_core::human_author::HUMAN_AUTHOR_KEY);
+            obj.remove(crate::agent_ops::MERGED_MESSAGE_METADATA_KEY);
             Some(Value::Object(obj))
         }
         other => other,
@@ -918,12 +944,18 @@ impl Services {
             }
             *last = Some(Instant::now());
         }
-        let this = self.clone();
-        intent_core::spawn_daemon(async move {
+        let mut this = self.clone();
+        let owner = async move {
+            this.primary_auth_admitted = true;
             if let Err(e) = this.refresh_primary_identity(principal).await {
                 tracing::debug!(error = %e, "primary github identity refresh skipped");
             }
-        });
+        };
+        if self.primary_auth_admitted {
+            let _ = self.store_tasks.spawn_draining(owner);
+        } else {
+            let _ = self.settings_tasks.spawn_draining(owner);
+        }
     }
 
     /// Refresh the primary principal's cached forge profile from the forge
@@ -1045,17 +1077,7 @@ impl Services {
         let Some(host) = self.bound_gitlab_host() else {
             return ForgeLink::NotConnected;
         };
-        let client_id = self.gitlab_client_id(&host);
-        match source_control_auth_ops::probe_gitlab(
-            &host,
-            &|| self.gitlab_host_is_bound(&host),
-            client_id.as_deref(),
-            self.gitlab_secret_store.clone(),
-            &self.gitlab_credential_gate,
-            self.event_bus.as_ref(),
-        )
-        .await
-        {
+        match source_control_auth_ops::probe_gitlab(self, &host).await {
             Ok(source_control_auth_ops::ProbeOutcome::Configured { user, .. }) => {
                 ForgeLink::Connected(ForgeUser::gitlab(host.host(), &user))
             }
@@ -1117,8 +1139,9 @@ impl Services {
             .identity_rekey_generation
             .fetch_add(1, Ordering::SeqCst)
             + 1;
-        let this = self.clone();
-        intent_core::spawn_daemon(async move {
+        let mut this = self.clone();
+        let owner = async move {
+            this.primary_auth_admitted = true;
             let primary = match this.store.get_primary_principal().await {
                 Ok(p) => p,
                 Err(e) => {
@@ -1132,7 +1155,14 @@ impl Services {
             {
                 tracing::warn!(error = %e, "identity.provider changed: identity re-key deferred");
             }
-        });
+        };
+        // A committed reload callback can outlive early root closure. Its
+        // watcher is joined before the finite derived tail lane is drained.
+        if self.primary_auth_admitted || crate::config_watcher::owns_admitted_callback() {
+            let _ = self.store_tasks.spawn_draining(owner);
+        } else {
+            let _ = self.settings_tasks.spawn_draining(owner);
+        }
     }
 
     /// The explicit re-key an `identity.provider` write performs (protocol

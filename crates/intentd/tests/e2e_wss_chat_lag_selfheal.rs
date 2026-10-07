@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use intent_core::events::{AGENT_STREAM_END, CHAT_STREAM_DELTA};
+use intent_core::events::{AGENT_STREAM_END, AGENT_UPDATED, CHAT_STREAM_DELTA};
 use intent_core::{
     now_iso, ActorType, AgentId, EventActor, Result as CoreResult, WorkspaceApi, WorkspaceId,
 };
@@ -251,12 +251,112 @@ fn stream_event(ws_id: &str, agent_id: &str, event_type: &str, data: Value) -> N
     }
 }
 
+/// A destructive mutation must reset a standing subscription even when it
+/// empties the transcript. Metadata updates and other agents must not reset it.
+#[tokio::test]
+async fn chat_subscription_resets_after_replace_messages_over_wss() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let created = wss_rpc(&mut rpc, 1, "workspace.create", json!({ "title": "WS" })).await;
+    let ws_id = created["workspace"]["id"].as_str().unwrap();
+    let a = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap();
+    wss_rpc(
+        &mut rpc,
+        3,
+        "agent.replaceMessages",
+        json!({ "agentId": agent_id, "messages": [
+            { "role": "user", "contentBlocks": [{ "type": "text", "text": "old prompt" }] },
+            { "role": "assistant", "contentBlocks": [{ "type": "text", "text": "old answer" }] }
+        ] }),
+    )
+    .await;
+    let mut chat = connect(fx.port, fx.cfg.clone()).await;
+    let sub = wss_rpc(
+        &mut chat,
+        1,
+        "chat.subscribe",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let sub_id = sub["subscriptionId"].as_str().unwrap();
+    let initial = next_push(&mut chat, sub_id).await;
+    assert_eq!(
+        initial["params"]["snapshot"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // The following chunk is a barrier proving neither preceding event
+    // triggered a reset; no absence-by-sleep assertion is needed.
+    for (id, data) in [
+        (agent_id, json!({ "name": "new name" })),
+        (
+            "other-agent",
+            json!({ "truncatedCount": 2, "remainingCount": 0 }),
+        ),
+    ] {
+        fx.bus
+            .publish(&stream_event(ws_id, id, AGENT_UPDATED, data))
+            .await
+            .unwrap();
+    }
+    let mid = Uuid::now_v7().to_string();
+    let chunk = stream_event(
+        ws_id,
+        agent_id,
+        CHAT_STREAM_DELTA,
+        json!({
+            "agentId": agent_id, "messageId": mid, "content": "before reset",
+            "blockIndex": 0, "blockId": format!("{mid}:0"), "blockType": "text"
+        }),
+    );
+    fx.bus.publish(&chunk).await.unwrap();
+    let delta = next_push(&mut chat, sub_id).await;
+    assert_eq!(delta["params"]["kind"], "delta");
+    assert_eq!(delta["params"]["seq"], 1);
+
+    let replaced = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.replaceMessages",
+        json!({ "agentId": agent_id, "messages": [] }),
+    )
+    .await;
+    assert_eq!(replaced["success"], true);
+    let reset = next_push(&mut chat, sub_id).await;
+    assert_eq!(reset["params"]["kind"], "snapshot");
+    assert_eq!(reset["params"]["seq"], 2);
+    assert_eq!(reset["params"]["snapshot"]["messages"], json!([]));
+    assert_eq!(reset["params"]["snapshot"]["resumed"], false);
+
+    // Same block identity makes failure to clear the mapper observable:
+    // the next delta must not contain its pre-reset accumulated text.
+    let mut chunk = chunk;
+    chunk.data["content"] = json!("after reset");
+    fx.bus.publish(&chunk).await.unwrap();
+    let next = next_push(&mut chat, sub_id).await;
+    assert_eq!(next["params"]["seq"], 3);
+    assert_eq!(
+        next["params"]["delta"]["added"][0]["block"]["text"],
+        "after reset"
+    );
+}
+
 /// A broadcast-ring drop that swallows the turn's tail (trailing chunk +
 /// `agent:stream:end`) heals over the real WSS transport: the client receives
 /// a fresh snapshot at the next seq that equals `agent.getConversation`
 /// (converged, not mid-turn), then keeps receiving the next turn's deltas.
 #[intent_test_macros::daemon_test]
-async fn chat_subscription_self_heals_over_wss_after_broadcast_lag() {
+async fn twenty_message_chat_subscription_self_heals_over_wss_after_broadcast_lag() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
@@ -273,6 +373,17 @@ async fn chat_subscription_self_heals_over_wss_after_broadcast_lag() {
 
     // A persisted user message anchors the seq-0 snapshot.
     let store = fx.bus.store();
+    for seq in 0..23 {
+        store
+            .append_agent_message(
+                &AgentId::from(agent_id.as_str()),
+                "user",
+                &json!([{ "type": "text", "text": format!("history {seq}") }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append history");
+    }
     let user_id = Uuid::now_v7().to_string();
     store
         .append_agent_message_with_id(
@@ -291,6 +402,13 @@ async fn chat_subscription_self_heals_over_wss_after_broadcast_lag() {
     let snap = next_push(&mut ws, sub_id).await;
     assert_eq!(snap["params"]["kind"], "snapshot");
     assert_eq!(snap["params"]["seq"], 0);
+    assert_eq!(
+        snap["params"]["snapshot"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        20
+    );
 
     // The turn starts normally: the first chunk arrives as delta seq 1.
     let mid = Uuid::now_v7().to_string();
@@ -371,7 +489,7 @@ async fn chat_subscription_self_heals_over_wss_after_broadcast_lag() {
         &mut ws,
         4,
         "agent.getConversation",
-        json!({ "agentId": agent_id }),
+        json!({ "agentId": agent_id, "limit": 20 }),
     )
     .await;
     let mut want = want;
@@ -380,6 +498,7 @@ async fn chat_subscription_self_heals_over_wss_after_broadcast_lag() {
     want_obj.insert("isWaitingOnTool".into(), json!(false));
     want_obj.insert("isWaitingForOtherAgents".into(), json!(false));
     want_obj.insert("waitingForAgentIds".into(), json!([]));
+    want_obj.insert("resumed".into(), json!(false));
     assert_eq!(
         recovery["params"]["snapshot"], want,
         "recovery snapshot equals a fresh getConversation page"
@@ -387,7 +506,25 @@ async fn chat_subscription_self_heals_over_wss_after_broadcast_lag() {
     let messages = recovery["params"]["snapshot"]["messages"]
         .as_array()
         .unwrap();
-    assert_eq!(messages.len(), 2, "user + persisted assistant message");
+    assert_eq!(
+        messages.len(),
+        20,
+        "recovery retains the newest twenty messages"
+    );
+    assert_eq!(messages[0]["seq"], 5);
+    assert_eq!(messages[19]["id"], mid);
+    assert_eq!(want["totalMessages"], 25);
+    let older = wss_rpc(
+        &mut ws,
+        5,
+        "agent.getConversation",
+        json!({ "agentId": agent_id, "limit": 5, "nextToken": want["nextToken"] }),
+    )
+    .await;
+    assert_eq!(older["messages"].as_array().unwrap().len(), 5);
+    assert_eq!(older["messages"][0]["seq"], 0);
+    assert_eq!(older["messages"][4]["seq"], 4);
+    assert!(older["nextToken"].is_null());
     assert!(
         messages.iter().all(|m| m.get("isStreaming").is_none()),
         "the recovered transcript is not stranded mid-turn"

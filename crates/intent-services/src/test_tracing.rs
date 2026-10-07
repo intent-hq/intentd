@@ -52,9 +52,11 @@ where
 /// `rpc_profile` statement budget counts. Attribution is span-scoped: the
 /// future is instrumented with a marker span, sqlx forwards that span to its
 /// worker thread with every command, and only events under the marker are
-/// counted, so concurrent tests in one process never inflate each other. Run
-/// the code path once uncounted first if the pool may still lazy-connect
-/// (the connection-setup PRAGMA batch runs inside the acquiring span).
+/// counted, so concurrent tests in one process never inflate each other. Use
+/// [`warm_sqlx_pool`] first to exclude lazy connection setup from a query-cost
+/// budget. One uncounted request is insufficient: `SQLx` returns connections
+/// asynchronously and a later acquire can open another connection, counting
+/// its setup PRAGMA batch inside the acquiring span.
 ///
 /// The calling thread must NOT hold a thread-local capture (the marker span
 /// would then be created by the capture while the worker-thread events reach
@@ -75,6 +77,51 @@ pub(crate) async fn count_sqlx_statements<F: Future>(fut: F) -> (F::Output, usiz
     counters().lock().unwrap().remove(&id);
     drop(span);
     (out, statements)
+}
+
+/// Executed SQL and hydrated row count, scoped like `count_sqlx_statements`.
+#[derive(Debug, Default)]
+pub(crate) struct SqlxQuery {
+    pub sql: String,
+    pub rows_returned: u64,
+}
+
+impl tracing::field::Visit for SqlxQuery {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "db.statement" {
+            self.sql = value.to_owned();
+        }
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "rows_returned" {
+            self.rows_returned = value;
+        }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+type QueryCapture = Arc<Mutex<Vec<SqlxQuery>>>;
+
+fn query_captures() -> &'static Mutex<HashMap<u64, QueryCapture>> {
+    static CAPTURES: OnceLock<Mutex<HashMap<u64, QueryCapture>>> = OnceLock::new();
+    CAPTURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Capture real worker-thread statements, including their returned-row counts.
+/// Warm the pool first and do not hold a thread-local tracing capture.
+pub(crate) async fn capture_sqlx_queries<F: Future>(fut: F) -> (F::Output, Vec<SqlxQuery>) {
+    install_anchor();
+    let span = tracing::trace_span!(STATEMENT_COUNT_SPAN);
+    let id = span.id().expect("query capture span").into_u64();
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    query_captures().lock().unwrap().insert(id, capture.clone());
+    let out = fut.instrument(span.clone()).await;
+    query_captures().lock().unwrap().remove(&id);
+    let queries = std::mem::take(&mut *capture.lock().unwrap());
+    drop(span);
+    (out, queries)
 }
 
 fn install_anchor() {
@@ -143,5 +190,94 @@ where
         if let Some(counter) = counters().lock().unwrap().get(&marker.id().into_u64()) {
             counter.fetch_add(1, Ordering::SeqCst);
         }
+        if let Some(capture) = query_captures()
+            .lock()
+            .unwrap()
+            .get(&marker.id().into_u64())
+        {
+            let mut query = SqlxQuery::default();
+            event.record(&mut query);
+            capture.lock().unwrap().push(query);
+        }
     }
+}
+
+/// Initialize every pool slot before measuring an exact query-cost budget.
+/// Hold all connections at once so acquisitions cannot reuse a warmed slot
+/// while leaving another lazy. Dropping them may return them asynchronously,
+/// but the pool is already at capacity: subsequent reads wait for these
+/// initialized connections instead of opening new ones.
+///
+/// Call outside the counted span, with no connections checked out. This is
+/// for short tests that do not close/expire connections during measurement;
+/// it does not filter any SQL events or alter production pool behavior.
+pub(crate) async fn warm_sqlx_pool(pool: &intent_store::StorePool) {
+    let mut connections = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        connections.push(pool.acquire().await.expect("warm SQL statement-count pool"));
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn warmed_pool_statement_count_survives_connection_contention() {
+    // Force a connection beyond the one a single warm-up read can touch.
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(4)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect_lazy("sqlite::memory:")
+        .unwrap();
+    let pool = intent_store::StorePool::from(pool);
+    warm_sqlx_pool(&pool).await;
+    let mut held = Vec::new();
+    for _ in 1..pool.options().get_max_connections() {
+        held.push(pool.acquire().await.unwrap());
+    }
+    let ((), count) = count_sqlx_statements(async {
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query("SELECT 1")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("SELECT 2")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!(count, 2, "only the two application statements are counted");
+    drop(held);
+    pool.close().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn warmed_pool_counts_extra_queries_and_isolates_concurrent_spans() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(2)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect_lazy("sqlite::memory:")
+        .unwrap();
+    let pool = intent_store::StorePool::from(pool);
+    warm_sqlx_pool(&pool).await;
+    let barrier = tokio::sync::Barrier::new(2);
+    let read = async |statements| {
+        let mut connection = pool.acquire().await.unwrap();
+        // Both measured spans are live and own distinct connections before
+        // either issues SQL; a process-global counter would conflate them.
+        barrier.wait().await;
+        for _ in 0..statements {
+            sqlx::query("SELECT 1")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+    };
+    let (((), one), ((), extra)) = tokio::join!(
+        count_sqlx_statements(read(1)),
+        count_sqlx_statements(read(2)),
+    );
+    assert_eq!(one, 1);
+    assert_eq!(extra, 2, "a real extra application query must still count");
+    pool.close().await;
 }

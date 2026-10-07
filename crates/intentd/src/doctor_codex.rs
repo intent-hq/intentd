@@ -31,7 +31,7 @@ pub async fn report(settings: SettingsFile, live: bool) {
         let inspection = launch.inspect_local().await;
         print!("{}", render_runtime(&inspection.report));
         if cfg!(target_os = "macos") {
-            println!("    macOS diagnostics report the pinned launch without resolving its package; version and fresh catalog probes are unsupported.");
+            println!("    macOS diagnostics report the pinned launch without resolving its package; adapter version and fresh catalog probes are unsupported. Installed CLI version checks remain available.");
         } else {
             println!("    Fresh catalogs not requested; use intentd doctor --codex-models (may download the managed package).");
         }
@@ -70,7 +70,7 @@ fn render_runtime(report: &CodexRuntimeReport) -> String {
     render_version(&mut text, "adapter", &report.adapter_version);
     let runtime_source = match report.runtime_source {
         RuntimeSource::AdapterDependency => "selected adapter dependency",
-        RuntimeSource::EnvironmentOverride => "effective CODEX_PATH override",
+        RuntimeSource::EnvironmentOverride => "installed CLI on the execution host (CODEX_PATH)",
         RuntimeSource::Unknown => "unknown",
     };
     writeln!(text, "    runtime source: {runtime_source}").unwrap();
@@ -228,7 +228,7 @@ mod tests {
         report.runtime_version = VersionMeasurement::Measured("0.333.4".into());
         let text = render_runtime(&report);
         assert!(text.contains("configured managed package (not a measured version)"));
-        assert!(text.contains("runtime source: effective CODEX_PATH override"));
+        assert!(text.contains("runtime source: installed CLI on the execution host (CODEX_PATH)"));
         assert!(text.contains("measured runtime version: 0.333.4"));
         assert!(!text.contains("launch policy:"));
     }

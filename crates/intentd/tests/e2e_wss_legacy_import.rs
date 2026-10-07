@@ -141,7 +141,7 @@ fn spawn_daemon(data_dir: &Path, legacy_root: &Path, hold_file: &Path) -> Child 
     let log = std::fs::File::create(data_dir.join("daemon.log")).unwrap();
     let workspaces = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces).unwrap();
-    let mut cmd = common::serve_command();
+    let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", workspaces)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", legacy_root)

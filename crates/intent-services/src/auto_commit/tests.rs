@@ -77,6 +77,7 @@ fn workspace_with_repo(id: &WorkspaceId, repo: &GitRepo) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,
@@ -227,8 +228,11 @@ async fn setup_dirty_workspace(repo: &GitRepo) -> (TempDb, Services, WorkspaceId
     std::fs::write(repo.dir.join("change.txt"), "agent edit\n").unwrap();
     // Inject a missing auggie path so generation falls back to the deterministic
     // subject, preserving pre-LLM test semantics.
-    let services =
-        Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+    let services = Services::new_with_file_secrets(
+        store,
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
+    )
+    .with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
     (tmp, services, ws_id)
 }
 
@@ -477,6 +481,60 @@ async fn clean_tree_is_silent_skip() {
     svc.handle_agent_idle_auto_commit(&event).await;
     let commits = intent_git::history::history(&repo.dir, 5).unwrap();
     assert_eq!(commits.len(), 1);
+}
+
+#[intent_test_macros::daemon_test]
+async fn index_refresh_failure_does_not_repeat_auto_commit() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws) = setup_dirty_workspace(&repo).await;
+    let agent = session("agent-refresh", &ws, None, false, "Builder", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws, "agent-refresh").await;
+    std::fs::write(repo.dir.join("unrelated.txt"), "other actor\n").unwrap();
+    intent_git::stage::stage(&repo.dir, &["unrelated.txt".to_string()]).unwrap();
+    let git = Repository::open(&repo.dir).unwrap();
+    let parent = git.head().unwrap().target().unwrap();
+    let index_before = std::fs::read(git.path().join("index")).unwrap();
+    let lock = git.path().join("index.lock");
+    std::fs::write(&lock, "held by test\n").unwrap();
+    let event = idle_event(&ws, "agent-refresh", "end_turn");
+
+    svc.handle_agent_idle_auto_commit(&event).await;
+    let committed = git.head().unwrap().peel_to_commit().unwrap();
+    assert_ne!(committed.id(), parent);
+    assert_eq!(committed.parent_id(0).unwrap(), parent);
+    assert!(committed
+        .tree()
+        .unwrap()
+        .get_name("unrelated.txt")
+        .is_none());
+    assert_eq!(
+        std::fs::read(git.path().join("index")).unwrap(),
+        index_before
+    );
+    assert_eq!(
+        svc.store()
+            .list_tracked_changes(&ws)
+            .await
+            .unwrap()
+            .iter()
+            .find(|r| r.path == "change.txt")
+            .unwrap()
+            .stage,
+        "committed"
+    );
+
+    // Both with the lock held and after it is released, a later idle event
+    // cannot recommit the stale index or sweep in another actor's staged work.
+    svc.handle_agent_idle_auto_commit(&event).await;
+    std::fs::remove_file(lock).unwrap();
+    svc.handle_agent_idle_auto_commit(&event).await;
+    assert_eq!(git.head().unwrap().target(), Some(committed.id()));
+    assert_eq!(
+        std::fs::read(git.path().join("index")).unwrap(),
+        index_before
+    );
+    assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 2);
 }
 
 #[intent_test_macros::daemon_test]
@@ -1139,7 +1197,7 @@ async fn generated_message_preserves_trailers() {
 async fn generation_applies_commit_quick_action_effort_before_prompt() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
-    let (_dir, bin, log) = crate::test_support::quick_action_effort_adapter(&json!({
+    let (_dir, bin, log, _cli_env) = crate::test_support::quick_action_effort_adapter(&json!({
         "response": "{\"subject\":\"feat: configured effort\"}"
     }));
     let (_config_dir, registry) = auggie_active_registry();
@@ -1154,7 +1212,11 @@ async fn generation_applies_commit_quick_action_effort_before_prompt() {
             ),
         ])
         .unwrap();
-    let svc = svc.with_settings_registry(registry);
+    // Installed CLI providers ignore adapter path overrides. Route the pinned
+    // npm launch through the same isolated seam as the complete-once fixtures.
+    let svc = svc
+        .with_settings_registry(registry)
+        .with_one_shot_npx(Some(bin));
     let agent = session("effort-agent", &ws_id, None, false, "Builder", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
     attribute_dirty_change(&svc, &ws_id, "effort-agent").await;
@@ -1182,4 +1244,134 @@ async fn generation_applies_commit_quick_action_effort_before_prompt() {
     );
     assert_eq!(calls[2]["params"]["configId"], "adapter-thinking");
     assert_eq!(calls[2]["params"]["value"], "high");
+}
+
+#[intent_test_macros::daemon_test]
+async fn auto_commit_attribution_survives_receiver_abort() {
+    use crate::periodic_shutdown_tests::{drain_held, entered, hold};
+    let repo = init_git_repo();
+    let (db, svc, ws) = setup_dirty_workspace(&repo).await;
+    let bus = crate::events::EventBus::new(svc.store().clone());
+    let svc = svc
+        .with_event_bus(bus.clone())
+        .with_auto_commit_cooldown_ms(60_000);
+    svc.store()
+        .set_workspace_auto_commit(&ws, true)
+        .await
+        .unwrap();
+    assert!(svc.arm_auto_commit_cooldown(&ws));
+    assert!(svc.effective_auto_commit(&ws).await);
+    svc.store()
+        .insert_agent_session(&session("agent-tail", &ws, None, false, "Tail", true))
+        .await
+        .unwrap();
+    attribute_dirty_change(&svc, &ws, "agent-tail").await;
+    let (rx, release) = hold(&svc, "git");
+    let task = svc.spawn_auto_commit_loop();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while bus.subscriber_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let e = idle_event(&ws, "agent-tail", "end_turn");
+    bus.publish(&intent_store::NewEvent {
+        workspace_id: e.workspace_id,
+        timestamp: e.timestamp,
+        event_type: e.event_type,
+        actor: e.actor,
+        session_id: e.session_id,
+        correlation_id: e.correlation_id,
+        parent_event_id: e.parent_event_id,
+        metadata: e.metadata,
+        data: e.data,
+    })
+    .await
+    .unwrap();
+    entered(rx).await;
+    assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 2);
+    assert_eq!(
+        svc.store().list_tracked_changes(&ws).await.unwrap()[0].stage,
+        "unstaged"
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    drain_held(&svc, release).await;
+    bus.shutdown().await.unwrap();
+    svc.store().close().await;
+    let reopened = Store::open(&db.path).await.unwrap();
+    let rows = reopened.list_tracked_changes(&ws).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].stage, "committed");
+    assert_eq!(rows[0].agent_id.as_deref(), Some("agent-tail"));
+    for kind in ["git:commit", "changes:git-status"] {
+        let events = reopened
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![kind.into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "{kind}");
+    }
+    reopened.close().await;
+}
+
+#[tokio::test]
+#[expect(clippy::async_yields_async)] // Deliberately construct under one caller and poll under another.
+async fn agent_commit_captures_polling_caller_before_owned_handoff() {
+    use intent_core::{with_caller, Caller, HostRole, PrincipalId, WorkspaceApi};
+    let repo = init_git_repo();
+    let (_db, svc, ws) = setup_dirty_workspace(&repo).await;
+    svc.store()
+        .insert_agent_session(&session("context-agent", &ws, None, false, "Context", true))
+        .await
+        .unwrap();
+    attribute_dirty_change(&svc, &ws, "context-agent").await;
+    svc.store()
+        .set_workspace_auto_commit(&ws, true)
+        .await
+        .unwrap();
+    let future = svc.git_agent_commit(
+        ws.clone(),
+        "Scoped commit".into(),
+        Some(AgentId::from("context-agent")),
+        None,
+        None,
+        false,
+        None,
+    );
+    assert!(intent_core::current_caller().is_none());
+    with_caller(Caller::Daemon, future).await.unwrap();
+    assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 2);
+    assert_eq!(
+        svc.store().list_tracked_changes(&ws).await.unwrap()[0].stage,
+        "committed"
+    );
+    std::fs::write(repo.dir.join("change.txt"), "forbidden later edit").unwrap();
+    let future = with_caller(Caller::Daemon, async {
+        svc.git_agent_commit(
+            ws.clone(),
+            "Forbidden commit".into(),
+            Some(AgentId::from("context-agent")),
+            None,
+            Some(vec!["change.txt".into()]),
+            true,
+            None,
+        )
+    })
+    .await;
+    let result = with_caller(
+        Caller::Wire {
+            principal_id: PrincipalId::from("nonmember"),
+            host_role: HostRole::Guest,
+        },
+        future,
+    )
+    .await;
+    assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
+    assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 2);
+    svc.shutdown_store_writers().await;
 }

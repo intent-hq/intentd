@@ -8,7 +8,7 @@
 use intent_core::Error;
 
 pub use intent_core::{
-    FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
+    FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitFileStatus,
     GitMergeConflicts, GitPullResult, GitStatus, Result,
 };
 
@@ -30,6 +30,8 @@ pub mod hub;
 pub mod identity;
 pub mod local_changes;
 pub mod ls_remote;
+pub mod native_checkout;
+pub mod native_push;
 pub mod pull;
 pub mod push;
 pub mod rebase;

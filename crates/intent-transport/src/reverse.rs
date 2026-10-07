@@ -224,7 +224,7 @@ impl ReverseChannel {
             });
         }
         let id = self.mint_id();
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
         {
             let mut state = self.pending.lock().expect("reverse pending poisoned");
             if state.closed {
@@ -245,10 +245,16 @@ impl ReverseChannel {
         }))
         .unwrap_or_default();
         match tokio::time::timeout(timeout, async {
-            self.out_tx.send(frame).await.map_err(|_| ReverseError {
-                code: 0,
-                message: "client connection closed".to_string(),
-            })?;
+            tokio::select! {
+                result = &mut rx => return result.unwrap_or_else(|_| Err(ReverseError {
+                    code: 0,
+                    message: "client connection closed".to_string(),
+                })),
+                result = self.out_tx.send(frame) => result.map_err(|_| ReverseError {
+                    code: 0,
+                    message: "client connection closed".to_string(),
+                })?,
+            }
             rx.await.map_err(|_| ReverseError {
                 code: 0,
                 message: "reverse response channel dropped".to_string(),

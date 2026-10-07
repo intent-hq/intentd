@@ -40,6 +40,7 @@ fn workspace(id: &WorkspaceId, path: &std::path::Path) -> Workspace {
         created_at: ts.clone(),
         updated_at: ts.clone(),
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: Some(path.display().to_string()),
         repository_path: None,

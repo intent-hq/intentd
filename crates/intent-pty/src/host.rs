@@ -17,8 +17,10 @@ use tokio::sync::broadcast;
 
 use intent_core::{Error, Result};
 
-use crate::scrollback::{LineSnapshot, Scrollback, DEFAULT_SCROLLBACK_BYTES};
+use crate::scrollback::{LineSnapshot, OutputChunk, Scrollback, DEFAULT_SCROLLBACK_BYTES};
 
+#[cfg(any(windows, test))]
+mod conpty_startup;
 #[cfg(unix)]
 mod unix_io;
 
@@ -194,17 +196,20 @@ impl SpawnSpec {
 /// receiver tailing every subsequent output chunk (§12.1 back-fill-then-tail).
 pub struct Attachment {
     /// Recent scrollback captured at attach time, to be written before tailing.
-    pub backlog: Vec<u8>,
+    pub backlog: OutputChunk,
     /// Live output stream; each item is a shared output chunk.
-    pub live: broadcast::Receiver<Arc<Vec<u8>>>,
+    pub live: broadcast::Receiver<Arc<OutputChunk>>,
 }
 
 /// Scrollback + broadcast guarded together so attach (snapshot + subscribe) and
 /// the reader (append + send) are atomic relative to each other — guaranteeing a
 /// late subscriber sees each chunk exactly once (history XOR live, never both).
 struct Fanout {
+    eof: bool,
+    eof_notify: Arc<tokio::sync::Notify>,
+    framing: intent_core::script_output::LineDecoder,
     scrollback: Scrollback,
-    tx: broadcast::Sender<Arc<Vec<u8>>>,
+    tx: broadcast::Sender<Arc<OutputChunk>>,
 }
 
 /// A point-in-time view of a tracked PTY's metadata (`terminal.list` /
@@ -240,7 +245,7 @@ struct PtySession {
     /// lost. The exit watcher (or teardown) takes it so the reader still
     /// observes EOF and its thread exits.
     slave: Mutex<Option<Box<dyn SlavePty + Send>>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     fanout: Arc<Mutex<Fanout>>,
@@ -316,8 +321,8 @@ fn retry_transient<T, E: std::fmt::Display>(
 }
 
 /// The unified host owning every spawned PTY (terminals and scripts).
-#[derive(Default)]
 pub struct PtyHost {
+    daemon_boot_id: String,
     sessions: Mutex<HashMap<PtyId, Arc<PtySession>>>,
     next_id: AtomicU64,
     /// Latched by [`kill_all`](Self::kill_all) (clean daemon shutdown): once
@@ -327,11 +332,28 @@ pub struct PtyHost {
     closed: AtomicBool,
 }
 
+impl Default for PtyHost {
+    fn default() -> Self {
+        Self {
+            daemon_boot_id: uuid::Uuid::new_v4().to_string(),
+            sessions: Mutex::default(),
+            next_id: AtomicU64::default(),
+            closed: AtomicBool::default(),
+        }
+    }
+}
+
 impl PtyHost {
     /// Create an empty host.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Identity of this host lifetime, shared by terminal lists, snapshots and events.
+    #[must_use]
+    pub fn daemon_boot_id(&self) -> &str {
+        &self.daemon_boot_id
     }
 
     /// Spawn a process attached to a fresh PTY and start fanning out its output.
@@ -378,7 +400,36 @@ impl PtyHost {
         let writer = pair.master.take_writer().map_err(internal)?;
         #[cfg(not(unix))]
         let reader = pair.master.try_clone_reader().map_err(internal)?;
-        let child = pair.slave.spawn_command(cmd).map_err(internal)?;
+
+        let (tx, _rx) = broadcast::channel(FANOUT_CAPACITY);
+        let fanout = Arc::new(Mutex::new(Fanout {
+            eof: false,
+            eof_notify: Arc::default(),
+            framing: intent_core::script_output::LineDecoder::new(false),
+            scrollback: Scrollback::new(spec.scrollback_bytes),
+            tx,
+        }));
+
+        let writer = Arc::new(Mutex::new(writer));
+        let reader_fanout = Arc::clone(&fanout);
+        #[cfg(windows)]
+        let handle = {
+            // ConPTY can request its startup reply while the child is attaching.
+            let reader_writer = Arc::clone(&writer);
+            std::thread::spawn(move || read_loop(reader, &reader_fanout, &reader_writer))
+        };
+        let child = match pair.slave.spawn_command(cmd) {
+            Ok(child) => child,
+            Err(error) => {
+                #[cfg(windows)]
+                {
+                    drop(pair);
+                    drop(writer);
+                    let _ = handle.join();
+                }
+                return Err(internal(error));
+            }
+        };
         // Keep the parent-side slave open (monorepo#587): if we dropped it
         // here, a fast-exiting child would close the *last* slave fd before
         // the reader thread's first read(), and macOS discards buffered PTY
@@ -389,14 +440,7 @@ impl PtyHost {
 
         let pid = child.process_id();
         let killer = child.clone_killer();
-
-        let (tx, _rx) = broadcast::channel(FANOUT_CAPACITY);
-        let fanout = Arc::new(Mutex::new(Fanout {
-            scrollback: Scrollback::new(spec.scrollback_bytes),
-            tx,
-        }));
-
-        let reader_fanout = Arc::clone(&fanout);
+        #[cfg(not(windows))]
         let handle = std::thread::spawn(move || read_loop(reader, &reader_fanout));
 
         let cwd = spec
@@ -417,7 +461,7 @@ impl PtyHost {
             pid,
             master: Mutex::new(Some(pair.master)),
             slave: Mutex::new(Some(pair.slave)),
-            writer: Mutex::new(writer),
+            writer,
             child: Mutex::new(child),
             killer: Mutex::new(killer),
             fanout,
@@ -463,10 +507,50 @@ impl PtyHost {
     pub fn attach(&self, id: PtyId) -> Result<Attachment> {
         let session = self.get(id)?;
         let guard = session.fanout.lock().unwrap();
-        let backlog = guard.scrollback.snapshot();
+        let backlog = guard.scrollback.positioned_snapshot(usize::MAX);
         let live = guard.tx.subscribe();
         drop(guard);
         Ok(Attachment { backlog, live })
+    }
+
+    /// Whether the process output reader has observed EOF.
+    /// # Errors
+    /// Returns `NotFound` if the session was removed.
+    /// # Panics
+    /// Panics if the output lock is poisoned.
+    pub fn output_eof(&self, id: PtyId) -> Result<bool> {
+        Ok(self.get(id)?.fanout.lock().unwrap().eof)
+    }
+
+    /// Wait for the output reader to finish; callers decide their teardown deadline.
+    /// # Errors
+    /// Returns `NotFound` for a removed attempt.
+    /// # Panics
+    /// Panics if the output lock is poisoned.
+    pub async fn wait_output_eof(&self, id: PtyId) -> Result<()> {
+        let session = self.get(id)?;
+        let notify = session.fanout.lock().unwrap().eof_notify.clone();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !session.fanout.lock().unwrap().eof {
+            notified.await;
+        }
+        Ok(())
+    }
+
+    /// Atomically capture the output cursor and constant-sized framing state.
+    /// # Errors
+    /// Returns `NotFound` if the attempt no longer exists.
+    /// # Panics
+    /// Panics if the fanout lock was poisoned.
+    pub fn observation_cursor(
+        &self,
+        id: PtyId,
+    ) -> Result<(u64, intent_core::script_output::LineDecoder)> {
+        let session = self.get(id)?;
+        let guard = session.fanout.lock().unwrap();
+        Ok((guard.scrollback.end_offset(), guard.framing.window()))
     }
 
     /// Snapshot the PTY's current scrollback for replay (`terminal.getBuffer` /
@@ -499,6 +583,19 @@ impl PtyHost {
         let session = self.get(id)?;
         let guard = session.fanout.lock().unwrap();
         Ok(guard.scrollback.snapshot_tail(max_bytes))
+    }
+
+    /// Atomically capture retained output and its byte positions.
+    ///
+    /// # Errors
+    /// Returns `Error::NotFound` if no session exists for `id`.
+    ///
+    /// # Panics
+    /// Panics if the session fanout mutex is poisoned.
+    pub fn positioned_scrollback(&self, id: PtyId, max_bytes: usize) -> Result<OutputChunk> {
+        let session = self.get(id)?;
+        let guard = session.fanout.lock().unwrap();
+        Ok(guard.scrollback.positioned_snapshot(max_bytes))
     }
 
     /// Snapshot an oldest-indexed line window from retained scrollback. The
@@ -943,21 +1040,63 @@ fn exit_watch_loop(session: &PtySession) {
 
 /// Blocking reader loop (own thread): append each chunk to scrollback and
 /// broadcast it under one lock so attach sees a consistent history/live seam.
-fn read_loop(mut reader: Box<dyn Read + Send>, fanout: &Arc<Mutex<Fanout>>) {
+fn read_loop(
+    mut reader: Box<dyn Read + Send>,
+    fanout: &Arc<Mutex<Fanout>>,
+    #[cfg(windows)] writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+) {
     let mut buf = [0u8; READ_CHUNK];
+    #[cfg(windows)]
+    let mut handshake = conpty_startup::CursorHandshake::default();
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let chunk = Arc::new(buf[..n].to_vec());
-                let mut guard = fanout.lock().unwrap();
-                guard.scrollback.push(&chunk);
-                let _ = guard.tx.send(chunk);
+                #[cfg(windows)]
+                let output = match handshake.filter_with_reply(&buf[..n], |reply| {
+                    let mut writer = writer.lock().unwrap();
+                    writer.write_all(reply)?;
+                    writer.flush()
+                }) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to answer ConPTY startup cursor query");
+                        break;
+                    }
+                };
+                #[cfg(windows)]
+                let bytes = output.as_slice();
+                #[cfg(not(windows))]
+                let bytes = &buf[..n];
+                publish_output(fanout, bytes);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
+    #[cfg(windows)]
+    publish_output(fanout, &handshake.finish());
+    let mut fanout = fanout.lock().unwrap();
+    fanout.eof = true;
+    fanout.eof_notify.notify_waiters();
+}
+
+fn publish_output(fanout: &Arc<Mutex<Fanout>>, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let mut guard = fanout.lock().unwrap();
+    let start_offset = guard.scrollback.end_offset();
+    guard.scrollback.push(bytes);
+    for byte in bytes {
+        guard.framing.push(*byte);
+    }
+    let chunk = Arc::new(OutputChunk {
+        bytes: bytes.to_vec(),
+        start_offset,
+        end_offset: guard.scrollback.end_offset(),
+    });
+    let _ = guard.tx.send(chunk);
 }
 
 /// Terminate a session's whole process group (SIGTERM→grace→SIGKILL), then
@@ -1105,7 +1244,7 @@ mod tests {
 
     /// Drain a live receiver until `needle` is seen or the deadline passes.
     async fn collect_until(
-        rx: &mut broadcast::Receiver<Arc<Vec<u8>>>,
+        rx: &mut broadcast::Receiver<Arc<OutputChunk>>,
         needle: &[u8],
         timeout: Duration,
     ) -> Vec<u8> {
@@ -1128,7 +1267,7 @@ mod tests {
     /// deadline passes. Used when output arrives in an arbitrary order and no
     /// single chunk can serve as a completion sentinel.
     async fn collect_until_all(
-        rx: &mut broadcast::Receiver<Arc<Vec<u8>>>,
+        rx: &mut broadcast::Receiver<Arc<OutputChunk>>,
         needles: &[Vec<u8>],
         timeout: Duration,
     ) -> Vec<u8> {
@@ -1998,3 +2137,7 @@ mod tests {
         assert!(host.kill(id).await);
     }
 }
+
+#[cfg(test)]
+#[path = "replay_tests.rs"]
+mod replay_tests;

@@ -21,10 +21,11 @@ use futures_util::{SinkExt, StreamExt};
 use intent_core::{Result as CoreResult, WorkspaceApi};
 use intent_services::{EventBus, Services};
 use intent_sourcecontrol::{
-    AuthStatus, Branch, CheckRun, Comment, CommentAnchor, Issue, IssueQuery, MergeMethod,
-    MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
-    PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review,
-    ReviewComment, ReviewThread, ReviewVerdict, ScCapabilities, SourceControl, UserIdentity,
+    AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor, Issue, IssueQuery,
+    MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page, PageParams,
+    PrInvolvement, PrPatch, PrQuery, PrState, PullRequest, PullRequestFile, PullRequestFilesPage,
+    PullRequestReview, Repo, RepoRef, Result as ScResult, Review, ReviewComment, ReviewThread,
+    ReviewVerdict, ScCapabilities, SourceControl, UserIdentity,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -185,6 +186,18 @@ struct RecordingForge {
 
 #[async_trait]
 impl SourceControl for RecordingForge {
+    async fn list_org_prs(&self, org: &str, query: PrQuery) -> ScResult<Page<PullRequest>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["org-prs", org, query]));
+        let mut pr = sample_pr();
+        pr.url = format!("https://github.com/{org}/outside-home/pull/42");
+        Ok(Page {
+            items: vec![pr],
+            next_cursor: Some("2".into()),
+        })
+    }
     fn provider_id(&self) -> &'static str {
         "stub"
     }
@@ -298,8 +311,95 @@ impl SourceControl for RecordingForge {
             .push(json!(["create", repo, request]));
         Ok(sample_pr())
     }
-    async fn get_pr(&self, _: &RepoRef, _: u64) -> ScResult<PullRequest> {
-        unimplemented!()
+    async fn get_pr(&self, repo: &RepoRef, number: u64) -> ScResult<PullRequest> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["get-pr", repo.owner, repo.name, number]));
+        if number == 404 {
+            return Err(intent_sourcecontrol::Error::NotFound("PR missing".into()));
+        }
+        let mut pr = sample_pr();
+        if number == 43
+            && self
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call[0] == "get-pr" && call[3] == 43)
+                .count()
+                > 1
+        {
+            pr.head_sha = Some("new-head".into());
+        }
+        Ok(pr)
+    }
+    async fn pull_files(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        page: PageParams,
+    ) -> ScResult<PullRequestFilesPage> {
+        self.calls.lock().unwrap().push(json!([
+            "files",
+            repo.owner,
+            repo.name,
+            number,
+            page.limit,
+            page.cursor
+        ]));
+        Ok(PullRequestFilesPage {
+            items: vec![
+                PullRequestFile {
+                    filename: "src/new.rs".into(),
+                    previous_filename: Some("src/old.rs".into()),
+                    status: "renamed".into(),
+                    additions: 2,
+                    deletions: 1,
+                    changes: 3,
+                    patch: Some("@@ -1 +1,2 @@\n-old\n+new\n+line".into()),
+                    url: Some("https://github.com/o/r/blob/deadbeef/src/new.rs".into()),
+                },
+                PullRequestFile {
+                    filename: "image.png".into(),
+                    previous_filename: None,
+                    status: "added".into(),
+                    additions: 0,
+                    deletions: 0,
+                    changes: 0,
+                    patch: None,
+                    url: None,
+                },
+            ],
+            next_cursor: Some("2".into()),
+            truncated: false,
+        })
+    }
+    async fn pull_reviews(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        page: PageParams,
+    ) -> ScResult<Page<PullRequestReview>> {
+        self.calls.lock().unwrap().push(json!([
+            "reviews",
+            repo.owner,
+            repo.name,
+            number,
+            page.limit,
+            page.cursor
+        ]));
+        Ok(Page {
+            items: vec![PullRequestReview {
+                id: 7,
+                author: "reviewer".into(),
+                state: "DISMISSED".into(),
+                body: Some("Former review".into()),
+                submitted_at: Some("2026-09-29T00:00:00Z".into()),
+                url: Some("https://github.com/o/r/pull/42#pullrequestreview-7".into()),
+            }],
+            next_cursor: None,
+        })
     }
     async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> ScResult<Page<PullRequest>> {
         let items = if query.extra_repos.is_empty() {
@@ -432,8 +532,17 @@ impl SourceControl for RecordingForge {
         self.calls.lock().unwrap().push(json!(["unresolve", id]));
         Ok(false)
     }
-    async fn check_runs(&self, _: &RepoRef, _: &str) -> ScResult<Vec<CheckRun>> {
-        unimplemented!()
+    async fn check_runs(&self, repo: &RepoRef, git_ref: &str) -> ScResult<Vec<CheckRun>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!(["checks", repo.owner, repo.name, git_ref]));
+        Ok(vec![CheckRun {
+            name: "CI".into(),
+            state: CheckState::Pending,
+            url: None,
+            started_at: None,
+        }])
     }
     async fn create_issue(&self, _: &RepoRef, _: &str, _: Option<&str>) -> ScResult<Issue> {
         unimplemented!()
@@ -478,7 +587,7 @@ struct Fixture {
     port: u16,
     cfg: Arc<ClientConfig>,
     forge: Arc<RecordingForge>,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services carry the recording
@@ -516,7 +625,7 @@ async fn boot() -> Fixture {
         port,
         cfg,
         forge,
-        _dir: dir_guard,
+        dir: dir_guard,
     }
 }
 
@@ -567,6 +676,98 @@ fn wire_next_token(cursor: &str) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD_NO_PAD
         .encode(serde_json::to_vec(&json!({ "c": cursor })).unwrap())
+}
+
+#[intent_test_macros::daemon_test]
+async fn org_pulls_search_spans_repos_outside_home_and_preserves_cursor() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    let response = wss_rpc(
+        &mut ws,
+        1,
+        "github.pulls.search",
+        json!({
+            "org":"intent-hq", "query":"  fix login  ", "filter":"review-requested",
+            "state":"closed", "limit":25, "nextToken":wire_next_token("3")
+        }),
+    )
+    .await;
+    assert_eq!(response["pulls"][0]["owner"], "intent-hq");
+    assert_eq!(response["pulls"][0]["repo"], "outside-home");
+    assert_eq!(response["nextToken"], wire_next_token("2"));
+    let calls = fx.forge.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        1,
+        "no sidebar repository lookup or per-repo fan-out"
+    );
+    assert_eq!(calls[0][0], "org-prs");
+    assert_eq!(calls[0][1], "intent-hq");
+    assert_eq!(calls[0][2]["search"], "fix login");
+    assert_eq!(calls[0][2]["cursor"], "3");
+    assert_eq!(calls[0][2]["limit"], 25);
+    assert_eq!(calls[0][2]["state"], "closed");
+    assert_eq!(calls[0][2]["involvement"], "review-requested");
+    let blank = wss_rpc(
+        &mut ws,
+        2,
+        "github.pulls.search",
+        json!({"org":"intent-hq", "query":"  "}),
+    )
+    .await;
+    assert_eq!(blank["pulls"][0]["repo"], "outside-home");
+    assert!(
+        fx.forge.pr_queries.lock().unwrap().is_empty(),
+        "org listing never degrades to one repo"
+    );
+    let personal = wss_rpc(
+        &mut ws,
+        3,
+        "github.pulls.search",
+        json!({"org":"Wattenberger", "filter":"created"}),
+    )
+    .await;
+    assert_eq!(personal["pulls"][0]["owner"], "Wattenberger");
+    assert_eq!(personal["pulls"][0]["repo"], "outside-home");
+    let artifact = fx.dir.path().join("org-pulls-search-wire.json");
+    std::fs::write(
+        &artifact,
+        serde_json::to_vec_pretty(&json!({"filtered":response,"blank":blank,"personal":personal,"engineCalls":fx.forge.calls.lock().unwrap().clone()}))
+            .unwrap(),
+    )
+    .unwrap();
+    println!("org PR search wire artifact: {}", artifact.display());
+}
+
+#[intent_test_macros::daemon_test]
+async fn org_pulls_search_rejects_invalid_or_mixed_scopes_before_forge() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for (index, params) in [
+        json!({"org":""}),
+        json!({"org":"intent-hq OR org:elsewhere"}),
+        json!({"org":true}),
+        json!({"org":null}),
+        json!({"org":"x".repeat(40)}),
+        json!({"org":"with/slash"}),
+        json!({"org":"intent-hq","owner":"intent-hq","repo":"intent"}),
+        json!({"org":"intent-hq","repos":[]}),
+        json!({"org":"intent-hq","repo":null}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = wss_rpc_envelope(
+            &mut ws,
+            i64::try_from(index).unwrap(),
+            "github.pulls.search",
+            params,
+        )
+        .await;
+        assert_eq!(result["error"]["code"], -32602, "{result}");
+    }
+    assert!(fx.forge.calls.lock().unwrap().is_empty());
+    assert!(fx.forge.pr_queries.lock().unwrap().is_empty());
 }
 
 /// `github.pulls.search` with a free-text `query`: the trimmed text reaches
@@ -1397,4 +1598,91 @@ async fn integration_context_github_provider_and_write_errors_are_unchanged() {
         );
     }
     assert!(fx.forge.calls.lock().unwrap().is_empty());
+}
+
+// Failure modes: wrong repository/PR/head addressing; lost pagination; fabricated
+// binary patches; dismissed review coerced to approval; missing required params;
+// provider errors hidden as success; workspace context changing explicit addressing.
+#[intent_test_macros::daemon_test]
+async fn home_pull_details_wire_contract() {
+    for context in [None, Some("workspace-route")] {
+        let fx = boot().await;
+        let mut ws = connect(fx.port, fx.cfg.clone()).await;
+        let params =
+            json!({"owner":"o","repo":"r","number":42,"limit":2,"nextToken":wire_next_token("3")});
+        let checks =
+            context_envelope(context, &mut ws, 1, "github.pulls.checks", params.clone()).await;
+        assert_eq!(
+            checks,
+            json!({"jsonrpc":"2.0","id":1,"result":{"headSha":"deadbeef","checks":[{"name":"CI","state":"pending","url":null}]}})
+        );
+        let reviews =
+            context_envelope(context, &mut ws, 2, "github.pulls.reviews", params.clone()).await;
+        assert_eq!(
+            reviews,
+            json!({"jsonrpc":"2.0","id":2,"result":{"reviews":[{"id":7,"author":"reviewer","state":"DISMISSED","body":"Former review","submittedAt":"2026-09-29T00:00:00Z","url":"https://github.com/o/r/pull/42#pullrequestreview-7"}],"nextToken":null}})
+        );
+        let files = context_envelope(context, &mut ws, 3, "github.pulls.files", params).await;
+        assert_eq!(
+            files,
+            json!({"jsonrpc":"2.0","id":3,"result":{"headSha":"deadbeef","truncated":false,"files":[{"filename":"src/new.rs","previousFilename":"src/old.rs","status":"renamed","additions":2,"deletions":1,"changes":3,"patch":"@@ -1 +1,2 @@\n-old\n+new\n+line","url":"https://github.com/o/r/blob/deadbeef/src/new.rs"},{"filename":"image.png","previousFilename":null,"status":"added","additions":0,"deletions":0,"changes":0,"patch":null,"url":null}],"nextToken":wire_next_token("2")}})
+        );
+        assert_eq!(
+            *fx.forge.calls.lock().unwrap(),
+            vec![
+                json!(["get-pr", "o", "r", 42]),
+                json!(["checks", "o", "r", "deadbeef"]),
+                json!(["reviews", "o", "r", 42, 2, "3"]),
+                json!(["get-pr", "o", "r", 42]),
+                json!(["files", "o", "r", 42, 2, "3"]),
+                json!(["get-pr", "o", "r", 42])
+            ]
+        );
+        let conflict = context_envelope(
+            context,
+            &mut ws,
+            8,
+            "github.pulls.files",
+            json!({"owner":"o","repo":"r","number":42,"expectedHeadSha":"old-head"}),
+        )
+        .await;
+        assert_eq!(conflict["error"]["code"], -32005, "{conflict}");
+        assert!(conflict.get("result").is_none());
+        let moved = context_envelope(
+            context,
+            &mut ws,
+            9,
+            "github.pulls.files",
+            json!({"owner":"o","repo":"r","number":43}),
+        )
+        .await;
+        assert_eq!(moved["error"]["code"], -32005, "{moved}");
+        assert!(moved.get("result").is_none());
+
+        for (id, method) in [
+            (4, "github.pulls.checks"),
+            (5, "github.pulls.reviews"),
+            (6, "github.pulls.files"),
+        ] {
+            let response = context_envelope(
+                context,
+                &mut ws,
+                id,
+                method,
+                json!({"owner":"o","repo":"r"}),
+            )
+            .await;
+            assert_eq!(response["error"]["code"], -32602);
+        }
+        let error = context_envelope(
+            context,
+            &mut ws,
+            7,
+            "github.pulls.checks",
+            json!({"owner":"o","repo":"r","number":404}),
+        )
+        .await;
+        assert!(error.get("error").is_some(), "{error}");
+        assert!(error.get("result").is_none());
+    }
 }

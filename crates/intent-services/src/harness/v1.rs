@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
 use intent_core::TaskStatus;
+use intent_sourcecontrol::PrAncestry;
 
 use super::{ChildSettlementParams, Doctrine, Harness, HarnessEntry, TurnEnvelopeParams};
 use crate::agent_ops::ready_delta::{UnblockedReason, UnblockedTask};
@@ -1019,9 +1020,25 @@ impl Harness for V1 {
         if r.has_conflicts {
             lines.push("merge conflicts present".to_string());
         }
-        if r.is_behind {
-            lines.push("branch is behind its base".to_string());
-        }
+        lines.push(match &r.ancestry {
+            PrAncestry::Unknown => "branch ancestry: unknown".to_string(),
+            PrAncestry::Known { behind_by, .. } => {
+                let suffix = if *behind_by == 1 { "" } else { "s" };
+                let mut line = format!("branch ancestry: {behind_by} commit{suffix} behind base");
+                if *behind_by > 0 && crate::pr_monitor::requirements_ready(r) {
+                    line.push_str(" (behind but mergeable)");
+                }
+                line
+            }
+        });
+        lines.push(
+            match r.branch_update_required {
+                Some(true) => "forge requires a branch update before merging",
+                Some(false) => "forge branch-update requirement: not required",
+                None => "forge branch-update requirement: unknown",
+            }
+            .to_string(),
+        );
         if r.is_in_merge_queue == Some(true) {
             lines.push("in merge queue".to_string());
         }
@@ -1156,7 +1173,7 @@ impl Harness for V1 {
         // Mergeability + residual signals. `unknown` is a transient GitHub
         // state ("still recomputing", e.g. while a merge-queue group is
         // processed), never an actionable signal — and the recomputation
-        // also resets the derived conflict/behind/blocked signals, so while
+        // also resets the derived conflict/blocked signals, so while
         // the NEW snapshot's mergeability is unknown their clearing
         // direction is suppressed alongside the raw `mergeable`/`merge
         // state` transitions (the appearing direction always reports). A
@@ -1175,12 +1192,24 @@ impl Harness for V1 {
                 "merge conflicts resolved".to_string()
             });
         }
-        if o.is_behind != n.is_behind && (n.is_behind || !recomputing) {
-            changes.push(if n.is_behind {
-                "branch is now behind its base".to_string()
-            } else {
-                "branch is no longer behind its base".to_string()
-            });
+        // Ancestry is visible in the checklist, but neither distance nor
+        // availability changes warrant a wake or reset the debounce window.
+        // Only a known true→false forge verdict clears this requirement.
+        // In particular, an old persisted baseline has None, not false.
+        let update_change = match (o.branch_update_required, n.branch_update_required) {
+            (Some(false), Some(true)) => Some("forge now requires a branch update before merging"),
+            (Some(true), Some(false)) => {
+                Some("forge no longer requires a branch update before merging")
+            }
+            (None, Some(true)) => {
+                Some("forge branch-update requirement available: required before merging")
+            }
+            (None, Some(false)) => Some("forge branch-update requirement available: not required"),
+            (Some(_), None) => Some("forge branch-update requirement unknown"),
+            _ => None,
+        };
+        if let Some(line) = update_change {
+            changes.push(line.to_string());
         }
         if o.is_in_merge_queue != n.is_in_merge_queue {
             changes.push(if n.is_in_merge_queue == Some(true) {

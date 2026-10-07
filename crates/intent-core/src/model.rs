@@ -154,7 +154,7 @@ pub enum ContextLinkKind {
     Pr,
 }
 
-/// A GitHub issue/PR context link persisted on a [`Workspace`] as
+/// A repository issue/PR context link persisted on a [`Workspace`] as
 /// `contextLinks` (§5.1). Supplied by clients on `workspace.create` from the
 /// initializer's issue/PR context mentions and returned on the `Workspace`
 /// wire shape so any client opening the workspace can seed its layout from
@@ -261,6 +261,11 @@ pub struct Workspace {
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
+    /// Persisted high-water mark of recorded user/assistant message timestamps
+    /// and note update timestamps. Excludes metadata/usage maintenance. Historical
+    /// backfill uses retained content only; absent when no valid content exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_content_activity: Option<String>,
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -755,6 +760,7 @@ pub fn chief_workspace() -> Workspace {
         created_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
         updated_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
         last_activity: Some(CHIEF_WORKSPACE_TIMESTAMP.to_string()),
+        last_content_activity: None,
         tags: Vec::new(),
         path: None,
         repository_path: None,
@@ -1300,6 +1306,9 @@ pub struct WorkspaceDiffSummary {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceCreate {
+    /// Original native pre-workspace checkout selection. Mutually exclusive
+    /// with caller-supplied repository/clone/worktree paths and legacy URLs.
+    pub repository_checkout: Option<crate::repository_checkout::CheckoutSelection>,
     pub title: Option<String>,
     pub status_message: Option<String>,
     pub branch: Option<String>,
@@ -1365,6 +1374,10 @@ pub struct WorkspaceCreate {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceCreateInitialAgent {
+    /// Opt in to remembering a successful manual initial-agent selection.
+    pub remember_specialist: Option<bool>,
+    /// False marks a client-supplied name as a generated placeholder.
+    pub name_explicitly_set: Option<bool>,
     pub prompt: Option<String>,
     pub name: Option<String>,
     /// Bare model id (no `provider:` prefix — compound ids are rejected
@@ -3639,11 +3652,17 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// (`agent.create` and everything funneling through it — delegate,
 /// wakeOrCreate) stamps exactly this value, and a new session ALWAYS gets the
 /// current version — the stamp depends only on creation time, never on the
-/// creating parent's pinned version. Bump when doctrine text or feature
-/// defaults change materially; existing sessions keep their stamped version
+/// creating parent's pinned version. Bump when versioned guidance behavior,
+/// doctrine text or feature defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "2.10";
+pub const CURRENT_HARNESS_VERSION: &str = "3.1";
+
+/// Explicit admission preserves repository guidance without admitting unknown versions.
+#[must_use]
+pub fn harness_supports_repository_guidance(version: &str) -> bool {
+    matches!(version, "3.0" | "3.1")
+}
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
 /// exported before harness versioning existed deserialize as "1.0", matching
@@ -3766,7 +3785,8 @@ pub fn chief_prompt_version(metadata: &serde_json::Value) -> Option<u32> {
 /// an answer-tagged row, `agent.dismissQuestions`, or a newer question turn,
 /// never by delivery order. `Automatic` is the `Default` so unmarked internal
 /// paths fail closed (never mistaken for a user action).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MessageOrigin {
     /// FE-originated user action: `agent.sendMessage` (typed message or
     /// wizard answers), a drained `agent.queueMessage` entry,
@@ -4353,6 +4373,8 @@ pub struct AgentLite {
     /// the service projection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting_on_pr_monitors: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_on_script_monitors: Vec<serde_json::Value>,
     /// Turn-liveness (STAB-125): `turnInFlight` is `true` while a
     /// `session/prompt` turn's live-turn slot is open for this agent, and
     /// `lastStreamActivityAt` is the RFC-3339 timestamp of the most recent
@@ -4545,6 +4567,7 @@ impl AgentLite {
             waiting_for_agent_ids: Vec::new(),
             waiting_on_hooks: Vec::new(),
             waiting_on_pr_monitors: Vec::new(),
+            waiting_on_script_monitors: Vec::new(),
             turn_in_flight: false,
             last_stream_activity_at: None,
             context_usage: None,
@@ -4736,6 +4759,8 @@ impl AgentLite {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentCreateExtra {
+    /// Opt in to remembering this successful manual creation’s specialist.
+    pub remember_specialist: bool,
     pub provider: Option<String>,
     /// Reasoning-effort level persisted on the created session (PROTOCOL
     /// §5.5, Option B). Stored as-is when a non-empty string; empty /
@@ -5061,16 +5086,6 @@ pub struct GitPullResult {
     pub error: Option<String>,
 }
 
-/// `git.commit` service result (the `ok` flag is added by the transport). Mirrors
-/// the TS `ws.git.commit` payload `{ hash?, files? }`; on success both are
-/// present (`hash` is the new commit SHA, `files` the files it changed).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GitCommitResult {
-    pub hash: String,
-    pub files: Vec<String>,
-}
-
 /// `git.agentCommit` service result (the `ok` flag is added by the transport).
 /// Mirrors the TS `ws.git.agentCommit` payload `{ hash, files, fileCount }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5107,6 +5122,51 @@ pub enum ScriptMode {
     Command,
 }
 
+/// Explicit retention choice; legacy definitions remain saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScriptPurpose {
+    #[default]
+    Saved,
+    OneOff,
+}
+
+/// Archive selection. Omitted wire filters preserve legacy lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptArchiveFilter {
+    Active,
+    Archived,
+    #[default]
+    All,
+}
+
+/// Latest settled command outcome, independent of transient runtime state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptRunOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+/// Compact durable result; full PTY output remains transient.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptLastRun {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub outcome: ScriptRunOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    pub stopped_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Runtime status of a script process (ported from the TS `ScriptStatus`,
 /// plus `restarting` — new in intentd, monorepo#1318 — and `starting` —
 /// intent-hq/intent#4858). `restarting` covers the restart-in-flight window
@@ -5134,6 +5194,8 @@ pub enum ScriptStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScriptRuntimeState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub status: ScriptStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
@@ -5161,6 +5223,7 @@ impl Default for ScriptRuntimeState {
     fn default() -> Self {
         Self {
             status: ScriptStatus::Idle,
+            run_id: None,
             pid: None,
             exit_code: None,
             started_at: None,
@@ -5178,6 +5241,12 @@ impl Default for ScriptRuntimeState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Script {
+    #[serde(default)]
+    pub purpose: ScriptPurpose,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<ScriptLastRun>,
     pub id: String,
     pub workspace_id: String,
     pub name: String,
@@ -5201,6 +5270,7 @@ pub struct Script {
 /// request params. `workspaceId` is passed separately.
 #[derive(Debug, Clone, Default)]
 pub struct ScriptCreateParams {
+    pub purpose: Option<ScriptPurpose>,
     pub name: String,
     pub command: String,
     pub mode: ScriptMode,
@@ -7213,6 +7283,7 @@ mod tests {
             created_at: ts.clone(),
             updated_at: ts.clone(),
             last_activity: None,
+            last_content_activity: None,
             tags: vec![],
             path: None,
             repository_path: None,
@@ -8455,6 +8526,41 @@ mod tests {
             assert!(v["metadata"].get(CHIEF_PROMPT_VERSION_KEY).is_none());
         }
         assert!(legacy["metadata"].get(CHIEF_PROMPT_VERSION_KEY).is_none());
+    }
+
+    #[test]
+    fn harness_stamps_preserve_missing_and_saved_versions() {
+        for stamp in [
+            None,
+            Some("1.0"),
+            Some("2.9"),
+            Some("future-unknown"),
+            Some("3.0"),
+        ] {
+            let mut payload = json!({
+                "id":"agent-legacy", "workspaceId":"ws-legacy", "name":"Saved",
+                "status":"idle", "createdAt":"t0", "updatedAt":"t0",
+                "harnessFeatures":{"peerAgents":false}
+            });
+            if let Some(stamp) = stamp {
+                payload["harnessVersion"] = json!(stamp);
+            }
+            let session: AgentSession = serde_json::from_value(payload).unwrap();
+            let expected = stamp.unwrap_or("1.0");
+            assert_eq!(session.harness_version, expected);
+            assert_eq!(session.harness_features, Some(json!({"peerAgents":false})));
+            let round_trip: AgentSession =
+                serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+            assert_eq!(round_trip, session);
+            let lite = AgentLite::from_session(session, 0, None, None, None, None, None);
+            let mut payload = serde_json::to_value(lite).unwrap();
+            if stamp.is_none() {
+                payload.as_object_mut().unwrap().remove("harnessVersion");
+            }
+            let lite: AgentLite = serde_json::from_value(payload).unwrap();
+            assert_eq!(lite.harness_version, expected);
+            assert_eq!(lite.harness_features, Some(json!({"peerAgents":false})));
+        }
     }
 
     /// `AgentSession` serializes to the camelCase `agent-session.ts` wire shape:

@@ -120,7 +120,7 @@ async fn launch_daemon_with(
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir workspaces dir");
     let behavior = json!({ "blockUntilCancel": true, "response": "parked" }).to_string();
-    let mut command = common::serve_command();
+    let mut command = common::hermetic_serve_command(data_dir);
     command
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
@@ -137,6 +137,7 @@ async fn launch_daemon_with(
     for (k, v) in extra_env {
         command.env(k, v);
     }
+    common::hermetic_fixture_identity(&mut command, data_dir);
     let child = GuardedChild::spawn(&mut command).expect("spawn intentd serve");
     let mut daemon = Daemon { child, log_path };
     let socket = data_dir.join("intentd.sock");
@@ -296,7 +297,7 @@ async fn launch_held_teardown(
     common::enable_ws_api(data_dir);
     let tailcat_s = tailcat.to_string_lossy().to_string();
     let release_s = genkey.barrier().path().to_string_lossy().to_string();
-    // `common::serve_command` binds an OS-assigned port, overriding the fixed
+    // `common::hermetic_serve_command` binds an OS-assigned port, overriding the fixed
     // port `enable_ws_api` reserved and released, so a concurrent test cannot
     // claim it first. Nothing here needs the actual port number.
     let env: [(&str, &str); 3] = [
@@ -471,6 +472,7 @@ async fn seed_workspace(data_dir: &Path) -> String {
         created_at: timestamp.clone(),
         updated_at: timestamp,
         last_activity: None,
+        last_content_activity: None,
         tags: vec![],
         path: None,
         repository_path: None,

@@ -9,6 +9,8 @@
 #![allow(dead_code)]
 
 #[cfg(unix)]
+pub mod claude_npx;
+#[cfg(unix)]
 pub mod codex_npx;
 
 use std::fmt::Write as _;
@@ -17,6 +19,46 @@ use std::process::Child;
 use std::sync::{Arc, Mutex, Once};
 use std::thread::ThreadId;
 use std::time::Duration;
+
+/// The four repository retirement feeds share the response connection. Their
+/// typed, nonsecret envelopes are notifications, never an RPC acknowledgment.
+pub fn is_repository_retirement_notification(value: &serde_json::Value) -> bool {
+    let Some(frame) = value.as_object() else {
+        return false;
+    };
+    if frame.len() != 3 || value["jsonrpc"] != "2.0" {
+        return false;
+    }
+    let ids = match value["method"].as_str() {
+        Some("workspace.repositoryContext.retired") => "lifetimeIds",
+        Some("workspace.repositorySelection.retired") => "selectionIds",
+        Some("accept-changes.retired") => "operationIds",
+        Some("sourceControl.read.retired") => "readLifetimeIds",
+        _ => return false,
+    };
+    let Some(params) = value["params"].as_object() else {
+        return false;
+    };
+    params.len() == 4
+        && params
+            .get(ids)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|ids| ids.iter().all(serde_json::Value::is_string))
+        && params
+            .get("sequence")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|sequence| {
+                sequence
+                    .parse::<u64>()
+                    .is_ok_and(|n| n.to_string() == sequence)
+            })
+        && params
+            .get("allRetired")
+            .is_some_and(serde_json::Value::is_boolean)
+        && params
+            .get("terminal")
+            .is_some_and(serde_json::Value::is_boolean)
+}
 
 /// Force the hermetic-root guard on for every integration-test binary that
 /// compiles this module. Runs before `main()` — and therefore before any test
@@ -558,61 +600,119 @@ async fn await_wss_stopped_impl(socket: &Path, log_path: Option<&Path>) {
     }
 }
 
-/// The one way an e2e suite spawns `intentd serve`: the `intentd` test binary
-/// with the `serve` subcommand and the `INTENTD_TCP_PORT=0` ephemeral-port
-/// seam (monorepo#1051) already set, so a daemon whose WSS listener is enabled
-/// ([`enable_ws_api`]) binds a true OS-assigned port instead of racing another
-/// process for the seeded one. Callers add everything else themselves (data
-/// dir, workspaces dir, token, stdio, `process_group`, mock-agent env): the
-/// builder stays thin so migration is mechanical. The seam is inert for a
-/// UDS-only daemon (no WSS listener, no bind). A later `.env("INTENTD_TCP_PORT",
-/// …)` on the returned `Command` overrides the seam, so a deliberate pin (e.g.
-/// an out-of-range value to prove startup refusal) still works.
-///
-/// `serve_spawn_lint.rs` is a bounded textual backstop for this: it fails
-/// the suite on a single-statement `Command::new(env!("CARGO_BIN_EXE_intentd"))
-/// … "serve"` outside this module (30-line cap), and on a file whose code calls
-/// [`enable_ws_api`] without a builder call in code. A split-statement raw
-/// spawn in a file that also calls a builder is not detected.
-pub fn serve_command() -> std::process::Command {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve").env("INTENTD_TCP_PORT", "0");
+/// Build a daemon fixture with complete GitHub identity isolation and an
+/// OS-assigned WSS port. The caller owns `data_dir` through child shutdown.
+/// Workspaces, stdio, authentication, and mock-provider settings remain caller-owned.
+/// Later explicit TCP port overrides retain their usual meaning.
+pub fn hermetic_serve_command(data_dir: &Path) -> std::process::Command {
+    let mut cmd = hermetic_serve_command_fixed_port(data_dir);
+    cmd.env("INTENTD_TCP_PORT", "0");
     cmd
 }
 
-/// [`serve_command`] WITHOUT the `INTENTD_TCP_PORT=0` seam: the WSS listener
-/// binds the `server.wsApi.port` seeded by [`enable_ws_api`] (or set later via
-/// `settings.update`), accepting the reserve-then-release TOCTOU window on
-/// that port. Only for suites that need the settings-file port to be the
-/// bound port — a listener restart that must rebind the same port, or a
-/// settings batch whose explicit port is exactly what the test proves.
-pub fn serve_command_fixed_port() -> std::process::Command {
+/// Complete fixture constructor for tests that must bind the settings-file port.
+/// Sets no TCP-port env override, preserving explicit pins and listener restarts.
+pub fn hermetic_serve_command_fixed_port(data_dir: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve");
+    cmd.arg("serve").env("INTENTD_DATA_DIR", data_dir);
+    hermetic_fixture_identity(&mut cmd, data_dir);
     cmd
 }
 
-/// Cut a spawned daemon off from the HOST's GitHub identity so its boot-time
-/// primary-identity refresh resolves no token and hydrates no `login` /
-/// `displayName` / `avatarUrl` onto the primary principal (intent-hq/intent#5645).
-/// The daemon's token resolution falls back from the secrets store to
-/// `GITHUB_TOKEN` / `GH_TOKEN` and then to `gh auth token`, so a test that
-/// asserts anonymous author shapes is otherwise a race against the developer's
-/// own `gh auth login` — green on CI and on a logged-out machine, red on a
-/// logged-in one. Removes both env tokens and points `GH_CONFIG_DIR` at an
-/// empty directory under `data_dir` (no `hosts.yml` → `gh auth token` fails
-/// without consulting the keyring). This covers only the env and `gh` rungs:
-/// the caller must ALSO isolate the secrets store (`INTENTD_SECRETS_FILE`
-/// under the test dir, as every spawn helper here already does) or a stored
-/// device-flow token on the host still wins. Callers that seed their own
-/// token / secrets file / API-base mock still layer those on top via later
-/// `.env(..)`.
-pub fn hermetic_github_identity(cmd: &mut std::process::Command, data_dir: &Path) {
+/// Remove standard/enterprise GitHub tokens and `GH_HOST`, and select private
+/// config/secrets paths, including after caller env overrides.
+/// Reuse an existing `gh-config` only when it is a real, empty directory;
+/// reject populated directories and symlinks without deleting fixture state.
+/// The private secrets file may contain deliberately seeded state and is never
+/// truncated (restarts must retain it); symlinks and non-files are rejected.
+/// Intentional identity tests can layer private mock configuration afterwards.
+pub fn hermetic_fixture_identity(cmd: &mut std::process::Command, data_dir: &Path) {
     let gh_config_dir = data_dir.join("gh-config");
-    std::fs::create_dir_all(&gh_config_dir).expect("mkdir empty gh config dir");
+    match std::fs::create_dir(&gh_config_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => panic!(
+            "create private gh config {}: {error}",
+            gh_config_dir.display()
+        ),
+    }
+    assert!(
+        std::fs::symlink_metadata(&gh_config_dir)
+            .expect("inspect private gh config")
+            .file_type()
+            .is_dir(),
+        "private gh config must be a real directory: {}",
+        gh_config_dir.display()
+    );
+    assert!(
+        std::fs::read_dir(&gh_config_dir)
+            .expect("read private gh config")
+            .next()
+            .is_none(),
+        "private gh config must be empty: {}",
+        gh_config_dir.display()
+    );
+    let secrets = data_dir.join("secrets.json");
+    match std::fs::symlink_metadata(&secrets) {
+        Ok(metadata) => assert!(
+            metadata.file_type().is_file(),
+            "private secrets must be a regular file: {}",
+            secrets.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("inspect private secrets {}: {error}", secrets.display()),
+    }
     cmd.env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
-        .env("GH_CONFIG_DIR", &gh_config_dir);
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GITHUB_ENTERPRISE_TOKEN")
+        .env_remove("GH_HOST")
+        .env("GH_CONFIG_DIR", gh_config_dir)
+        .env("INTENTD_SECRETS_FILE", secrets);
+}
+
+/// Deliberate mock-token exception. Call only with a test-owned synthetic token
+/// and a loopback API mock; a statement-local fixture-identity marker names the
+/// scenario. Restore private paths first so generic overrides cannot leak in.
+pub fn mock_github_token(cmd: &mut std::process::Command, data_dir: &Path, token: &str) {
+    hermetic_fixture_identity(cmd, data_dir);
+    let endpoint = |key: &str| {
+        cmd.get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v)
+            .and_then(|v| v.to_str())
+            .map(str::to_owned)
+    };
+    let api = endpoint("INTENTD_GITHUB_API_BASE_URI").expect("mock GitHub API required");
+    let login = endpoint("INTENTD_GITHUB_LOGIN_BASE_URI")
+        .unwrap_or_else(|| "http://127.0.0.1:0".to_owned());
+    for value in [&api, &login] {
+        let address = value.strip_prefix("http://").and_then(|v| {
+            v.trim_end_matches('/')
+                .parse::<std::net::SocketAddrV4>()
+                .ok()
+        });
+        assert!(
+            address.is_some_and(|a| *a.ip() == std::net::Ipv4Addr::LOCALHOST),
+            "mock GitHub endpoint must be explicit IPv4 loopback HTTP"
+        );
+    }
+    cmd.env("INTENTD_GITHUB_LOGIN_BASE_URI", login)
+        .env("GITHUB_TOKEN", token);
+}
+
+/// The PTY driver execs the daemon through bash. Copy the supported constructor's
+/// complete environment, including explicit removals, into its wrapper command.
+/// `portable_pty` snapshots the environment at construction; `env_remove` deletes
+/// inherited entries from that snapshot as well as explicit overrides.
+pub fn hermetic_pty_fixture_identity(cmd: &mut portable_pty::CommandBuilder, data_dir: &Path) {
+    let isolated = hermetic_serve_command(data_dir);
+    for (key, value) in isolated.get_envs() {
+        match value {
+            Some(value) => cmd.env(key, value),
+            None => cmd.env_remove(key),
+        }
+    }
 }
 
 /// Enable the WSS/TCP listener for a daemon booted from `data_dir` by seeding
@@ -621,12 +721,12 @@ pub fn hermetic_github_identity(cmd: &mut std::process::Command, data_dir: &Path
 /// flag: UDS always serves; the WSS listener boot-starts iff the effective
 /// `server.wsApi.enabled` is true, binding `server.wsApi.port`).
 ///
-/// Port interplay: daemons spawned via [`serve_command`] carry the
+/// Port interplay: daemons spawned via [`hermetic_serve_command`] carry the
 /// `INTENTD_TCP_PORT=0` seam, which wins over the seeded settings port, so
 /// they get a true OS-assigned ephemeral bind and never race another process
 /// for the port this helper reserved and released before the daemon booted
 /// (monorepo#1051). The seeded port is bound only by
-/// [`serve_command_fixed_port`] spawns, keeping them off the fixed 5181
+/// [`hermetic_serve_command_fixed_port`] spawns, keeping them off the fixed 5181
 /// default that would collide across parallel daemons. Either way, read the
 /// real port from `system.status` ([`await_wss_status`]), never from the
 /// seeded config value — with the seam, the ephemeral port changes across

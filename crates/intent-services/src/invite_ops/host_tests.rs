@@ -3,6 +3,8 @@ use super::*;
 use crate::tests::TempDb;
 use intent_core::with_caller;
 
+mod presence_notifications;
+
 async fn create(f: &super::tests::Fixture, login: &str) -> Value {
     with_caller(
         Caller::Daemon,
@@ -43,7 +45,7 @@ async fn host_invitation_owner_administration_and_scope_privacy() {
         .unwrap();
     assert_eq!(
         preview,
-        json!({"scope":"host","role":"member","pinIdentity":PrincipalIdentity::github(4242)})
+        json!({"scope":"host","role":"member","pinIdentity":PrincipalIdentity::github(4242),"collaborationName":null})
     );
     assert_eq!(
         invite_kind(
