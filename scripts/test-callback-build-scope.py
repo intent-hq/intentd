@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline regression controls for callback compilation scope selection."""
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -28,6 +29,34 @@ class ScopeTests(unittest.TestCase):
         result = self.select(plans)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), expected)
+
+    def test_ci_callback_inventory_names_existing_source_tests(self):
+        root = SCRIPT.parent.parent
+        workflow = (root / ".github/workflows/ci.yml").read_text()
+        blocks = re.findall(r"^      CALLBACK_FIXTURE_TESTS: \|\n((?:        \S[^\n]*\n)+)",
+                            workflow, re.M)
+        self.assertEqual(len(blocks), 1)
+        names = blocks[0].split()
+        self.assertEqual(len(names), 6)
+        self.assertEqual(len(set(names)), 6)
+        owners = {
+            "callback_registration::tests":
+                "crates/intent-acp/src/callback_registration/tests.rs",
+            "agent_manager::repository_origin::callback_delivery::tests::live_context":
+                "crates/intent-services/src/agent_manager/repository_origin/callback_delivery/tests.rs",
+        }
+        # A fast source-name drift check. CI's compiled nextest inventory remains
+        # authoritative for full module paths, cfg selection and execution.
+        for name in names:
+            with self.subTest(name=name):
+                module, function = name.rsplit("::", 1)
+                self.assertIn(module, owners)
+                source = (root / owners[module]).read_text()
+                self.assertIsNotNone(
+                    re.search(r"(?m)^\s*(?:async )?fn " + re.escape(function) +
+                              r"\s*\(", source),
+                    f"CI callback test is absent from {owners[module]}: {name}",
+                )
 
     def test_shared_graph_keeps_all_original_packages_and_targets(self):
         self.assert_scope([SHARED], SHARED + ["-p", "intent-acp"])

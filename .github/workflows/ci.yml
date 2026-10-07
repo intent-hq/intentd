@@ -1399,7 +1399,7 @@ jobs:
       CALLBACK_FIXTURE_TESTS: |
         callback_registration::tests::actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_old_result
         callback_registration::tests::actual_adapter_replacement_rejects_old_query_and_disabled_never_registers
-        agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_actual_created_3_0_reaches_original_guidance_boundary
+        agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_actual_created_3_1_reaches_original_guidance_boundary
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_saved_legacy_and_disabled_outbound_messages_remain_ordinary
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_load_and_failed_load_new_keep_original_producers_and_capture
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_successful_zero_pending_absent_and_failed_never_conflate
