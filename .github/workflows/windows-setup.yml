@@ -1,0 +1,66 @@
+name: Windows setup regression
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/windows-setup.yml
+      - .github/workflows/ci.yml
+      - crates/intent-pty/**
+      - crates/intent-services/src/lib.rs
+      - crates/intent-services/src/setup_runner/**
+      - crates/intentd/tests/e2e_wss_setup_headless.rs
+      - crates/intentd/tests/common/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  headless-setup:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: gh-windows-16x
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      INTENTD_ASSERT_BOUND_CALLER: "1"
+      INTENTD_SETUP_EVIDENCE_DIR: ${{ github.workspace }}/setup-headless-evidence
+    steps:
+      - uses: actions/checkout@v7
+      - name: Put Git Bash first on PATH
+        shell: cmd
+        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gh-build-x86_64-pc-windows-msvc
+      - name: Test cursor parser
+        run: cargo test --locked -p intent-pty --lib --target x86_64-pc-windows-msvc conpty_startup::tests -- --nocapture
+      - name: Test setup without terminal input
+        run: |
+          mkdir -p setup-headless-evidence
+          cargo test --locked -p intentd --test e2e_wss_setup_headless --target x86_64-pc-windows-msvc setup_finishes_without_terminal_client_input -- --exact --nocapture 2>&1 | tee setup-headless-evidence/runtime.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: setup-headless-pr-windows
+          path: setup-headless-evidence
+          if-no-files-found: error
