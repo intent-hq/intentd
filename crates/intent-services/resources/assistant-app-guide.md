@@ -70,7 +70,9 @@ Open Settings and use these sidebar labels (English labels shown):
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
-For MCP configuration, open **Connections → MCP servers**; its reference route is `/settings?tab=connections#mcp-servers`.
+<!-- Source: packages/intentd/crates/intent-services/src/mcp_servers.rs. -->
+
+For MCP configuration, open **Connections → MCP servers**; its reference route is `/settings?tab=connections#mcp-servers`. When MCP is enabled, saving edits to an enabled server reconnects the daemon using the saved settings, including a changed URL. Disabled servers stay disabled; an unreachable URL shows a connection error.
 
 ## Choose a model or change agent behavior
 
