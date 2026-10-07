@@ -69,7 +69,11 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
     async stopClients() {
       const results = await Promise.allSettled(clients.map(client => client.stop()));
       const failures = results.filter(result => result.status === 'rejected');
-      evidence.piStderr = existsSync(piStderr) ? readFileSync(piStderr, 'utf8') : '';
+      const stderrFiles = windows
+        ? readdirSync(root).filter(name => name.startsWith('pi-stderr.log-') && name.endsWith('.log')).sort().map(name => join(root, name))
+        : existsSync(piStderr) ? [piStderr] : [];
+      evidence.piStderrLogs = stderrFiles.map(file => ({ file, text: readFileSync(file, 'utf8') }));
+      evidence.piStderr = evidence.piStderrLogs.map(log => log.text).join('');
       if (failures.length) throw new AggregateError(failures.map(result => result.reason));
     },
     async closeLifetime() {
@@ -146,7 +150,7 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
     const realPi = join(home, 'pi.cmd');
     if (windows) {
       copyFileSync(fileURLToPath(new URL('../../../intent-services/src/pi_mcp_wrapper.cmd', import.meta.url)), wrapper);
-      writeFileSync(realPi, '@echo off\r\nsetlocal DisableDelayedExpansion\r\n"%INTENTD_TEST_NODE%" "%INTENTD_TEST_PI_ENTRY%" %* 2>>"%INTENTD_TEST_PI_STDERR%"\r\n');
+      writeFileSync(realPi, '@echo off\r\nsetlocal DisableDelayedExpansion\r\n"%INTENTD_TEST_NODE%" "%INTENTD_TEST_PI_ENTRY%" %* 2>>"%INTENTD_TEST_PI_STDERR%-%RANDOM%-%RANDOM%.log"\r\n');
     } else {
       writeFileSync(wrapper, `#!/bin/sh\nexec ${[process.execPath, piEntry, '-e', extension].map(quoteSh).join(' ')} "$@" 2>>${quoteSh(piStderr)}\n`);
       chmodSync(wrapper, 0o755);

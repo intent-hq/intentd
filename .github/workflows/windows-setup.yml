@@ -57,10 +57,11 @@ jobs:
         with:
           shared-key: gh-build-x86_64-pc-windows-msvc
       - name: Test cursor parser
-        run: cargo test --locked -p intent-pty --lib --target x86_64-pc-windows-msvc conpty_startup::tests -- --nocapture
-      - name: Test setup without terminal input
         run: |
           mkdir -p setup-headless-evidence
+          cargo test --locked -p intent-pty --lib --target x86_64-pc-windows-msvc conpty_startup::tests -- --nocapture 2>&1 | tee setup-headless-evidence/parser.log
+      - name: Test setup without terminal input
+        run: |
           cargo test --locked -p intentd --test e2e_wss_setup_headless --target x86_64-pc-windows-msvc setup_finishes_without_terminal_client_input -- --exact --nocapture 2>&1 | tee setup-headless-evidence/runtime.log
       - uses: actions/upload-artifact@v7
         if: always()
