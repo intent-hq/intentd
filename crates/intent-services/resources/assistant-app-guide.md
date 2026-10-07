@@ -157,6 +157,16 @@ title in the conversation header. The title field uses the available header widt
 Press **Enter** or click away to save; press **Escape** to cancel. Sidebar titles
 select conversations and cannot be edited there.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeIntegrations,HomePullSummary,HomePullCode}.svelte; messages/en.json. -->
+
+In **Home → Pull requests**, select a PR to open its preview. **Summary** shows
+reviews and check status counts; expand the overview to inspect individual checks in
+open status groups. Collapse a group to hide its checks. **Code** lists changed
+files with their directory paths. Search by filename or path, then click a file to
+expand its diff in place. Multiple files
+can stay open, and the preview scrolls through them together. If a patch is
+unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
+
 ## Inspect a failed response and recover
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,ChatPanel}.svelte; messages/en.json. -->
