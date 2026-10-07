@@ -137,6 +137,13 @@ agent conversations. Resolve any displayed repository, Git, or provider setup
 error before retrying. If creation succeeded but sending the first message failed,
 use the form's retry instruction instead of creating a second workspace.
 
+<!-- Sources: packages/intentd/crates/intent-services/src/lib.rs (SETUP_TERMINAL_NAME); packages/intentd/crates/intent-pty/src/host.rs. -->
+
+Workspace setup runs in the **Setup Script** terminal and can finish without that
+terminal being open. If setup stays running, inspect its last output before
+retrying. Include that output, the Intent version, and the operating system when
+reporting the problem.
+
 To continue work, open its existing card or sidebar entry, then the existing agent's
 conversation. Read its status and last response before sending a follow-up. Use
 **Create new agent** in that workspace only when a separate conversation is needed;
@@ -176,6 +183,15 @@ command; signing in to the Claude desktop app does not sign in its CLI. For
 **Agent session corrupted**, retry starts a fresh session and carries over the
 conversation history. Do not promise a model or provider switch unless the UI
 offers it; inspect **Settings → Providers** for setup problems.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/{pi_cli.rs,agent_manager.rs,pi_mcp_wrapper.cmd}; packages/intentd/crates/intent-providers/src/config.rs. -->
+
+Pi requires the installed Pi CLI version shown in **Providers**. Intent supplies
+its workspace tools automatically and keeps user-installed Pi extensions enabled.
+If Pi works in a terminal but fails in Intent, copy the conversation's failure
+details and check the CLI found by **Providers**. A Windows error saying Pi MCP
+delivery requires a Unix host comes from an older Intent build; changing the
+workspace setup script does not resolve it.
 
 ## Restore workspace browser use
 

@@ -96,6 +96,7 @@ REQUIRED_TEST_STEPS = {
     # None: indirect Python/Bash-array routes are executed with a stub below.
     ("build", "Tunnel deadline and TLS controls (macOS runtime)"): None,
     ("build", "Retained workspace CoW fixtures (macOS runtime)"): None,
+    ("build", "Headless workspace setup (Windows runtime)"): 1,
     ("build", "Codex diagnostic process ownership (Windows runtime)"): 1,
     ("build", "Codex focused diagnostics (macOS runtime)"): 2,
     ("coverage-e2e", "Run e2e coverage"): 1,
