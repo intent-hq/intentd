@@ -7018,6 +7018,68 @@ async fn list_previews_bounded_and_correct_with_multi_megabyte_messages() {
     );
 }
 
+/// Measure the actual service read, including metadata/count queries, on every
+/// read-pool connection. A bounded page must not scan the entire transcript.
+#[tokio::test]
+async fn progressive_history_batch_work_is_bounded_for_large_transcripts() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let (_tmp, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Large history").await;
+    sqlx::query(
+        "WITH RECURSIVE n(seq) AS (SELECT 0 UNION ALL SELECT seq + 1 FROM n WHERE seq < 9999) \
+         INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) \
+         SELECT 'history-' || seq, ?, seq, 'user', '[]', ? FROM n",
+    )
+    .bind(id.as_str())
+    .bind(now_iso())
+    .execute(svc.store().write_pool())
+    .await
+    .unwrap();
+
+    let steps = Arc::new(AtomicU64::new(0));
+    // Hold all connections while instrumenting so the pool cannot hand back
+    // the same connection repeatedly or create an uninstrumented replacement.
+    let mut connections = Vec::new();
+    for _ in 0..svc.store().read_pool().options().get_max_connections() {
+        let mut conn = svc.store().read_pool().acquire().await.unwrap();
+        let counter = steps.clone();
+        conn.lock_handle()
+            .await
+            .unwrap()
+            .set_progress_handler(100, move || {
+                counter.fetch_add(100, Ordering::Relaxed);
+                true
+            });
+        connections.push(conn);
+    }
+    drop(connections);
+    let mut before = None;
+    for batch_index in 0..26 {
+        steps.store(0, Ordering::Relaxed);
+        let batch = svc
+            .agent_history_batch_op(id.clone(), before, 8)
+            .await
+            .unwrap();
+        let cost = steps.load(Ordering::Relaxed);
+        assert_eq!(batch["totalMessages"], 10_000);
+        let messages = batch["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 8);
+        assert_eq!(messages[0]["seq"], 9_999 - batch_index * 8);
+        before = messages.last().unwrap()["seq"].as_i64();
+        assert!(
+            cost < 10_000,
+            "batch {batch_index} executed {cost} SQLite VM steps for eight rows"
+        );
+    }
+    let mut connections = Vec::new();
+    for _ in 0..svc.store().read_pool().options().get_max_connections() {
+        let mut conn = svc.store().read_pool().acquire().await.unwrap();
+        conn.lock_handle().await.unwrap().remove_progress_handler();
+        connections.push(conn);
+    }
+}
+
 #[tokio::test]
 async fn get_conversation_truncates_to_limit() {
     let (_t, svc, ws) = setup().await;

@@ -1852,6 +1852,19 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Internal progressive subscription reader. Returns a bounded newest-first
+    /// slim batch strictly before `before_seq`; it never hydrates heavy bodies.
+    /// Callers emit every returned row before requesting another batch.
+    fn agent_history_batch(
+        &self,
+        agent_id: AgentId,
+        before_seq: Option<i64>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (agent_id, before_seq, limit);
+        Box::pin(async { Err(Error::Internal("history reader unavailable".into())) })
+    }
+
     /// `agent.getMessageBlock`: one full content block of one persisted
     /// message, by block id — `{ block }` (PROTOCOL §5.5). The on-demand
     /// counterpart of the `projection: "slim"` conversation read: a client
