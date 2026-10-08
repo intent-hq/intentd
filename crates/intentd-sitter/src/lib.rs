@@ -18,3 +18,6 @@ pub mod startup;
 pub mod state;
 pub mod supervisor;
 pub mod updater;
+
+#[cfg(windows)]
+pub mod windows;

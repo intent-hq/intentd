@@ -23,8 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ("success", "skipped", "failure", "cancelled")
 ALWAYS_REQUIRED = {"deb-packaging", "release-scripts", "install-ps1", "pi-session-paths"}
 REQUIRED = {
-    "pull_request": ALWAYS_REQUIRED | {"check", "coverage-changed", "monorepo-consumer-checks"},
-    "merge_group": ALWAYS_REQUIRED | {"check", "build", "coverage-e2e", "coverage-all", "monorepo-consumer-checks"},
+    "pull_request": ALWAYS_REQUIRED | {"daemon-lifecycle", "check", "coverage-changed", "monorepo-consumer-checks"},
+    "merge_group": ALWAYS_REQUIRED | {"daemon-lifecycle", "check", "build", "coverage-e2e", "coverage-all", "monorepo-consumer-checks"},
     "push": ALWAYS_REQUIRED | {"build"},
 }
 PR_METADATA = {"pr-title", "conflict-markers"}
@@ -313,6 +313,19 @@ class NativeRoutingTests(unittest.TestCase):
         workflow = copy.deepcopy(self.workflow)
         workflow["jobs"]["gate"]["needs"].remove("build")
         self.assertIn("gate dependencies changed", gate_errors(workflow))
+
+    def test_lifecycle_matrix_is_required_and_runs_real_proof(self):
+        job = self.workflow["jobs"]["daemon-lifecycle"]
+        self.assertEqual({row["platform"] for row in job["strategy"]["matrix"]["include"]}, {"linux", "macos", "windows"})
+        self.assertFalse(job["strategy"]["fail-fast"])
+        step = next(step for step in job["steps"] if step.get("name") == "Native lifecycle lint and runtime proof")
+        self.assertIn("python3 -I -B scripts/test-daemon-lifecycle.py", step["run"])
+        self.assertFalse(step.get("continue-on-error", False))
+        for event in ("pull_request", "merge_group"):
+            workflow = copy.deepcopy(self.workflow)
+            gate = next(step for step in workflow["jobs"]["gate"]["steps"] if step.get("name") == "Check results")
+            gate["run"] = gate["run"].replace("${{ needs.daemon-lifecycle.result }}", "success")
+            self.assertIn(f"{event}: daemon-lifecycle=skipped", gate_errors(workflow))
 
     def test_expression_status_and_unknown_syntax(self):
         self.assertFalse(condition("github.event_name != 'push'", context("pull_request"), success=False))

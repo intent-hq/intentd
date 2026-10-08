@@ -61,6 +61,13 @@ fn run() -> i32 {
             .collect(),
     };
 
+    #[cfg(windows)]
+    if args.passthrough.first().is_some_and(|arg| arg == "stop") {
+        if let Some(code) = intentd_sitter::startup::stop(&paths) {
+            return code;
+        }
+    }
+
     match args.sitter_command() {
         Some(Ok(command)) => return run_sitter_command(command, &args, &paths, &base_urls),
         Some(Err(e)) => {
@@ -361,12 +368,7 @@ fn run_restart(args: &SitterArgs, paths: &SitterPaths) -> i32 {
     send_sighup_to_sitter(pid)
 }
 
-/// No SIGHUP on windows: point at the service manager instead.
-#[cfg(not(unix))]
-fn run_restart(_args: &SitterArgs, _paths: &SitterPaths) -> i32 {
-    eprintln!(
-        "intentd-sitter: `intentd restart` is not supported on Windows; \
-         restart the service instead"
-    );
-    1
+#[cfg(windows)]
+fn run_restart(args: &SitterArgs, paths: &SitterPaths) -> i32 {
+    intentd_sitter::startup::restart(args, paths)
 }
