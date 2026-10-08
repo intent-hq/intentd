@@ -29,6 +29,30 @@ impl NoteWriteConnection {
         Ok(guard)
     }
 
+    /// Only pool acquisition is timed. Once BEGIN is sent, its physical `SQLite`
+    /// work and the subsequent transaction stay owned until explicit settlement.
+    pub(crate) async fn begin_before(
+        store: &Store,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self> {
+        let conn = tokio::time::timeout_at(deadline, store.write_pool().acquire())
+            .await
+            .map_err(|_| Error::NoteDelete(intent_core::note_delete::NoteDeleteError::Unavailable))?
+            .map_err(|e| Error::Internal(format!("acquire note delete writer: {e}")))?;
+        let mut guard = Self(Some(conn));
+        if let Err(error) = sqlx::query("BEGIN IMMEDIATE").execute(&mut *guard).await {
+            return guard
+                .finish(
+                    Err(Error::Internal(format!(
+                        "begin note delete writer: {error}"
+                    ))),
+                    "begin note delete writer",
+                )
+                .await;
+        }
+        Ok(guard)
+    }
+
     pub(crate) async fn finish<T>(mut self, result: Result<T>, context: &str) -> Result<T> {
         let error = match result {
             Ok(value) => match sqlx::query("COMMIT").execute(&mut *self).await {

@@ -1533,3 +1533,347 @@ async fn read_capability_and_complete_edit_cas_preserve_paged_source_over_wss() 
     rpc.close(None).await.unwrap();
     fx.ws.stop().await;
 }
+/// The grace contract keeps the authoritative row live and Undo cancels the
+/// operation rather than recreating its source or identity.
+#[intent_test_macros::daemon_test]
+async fn note_delete_grace_cancel_preserves_authoritative_record_over_wss() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let hello = wss_rpc(&mut rpc, 0, "client.hello", json!({})).await;
+    assert_eq!(hello["server"]["capabilities"]["noteDeleteGrace"], 1);
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"title":"grace cancellation", "path":"."}),
+    )
+    .await;
+    let ws = workspace["workspace"]["id"].as_str().unwrap();
+    let source = "😀 exact source\r\n\n[link](https://example.test/)\n";
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({"workspaceId":ws,"title":"Preserve me","content":source,"tags":["undo"]}),
+    )
+    .await;
+    let note = created["note"]["id"].as_str().unwrap();
+    let before = wss_rpc(
+        &mut rpc,
+        3,
+        "note.get",
+        json!({"workspaceId":ws,"noteId":note}),
+    )
+    .await;
+    assert_eq!(
+        before["note"]["content"], source,
+        "fixture stores exact Unicode/CRLF source"
+    );
+    let state = wss_rpc(
+        &mut rpc,
+        4,
+        "note.deleteStatus",
+        json!({"workspaceId":ws,"noteId":note}),
+    )
+    .await;
+    assert!(state["current"]["noteInstanceId"].is_string());
+    assert_eq!(state["current"]["revision"], before["note"]["rev"]);
+    assert!(state["current"].get("content").is_none());
+    let key = json!({"epoch":state["epoch"],"issuedTickMs":state["serverTickMs"],"nonce":"2bda6166-ea20-4a40-983c-aab99a8bca61"});
+    let params = json!({"workspaceId":ws,"noteId":note,"noteInstanceId":state["current"]["noteInstanceId"],"expectedVersion":state["current"]["revision"],"sourceRevision":state["current"]["sourceRevision"],"operationKey":key,"undoDelayMs":60000});
+    let mut evt = connect(fx.port, fx.cfg.clone()).await;
+    wss_rpc(
+        &mut evt,
+        1,
+        "events.subscribe",
+        json!({"workspaceId":ws,"eventTypes":["note:delete-operation"]}),
+    )
+    .await;
+    let scheduled_frame = wss_rpc_raw(&mut rpc, 5, "note.deleteSchedule", params.clone()).await;
+    assert_eq!(scheduled_frame["jsonrpc"], "2.0");
+    assert_eq!(scheduled_frame["id"], 5);
+    assert!(scheduled_frame.get("error").is_none());
+    let scheduled = scheduled_frame["result"].clone();
+    let pending_event = next_delete_operation(&mut evt).await;
+    assert_eq!(
+        pending_event,
+        json!({"workspaceId":ws,"noteId":note,"noteInstanceId":state["current"]["noteInstanceId"],"epoch":state["epoch"],"sequence":scheduled["operation"]["sequence"],"operationKey":key,"state":"PENDING","deadlineTickMs":scheduled["operation"]["deadlineTickMs"]})
+    );
+    assert_eq!(scheduled["operation"]["state"], "PENDING");
+    let live = wss_rpc(
+        &mut rpc,
+        6,
+        "note.get",
+        json!({"workspaceId":ws,"noteId":note}),
+    )
+    .await;
+    assert_eq!(
+        live["note"], before["note"],
+        "scheduling must not mutate the authoritative note"
+    );
+    let repeated = wss_rpc(&mut rpc, 7, "note.deleteSchedule", params).await;
+    assert_eq!(
+        repeated["operation"], scheduled["operation"],
+        "same intent cannot extend its deadline"
+    );
+    let cancelled = wss_rpc(
+        &mut rpc,
+        8,
+        "note.deleteCancel",
+        json!({"workspaceId":ws,"noteId":note,"operationKey":key}),
+    )
+    .await;
+    assert_eq!(cancelled["operation"]["state"], "CANCELLED");
+    let cancelled_event = next_delete_operation(&mut evt).await;
+    assert_eq!(cancelled_event["state"], "CANCELLED");
+    assert_eq!(cancelled_event["operationKey"], key);
+    assert!(
+        cancelled_event["sequence"].as_u64().unwrap() > pending_event["sequence"].as_u64().unwrap()
+    );
+    assert_eq!(
+        cancelled_event["deadlineTickMs"],
+        pending_event["deadlineTickMs"]
+    );
+    let after = wss_rpc(
+        &mut rpc,
+        9,
+        "note.get",
+        json!({"workspaceId":ws,"noteId":note}),
+    )
+    .await;
+    assert_eq!(
+        after["note"], before["note"],
+        "Undo preserves full record identity and metadata"
+    );
+    let status = wss_rpc(
+        &mut rpc,
+        10,
+        "note.deleteStatus",
+        json!({"workspaceId":ws,"noteId":note,"operationKey":key}),
+    )
+    .await;
+    assert_eq!(status["operation"]["state"], "CANCELLED");
+    assert_eq!(status["current"], state["current"]);
+    assert_eq!(status["pending"], json!([]));
+    evt.close(None).await.unwrap();
+    rpc.close(None).await.unwrap();
+    fx.ws.stop().await;
+}
+
+async fn next_delete_operation(evt: &mut TlsWs) -> Value {
+    timeout(common::rpc_read_timeout(), async {
+        loop {
+            match evt.next().await.unwrap().unwrap() {
+                Message::Text(text) => {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(frame["jsonrpc"], "2.0");
+                    assert_eq!(frame["method"], "events.event");
+                    assert_eq!(frame["params"]["event"]["type"], "note:delete-operation");
+                    return frame["params"]["event"]["data"].clone();
+                }
+                Message::Ping(p) => evt.send(Message::Pong(p)).await.unwrap(),
+                Message::Pong(_) => {}
+                other => panic!("unexpected grace event frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[intent_test_macros::daemon_test]
+async fn note_delete_grace_wss_principal_replay_foreign_cancel_and_revoked_commit() {
+    let fx = boot().await;
+    let mut admin = connect(fx.port, fx.cfg.clone()).await;
+    let workspace = wss_rpc(
+        &mut admin,
+        1,
+        "workspace.create",
+        json!({"title":"grace authority","path":"."}),
+    )
+    .await;
+    let ws = workspace["workspace"]["id"].as_str().unwrap();
+    let created = wss_rpc(
+        &mut admin,
+        2,
+        "note.create",
+        json!({"workspaceId":ws,"title":"authority source","content":"exact authority body"}),
+    )
+    .await;
+    let note = created["note"]["id"].as_str().unwrap();
+    let primary = fx.store.get_primary_principal().await.unwrap();
+    let mut guest = primary.clone();
+    guest.id = "grace-guest".into();
+    guest.is_primary = false;
+    guest.identity = None;
+    guest.github_user_id = None;
+    guest.login = None;
+    fx.store.upsert_principal(&guest).await.unwrap();
+    fx.store
+        .add_workspace_member(
+            &ws.into(),
+            &guest.id,
+            intent_core::WorkspaceRole::Collaborator,
+        )
+        .await
+        .unwrap();
+    let tokens = ["ab".repeat(32), "ef".repeat(32), "12".repeat(32)];
+    let hashes: Vec<_> = tokens
+        .iter()
+        .map(|t| {
+            use std::fmt::Write as _;
+            Sha256::digest(t.as_bytes()).iter().fold(
+                String::with_capacity(64),
+                |mut encoded, byte| {
+                    write!(encoded, "{byte:02x}").unwrap();
+                    encoded
+                },
+            )
+        })
+        .collect();
+    for (i, hash) in hashes.iter().enumerate() {
+        fx.store
+            .insert_principal_credential(if i == 2 { &guest.id } else { &primary.id }, hash)
+            .await
+            .unwrap();
+    }
+    let mut owner_a = common::wss_connect_with_retry(
+        fx.port,
+        fx.cfg.clone(),
+        &format!("wss://localhost:{}/ws?token={}", fx.port, tokens[0]),
+    )
+    .await;
+    let mut owner_b = common::wss_connect_with_retry(
+        fx.port,
+        fx.cfg.clone(),
+        &format!("wss://localhost:{}/ws?token={}", fx.port, tokens[1]),
+    )
+    .await;
+    let mut other = common::wss_connect_with_retry(
+        fx.port,
+        fx.cfg.clone(),
+        &format!("wss://localhost:{}/ws?token={}", fx.port, tokens[2]),
+    )
+    .await;
+    let current = wss_rpc(
+        &mut owner_a,
+        3,
+        "note.deleteStatus",
+        json!({"workspaceId":ws,"noteId":note}),
+    )
+    .await;
+    let key = json!({"epoch":current["epoch"],"issuedTickMs":current["serverTickMs"],"nonce":uuid::Uuid::new_v4().to_string()});
+    let params = json!({"workspaceId":ws,"noteId":note,"noteInstanceId":current["current"]["noteInstanceId"],"expectedVersion":current["current"]["revision"],"sourceRevision":current["current"]["sourceRevision"],"operationKey":key,"undoDelayMs":60000});
+    let scheduled = wss_rpc(&mut owner_a, 4, "note.deleteSchedule", params.clone()).await;
+    owner_a.close(None).await.unwrap();
+    let replay = wss_rpc(&mut owner_b, 5, "note.deleteSchedule", params.clone()).await;
+    assert_eq!(
+        replay["operation"], scheduled["operation"],
+        "stable principal replay over renewed bearer"
+    );
+    let visible = wss_rpc(
+        &mut other,
+        6,
+        "note.deleteStatus",
+        json!({"workspaceId":ws,"noteId":note}),
+    )
+    .await;
+    assert_eq!(visible["pending"][0]["canCancel"], false);
+    for method in ["note.deleteCancel", "note.deleteStatus"] {
+        let denied = wss_rpc_raw(
+            &mut other,
+            7,
+            method,
+            json!({"workspaceId":ws,"noteId":note,"operationKey":key}),
+        )
+        .await;
+        assert_eq!(denied["error"]["code"], -32003);
+    }
+    wss_rpc(
+        &mut owner_b,
+        8,
+        "note.deleteCancel",
+        json!({"workspaceId":ws,"noteId":note,"operationKey":key}),
+    )
+    .await;
+    timeout(common::rpc_read_timeout(), async {
+        loop {
+            let status = wss_rpc(
+                &mut owner_b,
+                9,
+                "note.deleteStatus",
+                json!({"workspaceId":ws,"noteId":note,"operationKey":key}),
+            )
+            .await;
+            if status["operation"]["expiresTickMs"].is_number() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Revoke a captured principal bearer within a measured long grace window.
+    // Observe terminal completion with a separately authorized same-principal
+    // connection; never infer survival from transport disconnect alone.
+    let mut owner_a = common::wss_connect_with_retry(
+        fx.port,
+        fx.cfg.clone(),
+        &format!("wss://localhost:{}/ws?token={}", fx.port, tokens[0]),
+    )
+    .await;
+    let mut second = params;
+    second["operationKey"]["nonce"] = json!(uuid::Uuid::new_v4().to_string());
+    second["undoDelayMs"] = json!(5000);
+    let next = wss_rpc(&mut owner_a, 10, "note.deleteSchedule", second.clone()).await;
+    let nextkey = next["operation"]["operationKey"].clone();
+    fx.store
+        .revoke_principal_credential(&hashes[0])
+        .await
+        .unwrap();
+    let checkpoint = wss_rpc(
+        &mut owner_b,
+        11,
+        "note.deleteStatus",
+        json!({"workspaceId":ws,"noteId":note,"operationKey":nextkey}),
+    )
+    .await;
+    assert!(
+        checkpoint["serverTickMs"].as_u64().unwrap()
+            < next["operation"]["deadlineTickMs"].as_u64().unwrap(),
+        "revocation must precede deadline in this control"
+    );
+    timeout(common::rpc_read_timeout(), async {
+        loop {
+            let status = wss_rpc(
+                &mut owner_b,
+                12,
+                "note.deleteStatus",
+                json!({"workspaceId":ws,"noteId":note,"operationKey":nextkey}),
+            )
+            .await;
+            if status["operation"]["expiresTickMs"].is_number() {
+                assert_eq!(status["operation"]["state"], "CONFLICT");
+                assert_eq!(status["operation"]["reason"], "authorityLost");
+                break;
+            }
+            // timing-guard: bounded status polling stops as soon as the owned operation settles.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let preserved = wss_rpc(
+        &mut owner_b,
+        13,
+        "note.get",
+        json!({"workspaceId":ws,"noteId":note}),
+    )
+    .await;
+    assert_eq!(preserved["note"], created["note"]);
+    let _ = owner_a.close(None).await;
+    owner_b.close(None).await.unwrap();
+    other.close(None).await.unwrap();
+    admin.close(None).await.unwrap();
+    fx.ws.stop().await;
+}

@@ -742,7 +742,8 @@ use std::time::{Duration, Instant};
 // require notePagingRead: 1 plus the persisted notePagingBackendId; complete
 // annotations additionally require noteAnnotations: 1. The numeric version
 // does not activate paginated editing, and the old notePaging stays absent.
-pub const PROTOCOL_VERSION: &str = "13.9";
+// 13.10 adds capability-gated cancellable note deletion controls.
+pub const PROTOCOL_VERSION: &str = "13.10";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

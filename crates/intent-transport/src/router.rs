@@ -98,6 +98,11 @@ fn not_found(message: impl Into<String>) -> RpcErr {
 /// surface as `-32603 "Internal error"` carrying the original cause in `data`.
 fn domain_to_rpc(e: Error) -> RpcErr {
     match e {
+        Error::NoteDelete(kind) => RpcErr {
+            code: kind.rpc_code(),
+            message: "Note deletion unavailable".into(),
+            data: Some(json!({"code":kind.wire_code()})),
+        },
         Error::NotePage(kind) => RpcErr {
             code: if kind == intent_core::note_page::NotePageError::Stale {
                 -32005
@@ -1498,6 +1503,87 @@ async fn dispatch_other(
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
+        }
+        "note.deleteSchedule" => {
+            let request: intent_core::note_delete::NoteDeleteSchedule =
+                serde_json::from_value(Value::Object(params.clone())).map_err(|_| {
+                    domain_to_rpc(Error::NoteDelete(
+                        intent_core::note_delete::NoteDeleteError::Invalid,
+                    ))
+                })?;
+            let response = api
+                .schedule_note_delete(request)
+                .await
+                .map_err(domain_to_rpc)?;
+            let value = to_result_value(&response)?;
+            if serde_json::to_vec(&value)
+                .map_err(|_| {
+                    domain_to_rpc(Error::NoteDelete(
+                        intent_core::note_delete::NoteDeleteError::Unavailable,
+                    ))
+                })?
+                .len()
+                > intent_core::note_delete::MAX_RESULT_BYTES
+            {
+                return Err(domain_to_rpc(Error::NoteDelete(
+                    intent_core::note_delete::NoteDeleteError::Unavailable,
+                )));
+            }
+            Ok(value)
+        }
+        "note.deleteCancel" => {
+            let request: intent_core::note_delete::NoteDeleteCancel =
+                serde_json::from_value(Value::Object(params.clone())).map_err(|_| {
+                    domain_to_rpc(Error::NoteDelete(
+                        intent_core::note_delete::NoteDeleteError::Invalid,
+                    ))
+                })?;
+            let response = api
+                .cancel_note_delete(request)
+                .await
+                .map_err(domain_to_rpc)?;
+            let value = to_result_value(&response)?;
+            if serde_json::to_vec(&value)
+                .map_err(|_| {
+                    domain_to_rpc(Error::NoteDelete(
+                        intent_core::note_delete::NoteDeleteError::Unavailable,
+                    ))
+                })?
+                .len()
+                > intent_core::note_delete::MAX_RESULT_BYTES
+            {
+                return Err(domain_to_rpc(Error::NoteDelete(
+                    intent_core::note_delete::NoteDeleteError::Unavailable,
+                )));
+            }
+            Ok(value)
+        }
+        "note.deleteStatus" => {
+            let request: intent_core::note_delete::NoteDeleteStatus =
+                serde_json::from_value(Value::Object(params.clone())).map_err(|_| {
+                    domain_to_rpc(Error::NoteDelete(
+                        intent_core::note_delete::NoteDeleteError::Invalid,
+                    ))
+                })?;
+            let response = api
+                .note_delete_status(request)
+                .await
+                .map_err(domain_to_rpc)?;
+            let value = to_result_value(&response)?;
+            if serde_json::to_vec(&value)
+                .map_err(|_| {
+                    domain_to_rpc(Error::NoteDelete(
+                        intent_core::note_delete::NoteDeleteError::Unavailable,
+                    ))
+                })?
+                .len()
+                > intent_core::note_delete::MAX_RESULT_BYTES
+            {
+                return Err(domain_to_rpc(Error::NoteDelete(
+                    intent_core::note_delete::NoteDeleteError::Unavailable,
+                )));
+            }
+            Ok(value)
         }
         "note.delete" => {
             let ws = require_ws_note(params)?;

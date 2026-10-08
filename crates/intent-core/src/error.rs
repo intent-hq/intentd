@@ -8,6 +8,9 @@
 /// Domain error type for intentd.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Bounded cancellable deletion control failure.
+    #[error("{}", .0.wire_code())]
+    NoteDelete(crate::note_delete::NoteDeleteError),
     /// Bounded note page failure; never carries source content.
     #[error("{}", .0.wire_code())]
     NotePage(crate::note_page::NotePageError),
@@ -525,6 +528,7 @@ impl Error {
     #[must_use]
     pub fn code(&self) -> i32 {
         match self {
+            Error::NoteDelete(kind) => kind.rpc_code(),
             Error::ExecutionAuthorization { source, .. } => match source.as_ref() {
                 Error::CloneFailed { .. } | Error::SourceControlUnauthorized { .. } => source.code(),
                 _ => -32603,

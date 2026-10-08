@@ -1286,6 +1286,38 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Whether this implementation provides the complete grace deletion contract.
+    fn supports_note_delete_grace(&self) -> bool {
+        false
+    }
+
+    /// Bounded grace deletion control; legacy immediate deletion is unchanged.
+    fn schedule_note_delete(
+        &self,
+        request: crate::note_delete::NoteDeleteSchedule,
+    ) -> BoxFuture<'_, Result<crate::note_delete::NoteDeleteOperationResponse>> {
+        let _ = request;
+        Box::pin(async { Err(Error::Unsupported("note deletion grace".into())) })
+    }
+
+    /// Bounded grace deletion control; legacy immediate deletion is unchanged.
+    fn cancel_note_delete(
+        &self,
+        request: crate::note_delete::NoteDeleteCancel,
+    ) -> BoxFuture<'_, Result<crate::note_delete::NoteDeleteOperationResponse>> {
+        let _ = request;
+        Box::pin(async { Err(Error::Unsupported("note deletion grace".into())) })
+    }
+
+    /// Bounded grace deletion control; legacy immediate deletion is unchanged.
+    fn note_delete_status(
+        &self,
+        request: crate::note_delete::NoteDeleteStatus,
+    ) -> BoxFuture<'_, Result<crate::note_delete::NoteDeleteStatusResponse>> {
+        let _ = request;
+        Box::pin(async { Err(Error::Unsupported("note deletion grace".into())) })
+    }
+
     /// `note.delete`: remove a note (PROTOCOL §5.2). `expected_version` gates the
     /// delete on the current `rev` when `Some` (§5.6); on a stale value the
     /// conflict carries the current entity snapshot prior to deletion.

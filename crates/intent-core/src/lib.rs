@@ -36,6 +36,7 @@ pub mod model;
 pub mod native_review;
 pub mod nodes;
 pub mod note_annotation;
+pub mod note_delete;
 pub mod note_page;
 pub mod path_utils;
 pub mod process_policy;

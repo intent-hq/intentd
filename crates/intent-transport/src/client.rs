@@ -200,6 +200,9 @@ pub(crate) async fn handle(
         crate::BUILD_COMMIT,
         is_local,
     );
+    if api.supports_note_delete_grace() {
+        server["capabilities"]["noteDeleteGrace"] = json!(1);
+    }
     if let Some(backend_id) = api.note_paging_backend_id() {
         server["capabilities"]["notePagingRead"] = json!(1);
         server["capabilities"]["notePagingBackendId"] = json!(backend_id);

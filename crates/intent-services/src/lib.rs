@@ -96,6 +96,7 @@ pub mod host_exec;
 pub mod host_exec_stream;
 mod host_execution;
 mod installed_cli;
+mod note_delete;
 mod workspace_mutations;
 
 mod github_ops;
@@ -696,6 +697,7 @@ pub struct Services {
     primary_auth_admitted: bool,
     terminal_tasks: Arc<delivery_tasks::DeliveryTasks>,
     pending_delete_tasks: Arc<delivery_tasks::DeliveryTasks>,
+    note_deletions: Arc<note_delete::Registry>,
     host_exec_runtime: Arc<host_exec::HostExecRuntime>,
     provider_preparation: Arc<provider_preparation::Preparation>,
     /// Child agent ids with an active terminal-delivery retry task, mapped
@@ -1638,6 +1640,7 @@ impl Services {
             primary_auth_admitted: false,
             terminal_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             pending_delete_tasks,
+            note_deletions: Arc::default(),
             host_exec_runtime: Arc::default(),
             provider_preparation: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
@@ -6738,6 +6741,8 @@ impl Services {
         // and PtyHost::kill_all has refused/reaped every late PTY spawn.
         // Pending undo waits are discarded on restart by their wire contract;
         // a timer that already claimed its delete finishes the cascade.
+        self.note_deletions.close();
+        self.note_deletions.tasks.shutdown().await;
         self.pending_delete_tasks.shutdown().await;
         // Device-flow cancellation is cooperative: remove the generation and
         // join any in-flight token write/reconciliation instead of aborting it.
@@ -25854,6 +25859,31 @@ impl WorkspaceApi for Services {
                 rev: Some(note.rev),
             })
         })
+    }
+
+    fn supports_note_delete_grace(&self) -> bool {
+        true
+    }
+
+    fn schedule_note_delete(
+        &self,
+        request: intent_core::note_delete::NoteDeleteSchedule,
+    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteOperationResponse>> {
+        Box::pin(self.grace_schedule(request))
+    }
+
+    fn cancel_note_delete(
+        &self,
+        request: intent_core::note_delete::NoteDeleteCancel,
+    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteOperationResponse>> {
+        Box::pin(self.grace_cancel(request))
+    }
+
+    fn note_delete_status(
+        &self,
+        request: intent_core::note_delete::NoteDeleteStatus,
+    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteStatusResponse>> {
+        Box::pin(self.grace_status(request))
     }
 
     fn delete_note(

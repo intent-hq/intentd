@@ -40,6 +40,7 @@ mod message_thumbnails;
 mod metrics_repo;
 mod node_repo;
 pub mod note_annotation_repo;
+pub mod note_delete_repo;
 mod note_line_attribution_repo;
 mod note_page_html;
 mod note_page_index;
