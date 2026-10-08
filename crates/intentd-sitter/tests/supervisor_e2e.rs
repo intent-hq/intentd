@@ -2699,6 +2699,38 @@ fn one_shot_with_installed_version_never_touches_the_updater() {
 }
 
 #[test]
+fn daemon_help_serve_ignores_supervisor_ownership_and_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(
+        &paths,
+        "0.1.0",
+        "#!/bin/sh\n[ \"$*\" = 'help serve' ] || exit 2\nprintf 'Usage: intentd serve [OPTIONS]\\n'\n",
+    );
+    let before = fs::read(&paths.state_path).unwrap();
+    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+    let (base_url, requests) = serve_recording(routes);
+    let lock_path = paths.sitter_dir.join("sitter.lock");
+
+    for locked in [false, true] {
+        let _lock = locked.then(|| {
+            let file = fs::File::create(&lock_path).unwrap();
+            nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).unwrap()
+        });
+        let output = run_one_shot(dir.path(), &base_url, &["help", "serve"]);
+        assert!(output.status.success(), "locked={locked}: {output:?}");
+        assert_eq!(output.stdout, b"Usage: intentd serve [OPTIONS]\n");
+        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(fs::read(&paths.state_path).unwrap(), before);
+        assert!(!paths.pid_path.exists());
+        assert!(!paths.sitter_dir.join("start.log").exists());
+        if !locked {
+            assert!(!lock_path.exists());
+        }
+    }
+}
+
+#[test]
 fn one_shot_channel_mismatch_warns_and_runs_installed_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());

@@ -47,6 +47,7 @@ fn root_help_lists_lifecycle_and_start_help_lists_serve_options() {
                 "serve",
                 "--sitter-channel",
                 "intentd help",
+                "intentd help <COMMAND>",
             ],
         ),
         (
@@ -59,6 +60,7 @@ fn root_help_lists_lifecycle_and_start_help_lists_serve_options() {
                 "INTENTD_DATA_DIR",
                 "start.log",
                 "60 seconds",
+                "intentd help serve",
             ],
         ),
     ] {
@@ -70,6 +72,7 @@ fn root_help_lists_lifecycle_and_start_help_lists_serve_options() {
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         let help = String::from_utf8(output.stdout).unwrap();
+        assert!(!help.contains("intentd serve --help"), "{help}");
         for item in expected {
             assert!(help.contains(item), "missing {item}: {help}");
         }

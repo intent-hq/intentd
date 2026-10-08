@@ -257,7 +257,7 @@ inspect that log before retrying.
 and environment, including `INTENTD_DATA_DIR`, `INTENTD_CONFIG`, and
 `INTENTD_CHANNEL`; `--sitter-channel` remains a per-launch channel override.
 Use the same data directory/environment for all lifecycle commands. There is no
-`--data-dir` startup flag; set `INTENTD_DATA_DIR` instead. Run `intentd serve --help`
+`--data-dir` startup flag; set `INTENTD_DATA_DIR` instead. Run `intentd help serve`
 for the installed daemon's detailed options.
 
 `restart` takes no launch options. For a running supervised daemon it keeps the

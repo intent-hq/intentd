@@ -41,7 +41,7 @@ Launcher options:
 Use intentd start --help or intentd restart --help for lifecycle details.
 Other daemon commands include call, doctor, settings, token, and pair.
 After installation, intentd help lists all daemon commands, and
-intentd <COMMAND> --help describes their options. --version is the daemon version.
+intentd help <COMMAND> describes their options. --version is the daemon version.
 A leading -- forwards all following arguments verbatim, bypassing launcher handling.
 Background start does not install or enable a service or Scheduled Task.
 Direct daemon builds support serve, but start/restart belong to this launcher.";
@@ -66,7 +66,7 @@ Options (forwarded to the installed daemon's serve command):
 Uses the same environment/configuration as serve, including INTENTD_DATA_DIR,
 INTENTD_CONFIG and INTENTD_CHANNEL; --sitter-channel overrides the channel.
 Use the same data directory/environment for intentd status, stop, and restart.
-Run intentd serve --help for the installed daemon's detailed serve options.";
+Run intentd help serve for the installed daemon's detailed serve options.";
 
 const RESTART_HELP: &str = "Restart intentd on Windows, macOS, and Linux.
 
