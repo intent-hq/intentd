@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.33] - 2026-10-08
+
+### 🐛 Bug Fixes
+
+- Clear recovered agent blockers explicitly ([#2350](https://github.com/intent-hq/intentd/pull/2350))
+
+### 🧪 Testing
+
+- Separate report wake text from event metadata ([#2353](https://github.com/intent-hq/intentd/pull/2353))
+
+
 ## [0.10.32] - 2026-10-08
 
 ### 🐛 Bug Fixes
