@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.34] - 2026-10-08
+
+### 🚀 Features
+
+- Deliver initial chat history progressively ([#2339](https://github.com/intent-hq/intentd/pull/2339))
+
+
 ## [0.10.33] - 2026-10-08
 
 ### 🐛 Bug Fixes
