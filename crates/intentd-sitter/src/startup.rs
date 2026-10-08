@@ -115,20 +115,15 @@ fn start(args: &SitterArgs, paths: &SitterPaths) -> std::io::Result<()> {
     detach(&mut command);
     let mut child = command.spawn()?;
     let outcome = (|| loop {
-        if let Some(status) = child.try_wait()? {
-            // A foreground serve could win the lifetime lock between our probe
-            // and spawn. Its healthy response is still a successful no-op.
-            break if probe(paths, deadline) {
-                Ok(())
-            } else {
-                Err(io::Error::other(format!(
-                    "supervisor exited before readiness ({status})"
-                )))
-            };
+        if child_exited(&child)? {
+            break Err(io::Error::other("supervisor exited before readiness"));
         }
         if probe(paths, deadline) {
             // Avoid accepting a response from a child that has already exited.
-            if child.try_wait()?.is_none() {
+            if !child_exited(&child)?
+                && supervisor::read_live_pid(&paths.pid_path)
+                    .is_some_and(|pid| pid.as_raw() == child.id().cast_signed())
+            {
                 println!(
                     "intentd started; logs: {}",
                     paths.sitter_dir.join("start.log").display()
@@ -142,7 +137,17 @@ fn start(args: &SitterArgs, paths: &SitterPaths) -> std::io::Result<()> {
         pause(deadline);
     })();
     if outcome.is_err() {
-        stop_owned_child(&mut child);
+        let owned_pid = child.id().cast_signed();
+        stop_owned_child(&mut child, &paths.pid_path);
+        // Only another published lifetime owner can turn a failed launch into
+        // a no-op. Probe after cleaning our group so an owned orphan cannot
+        // supply that response. Never signal the other owner's PID.
+        if supervisor::read_live_pid(&paths.pid_path).is_some_and(|pid| pid.as_raw() != owned_pid)
+            && probe(paths, deadline)
+        {
+            println!("intentd is already running under another supervisor");
+            return Ok(());
+        }
     }
     outcome
 }
@@ -207,27 +212,59 @@ fn detach(command: &mut std::process::Command) {
     }
 }
 
+/// Observe exit without reaping: the kernel must keep the child's PID reserved
+/// until its session has been cleaned. `Child::try_wait` would release that PID
+/// before killpg, risking a signal to an unrelated reused process group.
 #[cfg(unix)]
-fn stop_owned_child(child: &mut std::process::Child) {
+fn child_exited(child: &std::process::Child) -> std::io::Result<bool> {
+    use nix::libc;
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: info points to writable siginfo_t storage. P_PID selects our
+    // unreaped direct child; WNOWAIT leaves its ownership intact on every poll.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: storage was zeroed and waitid succeeded. No event leaves si_pid
+    // zero; an exit event fills its child-status fields on Linux and macOS.
+    Ok(unsafe { info.assume_init().si_pid() } != 0)
+}
+
+#[cfg(unix)]
+fn stop_owned_child(child: &mut std::process::Child, pid_path: &std::path::Path) {
     use nix::sys::signal::{kill, killpg, Signal};
     use nix::unistd::Pid;
     use std::time::{Duration, Instant};
 
-    if child.try_wait().ok().flatten().is_some() {
+    let Ok(exited) = child_exited(child) else {
+        // ECHILD means we no longer have kernel ownership. Do not act on a
+        // numeric PID that could have been reaped/reused by another owner.
         return;
-    }
+    };
     let pid = Pid::from_raw(child.id().cast_signed());
-    let _ = kill(pid, Signal::SIGTERM);
-    let deadline = Instant::now()
-        + crate::supervisor::SupervisorConfig::from_env().kill_timeout
-        + Duration::from_secs(1);
-    while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
-        pause(deadline);
+    if !exited {
+        let _ = kill(pid, Signal::SIGTERM);
+        let deadline = Instant::now()
+            + crate::supervisor::SupervisorConfig::from_env().kill_timeout
+            + Duration::from_secs(1);
+        while matches!(child_exited(child), Ok(false)) && Instant::now() < deadline {
+            pause(deadline);
+        }
     }
-    if child.try_wait().ok().flatten().is_none() {
-        // This process group was created by setsid for this exact child. Never
-        // use a PID read from shared state for timeout cleanup.
-        let _ = killpg(pid, Signal::SIGKILL);
-        let _ = child.wait();
+    // Even an exited supervisor can leave descendants behind. Its unreaped
+    // leader reserves the PGID, so this cannot target a reused process group.
+    let _ = killpg(pid, Signal::SIGKILL);
+    // Remove only this child's stale record, before reaping releases its PID.
+    // A foreground contender cannot overwrite a live/unreaped owner's record.
+    if std::fs::read_to_string(pid_path).is_ok_and(|value| value.trim() == pid.to_string()) {
+        let _ = std::fs::remove_file(pid_path);
     }
+    let _ = child.wait();
 }

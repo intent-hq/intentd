@@ -3394,3 +3394,101 @@ fn start_and_restart_do_not_duplicate_an_unsupervised_daemon() {
         .unwrap()
         .success());
 }
+
+/// Subreaping keeps the orphan's PID reserved until the test reaps it, making
+/// both the cleanup guard and the liveness assertion independent of init timing.
+#[cfg(target_os = "linux")]
+fn supervisor_death_during_startup(ready: bool) {
+    use nix::sys::signal::Signal;
+    use nix::sys::wait::{waitid, waitpid, Id, WaitPidFlag, WaitStatus};
+
+    struct AdoptedDaemon(Pid, Pid);
+    impl Drop for AdoptedDaemon {
+        fn drop(&mut self) {
+            // This adopted child remains unreaped until this guard releases it.
+            if waitid(
+                Id::Pid(self.0),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+            )
+            .is_ok()
+            {
+                let _ = nix::sys::signal::killpg(self.1, Signal::SIGKILL);
+                // Reap every adopted member of this private session, including
+                // a shell fixture's short-lived sleep child.
+                while waitpid(Pid::from_raw(-self.1.as_raw()), None).is_ok() {}
+            }
+        }
+    }
+
+    nix::sys::prctl::set_child_subreaper(true).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = background_fixture(dir.path());
+    let mut unrelated = spawn_guarded(Command::new("sh").args(["-c", "exec sleep 60"])); // timing-guard: unrelated sentinel lives until its guard kills it
+    let mut command = sitter_command(dir.path(), &dead_url());
+    command
+        .arg("start")
+        .env("FAKE_NO_READY", "1")
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, "5000")
+        .env(KILL_TIMEOUT_ENV, "100");
+    let mut caller = spawn_guarded(&mut command);
+    wait_until("owned daemon launch", Duration::from_secs(5), || {
+        dir.path().join("daemon-pid").exists()
+    });
+    caller.signal(Signal::SIGSTOP).unwrap();
+    let daemon = Pid::from_raw(
+        fs::read_to_string(dir.path().join("daemon-pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap(),
+    );
+    let supervisor = intentd_sitter::supervisor::read_live_pid(&fixture.paths.pid_path).unwrap();
+    kill(supervisor, Signal::SIGKILL).unwrap();
+    wait_until("orphan adoption", Duration::from_secs(5), || {
+        waitid(
+            Id::Pid(daemon),
+            WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+        )
+        .is_ok()
+    });
+    let _orphan = AdoptedDaemon(daemon, supervisor);
+    if ready {
+        fs::write(dir.path().join("ready"), daemon.to_string()).unwrap();
+    }
+    caller.signal(Signal::SIGCONT).unwrap();
+    let status = caller
+        .wait_with_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    wait_until("owned orphan termination", Duration::from_secs(1), || {
+        waitid(
+            Id::Pid(daemon),
+            WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+        )
+        .is_ok_and(|status| status != WaitStatus::StillAlive)
+    });
+    assert!(
+        !status.success(),
+        "a dead supervisor cannot count as a ready supervised launch"
+    );
+    assert!(
+        unrelated.try_wait().unwrap().is_none(),
+        "cleanup must not signal unrelated sessions"
+    );
+    assert!(
+        !fixture.paths.pid_path.exists(),
+        "dead owned PID record must be removed"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn background_start_rejects_and_cleans_ready_orphan_after_supervisor_death() {
+    supervisor_death_during_startup(true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn background_start_cleans_unready_orphan_after_supervisor_death() {
+    supervisor_death_during_startup(false);
+}
