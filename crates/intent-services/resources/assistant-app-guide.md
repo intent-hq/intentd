@@ -176,7 +176,7 @@ unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
 ## Custom homepage views
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/custom-views/components/{CustomViewsSidebar,CustomViewPanel,CustomViewForm}.svelte; src/features/custom-views/main/custom-views.service.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/custom-views/components/{CustomViewsSidebar,CustomViewPanel,CustomViewForm}.svelte; src/features/custom-views/main/custom-views.service.ts; src/shared/custom-view-sdk/index.ts; examples/custom-view-theme/; messages/en.json. -->
 
 Custom homepage views are an experimental desktop feature. Discuss them when the
 user asks about building or testing a custom view. In **Home → Workspaces**, use
@@ -196,6 +196,24 @@ a dialog. Switching homepage sections keeps the server running; editing, removin
 or quitting the app stops it. An occupied port or failed command shows an error;
 check the view's server output before retrying. Custom pages do not receive the
 app's workspace or agent tools.
+
+Custom view authors can use the experimental, local **@intent/custom-view-sdk**
+package to receive Intent's current design tokens and live theme changes. In the
+frontend checkout, run `corepack pnpm run build:custom-view-sdk`, then install
+`/absolute/path/to/cloudlands-fe/sdk/custom-view` in the custom app. Import
+`createCustomViewTheme` from `@intent/custom-view-sdk` and call it once. It applies
+CSS variables to the page root; `getSnapshot()` returns the same tokens as a
+JSON-compatible object, and `subscribe(listener)` receives changes. Call
+`dispose()` when the view unmounts. Use `{ applyCss: false }` for JSON only.
+Color tokens keep their existing format, such as `hsl(var(--background))`.
+Font-family tokens do not load font files; custom apps must provide those assets.
+
+The SDK expects the packaged app's `app://workspaces` parent origin. For a web or
+development host, pass its exact origin as `parentOrigin`. It only exchanges theme
+data; it does not grant access to workspace or agent APIs. A runnable example lives
+in `examples/custom-view-theme/`: after building the SDK, register the frontend
+checkout as the server directory, `node examples/custom-view-theme/server.mjs` as
+the command, and `4317` as the port.
 
 ## Inspect a failed response and recover
 
