@@ -188,7 +188,8 @@ computer.
 Opening a view starts its server and embeds its page. The command receives the
 configured port as `PORT`; it must listen on that port and permit iframe embedding.
 The view opens in a tab with its name beside **Workspaces**, **PRs**, and **Linear**.
-Switch to another tab and use the named tab to return to the view.
+Switching to another tab hides the named tab. Reopen the view from **Custom views**
+in the sidebar.
 Open the view's **…** menu for **Edit view**, **Start server** or **Stop server**,
 **Reload**, **Server logs**, and **Remove view**. **Server logs** opens the output in
 a dialog. Switching homepage sections keeps the server running; editing, removing,
