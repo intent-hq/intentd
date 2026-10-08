@@ -5444,6 +5444,16 @@ impl AgentManager {
         // is enabled, including pinned harnesses with stateSnapshot off.
         // Neither decoration dismisses an attention request.
         let snapshot_line = self.services.agent_state_snapshot_line(agent_id).await;
+        let recovery_guidance = self
+            .services
+            .agent_blocker_recovery_guidance(agent_id)
+            .await;
+        let state_context = match (snapshot_line, recovery_guidance) {
+            (Some(snapshot), Some(guidance)) => Some(format!("{snapshot}\n{guidance}")),
+            (Some(snapshot), None) => Some(snapshot),
+            (None, Some(guidance)) => Some(guidance.to_string()),
+            (None, None) => None,
+        };
         // Workspace setup-stage notice (§6.5): sits between the snapshot line
         // and the Context block, ahead of the user content, so an agent whose
         // turn starts while the setup script is still running (the create-time
@@ -5461,7 +5471,7 @@ impl AgentManager {
         let prompt_text =
             crate::harness::latest().compose_turn_prompt(&crate::harness::TurnEnvelopeParams {
                 first_turn_prepend: prepend.as_deref(),
-                snapshot_line: snapshot_line.as_deref(),
+                snapshot_line: state_context.as_deref(),
                 setup_notice: setup_notice.as_deref(),
                 stdin_context,
                 naming_nudge: naming.as_deref(),

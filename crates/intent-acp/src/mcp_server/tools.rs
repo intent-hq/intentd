@@ -2411,7 +2411,11 @@ mod tests {
             (&["ws.browser."], |f| f.browser_automation = false),
             (&["ws.app.question."], |f| f.structured_questions = false),
             (
-                &["ws.agent.requestDiscussion", "ws.agent.reportBlocker"],
+                &[
+                    "ws.agent.requestDiscussion",
+                    "ws.agent.reportBlocker",
+                    "ws.agent.resolveBlocker",
+                ],
                 |f| f.attention_requests = false,
             ),
             (

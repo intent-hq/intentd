@@ -13086,25 +13086,27 @@ impl Services {
     pub(crate) async fn agent_state_snapshot_line(&self, agent_id: &AgentId) -> Option<String> {
         let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
         let features = self.session_agent_features(&session);
-        // Live guidance reaches already-pinned harnesses without changing
-        // their immutable doctrine. It does not itself dismiss attention.
-        let recovery = (features.attention_requests
-            && session.attention_request_kind.as_deref() == Some("blocker"))
-            .then_some("After confirming recovery, call ws.agent.resolveBlocker(reason) with evidence to clear your own blocker. Ordinary automatic wakes do not clear it; keep genuine blockers pending.");
         if !features.state_snapshot {
-            return recovery.map(str::to_string);
+            return None;
         }
         let snapshot = self.build_agent_snapshot(&session).await.ok()?;
         if snapshot.is_trivial() {
-            return recovery.map(str::to_string);
+            return None;
         }
         let json = serde_json::to_string(&snapshot).ok()?;
-        let mut line = crate::harness::latest().snapshot_line(&json);
-        if let Some(recovery) = recovery {
-            line.push('\n');
-            line.push_str(recovery);
-        }
-        Some(line)
+        Some(crate::harness::latest().snapshot_line(&json))
+    }
+
+    /// Live recovery guidance is independent of snapshot injection.
+    pub(crate) async fn agent_blocker_recovery_guidance(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<&'static str> {
+        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
+        let features = self.session_agent_features(&session);
+        (features.attention_requests
+            && session.attention_request_kind.as_deref() == Some("blocker"))
+            .then_some("After confirming recovery, call ws.agent.resolveBlocker(reason) with evidence to clear your own blocker. Ordinary automatic wakes do not clear it; keep genuine blockers pending.")
     }
 
     /// `agent.diagnostics`: a sanitized snapshot of agent statuses,
