@@ -2402,18 +2402,21 @@ const INTENTD_MCP_BRIDGE_ADDR_ENV: &str = "INTENTD_MCP_BRIDGE_ADDR";
 
 /// Bundled pi extension source (MCP bridge client + tool registration),
 /// embedded at build time and written to a per-agent temp file at spawn.
-#[cfg(unix)]
 const PI_MCP_EXTENSION_SOURCE: &str = include_str!("pi_mcp_extension.ts");
+
+#[cfg(windows)]
+const PI_MCP_WRAPPER_SOURCE: &str = include_str!("pi_mcp_wrapper.cmd");
 
 /// Per-agent pi-extension MCP delivery files: the bundled extension plus a
 /// wrapper script that execs the real pi binary with `-e <extension>`. Both
 /// live in the temp dir for the lifetime of the owning agent handle (same
 /// pattern as the generated `--mcp-config`).
 struct PiExtensionDelivery {
-    /// Held for its temp-file lifetime only — the wrapper script carries the
-    /// path, so nothing reads this field after construction.
+    /// Held for the wrapper's lifetime; Windows also passes its path via env.
     _extension: TempConfigFile,
     wrapper: TempConfigFile,
+    #[cfg(windows)]
+    real_pi_command: String,
 }
 
 impl PiExtensionDelivery {
@@ -2447,18 +2450,46 @@ impl PiExtensionDelivery {
         })
     }
 
-    /// The delivery relies on an executable `#!/bin/sh` wrapper; there is no
-    /// non-unix equivalent, so fail with a clear error instead of spawning pi
-    /// with a script it cannot execute.
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn write(real_pi_command: &str, dir: &Path) -> Result<Self> {
+        if real_pi_command.contains(['"', '\r', '\n', '\0']) {
+            return Err(Error::InvalidInput(
+                "Pi command must be a command name or a path without quotes or line breaks"
+                    .to_string(),
+            ));
+        }
+        let extension_path = dir.join(format!("intentd-pi-ext-{}.ts", Uuid::new_v4()));
+        std::fs::write(&extension_path, PI_MCP_EXTENSION_SOURCE)
+            .map_err(|e| Error::Internal(format!("write pi extension failed: {e}")))?;
+        let extension = TempConfigFile {
+            path: extension_path,
+        };
+        let wrapper_path = dir.join(format!("intentd-pi-wrapper-{}.cmd", Uuid::new_v4()));
+        std::fs::write(&wrapper_path, PI_MCP_WRAPPER_SOURCE)
+            .map_err(|e| Error::Internal(format!("write pi wrapper failed: {e}")))?;
+        Ok(Self {
+            _extension: extension,
+            wrapper: TempConfigFile { path: wrapper_path },
+            real_pi_command: real_pi_command.to_string(),
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn write(_real_pi_command: &str, _dir: &Path) -> Result<Self> {
         Err(Error::Internal(
-            "pi extension MCP delivery requires a unix host (sh wrapper script)".to_string(),
+            "Pi extension MCP delivery is unsupported on this host".to_string(),
         ))
     }
 
     /// Insert the two spawn env vars: route pi-acp's pi spawn through the
     /// wrapper, and hand the extension the bridge's TCP address.
+    #[cfg_attr(
+        windows,
+        expect(
+            clippy::used_underscore_binding,
+            reason = "Windows passes the retained extension path to the wrapper"
+        )
+    )]
     fn apply_spawn_env(
         &self,
         extra_env: &mut BTreeMap<String, String>,
@@ -2469,6 +2500,17 @@ impl PiExtensionDelivery {
             self.wrapper.path.to_string_lossy().into_owned(),
         );
         extra_env.insert(INTENTD_MCP_BRIDGE_ADDR_ENV.to_string(), bridge_connect_addr);
+        #[cfg(windows)]
+        {
+            extra_env.insert(
+                "INTENTD_PI_COMMAND".to_string(),
+                self.real_pi_command.clone(),
+            );
+            extra_env.insert(
+                "INTENTD_PI_EXTENSION".to_string(),
+                self._extension.path.to_string_lossy().into_owned(),
+            );
+        }
     }
 }
 
@@ -5397,12 +5439,21 @@ impl AgentManager {
         // context/naming/reminder, after only the fire-once FirstTurnPrepend.
         // Rebuilt every turn for ALL agents (specialist and
         // non-specialist, unlike the role reminder) and never persisted.
-        // `agent_state_snapshot_line` gates on the session's captured
-        // harness feature snapshot (`agentFeatures.stateSnapshot`, like
-        // every other toggle) and returns `None` when the toggle is off or
-        // the snapshot is trivial (all counts zero, no pending attention),
-        // leaving the prompt byte-identical to pre-feature output.
+        // Counts follow the captured stateSnapshot feature. A pending
+        // blocker also gets live recovery guidance when attentionRequests
+        // is enabled, including pinned harnesses with stateSnapshot off.
+        // Neither decoration dismisses an attention request.
         let snapshot_line = self.services.agent_state_snapshot_line(agent_id).await;
+        let recovery_guidance = self
+            .services
+            .agent_blocker_recovery_guidance(agent_id)
+            .await;
+        let state_context = match (snapshot_line, recovery_guidance) {
+            (Some(snapshot), Some(guidance)) => Some(format!("{snapshot}\n{guidance}")),
+            (Some(snapshot), None) => Some(snapshot),
+            (None, Some(guidance)) => Some(guidance.to_string()),
+            (None, None) => None,
+        };
         // Workspace setup-stage notice (§6.5): sits between the snapshot line
         // and the Context block, ahead of the user content, so an agent whose
         // turn starts while the setup script is still running (the create-time
@@ -5420,7 +5471,7 @@ impl AgentManager {
         let prompt_text =
             crate::harness::latest().compose_turn_prompt(&crate::harness::TurnEnvelopeParams {
                 first_turn_prepend: prepend.as_deref(),
-                snapshot_line: snapshot_line.as_deref(),
+                snapshot_line: state_context.as_deref(),
                 setup_notice: setup_notice.as_deref(),
                 stdin_context,
                 naming_nudge: naming.as_deref(),
@@ -7170,6 +7221,8 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) {
+        let gate = self.services.attention_mutation_gates.for_agent(agent_id);
+        let _guard = gate.lock().await;
         let ts = now_iso();
         match self
             .services
@@ -20263,7 +20316,7 @@ mod pi_extension_delivery_tests {
     //! Unit tests for the pi-extension MCP delivery spawn assembly: the two
     //! per-agent temp files (bundled extension + 0755 wrapper), the two spawn
     //! env vars, and the capability gate that leaves non-pi providers alone.
-    //! Unix-only, matching the delivery itself (sh wrapper + chmod).
+    //! Unix factory coverage; native Pi runtime E2E exercises the shared Windows CMD asset.
 
     use super::*;
     use std::os::unix::fs::PermissionsExt;

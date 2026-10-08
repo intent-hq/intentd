@@ -1088,6 +1088,7 @@ pub struct Services {
     /// through the ordinary list/get reads). Shared across clones so the
     /// raising op and the turn worker observe the same map.
     deferred_attention: Arc<Mutex<HashMap<AgentId, Vec<DeferredAttention>>>>,
+    attention_mutation_gates: agent_ops::AttentionMutationGates,
     /// Per-note debouncers for `attribute_lines` recomputes (PROTOCOL §5.2.1,
     /// FE parity with `LineAttributionService.scheduleComputation`). Every
     /// content-changing `note.*` mutation schedules a delayed recompute
@@ -1703,6 +1704,7 @@ impl Services {
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),
+            attention_mutation_gates: agent_ops::AttentionMutationGates::default(),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
             last_activity_debounce_gen: Arc::new(Mutex::new(0)),
@@ -11413,6 +11415,28 @@ impl Services {
         expected_version: Option<i64>,
         caller_agent_id: Option<AgentId>,
     ) -> Result<TaskUpdateNoteStatusResult> {
+        self.set_task_note_status_guarded(
+            workspace_id,
+            note_id,
+            new_status,
+            expected_version,
+            caller_agent_id,
+            None,
+        )
+        .await
+    }
+
+    /// Recovery adds a current-session-link predicate to the same conditional
+    /// metadata write. All normal task transitions use the unguarded wrapper.
+    pub(crate) async fn set_task_note_status_guarded(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        new_status: TaskStatus,
+        expected_version: Option<i64>,
+        caller_agent_id: Option<AgentId>,
+        required_link: Option<AgentId>,
+    ) -> Result<TaskUpdateNoteStatusResult> {
         let _mutation = self.workspace_mutations.enter(workspace_id)?;
         let store = &self.store;
         let bus = self.event_bus.as_ref();
@@ -11448,9 +11472,38 @@ impl Services {
         apply_status_transition(&mut task, new_status, &now);
         note.metadata.task = Some(task);
         note.updated_at = now.clone();
-        store
-            .update_note_metadata_versioned(&note, expected_version)
-            .await?;
+        if let Some(agent_id) = required_link {
+            let rev = expected_version.ok_or_else(|| {
+                Error::Internal("linked task recovery requires an observed revision".into())
+            })?;
+            if store
+                .update_note_metadata_if_agent_linked(&note, rev, &agent_id)
+                .await?
+                .is_none()
+            {
+                // A changed note or session link is an ordinary race: no task
+                // events, checkbox materialization, or side effects may fire.
+                let current = fetch_note(store, workspace_id, note_id).await?;
+                let status = current
+                    .metadata
+                    .task
+                    .as_ref()
+                    .map_or(previous_status, |task| task.status);
+                return Ok(TaskUpdateNoteStatusResult {
+                    ok: true,
+                    note_id: current.id.clone(),
+                    status,
+                    note: current,
+                    advisory: Some(
+                        "Task or agent link changed; recovery did not resume this task.".into(),
+                    ),
+                });
+            }
+        } else {
+            store
+                .update_note_metadata_versioned(&note, expected_version)
+                .await?;
+        }
         // Mirror `notes.service.ts`: emit only when the status actually changed.
         let all = if previous_status == new_status {
             None
@@ -31349,6 +31402,19 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
             self.agent_request_attention_op(workspace_id, kind, reason, caller_agent_id)
+                .await
+        })
+    }
+
+    fn agent_resolve_blocker(
+        &self,
+        workspace_id: WorkspaceId,
+        reason: String,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            self.agent_resolve_blocker_op(workspace_id, reason, caller_agent_id)
                 .await
         })
     }

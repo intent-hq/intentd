@@ -2874,8 +2874,8 @@ impl Store {
         // the same grounds: `set_agent_effort_levels` (called at session
         // open) is its only post-insert mutator, so a stale in-memory session
         // persisted here cannot wipe freshly discovered levels.
-        // Those two attention writers are
-        // the only post-insert mutators of the attention columns.
+        // The narrow attention writers (raise, turn-begin clear and conditional
+        // blocker recovery) are the only post-insert mutators of those columns.
         // `notifications_muted` (0123) is excluded for the same reason: it is
         // a user toggle changed only by explicit scoped patches, so a
         // concurrent or long-lived in-memory session persisted here without
@@ -3776,6 +3776,37 @@ impl Store {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// Clear only the blocker observed by the resolver. A replacement request
+    /// (including a discussion) survives this conditional write.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_blocker_request_if_matches(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        reason: &str,
+        timestamp: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET attention_request_kind=NULL, \
+             attention_request_reason=NULL, attention_request_timestamp=NULL, updated_at=? \
+             WHERE id=? AND workspace_id=? AND attention_request_kind='blocker' \
+             AND attention_request_reason=? AND attention_request_timestamp IS ?",
+        )
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(reason)
+        .bind(timestamp)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("resolve blocker failed: {e}")))?
+        .rows_affected();
+        Ok(rows != 0)
     }
 
     /// Replace the session's `effort_levels` wholesale (PROTOCOL §5.5,

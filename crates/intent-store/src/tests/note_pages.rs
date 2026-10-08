@@ -12,6 +12,7 @@ use std::sync::{
 };
 
 mod anchor_lifecycle;
+mod guarded_metadata;
 mod plain_markdown;
 mod writer_anchors;
 

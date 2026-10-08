@@ -70,7 +70,9 @@ Open Settings and use these sidebar labels (English labels shown):
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
-For MCP configuration, open **Connections → MCP servers**; its reference route is `/settings?tab=connections#mcp-servers`.
+<!-- Source: packages/intentd/crates/intent-services/src/mcp_servers.rs. -->
+
+For MCP configuration, open **Connections → MCP servers**; its reference route is `/settings?tab=connections#mcp-servers`. When MCP is enabled, saving edits to an enabled server reconnects the daemon using the saved settings, including a changed URL. Disabled servers stay disabled; an unreachable URL shows a connection error.
 
 ## Choose a model or change agent behavior
 
@@ -135,11 +137,94 @@ agent conversations. Resolve any displayed repository, Git, or provider setup
 error before retrying. If creation succeeded but sending the first message failed,
 use the form's retry instruction instead of creating a second workspace.
 
+<!-- Sources: packages/intentd/crates/intent-services/src/lib.rs (SETUP_TERMINAL_NAME); packages/intentd/crates/intent-pty/src/host.rs. -->
+
+Workspace setup runs in the **Setup Script** terminal and can finish without that
+terminal being open. If setup stays running, inspect its last output before
+retrying. Include that output, the Intent version, and the operating system when
+reporting the problem.
+
 To continue work, open its existing card or sidebar entry, then the existing agent's
 conversation. Read its status and last response before sending a follow-up. Use
 **Create new agent** in that workspace only when a separate conversation is needed;
 choose a specialist and model where offered. A specialist defines reusable behavior;
 an agent is a particular conversation doing work.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/HomeAssistantThreads.svelte; src/lib/components/layout/sidebar-nav/cards/ChiefCard.svelte; src/lib/components/chat/AssistantThreadTitle.svelte. -->
+
+In **Home → Assistant**, select a thread in the sidebar. To rename it, click its
+title in the conversation header. The title field uses the available header width.
+Press **Enter** or click away to save; press **Escape** to cancel. Sidebar titles
+select conversations and cannot be edited there.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeIntegrations,HomePullSummary,HomePullCode}.svelte; messages/en.json. -->
+
+In **Home → Pull requests**, select a PR to open its preview. **Summary** shows
+reviews and check status counts; expand the overview to inspect individual checks in
+open status groups. Collapse a group to hide its checks. **Code** lists changed
+files with their directory paths. Search by filename or path, then click a file to
+expand its diff in place. Multiple files
+can stay open, and the preview scrolls through them together. If a patch is
+unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
+
+## Inspect a failed response and recover
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,ChatPanel}.svelte; messages/en.json. -->
+
+In the existing conversation, **Couldn't complete this response** summarizes a
+stopped response. Open **Details** to inspect the technical error, then **Copy
+details** to copy it. **Needs attention** means action is needed; choose **Retry**
+when offered. **Queued** means a message is in the queue, not that a retry is
+scheduled. Inspect that message and use its available controls before sending
+another copy. Active work keeps its normal **Thinking** or activity status; do not
+infer a retry from that status alone. Controls depend on the conversation's state
+and your access.
+
+Earlier failures may appear as **1 recorded failure** or **N recorded failures**.
+Expand that label to inspect the saved errors and timestamps and use **Copy
+details**. These are counts of recorded notices, not total attempts or proof that
+all failures belong to the same request. A historical notice alone does not mean
+the agent is still failing; check the current status and latest response.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/agent_ops.rs (agent_resolve_blocker_op); packages/cloudlands-fe/src/shared/utils/agent-attention.ts. -->
+
+A current blocker warning means an agent reported a problem that prevents work.
+After confirming recovery, the agent can clear its warning while a release or
+scheduled check is still pending. A recorded blocker notice can remain in the
+conversation after the current warning clears.
+
+Follow specific recovery guidance when shown: **Retry with [model]** uses the
+offered available model; **Retry on [provider]** switches away from a provider
+whose usage limit was reached. For sign-in errors, run the displayed CLI login
+command; signing in to the Claude desktop app does not sign in its CLI. For
+**Agent session corrupted**, retry starts a fresh session and carries over the
+conversation history. Do not promise a model or provider switch unless the UI
+offers it; inspect **Settings → Providers** for setup problems.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/{pi_cli.rs,agent_manager.rs,pi_mcp_wrapper.cmd}; packages/intentd/crates/intent-providers/src/config.rs. -->
+
+Pi requires the installed Pi CLI version shown in **Providers**. Intent supplies
+its workspace tools automatically and keeps user-installed Pi extensions enabled.
+If Pi works in a terminal but fails in Intent, copy the conversation's failure
+details and check the CLI found by **Providers**. A Windows error saying Pi MCP
+delivery requires a Unix host comes from an older Intent build; changing the
+workspace setup script does not resolve it.
+
+## Restore workspace browser use
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/store/renderer/slices/browser-clients/browser-clients-selectors.ts; messages/en.json. -->
+
+The workspace sidebar warns when its primary browser client is offline, even if
+the workspace has no browser tabs yet. Hover over the warning for recovery help:
+agent browser tabs and tunnels fail until that client reconnects or another
+connected, browser-capable client is set as primary.
+
+To switch, open the workspace in the client you want to use, open the workspace
+sidebar's menu, choose **Set Current Client as Primary**, and confirm **Set as
+Primary**. This moves agent-owned tabs to that client without preserving page
+state; tabs you opened yourself stay where they are. The action depends on the
+current client's browser capability and your access. Do not promise automatic
+failover or change the primary client without the user's instruction.
 
 ## Add context, run a task, and find results
 

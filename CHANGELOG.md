@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.32] - 2026-10-08
+
+### 🐛 Bug Fixes
+
+- Support Windows Pi tools and headless workspace setup ([#2346](https://github.com/intent-hq/intentd/pull/2346))
+
+### 📚 Documentation
+
+- Explain Home pull request previews ([#2348](https://github.com/intent-hq/intentd/pull/2348))
+
+
+## [0.10.31] - 2026-10-07
+
+### 📚 Documentation
+
+- Explain assistant thread title editing ([#2345](https://github.com/intent-hq/intentd/pull/2345))
+
+
+## [0.10.30] - 2026-10-07
+
+### 📚 Documentation
+
+- Explain conversation failure recovery ([#2341](https://github.com/intent-hq/intentd/pull/2341))
+
+
+## [0.10.29] - 2026-10-07
+
+### 🚀 Features
+
+- Add optional provider access token settings ([#2342](https://github.com/intent-hq/intentd/pull/2342))
+
+### 🐛 Bug Fixes
+
+- Reconnect enabled MCP servers when saving edits ([#2340](https://github.com/intent-hq/intentd/pull/2340))
+
+
+## [0.10.28] - 2026-10-07
+
+### 📚 Documentation
+
+- Explain primary browser client offline recovery ([#2337](https://github.com/intent-hq/intentd/pull/2337))
+
+
 ## [0.10.27] - 2026-10-06
 
 ### 🚀 Features

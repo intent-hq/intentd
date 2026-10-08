@@ -3006,6 +3006,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Explicit, self-scoped recovery of the caller's pending blocker.
+    /// Discussions are never cleared; a nonblank recovery reason is required.
+    fn agent_resolve_blocker(
+        &self,
+        workspace_id: WorkspaceId,
+        reason: String,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, reason, caller_agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_resolve_blocker not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.getSubscriptions`: `{ subscriptions, delegationGroups, agentStatuses }`
     /// (PROTOCOL §5.5).
     fn agent_get_subscriptions(

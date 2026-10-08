@@ -1617,7 +1617,7 @@ impl<'a> McpServersService<'a> {
     }
 
     /// `mcp.servers.update` → replace an existing definition; `{ server }`
-    /// (redacted). A running server is restarted to apply the new config.
+    /// (redacted). An eligible enabled server reconnects, even if stopped.
     ///
     /// `env`/`headers` values equal to the redaction placeholder (what `list`
     /// returns) keep the stored secret for that key; a placeholder for a key
@@ -1634,13 +1634,17 @@ impl<'a> McpServersService<'a> {
         let normalized = merge_redacted_secrets(normalize_config(config, Some(server_id))?, stored);
         configs.insert(server_id.to_string(), normalized.clone());
         write_configs(self.secrets, &configs).await?;
-        // Apply live: any tracked server (running, or a remote in `error` or
-        // `auth_required`) picks up the new definition on restart. A failed
-        // remote must re-probe updated credentials, not keep the old config.
-        let tracked = self.hub.status(server_id)["state"] != "stopped";
-        if tracked {
-            let enable = enable_user_servers(&self.effective());
-            self.hub.restart(normalized.clone(), enable).await;
+        // Apply the saved definition using configured eligibility, not the
+        // transient runtime state. An enabled server may have no hub entry
+        // after creation or a failed launch; saving must reconnect it too.
+        let settings = self.effective();
+        let enabled = normalized["enabled"].as_bool().unwrap_or(false)
+            && enable_user_servers(&settings)
+            && !disabled_servers(&settings).iter().any(|id| id == server_id);
+        if enabled {
+            self.hub.restart(normalized.clone(), true).await;
+        } else {
+            self.hub.stop(server_id).await;
         }
         Ok(json!({ "server": redact_config(&normalized) }))
     }
@@ -3749,6 +3753,185 @@ for line in sys.stdin:
         assert_eq!(h.status("r-upd")["state"], json!("running"));
     }
 
+    // Verify forwarding, not just the saved definition or lifecycle status.
+    async fn assert_endpoint(s: &McpServersService<'_>, id: &str, endpoint: &str) {
+        let tools = s.agent_list_tools(None, id).await.unwrap();
+        assert_eq!(tools["tools"][0]["name"], "t1");
+        let result = s
+            .agent_call_tool(None, id, "t1", json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], endpoint);
+    }
+
+    #[tokio::test]
+    async fn url_save_switches_live_tool_endpoint() {
+        let (a, guard_a) = http_tool_stub_named(None, None, "endpoint-a").await;
+        let (b, guard_b) = http_tool_stub_named(None, None, "endpoint-b").await;
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let s = svc(None, &secrets, &h);
+        s.create(remote_cfg("edit", "http", &a)).await.unwrap();
+        s.toggle("edit", true).await.unwrap();
+        assert_endpoint(&s, "edit", "endpoint-a").await;
+        s.update("edit", remote_cfg("edit", "http", &b))
+            .await
+            .unwrap();
+        assert_endpoint(&s, "edit", "endpoint-b").await;
+        guard_a.abort();
+        guard_b.abort();
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn url_save_reconnects_enabled_stopped_server() {
+        use intent_core::WorkspaceApi;
+        let (a, guard_a) = http_tool_stub_named(None, None, "endpoint-a").await;
+        let (b, guard_b) = http_tool_stub_named(None, None, "endpoint-b").await;
+        let dir = crate::test_support::test_tempdir("mcp-stopped-url-save-");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let services = crate::Services::new_with_file_secrets(
+            store,
+            intent_core::FileSecretStore::with_path(dir.path().join("secrets.json")),
+        );
+        // The settings client's create path persists enabled=true without
+        // toggling it. Editing that saved server must apply its new endpoint.
+        services
+            .mcp_servers_create(remote_cfg("edit", "http", &a))
+            .await
+            .unwrap();
+        assert_eq!(
+            services
+                .mcp_servers_get_status("edit".into())
+                .await
+                .unwrap()["status"]["state"],
+            "stopped"
+        );
+        let saved = services
+            .mcp_servers_update("edit".into(), remote_cfg("edit", "http", &b))
+            .await
+            .unwrap();
+        assert_eq!(saved["server"]["url"], b);
+        assert_endpoint(&services.mcp_servers_service(), "edit", "endpoint-b").await;
+        services.shutdown_store_writers().await;
+        services.mcp_hub.stop("edit").await;
+        services.store.close().await;
+        guard_a.abort();
+        guard_b.abort();
+    }
+
+    #[tokio::test]
+    async fn url_save_reports_unreachable_endpoint_and_recovers() {
+        let (a, guard_a) = http_tool_stub_named(None, None, "endpoint-a").await;
+        let (b, guard_b) = http_tool_stub_named(None, None, "endpoint-b").await;
+        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = format!("http://{}", unavailable.local_addr().unwrap());
+        drop(unavailable);
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let s = svc(None, &secrets, &h);
+        s.create(remote_cfg("edit", "http", &a)).await.unwrap();
+        s.toggle("edit", true).await.unwrap();
+        assert_endpoint(&s, "edit", "endpoint-a").await;
+        s.update("edit", remote_cfg("edit", "http", &dead))
+            .await
+            .unwrap();
+        assert_eq!(h.status("edit")["state"], "error");
+        assert!(s
+            .agent_call_tool(None, "edit", "t1", json!({}), None)
+            .await
+            .is_err());
+        s.update("edit", remote_cfg("edit", "http", &b))
+            .await
+            .unwrap();
+        assert_endpoint(&s, "edit", "endpoint-b").await;
+        guard_a.abort();
+        guard_b.abort();
+    }
+
+    #[tokio::test]
+    async fn url_save_preserves_disable_gates() {
+        for (gate, running) in [
+            ("server", false),
+            ("master", false),
+            ("disabled-list", false),
+            ("server", true),
+            ("master", true),
+            ("disabled-list", true),
+        ] {
+            let (url, guard) = http_tool_stub_named(None, None, "endpoint-b").await;
+            let (reg, _cfg) = temp_registry();
+            let secrets = mem_async();
+            let h = McpHub::new();
+            let s = svc(Some(&reg), &secrets, &h);
+            let mut config = remote_cfg("edit", "http", &url);
+            s.create(config.clone()).await.unwrap();
+            if running {
+                s.toggle("edit", true).await.unwrap();
+                assert_endpoint(&s, "edit", "endpoint-b").await;
+            }
+            if gate == "server" {
+                config["enabled"] = json!(false);
+            }
+            if gate == "master" {
+                reg.apply(&[("mcp.enableUserServers".into(), json!(false))])
+                    .unwrap();
+            }
+            if gate == "disabled-list" {
+                set_disabled_servers(Some(&reg), &["edit".into()]).unwrap();
+            }
+            config["url"] = json!(format!("{url}/saved"));
+            let saved = s.update("edit", config.clone()).await.unwrap();
+            assert_eq!(saved["server"]["enabled"], config["enabled"], "{gate}");
+            assert_eq!(h.status("edit")["state"], "stopped", "{gate}");
+            assert!(
+                s.agent_call_tool(None, "edit", "t1", json!({}), None)
+                    .await
+                    .is_err(),
+                "{gate}"
+            );
+            guard.abort();
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn url_save_concurrent_requests_keep_saved_and_live_endpoints_aligned() {
+        use intent_core::WorkspaceApi;
+        let (a, guard_a) = http_tool_stub_named(None, None, "endpoint-a").await;
+        let (b, guard_b) = http_tool_stub_named(None, None, "endpoint-b").await;
+        let dir = crate::test_support::test_tempdir("mcp-url-save-");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let services = crate::Services::new_with_file_secrets(
+            store,
+            intent_core::FileSecretStore::with_path(dir.path().join("secrets.json")),
+        );
+        services
+            .mcp_servers_create(remote_cfg("edit", "http", &a))
+            .await
+            .unwrap();
+        services
+            .mcp_servers_toggle("edit".into(), true, None)
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            services.mcp_servers_update("edit".into(), remote_cfg("edit", "http", &b)),
+            services.mcp_servers_update("edit".into(), remote_cfg("edit", "http", &a)),
+        );
+        first.unwrap();
+        second.unwrap();
+        let saved = services.mcp_servers_list(None).await.unwrap();
+        let expected = if saved["servers"][0]["url"] == a {
+            "endpoint-a"
+        } else {
+            "endpoint-b"
+        };
+        assert_endpoint(&services.mcp_servers_service(), "edit", expected).await;
+        services.shutdown_store_writers().await;
+        services.mcp_hub.stop("edit").await;
+        services.store.close().await;
+        guard_a.abort();
+        guard_b.abort();
+    }
+
     #[tokio::test]
     async fn update_restart_receives_merged_secrets_not_placeholder() {
         // The hub restart on update must get the merged (real-secret) config:
@@ -4256,6 +4439,14 @@ for line in sys.stdin:
         required_auth: Option<&str>,
         denied_request: Option<&str>,
     ) -> (String, tokio::task::JoinHandle<()>) {
+        http_tool_stub_named(required_auth, denied_request, "http-ok").await
+    }
+
+    async fn http_tool_stub_named(
+        required_auth: Option<&str>,
+        denied_request: Option<&str>,
+        endpoint: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let required_auth = required_auth.map(String::from);
@@ -4299,7 +4490,11 @@ for line in sys.stdin:
                                 )
                             } else {
                                 ok_json_response(
-                                    r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"http-ok"}]}}"#,
+                                    &json!({
+                                        "jsonrpc": "2.0", "id": 2,
+                                        "result": {"content": [{"type": "text", "text": endpoint}]},
+                                    })
+                                    .to_string(),
                                 )
                             }
                         } else {
