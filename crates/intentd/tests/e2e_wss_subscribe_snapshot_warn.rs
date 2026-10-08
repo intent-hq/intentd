@@ -372,10 +372,10 @@ where
 /// grow SQL statement count.
 #[tokio::test]
 async fn workspace_list_and_subscribe_statement_counts_are_constant_over_wss() {
-    // Ten bulk workspace/aggregate reads, one indexed invitation-expiry
-    // probe, and one scalar membership projection. No invitations are due
-    // in this fixture; expiry maintenance is covered by the store tests.
-    const MAX_STATEMENTS: u64 = 12;
+    // Ten bulk workspace/aggregate reads, one batched reminder-state read,
+    // one indexed invitation-expiry probe, and one membership projection.
+    // No invitations are due; expiry maintenance is covered by store tests.
+    const MAX_STATEMENTS: u64 = 13;
     let (daemon, port, cfg, socket) = boot(
         "itd-wscost",
         &[
@@ -440,6 +440,20 @@ async fn workspace_list_and_subscribe_statement_counts_are_constant_over_wss() {
             snapshot.as_array().expect("workspace snapshot rows").len(),
             usize::try_from(target).unwrap()
         );
+        for rows in [
+            listed["result"]["workspaces"].as_array().unwrap(),
+            snapshot.as_array().unwrap(),
+        ] {
+            for row in rows {
+                let reminder = &row["attentionReminder"];
+                assert!(
+                    reminder["reasons"].as_array().is_some_and(Vec::is_empty),
+                    "fresh workspace reminder: {row}"
+                );
+                assert_eq!(reminder["dismissed"], json!(false));
+                assert_eq!(reminder["displayStatus"], row["displayStatus"]);
+            }
+        }
 
         let segment = await_profile_rows(
             &log_path,
@@ -470,13 +484,22 @@ async fn workspace_list_and_subscribe_statement_counts_are_constant_over_wss() {
         [1, 10, 100]
     );
     let (_, baseline_list, baseline_subscribe) = observed[0];
-    for (target, list_count, subscribe_count) in observed {
+    for (target, list_count, subscribe_count) in &observed {
         assert_eq!(
-            (list_count, subscribe_count),
+            (*list_count, *subscribe_count),
             (baseline_list, baseline_subscribe),
             "statement counts must stay constant at {target} rows"
         );
     }
+    eprintln!(
+        "workspace cost evidence: {}",
+        json!({
+            "maxStatements": MAX_STATEMENTS,
+            "measurements": observed.iter().map(|(rows, list, subscribe)| {
+                json!({"workspaces": rows, "list": list, "subscribe": subscribe})
+            }).collect::<Vec<_>>()
+        })
+    );
 }
 
 /// End-to-end: with the threshold lowered to 0, a real `note.subscribe` over
