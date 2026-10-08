@@ -165,6 +165,15 @@ impl RestartControl {
         })
     }
     pub(crate) fn open(pid: u32, process: &Process, dir: &Path) -> io::Result<Self> {
+        // Numeric liveness is only a duplicate-start guard. Before opening any
+        // control event, bind this retained handle to this instance's saved
+        // identity. A legacy/mismatched record must not target a reused PID.
+        if !process.matches_record(&dir.join("sitter.pid"), pid) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refusing to control unverified supervisor",
+            ));
+        }
         let time = process.creation_time()?;
         let open = |name: String| {
             let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
@@ -344,10 +353,20 @@ mod tests {
     }
 
     #[test]
-    fn restart_events_require_explicit_completion_and_consume_requests() {
+    fn restart_events_reject_foreign_identity_and_require_explicit_completion() {
         let dir = tempfile::tempdir().unwrap();
         let control = RestartControl::create(dir.path()).unwrap();
         let process = Process::open(std::process::id(), false).unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_pid = foreign.path().join("sitter.pid");
+        let pid = std::process::id();
+        std::fs::write(&foreign_pid, pid.to_string()).unwrap();
+        assert!(RestartControl::open(pid, &process, foreign.path()).is_err());
+        std::fs::write(foreign_pid.with_extension("identity"), format!("{pid}:0")).unwrap();
+        assert!(RestartControl::open(pid, &process, foreign.path()).is_err());
+        assert!(!control.take_stop().unwrap());
+        assert_eq!(control.take_request().unwrap(), None);
+        publish_identity(&dir.path().join("sitter.pid")).unwrap();
         let client = RestartControl::open(std::process::id(), &process, dir.path()).unwrap();
         client.request_stop().unwrap();
         assert!(control.take_stop().unwrap());

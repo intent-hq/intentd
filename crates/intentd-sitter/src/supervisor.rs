@@ -314,7 +314,9 @@ pub fn read_live_pid(path: &Path) -> Option<WindowsPid> {
         .parse::<u32>()
         .ok()
         .filter(|pid| *pid > 0)?;
-    // Access denied is not proof of death: refuse duplicate startup.
+    // This is a conservative duplicate-start guard, not proof of ownership.
+    // Windows control validates the saved identity on its retained handle before
+    // opening any events. Access denied is not proof of death.
     let alive = crate::windows::Process::open(pid, false)
         .and_then(|process| process.exited())
         .map_or_else(|error| error.raw_os_error() != Some(87), |exited| !exited);

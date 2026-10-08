@@ -166,6 +166,58 @@ async fn detached_sitter_lifecycle_over_wss() {
         first_pid
     );
     invoke("status");
+    #[cfg(windows)]
+    {
+        // Instance A's stale numeric PID must never control live instance B.
+        let foreign = common::test_tempdir("intentd-stale-supervisor-");
+        let foreign_paths = SitterPaths::from_data_dir(foreign.path());
+        std::fs::create_dir_all(&foreign_paths.sitter_dir).unwrap();
+        let supervisor_pid = std::fs::read_to_string(&paths.pid_path).unwrap();
+        let supervisor =
+            intentd_sitter::windows::Process::open(supervisor_pid.trim().parse().unwrap(), false)
+                .unwrap();
+        let daemon =
+            intentd_sitter::windows::Process::open(first_pid.trim().parse().unwrap(), false)
+                .unwrap();
+        std::fs::write(&foreign_paths.pid_path, &supervisor_pid).unwrap();
+        for missing_identity in [true, false] {
+            if !missing_identity {
+                std::fs::write(
+                    foreign_paths.pid_path.with_extension("identity"),
+                    format!("{}:0", supervisor_pid.trim()),
+                )
+                .unwrap();
+            }
+            for verb in ["stop", "restart"] {
+                let mut command = make_command(verb);
+                command
+                    .env("INTENTD_DATA_DIR", foreign.path())
+                    .env("INTENTD_CONFIG", foreign.path().join("config.toml"))
+                    .env("INTENTD_SITTER_READINESS_TIMEOUT_MS", "1000");
+                common::hermetic_fixture_identity(&mut command, foreign.path());
+                let mut child = GuardedChild::spawn(&mut command).unwrap();
+                assert!(!child
+                    .wait_with_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .expect("foreign control must fail promptly")
+                    .success());
+                assert!(
+                    !supervisor.exited().unwrap(),
+                    "foreign stop killed supervisor"
+                );
+                assert!(!daemon.exited().unwrap(), "foreign control replaced daemon");
+                assert_eq!(
+                    std::fs::read_to_string(&paths.pid_path).unwrap(),
+                    supervisor_pid
+                );
+                assert_eq!(
+                    std::fs::read_to_string(data.join("intentd.pid")).unwrap(),
+                    first_pid
+                );
+                invoke("status");
+            }
+        }
+    }
     for restarted in [false, true] {
         if restarted {
             invoke("restart");

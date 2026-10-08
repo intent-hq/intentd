@@ -41,6 +41,7 @@ def main():
         require_passed(run(["cargo", "test", "--locked", "-p", "intentd-sitter", "--lib", "--", "--exact", "startup::tests::dead_supervisor_cleanup_closes_descendant_pipe"], env))
         require_passed(run(["cargo", "test", "--locked", "-p", "intentd-sitter", "--test", "supervisor_e2e", "background_start"], env))
     else:
+        require_passed(run(["cargo", "test", "--locked", "-p", "intentd-sitter", "--lib", "--", "--exact", "windows::tests::restart_events_reject_foreign_identity_and_require_explicit_completion"], env))
         require_passed(run(["cargo", "test", "--locked", "-p", "intentd", "--test", "e2e_detached_lifecycle", "windows_"], env))
     require_passed(run(["cargo", "test", "--locked", "-p", "intentd", "--test", "e2e_detached_lifecycle", "--", "--ignored", "--exact", "detached_sitter_lifecycle_over_wss", "--nocapture"], env))
 
