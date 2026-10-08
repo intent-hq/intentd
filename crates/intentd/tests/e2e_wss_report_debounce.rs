@@ -392,9 +392,60 @@ async fn set_debounce(rpc: &mut TlsWs, id: i64, seconds: u64) {
     );
 }
 
-/// Serialize a conversation row's `contentBlocks` for substring assertions.
+/// Rendered text only: content-block metadata is not part of the message body.
 fn blocks_text(message: &Value) -> String {
-    serde_json::to_string(&message["contentBlocks"]).unwrap_or_default()
+    let blocks = message["contentBlocks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("contentBlocks must be an array: {message}"));
+    let text = blocks
+        .iter()
+        .filter(|block| block["type"] == "text")
+        .map(|block| {
+            block["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("text block must carry string text: {block}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !text.trim().is_empty(),
+        "message must carry nonempty rendered text: {message}"
+    );
+    text
+}
+
+fn assert_report_metadata(row: &Value, event_type: &str, report: &str) {
+    let events = row["metadata"]["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("wake metadata must carry events: {row}"));
+    let event = events
+        .iter()
+        .find(|event| event["type"] == event_type)
+        .unwrap_or_else(|| panic!("wake must carry {event_type}: {row}"));
+    for alias in ["completionReport", "report"] {
+        assert_eq!(
+            event["data"][alias].as_str(),
+            Some(report),
+            "{event_type} metadata retains {alias}: {event}"
+        );
+    }
+}
+
+fn save_receipt(scenario: &str, observations: Value) {
+    let Some(dir) = std::env::var_os("REPORT_DEBOUNCE_RECEIPT_DIR") else {
+        return;
+    };
+    std::fs::create_dir_all(&dir).expect("create report-debounce receipt directory");
+    std::fs::write(
+        Path::new(&dir).join(format!("{scenario}.json")),
+        serde_json::to_vec_pretty(&json!({
+            "scenario": scenario,
+            "result": "pass",
+            "observations": observations,
+        }))
+        .expect("serialize report-debounce receipt"),
+    )
+    .expect("write repeatable report-debounce receipt");
 }
 
 /// The `agent.getConversation` page for an agent.
@@ -513,8 +564,8 @@ async fn wake_rows_serialized(
         .expect("messages array")
         .iter()
         .filter(|m| m["role"] == "user")
+        .filter(|m| blocks_text(m).contains("[WORKSPACE EVENTS]"))
         .map(std::string::ToString::to_string)
-        .filter(|t| t.contains("[WORKSPACE EVENTS]"))
         .collect()
 }
 
@@ -686,9 +737,11 @@ async fn debounced_report_combined_with_completion_wake_over_wss() {
         .iter()
         .find(|r| r.contains("completed."))
         .unwrap_or_else(|| panic!("combined terminal wake row present: {rows:?}"));
+    let combined_row: Value = serde_json::from_str(combined).expect("combined wake row json");
+    let combined_text = blocks_text(&combined_row);
     assert!(
-        combined.contains(REPORT),
-        "combined wake text renders the persisted report: {combined}"
+        combined_text.contains(REPORT),
+        "combined wake text renders the persisted report: {combined_text}"
     );
     assert!(
         combined.contains("\"watchStillArmed\":false"),
@@ -701,6 +754,18 @@ async fn debounced_report_combined_with_completion_wake_over_wss() {
     assert!(
         combined.contains("\"eventCount\":2"),
         "combined wake metadata counts both folded events: {combined}"
+    );
+    assert_report_metadata(&combined_row, "agent:reportToParent", REPORT);
+    assert_report_metadata(&combined_row, "agent:idle", REPORT);
+    save_receipt(
+        "debounced-report-combined",
+        json!({
+            "heldProgress": held,
+            "terminal": combined_row,
+            "terminalText": combined_text,
+            "wakeCount": wakes,
+            "heldEntriesAfterSettlement": leftover,
+        }),
     );
 }
 
@@ -818,9 +883,11 @@ async fn immediate_report_wake_when_debounce_disabled_over_wss() {
         .iter()
         .find(|r| r.contains("reported. Report:"))
         .unwrap_or_else(|| panic!("progress wake row present: {rows:?}"));
+    let progress_row: Value = serde_json::from_str(progress).expect("progress wake row json");
+    let progress_text = blocks_text(&progress_row);
     assert!(
-        progress.contains(REPORT),
-        "progress wake carries the report: {progress}"
+        progress_text.contains(REPORT),
+        "progress wake carries the report: {progress_text}"
     );
     assert!(
         progress.contains("\"watchStillArmed\":true"),
@@ -830,6 +897,7 @@ async fn immediate_report_wake_when_debounce_disabled_over_wss() {
         progress.contains("\"eventTypes\":[\"agent:reportToParent\"]"),
         "progress wake metadata carries only the report event: {progress}"
     );
+    assert_report_metadata(&progress_row, "agent:reportToParent", REPORT);
     let terminal = rows
         .iter()
         .find(|r| r.contains("completed."))
@@ -845,11 +913,33 @@ async fn immediate_report_wake_when_debounce_disabled_over_wss() {
     let terminal_row: Value = serde_json::from_str(terminal).expect("terminal wake row json");
     let terminal_text = blocks_text(&terminal_row);
     assert!(
+        terminal_text.contains("[WORKSPACE EVENTS]")
+            && terminal_text.contains("Child agent ZeroChild")
+            && terminal_text.contains("completed."),
+        "terminal wake text identifies the child's completion: {terminal_text}"
+    );
+    assert!(
         terminal_text.contains("already delivered in a previous message"),
         "terminal wake text references the already-delivered report: {terminal_text}"
     );
     assert!(
         !terminal_text.contains(REPORT),
         "terminal wake text does not repeat the delivered report verbatim: {terminal_text}"
+    );
+    assert_eq!(
+        terminal_row["metadata"]["eventTypes"],
+        json!(["agent:idle"]),
+        "terminal wake carries only the idle event: {terminal_row}"
+    );
+    assert_report_metadata(&terminal_row, "agent:idle", REPORT);
+    save_receipt(
+        "immediate-report-separate-completion",
+        json!({
+            "progress": progress_row,
+            "progressText": progress_text,
+            "terminal": terminal_row,
+            "terminalText": terminal_text,
+            "wakeCount": wakes,
+        }),
     );
 }
