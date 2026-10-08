@@ -179,6 +179,34 @@ async fn detached_sitter_lifecycle_over_wss() {
         let daemon =
             intentd_sitter::windows::Process::open(first_pid.trim().parse().unwrap(), false)
                 .unwrap();
+        for option in ["--help", "-h", "--invalid-lifecycle-option"] {
+            let mut command = make_command("stop");
+            command.arg(option);
+            let mut child = GuardedChild::spawn(&mut command).unwrap();
+            assert!(child
+                .wait_with_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_some());
+            let output = child.disarm().wait_with_output().unwrap();
+            let help = option != "--invalid-lifecycle-option";
+            assert_eq!(output.status.success(), help, "{option}: {output:?}");
+            if help {
+                assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
+            }
+            assert!(
+                !supervisor.exited().unwrap(),
+                "stop option killed supervisor"
+            );
+            assert!(!daemon.exited().unwrap(), "stop option killed daemon");
+            assert_eq!(
+                std::fs::read_to_string(&paths.pid_path).unwrap(),
+                supervisor_pid
+            );
+            assert_eq!(
+                std::fs::read_to_string(data.join("intentd.pid")).unwrap(),
+                first_pid
+            );
+        }
         std::fs::write(&foreign_paths.pid_path, &supervisor_pid).unwrap();
         for missing_identity in [true, false] {
             if !missing_identity {

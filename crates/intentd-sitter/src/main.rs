@@ -61,8 +61,9 @@ fn run() -> i32 {
             .collect(),
     };
 
+    // Let the daemon parser handle help and invalid options before any effect.
     #[cfg(windows)]
-    if args.passthrough.first().is_some_and(|arg| arg == "stop") {
+    if args.passthrough.len() == 1 && args.passthrough[0] == "stop" {
         if let Some(code) = intentd_sitter::startup::stop(&paths) {
             return code;
         }
