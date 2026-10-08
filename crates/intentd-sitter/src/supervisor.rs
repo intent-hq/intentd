@@ -551,7 +551,7 @@ impl Supervisor {
                 tokio::select! {
                     biased;
                     event = signals.recv() => match event {
-                        SignalEvent::Shutdown(signal) => { signals.confirm_stop(); return 128 + signal; },
+                        SignalEvent::Shutdown(signal) => { return signals.finish_stop(128 + signal); },
                         // No child exists yet; startup already checks for an
                         // update and will spawn the selected version once.
                         SignalEvent::Restart => {
@@ -711,8 +711,7 @@ impl Supervisor {
                             continue;
                         }
                         FailedStartCheck::Shutdown(code) => {
-                            signals.confirm_stop();
-                            return code;
+                            return signals.finish_stop(code);
                         }
                         FailedStartCheck::RestartRequested => {
                             self.refresh_version_from_state(&mut current_version);
@@ -728,8 +727,7 @@ impl Supervisor {
                     }
                     match self.backoff_sleep(&mut backoff, &mut signals).await {
                         BackoffOutcome::Shutdown(code) => {
-                            signals.confirm_stop();
-                            return code;
+                            return signals.finish_stop(code);
                         }
                         BackoffOutcome::RestartRequested => {
                             self.refresh_version_from_state(&mut current_version);
@@ -749,8 +747,7 @@ impl Supervisor {
                                 .await
                             {
                                 CheckNowOutcome::Shutdown(signal) => {
-                                    signals.confirm_stop();
-                                    return 128 + signal;
+                                    return signals.finish_stop(128 + signal);
                                 }
                                 CheckNowOutcome::RestartRequested => {
                                     self.refresh_version_from_state(&mut current_version);
@@ -781,15 +778,17 @@ impl Supervisor {
                     .await_initial_readiness(&binary, &mut child, &mut signals)
                     .await
                 {
-                    if self.graceful_stop(&mut child).await {
-                        signals.confirm_stop();
-                    }
+                    let exit = if self.graceful_stop(&mut child).await {
+                        signals.finish_stop(1)
+                    } else {
+                        1
+                    };
                     #[cfg(windows)]
                     if signals.restart_during_readiness {
                         self.refresh_version_from_state(&mut current_version);
                         continue;
                     }
-                    return 1;
+                    return exit;
                 }
                 #[cfg(windows)]
                 if let Some(nonce) = signals.restart_pending.take() {
@@ -869,7 +868,7 @@ impl Supervisor {
                                 failures = 0;
                                 break; // respawn the fixed version immediately
                             }
-                            FailedStartCheck::Shutdown(code) => { signals.confirm_stop(); return code; },
+                            FailedStartCheck::Shutdown(code) => { return signals.finish_stop(code); },
                                                         FailedStartCheck::RestartRequested => {
                                 self.refresh_version_from_state(&mut current_version);
                                 backoff = self.config.backoff_initial;
@@ -883,7 +882,7 @@ impl Supervisor {
                             return 0;
                         }
                         match self.backoff_sleep(&mut backoff, &mut signals).await {
-                            BackoffOutcome::Shutdown(code) => { signals.confirm_stop(); return code; },
+                            BackoffOutcome::Shutdown(code) => { return signals.finish_stop(code); },
                                                         BackoffOutcome::RestartRequested => {
                                 self.refresh_version_from_state(&mut current_version);
                                 backoff = self.config.backoff_initial;
@@ -895,7 +894,7 @@ impl Supervisor {
                                     .check_now(&current_version, RestartStyle::Now, &mut signals, &mut next_check_at)
                                     .await
                                 {
-                                    CheckNowOutcome::Shutdown(signal) => { signals.confirm_stop(); return 128 + signal; },
+                                    CheckNowOutcome::Shutdown(signal) => { return signals.finish_stop(128 + signal); },
                                     CheckNowOutcome::RestartRequested => {
                                         self.refresh_version_from_state(&mut current_version);
                                     }
@@ -1073,14 +1072,14 @@ impl Supervisor {
                                         "intentd-sitter: intentd did not exit within {:?} of forwarded signal; killing",
                                         self.config.kill_timeout
                                     );
-                                    if child.kill().await.is_ok() {
-                                        signals.confirm_stop();
-                                    }
-                                    return 128 + signal;
+                                    return if child.kill().await.is_ok() {
+                                        signals.finish_stop(128 + signal)
+                                    } else {
+                                        128 + signal
+                                    };
                                 }
                             };
-                            signals.confirm_stop();
-                            return exit_code(status);
+                            return signals.finish_stop(exit_code(status));
                         }
                     }
                 }
@@ -1632,7 +1631,7 @@ impl Signals {
     /// A receipt proves orderly child cleanup; retaining the non-inherited
     /// connection after it is written makes EOF a separate process-exit barrier.
     /// Crash/early-close sends no receipt, so it cannot falsely confirm stop.
-    fn confirm_stop(&mut self) {
+    fn finish_stop(&mut self, exit_code: i32) -> i32 {
         use std::io::Write;
         if let Some(connection) = self.stop_connection.take() {
             if let Ok(mut connection) = connection.into_std() {
@@ -1644,7 +1643,13 @@ impl Signals {
                 }
                 std::mem::forget(connection);
             }
+            // Installed service managers restart on failure. A successful
+            // private stop must leave the service stopped, even if the child
+            // needed SIGKILL or no child existed yet. External signals retain
+            // their original exit semantics because they have no connection.
+            return 0;
         }
+        exit_code
     }
 
     async fn recv(&mut self) -> SignalEvent {
@@ -1695,7 +1700,9 @@ impl Signals {
         clippy::unused_self,
         reason = "Unix receipt hook; Windows stop waits on retained process handles"
     )]
-    fn confirm_stop(&mut self) {}
+    fn finish_stop(&mut self, exit_code: i32) -> i32 {
+        exit_code
+    }
 
     async fn recv(&mut self) -> SignalEvent {
         loop {

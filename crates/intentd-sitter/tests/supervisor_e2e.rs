@@ -3230,8 +3230,9 @@ fn background_start_stop_during_update_or_backoff_confirms_supervisor_exit() {
                 owner
                     .wait_with_timeout(Duration::from_secs(1))
                     .unwrap()
-                    .is_some(),
-                "stop reported success but supervisor could still spawn a daemon"
+                    .expect("stop must wait for supervisor exit")
+                    .success(),
+                "private stop must exit cleanly so Restart=on-failure / SuccessfulExit=false do not relaunch"
             );
             assert!(!paths.pid_path.exists());
         }));
@@ -3239,6 +3240,51 @@ fn background_start_stop_during_update_or_backoff_confirms_supervisor_exit() {
         if let Err(error) = outcome {
             panic::resume_unwind(error);
         }
+    }
+}
+
+#[test]
+fn background_start_stop_exits_cleanly_after_forced_child_cleanup() {
+    for starting in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        preinstall(
+            &paths,
+            "0.1.0",
+            r#"#!/bin/sh
+case "$1" in
+serve)
+  trap '' TERM
+  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon"
+  # // timing-guard: force the supervisor to exercise its bounded child-kill fallback
+  while :; do sleep 0.05; done
+  ;;
+*) exit 1;;
+esac
+"#,
+        );
+        let base = dead_url();
+        let mut command = sitter_command(dir.path(), &base);
+        command.env(KILL_TIMEOUT_ENV, "100").arg("serve");
+        if starting {
+            command.env(intentd_sitter::startup::STARTING_ENV, "1");
+        }
+        let mut owner = spawn_guarded(&mut command);
+        wait_until("owned daemon", Duration::from_secs(10), || {
+            dir.path().join("owned-daemon").exists()
+        });
+        let daemon_pid = read_or_empty(&dir.path().join("owned-daemon"))
+            .trim()
+            .parse()
+            .unwrap();
+        let out = background_call(dir.path(), &base, &["stop"]);
+        assert!(out.status.success(), "{out:?}");
+        assert!(owner.wait_with_timeout(Duration::from_secs(1)).unwrap().unwrap().success(),
+            "private stop must prevent restart-on-failure after forced cleanup (starting={starting})");
+        assert!(
+            !alive(daemon_pid),
+            "stop must confirm the owned daemon exit"
+        );
     }
 }
 

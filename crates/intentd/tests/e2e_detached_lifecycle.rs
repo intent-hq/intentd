@@ -442,10 +442,17 @@ async fn detached_sitter_lifecycle_over_wss() {
             );
         }
         invoke("stop");
-        assert!(booting
+        let stopped = booting
             .wait_with_timeout(Duration::from_secs(5))
             .unwrap()
-            .is_some());
+            .unwrap();
+        #[cfg(unix)]
+        assert!(
+            stopped.success(),
+            "private stop must not trigger service restart: {stopped}"
+        );
+        #[cfg(windows)]
+        let _ = stopped;
         assert!(!paths.pid_path.exists());
         drop(stalled);
 
@@ -470,10 +477,17 @@ async fn detached_sitter_lifecycle_over_wss() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         invoke("stop");
-        assert!(recovering
+        let stopped = recovering
             .wait_with_timeout(Duration::from_secs(5))
             .unwrap()
-            .is_some());
+            .unwrap();
+        #[cfg(unix)]
+        assert!(
+            stopped.success(),
+            "private stop must not trigger service restart: {stopped}"
+        );
+        #[cfg(windows)]
+        let _ = stopped;
         assert!(!paths.pid_path.exists());
     }
     #[cfg(windows)]
