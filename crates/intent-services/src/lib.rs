@@ -23423,10 +23423,12 @@ impl WorkspaceApi for Services {
             if !ws.id.is_chief() && (pr_fields_changed || attention_changed) {
                 this.maybe_emit_display_status_changed(&ws.id).await;
             }
-            if matches!(
-                intent_core::current_caller(),
-                Some(intent_core::Caller::Wire { .. })
-            ) {
+            if !ws.id.is_chief()
+                && matches!(
+                    intent_core::current_caller(),
+                    Some(intent_core::Caller::Wire { .. })
+                )
+            {
                 this.enrich_workspace_aggregates_with_unread(&mut ws, None, None)
                     .await;
             }
@@ -23744,10 +23746,12 @@ impl WorkspaceApi for Services {
             self.require_workspace_manager(&id, "workspace.unarchive")
                 .await?;
             let (mut ws, _) = this.unarchive_workspace_inner(id, None).await?;
-            if matches!(
-                intent_core::current_caller(),
-                Some(intent_core::Caller::Wire { .. })
-            ) {
+            if !ws.id.is_chief()
+                && matches!(
+                    intent_core::current_caller(),
+                    Some(intent_core::Caller::Wire { .. })
+                )
+            {
                 this.enrich_workspace_aggregates_with_unread(&mut ws, None, None)
                     .await;
             }
