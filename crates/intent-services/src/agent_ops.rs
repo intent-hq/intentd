@@ -9922,8 +9922,9 @@ impl Services {
                 &workspace_id, &caller, intent_core::events::AGENT_UPDATED,
                 json!({ "agentId": caller.0, "attentionRequestCleared": true }),
             ).await;
-            // Read the current task and gate its write on that exact revision.
-            // A reassignment, terminal transition or new status wins the race.
+            // Read the current task, then condition its write on both that
+            // revision and the session link in one SQLite statement. A note
+            // transition or a session-only relink wins before the write.
             let current = self.store.get_agent_session_summary(&caller).await?;
             if current.task_note_id == session.task_note_id {
                 if let Some(note_id) = &session.task_note_id {
@@ -9932,9 +9933,9 @@ impl Services {
                             task.status == intent_core::TaskStatus::Blocked
                                 && task.assigned_agent_ids.contains(&caller)
                         }) {
-                            if let Err(e) = WorkspaceApi::task_update_note_status(
-                                self, workspace_id.clone(), note_id.clone(),
-                                "in_progress".into(), Some(note.rev), Some(caller.clone()),
+                            if let Err(e) = self.set_task_note_status_guarded(
+                                &workspace_id, note_id, intent_core::TaskStatus::InProgress,
+                                Some(note.rev), Some(caller.clone()), Some(caller.clone()),
                             ).await {
                                 tracing::warn!(error = %e, note = %note_id, "blocker recovery task transition skipped");
                             }
