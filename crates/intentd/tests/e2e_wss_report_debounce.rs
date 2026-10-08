@@ -431,7 +431,7 @@ fn assert_report_metadata(row: &Value, event_type: &str, report: &str) {
     }
 }
 
-fn save_receipt(scenario: &str, observations: Value) {
+fn save_receipt(scenario: &str, observations: &Value) {
     let Some(dir) = std::env::var_os("REPORT_DEBOUNCE_RECEIPT_DIR") else {
         return;
     };
@@ -759,7 +759,7 @@ async fn debounced_report_combined_with_completion_wake_over_wss() {
     assert_report_metadata(&combined_row, "agent:idle", REPORT);
     save_receipt(
         "debounced-report-combined",
-        json!({
+        &json!({
             "heldProgress": held,
             "terminal": combined_row,
             "terminalText": combined_text,
@@ -934,7 +934,7 @@ async fn immediate_report_wake_when_debounce_disabled_over_wss() {
     assert_report_metadata(&terminal_row, "agent:idle", REPORT);
     save_receipt(
         "immediate-report-separate-completion",
-        json!({
+        &json!({
             "progress": progress_row,
             "progressText": progress_text,
             "terminal": terminal_row,
