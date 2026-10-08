@@ -167,6 +167,15 @@ async fn detached_sitter_lifecycle_over_wss() {
     );
     invoke("status");
     #[cfg(windows)]
+    let first_pid = {
+        // Leave a legitimate prior restart request in B's control directory:
+        // signaling its event from A must not replay that previous request.
+        invoke("restart");
+        let replacement = std::fs::read_to_string(data.join("intentd.pid")).unwrap();
+        assert_ne!(replacement, first_pid);
+        replacement
+    };
+    #[cfg(windows)]
     {
         // Instance A's stale numeric PID must never control live instance B.
         let foreign = common::test_tempdir("intentd-stale-supervisor-");
