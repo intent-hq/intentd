@@ -490,3 +490,51 @@ pub fn stop(paths: &SitterPaths) -> Option<i32> {
         }
     })
 }
+
+/// Stop the lifetime owner through its private endpoint, never a numeric PID.
+/// EOF is delivered at supervisor process exit, after child shutdown. A stale
+/// record without an endpoint cannot authorize signaling another process.
+#[cfg(unix)]
+#[must_use]
+pub fn stop(paths: &SitterPaths) -> Option<i32> {
+    use tokio::io::AsyncReadExt;
+    crate::supervisor::read_live_pid(&paths.pid_path)?;
+    let result = (|| -> std::io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let budget = crate::supervisor::SupervisorConfig::from_env().kill_timeout * 2
+                + std::time::Duration::from_secs(2);
+            tokio::time::timeout(budget, async {
+                let mut control =
+                    tokio::net::UnixStream::connect(paths.pid_path.with_extension("stop")).await?;
+                let mut receipt = [0; 8];
+                control.read_exact(&mut receipt).await?;
+                if &receipt != b"stopped\n" {
+                    return Err(std::io::Error::other(
+                        "supervisor did not confirm child shutdown",
+                    ));
+                }
+                match control.read(&mut [0]).await? {
+                    0 => Ok(()),
+                    _ => Err(std::io::Error::other("unexpected supervisor stop response")),
+                }
+            })
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "supervisor did not stop")
+            })?
+        })
+    })();
+    Some(match result {
+        Ok(()) => {
+            println!("intentd: stopped");
+            0
+        }
+        Err(error) => {
+            eprintln!("intentd-sitter: cannot confirm supervisor stop: {error}");
+            1
+        }
+    })
+}

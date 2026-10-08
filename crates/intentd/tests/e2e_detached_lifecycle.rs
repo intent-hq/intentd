@@ -327,8 +327,88 @@ async fn detached_sitter_lifecycle_over_wss() {
         "failed launch leaked supervisor ownership"
     );
     #[cfg(windows)]
+    // A failed spawned child must not shut down a different, unsupervised
+    // daemon whose endpoint became available during initial readiness.
     {
-        use std::os::windows::process::CommandExt;
+        let template = make_command("serve");
+        let mut direct = Command::new(&binary);
+        direct.arg("serve");
+        for (key, value) in template.get_envs() {
+            match value {
+                Some(value) => {
+                    direct.env(key, value);
+                }
+                None => {
+                    direct.env_remove(key);
+                }
+            }
+        }
+        common::hermetic_fixture_identity(&mut direct, data);
+        direct.stdout(Stdio::null()).stderr(Stdio::null());
+        let mut owner = GuardedChild::spawn(&mut direct).unwrap();
+        local_status(data, &socket, &log).await;
+        let owner_pid = std::fs::read(data.join("intentd.pid")).unwrap();
+        let mut duplicate = make_command("serve");
+        duplicate.env("INTENTD_SITTER_STARTING", "1");
+        // The real data-directory lock makes the spawned child exit. The
+        // surviving daemon is ready by the time failed-start cleanup runs.
+        let mut failed = GuardedChild::spawn(&mut duplicate).unwrap();
+        assert!(
+            failed
+                .wait_with_timeout(Duration::from_secs(10))
+                .unwrap()
+                .is_some(),
+            "duplicate launch must exit after failing the data-directory lock"
+        );
+        let output = failed.disarm().wait_with_output().unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("daemon exited before startup readiness"),
+            "regression must exercise failed-child cleanup: {output:?}"
+        );
+        assert!(
+            owner.wait_with_timeout(Duration::ZERO).unwrap().is_none(),
+            "failed launch stopped the other daemon: {output:?}"
+        );
+        assert_eq!(std::fs::read(data.join("intentd.pid")).unwrap(), owner_pid);
+        local_status(data, &socket, &log).await;
+        // A different retained process, or malformed guard, cannot authorize
+        // shutdown of this endpoint. No guarded request may reach the daemon.
+        for expected in [std::process::id().to_string(), "invalid".into(), "0".into()] {
+            let rejected = tokio::process::Command::new(&binary)
+                .args(["call", "system.shutdown"])
+                .env("INTENTD_DATA_DIR", data)
+                .env("INTENTD_SHUTDOWN_EXPECTED_PID", expected)
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                !rejected.status.success(),
+                "foreign endpoint accepted shutdown: {rejected:?}"
+            );
+            assert!(owner.wait_with_timeout(Duration::ZERO).unwrap().is_none());
+        }
+        let accepted = tokio::process::Command::new(&binary)
+            .args(["call", "system.shutdown"])
+            .env("INTENTD_DATA_DIR", data)
+            .env("INTENTD_SHUTDOWN_EXPECTED_PID", owner.id().to_string())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            accepted.status.success(),
+            "owned endpoint rejected shutdown: {accepted:?}"
+        );
+        assert!(owner
+            .wait_with_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap()
+            .success());
+    }
+    {
         // Stop must reach the sitter before there is any daemon pidfile.
         // A held HTTP endpoint keeps its initial update check pending.
         let stalled = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -347,17 +427,20 @@ async fn detached_sitter_lifecycle_over_wss() {
             // timing-guard: wait for control publication before stopping during startup
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let mut restart = make_command("restart");
-        restart.env("INTENTD_SITTER_READINESS_TIMEOUT_MS", "300");
-        let mut waiting = GuardedChild::spawn(&mut restart).unwrap();
-        assert!(
-            !waiting
-                .wait_with_timeout(Duration::from_secs(5))
-                .unwrap()
-                .unwrap()
-                .success(),
-            "restart must not report ready while startup is stalled"
-        );
+        #[cfg(windows)]
+        {
+            let mut restart = make_command("restart");
+            restart.env("INTENTD_SITTER_READINESS_TIMEOUT_MS", "300");
+            let mut waiting = GuardedChild::spawn(&mut restart).unwrap();
+            assert!(
+                !waiting
+                    .wait_with_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .success(),
+                "restart must not report ready while startup is stalled"
+            );
+        }
         invoke("stop");
         assert!(booting
             .wait_with_timeout(Duration::from_secs(5))
@@ -392,7 +475,10 @@ async fn detached_sitter_lifecycle_over_wss() {
             .unwrap()
             .is_some());
         assert!(!paths.pid_path.exists());
-
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
         // The installer starts `serve` directly from Task Scheduler, with no
         // STARTING marker and no inherited console. Exercise that same path.
         let mut command = make_command("serve");

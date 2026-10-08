@@ -259,8 +259,9 @@ this static guide.
 
 For a separately installed `intentd` launcher on Windows, macOS, or Linux, use
 `intentd start` to run in the background, `intentd status` to inspect live status,
-`intentd stop` to confirm shutdown (already stopped succeeds), and `intentd restart`
-to replace the supervised daemon or start it if stopped. These commands act on the
+`intentd stop` to confirm shutdown (including a supervisor still starting or recovering;
+already stopped succeeds), and `intentd restart` to replace the supervised daemon
+or start it if stopped. These commands act on the
 host where they run; stopping the daemon disconnects its clients.
 
 `start` waits for readiness (60-second default budget); starting a healthy daemon
@@ -281,4 +282,4 @@ builds and the desktop-bundled daemon are distinct from this installed launcher;
 start/restart are launcher commands. Check the installed launcher's help when its
 version differs from this guide; do not infer launcher support from daemon version.
 
-<!-- Sources: packages/intentd/README.md (Start, status, stop, and restart); packages/intentd/crates/intentd-sitter/src/{cli.rs,main.rs,startup.rs,paths.rs,readiness.rs}; packages/intentd/crates/intentd/src/main.rs (Serve, Status, Stop). -->
+<!-- Sources: packages/intentd/README.md (Start, status, stop, and restart); packages/intentd/crates/intentd-sitter/src/{cli.rs,main.rs,startup.rs,supervisor.rs,paths.rs,readiness.rs}; packages/intentd/crates/intentd/src/main.rs (Serve, Status, Stop). -->

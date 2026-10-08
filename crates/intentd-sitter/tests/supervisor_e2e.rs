@@ -3193,6 +3193,164 @@ fn background_call(dir: &Path, base_url: &str, args: &[&str]) -> std::process::O
 }
 
 #[test]
+fn background_start_stop_during_update_or_backoff_confirms_supervisor_exit() {
+    use std::sync::atomic::Ordering;
+    for updating in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        // Like the real daemon, stop succeeds when no daemon PID exists.
+        preinstall(
+            &paths,
+            "0.1.0",
+            "#!/bin/sh\ncase \"$1\" in stop) exit 0;; serve) exit 7;; *) exit 1;; esac\n",
+        );
+        let (base, hold, parked) = serve_holdable(Arc::new(Mutex::new(HashMap::new())));
+        hold.store(updating, Ordering::SeqCst);
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut owner = spawn_guarded(
+                sitter_command(dir.path(), &base)
+                    .env(BACKOFF_INITIAL_ENV, "30000")
+                    .arg("serve"),
+            );
+            wait_until(
+                "supervisor early lifecycle state",
+                Duration::from_secs(10),
+                || {
+                    if updating {
+                        parked.load(Ordering::SeqCst) > 0
+                    } else {
+                        read_or_empty(&stderr_path(dir.path())).contains("respawning intentd in")
+                    }
+                },
+            );
+            assert!(!dir.path().join("intentd.pid").exists());
+            let out = background_call(dir.path(), &base, &["stop"]);
+            assert!(out.status.success(), "{out:?}");
+            assert!(
+                owner
+                    .wait_with_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .is_some(),
+                "stop reported success but supervisor could still spawn a daemon"
+            );
+            assert!(!paths.pid_path.exists());
+        }));
+        hold.store(false, Ordering::SeqCst);
+        if let Err(error) = outcome {
+            panic::resume_unwind(error);
+        }
+    }
+}
+
+#[test]
+fn background_start_stop_reports_supervisor_crash_with_live_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(
+        &paths,
+        "0.1.0",
+        r#"#!/bin/sh
+case "$1" in
+serve)
+  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon"
+  trap 'echo stopping > "$INTENTD_DATA_DIR/stop-seen"' TERM
+  # // timing-guard: fixture remains alive after TERM until its owned group is killed
+  while :; do sleep 0.05; done
+  ;;
+*) exit 1;;
+esac
+"#,
+    );
+    let base = dead_url();
+    let owner = spawn_guarded(
+        sitter_command(dir.path(), &base)
+            .env(KILL_TIMEOUT_ENV, "30000")
+            .arg("serve"),
+    );
+    wait_until("owned daemon", Duration::from_secs(10), || {
+        dir.path().join("owned-daemon").exists()
+    });
+    let daemon_pid = read_or_empty(&dir.path().join("owned-daemon"))
+        .trim()
+        .parse()
+        .unwrap();
+    let mut stop = spawn_guarded(
+        sitter_command(dir.path(), &base)
+            .env(KILL_TIMEOUT_ENV, "500")
+            .arg("stop"),
+    );
+    wait_until(
+        "daemon received forwarded stop",
+        Duration::from_secs(3),
+        || dir.path().join("stop-seen").exists(),
+    );
+    // Kill only the supervisor. The guard still owns its process group and
+    // cleans the intentionally surviving daemon when this scope ends.
+    send_signal(&owner, "KILL");
+    let status = stop
+        .wait_with_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !status.success(),
+        "supervisor crash was mistaken for successful stop"
+    );
+    assert!(
+        alive(daemon_pid),
+        "fixture must prove the daemon survived its supervisor"
+    );
+}
+
+#[test]
+fn background_start_stop_rejects_control_eof_without_shutdown_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = background_fixture(dir.path());
+    let listener =
+        std::os::unix::net::UnixListener::bind(fixture.paths.pid_path.with_extension("stop"))
+            .unwrap();
+    fs::write(&fixture.paths.pid_path, std::process::id().to_string()).unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        drop(stream); // Model a crash before the owned daemon has stopped.
+    });
+    let out = background_call(dir.path(), &dead_url(), &["stop"]);
+    fs::remove_file(&fixture.paths.pid_path).unwrap();
+    server.join().unwrap();
+    assert!(
+        !out.status.success(),
+        "early EOF is not confirmed shutdown: {out:?}"
+    );
+}
+
+#[test]
+fn background_start_stop_refuses_foreign_supervisor_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = background_fixture(dir.path());
+    let foreign = tempfile::tempdir().unwrap();
+    let foreign_fixture = background_fixture(foreign.path());
+    let base = dead_url();
+    assert!(background_call(foreign.path(), &base, &["start"])
+        .status
+        .success());
+    let record = fs::read(&foreign_fixture.paths.pid_path).unwrap();
+    fs::write(&fixture.paths.pid_path, &record).unwrap();
+    let out = background_call(dir.path(), &base, &["stop"]);
+    // Clear the forged record before either fixture's failure cleanup runs.
+    fs::remove_file(&fixture.paths.pid_path).unwrap();
+    assert!(
+        !out.status.success(),
+        "unverified supervisor cannot confirm stop: {out:?}"
+    );
+    assert_eq!(fs::read(&foreign_fixture.paths.pid_path).unwrap(), record);
+    assert!(background_call(foreign.path(), &base, &["status"])
+        .status
+        .success());
+    assert!(background_call(foreign.path(), &base, &["stop"])
+        .status
+        .success());
+}
+
+#[test]
 fn background_start_detaches_preserves_options_and_supports_restart_stop() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = background_fixture(dir.path());

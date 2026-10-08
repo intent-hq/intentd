@@ -331,6 +331,8 @@ struct PidFile {
     path: std::path::PathBuf,
     #[cfg(unix)]
     _lock: nix::fcntl::Flock<std::fs::File>,
+    #[cfg(unix)]
+    stop: std::os::unix::net::UnixListener,
     #[cfg(not(unix))]
     _lock: std::fs::File,
 }
@@ -372,12 +374,30 @@ impl PidFile {
                 }
             }
         }
+        #[cfg(unix)]
+        let stop = {
+            use std::os::unix::fs::PermissionsExt;
+            let socket = path.with_extension("stop");
+            // The lifetime lock excludes another owner while stale control
+            // state is replaced. Publish discovery only after control is ready.
+            match std::fs::remove_file(&socket) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+            listener.set_nonblocking(true)?;
+            listener
+        };
         #[cfg(windows)]
         crate::windows::publish_identity(path)?;
         std::fs::write(path, format!("{}\n", std::process::id()))?;
         Ok(Self {
             path: path.to_path_buf(),
             _lock: lock,
+            #[cfg(unix)]
+            stop,
         })
     }
 }
@@ -390,6 +410,8 @@ impl Drop for PidFile {
         let ours = std::process::id().to_string();
         if std::fs::read_to_string(&self.path).is_ok_and(|s| s.trim() == ours) {
             let _ = std::fs::remove_file(&self.path);
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(self.path.with_extension("stop"));
         }
     }
 }
@@ -489,7 +511,7 @@ impl Supervisor {
         // Claim ownership before any startup update can mutate shared state.
         // Publish only after handlers exist, so discovery cannot expose a
         // sitter that would die to SIGHUP. Failure must not spawn a child.
-        let _pidfile = if supervised {
+        let pidfile = if supervised {
             match PidFile::create(&self.paths.pid_path) {
                 Ok(guard) => Some(guard),
                 Err(e) => {
@@ -500,6 +522,23 @@ impl Supervisor {
         } else {
             None
         };
+
+        #[cfg(windows)]
+        let _pidfile = pidfile;
+        #[cfg(unix)]
+        if let Some(pidfile) = &pidfile {
+            let listener = pidfile
+                .stop
+                .try_clone()
+                .and_then(tokio::net::UnixListener::from_std);
+            match listener {
+                Ok(listener) => signals.stop = Some(listener),
+                Err(error) => {
+                    eprintln!("intentd-sitter: cannot receive stop requests: {error}");
+                    return 1;
+                }
+            }
+        }
 
         let (mut current_version, mut next_check_at) = if supervised {
             // Startup check: always runs, regardless of the persisted schedule.
@@ -512,7 +551,7 @@ impl Supervisor {
                 tokio::select! {
                     biased;
                     event = signals.recv() => match event {
-                        SignalEvent::Shutdown(signal) => return 128 + signal,
+                        SignalEvent::Shutdown(signal) => { signals.confirm_stop(); return 128 + signal; },
                         // No child exists yet; startup already checks for an
                         // update and will spawn the selected version once.
                         SignalEvent::Restart => {
@@ -671,7 +710,10 @@ impl Supervisor {
                             failures = 0;
                             continue;
                         }
-                        FailedStartCheck::Shutdown(code) => return code,
+                        FailedStartCheck::Shutdown(code) => {
+                            signals.confirm_stop();
+                            return code;
+                        }
                         FailedStartCheck::RestartRequested => {
                             self.refresh_version_from_state(&mut current_version);
                             backoff = self.config.backoff_initial;
@@ -685,7 +727,10 @@ impl Supervisor {
                         return 0;
                     }
                     match self.backoff_sleep(&mut backoff, &mut signals).await {
-                        BackoffOutcome::Shutdown(code) => return code,
+                        BackoffOutcome::Shutdown(code) => {
+                            signals.confirm_stop();
+                            return code;
+                        }
                         BackoffOutcome::RestartRequested => {
                             self.refresh_version_from_state(&mut current_version);
                             backoff = self.config.backoff_initial;
@@ -703,7 +748,10 @@ impl Supervisor {
                                 )
                                 .await
                             {
-                                CheckNowOutcome::Shutdown(signal) => return 128 + signal,
+                                CheckNowOutcome::Shutdown(signal) => {
+                                    signals.confirm_stop();
+                                    return 128 + signal;
+                                }
                                 CheckNowOutcome::RestartRequested => {
                                     self.refresh_version_from_state(&mut current_version);
                                 }
@@ -733,7 +781,9 @@ impl Supervisor {
                     .await_initial_readiness(&binary, &mut child, &mut signals)
                     .await
                 {
-                    self.graceful_stop(&mut child).await;
+                    if self.graceful_stop(&mut child).await {
+                        signals.confirm_stop();
+                    }
                     #[cfg(windows)]
                     if signals.restart_during_readiness {
                         self.refresh_version_from_state(&mut current_version);
@@ -819,7 +869,7 @@ impl Supervisor {
                                 failures = 0;
                                 break; // respawn the fixed version immediately
                             }
-                            FailedStartCheck::Shutdown(code) => return code,
+                            FailedStartCheck::Shutdown(code) => { signals.confirm_stop(); return code; },
                                                         FailedStartCheck::RestartRequested => {
                                 self.refresh_version_from_state(&mut current_version);
                                 backoff = self.config.backoff_initial;
@@ -833,7 +883,7 @@ impl Supervisor {
                             return 0;
                         }
                         match self.backoff_sleep(&mut backoff, &mut signals).await {
-                            BackoffOutcome::Shutdown(code) => return code,
+                            BackoffOutcome::Shutdown(code) => { signals.confirm_stop(); return code; },
                                                         BackoffOutcome::RestartRequested => {
                                 self.refresh_version_from_state(&mut current_version);
                                 backoff = self.config.backoff_initial;
@@ -845,7 +895,7 @@ impl Supervisor {
                                     .check_now(&current_version, RestartStyle::Now, &mut signals, &mut next_check_at)
                                     .await
                                 {
-                                    CheckNowOutcome::Shutdown(signal) => return 128 + signal,
+                                    CheckNowOutcome::Shutdown(signal) => { signals.confirm_stop(); return 128 + signal; },
                                     CheckNowOutcome::RestartRequested => {
                                         self.refresh_version_from_state(&mut current_version);
                                     }
@@ -1023,10 +1073,13 @@ impl Supervisor {
                                         "intentd-sitter: intentd did not exit within {:?} of forwarded signal; killing",
                                         self.config.kill_timeout
                                     );
-                                    let _ = child.kill().await;
+                                    if child.kill().await.is_ok() {
+                                        signals.confirm_stop();
+                                    }
                                     return 128 + signal;
                                 }
                             };
+                            signals.confirm_stop();
                             return exit_code(status);
                         }
                     }
@@ -1360,6 +1413,19 @@ impl Supervisor {
                 }
                 result = probe => {
                     if result.is_some() {
+                        if !matches!(child.try_wait(), Ok(None)) {
+                            return false;
+                        }
+                        #[cfg(windows)]
+                        if !child.id().is_some_and(|pid| {
+                            crate::windows::Process::open(pid, false).is_ok_and(|process| {
+                                process.matches_record(&self.paths.data_dir.join("intentd.pid"), pid)
+                            })
+                        }) {
+                            // A booting unsupervised daemon can answer while
+                            // our duplicate child is about to fail its lock.
+                            continue;
+                        }
                         return true;
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1369,7 +1435,14 @@ impl Supervisor {
     }
 
     /// Sitter-initiated stop: graceful signal, then bounded force-kill.
-    async fn graceful_stop(&self, child: &mut tokio::process::Child) {
+    async fn graceful_stop(&self, child: &mut tokio::process::Child) -> bool {
+        // Readiness can already have reaped a failed duplicate child. A shared
+        // endpoint then belongs to another launch, never to this child.
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Err(_) => return false,
+            Ok(None) => {}
+        }
         #[cfg(unix)]
         if let Some(id) = child.id() {
             let _ = nix::sys::signal::kill(
@@ -1380,11 +1453,18 @@ impl Supervisor {
         #[cfg(windows)]
         {
             // Reuse the existing graceful local RPC, with a bounded probe child.
+            let owned_pid = child.id().filter(|pid| {
+                crate::windows::Process::open(*pid, false).is_ok_and(|process| {
+                    process.matches_record(&self.paths.data_dir.join("intentd.pid"), *pid)
+                        && matches!(process.exited(), Ok(false))
+                })
+            });
             let version = crate::state::load(&self.paths.state_path).current_version;
-            if let Some(version) = version {
+            if let (Some(version), Some(pid)) = (version, owned_pid) {
                 let mut command = tokio::process::Command::new(self.paths.daemon_binary(&version));
                 command
                     .args(["call", "system.shutdown"])
+                    .env("INTENTD_SHUTDOWN_EXPECTED_PID", pid.to_string())
                     .kill_on_drop(true)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
@@ -1393,15 +1473,14 @@ impl Supervisor {
             }
         }
 
-        if tokio::time::timeout(self.config.kill_timeout, child.wait())
-            .await
-            .is_err()
-        {
+        if let Ok(result) = tokio::time::timeout(self.config.kill_timeout, child.wait()).await {
+            result.is_ok()
+        } else {
             eprintln!(
                 "intentd-sitter: intentd did not stop within {:?}; killing",
                 self.config.kill_timeout
             );
-            let _ = child.kill().await;
+            child.kill().await.is_ok()
         }
     }
 }
@@ -1531,6 +1610,8 @@ struct Signals {
     hup: tokio::signal::unix::Signal,
     usr1: tokio::signal::unix::Signal,
     usr2: tokio::signal::unix::Signal,
+    stop: Option<tokio::net::UnixListener>,
+    stop_connection: Option<tokio::net::UnixStream>,
 }
 
 #[cfg(unix)]
@@ -1543,11 +1624,45 @@ impl Signals {
             hup: signal(SignalKind::hangup())?,
             usr1: signal(SignalKind::user_defined1())?,
             usr2: signal(SignalKind::user_defined2())?,
+            stop: None,
+            stop_connection: None,
         })
     }
 
+    /// A receipt proves orderly child cleanup; retaining the non-inherited
+    /// connection after it is written makes EOF a separate process-exit barrier.
+    /// Crash/early-close sends no receipt, so it cannot falsely confirm stop.
+    fn confirm_stop(&mut self) {
+        use std::io::Write;
+        if let Some(connection) = self.stop_connection.take() {
+            if let Ok(mut connection) = connection.into_std() {
+                let configured = connection
+                    .set_nonblocking(false)
+                    .and_then(|()| connection.set_write_timeout(Some(Duration::from_secs(1))));
+                if configured.is_ok() {
+                    let _ = connection.write_all(b"stopped\n");
+                }
+                std::mem::forget(connection);
+            }
+        }
+    }
+
     async fn recv(&mut self) -> SignalEvent {
+        let stop = async {
+            match &self.stop {
+                Some(listener) => loop {
+                    if let Ok((connection, _)) = listener.accept().await {
+                        break connection;
+                    }
+                },
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
+            connection = stop => {
+                self.stop_connection = Some(connection);
+                SignalEvent::Shutdown(nix::sys::signal::Signal::SIGTERM as i32)
+            },
             _ = self.term.recv() => SignalEvent::Shutdown(nix::sys::signal::Signal::SIGTERM as i32),
             _ = self.int.recv() => SignalEvent::Shutdown(nix::sys::signal::Signal::SIGINT as i32),
             _ = self.hup.recv() => SignalEvent::Restart,
@@ -1576,6 +1691,12 @@ impl Signals {
             interrupt: tokio::signal::windows::ctrl_c().ok(),
         })
     }
+    #[expect(
+        clippy::unused_self,
+        reason = "Unix receipt hook; Windows stop waits on retained process handles"
+    )]
+    fn confirm_stop(&mut self) {}
+
     async fn recv(&mut self) -> SignalEvent {
         loop {
             if self.control.take_stop().unwrap_or(false) {
