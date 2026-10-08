@@ -6334,6 +6334,16 @@ async fn build_turn_prompt_prepends_history_once_after_recreate() {
 
 // --- Attachment blocks (image + file) ----------------------------------------
 
+/// Provider-reaching lifecycle tests need real image bytes, not text with an image MIME.
+fn tiny_png_base64() -> String {
+    use base64::Engine as _;
+
+    let image = image::RgbImage::from_pixel(2, 1, image::Rgb([23, 67, 91]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+}
+
 /// FE-supplied `imageBlocks` become ACP `image` content blocks appended after
 /// the text prompt (reference-parity `acp-provider.ts`), preserving `data`
 /// and `mimeType` verbatim in the camelCase wire shape.
@@ -6784,7 +6794,7 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
 
     let options = super::TurnOptions {
         prepend_content: Some("original ask".to_string()),
-        prepend_image_blocks: Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}])),
+        prepend_image_blocks: Some(json!([{"data": tiny_png_base64(), "mimeType": "image/png"}])),
         prepend_file_blocks: Some(json!([
             {"attachmentId": "att-orig", "data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
         ])),
@@ -6842,7 +6852,7 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
     assert_eq!(queued.prepend_content.as_deref(), Some("original ask"));
     assert_eq!(
         queued.prepend_image_blocks,
-        Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}]))
+        Some(json!([{"data": tiny_png_base64(), "mimeType": "image/png"}]))
     );
     assert_eq!(
         queued.prepend_file_blocks,
@@ -6917,7 +6927,7 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
         "original text, image and file precede interrupt: {blocks:?}"
     );
     assert_eq!(blocks[original + 1]["type"], "image");
-    assert_eq!(blocks[original + 1]["data"], "ORIG_IMG");
+    assert_eq!(blocks[original + 1]["data"], tiny_png_base64());
     assert_eq!(blocks[original + 1]["mimeType"], "image/png");
     let file = blocks[original + 2]["text"]
         .as_str()
@@ -6940,7 +6950,7 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
     assert_eq!(
         blocks
             .iter()
-            .filter(|block| block["data"] == "ORIG_IMG")
+            .filter(|block| block["data"] == tiny_png_base64())
             .count(),
         1
     );
@@ -7695,7 +7705,7 @@ async fn stop_redelivery_flush_413_retry(
             "user",
             &json!([
                 { "type": "text", "text": stopped_text },
-                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+                { "type": "image", "data": tiny_png_base64(), "mimeType": "image/png" },
             ]),
             &now_iso(),
         )
@@ -7875,7 +7885,7 @@ async fn context_size_flush_requeue_keeps_small_stop_redelivery_prepend() {
         tail.prepend_image_blocks
             .as_ref()
             .and_then(Value::as_array)
-            .is_some_and(|b| b.iter().any(|b| b["data"] == json!("aGVsbG8="))),
+            .is_some_and(|b| b.iter().any(|b| b["data"] == json!(tiny_png_base64()))),
         "the redelivered image rides along: {:?}",
         tail.prepend_image_blocks
     );
@@ -8055,7 +8065,7 @@ async fn context_size_flush_requeue_keeps_stop_redelivery_prepend_order() {
         "second own prepend\n\nstopped before output"
     );
     assert_eq!(first_prepends[2]["type"], "image");
-    assert_eq!(first_prepends[2]["data"], "aGVsbG8=");
+    assert_eq!(first_prepends[2]["data"], tiny_png_base64());
     assert_eq!(first_prepends[2]["mimeType"], "image/png");
     assert_eq!(
         prepend_section(&retry_content),
@@ -10343,7 +10353,7 @@ async fn stop_zero_output_then_follow_up_redelivers_stopped_message_and_attachme
             "user",
             &json!([
                 { "type": "text", "text": "first with screenshot" },
-                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+                { "type": "image", "data": tiny_png_base64(), "mimeType": "image/png" },
             ]),
             &now_iso(),
         )
@@ -10416,7 +10426,7 @@ async fn stop_zero_output_then_follow_up_redelivers_stopped_message_and_attachme
     assert!(
         blocks
             .iter()
-            .any(|b| b["type"] == json!("image") && b["data"] == json!("aGVsbG8=")),
+            .any(|b| b["type"] == json!("image") && b["data"] == json!(tiny_png_base64())),
         "follow-up prompt redelivers the stopped message's image attachment: {blocks:?}"
     );
 
@@ -10598,7 +10608,7 @@ async fn arm_redelivery_via_fallback_stop(mgr: &AgentManager, ws: &WorkspaceId, 
             "user",
             &json!([
                 { "type": "text", "text": "first with screenshot" },
-                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+                { "type": "image", "data": tiny_png_base64(), "mimeType": "image/png" },
             ]),
             &now_iso(),
         )
@@ -10660,9 +10670,13 @@ async fn stop_redelivery_survives_daemon_restart_and_redelivers_once() {
     let armed = mgr2.stop_redelivery.lock().unwrap().get(&id).cloned();
     let armed = armed.expect("rehydrated payload lands in the in-memory map");
     assert_eq!(armed.content.as_deref(), Some("first with screenshot"));
+    // The transcript write stamps intrinsic dimensions onto real image blocks.
     assert_eq!(
         armed.image_blocks,
-        Some(json!([{ "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" }]))
+        Some(json!([{
+            "type": "image", "data": tiny_png_base64(), "mimeType": "image/png",
+            "width": 2, "height": 1,
+        }]))
     );
 
     // Follow-up send on the restarted manager: the prompt redelivers the
@@ -10718,7 +10732,7 @@ async fn stop_redelivery_survives_daemon_restart_and_redelivers_once() {
     assert!(
         blocks
             .iter()
-            .any(|b| b["type"] == json!("image") && b["data"] == json!("aGVsbG8=")),
+            .any(|b| b["type"] == json!("image") && b["data"] == json!(tiny_png_base64())),
         "restarted follow-up redelivers the stopped message's image attachment: {blocks:?}"
     );
 
