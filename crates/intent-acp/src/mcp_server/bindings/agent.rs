@@ -232,6 +232,8 @@ pub(crate) const PRELUDE: &str = r"
             host({ method: 'agent.requestDiscussion', args: { reason } }),
         reportBlocker: (reason) =>
             host({ method: 'agent.reportBlocker', args: { reason } }),
+        resolveBlocker: (reason) =>
+            host({ method: 'agent.resolveBlocker', args: { reason } }),
         retire: (reason) =>
             host({ method: 'agent.retire', args: { reason } }),
     };
@@ -241,7 +243,7 @@ pub(crate) const PRELUDE: &str = r"
 /// lines inside [`PRELUDE`], removed when `agentFeatures.attentionRequests`
 /// is off (a unit test guards that this segment still matches the prelude
 /// verbatim).
-pub(crate) const ATTENTION_PRELUDE_SEGMENT: &str = "        requestDiscussion: (reason) =>\n            host({ method: 'agent.requestDiscussion', args: { reason } }),\n        reportBlocker: (reason) =>\n            host({ method: 'agent.reportBlocker', args: { reason } }),\n";
+pub(crate) const ATTENTION_PRELUDE_SEGMENT: &str = "        requestDiscussion: (reason) =>\n            host({ method: 'agent.requestDiscussion', args: { reason } }),\n        reportBlocker: (reason) =>\n            host({ method: 'agent.reportBlocker', args: { reason } }),\n        resolveBlocker: (reason) =>\n            host({ method: 'agent.resolveBlocker', args: { reason } }),\n";
 
 /// The `ws.agent.retire` installer lines inside [`PRELUDE`], removed when
 /// `agentFeatures.peerAgents` is explicitly off (a unit test guards that
@@ -249,7 +251,7 @@ pub(crate) const ATTENTION_PRELUDE_SEGMENT: &str = "        requestDiscussion: (
 pub(crate) const RETIRE_PRELUDE_SEGMENT: &str = "        retire: (reason) =>\n            host({ method: 'agent.retire', args: { reason } }),\n";
 
 /// Feature-aware `ws.agent` prelude: with `agentFeatures.attentionRequests`
-/// off the two attention-request installers are omitted, and with
+/// off the attention-request and recovery installers are omitted, and with
 /// `agentFeatures.peerAgents` off the `retire` installer is omitted, so agent
 /// code touching them fails with a clear `not a function` `TypeError`. Every other
 /// `ws.agent.*` method (including `reportToParent`) stays un-gated. With
@@ -332,6 +334,14 @@ async fn dispatch_inner(
         "reportToParent" => report_to_parent(api, ws, caller, args).await,
         "requestDiscussion" => request_attention(api, ws, caller, "discussion", args).await,
         "reportBlocker" => request_attention(api, ws, caller, "blocker", args).await,
+        "resolveBlocker" => {
+            let reason = req_str(args, "reason").map_err(|_| "reason is required".to_string())?;
+            let v = api
+                .agent_resolve_blocker(ws.clone(), reason, caller.cloned())
+                .await
+                .map_err(map_err)?;
+            Ok(merge_ok(v))
+        }
         "retire" => retire(api, ws, caller, args).await,
         other => Err(format!("host: unknown method `agent.{other}`")),
     }

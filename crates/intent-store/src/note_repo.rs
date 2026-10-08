@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use intent_core::{
-    ContentType, Error, Note, NoteId, NoteMetadata, NoteVisibility, Result, TaskListResult,
-    TaskMetadata, TaskStatus, WorkspaceId, WorkspaceTask, WorkspaceTaskStats,
+    AgentId, ContentType, Error, Note, NoteId, NoteMetadata, NoteVisibility, Result,
+    TaskListResult, TaskMetadata, TaskStatus, WorkspaceId, WorkspaceTask, WorkspaceTaskStats,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -383,6 +383,29 @@ impl Store {
     ) -> Result<i64> {
         self.exec_note_update(note, expected_version, NoteUpdateScope::Metadata)
             .await
+    }
+
+    /// Update recovery metadata only while this agent is still linked to the
+    /// note in the same workspace. The revision and session link are checked
+    /// in one `SQLite` UPDATE, so a session-only relink cannot slip past the CAS.
+    /// Returns None on a stale revision, missing note, or changed agent link.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if encoding or the database write fails.
+    pub async fn update_note_metadata_if_agent_linked(
+        &self,
+        note: &Note,
+        expected_version: i64,
+        agent_id: &AgentId,
+    ) -> Result<Option<i64>> {
+        exec_update_note_with_link_guard(
+            self.write_pool(),
+            note,
+            Some(expected_version),
+            NoteUpdateScope::Metadata,
+            Some(agent_id),
+        )
+        .await
     }
 
     async fn exec_note_update(
@@ -913,6 +936,19 @@ pub(crate) async fn exec_update_note<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
+    exec_update_note_with_link_guard(executor, note, expected_version, scope, None).await
+}
+
+async fn exec_update_note_with_link_guard<'e, E>(
+    executor: E,
+    note: &Note,
+    expected_version: Option<i64>,
+    scope: NoteUpdateScope,
+    required_link: Option<&AgentId>,
+) -> Result<Option<i64>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
     let task_json = note
         .metadata
@@ -930,6 +966,13 @@ where
     );
     if expected_version.is_some() {
         sql.push_str(" AND rev=?");
+    }
+    if required_link.is_some() {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM agent_session \
+             WHERE agent_session.id=? AND agent_session.workspace_id=note.workspace_id \
+             AND agent_session.task_note_id=note.id)",
+        );
     }
     sql.push_str(" RETURNING rev");
     let mut query = sqlx::query(&sql).bind(&note.title);
@@ -952,6 +995,9 @@ where
         .bind(&note.workspace_id.0);
     if let Some(rev) = expected_version {
         query = query.bind(rev);
+    }
+    if let Some(agent_id) = required_link {
+        query = query.bind(&agent_id.0);
     }
     let row = query
         .fetch_optional(executor)
