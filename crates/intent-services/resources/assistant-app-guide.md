@@ -174,6 +174,25 @@ expand its diff in place. Multiple files
 can stay open, and the preview scrolls through them together. If a patch is
 unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
+## Custom homepage views
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/custom-views/{CustomViewsSidebar,CustomViewPanel,CustomViewForm}.svelte; src/features/custom-views/main/custom-views-service.ts; messages/en.json. -->
+
+Custom homepage views are an experimental desktop feature. Discuss them when the
+user asks about building or testing a custom view. In **Home → Workspaces**, use
+**Custom views → Add view** to register a name, server directory, start command,
+fixed port, and icon. The directory and command run on the computer running the
+Electron app, even when the selected daemon is remote. Registrations stay on that
+computer.
+
+Opening a view starts its server and embeds its page. The command receives the
+configured port as `PORT`; it must listen on that port and permit iframe embedding.
+Use **Stop** to stop the server, **Start** to start it again, and **Reload** to reload
+the page. Switching homepage sections keeps the server running; editing, removing,
+or quitting the app stops it. An occupied port or failed command shows an error;
+check the view's server output before retrying. Custom pages do not receive the
+app's workspace or agent tools.
+
 ## Inspect a failed response and recover
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,ChatPanel}.svelte; messages/en.json. -->
