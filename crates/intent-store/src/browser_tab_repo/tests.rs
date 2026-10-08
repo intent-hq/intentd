@@ -73,6 +73,7 @@ fn test_workspace(ws_id: &WorkspaceId, ts: &str) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        attention_reminder: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,

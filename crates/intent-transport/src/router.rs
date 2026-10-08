@@ -879,7 +879,27 @@ async fn dispatch(
         }
         "workspace.dismissAttention" => {
             let id = require_workspace_id(params)?;
-            let ws = api.dismiss_attention(id).await.map_err(workspace_err)?;
+            let ws = if let Some(value) = params.get("reasons") {
+                let reasons: Vec<intent_core::AttentionReminderReason> =
+                    serde_json::from_value(value.clone()).map_err(|_| {
+                        invalid_params("reasons must be an array of identity/revision pairs")
+                    })?;
+                if reasons.len() > 1024
+                    || reasons.iter().any(|r| {
+                        r.id.is_empty()
+                            || r.revision.is_empty()
+                            || r.id.len() > 512
+                            || r.revision.len() > 512
+                    })
+                {
+                    return Err(invalid_params("invalid reminder reasons"));
+                }
+                api.dismiss_attention_reasons(id, reasons)
+                    .await
+                    .map_err(workspace_err)?
+            } else {
+                api.dismiss_attention(id).await.map_err(workspace_err)?
+            };
             Ok(json!({ "workspace": ws }))
         }
         "workspace.markSeen" => {

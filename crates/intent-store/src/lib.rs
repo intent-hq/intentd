@@ -27,6 +27,7 @@ mod delegation_group_repo;
 mod diagnostics;
 mod store_pool;
 pub use store_pool::{StorePool, StorePoolOptions};
+mod attention_reminder_repo;
 mod diffs_repo;
 mod draft_repo;
 mod event_repo;
