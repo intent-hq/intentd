@@ -387,7 +387,7 @@ impl Store {
 
     /// Update recovery metadata only while this agent is still linked to the
     /// note in the same workspace. The revision and session link are checked
-    /// in one SQLite UPDATE, so a session-only relink cannot slip past the CAS.
+    /// in one `SQLite` UPDATE, so a session-only relink cannot slip past the CAS.
     /// Returns None on a stale revision, missing note, or changed agent link.
     ///
     /// # Errors
