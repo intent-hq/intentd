@@ -3307,7 +3307,8 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
     // THIS turn's outbound prompt carries the trailing notice block…
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let last = serde_json::to_value(prompt.last().expect("non-empty prompt")).unwrap();
     assert_eq!(last["text"], json!(super::AUTO_UNARCHIVE_PROMPT_NOTICE));
     mgr.end_turn(&id).await;
@@ -3316,7 +3317,8 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
     assert!(mgr.try_begin(&id, &ws).await, "second claim wins");
     let next = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     assert!(
         !serde_json::to_string(&next)
             .unwrap()
@@ -3345,7 +3347,8 @@ async fn winning_try_begin_in_active_workspace_persists_no_notice() {
     assert!(messages.is_empty(), "no notice row on an active workspace");
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     assert!(
         !serde_json::to_string(&prompt)
             .unwrap()
@@ -3391,7 +3394,8 @@ async fn suppressed_reclaim_persists_no_notice() {
     );
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     assert!(
         !serde_json::to_string(&prompt)
             .unwrap()
@@ -3424,7 +3428,8 @@ async fn auto_unarchive_prompt_flag_cleared_on_slot_release() {
     assert!(mgr.try_begin(&id, &ws).await, "next claim wins");
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     assert!(
         !serde_json::to_string(&prompt)
             .unwrap()
@@ -3474,7 +3479,8 @@ async fn auto_unarchive_flag_arm_skipped_when_slot_released() {
     assert!(mgr.try_begin(&id, &ws).await, "next claim wins");
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     assert!(
         !serde_json::to_string(&prompt)
             .unwrap()
@@ -5793,7 +5799,8 @@ async fn antigravity_failed_setup_survives_restart_without_losing_first_turn_con
             );
             let prompt = mgr
                 .build_turn_prompt(&id, &ws, "Current request", &super::TurnOptions::default())
-                .await;
+                .await
+                .unwrap();
             let text = serde_json::to_value(prompt).unwrap()[0]["text"]
                 .as_str()
                 .unwrap()
@@ -5809,7 +5816,8 @@ async fn antigravity_failed_setup_survives_restart_without_losing_first_turn_con
             );
             let next = mgr
                 .build_turn_prompt(&id, &ws, "Next request", &super::TurnOptions::default())
-                .await;
+                .await
+                .unwrap();
             assert_eq!(
                 serde_json::to_value(next).unwrap()[0]["text"],
                 "Next request"
@@ -5839,7 +5847,8 @@ async fn antigravity_failed_setup_survives_restart_without_losing_first_turn_con
                 .any(|(method, _)| method == "session/new"));
             let resumed = mgr
                 .build_turn_prompt(&id, &ws, "Resumed request", &super::TurnOptions::default())
-                .await;
+                .await
+                .unwrap();
             assert_eq!(
                 serde_json::to_value(resumed).unwrap()[0]["text"],
                 "Resumed request"
@@ -6293,7 +6302,8 @@ async fn build_turn_prompt_prepends_history_once_after_recreate() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "current message", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -6313,7 +6323,8 @@ async fn build_turn_prompt_prepends_history_once_after_recreate() {
     // The flag is consumed: a follow-up turn sends only the message text.
     let plain = mgr
         .build_turn_prompt(&id, &ws, "next message", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let plain_text = serde_json::to_value(&plain).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -6339,7 +6350,10 @@ async fn build_turn_prompt_appends_image_blocks_after_text() {
         ])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hi", &options)
+        .await
+        .unwrap();
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     assert_eq!(arr.len(), 3, "text + 2 image blocks");
@@ -6370,7 +6384,10 @@ async fn build_turn_prompt_appends_file_blocks_after_text_and_images() {
         ])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hi", &options)
+        .await
+        .unwrap();
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     assert_eq!(arr.len(), 4, "text + 1 image + 2 file notices");
@@ -6418,7 +6435,10 @@ async fn build_turn_prompt_skips_malformed_attachments() {
         ])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hi", &options)
+        .await
+        .unwrap();
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     // text + 1 well-formed image + 1 well-formed file reference.
@@ -6455,7 +6475,8 @@ async fn build_turn_prompt_prepends_preempted_content_and_attachments_first() {
     };
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "urgent update", &options)
-        .await;
+        .await
+        .unwrap();
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     assert_eq!(
@@ -6522,7 +6543,8 @@ async fn build_turn_prompt_skips_prepend_text_when_session_recreated() {
     };
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "urgent update", &options)
-        .await;
+        .await
+        .unwrap();
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     let text = arr[0]["text"].as_str().unwrap();
@@ -8623,7 +8645,8 @@ async fn build_turn_prompt_injects_naming_instruction_for_slug_title() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -8666,7 +8689,8 @@ async fn build_turn_prompt_injects_naming_instruction_for_empty_title() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -8700,7 +8724,8 @@ async fn build_turn_prompt_naming_instruction_uses_opencode_tool_name() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -8750,7 +8775,8 @@ async fn build_turn_prompt_naming_instruction_ignores_model_string() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -8788,7 +8814,8 @@ async fn build_turn_prompt_naming_instruction_generic_for_unknown_provider() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -8825,7 +8852,8 @@ async fn build_turn_prompt_skips_naming_instruction_for_custom_title() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hi", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -8860,7 +8888,8 @@ async fn build_turn_prompt_skips_naming_instruction_after_first_turn() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "follow-up", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -18010,7 +18039,7 @@ async fn validate_image_block_refs_enforces_aggregate_cap() {
 /// `resolve_image_block_refs` (monorepo#3338): a reference entry resolves to
 /// inline base64 bytes read from the attachment's workspace root (MIME from
 /// the block, else the registry row); inline entries pass through untouched;
-/// a reference whose file vanished is skipped fail-soft.
+/// unavailable or over-cap references fail the whole turn without changing originals.
 #[tokio::test]
 async fn resolve_image_block_refs_inlines_attachment_bytes() {
     use base64::Engine as _;
@@ -18089,11 +18118,11 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
         })
         .await
         .unwrap();
-    // Registered row whose file was deleted out-of-band → skipped fail-soft.
+    // Registered row whose file was deleted out-of-band must fail closed.
     store
         .insert_attachment(&intent_store::AttachmentRecord {
             id: "att-gone".into(),
-            workspace_id: ws_id,
+            workspace_id: ws_id.clone(),
             file_name: "gone.png".into(),
             mime_type: None,
             size: 1,
@@ -18103,31 +18132,238 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
         .await
         .unwrap();
 
-    let services = Services::new(store);
+    let services = Services::new(store.clone());
     let input = json!([
         { "type": "image", "attachmentId": "att-r" },
-        { "type": "image", "attachmentId": "att-gone" },
         { "type": "image", "data": "inline", "mimeType": "image/jpeg" },
     ]);
     let out = services
         .resolve_image_block_refs(Some(input))
         .await
+        .expect("resolve references")
         .expect("resolved array");
     let arr = out.as_array().expect("array");
-    assert_eq!(arr.len(), 2, "vanished reference skipped: {arr:?}");
+    assert_eq!(arr.len(), 2);
     let expected = base64::engine::general_purpose::STANDARD.encode(b"png-bytes");
     assert_eq!(arr[0]["data"], json!(expected));
     assert_eq!(arr[0]["mimeType"], json!("image/png"));
     assert!(arr[0].get("attachmentId").is_none());
     assert_eq!(arr[1]["data"], json!("inline"));
     assert_eq!(arr[1]["mimeType"], json!("image/jpeg"));
+    assert_eq!(std::fs::read(&full).unwrap(), b"png-bytes");
 
     // No references → input returned unchanged (no clone/rebuild).
     let inline_only = json!([{ "type": "image", "data": "x", "mimeType": "image/png" }]);
     let out = services
         .resolve_image_block_refs(Some(inline_only.clone()))
-        .await;
+        .await
+        .unwrap();
     assert_eq!(out, Some(inline_only));
+
+    for (id, reason) in [
+        ("att-missing", "cannot load attachment record"),
+        ("att-gone", "cannot access attachment file"),
+    ] {
+        let err = services
+            .resolve_image_block_refs(Some(json!([
+                { "type": "image", "attachmentId": "att-r" },
+                { "type": "image", "attachmentId": id },
+            ])))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("imageBlocks[1]") && text.contains(id),
+            "{text}"
+        );
+        assert!(text.contains(reason) && text.contains("Reattach"), "{text}");
+    }
+
+    for (id, path, reason) in [
+        ("att-escape", "../escape.png", "stored path is unsafe"),
+        ("att-directory", ".intent/attachments", "regular file"),
+    ] {
+        store
+            .insert_attachment(&intent_store::AttachmentRecord {
+                id: id.into(),
+                workspace_id: ws_id.clone(),
+                file_name: "pic.png".into(),
+                mime_type: Some("image/png".into()),
+                size: 1,
+                uploaded_at: now_iso(),
+                stored_path: path.into(),
+            })
+            .await
+            .unwrap();
+        let err = services
+            .resolve_image_block_refs(Some(json!([{ "attachmentId": id }])))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("imageBlocks[0]") && text.contains(id),
+            "{text}"
+        );
+        assert!(text.contains(reason), "{text}");
+    }
+
+    // The file grew after ingress validated the recorded size (still 9).
+    let cap = crate::agent_ops::IMAGE_REF_MAX_BYTES;
+    let file = std::fs::OpenOptions::new().write(true).open(&full).unwrap();
+    file.set_len(cap + 1).unwrap();
+    let err = services
+        .resolve_image_block_refs(Some(json!([{ "attachmentId": "att-r" }])))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("imageBlocks[0]") && text.contains("att-r"),
+        "{text}"
+    );
+    assert!(text.contains("byte cap"), "{text}");
+    assert_eq!(file.metadata().unwrap().len(), cap + 1);
+
+    file.set_len(cap / 2 + 1).unwrap();
+    let err = services
+        .resolve_image_block_refs(Some(json!([
+            { "attachmentId": "att-r" }, { "attachmentId": "att-r" },
+        ])))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("imageBlocks[1]") && text.contains("att-r"),
+        "{text}"
+    );
+    assert!(text.contains("aggregate cap"), "{text}");
+}
+
+/// An image lost after ingress must park the real worker in Error without
+/// delivering a partial prompt, losing retry attachments, or leaking its slot.
+#[tokio::test]
+async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-img-failure"),
+        AgentId::from("a-img-failure"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_provider = "node".into();
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-img-failure")
+        .await
+        .unwrap();
+
+    let images = json!([{ "type": "image", "attachmentId": "att-lost-after-ingress" }]);
+    let files = json!([{ "type": "file", "attachmentId": "att-file", "fileName": "context.txt" }]);
+    let prepend_images = json!([{ "type": "image", "data": "b3JpZw==", "mimeType": "image/png" }]);
+    let metadata = json!({ "type": "image-reference-test" });
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    // The manager receives already-validated blocks from ingress. A missing
+    // row here models an attachment removed while the accepted turn waited.
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "inspect the image".into(),
+        Some("msg-img-failure".into()),
+        super::TurnOptions {
+            turn_id: Some("turn-img-failure".into()),
+            image_blocks: Some(images.clone()),
+            file_blocks: Some(files.clone()),
+            message_metadata: Some(metadata.clone()),
+            prepend_content: Some("earlier instruction".into()),
+            prepend_image_blocks: Some(prepend_images.clone()),
+            prepend_file_blocks: Some(files.clone()),
+            interrupt_priority: true,
+            ..super::TurnOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if !mgr.is_busy(&id) && !mgr.workers.lock().unwrap().contains_key(&id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed worker releases its slot and exits");
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.status, AgentStatus::Error);
+    assert!(!session.is_active);
+    let reason = session.stop_reason.unwrap();
+    assert!(reason.contains("att-lost-after-ingress"), "{reason}");
+    assert!(reason.contains("imageBlocks[0]"), "{reason}");
+    assert!(!mgr.active_delivery_groups.lock().unwrap().contains_key(&id));
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(method, _)| method != "session/prompt"));
+
+    let queued = mgr.services.dequeue_message(&id).expect("retry payload");
+    assert!(
+        mgr.services.queue_snapshot(&id).is_empty(),
+        "requeued exactly once"
+    );
+    assert_eq!(queued.content, "inspect the image");
+    assert_eq!(queued.turn_id, "turn-img-failure");
+    assert_eq!(queued.image_blocks, Some(images.clone()));
+    assert_eq!(queued.file_blocks, Some(files.clone()));
+    // Retry correlation retains the submitted id and adds the retry queue id.
+    let mut expected_metadata = metadata;
+    expected_metadata["submissionIds"] = json!(["msg-img-failure", queued.id]);
+    assert_eq!(queued.message_metadata, Some(expected_metadata));
+    assert_eq!(
+        queued.prepend_content.as_deref(),
+        Some("earlier instruction")
+    );
+    assert_eq!(queued.prepend_image_blocks, Some(prepend_images));
+    assert_eq!(queued.prepend_file_blocks, Some(files));
+    assert!(queued.interrupt_priority && queued.persisted && queued.requeued_after_failure);
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    let users: Vec<_> = messages.iter().filter(|m| m.role == "user").collect();
+    assert_eq!(users.len(), 1, "original user row retained exactly once");
+    assert_eq!(
+        users[0].content[1], images[0],
+        "transcript retains reference"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await {
+        events.extend(batch);
+    }
+    for kind in ["agent:failed", "agent:stream:end"] {
+        let terminal: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == kind)
+            .collect();
+        assert_eq!(terminal.len(), 1, "one {kind} event");
+        assert_eq!(terminal[0].data["turnId"], json!("turn-img-failure"));
+    }
 }
 
 /// Prompt rendering (PROTOCOL §5.5): an attachment-reference file block
@@ -18554,7 +18790,10 @@ async fn build_turn_prompt_uses_context_references_when_stdin_context_is_absent(
         ])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, &ws, "do it", &options).await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "do it", &options)
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -18575,7 +18814,10 @@ async fn build_turn_prompt_uses_context_references_when_stdin_context_is_absent(
         ])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, &ws, "do it", &options).await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "do it", &options)
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -18645,7 +18887,10 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
         note_ids: Some(json!([note_id.to_string()])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, &ws, "look", &options).await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "look", &options)
+        .await
+        .unwrap();
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     // Expect: original text prompt, image block, system notice.
@@ -18673,7 +18918,10 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
         note_ids: Some(json!([stray_id.to_string()])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, &ws, "look", &options).await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "look", &options)
+        .await
+        .unwrap();
     let arr_json = serde_json::to_value(&prompt).unwrap();
     let arr = arr_json.as_array().unwrap();
     assert_eq!(arr.len(), 1, "only text; stray URL is skipped");
@@ -27236,7 +27484,10 @@ async fn flush_prompt_keeps_prepend_and_entry_attachment_groups_on_recreate() {
         if recreated {
             mgr.recreated.lock().unwrap().insert(id.clone());
         }
-        let prompt = mgr.build_turn_prompt(&id, &ws, &content, &options).await;
+        let prompt = mgr
+            .build_turn_prompt(&id, &ws, &content, &options)
+            .await
+            .unwrap();
         let wire = serde_json::to_value(prompt).unwrap();
         let blocks = wire.as_array().unwrap();
         let text: String = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
@@ -27361,7 +27612,8 @@ async fn grouped_retry_keeps_legacy_prepend_and_cleans_up_on_stop() {
     let options = super::turn_options_for_entry(&entry, false);
     let prompt = mgr
         .build_turn_prompt(&id, &ws, &entry.content, &options)
-        .await;
+        .await
+        .unwrap();
     let wire = serde_json::to_value(prompt).unwrap();
     let blocks = wire.as_array().unwrap();
     let earlier = blocks
@@ -27452,7 +27704,8 @@ async fn grouped_retry_normalizes_mirrors_and_successive_carry_over() {
     );
     let prompt = mgr
         .build_turn_prompt(&id, &ws, &retry.content, &options)
-        .await;
+        .await
+        .unwrap();
     let wire = serde_json::to_value(prompt).unwrap();
     let blocks = wire.as_array().unwrap();
     for (text, data) in [

@@ -7863,28 +7863,28 @@ impl Services {
     /// within-root containment guard as `file.getAttachment`) and
     /// base64-encoded so the ACP receives the image exactly as an inline
     /// block. MIME resolves block `mimeType` > registry `mime_type` >
-    /// extension inference. Fail-soft by design — ingress already rejected
-    /// bad references, so a row/file that vanished since is skipped with a
-    /// warning rather than breaking the turn (same convention as note-image
-    /// resolution); the same skip re-enforces the [`IMAGE_REF_MAX_BYTES`]
-    /// aggregate cap over the bytes actually read, in case files grew after
-    /// ingress validated the recorded sizes. Inline entries pass through
-    /// untouched; inputs without references return unchanged.
+    /// extension inference. A row/file that vanished or became unsafe since
+    /// ingress fails the whole turn rather than silently omitting an image.
+    /// Bounded reads re-enforce the [`IMAGE_REF_MAX_BYTES`] aggregate cap
+    /// over actual bytes, in case files grew after ingress validated the
+    /// recorded sizes. Inline entries and original files remain untouched;
+    /// provider-specific image preparation happens at the ACP boundary.
     pub(crate) async fn resolve_image_block_refs(
         &self,
         image_blocks: Option<Value>,
-    ) -> Option<Value> {
+    ) -> Result<Option<Value>> {
         use base64::Engine as _;
+        use tokio::io::AsyncReadExt as _;
         if image_block_ref_ids(image_blocks.as_ref()).is_empty() {
-            return image_blocks;
+            return Ok(image_blocks);
         }
         let arr = match image_blocks {
             Some(Value::Array(arr)) => arr,
-            other => return other,
+            other => return Ok(other),
         };
         let mut out = Vec::with_capacity(arr.len());
         let mut total: u64 = 0;
-        for img in arr {
+        for (i, img) in arr.into_iter().enumerate() {
             let Some(obj) = img.as_object() else {
                 out.push(img);
                 continue;
@@ -7897,34 +7897,52 @@ impl Services {
                 out.push(img);
                 continue;
             };
-            let Ok(record) = self.store.get_attachment(id).await else {
-                tracing::warn!(attachment = %id, "image reference: attachment row vanished; skipping");
-                continue;
+            let invalid = |reason: String| {
+                Error::InvalidParams(format!(
+                    "imageBlocks[{i}] attachment {id}: {reason}. Reattach the image and retry."
+                ))
             };
+            let record = self
+                .store
+                .get_attachment(id)
+                .await
+                .map_err(|e| invalid(format!("cannot load attachment record: {e}")))?;
             let root = crate::file_ops::resolve_root(&self.store, &record.workspace_id, None).await;
-            if root.is_empty() {
-                tracing::warn!(attachment = %id, "image reference: attachment workspace has no resolved root; skipping");
-                continue;
+            if root.is_empty() || !std::path::Path::new(&root).is_absolute() {
+                return Err(invalid(
+                    "attachment workspace has no safe resolved root".into(),
+                ));
             }
-            let Ok(path) = crate::file_ops::resolve_attachment_source(&root, &record.stored_path)
-            else {
-                tracing::warn!(attachment = %id, "image reference: stored path escapes the workspace; skipping");
-                continue;
-            };
-            let bytes = match tokio::fs::read(&path).await {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(attachment = %id, error = %e, "image reference: read failed; skipping");
-                    continue;
-                }
-            };
+            let path = crate::file_ops::resolve_attachment_source(&root, &record.stored_path)
+                .map_err(|e| invalid(format!("stored path is unsafe: {e}")))?;
+            let metadata = tokio::fs::metadata(&path)
+                .await
+                .map_err(|e| invalid(format!("cannot access attachment file: {e}")))?;
+            if !metadata.is_file() {
+                return Err(invalid("attachment must be a regular file".into()));
+            }
+            if metadata.len() > IMAGE_REF_MAX_BYTES {
+                return Err(invalid(format!(
+                    "attachment exceeds the {IMAGE_REF_MAX_BYTES} byte cap for image references"
+                )));
+            }
+            let file = tokio::fs::File::open(&path)
+                .await
+                .map_err(|e| invalid(format!("cannot open attachment file: {e}")))?;
+            let mut bytes = Vec::new();
+            file.take(IMAGE_REF_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|e| invalid(format!("cannot read attachment file: {e}")))?;
             if bytes.len() as u64 > IMAGE_REF_MAX_BYTES {
-                tracing::warn!(attachment = %id, size = bytes.len(), "image reference: over the byte cap; skipping");
-                continue;
+                return Err(invalid(format!(
+                    "attachment exceeds the {IMAGE_REF_MAX_BYTES} byte cap for image references"
+                )));
             }
             if total.saturating_add(bytes.len() as u64) > IMAGE_REF_MAX_BYTES {
-                tracing::warn!(attachment = %id, size = bytes.len(), total, "image reference: over the aggregate byte cap; skipping");
-                continue;
+                return Err(invalid(format!(
+                    "image references exceed the {IMAGE_REF_MAX_BYTES} byte aggregate cap"
+                )));
             }
             total += bytes.len() as u64;
             let mime = obj
@@ -7936,7 +7954,7 @@ impl Services {
             let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
             out.push(json!({ "type": "image", "data": data, "mimeType": mime }));
         }
-        Some(Value::Array(out))
+        Ok(Some(Value::Array(out)))
     }
 
     /// `agent.sendMessage`: persist the user message; on failure auto-queue

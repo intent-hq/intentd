@@ -137,6 +137,16 @@ agent conversations. Resolve any displayed repository, Git, or provider setup
 error before retrying. If creation succeeded but sending the first message failed,
 use the form's retry instruction instead of creating a second workspace.
 
+<!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_session,agent_ops}.rs. -->
+
+Images sent to agents may be resized or re-encoded for provider delivery; original
+attachments and their displayed previews are unchanged. If an image cannot be read
+or the images together exceed the delivery budget, the turn fails rather than
+silently omitting an image. Re-export an unreadable image as PNG/JPEG, or send fewer
+images cropped to the relevant detail. A provider request-size error can also come
+from images retained in earlier turns: start a new agent conversation with only
+the images needed if sending fewer images still fails.
+
 <!-- Sources: packages/intentd/crates/intent-services/src/lib.rs (SETUP_TERMINAL_NAME); packages/intentd/crates/intent-pty/src/host.rs. -->
 
 Workspace setup runs in the **Setup Script** terminal and can finish without that
