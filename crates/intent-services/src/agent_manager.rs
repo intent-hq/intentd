@@ -5731,6 +5731,17 @@ impl AgentManager {
         turn_id: Option<&str>,
     ) -> Result<StopReason> {
         let original = self.capture_turn(agent_id)?;
+        // Bare callers do not hold the worker's busy slot: protect their
+        // process from idle eviction while image preparation awaits CPU work.
+        self.registry.mark_active(agent_id);
+        let prompt = match crate::provider_images::PreparedPrompt::new(prompt).await {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                self.active_delivery_groups.lock().unwrap().remove(agent_id);
+                self.registry.mark_idle_slot_held(agent_id);
+                return Err(error);
+            }
+        };
         self.run_turn_owned(
             agent_id,
             workspace_id,
@@ -5763,7 +5774,7 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         acp_session_id: &str,
-        prompt: Vec<ContentBlock>,
+        prompt: crate::provider_images::PreparedPrompt,
         turn_id: Option<&str>,
         original: OriginalTurn,
     ) -> Result<StopReason> {
@@ -12797,13 +12808,33 @@ async fn run_message_worker(
                     mgr.clear_attention_request_if_present(&agent_id, &workspace_id)
                         .await;
                 }
-                let prompt = match mgr
-                    .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
-                    .await
-                {
+                // Session establishment may arm both flags. Assembly consumes
+                // them, but a rejected prompt has delivered neither context.
+                // The worker's busy slot protects the child throughout prep.
+                let prepend_pending = mgr.prepend_pending.lock().unwrap().contains(&agent_id);
+                let recreated = mgr.recreated.lock().unwrap().contains(&agent_id);
+                let restore_undelivered_context = || {
+                    if prepend_pending {
+                        mgr.prepend_pending.lock().unwrap().insert(agent_id.clone());
+                    }
+                    if recreated {
+                        mgr.recreated.lock().unwrap().insert(agent_id.clone());
+                    }
+                };
+                let prepared = async {
+                    let prompt = mgr
+                        .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
+                        .await?;
+                    crate::provider_images::PreparedPrompt::new(prompt).await
+                }
+                .await;
+                let prompt = match prepared {
                     Ok(prompt) => prompt,
                     Err(e) => {
-                        tracing::warn!(agent = %agent_id, error = %e, "agent prompt assembly failed");
+                        // Restore only on pre-delivery failure, never on an ACP
+                        // error after the provider may have seen the context.
+                        restore_undelivered_context();
+                        tracing::warn!(agent = %agent_id, error = %e, "agent prompt preparation failed");
                         // No partial prompt reaches the provider. The original
                         // options (including image references and turn id) feed
                         // the normal durable failure/retry path unchanged.
@@ -12827,6 +12858,7 @@ async fn run_message_worker(
                     &content,
                     options.message_metadata.as_ref(),
                 ) {
+                    restore_undelivered_context();
                     mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
                         .await;
                     return;
@@ -12836,6 +12868,7 @@ async fn run_message_worker(
                     .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())
                     .await
                 {
+                    restore_undelivered_context();
                     mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
                         .await;
                     return;

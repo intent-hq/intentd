@@ -12786,6 +12786,7 @@ async fn image_reference_block_resolves_to_acp_image_over_wss() {
 /// A valid base64 payload with a PNG header but missing pixel data must fail
 /// the turn with an actionable image error, not reach the provider or vanish
 /// silently from the prompt. Covers both attachment and inline delivery.
+/// Resuming after rejection must deliver the assembled system prompt once.
 #[intent_test_macros::daemon_test]
 async fn corrupt_image_fails_before_acp_prompt_over_wss() {
     image_prompt_preparation_over_wss(ImagePreparationCase::CorruptPng).await;
@@ -12807,6 +12808,7 @@ enum ImagePreparationCase {
 async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     use base64::Engine as _;
 
+    const SYSTEM_MARKER: &str = "IMAGE_PREPARATION_SYSTEM_MARKER";
     let Some(script) = gate("image prompt preparation E2E") else {
         return;
     };
@@ -12864,6 +12866,9 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         let ws = intent_core::WorkspaceId::new();
         let root = data_dir.join("ws-root");
         std::fs::create_dir_all(&root).expect("mkdir ws root");
+        if corrupt {
+            std::fs::write(root.join("AGENTS.md"), SYSTEM_MARKER).expect("write workspace rules");
+        }
         let mut seed = workspace_seed(&ws);
         seed.worktree_path = Some(root.to_string_lossy().into_owned());
         store.insert_workspace(&seed).await.expect("insert ws");
@@ -12871,12 +12876,17 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     };
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
-    let behavior = json!({ "response": "seen" }).to_string();
-    let env: [(&str, &str); 4] = [
+    let session_log = data_dir.join("sessions.jsonl");
+    let behavior = json!({ "response": "seen", "loadSession": corrupt }).to_string();
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+        (
+            "MOCK_AGENT_SESSION_LOG",
+            session_log.to_str().expect("session log path"),
+        ),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon { child };
@@ -13033,9 +13043,120 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
             .collect();
         if corrupt {
             assert!(
-                prompts.is_empty(),
+                prompts
+                    .iter()
+                    .all(|p| !p["text"].as_str().unwrap_or_default().contains(&content)),
                 "corrupt images never reach session/prompt"
             );
+            // Discard the retained corrupt retry, as a user would before
+            // replacing it; otherwise it auto-drains after the valid turn.
+            let queued = wss_rpc(
+                &mut rpc,
+                17,
+                "agent.getQueue",
+                json!({ "agentId": agent_id }),
+            )
+            .await;
+            let queue = queued["queue"].as_array().expect("retained retry queue");
+            assert_eq!(queue.len(), 1, "only the corrupt retry is retained");
+            assert_eq!(queue[0]["content"], content);
+            let removed = wss_rpc(
+                &mut rpc,
+                18,
+                "agent.removeQueuedMessage",
+                json!({ "agentId": agent_id, "messageId": queue[0]["id"].as_str().expect("retry id") }),
+            )
+            .await;
+            assert_eq!(removed["success"], true);
+            let remaining = wss_rpc(
+                &mut rpc,
+                19,
+                "agent.getQueue",
+                json!({ "agentId": agent_id }),
+            )
+            .await;
+            assert!(remaining["queue"].as_array().expect("queue").is_empty());
+            let read_sessions = || -> Vec<Value> {
+                std::fs::read_to_string(&session_log)
+                    .expect("read session log")
+                    .lines()
+                    .map(|line| serde_json::from_str(line).expect("session log JSON"))
+                    .collect()
+            };
+            let before_retry = read_sessions();
+            let fresh = before_retry.last().expect("failed turn created a session");
+            assert_eq!(fresh["method"], "session/new");
+            assert!(fresh["sessionId"].is_string());
+            for turn in 1..=2 {
+                let retry_content = format!("valid follow-up {turn} for {name}");
+                let retry = wss_rpc(
+                    &mut rpc,
+                    20 + turn,
+                    "agent.sendMessage",
+                    json!({ "workspaceId": &ws_id, "agentId": agent_id, "content": &retry_content }),
+                )
+                .await;
+                assert_eq!(retry["success"], true, "follow-up accepted: {retry}");
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                let (mut ended, mut idle, mut settled) = (false, false, false);
+                while !(ended && idle && settled) {
+                    let frame = wss_event_opt_until(&mut sub, deadline)
+                        .await
+                        .expect("valid follow-up completed");
+                    let event = &frame["params"]["event"];
+                    if event["data"]["agentId"].as_str() != Some(agent_id) {
+                        continue;
+                    }
+                    match event["type"].as_str() {
+                        Some("agent:failed") => panic!("valid follow-up failed: {event}"),
+                        Some("agent:stream:end") => ended = true,
+                        Some("agent:idle") => idle = true,
+                        Some("agent:status-changed") if event["data"]["status"] == "idle" => {
+                            settled = true;
+                        }
+                        _ => {}
+                    }
+                }
+                // Prove resume, not recreation that would re-arm the prepend.
+                let sessions = read_sessions();
+                assert_eq!(sessions.len(), before_retry.len() + 1);
+                let resumed = &sessions[before_retry.len()];
+                assert_eq!(resumed["method"], "session/load");
+                assert_eq!(resumed["sessionId"], fresh["sessionId"]);
+                let delivered: Vec<Value> = std::fs::read_to_string(&prompt_log)
+                    .expect("read follow-up prompts")
+                    .lines()
+                    .map(|line| serde_json::from_str(line).expect("prompt log JSON"))
+                    .filter(|p: &Value| {
+                        p["text"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains(&retry_content)
+                    })
+                    .collect();
+                assert_eq!(delivered.len(), 1, "one provider prompt per follow-up");
+                assert_eq!(
+                    delivered[0]["turn"], turn,
+                    "same resumed child serves both turns"
+                );
+                let text = delivered[0]["text"].as_str().expect("prompt text");
+                if turn == 1 {
+                    assert!(
+                        text.starts_with("<system>\n"),
+                        "first delivered prompt retains system prompt: {text}"
+                    );
+                    let system_end = text.find("\n</system>").expect("system block closes");
+                    assert!(
+                        text[..system_end].contains(SYSTEM_MARKER),
+                        "assembled workspace rules retained"
+                    );
+                } else {
+                    assert!(
+                        !text.contains("<system>\n") && !text.contains(SYSTEM_MARKER),
+                        "system prompt must not repeat: {text}"
+                    );
+                }
+            }
         } else {
             let matching: Vec<_> = prompts
                 .iter()

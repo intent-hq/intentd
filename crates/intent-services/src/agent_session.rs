@@ -3302,6 +3302,7 @@ impl Services {
         prompt: Vec<ContentBlock>,
         turn_id: Option<&str>,
     ) -> Result<StopReason> {
+        let prompt = crate::provider_images::PreparedPrompt::new(prompt).await?;
         self.run_prompt_turn_captured(
             conn,
             notifications,
@@ -3326,15 +3327,13 @@ impl Services {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         acp_session_id: &str,
-        prompt: Vec<ContentBlock>,
+        prompt: crate::provider_images::PreparedPrompt,
         turn_id: Option<&str>,
         mut local: Option<LocalPromptInput<'_>>,
     ) -> Result<StopReason> {
-        // All clients and delivery modes converge here. Prepare only this
-        // outbound copy; persisted messages, attachments, and the local original
-        // prompt capture remain untouched. Failure precedes ACP delivery and is
-        // surfaced by the worker's ordinary terminal-failure path.
-        let prompt = crate::provider_images::prepare_prompt_images(prompt).await?;
+        // The worker prepares this outbound copy before committing its
+        // first-turn context. Persisted originals and local capture are untouched.
+        let prompt = prompt.into_blocks();
         // Mint the assistant message id at turn START (CS-0 D1) so streaming
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();

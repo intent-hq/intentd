@@ -23,6 +23,21 @@ const RESIZE_ATTEMPTS: usize = 6;
 
 static IMAGE_WORKERS: Semaphore = Semaphore::const_new(2);
 
+/// An outbound copy whose images have all passed provider preparation.
+/// Keep delivery typed so the worker can recover undelivered context on
+/// preparation failure without decoding the images a second time.
+pub(crate) struct PreparedPrompt(Vec<ContentBlock>);
+
+impl PreparedPrompt {
+    pub(crate) async fn new(prompt: Vec<ContentBlock>) -> Result<Self> {
+        prepare_prompt_images(prompt).await.map(Self)
+    }
+
+    pub(crate) fn into_blocks(self) -> Vec<ContentBlock> {
+        self.0
+    }
+}
+
 /// Prepare all images together without exposing partially prepared prompts.
 pub(crate) async fn prepare_prompt_images(prompt: Vec<ContentBlock>) -> Result<Vec<ContentBlock>> {
     if !prompt

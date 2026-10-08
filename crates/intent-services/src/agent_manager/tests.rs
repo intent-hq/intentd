@@ -18260,7 +18260,7 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
 /// delivering a partial prompt, losing retry attachments, or leaking its slot.
 #[tokio::test]
 async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() {
-    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (tmp, mgr, bus) = manager_with_bus().await;
     let mgr = Arc::new(mgr);
     let (ws, id) = (
         WorkspaceId::from("ws-img-failure"),
@@ -18287,6 +18287,26 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
     let files = json!([{ "type": "file", "attachmentId": "att-file", "fileName": "context.txt" }]);
     let prepend_images = json!([{ "type": "image", "data": "b3JpZw==", "mimeType": "image/png" }]);
     let metadata = json!({ "type": "image-reference-test" });
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.system_prompt = Some("Undelivered system instructions".into());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .unwrap();
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "Earlier conversation context" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    // Model the first prompt after session/new recreated a lost session.
+    mgr.recreated.lock().unwrap().insert(id.clone());
+    mgr.arm_first_turn_prepend(&id, intent_providers::find_provider("mock").unwrap());
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     // The manager receives already-validated blocks from ingress. A missing
     // row here models an attachment removed while the accepted turn waited.
@@ -18360,9 +18380,13 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
         .await
         .unwrap();
     let users: Vec<_> = messages.iter().filter(|m| m.role == "user").collect();
-    assert_eq!(users.len(), 1, "original user row retained exactly once");
     assert_eq!(
-        users[0].content[1], images[0],
+        users.len(),
+        2,
+        "history and original user row retained exactly once"
+    );
+    assert_eq!(
+        users[1].content[1], images[0],
         "transcript retains reference"
     );
 
@@ -18378,6 +18402,67 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
         assert_eq!(terminal.len(), 1, "one {kind} event");
         assert_eq!(terminal[0].data["turnId"], json!("turn-img-failure"));
     }
+
+    // A successful session/load does not re-arm first-turn context. It must
+    // still arrive on the next delivered prompt because the failed one never
+    // reached the provider. The broken retry payload was dequeued above.
+    let (_resumed_agent, resumed_log) = track_mock_agent_with_log(&mgr, &id, true);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .spawned_provider = "node".into();
+    mgr.start_session(
+        &id,
+        tmp.path.parent().unwrap().to_path_buf(),
+        intent_providers::find_provider("mock").unwrap(),
+    )
+    .await
+    .unwrap();
+    for (text, expects_context) in [("valid follow-up", true), ("later turn", false)] {
+        mgr.send_message(
+            id.clone(),
+            ws.clone(),
+            text.into(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(10), async {
+            while mgr.is_busy(&id) || mgr.workers.lock().unwrap().contains_key(&id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("follow-up worker settles");
+        let calls = resumed_log.lock().unwrap();
+        assert!(calls.iter().any(|(method, _)| method == "session/load"));
+        let prompt = calls
+            .iter()
+            .rev()
+            .find(|(method, _)| method == "session/prompt")
+            .expect("follow-up reaches provider");
+        let delivered = prompt.1["prompt"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<String>();
+        assert!(delivered.contains(text), "current user message delivered");
+        assert_eq!(
+            delivered.contains("Undelivered system instructions"),
+            expects_context,
+            "system context delivered exactly once after pre-delivery failure"
+        );
+        assert_eq!(
+            delivered.contains("Earlier conversation context"),
+            expects_context,
+            "recreated history delivered exactly once after pre-delivery failure"
+        );
+    }
+    mgr.stop(&id).await;
 }
 
 /// Prompt rendering (PROTOCOL §5.5): an attachment-reference file block
