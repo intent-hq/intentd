@@ -136,8 +136,9 @@ enum Command {
     /// Probe daemon liveness and print live status (transports, port, clients,
     /// agents, cert fingerprint, host OS/arch + hasDisplay + locality, §5.7).
     Status,
-    /// Ask a running daemon to shut down gracefully (control RPC → SIGTERM →
-    /// SIGKILL escalation, signalled via the pidfile, §5.7).
+    /// Shut down gracefully and confirm exit; already stopped succeeds.
+    /// Escalates within a bounded wait if needed (Unix signals or Windows
+    /// process control). Uses the current data directory (§5.7).
     Stop,
     /// Diagnostics: data-dir writable, SQLite/migrations current, providers,
     /// ports free, cert validity, GitHub token, context engine, host caps (§5.7).

@@ -36,6 +36,7 @@ def main():
     if sitter is None or not sitter.is_file():
         raise RuntimeError("current build did not produce the sitter executable")
     env["INTENTD_TEST_SITTER_BIN"] = str(sitter)
+    require_passed(run(["cargo", "test", "--locked", "-p", "intentd-sitter", "--test", "cli_help"], env), minimum=2)
     require_passed(run(["cargo", "test", "--locked", "-p", "intentd-sitter", "--lib"], env))
     if os.name != "nt":
         require_passed(run(["cargo", "test", "--locked", "-p", "intentd-sitter", "--lib", "--", "--exact", "startup::tests::dead_supervisor_cleanup_closes_descendant_pipe"], env))

@@ -6,9 +6,8 @@
 //! verbatim, keep it updated on the randomized 12–24h cadence, and babysit
 //! crashes. One-shot subcommands run the installed daemon exactly once with
 //! no updater activity. The intercepted `intentd sitter channel`,
-//! `intentd restart`, and `intentd update` commands are handled entirely
-//! here — they never spawn a serving daemon (`update` only probes readiness
-//! with one-shot `call system.status` invocations after a restart).
+//! `intentd start`, `intentd restart`, and `intentd update` commands are handled
+//! here. Start and restart-from-stopped launch a detached supervisor.
 
 use intentd_sitter::cli::{self, SitterArgs, SitterCommand};
 use intentd_sitter::config;
@@ -37,6 +36,11 @@ fn run() -> i32 {
 
     if args.print_version {
         println!("intentd-sitter {}", env!("CARGO_PKG_VERSION"));
+        return 0;
+    }
+
+    if let Some(help) = args.help() {
+        println!("{help}");
         return 0;
     }
 
@@ -349,11 +353,10 @@ fn wait_for_restarted_daemon(paths: &SitterPaths, version: &str) -> i32 {
     }
 }
 
-/// No SIGHUP on windows: the new binary takes effect on the next (service)
-/// restart instead.
+/// Windows update installation does not automatically request a restart.
 #[cfg(not(unix))]
 fn apply_installed_update(_paths: &SitterPaths, _version: &str) -> i32 {
-    println!("restart the intentd service to start using the new version");
+    println!("run `intentd restart` to start using the new version");
     0
 }
 

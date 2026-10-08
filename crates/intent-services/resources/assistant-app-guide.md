@@ -247,3 +247,31 @@ or artifact links the agent supplied. A status label alone is not proof that wor
 succeeded. Use live workspace, note, and agent tools for actual IDs, progress, and
 available actions. Never construct links from guessed IDs or claim completion from
 this static guide.
+
+## Daemon lifecycle from the terminal
+
+For a separately installed `intentd` launcher on Windows, macOS, or Linux, use
+`intentd start` to run in the background, `intentd status` to inspect live status,
+`intentd stop` to confirm shutdown (already stopped succeeds), and `intentd restart`
+to replace the supervised daemon or start it if stopped. These commands act on the
+host where they run; stopping the daemon disconnects its clients.
+
+`start` waits for readiness (60-second default budget); starting a healthy daemon
+again succeeds without restarting it. Startup errors return nonzero and point to
+`<data-dir>/sitter/start.log`. `restart` from stopped uses that same startup path.
+For a running supervisor, restart retains its launch options; Windows waits for
+replacement readiness, while macOS/Linux return after signaling, so check `status`.
+This also works with supervisors launched by services or Windows Scheduled Tasks.
+Background start/restart does not install or enable boot/login services or tasks;
+stop does not disable an existing one.
+
+Use the same `INTENTD_DATA_DIR` and configuration environment for each command.
+`start` accepts serve options (`--mode`, `--insecure` for development only,
+`--resume-all`, `--specialists-dir`); restart takes no launch options. Stop then
+start to change options. `intentd --help` and `intentd start --help` are safe even
+before daemon installation. `serve` stays in the foreground. Direct bare daemon
+builds and the desktop-bundled daemon are distinct from this installed launcher;
+start/restart are launcher commands. Check the installed launcher's help when its
+version differs from this guide; do not infer launcher support from daemon version.
+
+<!-- Sources: packages/intentd/README.md (Start, status, stop, and restart); packages/intentd/crates/intentd-sitter/src/{cli.rs,main.rs,startup.rs,paths.rs,readiness.rs}; packages/intentd/crates/intentd/src/main.rs (Serve, Status, Stop). -->
