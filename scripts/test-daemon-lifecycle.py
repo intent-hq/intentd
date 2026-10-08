@@ -18,10 +18,15 @@ def require_passed(output, minimum=1):
 
 def run(args, env=None):
     print("+ " + " ".join(args), flush=True)
-    result = subprocess.run(args, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    print(result.stdout, flush=True)
-    result.check_returncode()
-    return result.stdout
+    with subprocess.Popen(args, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+        lines = []
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            lines.append(line)
+        output = "".join(lines)
+        if process.wait():
+            raise subprocess.CalledProcessError(process.returncode, args, output)
+        return output
 
 
 def main():
@@ -36,6 +41,7 @@ def main():
     if sitter is None or not sitter.is_file():
         raise RuntimeError("current build did not produce the sitter executable")
     env["INTENTD_TEST_SITTER_BIN"] = str(sitter)
+    require_passed(run(["cargo", "test", "--locked", "-p", "intentd", "--test", "e2e_detached_lifecycle", "lifecycle_capture_"], env), minimum=3)
     require_passed(run(["cargo", "test", "--locked", "-p", "intentd-sitter", "--test", "cli_help"], env), minimum=2)
     require_passed(run(["cargo", "test", "--locked", "-p", "intentd-sitter", "--lib"], env))
     if os.name != "nt":

@@ -18,6 +18,151 @@ use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 #[cfg(windows)]
 use windows_child::GuardedChild;
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+
+fn captured_command(
+    command: &mut Command,
+    budget: Duration,
+) -> std::io::Result<std::process::Output> {
+    // Files avoid both a full pipe before exit and waiting for EOF after exit
+    // when a descendant inherited stdout/stderr. Keep the process guard armed.
+    let capture = common::test_tempdir("lifecycle-command-");
+    let stdout = capture.path().join("stdout");
+    let stderr = capture.path().join("stderr");
+    command
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&stdout)?)
+        .stderr(std::fs::File::create(&stderr)?);
+    let args = command.get_args().collect::<Vec<_>>();
+    eprintln!("lifecycle: starting {args:?}");
+    let started = std::time::Instant::now();
+    let mut child = GuardedChild::spawn(command)?;
+    let status = child.wait_with_timeout(budget)?;
+    eprintln!(
+        "lifecycle: command {status:?} after {:?}",
+        started.elapsed()
+    );
+    let stdout = std::fs::read(stdout)?;
+    let stderr = std::fs::read(stderr)?;
+    let Some(status) = status else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "lifecycle command timed out; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            ),
+        ));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[test]
+fn lifecycle_output_fixture() {
+    match std::env::var("INTENTD_LIFECYCLE_OUTPUT_FIXTURE").as_deref() {
+        Ok("chatty") => {
+            use std::io::Write;
+            std::io::stdout()
+                .write_all(&vec![b'o'; 256 * 1024])
+                .unwrap();
+            std::io::stderr()
+                .write_all(&vec![b'e'; 256 * 1024])
+                .unwrap();
+        }
+        Ok("descendant") => {
+            // Deliberately outlive the direct child while retaining its output.
+            // The test releases us; the deadline also bounds failure cleanup.
+            let release = std::env::var_os("INTENTD_LIFECYCLE_RELEASE").unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !std::path::Path::new(&release).exists() && std::time::Instant::now() < deadline {
+                // timing-guard: bounded fixture release polling
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::fs::write(
+                std::path::Path::new(&release).with_extension("done"),
+                "done",
+            )
+            .unwrap();
+        }
+        Ok("spawn") => {
+            // This fixture intentionally drops an unwaited child so the caller
+            // must finish capture without EOF from the inherited pipe.
+            drop(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "lifecycle_output_fixture", "--nocapture"])
+                    .env("INTENTD_LIFECYCLE_OUTPUT_FIXTURE", "descendant")
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        Ok("hang") => {
+            eprintln!("fixture waiting for termination");
+            std::thread::park_timeout(Duration::from_secs(5));
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn lifecycle_capture_drains_output_before_waiting_for_exit() {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "lifecycle_output_fixture", "--nocapture"])
+        .env("INTENTD_LIFECYCLE_OUTPUT_FIXTURE", "chatty");
+    let output = captured_command(&mut command, Duration::from_secs(3)).unwrap();
+    assert!(output.status.success());
+    assert!(output
+        .stdout
+        .windows(256 * 1024)
+        .any(|b| b.iter().all(|b| *b == b'o')));
+    assert!(output
+        .stderr
+        .windows(256 * 1024)
+        .any(|b| b.iter().all(|b| *b == b'e')));
+}
+#[test]
+fn lifecycle_capture_does_not_wait_for_inherited_output_eof() {
+    let dir = common::test_tempdir("lifecycle-inherited-output-");
+    let release = dir.path().join("release");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "lifecycle_output_fixture", "--nocapture"])
+        .env("INTENTD_LIFECYCLE_OUTPUT_FIXTURE", "spawn")
+        .env("INTENTD_LIFECYCLE_RELEASE", &release);
+    let started = std::time::Instant::now();
+    let result = captured_command(&mut command, Duration::from_secs(3));
+    std::fs::write(&release, "done").unwrap();
+    assert!(result.unwrap().status.success());
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !release.with_extension("done").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "descendant did not observe cleanup"
+        );
+        // timing-guard: retain the release directory until the descendant acknowledges cleanup
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn lifecycle_capture_bounds_hung_commands_with_diagnostics() {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "lifecycle_output_fixture", "--nocapture"])
+        .env("INTENTD_LIFECYCLE_OUTPUT_FIXTURE", "hang");
+    let started = std::time::Instant::now();
+    let error = captured_command(&mut command, Duration::from_secs(1)).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(error
+        .to_string()
+        .contains("fixture waiting for termination"));
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
 /// This cross-package test needs a freshly built sitter artifact, which Cargo
 /// does not expose through `CARGO_BIN_EXE` for a sibling package. Run explicitly
 /// after building intentd-sitter, setting `INTENTD_TEST_SITTER_BIN` to its binary.
@@ -33,6 +178,12 @@ async fn detached_sitter_lifecycle_over_wss() {
     struct SessionGuard(std::path::PathBuf);
     impl Drop for SessionGuard {
         fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!(
+                    "lifecycle: daemon log on failure: {}",
+                    std::fs::read_to_string(self.0.with_file_name("start.log")).unwrap_or_default()
+                );
+            }
             if let Some(pid) = intentd_sitter::supervisor::read_live_pid(&self.0) {
                 #[cfg(unix)]
                 let _ = killpg(pid, Signal::SIGKILL);
@@ -93,6 +244,9 @@ async fn detached_sitter_lifecycle_over_wss() {
             use std::io::Write;
             while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
                     let _ = stream.write_all(
                         b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                     );
@@ -135,15 +289,7 @@ async fn detached_sitter_lifecycle_over_wss() {
     };
     let invoke = |verb: &str| {
         let mut command = make_command(verb);
-        let mut child = GuardedChild::spawn(&mut command).unwrap();
-        assert!(
-            child
-                .wait_with_timeout(Duration::from_secs(70))
-                .unwrap()
-                .is_some(),
-            "{verb} timed out"
-        );
-        let output = child.disarm().wait_with_output().unwrap();
+        let output = captured_command(&mut command, Duration::from_secs(70)).unwrap();
         assert!(
             output.status.success(),
             "{verb}: {output:?}; log: {}",
@@ -191,12 +337,7 @@ async fn detached_sitter_lifecycle_over_wss() {
         for option in ["--help", "-h", "--invalid-lifecycle-option"] {
             let mut command = make_command("stop");
             command.arg(option);
-            let mut child = GuardedChild::spawn(&mut command).unwrap();
-            assert!(child
-                .wait_with_timeout(Duration::from_secs(5))
-                .unwrap()
-                .is_some());
-            let output = child.disarm().wait_with_output().unwrap();
+            let output = captured_command(&mut command, Duration::from_secs(5)).unwrap();
             let help = option != "--invalid-lifecycle-option";
             assert_eq!(output.status.success(), help, "{option}: {output:?}");
             if help {
@@ -256,6 +397,7 @@ async fn detached_sitter_lifecycle_over_wss() {
         }
     }
     for restarted in [false, true] {
+        eprintln!("lifecycle: real WSS proof, restarted={restarted}");
         if restarted {
             invoke("restart");
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -281,7 +423,10 @@ async fn detached_sitter_lifecycle_over_wss() {
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 701);
         assert_eq!(response["result"]["version"], env!("CARGO_PKG_VERSION"));
-        ws.close(None).await.unwrap();
+        timeout(Duration::from_secs(5), ws.close(None))
+            .await
+            .unwrap()
+            .unwrap();
     }
     invoke("stop");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -352,15 +497,7 @@ async fn detached_sitter_lifecycle_over_wss() {
         duplicate.env("INTENTD_SITTER_STARTING", "1");
         // The real data-directory lock makes the spawned child exit. The
         // surviving daemon is ready by the time failed-start cleanup runs.
-        let mut failed = GuardedChild::spawn(&mut duplicate).unwrap();
-        assert!(
-            failed
-                .wait_with_timeout(Duration::from_secs(10))
-                .unwrap()
-                .is_some(),
-            "duplicate launch must exit after failing the data-directory lock"
-        );
-        let output = failed.disarm().wait_with_output().unwrap();
+        let output = captured_command(&mut duplicate, Duration::from_secs(10)).unwrap();
         assert!(!output.status.success(), "{output:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr)
@@ -376,28 +513,36 @@ async fn detached_sitter_lifecycle_over_wss() {
         // A different retained process, or malformed guard, cannot authorize
         // shutdown of this endpoint. No guarded request may reach the daemon.
         for expected in [std::process::id().to_string(), "invalid".into(), "0".into()] {
-            let rejected = tokio::process::Command::new(&binary)
-                .args(["call", "system.shutdown"])
-                .env("INTENTD_DATA_DIR", data)
-                .env("INTENTD_SHUTDOWN_EXPECTED_PID", expected)
-                .kill_on_drop(true)
-                .output()
-                .await
-                .unwrap();
+            let rejected = timeout(
+                Duration::from_secs(10),
+                tokio::process::Command::new(&binary)
+                    .args(["call", "system.shutdown"])
+                    .env("INTENTD_DATA_DIR", data)
+                    .env("INTENTD_SHUTDOWN_EXPECTED_PID", expected)
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("guarded foreign shutdown timed out")
+            .unwrap();
             assert!(
                 !rejected.status.success(),
                 "foreign endpoint accepted shutdown: {rejected:?}"
             );
             assert!(owner.wait_with_timeout(Duration::ZERO).unwrap().is_none());
         }
-        let accepted = tokio::process::Command::new(&binary)
-            .args(["call", "system.shutdown"])
-            .env("INTENTD_DATA_DIR", data)
-            .env("INTENTD_SHUTDOWN_EXPECTED_PID", owner.id().to_string())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .unwrap();
+        let accepted = timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new(&binary)
+                .args(["call", "system.shutdown"])
+                .env("INTENTD_DATA_DIR", data)
+                .env("INTENTD_SHUTDOWN_EXPECTED_PID", owner.id().to_string())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("guarded owned shutdown timed out")
+        .unwrap();
         assert!(
             accepted.status.success(),
             "owned endpoint rejected shutdown: {accepted:?}"
@@ -409,10 +554,14 @@ async fn detached_sitter_lifecycle_over_wss() {
             .success());
     }
     {
+        eprintln!("lifecycle: stop during startup and crash backoff");
         // Stop must reach the sitter before there is any daemon pidfile.
         // A held HTTP endpoint keeps its initial update check pending.
         let stalled = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut command = make_command("serve");
+        command
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(data.join("booting.log")).unwrap());
         command.env(
             "INTENTD_SITTER_MANIFEST_BASE_URL",
             format!("http://{}", stalled.local_addr().unwrap()),
@@ -463,6 +612,7 @@ async fn detached_sitter_lifecycle_over_wss() {
         command
             .arg("--invalid-lifecycle-option")
             .env("INTENTD_SITTER_BACKOFF_INITIAL_MS", "30000")
+            .stdout(Stdio::null())
             .stderr(log_file);
         let mut recovering = GuardedChild::spawn(&mut command).unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -493,6 +643,7 @@ async fn detached_sitter_lifecycle_over_wss() {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        eprintln!("lifecycle: Task Scheduler foreground serve");
         // The installer starts `serve` directly from Task Scheduler, with no
         // STARTING marker and no inherited console. Exercise that same path.
         let mut command = make_command("serve");
@@ -666,6 +817,7 @@ async fn windows_stop_confirms_graceful_exit_without_supervisor() {
     let dir = common::test_tempdir("windows-stop-regression-");
     common::enable_ws_api(dir.path());
     let mut command = common::hermetic_serve_command(dir.path());
+    command.env("INTENTD_WORKSPACES_DIR", dir.path().join("workspaces"));
     let mut daemon = GuardedChild::spawn(&mut command).unwrap();
     local_status(
         dir.path(),
@@ -673,13 +825,17 @@ async fn windows_stop_confirms_graceful_exit_without_supervisor() {
         &dir.path().join("daemon.log"),
     )
     .await;
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("stop")
-        .env("INTENTD_DATA_DIR", dir.path())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .unwrap();
+    let output = timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .arg("stop")
+            .env("INTENTD_DATA_DIR", dir.path())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("unsupervised stop timed out")
+    .unwrap();
     assert!(
         output.status.success(),
         "stop must confirm graceful shutdown: {output:?}"
@@ -794,10 +950,6 @@ mod windows_child {
                 // timing-guard: bounded child exit polling against a retained handle
                 std::thread::sleep(Duration::from_millis(20));
             }
-        }
-        // raw-child: allow — transfer the retained Windows child to wait_with_output
-        pub fn disarm(mut self) -> Child {
-            self.0.take().unwrap()
         }
     }
     impl Drop for GuardedChild {
