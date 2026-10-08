@@ -225,7 +225,7 @@ async fn detached_sitter_lifecycle_over_wss() {
                 )
                 .unwrap();
             }
-            for verb in ["stop", "restart"] {
+            for verb in ["restart", "stop"] {
                 let mut command = make_command(verb);
                 command
                     .env("INTENTD_DATA_DIR", foreign.path())
