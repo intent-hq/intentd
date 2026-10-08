@@ -2212,3 +2212,176 @@ fn stand_in_sitter_configuration_restores_private_identity_after_overrides() {
         Some(&Some(OsStr::new("54321")))
     );
 }
+
+/// This cross-package test needs a freshly built sitter artifact, which Cargo
+/// does not expose through `CARGO_BIN_EXE` for a sibling package. Run explicitly
+/// after building intentd-sitter, setting `INTENTD_TEST_SITTER_BIN` to its binary.
+#[tokio::test]
+#[ignore = "requires freshly built INTENTD_TEST_SITTER_BIN; run with --run-ignored ignored-only"]
+async fn detached_sitter_lifecycle_over_wss() {
+    use intentd_sitter::{paths::SitterPaths, state};
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+    use std::process::Command;
+
+    struct SessionGuard(std::path::PathBuf);
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            if let Some(pid) = intentd_sitter::supervisor::read_live_pid(&self.0) {
+                let _ = killpg(pid, Signal::SIGKILL);
+            }
+        }
+    }
+
+    struct HttpGuard(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        Option<std::thread::JoinHandle<()>>,
+    );
+    impl Drop for HttpGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.1.take().unwrap().join().unwrap();
+        }
+    }
+
+    let sitter = std::env::var_os("INTENTD_TEST_SITTER_BIN")
+        .expect("build intentd-sitter and set INTENTD_TEST_SITTER_BIN");
+    let dir = common::test_tempdir("intentd-start-wss-");
+    let data = dir.path();
+    let paths = SitterPaths::from_data_dir(data);
+    let _session = SessionGuard(paths.pid_path.clone());
+    let binary = paths.daemon_binary(env!("CARGO_PKG_VERSION"));
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_intentd"), &binary).unwrap();
+    state::save(
+        &paths.state_path,
+        &state::SitterState {
+            current_version: Some(env!("CARGO_PKG_VERSION").into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    common::enable_ws_api(data);
+    let workspaces = data.join("workspaces");
+    std::fs::create_dir(&workspaces).unwrap();
+    // A held local listener cannot ever serve a real release manifest. It also
+    // proves a startup timeout can cancel the supervisor's initial update check.
+    // For this successful lifecycle use HTTP 404 rather than the public network.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = stop.clone();
+    let _http = HttpGuard(
+        stop,
+        Some(std::thread::spawn(move || {
+            use std::io::Write;
+            while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+                // timing-guard: poll the private fixture's shutdown flag
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })),
+    );
+    let invoke = |verb: &str| {
+        let mut command = Command::new(&sitter);
+        // serve-spawn: allow — the installed sitter owns serve; copy the complete hermetic constructor environment
+        let isolated = common::hermetic_serve_command(data);
+        for (key, value) in isolated.get_envs() {
+            match value {
+                Some(value) => {
+                    command.env(key, value);
+                }
+                None => {
+                    command.env_remove(key);
+                }
+            }
+        }
+        command
+            .arg(verb)
+            .env("INTENTD_AUTH_TOKEN", TOKEN)
+            .env("INTENTD_WORKSPACES_DIR", &workspaces)
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env(
+                "INTENTD_SITTER_MANIFEST_BASE_URL",
+                format!("http://{address}"),
+            )
+            .env("INTENTD_SITTER_READINESS_TIMEOUT_MS", "30000")
+            .env_remove("INTENTD_CHANNEL")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        common::hermetic_fixture_identity(&mut command, data);
+        let mut child = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
+        assert!(
+            child
+                .wait_with_timeout(Duration::from_secs(70))
+                .unwrap()
+                .is_some(),
+            "{verb} timed out"
+        );
+        let output = child.disarm().wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{verb}: {output:?}; log: {}",
+            std::fs::read_to_string(paths.sitter_dir.join("start.log")).unwrap_or_default()
+        );
+    };
+    invoke("start");
+    let supervisor = intentd_sitter::supervisor::read_live_pid(&paths.pid_path).unwrap();
+    assert_eq!(nix::unistd::getsid(Some(supervisor)).unwrap(), supervisor);
+    let socket = data.join("intentd.sock");
+    let log = paths.sitter_dir.join("start.log");
+    let first_pid = std::fs::read_to_string(data.join("intentd.pid")).unwrap();
+    invoke("start");
+    assert_eq!(
+        std::fs::read_to_string(data.join("intentd.pid")).unwrap(),
+        first_pid
+    );
+    invoke("status");
+    for restarted in [false, true] {
+        if restarted {
+            invoke("restart");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while !std::fs::read_to_string(data.join("intentd.pid"))
+                .is_ok_and(|pid| pid != first_pid)
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "replacement pid missing"
+                );
+                // timing-guard: poll replacement daemon ownership
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        let status = common::await_wss_status_logged(&socket, &log).await;
+        let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+        let mut ws = connect_ws(
+            port,
+            client_config(status["result"]["fingerprint"].as_str().unwrap()),
+        )
+        .await;
+        let response = wss_rpc(&mut ws, 701, "system.status", json!({})).await;
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 701);
+        assert_eq!(response["result"]["version"], env!("CARGO_PKG_VERSION"));
+        ws.close(None).await.unwrap();
+    }
+    invoke("stop");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while paths.pid_path.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sitter did not stop"
+        );
+        // timing-guard: poll supervisor cleanup after graceful daemon shutdown
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        nix::sys::signal::kill(Pid::from_raw(first_pid.trim().parse().unwrap()), None),
+        Err(nix::errno::Errno::ESRCH)
+    );
+}

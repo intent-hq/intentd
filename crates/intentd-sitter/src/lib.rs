@@ -14,6 +14,7 @@ pub mod config;
 pub mod manifest;
 pub mod paths;
 pub mod readiness;
+pub mod startup;
 pub mod state;
 pub mod supervisor;
 pub mod updater;

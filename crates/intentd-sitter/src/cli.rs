@@ -102,6 +102,8 @@ pub enum SitterCommand {
     /// `intentd restart` — restart the supervised daemon in place by
     /// signaling the serve-mode sitter found via its pidfile (SIGHUP).
     Restart,
+    /// Launch a detached supervised daemon, forwarding the remaining serve options.
+    Start,
     /// `intentd update [--check]` — force an update check on the effective
     /// channel now, instead of waiting for the periodic serve-mode check.
     Update {
@@ -242,6 +244,7 @@ impl SitterArgs {
     pub fn sitter_command(&self) -> Option<Result<SitterCommand, CliError>> {
         let first = self.passthrough.first()?;
         match first.to_str() {
+            Some("start") => Some(Ok(SitterCommand::Start)),
             Some("sitter") => Some(SitterCommand::parse(&self.passthrough[1..])),
             Some("restart") => Some(match self.passthrough.get(1) {
                 Some(arg) => Err(CliError::UnexpectedRestartArg(
@@ -545,6 +548,29 @@ mod tests {
                 "restart".to_string()
             )))
         );
+    }
+
+    #[test]
+    fn start_preserves_serve_options_and_channel_selection() {
+        let args = parse(
+            &[
+                "start",
+                "--resume-all",
+                "--sitter-channel=beta",
+                "--specialists-dir",
+                "with spaces",
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(args.sitter_command(), Some(Ok(SitterCommand::Start)));
+        assert_eq!(args.channel, resolved(Channel::Beta, ChannelOrigin::Flag));
+        assert_eq!(
+            args.passthrough,
+            ["start", "--resume-all", "--specialists-dir", "with spaces"].map(OsString::from)
+        );
+        assert_eq!(sitter_cmd(&["--", "start"]), None);
+        assert_eq!(sitter_cmd(&["serve", "start"]), None);
     }
 
     #[test]

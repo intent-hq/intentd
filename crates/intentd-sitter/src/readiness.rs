@@ -80,7 +80,10 @@ pub fn probe_daemon_version(daemon_binary: &Path) -> Option<String> {
 
 /// [`probe_daemon_version`] with an explicit per-probe deadline (split out
 /// so tests can exercise the kill path without waiting the real ceiling).
-fn probe_daemon_version_with_timeout(daemon_binary: &Path, timeout: Duration) -> Option<String> {
+pub(crate) fn probe_daemon_version_with_timeout(
+    daemon_binary: &Path,
+    timeout: Duration,
+) -> Option<String> {
     let mut child = Command::new(daemon_binary)
         .args(["call", "system.status"])
         .stdin(Stdio::null())
@@ -94,10 +97,11 @@ fn probe_daemon_version_with_timeout(daemon_binary: &Path, timeout: Duration) ->
     // the inherited write end would keep the pipe open past the kill, and
     // joining would trade the subprocess hang for a thread hang.
     let mut pipe = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = String::new();
         let _ = pipe.read_to_string(&mut buf);
-        buf
+        let _ = send.send(buf);
     });
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -116,11 +120,34 @@ fn probe_daemon_version_with_timeout(daemon_binary: &Path, timeout: Duration) ->
             }
         }
     };
-    let stdout = reader.join().ok()?;
+    let stdout = receive
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()?;
     if !status.success() {
         return None;
     }
     parse_status_version(&stdout)
+}
+
+/// Cancellation-safe probe for the supervisor's initial startup select. Dropping
+/// this future (child exit, signal or timeout) also kills the probe subprocess.
+pub(crate) async fn probe_daemon_version_async(binary: &Path) -> Option<String> {
+    let child = tokio::process::Command::new(binary)
+        .args(["call", "system.status"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let output = tokio::time::timeout(PROBE_TIMEOUT, child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_status_version(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Extract the `version` field from a `system.status` result JSON.

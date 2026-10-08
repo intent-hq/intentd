@@ -86,7 +86,7 @@ const RESTART_HINT: &str = "apply it now with `intentd restart` (fallback: \
      `brew services restart intentd` / `systemctl --user restart intentd`)";
 
 /// Execute an intercepted sitter-owned command; returns the exit code.
-/// Never spawns the daemon.
+/// Start (and restart when stopped) launch the supervised daemon.
 fn run_sitter_command(
     command: SitterCommand,
     args: &SitterArgs,
@@ -97,7 +97,8 @@ fn run_sitter_command(
         SitterCommand::Channel { set, redownload } => {
             run_channel_command(set, redownload, args, paths, base_urls)
         }
-        SitterCommand::Restart => run_restart(paths),
+        SitterCommand::Restart => run_restart(args, paths),
+        SitterCommand::Start => intentd_sitter::startup::run(args, paths),
         SitterCommand::Update { check } => run_update_command(check, args, paths, base_urls),
     }
 }
@@ -352,22 +353,17 @@ fn apply_installed_update(_paths: &SitterPaths, _version: &str) -> i32 {
 /// SIGHUP to the serve-mode sitter found via its pidfile. Stale pidfiles
 /// (dead pid) are treated as no running service.
 #[cfg(unix)]
-fn run_restart(paths: &SitterPaths) -> i32 {
+fn run_restart(args: &SitterArgs, paths: &SitterPaths) -> i32 {
     let Some(pid) = supervisor::read_live_pid(&paths.pid_path) else {
-        eprintln!(
-            "intentd-sitter: no running supervised intentd found (no live pid in {}); \
-             start the service first (`intentd serve`, `brew services start intentd`, \
-             or `systemctl --user start intentd`)",
-            paths.pid_path.display()
-        );
-        return 1;
+        println!("no running supervisor; starting intentd");
+        return intentd_sitter::startup::run(args, paths);
     };
     send_sighup_to_sitter(pid)
 }
 
 /// No SIGHUP on windows: point at the service manager instead.
 #[cfg(not(unix))]
-fn run_restart(_paths: &SitterPaths) -> i32 {
+fn run_restart(_args: &SitterArgs, _paths: &SitterPaths) -> i32 {
     eprintln!(
         "intentd-sitter: `intentd restart` is not supported on Windows; \
          restart the service instead"

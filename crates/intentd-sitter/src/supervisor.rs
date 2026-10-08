@@ -437,6 +437,8 @@ impl Supervisor {
         // subcommands never touch the updater: they run the installed
         // version exactly once and their exit status passes through.
         let supervised = self.passthrough.first().is_some_and(|arg| arg == "serve");
+        let mut starting = supervised && std::env::var_os(crate::startup::STARTING_ENV).is_some();
+        let startup_deadline = Instant::now() + crate::readiness::timeout_from_env();
 
         let mut signals = match Signals::new() {
             Ok(signals) => signals,
@@ -483,6 +485,10 @@ impl Supervisor {
                             eprintln!("intentd-sitter: {} received; startup check is already running", event.name());
                         }
                     },
+                    () = tokio::time::sleep_until(startup_deadline), if starting => {
+                        eprintln!("intentd-sitter: startup update check timed out");
+                        return 1;
+                    }
                     outcome = &mut check => break outcome,
                 }
             };
@@ -570,7 +576,10 @@ impl Supervisor {
         loop {
             let binary = self.paths.daemon_binary(&current_version);
             let mut command = tokio::process::Command::new(&binary);
-            command.args(&self.passthrough).kill_on_drop(true);
+            command
+                .args(&self.passthrough)
+                .kill_on_drop(true)
+                .env_remove(crate::startup::STARTING_ENV);
             if last_ran_version
                 .as_ref()
                 .is_some_and(|last| *last != current_version)
@@ -598,7 +607,7 @@ impl Supervisor {
                     // "failed to spawn" is part of the install-script log
                     // contract (see the `what` match in the wait arm below).
                     let what = format!("failed to spawn {}: {e}", binary.display());
-                    if !supervised {
+                    if !supervised || starting {
                         eprintln!("intentd-sitter: {what}");
                         return 1;
                     }
@@ -675,6 +684,16 @@ impl Supervisor {
                     }
                 }
             };
+            if starting {
+                if !self
+                    .await_initial_readiness(&binary, &mut child, &mut signals)
+                    .await
+                {
+                    self.graceful_stop(&mut child).await;
+                    return 1;
+                }
+                starting = false;
+            }
             last_ran_version = Some(current_version.clone());
             let spawned_at = Instant::now();
 
@@ -1248,8 +1267,42 @@ impl Supervisor {
         }
     }
 
-    /// Sitter-initiated stop: graceful signal, then force-kill after the
-    /// kill timeout. Never triggers a respawn by itself.
+    /// A background launch must answer before entering normal crash recovery.
+    async fn await_initial_readiness(
+        &self,
+        binary: &Path,
+        child: &mut tokio::process::Child,
+        signals: &mut Signals,
+    ) -> bool {
+        let deadline = Instant::now() + crate::readiness::timeout_from_env();
+        loop {
+            let probe = crate::readiness::probe_daemon_version_async(binary);
+            tokio::select! {
+                biased;
+                status = child.wait() => {
+                    eprintln!("intentd-sitter: daemon exited before startup readiness: {status:?}");
+                    return false;
+                }
+                event = signals.recv() => {
+                    if matches!(event, SignalEvent::Shutdown(_)) {
+                        return false;
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    eprintln!("intentd-sitter: startup readiness timed out");
+                    return false;
+                }
+                result = probe => {
+                    if result.is_some() {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    /// Sitter-initiated stop: graceful signal, then bounded force-kill.
     async fn graceful_stop(&self, child: &mut tokio::process::Child) {
         #[cfg(unix)]
         if let Some(id) = child.id() {
