@@ -187,8 +187,9 @@ computer.
 
 Opening a view starts its server and embeds its page. The command receives the
 configured port as `PORT`; it must listen on that port and permit iframe embedding.
-Use **Stop server** to stop the server, **Start server** to start it again, and **Reload** to reload
-the page. Switching homepage sections keeps the server running; editing, removing,
+Open the view's **…** menu for **Edit view**, **Start server** or **Stop server**,
+**Reload**, **Server logs**, and **Remove view**. **Server logs** opens the output in
+a dialog. Switching homepage sections keeps the server running; editing, removing,
 or quitting the app stops it. An occupied port or failed command shows an error;
 check the view's server output before retrying. Custom pages do not receive the
 app's workspace or agent tools.
