@@ -1,0 +1,22 @@
+{
+  "original": "5c971c1abf8dc276cd116bc3089c0bb26a0f712d9ebeabf3cef9bec464154ea6",
+  "candidate": "54518a44b045e43574fdec9d5faad08baf2cbf6e4e8f35c4344f4595d79a7609",
+  "changes": [
+    {
+      "id": "failure-only-prefix-form",
+      "old": "  MarkDependencyFailureStage(dependencyA04Stage);",
+      "new": "  if(dependencyA04Part==='prefix'&&dependencyA04Returned&&dependencyA04Value===false){\n   try {\n    if(typeof name==='string'&&typeof type==='string'&&type.length===1){\n     if(name==='package')dependencyA04Stage=type==='5'?'tar-a04-form-root-dir':'tar-a04-form-root-other';\n     else if(name==='./package'||name==='./package/')dependencyA04Stage=type==='5'?'tar-a04-form-dot-dir':'tar-a04-form-dot-other';\n     else if(type==='x'||type==='g')dependencyA04Stage=name.startsWith('PaxHeader/')?(type==='x'?'tar-a04-form-pax-x':'tar-a04-form-pax-g'):'tar-a04-form-pax-other';\n     else if(type==='L')dependencyA04Stage='tar-a04-form-gnu-L';\n     else if(type==='K')dependencyA04Stage='tar-a04-form-gnu-K';\n     else if(type==='5')dependencyA04Stage='tar-a04-form-dir';\n     else if(type==='0')dependencyA04Stage='tar-a04-form-file';\n     else dependencyA04Stage='tar-a04-form-other';\n    }\n   } catch {}\n  }\n  MarkDependencyFailureStage(dependencyA04Stage);"
+    },
+    {
+      "id": "fixed-stage-enum",
+      "old": "const DEPENDENCY_FAILURE_STAGES=[\"argument-resolution\",\"platform\",\"node-version\",\"expected-lock-read\",\"installed-lock-read\",\"package-keys\",\"package-path\",\"package-metadata\",\"integrity-attribution\",\"tar-cache-key\",\"tar-url-policy\",\"tar-fetch\",\"tar-response\",\"tar-stream\",\"tar-integrity\",\"tar-inflate\",\"tar-parse\",\"installed-tar-bytes\",\"installed-inventory\",\"generated-files\",\"mirror-absence\",\"mirror-copy\",\"mirror-inventory\",\"entry-pin\",\"resolution-preinventory\",\"resolution-helper\",\"resolution-child\",\"resolution-output\",\"resolution-identities\",\"resolution-targets\",\"resolution-postinventory\",\"mirror-unmodified\",\"result-write\",\"tar-a01-checksum\",\"tar-a02-octal-size\",\"tar-a03-size-extent\",\"tar-a04-package-path\",\"tar-a05-windows-name\",\"tar-a06-file-unique\",\"tar-a07-file-count\",\"tar-a08-entry-type\",\"tar-a09-nonempty\",\"tar-a04-prefix-eval\",\"tar-a04-prefix-false\",\"tar-a04-prefix-true\",\"tar-a04-prefix-other\",\"tar-a04-backslash-eval\",\"tar-a04-backslash-false\",\"tar-a04-backslash-true\",\"tar-a04-backslash-other\",\"tar-a04-traversal-eval\",\"tar-a04-traversal-false\",\"tar-a04-traversal-true\",\"tar-a04-traversal-other\",\"tar-a04-colon-eval\",\"tar-a04-colon-false\",\"tar-a04-colon-true\",\"tar-a04-colon-other\"];",
+      "new": "const DEPENDENCY_FAILURE_STAGES=[\"argument-resolution\",\"platform\",\"node-version\",\"expected-lock-read\",\"installed-lock-read\",\"package-keys\",\"package-path\",\"package-metadata\",\"integrity-attribution\",\"tar-cache-key\",\"tar-url-policy\",\"tar-fetch\",\"tar-response\",\"tar-stream\",\"tar-integrity\",\"tar-inflate\",\"tar-parse\",\"installed-tar-bytes\",\"installed-inventory\",\"generated-files\",\"mirror-absence\",\"mirror-copy\",\"mirror-inventory\",\"entry-pin\",\"resolution-preinventory\",\"resolution-helper\",\"resolution-child\",\"resolution-output\",\"resolution-identities\",\"resolution-targets\",\"resolution-postinventory\",\"mirror-unmodified\",\"result-write\",\"tar-a01-checksum\",\"tar-a02-octal-size\",\"tar-a03-size-extent\",\"tar-a04-package-path\",\"tar-a05-windows-name\",\"tar-a06-file-unique\",\"tar-a07-file-count\",\"tar-a08-entry-type\",\"tar-a09-nonempty\",\"tar-a04-prefix-eval\",\"tar-a04-prefix-false\",\"tar-a04-prefix-true\",\"tar-a04-prefix-other\",\"tar-a04-backslash-eval\",\"tar-a04-backslash-false\",\"tar-a04-backslash-true\",\"tar-a04-backslash-other\",\"tar-a04-traversal-eval\",\"tar-a04-traversal-false\",\"tar-a04-traversal-true\",\"tar-a04-traversal-other\",\"tar-a04-colon-eval\",\"tar-a04-colon-false\",\"tar-a04-colon-true\",\"tar-a04-colon-other\",\"tar-a04-form-root-dir\",\"tar-a04-form-root-other\",\"tar-a04-form-dot-dir\",\"tar-a04-form-dot-other\",\"tar-a04-form-pax-x\",\"tar-a04-form-pax-g\",\"tar-a04-form-pax-other\",\"tar-a04-form-gnu-L\",\"tar-a04-form-gnu-K\",\"tar-a04-form-dir\",\"tar-a04-form-file\",\"tar-a04-form-other\"];"
+    }
+  ],
+  "reverseByteExact": true,
+  "originalAssertionCaptureBlockUnchanged": true,
+  "otherEightWrappersUnchanged": true,
+  "sameCaughtValueRethrow": true,
+  "extraFailureStringQueriesMax": 1,
+  "extraSuccessQueries": 0
+}

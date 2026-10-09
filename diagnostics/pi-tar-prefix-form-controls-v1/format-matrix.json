@@ -1,0 +1,52 @@
+[
+  {
+    "form": "package/file or USTAR prefixpackage plus namefile",
+    "format": "normal npm-prefixed file path; prefix/name split by producer when representable",
+    "current": "A04prefixtrue; other path, Windowsname, type, uniqueness/count/integrity checks stillrequired"
+  },
+  {
+    "form": "package/ type5",
+    "format": "package root directory with slash",
+    "current": "A04prefixtrue, emptyrel allowed for directory; no blanket root-rejection claim"
+  },
+  {
+    "form": "package type5",
+    "format": "tar directory type distinguishes directory; bare root name possible in general tar, not established currentproducer output",
+    "current": "A04prefixfalse; diagnosticroot-dir would be shape evidence only"
+  },
+  {
+    "form": "./package or ./package/",
+    "format": "relative leading-dot representation possible in general tar; pinned prefixPath strips leadingdot before prefixing usual filepaths",
+    "current": "prefixfalse; no normalization or acceptance proposed"
+  },
+  {
+    "form": "PaxHeader/<basename> with typex/g",
+    "format": "pinned producer emits such metadata header when extended attributes required",
+    "current": "prefixfalse, and originalA08 rejects x/g even ifprefix were bypassed. Headerbody/effectivepath unobserved; no skip/fix inferred"
+  },
+  {
+    "form": "other x/g header name",
+    "format": "metadata type alone doesnot authenticate header, name or payload; producerconventions vary",
+    "current": "finitepax-other shape only, no validitycredit"
+  },
+  {
+    "form": "GNU L/K metadata",
+    "format": "format/reader recognize longpath/longlink controls; effective name/link carried in body",
+    "current": "failclosedA04orA08; proposedtype-onlycategory doesnot prove bodyvalidity"
+  },
+  {
+    "form": "wrongprefix file/dir, absolute/drive/backslash/parentsegments/colon",
+    "format": "might be tarrepresentable but outside strict application/security contract",
+    "current": "remainrejected; categorydoesnot grant legitimacy. Prefixfalse shortcircuits otherpredicates and diagnosticclassification must not imply theirabsence"
+  },
+  {
+    "form": "package/../x,package/a\\b,package/C:x",
+    "format": "application-prohibited path forms evenwith packageprefix",
+    "current": "original traversal/backslash/colon predicates unchanged; classification gatedprefixfalse so doesnotrun"
+  },
+  {
+    "form": "oldGNU magic/prefixlayout or PAX-effectivepath",
+    "format": "prefix345:500 meaning format-dependent; currentparser unconditionally joins that field and doesnot applyextensions",
+    "current": "sourcecompatibilitygap only; no observedmagic/headerbytes or safefix established"
+  }
+]
