@@ -30,7 +30,8 @@ on:
   # event-aware about this (see the gate comment): it requires the coverage
   # jobs outright on merge_group and accepts their skip on pull_request /
   # push, and the reverse for coverage-changed. The native matrix is skipped
-  # at job level on PRs, so it allocates no macOS / Windows Rust runners.
+  # at job level on PRs; the focused daemon-lifecycle matrix still runs on
+  # PRs and merge groups with real Windows/macOS/Linux runtime proof.
   # CI Gate requires native check, Clippy and runtime proofs on merge_group,
   # and its release builds on push. CI Gate is the sole required status check.
   # Merge groups are created by the repo's own ruleset from already-filed
@@ -2016,6 +2017,51 @@ jobs:
           path: pi-path-evidence
           if-no-files-found: error
 
+  daemon-lifecycle:
+    name: Daemon lifecycle (${{ matrix.platform }})
+    needs: route
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ${{ fromJSON(needs.route.outputs.linux_labels || '["gh-linux-16x"]') }}
+          - platform: macos
+            os: [self-hosted, macOS, ARM64]
+          - platform: windows
+            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["gh-windows-16x"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v7
+      - name: Put Git Bash first on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: daemon-lifecycle-${{ matrix.platform }}
+      - name: Native lifecycle lint and runtime proof
+        shell: bash
+        run: |
+          cargo clippy --locked -p intentd-sitter -p intentd --all-targets -- -D warnings
+          python3 -I -B scripts/test-daemon-lifecycle.py
+
   # CI Gate is the sole required status check. Every failed/cancelled result
   # fails it; skips are accepted only for jobs intentionally absent by event.
   # build is required on merge_group (native check, Clippy and runtime proofs) and push
@@ -2035,11 +2081,21 @@ jobs:
     # would run the gate against all-skipped needs and report a spurious
     # failure on PRs that get no CI by policy.
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    needs: [check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    needs: [daemon-lifecycle, check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
-          # PRs deliberately allocate no native matrix runners. A skip on
+          if [ "${{ github.event_name }}" != "push" ] && [ "${{ needs.daemon-lifecycle.result }}" != "success" ]; then
+            echo "daemon-lifecycle must execute successfully on PR and merge queue"
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = "push" ]; then
+            case "${{ needs.daemon-lifecycle.result }}" in
+              success|skipped) ;;
+              *) exit 1 ;;
+            esac
+          fi
+          # PRs deliberately skip the general native build matrix. A skip on
           # merge_group or push must never pass as native validation.
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             case "${{ needs.build.result }}" in

@@ -2699,6 +2699,38 @@ fn one_shot_with_installed_version_never_touches_the_updater() {
 }
 
 #[test]
+fn daemon_help_serve_ignores_supervisor_ownership_and_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(
+        &paths,
+        "0.1.0",
+        "#!/bin/sh\n[ \"$*\" = 'help serve' ] || exit 2\nprintf 'Usage: intentd serve [OPTIONS]\\n'\n",
+    );
+    let before = fs::read(&paths.state_path).unwrap();
+    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+    let (base_url, requests) = serve_recording(routes);
+    let lock_path = paths.sitter_dir.join("sitter.lock");
+
+    for locked in [false, true] {
+        let _lock = locked.then(|| {
+            let file = fs::File::create(&lock_path).unwrap();
+            nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).unwrap()
+        });
+        let output = run_one_shot(dir.path(), &base_url, &["help", "serve"]);
+        assert!(output.status.success(), "locked={locked}: {output:?}");
+        assert_eq!(output.stdout, b"Usage: intentd serve [OPTIONS]\n");
+        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(fs::read(&paths.state_path).unwrap(), before);
+        assert!(!paths.pid_path.exists());
+        assert!(!paths.sitter_dir.join("start.log").exists());
+        if !locked {
+            assert!(!lock_path.exists());
+        }
+    }
+}
+
+#[test]
 fn one_shot_channel_mismatch_warns_and_runs_installed_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
@@ -3006,7 +3038,7 @@ fn duplicate_serve_preserves_live_sitter_discovery() {
 }
 
 #[test]
-fn restart_without_live_sitter_or_with_stale_pidfile_fails() {
+fn restart_without_installation_fails_and_cleans_up_stale_ownership() {
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     let base_url = dead_url();
@@ -3016,7 +3048,7 @@ fn restart_without_live_sitter_or_with_stale_pidfile_fails() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("no running supervised intentd"),
+        stderr.contains("supervisor exited before readiness"),
         "stderr: {stderr}"
     );
 
@@ -3030,13 +3062,13 @@ fn restart_without_live_sitter_or_with_stale_pidfile_fails() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("no running supervised intentd"),
+        stderr.contains("supervisor exited before readiness"),
         "stderr: {stderr}"
     );
 
     assert!(
         !daemon_log_path(dir.path()).exists(),
-        "`intentd restart` must never spawn the daemon"
+        "no installed daemon can be spawned"
     );
 }
 
@@ -3092,4 +3124,607 @@ fn sitter_initiated_stop_does_not_respawn() {
         .filter(|line| line.starts_with("start "))
         .count();
     assert_eq!(starts, 1, "sitter-initiated stop must not respawn");
+}
+
+/// Private background sessions need their own guard: the start caller exits,
+/// so its `GuardedChild` cannot own the detached supervisor process group.
+struct BackgroundFixture {
+    paths: SitterPaths,
+}
+
+impl Drop for BackgroundFixture {
+    fn drop(&mut self) {
+        if let Some(pid) = intentd_sitter::supervisor::read_live_pid(&self.paths.pid_path) {
+            let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+}
+
+fn background_fixture(dir: &Path) -> BackgroundFixture {
+    let paths = SitterPaths::from_data_dir(dir);
+    preinstall(
+        &paths,
+        "0.1.0",
+        r#"#!/bin/sh
+case "$1" in
+  serve)
+    shift
+    for arg in "$@"; do
+      case "$arg" in
+        --help|-h) echo 'serve options'; exit 0 ;;
+        --invalid) echo 'invalid option' >&2; exit 2 ;;
+      esac
+    done
+    echo "$$" > "$INTENTD_DATA_DIR/daemon-pid"
+    printf '%s\n' "$@" >> "$FAKE_DAEMON_LOG"
+    echo "spawn $$" >> "$FAKE_DAEMON_LOG"
+    trap 'rm -f "$INTENTD_DATA_DIR/ready"; exit 0' TERM INT
+    if [ "${FAKE_NO_READY:-}" != 1 ]; then echo "$$" > "$INTENTD_DATA_DIR/ready"; fi
+    # // timing-guard: the fake daemon remains alive until signalled
+    while :; do sleep 0.05; done
+    ;;
+  call|status)
+    test -f "$INTENTD_DATA_DIR/ready" || exit 1
+    kill -0 "$(cat "$INTENTD_DATA_DIR/ready")" 2>/dev/null || exit 1
+    echo '{"version":"0.1.0"}'
+    ;;
+  stop) kill -TERM "$(cat "$INTENTD_DATA_DIR/daemon-pid")" ;;
+  *) exit 2 ;;
+esac
+"#,
+    );
+    BackgroundFixture { paths }
+}
+
+fn background_call(dir: &Path, base_url: &str, args: &[&str]) -> std::process::Output {
+    let mut cmd = sitter_command(dir, base_url);
+    cmd.args(args)
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, "5000")
+        .env(KILL_TIMEOUT_ENV, "300")
+        .env_remove(CHANNEL_ENV)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = spawn_guarded(&mut cmd);
+    assert!(child
+        .wait_with_timeout(Duration::from_secs(15))
+        .unwrap()
+        .is_some());
+    child.disarm().wait_with_output().unwrap()
+}
+
+#[test]
+fn background_start_stop_during_update_or_backoff_confirms_supervisor_exit() {
+    use std::sync::atomic::Ordering;
+    for updating in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        // Like the real daemon, stop succeeds when no daemon PID exists.
+        preinstall(
+            &paths,
+            "0.1.0",
+            "#!/bin/sh\ncase \"$1\" in stop) exit 0;; serve) exit 7;; *) exit 1;; esac\n",
+        );
+        let (base, hold, parked) = serve_holdable(Arc::new(Mutex::new(HashMap::new())));
+        hold.store(updating, Ordering::SeqCst);
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut owner = spawn_guarded(
+                sitter_command(dir.path(), &base)
+                    .env(BACKOFF_INITIAL_ENV, "30000")
+                    .arg("serve"),
+            );
+            wait_until(
+                "supervisor early lifecycle state",
+                Duration::from_secs(10),
+                || {
+                    if updating {
+                        parked.load(Ordering::SeqCst) > 0
+                    } else {
+                        read_or_empty(&stderr_path(dir.path())).contains("respawning intentd in")
+                    }
+                },
+            );
+            assert!(!dir.path().join("intentd.pid").exists());
+            let out = background_call(dir.path(), &base, &["stop"]);
+            assert!(out.status.success(), "{out:?}");
+            assert!(
+                owner
+                    .wait_with_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .expect("stop must wait for supervisor exit")
+                    .success(),
+                "private stop must exit cleanly so Restart=on-failure / SuccessfulExit=false do not relaunch"
+            );
+            assert!(!paths.pid_path.exists());
+        }));
+        hold.store(false, Ordering::SeqCst);
+        if let Err(error) = outcome {
+            panic::resume_unwind(error);
+        }
+    }
+}
+
+#[test]
+fn background_start_stop_exits_cleanly_after_forced_child_cleanup() {
+    for starting in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        preinstall(
+            &paths,
+            "0.1.0",
+            r#"#!/bin/sh
+case "$1" in
+serve)
+  trap '' TERM
+  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon"
+  # // timing-guard: force the supervisor to exercise its bounded child-kill fallback
+  while :; do sleep 0.05; done
+  ;;
+*) exit 1;;
+esac
+"#,
+        );
+        let base = dead_url();
+        let mut command = sitter_command(dir.path(), &base);
+        command.env(KILL_TIMEOUT_ENV, "100").arg("serve");
+        if starting {
+            command.env(intentd_sitter::startup::STARTING_ENV, "1");
+        }
+        let mut owner = spawn_guarded(&mut command);
+        wait_until("owned daemon", Duration::from_secs(10), || {
+            dir.path().join("owned-daemon").exists()
+        });
+        let daemon_pid = read_or_empty(&dir.path().join("owned-daemon"))
+            .trim()
+            .parse()
+            .unwrap();
+        let out = background_call(dir.path(), &base, &["stop"]);
+        assert!(out.status.success(), "{out:?}");
+        assert!(owner.wait_with_timeout(Duration::from_secs(1)).unwrap().unwrap().success(),
+            "private stop must prevent restart-on-failure after forced cleanup (starting={starting})");
+        assert!(
+            !alive(daemon_pid),
+            "stop must confirm the owned daemon exit"
+        );
+    }
+}
+
+#[test]
+fn background_start_stop_reports_supervisor_crash_with_live_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(
+        &paths,
+        "0.1.0",
+        r#"#!/bin/sh
+case "$1" in
+serve)
+  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon"
+  trap 'echo stopping > "$INTENTD_DATA_DIR/stop-seen"' TERM
+  # // timing-guard: fixture remains alive after TERM until its owned group is killed
+  while :; do sleep 0.05; done
+  ;;
+*) exit 1;;
+esac
+"#,
+    );
+    let base = dead_url();
+    let owner = spawn_guarded(
+        sitter_command(dir.path(), &base)
+            .env(KILL_TIMEOUT_ENV, "30000")
+            .arg("serve"),
+    );
+    wait_until("owned daemon", Duration::from_secs(10), || {
+        dir.path().join("owned-daemon").exists()
+    });
+    let daemon_pid = read_or_empty(&dir.path().join("owned-daemon"))
+        .trim()
+        .parse()
+        .unwrap();
+    let mut stop = spawn_guarded(
+        sitter_command(dir.path(), &base)
+            .env(KILL_TIMEOUT_ENV, "500")
+            .arg("stop"),
+    );
+    wait_until(
+        "daemon received forwarded stop",
+        Duration::from_secs(3),
+        || dir.path().join("stop-seen").exists(),
+    );
+    // Kill only the supervisor. The guard still owns its process group and
+    // cleans the intentionally surviving daemon when this scope ends.
+    send_signal(&owner, "KILL");
+    let status = stop
+        .wait_with_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !status.success(),
+        "supervisor crash was mistaken for successful stop"
+    );
+    assert!(
+        alive(daemon_pid),
+        "fixture must prove the daemon survived its supervisor"
+    );
+}
+
+#[test]
+fn background_start_stop_rejects_control_eof_without_shutdown_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = background_fixture(dir.path());
+    let listener =
+        std::os::unix::net::UnixListener::bind(fixture.paths.pid_path.with_extension("stop"))
+            .unwrap();
+    fs::write(&fixture.paths.pid_path, std::process::id().to_string()).unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        drop(stream); // Model a crash before the owned daemon has stopped.
+    });
+    let out = background_call(dir.path(), &dead_url(), &["stop"]);
+    fs::remove_file(&fixture.paths.pid_path).unwrap();
+    server.join().unwrap();
+    assert!(
+        !out.status.success(),
+        "early EOF is not confirmed shutdown: {out:?}"
+    );
+}
+
+#[test]
+fn background_start_stop_refuses_foreign_supervisor_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = background_fixture(dir.path());
+    let foreign = tempfile::tempdir().unwrap();
+    let foreign_fixture = background_fixture(foreign.path());
+    let base = dead_url();
+    assert!(background_call(foreign.path(), &base, &["start"])
+        .status
+        .success());
+    let record = fs::read(&foreign_fixture.paths.pid_path).unwrap();
+    fs::write(&fixture.paths.pid_path, &record).unwrap();
+    let out = background_call(dir.path(), &base, &["stop"]);
+    // Clear the forged record before either fixture's failure cleanup runs.
+    fs::remove_file(&fixture.paths.pid_path).unwrap();
+    assert!(
+        !out.status.success(),
+        "unverified supervisor cannot confirm stop: {out:?}"
+    );
+    assert_eq!(fs::read(&foreign_fixture.paths.pid_path).unwrap(), record);
+    assert!(background_call(foreign.path(), &base, &["status"])
+        .status
+        .success());
+    assert!(background_call(foreign.path(), &base, &["stop"])
+        .status
+        .success());
+}
+
+#[test]
+fn background_start_detaches_preserves_options_and_supports_restart_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = background_fixture(dir.path());
+    let (base, requests) = serve_recording(Arc::new(Mutex::new(HashMap::new())));
+    let out = background_call(
+        dir.path(),
+        &base,
+        &[
+            "start",
+            "--resume-all",
+            "--specialists-dir",
+            "with spaces",
+            "--sitter-channel=beta",
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let supervisor = intentd_sitter::supervisor::read_live_pid(&fixture.paths.pid_path).unwrap();
+    assert_eq!(nix::unistd::getsid(Some(supervisor)).unwrap(), supervisor);
+    assert_eq!(nix::unistd::getpgid(Some(supervisor)).unwrap(), supervisor);
+    let first = fs::read_to_string(dir.path().join("daemon-pid")).unwrap();
+    let log = read_or_empty(&daemon_log_path(dir.path()));
+    assert!(
+        log.contains("--resume-all\n--specialists-dir\nwith spaces\n"),
+        "{log}"
+    );
+    assert!(requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|path| path == BETA_MANIFEST_PATH));
+    assert!(background_call(dir.path(), &base, &["status"])
+        .status
+        .success());
+    assert!(background_call(dir.path(), &base, &["start"])
+        .status
+        .success());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("daemon-pid")).unwrap(),
+        first
+    );
+    assert!(background_call(dir.path(), &base, &["restart"])
+        .status
+        .success());
+    wait_until("replacement daemon", Duration::from_secs(5), || {
+        fs::read_to_string(dir.path().join("daemon-pid")).is_ok_and(|pid| pid != first)
+            && dir.path().join("ready").exists()
+    });
+    assert_eq!(
+        intentd_sitter::supervisor::read_live_pid(&fixture.paths.pid_path),
+        Some(supervisor)
+    );
+    assert!(background_call(dir.path(), &base, &["stop"])
+        .status
+        .success());
+    wait_until("supervisor cleanup", Duration::from_secs(5), || {
+        !fixture.paths.pid_path.exists()
+    });
+    // User-requested behavior: restart of a stopped daemon starts it.
+    assert!(background_call(dir.path(), &base, &["restart"])
+        .status
+        .success());
+    assert!(background_call(dir.path(), &base, &["status"])
+        .status
+        .success());
+    assert!(background_call(dir.path(), &base, &["stop"])
+        .status
+        .success());
+    wait_until(
+        "restarted supervisor cleanup",
+        Duration::from_secs(5),
+        || !fixture.paths.pid_path.exists(),
+    );
+}
+
+#[test]
+fn concurrent_start_and_restart_claim_one_supervisor_with_stale_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = background_fixture(dir.path());
+    let mut dead = spawn_guarded(&mut Command::new("true"));
+    dead.wait().unwrap();
+    fs::write(&fixture.paths.pid_path, format!("{}\n", dead.id())).unwrap();
+    let base = dead_url();
+    thread::scope(|scope| {
+        let starts: Vec<_> = ["start", "start", "restart", "start"]
+            .into_iter()
+            .map(|verb| {
+                let dir = dir.path();
+                let base = &base;
+                scope.spawn(move || background_call(dir, base, &[verb]))
+            })
+            .collect();
+        for start in starts {
+            let out = start.join().unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+    });
+    // A concurrent restart may legitimately replace the daemon, but there is
+    // still exactly one lifetime owner and subsequent start is a no-op.
+    let owner = fs::read_to_string(&fixture.paths.pid_path).unwrap();
+    assert!(background_call(dir.path(), &base, &["start"])
+        .status
+        .success());
+    assert_eq!(fs::read_to_string(&fixture.paths.pid_path).unwrap(), owner);
+    assert!(background_call(dir.path(), &base, &["stop"])
+        .status
+        .success());
+    wait_until("concurrent owner cleanup", Duration::from_secs(5), || {
+        !fixture.paths.pid_path.exists()
+    });
+}
+
+#[test]
+fn background_start_help_invalid_options_and_timeout_leave_no_supervisor() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = background_fixture(dir.path());
+    let base = dead_url();
+    assert!(background_call(dir.path(), &base, &["start", "--help"])
+        .status
+        .success());
+    assert!(!fixture.paths.pid_path.exists());
+    let invalid = background_call(dir.path(), &base, &["start", "--invalid"]);
+    assert!(!invalid.status.success(), "{invalid:?}");
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("start.log"));
+    assert!(!fixture.paths.pid_path.exists());
+    let mut cmd = sitter_command(dir.path(), &base);
+    cmd.arg("start")
+        .env("FAKE_NO_READY", "1")
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, "500")
+        .env(KILL_TIMEOUT_ENV, "200");
+    let mut child = spawn_guarded(&mut cmd);
+    assert!(!child
+        .wait_with_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap()
+        .success());
+    assert!(!fixture.paths.pid_path.exists());
+    let daemon_pid: i32 = fs::read_to_string(dir.path().join("daemon-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(kill(Pid::from_raw(daemon_pid), None), Err(Errno::ESRCH));
+}
+
+#[test]
+fn background_start_timeout_cancels_a_stalled_initial_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = background_fixture(dir.path());
+    let (base, stalled) = serve_stallable(Arc::new(Mutex::new(HashMap::new())));
+    stalled.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut cmd = sitter_command(dir.path(), &base);
+    cmd.arg("start")
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, "300")
+        .env(KILL_TIMEOUT_ENV, "100");
+    let mut child = spawn_guarded(&mut cmd);
+    assert!(!child
+        .wait_with_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap()
+        .success());
+    assert!(!fixture.paths.pid_path.exists());
+    assert!(!dir.path().join("daemon-pid").exists());
+}
+
+#[test]
+fn restart_clean_stopped_instance_and_start_with_foreground_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = background_fixture(dir.path());
+    let base = dead_url();
+    assert!(background_call(dir.path(), &base, &["restart"])
+        .status
+        .success());
+    assert!(background_call(dir.path(), &base, &["stop"])
+        .status
+        .success());
+    wait_until("stopped restart", Duration::from_secs(5), || {
+        !fixture.paths.pid_path.exists()
+    });
+
+    // Existing foreground supervision retains its session and PID.
+    let mut foreground = spawn_guarded(sitter_command(dir.path(), &base).arg("serve"));
+    wait_until("foreground readiness", Duration::from_secs(5), || {
+        dir.path().join("ready").exists()
+    });
+    let pid = fs::read_to_string(dir.path().join("daemon-pid")).unwrap();
+    assert!(background_call(dir.path(), &base, &["start"])
+        .status
+        .success());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("daemon-pid")).unwrap(),
+        pid
+    );
+    assert_eq!(
+        intentd_sitter::supervisor::read_live_pid(&fixture.paths.pid_path)
+            .unwrap()
+            .as_raw(),
+        foreground.id().cast_signed()
+    );
+    assert!(background_call(dir.path(), &base, &["stop"])
+        .status
+        .success());
+    assert!(foreground
+        .wait_with_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap()
+        .success());
+}
+
+#[test]
+fn start_and_restart_do_not_duplicate_an_unsupervised_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = background_fixture(dir.path());
+    let mut cmd = Command::new(fixture.paths.daemon_binary("0.1.0"));
+    cmd.arg("serve")
+        .env(DATA_DIR_ENV, dir.path())
+        .env(FAKE_DAEMON_LOG, daemon_log_path(dir.path()));
+    let mut daemon = spawn_guarded(&mut cmd);
+    wait_until("unsupervised readiness", Duration::from_secs(5), || {
+        dir.path().join("ready").exists()
+    });
+    for verb in ["start", "restart"] {
+        assert!(background_call(dir.path(), &dead_url(), &[verb])
+            .status
+            .success());
+        assert!(!fixture.paths.pid_path.exists());
+    }
+    daemon.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
+    assert!(daemon
+        .wait_with_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap()
+        .success());
+}
+
+/// Subreaping keeps the orphan's PID reserved until the test reaps it, making
+/// both the cleanup guard and the liveness assertion independent of init timing.
+#[cfg(target_os = "linux")]
+fn supervisor_death_during_startup(ready: bool) {
+    use nix::sys::signal::Signal;
+    use nix::sys::wait::{waitid, waitpid, Id, WaitPidFlag, WaitStatus};
+
+    struct AdoptedDaemon(Pid, Pid);
+    impl Drop for AdoptedDaemon {
+        fn drop(&mut self) {
+            // This adopted child remains unreaped until this guard releases it.
+            if waitid(
+                Id::Pid(self.0),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+            )
+            .is_ok()
+            {
+                let _ = nix::sys::signal::killpg(self.1, Signal::SIGKILL);
+                // Reap every adopted member of this private session, including
+                // a shell fixture's short-lived sleep child.
+                while waitpid(Pid::from_raw(-self.1.as_raw()), None).is_ok() {}
+            }
+        }
+    }
+
+    nix::sys::prctl::set_child_subreaper(true).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = background_fixture(dir.path());
+    let mut unrelated = spawn_guarded(Command::new("sh").args(["-c", "exec sleep 60"])); // timing-guard: unrelated sentinel lives until its guard kills it
+    let mut command = sitter_command(dir.path(), &dead_url());
+    command
+        .arg("start")
+        .env("FAKE_NO_READY", "1")
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, "5000")
+        .env(KILL_TIMEOUT_ENV, "100");
+    let mut caller = spawn_guarded(&mut command);
+    wait_until("owned daemon launch", Duration::from_secs(5), || {
+        dir.path().join("daemon-pid").exists()
+    });
+    caller.signal(Signal::SIGSTOP).unwrap();
+    let daemon = Pid::from_raw(
+        fs::read_to_string(dir.path().join("daemon-pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap(),
+    );
+    let supervisor = intentd_sitter::supervisor::read_live_pid(&fixture.paths.pid_path).unwrap();
+    kill(supervisor, Signal::SIGKILL).unwrap();
+    wait_until("orphan adoption", Duration::from_secs(5), || {
+        waitid(
+            Id::Pid(daemon),
+            WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+        )
+        .is_ok()
+    });
+    let _orphan = AdoptedDaemon(daemon, supervisor);
+    if ready {
+        fs::write(dir.path().join("ready"), daemon.to_string()).unwrap();
+    }
+    caller.signal(Signal::SIGCONT).unwrap();
+    let status = caller
+        .wait_with_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    wait_until("owned orphan termination", Duration::from_secs(1), || {
+        waitid(
+            Id::Pid(daemon),
+            WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+        )
+        .is_ok_and(|status| status != WaitStatus::StillAlive)
+    });
+    assert!(
+        !status.success(),
+        "a dead supervisor cannot count as a ready supervised launch"
+    );
+    assert!(
+        unrelated.try_wait().unwrap().is_none(),
+        "cleanup must not signal unrelated sessions"
+    );
+    assert!(
+        !fixture.paths.pid_path.exists(),
+        "dead owned PID record must be removed"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn background_start_rejects_and_cleans_ready_orphan_after_supervisor_death() {
+    supervisor_death_during_startup(true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn background_start_cleans_unready_orphan_after_supervisor_death() {
+    supervisor_death_during_startup(false);
 }
