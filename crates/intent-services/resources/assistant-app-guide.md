@@ -185,17 +185,23 @@ fixed port, and icon. The directory and command run on the computer running the
 Electron app, even when the selected daemon is remote. Registrations stay on that
 computer.
 
-Opening a view starts its server and embeds its page. The command receives the
-configured port as `PORT`; it must listen on that port and permit iframe embedding.
+Opening a view reuses an HTTP server already responding on its configured local
+port, or starts the saved command if the port is free, then embeds the page.
+The saved directory is needed only when starting the command. The command receives
+the configured port as `PORT`; it must listen on that port and permit iframe embedding.
 The view opens in a tab with its name beside **Workspaces**, **PRs**, and **Linear**.
 Switching to another tab hides the named tab. Reopen the view from **Custom views**
 in the sidebar.
-Open the view's **…** menu for **Edit view**, **Start server** or **Stop server**,
-**Reload**, **Server logs**, and **Remove view**. **Server logs** opens the output in
-a dialog. Switching homepage sections keeps the server running; editing, removing,
-or quitting the app stops it. An occupied port or failed command shows an error;
-check the view's server output before retrying. Custom pages do not receive the
-app's workspace or agent tools.
+Open the view's **…** menu for **Edit view**, **Start server**, **Stop server** (or
+**Disconnect** for a server started outside Intent), **Reload**, **Server logs**,
+and **Remove view**. **Server logs** opens the output in a dialog; logs for servers
+started elsewhere remain where they were started. Switching homepage sections
+keeps the server running. Editing, removing, or quitting the app stops only servers
+Intent started; disconnecting leaves an external server running. If a reused server
+stops responding, the view shows an error without starting the saved command
+automatically. A port registered to another view, an occupied port without an HTTP
+response, or a failed command also shows an error; check the server before retrying.
+Custom pages do not receive the app's workspace or agent tools.
 
 Custom view authors can use the experimental, local **@intent/custom-view-sdk**
 package to receive Intent's current design tokens and live theme changes. In the
