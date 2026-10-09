@@ -80,12 +80,18 @@ appear in `listTabs`, and can be revealed again with `showTab`.
 Agent-opened tabs start hidden: `openTab` without `visible: true` creates the tab
 hidden — alive, owned by you, emulated (the sizing invariant above is unchanged),
 returned by `listTabs` with `visibility: "hidden"`, and rendering offscreen — with no
-panel mount and no focus or active-tab change. Pass `visible: true` to open directly
-into the user's panel layout: the tab is mounted AND made its panel's active tab
-without stealing panel/keyboard focus, on every `position` (`adjacent`, `same`, or a
-`replace` that falls back to a new tab). The `openTab` result carries an **optional**
-`displayed` (see below): present when the layout confirmed the tab's display state,
-absent when that state is unknown (the layout could not be read, or the tab was not
+panel mount and no focus or active-tab change. With the companion frontend update,
+`visible: true` on a fresh agent open inserts the tab immediately behind the active
+tab in the current panel (below it in the panel content menu), preserving the active
+content, keyboard focus, and forward history. This applies to new tabs for every
+`position` (`adjacent`, `same`, or a `replace` that falls back to a new tab); replacing
+an existing owned tab retains its replacement behavior. If the panel has no active
+tab, the new tab becomes active. User-initiated opens keep their existing behavior.
+This background insertion is pending release with that frontend update; older
+frontends activate fresh visible opens. The `openTab` result carries an **optional**
+`displayed` (see below): normally `false` for a background insertion, present when
+the layout confirmed the tab's display state, absent when that state is unknown
+(the layout could not be read, or the tab was not
 in the fresh tab list) — absence means unknown, NOT `false`; re-check with
 `listTabs`. Only `visible: true` requests carry it (a dedupe reuse under `visible: true`
 reports the reused tab's real display state); default hidden opens and reuses without
@@ -93,7 +99,18 @@ reports the reused tab's real display state); default hidden opens and reuses wi
 visibility — a same-URL reopen reuses your tab whether it is hidden or visible — and a
 dedupe hit never changes the reused tab's visibility: a hidden tab stays hidden even
 when the `openTab` carried `visible: true` (and a visible tab stays visible).
-Revealing an existing tab is `showTab`-only.
+Revealing an existing tab through the browser API is `showTab`-only.
+
+Successful opens return an action envelope `{ action: "openTab", success: true,
+result: { tabId, url, ... } }`. With the companion frontend update, `url` is present
+on fresh opens as well as reuses and is the resolved URL submitted to the browser;
+it does not promise the final destination after page redirects. Existing
+`requestedUrl` / `finalUrl` rewrite echoes remain unchanged. Use the returned
+`tabId` for subsequent actions: a background open does not change the active tab.
+The daemon preserves these structured result fields. In the accompanying chat UI,
+successful opens with a tab ID and URL show a clickable **Browsing hostname** badge
+(including a non-default port); clicking it reveals the existing tab. This badge is
+also pending the companion frontend release, not available on older builds.
 
 - `{ action: "showTab", tabId, focus? }` - Activate an owned tab in a visible panel:
   reveals a hidden tab, or brings a visible-but-inactive tab to the front of its
@@ -195,8 +212,8 @@ naming the "action execution" stage instead of a per-action `errorCode`.
 
 ## UI Control
 - `{ action: "openTab", url, position?, visible?, width?, height? }` - Open a new browser tab, owned by you; hidden by default (see Tab Visibility)
-  - visible: true opens directly into the UI, activated in its panel without stealing focus on any position; the result carries `displayed` when the layout confirmed it and omits it when unknown (absent ≠ false); omitted/false creates the tab hidden
-  - position: 'adjacent' (default), 'replace', or 'same'
+  - visible: true inserts fresh agent tabs behind the current panel's active tab without changing active content or focus (pending companion frontend release; see Tab Visibility); the result carries `displayed` when the layout confirmed it and omits it when unknown (absent ≠ false); omitted/false creates the tab hidden
+  - position: 'adjacent' (default), 'replace', or 'same'; fresh visible agent tabs use background insertion in the current panel regardless of position; replacing an existing owned tab is unchanged
   - width/height: emulated viewport size in CSS px; omitted width defaults to 1280, omitted height to 800
 - `{ action: "showTab", tabId, focus? }` - Activate an owned tab in a visible panel without stealing focus (reveals a hidden tab, or brings a visible-but-inactive one to the front); focus: true also focuses it (see Tab Visibility)
 - `{ action: "claimTab", tabId, width, height? }` - Claim an unowned (user) tab (see Tab Ownership & Sizing)
