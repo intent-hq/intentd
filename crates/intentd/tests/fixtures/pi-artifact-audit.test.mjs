@@ -118,3 +118,68 @@ test('independent audit checks child proof and cleanup, not just the fixture res
     assert.throws(() => auditArtifact(tampered, expected));
   }
 });
+
+test('a failing stream beyond the detail cap fails both validators without banning optional truncation', async () => {
+  const { default: diagnostics } = await import('./pi-diagnostics.cjs');
+  const cleanup = await import('./pi-session-cleanup.mjs');
+  const root = mkdtempSync(join(tmpdir(), 'pi-stream-summary-'));
+  try {
+    const record = { runId: 'case', root: join(root, 'already-removed'), result: 'passed',
+      cleanup: { completed: true, rootRemoved: true, steps: Object.fromEntries(['stopClients', 'closeLifetime', 'removeRoot'].map(name => [name, { result: 'passed' }])) },
+      replay: ['first:created', 'second:created'].map(text => ({ text })),
+      clients: [{ witnesses: ['newSession', 'newSession', 'loadSession', 'loadSession'].map((route, index) => ({
+        invocationId: String(index), runId: 'case', pid: 12345 + index, route, argv: ['--mode', 'rpc'],
+        close: { code: null, signal: 'SIGTERM', kind: 'harness' },
+        stderr: { text: '', bytesSeen: 0, bytesRetained: 0, limitBytes: 8192, truncated: false, incompleteLineOmitted: false },
+      })) }],
+      streamErrors: Array.from({ length: 128 }, () => ({ expected: true, message: 'retired socket' })),
+      histories: Array(200).fill('optional history'),
+    };
+    const produce = () => diagnostics.publishEvidence(join(root, 'evidence.json'), record);
+    let output = produce();
+    const expected = { run: output.evidenceRun, runtime: true };
+    auditArtifact(output, expected);
+    assert.equal(output.artifactTruncated, true);
+    record.streamErrors.push({ expected: false, message: 'unexpected 129th stream failure' });
+    // Never trust a previously published summary when republishing full evidence.
+    record.streamErrorSummary = { total: 0, unexpected: 0 };
+    output = produce();
+    assert.throws(() => auditArtifact(output, expected), /Unexpected MCP stream error/);
+    assert.throws(() => cleanup.assertNoUnexpectedStreamErrors(output), /Unexpected MCP stream error/);
+    assert.deepEqual(output.streamErrorSummary, { total: 129, unexpected: 1 });
+    record.streamErrors[128].expected = true;
+    const clean = produce();
+    assert.deepEqual(clean.streamErrorSummary, { total: 129, unexpected: 0 });
+    cleanup.assertNoUnexpectedStreamErrors(clean);
+    auditArtifact(clean, expected);
+    for (const summary of [undefined, {}, { total: 0, unexpected: 0 }, { total: 129, unexpected: -1 }]) {
+      const missingProof = { ...clean, streamErrorSummary: summary };
+      assert.throws(() => cleanup.assertNoUnexpectedStreamErrors(missingProof));
+      assert.throws(() => auditArtifact(missingProof, expected));
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('actual failing TAP file and console redact raw and escaped TAB and CR Bearer credentials', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-tap-whitespace-'));
+  const value = 'SYNTHETIC_UNLISTED_CREDENTIAL_123456';
+  try {
+    const forms = ['\t', '\r', '\r\n', '\\t', '\\r', '\\u0009', '\\x0d'];
+    const driver = join(root, 'failure.test.mjs');
+    writeFileSync(driver, `import test from 'node:test'; import {writeSync} from 'node:fs';
+      test('unexpected fixture failure', () => {
+        for (const separator of ${JSON.stringify(forms)}) writeSync(2, 'Bearer' + separator + ${JSON.stringify(value)} + '\\n');
+        throw new Error('Bearer\\t' + ${JSON.stringify(value)});
+      });`);
+    const run = spawnSync(process.execPath, [fixture('./pi-fixture-runner.mjs'), 'failed.tap', driver], {
+      env: { ...env, PI_ACP_EVIDENCE_DIR: root, PI_DIAGNOSTICS_RUN_ID: 'whitespace-proof' }, encoding: 'utf8', timeout: 15000,
+    });
+    assert.equal(run.status, 1, 'The test failure must remain a failure');
+    for (const text of [readFileSync(join(root, 'failed.tap'), 'utf8'), run.stdout, run.stderr]) {
+      assert.ok(!text.includes(value), 'Credential leaked through the runner');
+      assert.ok(Buffer.byteLength(text) <= 131072);
+      auditText(text);
+    }
+    for (const separator of forms) assert.throws(() => auditText('Bearer' + separator + value), 'Audit accepts a credential');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

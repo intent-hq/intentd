@@ -41,3 +41,13 @@ export function assertCleanupComplete(evidence, { runId, root }) {
   assert.equal(evidence.cleanup.rootRemoved, true, 'Cleanup did not remove the root');
   assert.equal(existsSync(root), false, 'Cleanup root still exists');
 }
+
+// Use the lossless summary computed before diagnostic arrays are capped.
+export function assertNoUnexpectedStreamErrors(record) {
+  const summary = record.streamErrorSummary;
+  assert.ok(summary && Number.isSafeInteger(summary.total) && summary.total >= 0
+    && Number.isSafeInteger(summary.unexpected) && summary.unexpected >= 0
+    && summary.unexpected <= summary.total, 'Missing or invalid stream-error summary');
+  assert.ok(summary.total >= (record.streamErrors?.length ?? 0), 'Inconsistent stream-error summary');
+  assert.equal(summary.unexpected, 0, 'Unexpected MCP stream error');
+}

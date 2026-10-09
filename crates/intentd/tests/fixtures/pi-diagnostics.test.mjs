@@ -104,3 +104,26 @@ test('artifact truncation preserves cleanup, replay and stream-error proof', () 
     assert.ok(statSync(file).size <= LIMITS.artifact);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('raw and escaped credential whitespace stays redacted across every chunk boundary and output surface', () => {
+  const value = 'SYNTHETIC_UNLISTED_CREDENTIAL_123456';
+  const root = mkdtempSync(join(tmpdir(), 'pi-whitespace-redaction-'));
+  try {
+    for (const separator of ['\t', '\r', '\r\n', '\n# ', '\r\n# ', '\\t', '\\r', '\\r\\n', '\\x09', '\\x0d', '\\u0009', '\\u000d', '\\\\t', '\\\\r']) {
+      const raw = Buffer.from(`original é failure\nBearer${separator}${value}\n`);
+      for (let split = 0; split <= raw.length; split++) {
+        const capture = new Capture();
+        capture.push(raw.subarray(0, split));
+        assert.ok(!capture.snapshot().text.includes(value), 'Partial capture leaks a credential');
+        capture.push(raw.subarray(split));
+        const result = capture.snapshot(true);
+        assert.ok(!result.text.includes(value), 'Completed capture leaks a credential');
+        assert.match(result.text, /original é failure/);
+      }
+      assert.ok(!failureReport('loadSession', new Error(raw.toString())).includes(value), 'Failure report leaks a credential');
+      const record = publishEvidence(join(root, 'evidence.json'), { error: raw.toString() });
+      assert.ok(!JSON.stringify(record).includes(value), 'JSON artifact leaks a credential');
+    }
+    assert.equal(safeText('C:\\temp\\runtime\\test.json').text, 'C:\\temp\\runtime\\test.json', 'Windows paths must not be unescaped as whitespace');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

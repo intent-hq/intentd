@@ -5,7 +5,7 @@ const { writeFileSync, renameSync } = require('node:fs');
 const LIMITS = Object.freeze({ capture: 8192, witness: 16384, report: 16384, artifact: 262144, tap: 131072, invocations: 16 });
 const SECRET = 'CANARY_pi_fixture_secret_9387';
 const controls = text => text
-  .replace(/\\(?:u00([0-9a-f]{2})|x([0-9a-f]{2}))/gi, (match, unicode, hex) => {
+  .replace(/\\+(?:u00([0-9a-f]{2})|x([0-9a-f]{2}))/gi, (match, unicode, hex) => {
     const code = parseInt(unicode ?? hex, 16);
     return code < 32 || (code >= 127 && code <= 159) ? String.fromCharCode(code) : match;
   })
@@ -14,12 +14,16 @@ const controls = text => text
   .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, '')
   .replace(/\x1b(?:\[[^\n]*|[^\n]?)$/g, '')
   .replace(/\x1b[ -/]*[@-~]/g, '')
+  .replace(/[\t\r\v\f]/g, ' ')
   .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, '');
 function sanitize(text, secrets) {
   // Match credential syntax BEFORE literal values: a value equal to "token"
   // must not erase the label that tells us to redact the following value.
   text = controls(text)
-    .replace(/\b(?:authorization|(?:access|refresh|auth|api)[_-]?(?:token|key)|token|password|secret|credential)["']?\s*[:=][^\n]*/gi, '[REDACTED]')
+    // Node TAP/JSON may spell whitespace as backslash escapes. Normalize only
+    // credential boundaries (including TAP comment continuation), not paths like C:\\temp.
+    .replace(/\bBearer(?:\n[ \t]*#[ \t]*|\s|\\+[trn])+/gi, 'Bearer ')
+    .replace(/\b(?:authorization|(?:access|refresh|auth|api)[_-]?(?:token|key)|token|password|secret|credential)["']?(?:\s|\\+[trn])*[:=][^\n]*/gi, '[REDACTED]')
     .replace(/\bBearer\s+[^\s"']+/gi, 'Bearer [REDACTED]')
     .replace(/(https?:\/\/)[^\s/]+@/gi, '$1[REDACTED]@');
   for (const secret of [...secrets].map(controls).filter(Boolean).sort((a, b) => b.length - a.length)) {
@@ -117,7 +121,14 @@ function failureReport(method, error, witnesses = []) {
     stderr: safeText(child.stderr?.text ?? '', { limit: 2048 }),
   } : null, truncated: true });
 }
+function summarizeStreamErrors(errors) {
+  if (!Array.isArray(errors)) return undefined;
+  let unexpected = 0;
+  for (const error of errors) if (error?.expected !== true) unexpected++;
+  return { total: errors.length, unexpected };
+}
 function publishEvidence(file, record) {
+  const streamErrorSummary = summarizeStreamErrors(record.streamErrors);
   // Mandatory proof precedes bulky optional request/history transcripts, so
   // exhausting the artifact budget cannot hide cleanup or stream failures.
   const primary = Object.fromEntries(['root', 'runId', 'route', 'oversized', 'result', 'controls',
@@ -126,7 +137,7 @@ function publishEvidence(file, record) {
     .filter(key => Object.hasOwn(record, key)).map(key => [key, record[key]]));
   const safe = safeValue({ ...primary,
     diagnostics: record.clients?.flatMap(client => client.witnesses ?? []) ?? [], ...record });
-  const output = { ...safe.value, diagnosticSchema: 1, evidenceRun: process.env.PI_DIAGNOSTICS_RUN_ID ?? 'local',
+  const output = { ...safe.value, streamErrorSummary, diagnosticSchema: 1, evidenceRun: process.env.PI_DIAGNOSTICS_RUN_ID ?? 'local',
     limits: LIMITS, artifactTruncated: safe.truncated };
   const json = JSON.stringify(output, null, 2);
   if (Buffer.byteLength(json) > LIMITS.artifact) throw new Error('Diagnostic artifact exceeds byte cap');
@@ -139,4 +150,4 @@ function writeWitness(file, record) {
   writeFileSync(file + '.tmp', json);
   renameSync(file + '.tmp', file);
 }
-module.exports = { Capture, LIMITS, SECRET, safeText, safeValue, failureReport, publishEvidence, writeWitness };
+module.exports = { Capture, LIMITS, SECRET, safeText, safeValue, failureReport, publishEvidence, writeWitness, summarizeStreamErrors };

@@ -17,10 +17,10 @@ import { createInterface } from 'node:readline';
 import { Readable, Writable } from 'node:stream';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { assertCleanupComplete, finishCleanup } from './pi-session-cleanup.mjs';
+import { assertCleanupComplete, assertNoUnexpectedStreamErrors, finishCleanup } from './pi-session-cleanup.mjs';
 import diagnostics from './pi-diagnostics.cjs';
 import { readWitnesses, stopWitnesses } from './pi-witness-harness.mjs';
-const { Capture, failureReport, publishEvidence } = diagnostics;
+const { Capture, failureReport, publishEvidence, summarizeStreamErrors } = diagnostics;
 const observer = fileURLToPath(new URL('./pi-startup-witness.cjs', import.meta.url));
 
 const windows = process.platform === 'win32';
@@ -85,6 +85,7 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
         bounded(new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())), 'fixture server close')));
     },
   }, record => {
+    record.streamErrorSummary = summarizeStreamErrors(record.streamErrors);
     if (process.env.PI_ACP_EVIDENCE_DIR) {
       mkdirSync(process.env.PI_ACP_EVIDENCE_DIR, { recursive: true });
       publishEvidence(join(process.env.PI_ACP_EVIDENCE_DIR, `runtime-${commandKind}.json`), record);
@@ -318,7 +319,7 @@ test('independent cleanup audit for real Pi compatibility', async () => {
     const record = process.env.PI_ACP_EVIDENCE_DIR
       ? JSON.parse(readFileSync(join(process.env.PI_ACP_EVIDENCE_DIR, `runtime-${commandKind}.json`), 'utf8')) : completedEvidence.get(commandKind);
     assertCleanupComplete(record, expected);
-    assert.deepEqual(record.streamErrors.filter(error => !error.expected), [], 'Unexpected MCP stream error');
+    assertNoUnexpectedStreamErrors(record);
     assert.equal(record.result, 'passed', record.error);
   }
 });
