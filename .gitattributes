@@ -1,0 +1,3 @@
+# Preserve exact diagnostic bytes without changing repository-wide text policy.
+/diagnostics/pi-native-version-contribution-v1/** -text
+/.github/workflows/pi-native-version-contribution-v1.yml -text
