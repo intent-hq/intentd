@@ -116,9 +116,11 @@ async fn queued_write(operation: Operation, retirement: Option<bool>) {
         .query_events(&intent_store::EventQuery {
             workspace_id: Some(f.git.workspace.id.clone()),
             event_types: vec![
-                "prMonitor:updated".into(),
-                "prMonitor:emitted".into(),
-                "prMonitor:completed".into(),
+                intent_core::events::PR_MONITOR_REGISTERED.into(),
+                intent_core::events::PR_MONITOR_CHANGED.into(),
+                intent_core::events::PR_MONITOR_EMITTED.into(),
+                intent_core::events::PR_MONITOR_COMPLETED.into(),
+                intent_core::events::PR_MONITOR_CANCELLED.into(),
             ],
             ..Default::default()
         })
