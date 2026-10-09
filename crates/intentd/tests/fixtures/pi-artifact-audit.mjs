@@ -53,7 +53,30 @@ export function auditArtifact(record, { run, route, oversized, runtime = false }
     const rpc = record.diagnostics.filter(child => child.argv.includes('rpc'));
     assert.equal(rpc.filter(child => child.route === 'newSession').length, 2);
     assert.equal(rpc.filter(child => child.route === 'loadSession').length, 2);
-    assert.ok(rpc.every(child => ['harness', 'adapter'].includes(child.close.kind)), 'Successful RPC children must record requested shutdown');
+    for (const child of rpc) {
+      if (['harness', 'adapter'].includes(child.close.kind)) continue;
+      // Windows may close the shell's input pipe while disposing a completed
+      // session. Require actual successful replacement evidence, keeping the
+      // child's independently observed natural0 status unchanged.
+      assert.ok(record.platform === 'win32' && child.close.kind === 'natural'
+        && child.close.code === 0 && child.close.signal === null, 'Unexpected natural RPC exit');
+      const lifecycle = Array.isArray(record.rpcLifecycle) ? record.rpcLifecycle : [];
+      const previous = lifecycle.filter(row => row.invocationId === child.invocationId);
+      assert.equal(previous.length, 1, 'Missing unique completed-session proof');
+      const prior = previous[0];
+      const following = lifecycle.filter(row => row.invocationId === prior.replacement?.invocationId);
+      assert.equal(following.length, 1, 'Missing unique replacement proof');
+      const next = following[0];
+      const successor = rpc.find(row => row.invocationId === next.invocationId);
+      assert.ok(prior.callCompleted === true && prior.promptStopReason === 'end_turn'
+        && prior.replacement?.priorLive === true && ['newSession', 'loadSession'].includes(prior.method)
+        && prior.method === child.route && next.callCompleted === true && next.method === prior.method
+        && typeof prior.sessionId === 'string' && prior.sessionId.length > 0
+        && typeof next.sessionId === 'string' && next.sessionId.length > 0 && next.sessionId !== prior.sessionId
+        && successor && successor.invocationId !== child.invocationId && successor.route === next.method
+        && Number.isSafeInteger(child.startedAt) && Number.isSafeInteger(successor.startedAt)
+        && successor.startedAt >= child.startedAt, 'Unproven completed-session replacement');
+    }
   } else {
     assert.equal(record.route, route);
     assert.equal(record.oversized, oversized);

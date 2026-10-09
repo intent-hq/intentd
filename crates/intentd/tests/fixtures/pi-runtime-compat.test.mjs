@@ -67,7 +67,7 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
   const agentDir = join(home, '.pi', 'agent');
   const runId = randomUUID();
   const evidence = { runId, root, platform: process.platform, node: process.version, adapterEntry, piEntry,
-    commandKind, requests, bridgeRequests, streamErrors: [], clients: [], sessions: [] };
+    commandKind, requests, bridgeRequests, streamErrors: [], clients: [], sessions: [], rpcLifecycle: [] };
   const retireSocket = socket => { retiringSockets.add(socket); socket.destroy(); };
   expectedEvidence.set(commandKind, { runId, root });
   let modelServer;
@@ -199,13 +199,39 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
         },
       }), ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout)));
       let stopPromise;
+      let activeRpc;
       const client = {
         record,
         async call(method, params) {
           writeFileSync(join(directory, 'route'), method);
           const call = { method, params };
           record.calls.push(call);
-          try { call.result = await bounded(connection[method](params), method); return call.result; }
+          try {
+            const opensSession = method === 'newSession' || method === 'loadSession';
+            const before = opensSession ? readWitnesses(directory) : [];
+            const prior = before.find(child => child.invocationId === activeRpc?.invocationId);
+            let priorLive = false;
+            if (prior?.pid && !prior.close) {
+              try { process.kill(prior.pid, 0); priorLive = true; }
+              catch (error) { if (error.code !== 'ESRCH') throw error; }
+            }
+            call.result = await bounded(connection[method](params), method);
+            if (opensSession) {
+              const created = readWitnesses(directory).filter(child => child.argv.includes('rpc')
+                && !before.some(previous => previous.invocationId === child.invocationId));
+              assert.equal(created.length, 1, 'Successful session call must identify one actual RPC child');
+              const lifecycle = { invocationId: created[0].invocationId, method,
+                sessionId: method === 'newSession' ? call.result.sessionId : params.sessionId, callCompleted: true };
+              // Preserve observed close.kind/code. This is independent call evidence,
+              // not a fabricated signal: Windows shell disposal may leave Pi exiting0.
+              if (activeRpc && priorLive) activeRpc.replacement = { invocationId: lifecycle.invocationId, priorLive };
+              evidence.rpcLifecycle.push(lifecycle);
+              activeRpc = lifecycle;
+            } else if (method === 'prompt' && activeRpc?.sessionId === params.sessionId) {
+              activeRpc.promptStopReason = call.result.stopReason;
+            }
+            return call.result;
+          }
           catch (error) {
             call.error = failureReport(method, error, readWitnesses(directory));
             throw new Error(call.error);

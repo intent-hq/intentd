@@ -132,7 +132,7 @@ function publishEvidence(file, record) {
   // Mandatory proof precedes bulky optional request/history transcripts, so
   // exhausting the artifact budget cannot hide cleanup or stream failures.
   const primary = Object.fromEntries(['root', 'runId', 'route', 'oversized', 'result', 'controls',
-    'cleanup', 'streamErrors', 'replay', 'failureReport', 'error', 'harnessError',
+    'cleanup', 'streamErrors', 'replay', 'rpcLifecycle', 'failureReport', 'error', 'harnessError',
     'response', 'platform', 'node', 'pin', 'piVersion', 'commandKind']
     .filter(key => Object.hasOwn(record, key)).map(key => [key, record[key]]));
   const safe = safeValue({ ...primary,

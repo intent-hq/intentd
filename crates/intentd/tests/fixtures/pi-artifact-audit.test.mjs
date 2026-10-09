@@ -348,3 +348,54 @@ test('actual failing runner redacts nested JSON errors before TAP and console pu
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('Windows zero exits require completed-session replacement proof without rewriting child status', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-retirement-proof-'));
+  try {
+    const record = { runId: 'replacement', platform: 'win32', root: join(root, 'removed'), result: 'passed',
+      cleanup: { completed: true, rootRemoved: true, steps: Object.fromEntries(['stopClients', 'closeLifetime', 'removeRoot'].map(name => [name, { result: 'passed' }])) },
+      streamErrors: [], replay: ['first:created', 'second:created'].map(text => ({ text })),
+      diagnostics: ['newSession', 'newSession', 'loadSession', 'loadSession'].map((route, index) => ({
+        invocationId: String(index), runId: 'replacement', pid: 12340 + index, startedAt: index + 1, route, argv: ['--mode', 'rpc'],
+        close: { code: index % 2 ? 1 : 0, signal: null, kind: index % 2 ? 'harness' : 'natural' },
+        stderr: { text: '', bytesSeen: 0, bytesRetained: 0, limitBytes: 8192, truncated: false, incompleteLineOmitted: false },
+      })),
+      rpcLifecycle: ['newSession', 'newSession', 'loadSession', 'loadSession'].map((method, index) => ({
+        invocationId: String(index), method, sessionId: `session-${index % 2}`, callCompleted: true, promptStopReason: 'end_turn',
+        ...(index % 2 ? {} : { replacement: { invocationId: String(index + 1), priorLive: true } }),
+      })),
+      histories: Array(200).fill('optional history'),
+    };
+    const output = diagnostics.publishEvidence(join(root, 'record.json'), record);
+    const expected = { run: output.evidenceRun, runtime: true };
+    auditArtifact(output, expected);
+    assert.equal(output.artifactTruncated, true);
+    assert.deepEqual(output.rpcLifecycle, record.rpcLifecycle, 'Mandatory replacement proof was truncated');
+    assert.deepEqual(output.diagnostics[0].close, { code: 0, signal: null, kind: 'natural' });
+    for (const index of [0, 2]) for (const change of [
+      value => { value.rpcLifecycle = undefined; },
+      value => { value.platform = 'linux'; },
+      value => { value.diagnostics[index].close.code = 73; },
+      value => { value.diagnostics[index].close.signal = 'SIGTERM'; },
+      value => { value.rpcLifecycle[index].replacement = undefined; },
+      value => { value.rpcLifecycle[index].replacement.priorLive = false; },
+      value => { value.rpcLifecycle[index].replacement.invocationId = String(index); },
+      value => { value.rpcLifecycle[index].replacement.invocationId = 'missing'; },
+      value => { value.rpcLifecycle[index].promptStopReason = 'cancelled'; },
+      value => { value.rpcLifecycle[index].callCompleted = false; },
+      value => { value.rpcLifecycle[index].method = 'prompt'; },
+      value => { value.rpcLifecycle[index + 1].callCompleted = false; },
+      value => { value.rpcLifecycle[index + 1].sessionId = value.rpcLifecycle[index].sessionId; },
+      value => { value.diagnostics[index + 1].startedAt = 0; },
+      value => { value.diagnostics[index + 1].route = 'prompt'; },
+      value => { value.rpcLifecycle.push(value.rpcLifecycle[index]); },
+    ]) {
+      const tampered = structuredClone(output);
+      change(tampered);
+      assert.throws(() => auditArtifact(tampered, expected), 'Unproven natural exit accepted');
+    }
+    const premature = structuredClone(output);
+    premature.diagnostics[1].close = { code: 0, signal: null, kind: 'natural' };
+    assert.throws(() => auditArtifact(premature, expected), 'Last child exited naturally without replacement');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
