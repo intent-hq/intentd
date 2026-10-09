@@ -1811,9 +1811,9 @@ async fn host_provider_discovery_over_wss() {
         ),
         "claude-code npxPackage must be the pinned spec: {cc}"
     );
-    // The pi row carries the `pi` CLI verdict fields (monorepo#1662); only
-    // the pi row does. The verdict itself is host-dependent — assert the
-    // field shape, not the values.
+    // Pi keeps its legacy CLI verdict. Other rows carry an optional check
+    // only when their exact pinned adapter declares an underlying CLI minimum.
+    // Installed version verdicts are host-dependent.
     let pi = providers
         .iter()
         .find(|p| p["id"] == "pi")
@@ -1827,9 +1827,17 @@ async fn host_provider_discovery_over_wss() {
         "{pi}"
     );
     for p in providers.iter().filter(|p| p["id"] != "pi") {
+        if let Some(requirement) =
+            intent_providers::adapter_cli::requirement(p["id"].as_str().unwrap())
+        {
+            assert_eq!(p["cliCommand"], requirement.command, "{p}");
+            assert_eq!(p["cliMinimumVersion"], requirement.minimum.to_string(), "{p}");
+            assert_eq!(p["cliVersionRange"], requirement.range, "{p}");
+            continue;
+        }
         assert!(
             p.get("cliCommand").is_none() && p.get("cliRequirement").is_none(),
-            "only the pi row carries CLI verdict fields: {p}"
+            "provider without a CLI declaration carries no verdict fields: {p}"
         );
     }
     // Env-var gated rows (the daemon env above sets none of the enable
