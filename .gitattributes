@@ -1,0 +1,3 @@
+# Preserve exact diagnostic bytes without changing repository-wide text policy.
+/diagnostics/pi-native-a04-predicate-v1/** -text
+/.github/workflows/pi-native-a04-predicate-v1.yml -text
