@@ -4705,6 +4705,93 @@ async fn streaming_terminal_failure_persists_error_before_publishing_events() {
     );
 }
 
+/// A provider can still reject its own retained history even on a text-only
+/// turn. Recovery guidance must reach the persisted failure and live event,
+/// not just a local classifier, without retrying or misclassifying other errors.
+#[tokio::test]
+async fn provider_request_size_failure_surfaces_actionable_history_guidance() {
+    for (error, expected_size_failure) in [
+        (json!({ "code": 413, "message": "request rejected" }), true),
+        (
+            json!({ "code": -32603, "message": "Internal error", "data": {
+                "details": "HTTP error: 413 Request Entity Too Large"
+            }}),
+            true,
+        ),
+        (
+            json!({ "code": -32603, "message": "augmentTooLarge" }),
+            true,
+        ),
+        (
+            json!({ "code": -32603, "message": "HTTP 413 Payload Too Large" }),
+            true,
+        ),
+        (
+            json!({ "code": -32603, "message": "HTTP 400 context too large; requestId=413" }),
+            false,
+        ),
+    ] {
+        let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+        let (conn, mut note_rx, _agent, prompt_calls) =
+            connect_with_prompt_rpc_error_code(error, Vec::new());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let err = services
+            .run_connection_prompt_turn(
+                &conn,
+                &mut note_rx,
+                &agent_id,
+                &workspace_id,
+                ACP_SID,
+                vec![text_block("continue")],
+                Some("image-history-turn"),
+            )
+            .await
+            .expect_err("provider failure must fail the turn");
+        let message = err.to_string();
+        assert_eq!(prompt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            crate::is_context_size_error(&message),
+            expected_size_failure
+        );
+        if expected_size_failure {
+            for guidance in [
+                "earlier turns",
+                "fewer images",
+                "crop",
+                "new agent conversation",
+            ] {
+                assert!(message.contains(guidance), "missing {guidance}: {message}");
+            }
+        } else {
+            assert!(message.contains("HTTP 400"));
+            assert!(!message.contains("new agent conversation"));
+        }
+        let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+        assert_eq!(stored.status, AgentStatus::Error);
+        assert_eq!(stored.stop_reason.as_deref(), Some(message.as_str()));
+        let mut events = Vec::new();
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await {
+            events.extend(batch);
+        }
+        let failures: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "agent:failed")
+            .collect();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].data["turnId"], "image-history-turn");
+        if expected_size_failure {
+            assert_eq!(failures[0].data["error"], message);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == "agent:stream:end")
+                .count(),
+            1
+        );
+    }
+}
+
 /// A benign provider-resolved cancel (JSON-RPC `-32800` request-cancelled) on
 /// the streaming path must NOT persist an Error status (monorepo#2050): it is
 /// the expected outcome of a concurrent stop/cancel, classified benign by the

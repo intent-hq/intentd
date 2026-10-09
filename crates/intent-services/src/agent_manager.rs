@@ -5277,7 +5277,7 @@ impl AgentManager {
         workspace_id: &WorkspaceId,
         content: &str,
         options: &TurnOptions,
-    ) -> Vec<ContentBlock> {
+    ) -> Result<Vec<ContentBlock>> {
         // Combined interrupt delivery (monorepo#1014): the preempted
         // message's text precedes the interrupt message's own content.
         // For legacy prepends when the ACP session was recreated, history
@@ -5508,7 +5508,7 @@ impl AgentManager {
                     group.image_blocks.as_ref(),
                     group.file_blocks.as_ref(),
                 )
-                .await;
+                .await?;
             }
         } else {
             self.append_resolved_attachments(
@@ -5516,13 +5516,13 @@ impl AgentManager {
                 options.prepend_image_blocks.as_ref(),
                 options.prepend_file_blocks.as_ref(),
             )
-            .await;
+            .await?;
             self.append_resolved_attachments(
                 &mut blocks,
                 options.image_blocks.as_ref(),
                 options.file_blocks.as_ref(),
             )
-            .await;
+            .await?;
         }
         // Resolve `noteIds` to `workspace-asset://` image content blocks
         // (Fidelity B, PROTOCOL §5.5): each note is scanned for markdown
@@ -5570,7 +5570,7 @@ impl AgentManager {
         if self.auto_unarchived.lock().unwrap().remove(agent_id) {
             blocks.extend(text_prompt(AUTO_UNARCHIVE_PROMPT_NOTICE));
         }
-        blocks
+        Ok(blocks)
     }
 
     /// Resolve references within their message group, before emitting the next text.
@@ -5579,11 +5579,11 @@ impl AgentManager {
         blocks: &mut Vec<ContentBlock>,
         images: Option<&Value>,
         files: Option<&Value>,
-    ) {
+    ) -> Result<()> {
         let resolved = self
             .services
             .resolve_image_block_refs(images.cloned())
-            .await;
+            .await?;
         append_attachment_blocks(
             blocks,
             &TurnOptions {
@@ -5592,6 +5592,7 @@ impl AgentManager {
                 ..TurnOptions::default()
             },
         );
+        Ok(())
     }
 
     /// Build the user-turn body: normally just `content`, but when the ACP
@@ -5733,6 +5734,17 @@ impl AgentManager {
         turn_id: Option<&str>,
     ) -> Result<StopReason> {
         let original = self.capture_turn(agent_id)?;
+        // Bare callers do not hold the worker's busy slot: protect their
+        // process from idle eviction while image preparation awaits CPU work.
+        self.registry.mark_active(agent_id);
+        let prompt = match crate::provider_images::PreparedPrompt::new(prompt).await {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                self.active_delivery_groups.lock().unwrap().remove(agent_id);
+                self.registry.mark_idle_slot_held(agent_id);
+                return Err(error);
+            }
+        };
         self.run_turn_owned(
             agent_id,
             workspace_id,
@@ -5765,7 +5777,7 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         acp_session_id: &str,
-        prompt: Vec<ContentBlock>,
+        prompt: crate::provider_images::PreparedPrompt,
         turn_id: Option<&str>,
         original: OriginalTurn,
     ) -> Result<StopReason> {
@@ -12799,14 +12811,57 @@ async fn run_message_worker(
                     mgr.clear_attention_request_if_present(&agent_id, &workspace_id)
                         .await;
                 }
-                let prompt = mgr
-                    .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
-                    .await;
+                // Session establishment may arm both flags. Assembly consumes
+                // them, but a rejected prompt has delivered neither context.
+                // The worker's busy slot protects the child throughout prep.
+                let prepend_pending = mgr.prepend_pending.lock().unwrap().contains(&agent_id);
+                let recreated = mgr.recreated.lock().unwrap().contains(&agent_id);
+                let restore_undelivered_context = || {
+                    if prepend_pending {
+                        mgr.prepend_pending.lock().unwrap().insert(agent_id.clone());
+                    }
+                    if recreated {
+                        mgr.recreated.lock().unwrap().insert(agent_id.clone());
+                    }
+                };
+                let prepared = async {
+                    let prompt = mgr
+                        .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
+                        .await?;
+                    crate::provider_images::PreparedPrompt::new(prompt).await
+                }
+                .await;
+                let prompt = match prepared {
+                    Ok(prompt) => prompt,
+                    Err(e) => {
+                        // Restore only on pre-delivery failure, never on an ACP
+                        // error after the provider may have seen the context.
+                        restore_undelivered_context();
+                        tracing::warn!(agent = %agent_id, error = %e, "agent prompt preparation failed");
+                        // No partial prompt reaches the provider. The original
+                        // options (including image references and turn id) feed
+                        // the normal durable failure/retry path unchanged.
+                        mgr.active_delivery_groups.lock().unwrap().remove(&agent_id);
+                        handle_terminal_turn_failure(
+                            &mgr,
+                            &agent_id,
+                            &workspace_id,
+                            &content,
+                            &options,
+                            user_persisted,
+                            &e,
+                        )
+                        .await;
+                        mgr.release_in_flight_slot(&agent_id);
+                        break 'outer;
+                    }
+                };
                 if mgr.services.defer_script_monitor_for_export(
                     &agent_id,
                     &content,
                     options.message_metadata.as_ref(),
                 ) {
+                    restore_undelivered_context();
                     mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
                         .await;
                     return;
@@ -12816,6 +12871,7 @@ async fn run_message_worker(
                     .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())
                     .await
                 {
+                    restore_undelivered_context();
                     mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
                         .await;
                     return;
@@ -16835,7 +16891,8 @@ mod role_reminder_tests {
                 "start",
                 &TurnOptions::default(),
             )
-            .await,
+            .await
+            .unwrap(),
         );
         assert!(text.contains(
             "`ws.workspace.setAgentName` through the `workspace_api` tool from the workspace MCP server"
@@ -16870,7 +16927,8 @@ mod role_reminder_tests {
                 .expect("update provider");
             let text = prompt_text(
                 &mgr.build_turn_prompt(&agent_id, &workspace_id, "start", &TurnOptions::default())
-                    .await,
+                    .await
+                    .unwrap(),
             );
             assert!(
                 text.contains(expected),
@@ -16887,7 +16945,8 @@ mod role_reminder_tests {
         set_workspace_title(&mgr, &workspace_id, "").await;
         let text = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &workspace_id, "start", &TurnOptions::default())
-                .await,
+                .await
+                .unwrap(),
         );
         let agent_pos = text
             .find("ws.workspace.setAgentName")
@@ -17026,7 +17085,8 @@ mod role_reminder_tests {
                 "start",
                 &TurnOptions::default(),
             )
-            .await,
+            .await
+            .unwrap(),
         );
         assert!(text.contains("ws.workspace.setAgentName"));
     }
@@ -17038,7 +17098,8 @@ mod role_reminder_tests {
         let workspace_id = WorkspaceId::from("ws-1");
         let first = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &workspace_id, "first", &TurnOptions::default())
-                .await,
+                .await
+                .unwrap(),
         );
         assert!(first.contains("ws.workspace.setAgentName"));
         mgr.services
@@ -17053,7 +17114,8 @@ mod role_reminder_tests {
             .expect("assistant message");
         let later = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &workspace_id, "later", &TurnOptions::default())
-                .await,
+                .await
+                .unwrap(),
         );
         assert!(!later.contains("ws.workspace.setAgentName"));
         assert!(later.ends_with("later"));
@@ -17097,7 +17159,8 @@ mod role_reminder_tests {
                     "do the thing",
                     &TurnOptions::default(),
                 )
-                .await;
+                .await
+                .unwrap();
             let text = prompt_text(&prompt);
             assert!(
                 text.starts_with("[Role Reminder: You are a Implementor. Stay in scope.]\n\n"),
@@ -17124,7 +17187,8 @@ mod role_reminder_tests {
                 "resume work",
                 &TurnOptions::default(),
             )
-            .await;
+            .await
+            .unwrap();
         let text = prompt_text(&prompt);
         assert!(
             text.starts_with("[Role Reminder: You are a Implementor. Stay in scope.]\n\n"),
@@ -17144,7 +17208,8 @@ mod role_reminder_tests {
                 "plain message",
                 &TurnOptions::default(),
             )
-            .await;
+            .await
+            .unwrap();
         assert_eq!(prompt_text(&prompt), "plain message");
     }
 
@@ -17165,7 +17230,8 @@ mod role_reminder_tests {
                 "user says hi",
                 &opts,
             )
-            .await;
+            .await
+            .unwrap();
         let text = prompt_text(&prompt);
         assert_eq!(text, "Context:\nhello ctx\n\n---\n\nuser says hi");
     }
@@ -17181,7 +17247,8 @@ mod role_reminder_tests {
         };
         let prompt = mgr
             .build_turn_prompt(&agent_id, &WorkspaceId::from("ws-role"), "body", &opts)
-            .await;
+            .await
+            .unwrap();
         assert_eq!(prompt_text(&prompt), "body");
     }
 
@@ -17201,7 +17268,8 @@ mod role_reminder_tests {
         };
         let prompt = mgr
             .build_turn_prompt(&agent_id, &WorkspaceId::from("ws-role"), "do it", &opts)
-            .await;
+            .await
+            .unwrap();
         let text = prompt_text(&prompt);
         assert!(
             text.starts_with("Context:\nctx\n\n---\n\n[Role Reminder:"),
@@ -17416,7 +17484,8 @@ mod role_reminder_tests {
                 "go",
                 &TurnOptions::default(),
             )
-            .await;
+            .await
+            .unwrap();
         let text = prompt_text(&prompt);
         assert!(
             text.starts_with("[Role Reminder: You are a Frozen Name. Frozen reminder.]\n\n"),
@@ -17448,7 +17517,8 @@ mod role_reminder_tests {
                 "go",
                 &TurnOptions::default(),
             )
-            .await;
+            .await
+            .unwrap();
         assert_eq!(prompt_text(&prompt), "go");
     }
 
@@ -17476,7 +17546,8 @@ mod role_reminder_tests {
                 "go",
                 &TurnOptions::default(),
             )
-            .await;
+            .await
+            .unwrap();
         let text = prompt_text(&prompt);
         assert!(
             text.starts_with("[Role Reminder: You are a Implementor. Stay in scope.]\n\n"),
@@ -17518,7 +17589,8 @@ mod role_reminder_tests {
                 "first message",
                 &TurnOptions::default(),
             )
-            .await;
+            .await
+            .unwrap();
         let text = prompt_text(&prompt);
         assert!(
             text.starts_with("<system>\nYou are helpful.\n</system>\n\n"),
@@ -17533,7 +17605,8 @@ mod role_reminder_tests {
                 "second message",
                 &TurnOptions::default(),
             )
-            .await;
+            .await
+            .unwrap();
         let text = prompt_text(&prompt);
         assert!(
             !text.contains("<system>\nYou are helpful."),
@@ -17555,7 +17628,8 @@ mod role_reminder_tests {
                 "one",
                 &TurnOptions::default(),
             )
-            .await,
+            .await
+            .unwrap(),
         );
         assert!(first.starts_with("<system>\nSP body\n</system>"));
         // Recreate path re-arms (start_session recreate branch) → fires again.
@@ -17567,7 +17641,8 @@ mod role_reminder_tests {
                 "two",
                 &TurnOptions::default(),
             )
-            .await,
+            .await
+            .unwrap(),
         );
         assert!(
             again.starts_with("<system>\nSP body\n</system>"),
@@ -17596,7 +17671,8 @@ mod role_reminder_tests {
                 "hello",
                 &TurnOptions::default(),
             )
-            .await,
+            .await
+            .unwrap(),
         );
         assert_eq!(text, "hello");
     }
@@ -17666,7 +17742,8 @@ mod role_reminder_tests {
                 "plain message",
                 &TurnOptions::default(),
             )
-            .await,
+            .await
+            .unwrap(),
         );
         assert_eq!(text, "plain message");
     }
@@ -17686,7 +17763,8 @@ mod role_reminder_tests {
                     "do the thing",
                     &TurnOptions::default(),
                 )
-                .await,
+                .await
+                .unwrap(),
             );
             assert!(
                 text.starts_with("current ws.agent.snapshot() => {"),
@@ -17704,7 +17782,8 @@ mod role_reminder_tests {
                 "resume",
                 &TurnOptions::default(),
             )
-            .await,
+            .await
+            .unwrap(),
         );
         assert!(
             text.starts_with("current ws.agent.snapshot() => {"),
@@ -17734,7 +17813,8 @@ mod role_reminder_tests {
         };
         let text = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &WorkspaceId::from("ws-1"), "do it", &opts)
-                .await,
+                .await
+                .unwrap(),
         );
         assert!(
             text.starts_with("<system>\nSP\n</system>\n\ncurrent ws.agent.snapshot() => {"),
@@ -17747,7 +17827,8 @@ mod role_reminder_tests {
         // Second turn: prepend consumed, snapshot line now outermost.
         let text = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &WorkspaceId::from("ws-1"), "again", &opts)
-                .await,
+                .await
+                .unwrap(),
         );
         assert!(
             text.starts_with("current ws.agent.snapshot() => {"),
@@ -17769,7 +17850,8 @@ mod role_reminder_tests {
 
         let on = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &ws, "turn", &TurnOptions::default())
-                .await,
+                .await
+                .unwrap(),
         );
         assert!(on.starts_with("current ws.agent.snapshot() => {"));
 
@@ -17783,7 +17865,8 @@ mod role_reminder_tests {
             .expect("apply toggle");
         let off = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &ws, "turn", &TurnOptions::default())
-                .await,
+                .await
+                .unwrap(),
         );
         assert_eq!(off, "turn", "toggle off → byte-identical prompt");
 
@@ -17797,7 +17880,8 @@ mod role_reminder_tests {
             .expect("apply toggle");
         let back_on = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &ws, "turn", &TurnOptions::default())
-                .await,
+                .await
+                .unwrap(),
         );
         assert!(
             back_on.starts_with("current ws.agent.snapshot() => {"),
@@ -17840,7 +17924,8 @@ mod role_reminder_tests {
             .expect("apply toggle");
         let text = prompt_text(
             &mgr.build_turn_prompt(&stamped_on, &ws, "turn", &TurnOptions::default())
-                .await,
+                .await
+                .unwrap(),
         );
         assert!(
             text.starts_with("current ws.agent.snapshot() => {"),
@@ -17862,7 +17947,8 @@ mod role_reminder_tests {
         make_snapshot_nontrivial(&mgr, &stamped_off);
         let text = prompt_text(
             &mgr.build_turn_prompt(&stamped_off, &ws, "turn", &TurnOptions::default())
-                .await,
+                .await
+                .unwrap(),
         );
         assert_eq!(text, "turn", "captured-off session never injects");
 
@@ -17877,7 +17963,8 @@ mod role_reminder_tests {
             .expect("apply toggle");
         let text = prompt_text(
             &mgr.build_turn_prompt(&stamped_off, &ws, "turn", &TurnOptions::default())
-                .await,
+                .await
+                .unwrap(),
         );
         assert_eq!(
             text, "turn",
@@ -18252,7 +18339,8 @@ mod role_reminder_tests {
                 "no sp",
                 &TurnOptions::default(),
             )
-            .await,
+            .await
+            .unwrap(),
         );
         assert_eq!(text, "no sp");
         assert!(!mgr.prepend_pending.lock().unwrap().contains(&agent_id));
@@ -18277,7 +18365,8 @@ mod role_reminder_tests {
         };
         let text = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &WorkspaceId::from("ws-1"), "do it", &opts)
-                .await,
+                .await
+                .unwrap(),
         );
         assert!(
             text.starts_with("<system>\nSP\n</system>\n\nContext:\nctx\n\n---\n\n[Role Reminder:"),
@@ -19672,7 +19761,8 @@ mod v1_turn_envelope_goldens {
                 "just the message",
                 &TurnOptions::default(),
             )
-            .await,
+            .await
+            .unwrap(),
         );
         assert_eq!(text, "just the message");
     }
@@ -19695,7 +19785,8 @@ mod v1_turn_envelope_goldens {
                 "fix the bug",
                 &TurnOptions::default(),
             )
-            .await,
+            .await
+            .unwrap(),
         );
         assert_eq!(
             text,
@@ -19748,7 +19839,8 @@ mod v1_turn_envelope_goldens {
         };
         let text = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &ws, "start the task", &options)
-                .await,
+                .await
+                .unwrap(),
         );
         // Outermost: the fire-once <system> prepend.
         let rest = text
@@ -19782,7 +19874,8 @@ mod v1_turn_envelope_goldens {
             .unwrap();
         let text = prompt_text(
             &mgr.build_turn_prompt(&agent_id, &ws, "continue", &TurnOptions::default())
-                .await,
+                .await
+                .unwrap(),
         );
         let rest = strip_snapshot_line(&text);
         assert_eq!(
@@ -19807,7 +19900,8 @@ mod v1_turn_envelope_goldens {
                 "interrupt message",
                 &options,
             )
-            .await,
+            .await
+            .unwrap(),
         );
         assert_eq!(text, "original message\n\ninterrupt message");
     }

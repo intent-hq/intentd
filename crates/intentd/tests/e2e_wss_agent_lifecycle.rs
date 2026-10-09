@@ -12775,17 +12775,83 @@ async fn agent_stop_zero_output_redelivers_message_and_image_on_follow_up_over_w
 
 /// monorepo#3338: an image block carrying an attachment-registry
 /// `attachmentId` reference (no inline base64) is resolved daemon-side at
-/// prompt assembly — the ACP receives an `image` content block exactly as if
-/// the bytes had been sent inline, while the persisted transcript row keeps
-/// only the reference. Asserted via the fixture's `MOCK_AGENT_PROMPT_LOG`
-/// seam (`blockTypes`).
+/// prompt assembly. Large images must reach ACP within provider byte and
+/// dimension limits, identically for reference and inline inputs, without
+/// changing the original attachment or replacing the transcript reference.
 #[intent_test_macros::daemon_test]
 async fn image_reference_block_resolves_to_acp_image_over_wss() {
+    image_prompt_preparation_over_wss(ImagePreparationCase::LargePng).await;
+}
+
+/// A valid base64 payload with a PNG header but missing pixel data must fail
+/// the turn with an actionable image error, not reach the provider or vanish
+/// silently from the prompt. Covers both attachment and inline delivery.
+/// Resuming after rejection must deliver the assembled system prompt once.
+#[intent_test_macros::daemon_test]
+async fn corrupt_image_fails_before_acp_prompt_over_wss() {
+    image_prompt_preparation_over_wss(ImagePreparationCase::CorruptPng).await;
+}
+
+/// The supported image/jpg alias must remain valid for reference and inline
+/// delivery, preserving small JPEG bytes instead of rejecting their MIME.
+#[intent_test_macros::daemon_test]
+async fn image_jpg_alias_reaches_acp_unchanged_over_wss() {
+    image_prompt_preparation_over_wss(ImagePreparationCase::JpegAlias).await;
+}
+
+enum ImagePreparationCase {
+    LargePng,
+    CorruptPng,
+    JpegAlias,
+}
+
+async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     use base64::Engine as _;
 
-    let Some(script) = gate("image-reference block resolution E2E") else {
+    const SYSTEM_MARKER: &str = "IMAGE_PREPARATION_SYSTEM_MARKER";
+    let Some(script) = gate("image prompt preparation E2E") else {
         return;
     };
+    let corrupt = matches!(case, ImagePreparationCase::CorruptPng);
+    let jpeg_alias = matches!(case, ImagePreparationCase::JpegAlias);
+    let (format, mime, file_name) = if jpeg_alias {
+        (image::ImageFormat::Jpeg, "image/jpg", "image.jpg")
+    } else {
+        (image::ImageFormat::Png, "image/png", "image.png")
+    };
+
+    // Deterministic high-entropy pixels defeat PNG compression. This fixture
+    // exceeds 5 MiB and the 2000-pixel long-edge limit, but its inline base64
+    // still fits the existing 8 MiB prompt cap before preparation.
+    let (width, height) = if corrupt || jpeg_alias {
+        (20, 10)
+    } else {
+        (3000, 640)
+    };
+    let mut state = 0x1234_5678_u32;
+    let pixels = image::RgbImage::from_fn(width, height, |_, _| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let [r, g, b, _] = state.to_le_bytes();
+        image::Rgb([r, g, b])
+    });
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    pixels
+        .write_to(&mut encoded, format)
+        .expect("encode genuine fixture image");
+    let mut original = encoded.into_inner();
+    if corrupt {
+        original.truncate(33); // PNG signature + valid IHDR; no IDAT pixel data.
+        assert!(image::load_from_memory(&original).is_err());
+    } else if !jpeg_alias {
+        assert!(original.len() > 5 * 1024 * 1024, "fixture exceeds 5 MiB");
+    }
+    let image_b64 = base64::engine::general_purpose::STANDARD.encode(&original);
+    assert!(
+        image_b64.len() < 8 * 1024 * 1024,
+        "fixture fits ingress cap"
+    );
 
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
@@ -12800,6 +12866,9 @@ async fn image_reference_block_resolves_to_acp_image_over_wss() {
         let ws = intent_core::WorkspaceId::new();
         let root = data_dir.join("ws-root");
         std::fs::create_dir_all(&root).expect("mkdir ws root");
+        if corrupt {
+            std::fs::write(root.join("AGENTS.md"), SYSTEM_MARKER).expect("write workspace rules");
+        }
         let mut seed = workspace_seed(&ws);
         seed.worktree_path = Some(root.to_string_lossy().into_owned());
         store.insert_workspace(&seed).await.expect("insert ws");
@@ -12807,12 +12876,17 @@ async fn image_reference_block_resolves_to_acp_image_over_wss() {
     };
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
-    let behavior = json!({ "response": "seen" }).to_string();
-    let env: [(&str, &str); 4] = [
+    let session_log = data_dir.join("sessions.jsonl");
+    let behavior = json!({ "response": "seen", "loadSession": corrupt }).to_string();
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+        (
+            "MOCK_AGENT_SESSION_LOG",
+            session_log.to_str().expect("session log path"),
+        ),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon { child };
@@ -12827,19 +12901,25 @@ async fn image_reference_block_resolves_to_acp_image_over_wss() {
         .to_string();
     let cfg = client_config(&fingerprint);
 
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let subscribed = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "workspaceId": &ws_id, "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(subscribed["subscriptionId"].is_string());
     let mut rpc = connect_ws(port, cfg.clone()).await;
-    // Register the attachment (1x1 transparent PNG).
-    let png_b64 =
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
     let placed = wss_rpc(
         &mut rpc,
         10,
         "file.placeAttachment",
         json!({
             "workspaceId": &ws_id,
-            "fileName": "pixel.png",
-            "data": png_b64,
-            "mimeType": "image/png",
+            "fileName": file_name,
+            "data": &image_b64,
+            "mimeType": mime,
         }),
     )
     .await;
@@ -12848,89 +12928,352 @@ async fn image_reference_block_resolves_to_acp_image_over_wss() {
         .expect("attachmentId")
         .to_string();
 
-    let created = wss_rpc(
-        &mut rpc,
-        11,
-        "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "ImgRef", "model": "default", "provider": "mock" }),
-    )
-    .await;
-    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+    let mut outbound = Vec::new();
+    for (name, input) in [
+        (
+            "ImgRef",
+            json!({ "type": "image", "attachmentId": &attachment_id }),
+        ),
+        (
+            "ImgInline",
+            json!({ "type": "image", "data": &image_b64, "mimeType": mime }),
+        ),
+    ] {
+        // Separate agents ensure each path has its own first-turn prompt,
+        // with no history replay or previous turn's image in the comparison.
+        let created = wss_rpc(
+            &mut rpc,
+            11,
+            "agent.create",
+            json!({ "workspaceId": &ws_id, "name": name, "model": "default", "provider": "mock" }),
+        )
+        .await;
+        let agent_id = created["agent"]["id"].as_str().expect("agent id");
+        let content = format!("describe image for {name}");
+        let sent = wss_rpc(
+            &mut rpc,
+            12,
+            "agent.sendMessage",
+            json!({
+                "workspaceId": &ws_id,
+                "agentId": agent_id,
+                "content": &content,
+                "imageBlocks": [input],
+            }),
+        )
+        .await;
+        assert_eq!(sent["success"], true, "sendMessage accepted: {sent}");
 
-    let sent = wss_rpc(
-        &mut rpc,
-        12,
-        "agent.sendMessage",
-        json!({
-            "workspaceId": &ws_id,
-            "agentId": &agent_id,
-            "content": "describe the referenced image",
-            "imageBlocks": [
-                { "type": "image", "attachmentId": &attachment_id }
-            ],
-        }),
-    )
-    .await;
-    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-
-    // Outbound-prompt contract: the turn's prompt reaches the mock carrying
-    // an `image` content block — the daemon resolved the reference to bytes.
-    let mut prompt = None;
-    for _ in 0..50 {
-        if let Ok(log) = std::fs::read_to_string(&prompt_log) {
-            if let Some(p) = log
-                .lines()
-                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-                .find(|p| {
-                    p["text"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .contains("describe the referenced image")
-                })
-            {
-                prompt = Some(p);
+        // Acceptance is not completion: preparation runs in the turn worker.
+        // Wait for both terminal events: pre-prompt failures publish failed
+        // before stream:end, while successful turns publish idle afterwards.
+        // The status-changed event confirms the worker's durable settlement.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut ends = 0;
+        let mut saw_terminal_status = false;
+        let mut saw_persisted_status = false;
+        let expected_status = if corrupt { "error" } else { "idle" };
+        loop {
+            let frame = wss_event_opt_until(&mut sub, deadline)
+                .await
+                .expect("image turn reached its terminal lifecycle event");
+            let event = &frame["params"]["event"];
+            if event["data"]["agentId"].as_str() != Some(agent_id) {
+                continue;
+            }
+            match event["type"].as_str() {
+                Some("agent:stream:end") => ends += 1,
+                Some("agent:status-changed") => {
+                    if event["data"]["status"] == expected_status {
+                        saw_persisted_status = true;
+                    }
+                }
+                Some("agent:failed") => {
+                    assert!(corrupt, "valid image turn failed: {event}");
+                    let error = event["data"]["error"].as_str().expect("turn error");
+                    assert!(
+                        error.contains("Image 1"),
+                        "error identifies the image: {error}"
+                    );
+                    assert!(
+                        error.to_lowercase().contains("decode"),
+                        "error explains corruption: {error}"
+                    );
+                    assert!(
+                        error.contains("PNG")
+                            && error.contains("JPEG")
+                            && error.to_lowercase().contains("export"),
+                        "error offers a PNG/JPEG export remedy: {error}"
+                    );
+                    saw_terminal_status = true;
+                }
+                Some("agent:idle") => {
+                    assert!(
+                        !corrupt,
+                        "corrupt image must fail before provider invocation"
+                    );
+                    saw_terminal_status = true;
+                }
+                _ => {}
+            }
+            if saw_terminal_status && saw_persisted_status && ends >= 1 {
                 break;
             }
         }
-        sleep(Duration::from_millis(200)).await;
-    }
-    let prompt = prompt.expect("turn's prompt reached the mock");
-    let block_types: Vec<&str> = prompt["blockTypes"]
-        .as_array()
-        .expect("prompt log carries blockTypes")
-        .iter()
-        .filter_map(Value::as_str)
-        .collect();
-    assert!(
-        block_types.contains(&"image"),
-        "reference resolved to an ACP image block: {block_types:?}"
-    );
+        assert_eq!(ends, 1, "one terminal stream:end for {name}");
 
-    // Persisted transcript: the user row keeps the REFERENCE (no bytes).
-    let conv = wss_rpc(
+        let session = wss_rpc(
+            &mut rpc,
+            13,
+            "agent.getSession",
+            json!({ "agentId": agent_id }),
+        )
+        .await;
+        assert_eq!(session["session"]["status"], expected_status);
+
+        // The fixture records actual session/prompt blocks before completing.
+        let log = match std::fs::read_to_string(&prompt_log) {
+            Ok(log) => log,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => panic!("read provider prompt log: {error}"),
+        };
+        let prompts: Vec<Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("prompt log JSON"))
+            .collect();
+        if corrupt {
+            assert!(
+                prompts
+                    .iter()
+                    .all(|p| !p["text"].as_str().unwrap_or_default().contains(&content)),
+                "corrupt images never reach session/prompt"
+            );
+            // Discard the retained corrupt retry, as a user would before
+            // replacing it; otherwise it auto-drains after the valid turn.
+            let queued = wss_rpc(
+                &mut rpc,
+                17,
+                "agent.getQueue",
+                json!({ "agentId": agent_id }),
+            )
+            .await;
+            let queue = queued["queue"].as_array().expect("retained retry queue");
+            assert_eq!(queue.len(), 1, "only the corrupt retry is retained");
+            assert_eq!(queue[0]["content"], content);
+            let removed = wss_rpc(
+                &mut rpc,
+                18,
+                "agent.removeQueuedMessage",
+                json!({ "agentId": agent_id, "messageId": queue[0]["id"].as_str().expect("retry id") }),
+            )
+            .await;
+            assert_eq!(removed["success"], true);
+            let remaining = wss_rpc(
+                &mut rpc,
+                19,
+                "agent.getQueue",
+                json!({ "agentId": agent_id }),
+            )
+            .await;
+            assert!(remaining["queue"].as_array().expect("queue").is_empty());
+            let read_sessions = || -> Vec<Value> {
+                std::fs::read_to_string(&session_log)
+                    .expect("read session log")
+                    .lines()
+                    .map(|line| serde_json::from_str(line).expect("session log JSON"))
+                    .collect()
+            };
+            let before_retry = read_sessions();
+            let fresh = before_retry.last().expect("failed turn created a session");
+            assert_eq!(fresh["method"], "session/new");
+            assert!(fresh["sessionId"].is_string());
+            for turn in 1..=2 {
+                let retry_content = format!("valid follow-up {turn} for {name}");
+                let retry = wss_rpc(
+                    &mut rpc,
+                    20 + turn,
+                    "agent.sendMessage",
+                    json!({ "workspaceId": &ws_id, "agentId": agent_id, "content": &retry_content }),
+                )
+                .await;
+                assert_eq!(retry["success"], true, "follow-up accepted: {retry}");
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                let (mut ended, mut idle, mut settled) = (false, false, false);
+                while !(ended && idle && settled) {
+                    let frame = wss_event_opt_until(&mut sub, deadline)
+                        .await
+                        .expect("valid follow-up completed");
+                    let event = &frame["params"]["event"];
+                    if event["data"]["agentId"].as_str() != Some(agent_id) {
+                        continue;
+                    }
+                    match event["type"].as_str() {
+                        Some("agent:failed") => panic!("valid follow-up failed: {event}"),
+                        Some("agent:stream:end") => ended = true,
+                        Some("agent:idle") => idle = true,
+                        Some("agent:status-changed") if event["data"]["status"] == "idle" => {
+                            settled = true;
+                        }
+                        _ => {}
+                    }
+                }
+                // Prove resume, not recreation that would re-arm the prepend.
+                let sessions = read_sessions();
+                assert_eq!(sessions.len(), before_retry.len() + 1);
+                let resumed = &sessions[before_retry.len()];
+                assert_eq!(resumed["method"], "session/load");
+                assert_eq!(resumed["sessionId"], fresh["sessionId"]);
+                let delivered: Vec<Value> = std::fs::read_to_string(&prompt_log)
+                    .expect("read follow-up prompts")
+                    .lines()
+                    .map(|line| serde_json::from_str(line).expect("prompt log JSON"))
+                    .filter(|p: &Value| {
+                        p["text"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains(&retry_content)
+                    })
+                    .collect();
+                assert_eq!(delivered.len(), 1, "one provider prompt per follow-up");
+                assert_eq!(
+                    delivered[0]["turn"], turn,
+                    "same resumed child serves both turns"
+                );
+                let text = delivered[0]["text"].as_str().expect("prompt text");
+                if turn == 1 {
+                    assert!(
+                        text.starts_with("<system>\n"),
+                        "first delivered prompt retains system prompt: {text}"
+                    );
+                    let system_end = text.find("\n</system>").expect("system block closes");
+                    assert!(
+                        text[..system_end].contains(SYSTEM_MARKER),
+                        "assembled workspace rules retained"
+                    );
+                } else {
+                    assert!(
+                        !text.contains("<system>\n") && !text.contains(SYSTEM_MARKER),
+                        "system prompt must not repeat: {text}"
+                    );
+                }
+            }
+        } else {
+            let matching: Vec<_> = prompts
+                .iter()
+                .filter(|p| p["text"].as_str().unwrap_or_default().contains(&content))
+                .collect();
+            assert_eq!(matching.len(), 1, "exactly one provider prompt for {name}");
+            let blocks = matching[0]["blocks"].as_array().expect("logged ACP blocks");
+            let images: Vec<_> = blocks.iter().filter(|b| b["type"] == "image").collect();
+            assert_eq!(images.len(), 1, "exactly one outgoing image for {name}");
+            let data = images[0]["data"].as_str().expect("inline ACP image data");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .expect("provider image is base64");
+            assert!(
+                bytes.len() <= 3 * 1024 * 1024,
+                "provider image exceeds 3 MiB: {} bytes",
+                bytes.len()
+            );
+            let format = image::guess_format(&bytes).expect("provider image format");
+            if jpeg_alias {
+                assert_eq!(format, image::ImageFormat::Jpeg);
+                assert_eq!(images[0]["mimeType"], "image/jpg");
+                assert!(bytes == original, "small JPEG bytes remain unchanged");
+            } else {
+                assert_eq!(
+                    images[0]["mimeType"],
+                    format.to_mime_type(),
+                    "MIME matches outgoing bytes"
+                );
+            }
+            let decoded = image::load_from_memory(&bytes).expect("provider image decodes");
+            assert!(
+                decoded.width().max(decoded.height()) <= 2000,
+                "provider image long edge exceeds 2000 pixels"
+            );
+            assert!(
+                decoded.width() > decoded.height(),
+                "landscape orientation preserved"
+            );
+            assert!(
+                images[0].get("attachmentId").is_none(),
+                "provider receives bytes, not registry references"
+            );
+            outbound.push((images[0]["mimeType"].clone(), bytes));
+        }
+
+        if name == "ImgRef" {
+            // Preparation must never write its derived bytes onto the user row.
+            let conv = wss_rpc(
+                &mut rpc,
+                14,
+                "agent.getConversation",
+                json!({ "agentId": agent_id }),
+            )
+            .await;
+            let images: Vec<_> = conv["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .filter(|m| m["role"] == "user")
+                .flat_map(|m| m["contentBlocks"].as_array().expect("user content blocks"))
+                .filter(|b| b["type"] == "image")
+                .collect();
+            assert_eq!(images.len(), 1, "one persisted image reference");
+            let mut reference = images[0].clone();
+            // Conversation reads add a stable block id, not image payload.
+            reference
+                .as_object_mut()
+                .expect("image object")
+                .remove("id");
+            assert_eq!(
+                reference, input,
+                "transcript keeps the submitted reference unchanged"
+            );
+        }
+    }
+    if !corrupt {
+        assert_eq!(outbound.len(), 2);
+        assert!(
+            outbound[0] == outbound[1],
+            "reference and inline produce identical provider images"
+        );
+    }
+
+    // Resolve via the public attachment registry, then read the original bytes
+    // over WSS: the provider derivative must not overwrite the user's upload.
+    let info = wss_rpc(
         &mut rpc,
-        13,
-        "agent.getConversation",
-        json!({ "agentId": &agent_id }),
+        15,
+        "file.getAttachmentInfo",
+        json!({ "workspaceId": &ws_id, "attachmentId": &attachment_id }),
     )
     .await;
-    let messages = conv["messages"].as_array().expect("messages array");
-    let image = messages
-        .iter()
-        .filter(|m| m["role"] == "user")
-        .flat_map(|m| m["contentBlocks"].as_array().cloned().unwrap_or_default())
-        .find(|b| b["type"] == "image")
-        .expect("image block on the user row");
-    assert_eq!(image["attachmentId"], json!(attachment_id), "{image}");
+    assert_eq!(info["exists"], true);
+    assert_eq!(info["size"], json!(original.len()));
+    assert_eq!(info["mimeType"], mime);
+    assert_eq!(info["path"], placed["path"]);
+    let read = wss_rpc(
+        &mut rpc,
+        16,
+        "file.readChunk",
+        json!({ "workspaceId": &ws_id, "path": info["path"], "offset": 0, "length": original.len() }),
+    )
+    .await;
+    assert_eq!(read["size"], json!(original.len()));
+    assert_eq!(read["bytesRead"], json!(original.len()));
+    let fetched = base64::engine::general_purpose::STANDARD
+        .decode(
+            read["content"]
+                .as_str()
+                .expect("original attachment content"),
+        )
+        .expect("base64 original attachment");
     assert!(
-        image.get("data").is_none(),
-        "no bytes on the transcript row: {image}"
+        fetched == original,
+        "registry attachment retains the exact uploaded bytes"
     );
-    // Sanity: the placed bytes decode (the mock does not echo block payloads,
-    // so byte-equality is covered by the services-layer resolution unit test).
-    base64::engine::general_purpose::STANDARD
-        .decode(png_b64)
-        .expect("valid fixture png");
 }
 
 /// STAB-124 regression: an interrupt landing mid-tool-call must NOT persist an

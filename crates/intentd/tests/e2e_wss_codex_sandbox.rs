@@ -9,6 +9,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use intentd_test_support::GuardedChild;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -249,6 +250,17 @@ async fn scenario(
     expected: &[&str],
     succeeds: bool,
 ) {
+    scenario_with_image(policy, provider, initial, expected, succeeds, None).await;
+}
+
+async fn scenario_with_image(
+    policy: Value,
+    provider: &str,
+    initial: Option<&str>,
+    expected: &[&str],
+    succeeds: bool,
+    image: Option<Value>,
+) {
     let script = format!(
         "{}/tests/fixtures/mock-acp-agent.mjs",
         env!("CARGO_MANIFEST_DIR")
@@ -306,7 +318,11 @@ async fn scenario(
     let created = wss_rpc(&mut rpc, 3, "agent.create", json!({"workspaceId":ws_id,"name":"Sandbox regression","provider":provider,"model":"mock-model"})).await;
     let agent_id = created["agent"]["id"].as_str().unwrap();
     for turn in 0..if succeeds { 2 } else { 1 } {
-        let sent = wss_rpc(&mut rpc, 4+turn, "agent.sendMessage", json!({"workspaceId":ws_id,"agentId":agent_id,"content":format!("sandbox turn {turn}")})).await;
+        let mut params = json!({"workspaceId":ws_id,"agentId":agent_id,"content":format!("sandbox turn {turn}")});
+        if let Some(image) = &image {
+            params["imageBlocks"] = json!([image]);
+        }
+        let sent = wss_rpc(&mut rpc, 4 + turn, "agent.sendMessage", params).await;
         assert_eq!(sent["success"], true);
         let mut events = drain_until_stream_end(&mut sub, agent_id).await;
         if succeeds {
@@ -331,6 +347,27 @@ async fn scenario(
                 usize::try_from(turn + 1).unwrap(),
                 "fallback must not duplicate user messages"
             );
+            if let Some(image) = &image {
+                for message in conversation["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| m["role"] == "user")
+                {
+                    let images: Vec<_> = message["contentBlocks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|b| b["type"] == "image")
+                        .collect();
+                    assert_eq!(images.len(), 1, "one original image per user message");
+                    assert_eq!(
+                        images[0]["data"], image["data"],
+                        "stored original is unchanged"
+                    );
+                    assert_eq!(images[0]["mimeType"], image["mimeType"]);
+                }
+            }
             assert!(
                 conversation
                     .to_string()
@@ -358,6 +395,44 @@ async fn scenario(
         actual, expected,
         "exact bounded prompt attempts and session persistence"
     );
+    if let Some(original) = &image {
+        let mut first_image = None;
+        for attempt in &log {
+            let images: Vec<_> = attempt["blocks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|b| b["type"] == "image")
+                .collect();
+            assert_eq!(images.len(), 1, "each attempt delivers exactly one image");
+            let delivered = images[0];
+            assert_ne!(
+                delivered["data"], original["data"],
+                "provider receives a resized copy"
+            );
+            let bytes = STANDARD
+                .decode(delivered["data"].as_str().unwrap())
+                .unwrap();
+            let decoded = image::load_from_memory(&bytes).unwrap();
+            assert!(decoded.width().max(decoded.height()) <= 2000);
+            if let Some(first) = first_image {
+                assert_eq!(
+                    delivered, first,
+                    "fallback and later turns retain the same prepared image"
+                );
+            } else {
+                first_image = Some(delivered);
+            }
+        }
+        assert_eq!(
+            log[0]["blocks"], log[1]["blocks"],
+            "first fallback preserves the complete prompt"
+        );
+        assert_eq!(
+            log[1]["blocks"], log[2]["blocks"],
+            "second fallback preserves the complete prompt"
+        );
+    }
     let mode_log: Vec<Value> = std::fs::read_to_string(modes)
         .unwrap_or_default()
         .lines()
@@ -580,4 +655,20 @@ async fn explicit_read_only_plan_approval_keeps_sandbox_restrictions() {
         true,
     )
     .await;
+}
+
+#[tokio::test]
+async fn codex_sandbox_fallback_preserves_prepared_images_and_stored_originals() {
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(2400, 10, image::Rgb([10, 20, 30]))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    scenario_with_image(
+        json!({"allowed":["workspace-write","read-only"],"allowedByMode":{"workspace-write":["read-only"]}}),
+        "codex",
+        None,
+        &["agent-full-access", "workspace-write", "read-only", "read-only"],
+        true,
+        Some(json!({"type":"image","mimeType":"image/png","data":STANDARD.encode(png.into_inner())})),
+    ).await;
 }
