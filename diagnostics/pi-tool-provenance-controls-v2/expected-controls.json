@@ -1,0 +1,17 @@
+[
+  "nominal-return-and-ledger",
+  "npm-entry-refusal",
+  "npm-package-identity-refusal",
+  "host-identity-refusal",
+  "image-shape-refusal",
+  "tree-reparse-refusal",
+  "tree-caps-refusal",
+  "provider-and-hash-errors",
+  "record-construction-error",
+  "fresh-invocation-reset",
+  "missing-malformed-marker-redaction",
+  "category-hresult-schema",
+  "disposed-writer-original-throw",
+  "bookkeeping-fault-transparency",
+  "existing-capture-composition"
+]

@@ -1,0 +1,3 @@
+# Preserve exact diagnostic bytes without changing repository-wide text policy.
+/diagnostics/pi-tool-provenance-controls-v2/** -text
+/.github/workflows/pi-tool-provenance-controls-v2.yml -text
