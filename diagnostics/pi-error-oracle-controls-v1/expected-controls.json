@@ -1,0 +1,10 @@
+[
+  "original-success-no-probe",
+  "original-other-refusal-no-probe",
+  "missing-entry-same-parent",
+  "missing-entry-other-parent",
+  "selection-shape-and-command-errors",
+  "path-and-existence-errors",
+  "installed-writer-fault-and-redaction",
+  "capture-composition-and-scope"
+]

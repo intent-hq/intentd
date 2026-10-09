@@ -1,0 +1,8 @@
+[
+  "cross-catch-wrapper-positive",
+  "exception-replacement-negative",
+  "record-semantic-negative",
+  "observer-and-context-negative",
+  "output-provider-ledger-negative",
+  "exact-original-marked-error-paths"
+]
