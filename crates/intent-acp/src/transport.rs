@@ -635,6 +635,7 @@ fn dispatch(
 /// so the detached drain (and its capture file) may outlive the connection
 /// until that process exits or the daemon's shutdown sweep reaps it.
 pub struct Connection {
+    pub(crate) codex_sandboxes: Mutex<HashMap<String, crate::codex_sandbox::CodexSandbox>>,
     callback_routes: Arc<CallbackToolRoutes>,
     writer_tx: mpsc::Sender<String>,
     pending: PendingMap,
@@ -836,6 +837,7 @@ impl Connection {
 
         Self {
             callback_routes: Arc::new(CallbackToolRoutes::default()),
+            codex_sandboxes: Mutex::new(HashMap::new()),
             writer_tx,
             pending,
             config_options,

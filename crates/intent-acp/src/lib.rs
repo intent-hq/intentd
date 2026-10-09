@@ -16,6 +16,7 @@
 //! denylist ([`tool_restrictions`]).
 
 pub mod callback_registration;
+pub mod codex_sandbox;
 #[cfg(unix)]
 pub mod descendant_sweep;
 pub mod error;
