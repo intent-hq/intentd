@@ -160,6 +160,10 @@ conversation. Read its status and last response before sending a follow-up. Use
 choose a specialist and model where offered. A specialist defines reusable behavior;
 an agent is a particular conversation doing work.
 
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/questions/QuestionWizard.svelte. -->
+
+When answering agent questions above the composer, paste images into **Or type your own answer…** to attach removable previews and send them with your answers, with or without text.
+
 On desktop, recent conversation messages appear progressively, newest first, while
 older messages in the initial window load. The conversation stays bottom-aligned
 unless you scroll away; older-history loading becomes available when that initial
