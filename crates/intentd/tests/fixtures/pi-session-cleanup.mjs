@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { existsSync, rmSync } from 'node:fs';
+import diagnostics from './pi-diagnostics.cjs';
+const { failureReport } = diagnostics;
 
 // Do every cleanup step even when a previous one fails. Never rely on an
 // after-hook throw: node:test can hide it behind the original body failure.
@@ -16,7 +18,7 @@ export async function finishCleanup(evidence, { stopClients, closeLifetime, remo
       await action();
       steps[name] = { result: 'passed' };
     } catch (error) {
-      steps[name] = { result: 'failed', error: String(error.stack ?? error) };
+      steps[name] = { result: 'failed', error: failureReport(`cleanup ${name}`, error) };
     }
   }
   evidence.cleanup = {

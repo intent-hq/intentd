@@ -1976,6 +1976,11 @@ jobs:
         node: [22, 24]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    env:
+      PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
+      PI_CLI_TEST_ENTRY: ${{ github.workspace }}/.pi-runtime-test/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
+      PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
+      PI_DIAGNOSTICS_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}-${{ matrix.node }}
     defaults:
       run:
         shell: bash
@@ -1991,25 +1996,30 @@ jobs:
           printf '%s\n' "$pin" > pi-path-evidence/package.txt
           npm install --prefix .pi-acp-test --no-save --ignore-scripts --no-audit --no-fund "$pin"
           cp .pi-acp-test/node_modules/.package-lock.json pi-path-evidence/package-lock.json
+          node crates/intentd/tests/fixtures/pi-artifact-audit.mjs --record-package
       - name: Test the pinned adapter (strict)
-        env:
-          PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
-          PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
-        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-session-paths.test.mjs | tee pi-path-evidence/test.tap
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs test.tap crates/intentd/tests/fixtures/pi-session-paths.test.mjs
       - name: Test cleanup failure observability
         if: ${{ !cancelled() }}
-        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-session-cleanup.test.mjs | tee pi-path-evidence/cleanup-checks.tap
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs cleanup-checks.tap crates/intentd/tests/fixtures/pi-session-cleanup.test.mjs
+      - name: Test bounded diagnostics and independent audit failure paths
+        if: ${{ !cancelled() }}
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs diagnostic-checks.tap crates/intentd/tests/fixtures/pi-diagnostics.test.mjs crates/intentd/tests/fixtures/pi-artifact-audit.test.mjs
+      - name: Prove original startup errors through the supported fixture launcher
+        if: ${{ !cancelled() }}
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs startup.tap crates/intentd/tests/fixtures/pi-startup-diagnostics.test.mjs
       - name: Install the real minimum Pi CLI
+        if: ${{ !cancelled() }}
         run: |
           minimum=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; const s = readFileSync("crates/intent-providers/src/config.rs", "utf8"); const m = s.match(/pub const PI_CLI_MIN_VERSION: &str = "([^"]+)";/); if (!m) throw new Error("Missing Pi CLI minimum"); console.log(m[1]);')
           npm install --prefix .pi-runtime-test --no-save --ignore-scripts --no-audit --no-fund "@earendil-works/pi-coding-agent@$minimum" "@earendil-works/pi-agent-core@$minimum" "@earendil-works/pi-ai@$minimum" "@earendil-works/pi-tui@$minimum"
           cp .pi-runtime-test/node_modules/.package-lock.json pi-path-evidence/pi-package-lock.json
       - name: Test real Pi lifecycle and supported MCP extension delivery
-        env:
-          PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
-          PI_CLI_TEST_ENTRY: ${{ github.workspace }}/.pi-runtime-test/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
-          PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
-        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-runtime-compat.test.mjs | tee pi-path-evidence/runtime.tap
+        if: ${{ !cancelled() }}
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs runtime.tap crates/intentd/tests/fixtures/pi-runtime-compat.test.mjs
+      - name: Independently audit diagnostics, replay, cleanup and unchanged package bytes
+        if: ${{ !cancelled() }}
+        run: node crates/intentd/tests/fixtures/pi-artifact-audit.mjs
       - uses: actions/upload-artifact@v7
         if: always()
         with:
