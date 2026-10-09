@@ -738,7 +738,12 @@ use std::time::{Duration, Instant};
 // Numeric versions do not replace the original connection capability.
 // Version 13.8 adds fixed GitLab checkout configuration reads, gated by
 // gitlabCheckoutRepoConfig: 1 as well as the original checkout capability.
-pub const PROTOCOL_VERSION: &str = "13.8";
+// Version 13.9 reserves revision-safe note viewing and annotations. Clients
+// require notePagingRead: 1 plus the persisted notePagingBackendId; complete
+// annotations additionally require noteAnnotations: 1. The numeric version
+// does not activate paginated editing, and the old notePaging stays absent.
+// 13.10 adds capability-gated cancellable note deletion controls.
+pub const PROTOCOL_VERSION: &str = "13.10";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

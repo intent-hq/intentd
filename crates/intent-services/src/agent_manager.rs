@@ -12750,7 +12750,9 @@ async fn run_message_worker(
                 .await;
             return;
         }
-        match retry_spawn_owned(&mgr, &agent_id, &workspace_id).await {
+        // Keep the large session-start future off the worker's inline state;
+        // it is still polled and cancelled by this same worker.
+        match Box::pin(retry_spawn_owned(&mgr, &agent_id, &workspace_id)).await {
             Ok(StartedSession {
                 session_id: acp_session_id,
                 turn,

@@ -101,6 +101,53 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("note_artifact_source", "derived canonical source grants rebuilt in the destination; artifact arena never transfers"),
+    ("note_page_backend", "database-local namespace and authentication secret never transfer"),
+    ("note_page_head", "fresh note incarnations created by import insert triggers"),
+    ("note_page_piece", "derived source index rebuilt inside import transaction"),
+    ("note_page_entry", "derived context and metadata rebuilt inside import transaction"),
+    ("note_stage_root", "backend-local staged operations, ownership and immutable source never transfer"),
+    ("note_stage_root_pin", "backend-local retained operation source ownership never transfers"),
+    ("note_stage_root_reclaim", "backend-local durable reclamation progress never transfers"),
+    ("note_operation_reclaim", "backend-local durable reclamation progress never transfers"),
+    ("note_stage", "backend-local staged operations, ownership and immutable source never transfer"),
+    ("note_stage_base_piece", "backend-local staged operations, ownership and immutable source never transfer"),
+    ("note_stage_chunk", "backend-local staged operations, ownership and immutable source never transfer"),
+    ("note_stage_record", "backend-local staged operations, ownership and immutable source never transfer"),
+    ("note_stage_stream", "backend-local staged operations, ownership and immutable source never transfer"),
+    ("note_stage_text", "backend-local staged operations, ownership and immutable source never transfer"),
+    ("note_stage_text_piece", "backend-local staged operations, ownership and immutable source never transfer"),
+    ("note_stage_view", "backend-local immutable staged view and validation ownership never transfer"),
+    ("note_stage_view_piece", "backend-local immutable staged view and validation ownership never transfer"),
+    ("note_stage_validation", "backend-local immutable staged view and validation ownership never transfer"),
+    ("note_stage_search_input", "backend-local frozen search selection ordering never transfers"),
+    ("note_stage_search_range", "backend-local frozen search selection union never transfers"),
+    ("note_operation", "durable retry identities belong to the original backend namespace, principal and note incarnation; never execute or replay them on an imported incarnation"),
+    ("note_operation_item", "receipt-owned mappings, effects and inverse references are local to excluded note_operation identities"),
+    ("note_operation_text", "receipt-owned inverse text views belong to excluded backend-local operations"),
+    ("note_operation_detail", "receipt-owned provenance and context belong to excluded backend-local operations"),
+    ("note_operation_reference", "backend-local immutable receipt reference authority"),
+    ("note_operation_scalar", "backend-local immutable receipt scalar views"),
+    ("note_operation_source", "retained receipt source belongs to excluded backend-local operations; live note source transfers through note"),
+    ("note_annotation_head", "destination note triggers create fresh annotation epochs; legacy source and comments transfer separately"),
+    ("note_annotation_workspace_retirement", "backend-local partial deletion admission never transfers to a fresh destination workspace"),
+    ("note_annotation_state", "backend-local incarnation state generations and deletion tombstones do not transfer"),
+    ("note_attribution_line", "derived attribution projection is republished against the destination source revision"),
+    ("note_attribution_author", "derived attribution author projection is republished against destination epochs"),
+    ("note_attribution_author_piece", "bounded fragments of the excluded attribution author projection"),
+    ("note_comment_root", "comment import triggers reconstruct canonical root identity from transferred comment and parent IDs"),
+    ("note_comment_thread", "maintained thread counts are reconstructed by comment import triggers"),
+    ("note_comment_projection", "bounded comment previews and thread ordering are rebuilt by comment import triggers"),
+    ("note_comment_anchor", "source-revision-bound anchor occurrences are republished from canonical markers in the destination"),
+    ("note_comment_anchor_extent", "derived RTree for excluded source-bound anchor occurrences"),
+    ("note_comment_anchor_extent_node", "RTree shadow table of the excluded anchor extent index"),
+    ("note_comment_anchor_extent_parent", "RTree shadow table of the excluded anchor extent index"),
+    ("note_comment_anchor_extent_rowid", "RTree shadow table of the excluded anchor extent index"),
+    ("note_comment_anchor_cover", "derived interval coverage for excluded source-bound anchor occurrences"),
+    ("note_comment_detail", "bounded detail metadata is rebuilt from transferred canonical comment rows"),
+    ("note_comment_detail_piece", "bounded detail fragments are rebuilt by comment import triggers"),
+    ("note_annotation_snapshot", "principal/backend/incarnation-scoped read leases never transfer"),
+    ("note_annotation_match_head", "scalar query totals belong to excluded backend-local annotation leases"),
     ("note_search_ctx", "derived note search identities/context; note import triggers rebuild them"),
     ("note_fts", "derived note full-text index; note import triggers rebuild it"),
     ("note_fts_config", "FTS5 shadow table of the derived note index"),
@@ -528,6 +575,7 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("transfer import begin failed: {e}")))?;
         reclaim_imported_metadata(&mut tx, rows).await?;
+        let mut anchor_notes = std::collections::BTreeSet::<(String, String)>::new();
         let mut inserted = 0usize;
         for (table, _) in TRANSFER_TABLES {
             let Some((_, objects)) = rows.iter().find(|(t, _)| t == table) else {
@@ -660,9 +708,29 @@ impl Store {
                 } else {
                     None
                 };
-                query.execute(&mut *tx).await.map_err(|e| {
+                let written = query.execute(&mut *tx).await.map_err(|e| {
                     Error::Internal(format!("transfer import insert into {table} failed: {e}"))
                 })?;
+                // Resolve the actual stored identity (including SQLite's
+                // coercions), not unvalidated archive labels. Keep IDs only.
+                let scope_sql = match *table {
+                    "note" => Some("SELECT workspace_id,id FROM note WHERE rowid=?"),
+                    "comment" => Some("SELECT workspace_id,note_id FROM comment WHERE rowid=?"),
+                    _ => None,
+                };
+                if let Some(scope_sql) = scope_sql {
+                    let (workspace, note): (String, Option<String>) = sqlx::query_as(scope_sql)
+                        .bind(written.last_insert_rowid())
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(|e| Error::Internal(format!("read imported note scope: {e}")))?;
+                    if let Some(note) = note {
+                        anchor_notes.insert((workspace, note));
+                    }
+                }
+                if *table == "note" {
+                    crate::note_page_index::rebuild_pending(&mut tx).await?;
+                }
                 if let Some(metadata) = history_metadata {
                     sqlx::query("UPDATE agent_message SET metadata=? WHERE id=? AND agent_id=?")
                         .bind(metadata)
@@ -790,6 +858,17 @@ impl Store {
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("materialize imported counts failed: {e}")))?;
+        }
+        // Comments arrive after notes. Publish only after the last imported
+        // root/reply, hydrating one affected note at a time inside this writer.
+        for (workspace, note) in anchor_notes {
+            crate::note_annotation_repo::rebuild_note_anchors(
+                &mut tx,
+                &WorkspaceId(workspace),
+                &intent_core::NoteId(note),
+                None,
+            )
+            .await?;
         }
         tx.commit()
             .await
@@ -1847,11 +1926,58 @@ mod tests {
         }
     }
 
-    /// Schema-parity tripwire: every table in the live post-migration schema
-    /// must appear in exactly one of [`TRANSFER_TABLES`] /
-    /// [`TRANSFER_EXCLUDED_TABLES`], and neither list may name a table that
-    /// no longer exists. A new migration that adds a table fails here until
-    /// its transfer fate is decided explicitly.
+    /// Destination triggers reconstruct deleted-root identity and bounded
+    /// details from canonical rows, while assigning a fresh local incarnation.
+    #[tokio::test]
+    async fn transfer_reconstructs_deleted_comment_roots_with_fresh_annotation_identity() {
+        let source_db = TempDb::new();
+        let source = Store::open(&source_db.path).await.unwrap();
+        for statement in [
+            "INSERT INTO workspace(id,title,branch,created_at,updated_at) VALUES('annotation-transfer','T','main','created','updated')",
+            "INSERT INTO note(id,workspace_id,title,content,created_at,updated_at) VALUES('n','annotation-transfer','N','unchanged😀','created','updated')",
+            "INSERT INTO comment(id,thread_id,note_id,workspace_id,kind,content,author,author_type,anchor_json,created_at,updated_at) VALUES('root','thread','n','annotation-transfer','comment','root body','author','user','{}','created','updated')",
+            "INSERT INTO comment(id,thread_id,note_id,workspace_id,kind,content,author,author_type,parent_id,anchor_json,created_at,updated_at) VALUES('reply','thread','n','annotation-transfer','comment','reply😀','author','user','root','{}','created','updated')",
+            "DELETE FROM comment WHERE id='root'",
+        ] {
+            sqlx::query(statement).execute(source.write_pool()).await.unwrap();
+        }
+        let original_instance: String = sqlx::query_scalar("SELECT instance_id FROM note_page_head WHERE workspace_id='annotation-transfer' AND note_id='n'")
+            .fetch_one(source.read_pool()).await.unwrap();
+        let rows = source
+            .transfer_export_rows(&WorkspaceId("annotation-transfer".into()))
+            .await
+            .unwrap();
+        assert!(rows
+            .iter()
+            .all(|(name, _)| !name.starts_with("note_annotation_")
+                && !name.starts_with("note_comment_")));
+        let target_db = TempDb::new();
+        let target = Store::open(&target_db.path).await.unwrap();
+        target.transfer_import_rows(&rows).await.unwrap();
+        let identity: (String, bool, i64) = sqlx::query_as("SELECT r.root_comment_id,r.root_present,t.total_comments FROM note_comment_root r JOIN note_comment_thread t USING(head_id,thread_id) JOIN note_annotation_head h ON h.id=r.head_id WHERE h.workspace_id='annotation-transfer' AND h.note_id='n' AND r.thread_id='thread'")
+            .fetch_one(target.read_pool()).await.unwrap();
+        assert_eq!(identity, ("root".into(), false, 1));
+        let reply: (String, String) =
+            sqlx::query_as("SELECT parent_id,content FROM comment WHERE id='reply'")
+                .fetch_one(target.read_pool())
+                .await
+                .unwrap();
+        assert_eq!(reply, ("root".into(), "reply😀".into()));
+        let detail: Vec<u8> = sqlx::query_scalar("SELECT data FROM note_comment_detail_piece WHERE comment_id='reply' AND field='body' AND position=0")
+            .fetch_one(target.read_pool()).await.unwrap();
+        assert_eq!(detail, "reply😀".as_bytes());
+        let current_instance: String = sqlx::query_scalar("SELECT instance_id FROM note_page_head WHERE workspace_id='annotation-transfer' AND note_id='n'")
+            .fetch_one(target.read_pool()).await.unwrap();
+        assert_ne!(current_instance, original_instance);
+        let snapshots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM note_annotation_snapshot")
+            .fetch_one(target.read_pool())
+            .await
+            .unwrap();
+        assert_eq!(snapshots, 0);
+    }
+
+    /// Schema-parity tripwire: every live table has exactly one transfer
+    /// decision, and neither registry may name an absent table.
     #[tokio::test]
     async fn every_live_table_has_an_explicit_transfer_decision() {
         let db = TempDb::new();
@@ -1912,6 +2038,87 @@ mod tests {
              absent from the live schema: {stale:?} — remove the stale entries \
              (and any import-side transformation for them)"
         );
+    }
+
+    // Bootstrap history is portable workspace state, not a daemon-local ID.
+    // An intentionally empty registry must remain initialized after transfer;
+    // older archives without the marker retain the schema default, with an
+    // imported script establishing initialization through the existing trigger.
+    #[tokio::test]
+    async fn transfer_preserves_script_initialization_and_legacy_defaults() {
+        let source_db = TempDb::new();
+        let source = Store::open(&source_db.path).await.unwrap();
+        let workspace = serde_json::json!({
+            "id":"script-history", "title":"Scripts", "branch":"main",
+            "created_at":"t0", "updated_at":"t0"
+        });
+        let script = serde_json::json!({
+            "id":"script-history-command", "workspace_id":"script-history",
+            "name":"Command", "command":"true", "mode":"command",
+            "source":"user", "created_at":"t0"
+        });
+        source
+            .transfer_import_rows(&[
+                ("workspace".into(), vec![workspace]),
+                ("script".into(), vec![script.clone()]),
+            ])
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM script WHERE workspace_id = 'script-history'")
+            .execute(source.write_pool())
+            .await
+            .unwrap();
+        let mut exported = source
+            .transfer_export_rows(&WorkspaceId::from("script-history"))
+            .await
+            .unwrap();
+        let workspace_row = &exported
+            .iter()
+            .find(|(table, _)| table == "workspace")
+            .unwrap()
+            .1[0];
+        assert_eq!(workspace_row["scripts_initialized"], 1);
+        assert!(exported
+            .iter()
+            .find(|(table, _)| table == "script")
+            .unwrap()
+            .1
+            .is_empty());
+        for (legacy, with_script, expected) in
+            [(false, false, 1_i64), (true, false, 0), (true, true, 1)]
+        {
+            if legacy {
+                exported
+                    .iter_mut()
+                    .find(|(table, _)| table == "workspace")
+                    .unwrap()
+                    .1[0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("scripts_initialized");
+            }
+            if with_script {
+                exported
+                    .iter_mut()
+                    .find(|(table, _)| table == "script")
+                    .unwrap()
+                    .1
+                    .push(script.clone());
+            }
+            let target_db = TempDb::new();
+            let target = Store::open(&target_db.path).await.unwrap();
+            target.transfer_import_rows(&exported).await.unwrap();
+            let initialized: i64 = sqlx::query_scalar(
+                "SELECT scripts_initialized FROM workspace WHERE id = 'script-history'",
+            )
+            .fetch_one(target.read_pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                initialized, expected,
+                "legacy={legacy}, with_script={with_script}"
+            );
+        }
     }
 
     /// Expected column list of every [`TRANSFER_TABLES`] table, in

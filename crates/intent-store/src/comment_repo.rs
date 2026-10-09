@@ -17,6 +17,8 @@ use sqlx::Row;
 
 use crate::{enum_from_db, enum_to_db, Store};
 
+mod anchor_writes;
+
 const COMMENT_COLUMNS: &str = "id, thread_id, note_id, kind, content, author, author_type, \
     status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at";
 
@@ -158,31 +160,7 @@ impl Store {
         c: &Comment,
         legacy_extra: &Map<String, Value>,
     ) -> Result<()> {
-        let (anchor_json, extra_json) = encode_comment_json(c, legacy_extra)?;
-        let sql = format!(
-            "INSERT INTO comment ({COMMENT_COLUMNS}, workspace_id) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-        );
-        sqlx::query(&sql)
-            .bind(&c.id)
-            .bind(&c.thread_id)
-            .bind(c.note_id.as_ref().map(|n| n.0.clone()))
-            .bind(enum_to_db(&c.kind)?)
-            .bind(&c.content)
-            .bind(&c.author)
-            .bind(enum_to_db(&c.author_type)?)
-            .bind(enum_to_db(&c.status)?)
-            .bind(&c.parent_id)
-            .bind(anchor_json)
-            .bind(&c.anchor_text)
-            .bind(extra_json)
-            .bind(&c.created_at)
-            .bind(&c.updated_at)
-            .bind(&workspace_id.0)
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("insert comment failed: {e}")))?;
-        Ok(())
+        anchor_writes::insert(self, workspace_id, c, legacy_extra).await
     }
 
     /// Atomically persist a `comment.add`: the anchor-marker note rewrite
@@ -213,15 +191,7 @@ impl Store {
         // IMMEDIATE mode: acquires the write lock upfront, avoiding the
         // DEFERRED-mode transaction-upgrade race that surfaces SQLITE_BUSY
         // when concurrent connections hold read locks (STAB-1).
-        let mut conn = self
-            .write_pool()
-            .acquire()
-            .await
-            .map_err(|e| Error::Internal(format!("acquire connection failed: {e}")))?;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("begin IMMEDIATE failed: {e}")))?;
+        let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
 
         // Execute the transaction body; rollback explicitly on error.
         let result = async {
@@ -230,7 +200,7 @@ impl Store {
             // bump, gated on `expected_version`. A miss (gate failed or note
             // absent) is told apart after the rollback.
             let Some(new_rev) = crate::note_repo::exec_update_note(
-                &mut *conn,
+                &mut conn,
                 note,
                 expected_version,
                 crate::note_repo::NoteUpdateScope::FullRow,
@@ -284,6 +254,15 @@ impl Store {
                     }
                 })?;
 
+            // Root insertion invalidates readiness even at the just-written
+            // source revision, so publication belongs after that insertion.
+            crate::note_annotation_repo::rebuild_note_anchors(
+                &mut conn,
+                &note.workspace_id,
+                &note.id,
+                Some(&note.content),
+            )
+            .await?;
             Ok(Some(new_rev))
         }
         .await;
@@ -292,9 +271,7 @@ impl Store {
         // failure, if the COMMIT itself fails — monorepo#638) or roll back
         // the failed body (monorepo#680), so the sole write-pool connection
         // is never returned holding an open transaction.
-        match crate::commit_with_rollback_guard(conn, result, "commit note+comment tx failed")
-            .await?
-        {
+        match conn.finish(result, "commit note+comment tx failed").await? {
             Some(new_rev) => Ok(new_rev),
             None => Err(self.note_update_miss(note).await),
         }
@@ -332,73 +309,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the comment does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn update_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
-        let anchor_json = serde_json::to_string(&c.anchor)
-            .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
-        let extra = ExtraFields {
-            // Creation attribution is immutable. Carry these from the stored
-            // row below, including absence on legacy comments.
-            author_principal_id: None,
-            author_identity: None,
-            anchor_before: c.anchor_before.clone(),
-            anchor_after: c.anchor_after.clone(),
-            suggestion_original: c.suggestion_original.clone(),
-            suggestion_proposed: c.suggestion_proposed.clone(),
-            agent_id: c.agent_id.clone(),
-            is_orphaned: c.is_orphaned,
-        };
-        let mut merged = extra.to_map()?;
-        // Carry over preserved legacy/unknown keys from the existing row.
-        let existing: Option<String> =
-            sqlx::query("SELECT extra_json FROM comment WHERE id = ? AND workspace_id = ?")
-                .bind(&c.id)
-                .bind(&workspace_id.0)
-                .fetch_optional(self.read_pool())
-                .await
-                .map_err(|e| Error::Internal(format!("read comment extras failed: {e}")))?
-                .and_then(|r| r.get::<Option<String>, _>("extra_json"));
-        if let Some(raw) = existing {
-            if let Ok(Value::Object(old)) = serde_json::from_str::<Value>(&raw) {
-                for (k, v) in old {
-                    // A non-bool `isOrphaned` can only be a legacy value the
-                    // importer preserved verbatim (the store itself only ever
-                    // encodes booleans here) — carry it over too.
-                    let legacy_orphaned = k == "isOrphaned" && !matches!(v, Value::Bool(_));
-                    if matches!(k.as_str(), "authorPrincipalId" | "authorIdentity")
-                        || !ExtraFields::KNOWN_KEYS.contains(&k.as_str())
-                        || legacy_orphaned
-                    {
-                        merged.entry(k).or_insert(v);
-                    }
-                }
-            }
-        }
-        let extra_json = extra_map_to_json(merged)?;
-        let res = sqlx::query(
-            "UPDATE comment SET thread_id=?, note_id=?, kind=?, content=?, author=?, \
-             author_type=?, status=?, parent_id=?, anchor_json=?, anchor_text=?, extra_json=?, \
-             updated_at=? WHERE id=? AND workspace_id=?",
-        )
-        .bind(&c.thread_id)
-        .bind(c.note_id.as_ref().map(|n| n.0.clone()))
-        .bind(enum_to_db(&c.kind)?)
-        .bind(&c.content)
-        .bind(&c.author)
-        .bind(enum_to_db(&c.author_type)?)
-        .bind(enum_to_db(&c.status)?)
-        .bind(&c.parent_id)
-        .bind(anchor_json)
-        .bind(&c.anchor_text)
-        .bind(extra_json)
-        .bind(&c.updated_at)
-        .bind(&c.id)
-        .bind(&workspace_id.0)
-        .execute(self.write_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("update comment failed: {e}")))?;
-        if res.rows_affected() == 0 {
-            return Err(Error::NotFound(format!("comment {}", c.id)));
-        }
-        Ok(())
+        anchor_writes::update(self, workspace_id, c).await
     }
 
     /// Delete a comment by id, scoped to `workspace_id` (defense-in-depth).
@@ -408,16 +319,7 @@ impl Store {
     ///
     /// Returns `Error::NotFound` if the comment does not exist in the workspace; `Error::Internal` if the database operation fails.
     pub async fn delete_comment(&self, workspace_id: &WorkspaceId, id: &str) -> Result<()> {
-        let res = sqlx::query("DELETE FROM comment WHERE id = ? AND workspace_id = ?")
-            .bind(id)
-            .bind(&workspace_id.0)
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("delete comment failed: {e}")))?;
-        if res.rows_affected() == 0 {
-            return Err(Error::NotFound(format!("comment {id}")));
-        }
-        Ok(())
+        anchor_writes::delete(self, workspace_id, id).await
     }
 
     /// Delete a comment within a note and return its authoritative thread ID.
@@ -435,16 +337,7 @@ impl Store {
         note_id: &NoteId,
         id: &str,
     ) -> Result<String> {
-        sqlx::query_scalar::<_, String>(
-            "DELETE FROM comment WHERE id = ? AND workspace_id = ? AND note_id = ? RETURNING thread_id",
-        )
-        .bind(id)
-        .bind(workspace_id.as_str())
-        .bind(note_id.as_str())
-        .fetch_optional(self.write_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("delete comment failed: {e}")))?
-        .ok_or_else(|| Error::NotFound(format!("comment {id}")))
+        anchor_writes::delete_in_note(self, workspace_id, note_id, id).await
     }
 
     /// List a note's comments, ordered by creation time.
@@ -520,17 +413,7 @@ impl Store {
         status: CommentStatus,
         updated_at: &str,
     ) -> Result<u64> {
-        let res = sqlx::query(
-            "UPDATE comment SET status=?, updated_at=? WHERE thread_id=? AND workspace_id=?",
-        )
-        .bind(enum_to_db(&status)?)
-        .bind(updated_at)
-        .bind(thread_id)
-        .bind(&workspace_id.0)
-        .execute(self.write_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("set thread status failed: {e}")))?;
-        Ok(res.rows_affected())
+        anchor_writes::set_status(self, workspace_id, thread_id, status, updated_at).await
     }
 
     /// Assemble a [`CommentThread`] (the comments sharing `thread_id`).
@@ -558,7 +441,7 @@ where
         .map_err(|e| Error::Internal(format!("column {name}: {e}")))
 }
 
-fn map_comment_row(row: &SqliteRow) -> Result<Comment> {
+pub(crate) fn map_comment_row(row: &SqliteRow) -> Result<Comment> {
     let note_id: Option<String> = col(row, "note_id")?;
     // Replies store `null` (they anchor via their thread/parent, monorepo#729);
     // legacy reply rows and all roots store the anchor object.

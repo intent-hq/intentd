@@ -241,6 +241,10 @@ In the workspace sidebar, open **Context** to find the **Spec** and other notes.
 Use its **Add context** action to create a note. In layouts showing the Notes-panel
 button, its visible label is **Attach more context**; **New note** is the tooltip.
 Notes hold shared context, decisions, and deliverables for that workspace.
+When a supported note deletion offers **Undo**, it cancels a pending deletion during
+the displayed grace period (normally 15 seconds). It does not restore an already
+deleted note. If the result is uncertain, check the note’s current status before trying again. If the
+connected backend does not support cancellable deletion, the note is kept.
 
 Open a task note and inspect its status and assigned agent first. Select the
 assigned agent to continue existing work. To start an agent for the task, use the

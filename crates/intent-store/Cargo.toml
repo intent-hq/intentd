@@ -26,10 +26,17 @@ flate2 = "1.1.9"
 futures-util = "0.3"
 async-stream = "0.3"
 
+hmac = "0.12"
+sha2 = "0.10"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+html5gum = { version = "=0.8.4", default-features = false }
+html5ever = "=0.29.1"
+
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+regex = "1"
 trybuild = "1"
 tempfile = "3"
 tokio = { workspace = true }

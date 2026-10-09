@@ -39,7 +39,7 @@ fail() {
   exit 1
 }
 
-for command in bash dirname mktemp rm sort; do
+for command in bash dirname mktemp rm sort python3; do
   ln -s "$(command -v "$command")" "$bin_dir/$command"
 done
 
@@ -760,6 +760,31 @@ expect_cov "-p intentd --test e2e_wss_agent_lifecycle"
 run_script
 expect_ok
 expect_cargo "-p intentd --test auggie_context_e2e --test e2e_wss_agent_lifecycle"
+
+# Structured export must describe the same argv without changing execution.
+case_name="structured plan export preserves execution and empty selections"
+reset_repo
+edit crates/alpha/src/lib.rs
+edit crates/beta/src/main.rs
+run_script --instrumented --plan-json "$temp_dir/plans.json"
+[[ "$status" -eq 0 ]] || fail "$case_name: $stderr"
+expect_cov "-p alpha --lib --bins --tests" "-p beta --bins --tests"
+python3 -I -B -S - "$temp_dir/plans.json" "$(g rev-parse HEAD)" <<'PYTHON'
+import json, sys
+p = json.load(open(sys.argv[1]))
+assert p == {"version": 1, "head": sys.argv[2], "mergeBase": sys.argv[2],
+             "plans": [["-p", "alpha", "--lib", "--bins", "--tests"],
+                       ["-p", "beta", "--bins", "--tests"]]}, p
+PYTHON
+reset_repo
+run_script --instrumented --dry-run --plan-json "$temp_dir/plans.json"
+[[ "$status" -eq 0 && -z "$cargo_log" ]] || fail "$case_name empty: $stderr"
+python3 -I -B -S - "$temp_dir/plans.json" <<'PYTHON'
+import json, sys
+assert json.load(open(sys.argv[1]))["plans"] == []
+PYTHON
+run_script --instrumented --plan-json "$temp_dir/absent/plans.json"
+[[ "$status" -ne 0 && -z "$cargo_log" ]] || fail "$case_name ignored export failure"
 
 echo "changed-tests tests passed under $("$script_bash" -c 'echo "bash $BASH_VERSION"')"
 [[ -z "${CHANGED_TESTS_TEST_BASH:-}" ]] || exit 0

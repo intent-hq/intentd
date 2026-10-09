@@ -279,9 +279,10 @@ jobs:
     if: github.event_name != 'push'
     needs: route
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
-    # Cold burst builds plus the socket suites can use nearly 15 minutes;
-    # leave time for post-job cache saving after the checks finish.
-    timeout-minutes: 20
+    # The cold-cache check job exhausted its 20-minute budget after its tests
+    # passed in run 37305697722. Allow completion/cache margin without changing
+    # individual test timeouts.
+    timeout-minutes: 25
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -1458,7 +1459,7 @@ jobs:
           set -euo pipefail
           plan="$RUNNER_TEMP/coverage-changed-plan.txt"
           status=0
-          ./scripts/changed-tests.sh --instrumented --dry-run --base "$BASE_SHA" | tee "$plan" || status=$?
+          ./scripts/changed-tests.sh --instrumented --dry-run --base "$BASE_SHA" --plan-json "$RUNNER_TEMP/coverage-changed-plan.json" | tee "$plan" || status=$?
           if [ "$status" -eq 4 ]; then
             echo "::error title=coverage-changed: base unresolvable::changed-tests.sh could not connect BASE $BASE_SHA to HEAD $(git rev-parse HEAD) — a checkout/fetch problem in this job, not a test failure (intent-hq/intent#5414)"
           fi
@@ -1468,6 +1469,9 @@ jobs:
           git diff --quiet "$BASE_SHA" HEAD -- \
             scripts/prepare-acp-callback-fixture.py \
             scripts/test-prepare-acp-callback-fixture.py \
+            scripts/changed-tests.sh \
+            scripts/callback-build-scope.py \
+            scripts/test-callback-build-scope.py \
             crates/intent-acp/tests/fixtures/claude-callback-adapter.json \
             crates/intent-acp/tests/fixtures/claude-callback-canonical.patch \
             crates/intent-acp/tests/fixtures/claude-callback-files.json \
@@ -1635,6 +1639,14 @@ jobs:
         run: |
           set -euo pipefail
           filter=$(printf '%s\n' "$CALLBACK_FIXTURE_TESTS" | sed '/^$/d;s/^/test(=/;s/$/)/' | paste -sd '|' -)
+          # Reuse the compatible changed-plan scope instead of narrowing the
+          # Cargo feature graph back to just the callback packages. Validate
+          # structured argv before reading it; process substitution would hide
+          # a failed producer. Both commands below use this exact array.
+          python3 -I -B -S scripts/callback-build-scope.py \
+            "$RUNNER_TEMP/coverage-changed-plan.json" "$(git rev-parse HEAD)" \
+            > "$RUNNER_TEMP/callback-build-args.txt"
+          mapfile -t callback_scope < "$RUNNER_TEMP/callback-build-args.txt"
           # show-env defaults to Cargo's target dir, but llvm-cov nextest adds
           # llvm-cov-target. Share the latter explicitly so discovery builds
           # exactly the instrumented binaries execution will reuse.
@@ -1647,7 +1659,7 @@ jobs:
             # show-env exports Cargo metadata's target dir even with a coverage override.
             coverage_env=$(CARGO_TARGET_DIR="$CARGO_LLVM_COV_TARGET_DIR" cargo llvm-cov show-env --sh)
             eval "$coverage_env"
-            cargo nextest list -p intent-acp -p intent-services --lib \
+            cargo nextest list "${callback_scope[@]}" \
               --target-dir "$CARGO_LLVM_COV_TARGET_DIR" \
               -E "$filter" --message-format json > "$RUNNER_TEMP/callback-fixture-tests.json"
           )
@@ -1659,7 +1671,7 @@ jobs:
                       if case["filter-match"]["status"] == "matches"]
           assert len(expected) == len(selected) == 6 and set(selected) == set(expected), selected
           PYTHON
-          cargo llvm-cov --no-report nextest -p intent-acp -p intent-services --lib \
+          cargo llvm-cov --no-report nextest "${callback_scope[@]}" \
             -E "$filter" --no-fail-fast --retries 0 --show-progress none \
             --status-level pass --final-status-level fail
       # Release the `.in-use` marker — see the `check` job's last step
@@ -1870,6 +1882,7 @@ jobs:
         run: |
           python3 -S scripts/test-test-policy.py
           python3 -I -B scripts/test-ci-test-policy.py
+          python3 -I -B -S scripts/test-callback-build-scope.py
       - name: Test native CI routing and gate results
         run: python3 -I -B scripts/test-ci-native-routing.py
       - name: Install release cache regression compiler
