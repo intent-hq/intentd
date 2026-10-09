@@ -278,6 +278,14 @@ succeeded. Use live workspace, note, and agent tools for actual IDs, progress, a
 available actions. Never construct links from guessed IDs or claim completion from
 this static guide.
 
+Workspace file links open a file panel. Excel workbooks and other binary files
+without a preview show a binary-file notice; use **Download file** in that panel
+to save the original file on your computer, including from a remote workspace.
+A missing-file or access error is different: check the path and access rather than
+assuming the file cannot be previewed.
+
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
+
 ## Daemon lifecycle from the terminal
 
 For a separately installed `intentd` launcher on Windows, macOS, or Linux, use
