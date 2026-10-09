@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.38] - 2026-10-09
+
+### 🐛 Bug Fixes
+
+- Enforce adapter-derived Codex CLI compatibility ([#2372](https://github.com/intent-hq/intentd/pull/2372))
+
+
 ## [0.10.37] - 2026-10-09
 
 ### 🚀 Features
