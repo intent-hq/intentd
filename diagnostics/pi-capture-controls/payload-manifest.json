@@ -1,0 +1,9 @@
+{
+  "original-upload-policy.mjs": "4851a0292d7c85bf1322b04d6a195cfcee228e7dc254fd151df5c5481cd45642",
+  "capture-functions.ps1": "927188fb15f9e10d09385a315f7da159673ae92a7614e0add91deec2bce2c1f7",
+  "setup-only.ps1": "0a007b21677d4fdb2206bae19baea09a29b910267a7fbe02261e5d2a6cd95bb7",
+  "run-controls.ps1": "9d747766ce55cea956cc17ff21b3034d99a405564a6c0b4517d71f0f6625a889",
+  "expected-controls.json": "df31144268d8bb2fe130792a178b4d14d3fd6bb4c418191eb55f3c827b6b8f8a",
+  "original-setup-only.ps1": "5ac18dd6486edd26fc7907c2b31656e2ab8fd7c4d44f34eed52fb80bafade2bc",
+  "controls.ps1": "a67fd0793a0f353d19ddf4b262b2dd28b1ee1ff0c2c3071eab096372685cda71"
+}

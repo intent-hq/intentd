@@ -1,0 +1,16 @@
+[
+  "original-fixed-fields",
+  "provenance-distinct-from-compile",
+  "unknown-stage-redacted",
+  "unknown-category-redacted",
+  "unknown-ownership-fails-closed",
+  "phase-cannot-inject",
+  "hresult-minimum",
+  "hresult-maximum",
+  "type-absent-no-invocation",
+  "type-absent-after-invocation-unresolved",
+  "writer-strips-extra-properties",
+  "writer-exception-does-not-escape",
+  "original-record-precedes-finalizer-record",
+  "summary-stage-compatible-with-original-policy"
+]

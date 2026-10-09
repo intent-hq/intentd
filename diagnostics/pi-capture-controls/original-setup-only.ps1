@@ -1,0 +1,102 @@
+param([Parameter(Mandatory)][string]$WorkRoot)
+$ErrorActionPreference='Stop'
+$stage='provenance';$outcome='FAILED';$code=0
+if (-not $IsWindows -or (Test-Path -LiteralPath $WorkRoot)) { throw 'exclusive_native_setup_required' }
+$null=New-Item -ItemType Directory -Path $WorkRoot
+$upload=Join-Path $WorkRoot 'upload-private';$null=New-Item -ItemType Directory -Path $upload
+$node=(Get-Command node.exe -CommandType Application).Source
+$packet=$PSScriptRoot
+$before=@{};$toolsEqual=$false;$toolsBefore=$null
+. (Join-Path $packet 'tool-provenance.ps1')
+function Inventory-Packet { $map=@{};Get-ChildItem -LiteralPath $packet -File -Recurse | ForEach-Object {$map[$_.FullName.Substring($packet.Length+1)]=(Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()};return $map }
+function Assert-Owned($r) { if($r.reason -ne 'completed' -or $r.originalExit -ne 0 -or -not $r.assigned -or -not $r.resumed -or -not $r.activeZero -or -not $r.rootSignalled -or -not $r.readerDone -or $r.readerError -or $r.overflow){throw 'setup_child_incomplete'} }
+try {
+ $manifest=Get-Content -Raw (Join-Path $packet 'payload-manifest.json') | ConvertFrom-Json -AsHashtable
+ foreach($rel in $manifest.Keys){$path=Join-Path $packet $rel;if((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() -ne $manifest[$rel]){throw 'payload_hash_mismatch'}}
+ $before=Inventory-Packet
+ $npm=Join-Path (Split-Path $node -Parent) 'node_modules/npm/bin/npm-cli.js'
+ $toolsBefore=Get-SetupTools $node $npm
+ Add-Type -Path (Join-Path $packet 'OwnedSetup.cs')
+ $compiler=Get-CompilerBindings $toolsBefore
+ & (Join-Path $packet 'latch-controls.ps1') -Output (Join-Path $WorkRoot 'latch-result.json')
+ $versionReceipts=@()
+ $vr=[OwnedSetup]::Run($node,[string[]]@('--eval','console.log(JSON.stringify({version:process.version,arch:process.arch}))'),$WorkRoot,(Join-Path $WorkRoot 'node-version.log'),5000,8192,$false)
+ $versionReceipts+=@{name='node-version';receipt=$vr};$versionReceipts | ConvertTo-Json -Depth 12 | Set-Content -Encoding utf8NoBOM (Join-Path $WorkRoot 'version-receipts.json');Assert-Owned $vr
+ $nodeRuntime=Get-Content -Raw (Join-Path $WorkRoot 'node-version.log') | ConvertFrom-Json
+ if($nodeRuntime.version -ne 'v24.21.0' -or $nodeRuntime.arch -ne 'x64'){throw 'node_runtime_mismatch'}
+ $vr=[OwnedSetup]::Run($node,[string[]]@($npm,'--version'),$WorkRoot,(Join-Path $WorkRoot 'npm-version.log'),10000,8192,$false)
+ $versionReceipts+=@{name='npm-version';receipt=$vr};$versionReceipts | ConvertTo-Json -Depth 12 | Set-Content -Encoding utf8NoBOM (Join-Path $WorkRoot 'version-receipts.json');Assert-Owned $vr
+ $versionReceipts | ConvertTo-Json -Depth 12 | Set-Content -Encoding utf8NoBOM (Join-Path $WorkRoot 'version-receipts.json')
+ $npmRuntime=(Get-Content -Raw (Join-Path $WorkRoot 'npm-version.log')).Trim()
+ if($npmRuntime -ne $toolsBefore.npm.declaredVersion){throw 'npm_runtime_version_mismatch'}
+ $native=Join-Path $WorkRoot 'native'
+ $stage='native-controls'
+ & (Join-Path $packet 'native-controls.ps1') -Node $node -OwnedRoot $native
+ if(-not (Test-Path (Join-Path $native 'native-result.json'))){throw 'native_controls_no_receipt'}
+ $policy=[OwnedSetup]::Run($node,[string[]]@('--test','--test-concurrency=1','--test-reporter=tap',(Join-Path $packet 'upload-policy-controls.mjs')),$WorkRoot,(Join-Path $WorkRoot 'policy-controls.tap'),30000,1048576,$false)
+ $policy | ConvertTo-Json -Depth 12 | Set-Content -Encoding utf8NoBOM (Join-Path $WorkRoot 'policy-receipt.json')
+ Assert-Owned $policy
+ $policyLines=Get-Content (Join-Path $WorkRoot 'policy-controls.tap')
+ $policyExpected=Get-Content -Raw (Join-Path $packet 'upload-expected.json') | ConvertFrom-Json
+ $policyActual=@($policyLines | Where-Object {$_ -match '^ok [0-9]+ - '} | ForEach-Object {$_ -replace '^ok [0-9]+ - ',''})
+ if(($policyActual | ConvertTo-Json -Compress) -ne ($policyExpected | ConvertTo-Json -Compress)){throw 'upload_controls_identity'}
+ foreach($line in @(('1..'+$policyExpected.Count),('# tests '+$policyExpected.Count),('# pass '+$policyExpected.Count),'# fail 0','# cancelled 0','# skipped 0','# todo 0')){if(-not($policyLines -contains $line)){throw 'upload_controls_inventory'}}
+ $resolver=[OwnedSetup]::Run($node,[string[]]@((Join-Path $packet 'resolution-control.mjs'),$WorkRoot),$WorkRoot,(Join-Path $WorkRoot 'resolution-control.log'),10000,8192,$false)
+ $resolver | ConvertTo-Json -Depth 12 | Set-Content -Encoding utf8NoBOM (Join-Path $WorkRoot 'resolution-receipt.json');Assert-Owned $resolver
+ $stage='dependency-install' 
+ $npm=Join-Path (Split-Path $node -Parent) 'node_modules/npm/bin/npm-cli.js'
+ if(-not(Test-Path -LiteralPath $npm)){throw 'npm_entry_unbound'}
+ $install=Join-Path $WorkRoot 'install';$null=New-Item -ItemType Directory -Path $install
+ $commands=@(
+  @{name='adapter-install';args=@($npm,'install','--prefix',(Join-Path $install '.pi-acp-test'),'--no-save','--ignore-scripts','--no-audit','--no-fund','pi-acp@0.0.34')},
+  @{name='pi-install';args=@($npm,'install','--prefix',(Join-Path $install '.pi-runtime-test'),'--no-save','--ignore-scripts','--no-audit','--no-fund','@earendil-works/pi-coding-agent@0.81.0','@earendil-works/pi-agent-core@0.81.0','@earendil-works/pi-ai@0.81.0','@earendil-works/pi-tui@0.81.0')}
+ )
+ $installReceipts=@()
+ foreach($c in $commands){$r=[OwnedSetup]::Run($node,[string[]]$c.args,$install,(Join-Path $WorkRoot ($c.name+'.log')),120000,8388608,$false);$installReceipts+=@{name=$c.name;receipt=$r};$installReceipts | ConvertTo-Json -Depth 12 | Set-Content -Encoding utf8NoBOM (Join-Path $WorkRoot 'install-receipts.json');Assert-Owned $r}
+ $stage='dependency-acceptance'
+ $r=[OwnedSetup]::Run($node,[string[]]@((Join-Path $packet 'accept-dependencies.mjs'),$packet,$install,$WorkRoot),$install,(Join-Path $WorkRoot 'acceptance.log'),120000,8388608,$false)
+ $r | ConvertTo-Json -Depth 12 | Set-Content -Encoding utf8NoBOM (Join-Path $WorkRoot 'acceptance-receipt.json');Assert-Owned $r
+ if(-not(Test-Path (Join-Path $WorkRoot 'dependency-result.json'))){throw 'dependency_acceptance_no_receipt'}
+ $stage='final-packet-guards';$after=Inventory-Packet
+ if($before.Count -ne $after.Count){throw 'packet_inventory_changed'}
+ foreach($key in $before.Keys){if($before[$key] -ne $after[$key]){throw 'packet_bytes_changed'}}
+ $toolsAfter=Get-SetupTools $node $npm
+ Assert-SetupToolsEqual $toolsBefore $toolsAfter;$toolsEqual=$true
+ @{status='PASS';before=$toolsBefore;afterEqual=$true;nodeRuntime=$nodeRuntime;npmRuntimeVersion=$npmRuntime;compiler=$compiler} | ConvertTo-Json -Depth 14 | Set-Content -Encoding utf8NoBOM (Join-Path $WorkRoot 'tool-provenance.json')
+ $outcome='PASS';$stage='setup-complete' 
+} catch { $code=$_.Exception.HResult; $outcome='FAILED' }
+finally {
+ # A private local artifact journal remains available to the reviewer on the runner.
+ # Upload only fixed-schema summaries and predeclared identities/digests, never npm output,
+ # arbitrary exceptions, installed files, credentials, or entire runner temporary directories.
+ $logs=@();foreach($name in @('adapter-install.log','pi-install.log','acceptance.log')){$f=Join-Path $WorkRoot $name;if(Test-Path -LiteralPath $f){$logs+=@{name=$name;bytes=(Get-Item -LiteralPath $f).Length;sha256=(Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLowerInvariant()}}}
+ $summary=@{stage=$stage;outcome=$outcome;errorHResult=$code;behavioralInvocations=0;nodeSha256=(Get-FileHash -LiteralPath $node -Algorithm SHA256).Hash.ToLowerInvariant();platform='win32';nodeVersion='24.21.0';logs=$logs;rawFailureOutputUploaded=$false;qualification='Setup-only. Failed setup output may be incomplete; no Windows behavioral or historical cause acceptance.'}
+ $summary | ConvertTo-Json -Depth 10 | Set-Content -Encoding utf8NoBOM (Join-Path $upload 'setup-summary.json')
+ foreach($name in @('native/native-receipts.json','native/native-result.json','install-receipts.json','acceptance-receipt.json','policy-receipt.json','latch-result.json','resolution-control-result.json','resolution-receipt.json','version-receipts.json')){
+  $f=Join-Path $WorkRoot $name
+  if(Test-Path -LiteralPath $f){if((Get-Item -LiteralPath $f).Length -gt 1048576){throw 'receipt_cap'};Copy-Item -LiteralPath $f -Destination (Join-Path $upload ($name -replace '/','-'))}
+ }
+ # Dependency acceptance output contains only package paths, registry URLs, hashes and fixed metadata.
+ $dep=Join-Path $WorkRoot 'dependency-result.json';if($outcome -eq 'PASS' -and (Test-Path -LiteralPath $dep)){if((Get-Item -LiteralPath $dep).Length -gt 16777216){throw 'inventory_cap'};Copy-Item -LiteralPath $dep -Destination (Join-Path $upload 'dependency-result.json')}
+ if($outcome -eq 'PASS'){
+  $tap=Join-Path $WorkRoot 'native/controls.tap';$lines=Get-Content -LiteralPath $tap
+  # Full schema/TAP reconciliation happens before promotion, with the reviewed validator.
+  Copy-Item -LiteralPath $tap -Destination (Join-Path $upload 'controls.tap')
+  Copy-Item -LiteralPath (Join-Path $WorkRoot 'policy-controls.tap') -Destination (Join-Path $upload 'policy-controls.tap')
+  $toolFile=Join-Path $WorkRoot 'tool-provenance.json';if((Get-Item -LiteralPath $toolFile).Length -gt 8388608){throw 'tool_provenance_cap'}
+  Copy-Item -LiteralPath $toolFile -Destination (Join-Path $upload 'tool-provenance.json')
+ }
+ $allowed=@('setup-summary.json','native-native-receipts.json','native-native-result.json','install-receipts.json','acceptance-receipt.json','dependency-result.json','controls.tap','policy-controls.tap','policy-receipt.json','latch-result.json','resolution-control-result.json','resolution-receipt.json','version-receipts.json','tool-provenance.json')
+ $total=0;foreach($f in Get-ChildItem -LiteralPath $upload){if($f.PSIsContainer -or $f.Name -notin $allowed){throw 'unexpected_upload'};$total+=$f.Length};if($total -gt 25165824){throw 'upload_cap'}
+ if(-not ('OwnedSetup' -as [type])){throw 'upload_validator_unavailable'}
+ if(-not [OwnedSetup]::OwnershipSafe){
+  @{outcome='INCOMPLETE';reason='ownership_unresolved';laterChildrenLaunched=0;behavioralInvocations=0} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM (Join-Path $WorkRoot 'ownership-stop.json')
+  throw 'ownership_unresolved_no_validator_or_further_child'
+ }
+ $check=[OwnedSetup]::Run($node,[string[]]@((Join-Path $packet 'upload-policy.mjs'),$upload,(Join-Path $packet 'payload/diagnostic/expected-tests.json')),$WorkRoot,(Join-Path $WorkRoot 'upload-validator.log'),10000,65536,$false)
+ $check | ConvertTo-Json -Depth 12 | Set-Content -Encoding utf8NoBOM (Join-Path $WorkRoot 'upload-validator-receipt.json')
+ Assert-Owned $check
+ if($null -ne $toolsBefore){$afterValidatorTools=Get-SetupTools $node $npm;Assert-SetupToolsEqual $toolsBefore $afterValidatorTools}
+ Move-Item -LiteralPath $upload -Destination (Join-Path $WorkRoot 'upload')
+}
+if($outcome -ne 'PASS'){exit 1}
