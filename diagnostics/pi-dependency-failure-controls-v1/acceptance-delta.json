@@ -1,0 +1,144 @@
+{
+  "original": "18d9e0391f2bf4c421a324d7bb177b12149b90052e48a1dd46621d6640f0a7e4",
+  "candidate": "5bcb0bbf01c4f7b176ffb073275fa1d6340864b20960ecd5a4a2a04b948229ae",
+  "insertionOffset": 452,
+  "prefix": "// BEGIN FIXED DEPENDENCY FAILURE METADATA\nlet dependencyFailureStage='argument-resolution',dependencyFailureGroup='none',dependencyFailureRoot=null;\nfunction MarkDependencyFailureStage(stage,group=null) {\n try {\n  if(DEPENDENCY_FAILURE_STAGES.includes(stage))dependencyFailureStage=stage;\n  if(group!==null&&['none','adapter','pi'].includes(group))dependencyFailureGroup=group;\n } catch {}\n}\nconst DEPENDENCY_FAILURE_STAGES=[\"argument-resolution\",\"platform\",\"node-version\",\"expected-lock-read\",\"installed-lock-read\",\"package-keys\",\"package-path\",\"package-metadata\",\"integrity-attribution\",\"tar-cache-key\",\"tar-url-policy\",\"tar-fetch\",\"tar-response\",\"tar-stream\",\"tar-integrity\",\"tar-inflate\",\"tar-parse\",\"installed-tar-bytes\",\"installed-inventory\",\"generated-files\",\"mirror-absence\",\"mirror-copy\",\"mirror-inventory\",\"entry-pin\",\"resolution-preinventory\",\"resolution-helper\",\"resolution-child\",\"resolution-output\",\"resolution-identities\",\"resolution-targets\",\"resolution-postinventory\",\"mirror-unmodified\",\"result-write\"];\nconst DEPENDENCY_FAILURE_CODES=[\"ERR_ASSERTION\",\"ENOENT\",\"ENOTDIR\",\"EACCES\",\"EPERM\",\"EEXIST\",\"ERR_INVALID_ARG_TYPE\",\"ERR_INVALID_ARG_VALUE\",\"ERR_OUT_OF_RANGE\",\"ABORT_ERR\",\"ETIMEDOUT\",\"ERR_BUFFER_TOO_LARGE\",\"Z_DATA_ERROR\",\"OTHER\"];\nfunction WriteDependencyFailureMetadata(error) {\n try {\n  if(typeof dependencyFailureRoot!=='string')return;\n  let code='OTHER';\n  try {const descriptor=Object.getOwnPropertyDescriptor(error,'code');if(descriptor&&typeof descriptor.value==='string'&&DEPENDENCY_FAILURE_CODES.includes(descriptor.value))code=descriptor.value;} catch {}\n  const record={schema:'dependency-failure-v1',stage:DEPENDENCY_FAILURE_STAGES.includes(dependencyFailureStage)?dependencyFailureStage:'unknown',group:['none','adapter','pi'].includes(dependencyFailureGroup)?dependencyFailureGroup:'unknown',code,outcome:'FAILED',behavioralInvocations:0};\n  const text=JSON.stringify(record);\n  if(text.length<=512)writeFileSync(join(dependencyFailureRoot,'dependency-failure.json'),text,{flag:'wx'});\n } catch {} // Metadata/file/writer failure cannot replace the original thrown value.\n}\n// END FIXED DEPENDENCY FAILURE METADATA\ntry {\n",
+  "suffix": "} catch(dependencyFailureError) {\n try {WriteDependencyFailureMetadata(dependencyFailureError);} catch {}\n throw dependencyFailureError;\n}\n",
+  "changes": [
+    {
+      "old": "const [packet,work,evidence]=process.argv.slice(2).map(x=>resolve(x));",
+      "new": "const [packet,work,evidence]=process.argv.slice(2).map(x=>resolve(x));\ntry {dependencyFailureRoot=evidence;} catch {}"
+    },
+    {
+      "old": "assert.equal(process.platform,'win32');",
+      "new": "MarkDependencyFailureStage('platform');assert.equal(process.platform,'win32');"
+    },
+    {
+      "old": "assert.equal(process.version,'v24.21.0');",
+      "new": "MarkDependencyFailureStage('node-version');assert.equal(process.version,'v24.21.0');"
+    },
+    {
+      "old": "async function tarFor(url,sri){const key=",
+      "new": "async function tarFor(url,sri){MarkDependencyFailureStage('tar-cache-key');const key="
+    },
+    {
+      "old": "const u=new URL(url);",
+      "new": "MarkDependencyFailureStage('tar-url-policy');const u=new URL(url);"
+    },
+    {
+      "old": "const response=await fetch(",
+      "new": "MarkDependencyFailureStage('tar-fetch');const response=await fetch("
+    },
+    {
+      "old": "assert.equal(response.status,200);",
+      "new": "MarkDependencyFailureStage('tar-response');assert.equal(response.status,200);"
+    },
+    {
+      "old": "const chunks=[];let size=0;",
+      "new": "MarkDependencyFailureStage('tar-stream');const chunks=[];let size=0;"
+    },
+    {
+      "old": "const compressed=Buffer.concat(chunks);",
+      "new": "MarkDependencyFailureStage('tar-integrity');const compressed=Buffer.concat(chunks);"
+    },
+    {
+      "old": "const tar=gunzipSync(",
+      "new": "MarkDependencyFailureStage('tar-inflate');const tar=gunzipSync("
+    },
+    {
+      "old": "const files=new Map();let count=0;",
+      "new": "MarkDependencyFailureStage('tar-parse');const files=new Map();let count=0;"
+    },
+    {
+      "old": "const base=join(work,prefix);const expected=",
+      "new": "MarkDependencyFailureStage('expected-lock-read',lockName==='package-lock.json'?'adapter':'pi');const base=join(work,prefix);const expected="
+    },
+    {
+      "old": "const actual=JSON.parse(readFileSync(join(base,'node_modules/.package-lock.json'),'utf8')).packages;",
+      "new": "MarkDependencyFailureStage('installed-lock-read');const actual=JSON.parse(readFileSync(join(base,'node_modules/.package-lock.json'),'utf8')).packages;"
+    },
+    {
+      "old": "assert.deepEqual(Object.keys(actual).sort(),Object.keys(expected).sort(),'no omitted optional/platform package accepted');",
+      "new": "MarkDependencyFailureStage('package-keys');assert.deepEqual(Object.keys(actual).sort(),Object.keys(expected).sort(),'no omitted optional/platform package accepted');"
+    },
+    {
+      "old": "assert(name.startsWith('node_modules/')",
+      "new": "MarkDependencyFailureStage('package-path');assert(name.startsWith('node_modules/')"
+    },
+    {
+      "old": "assert.equal(stable(a),stable(e),'metadata difference, including optional/platform flags');",
+      "new": "MarkDependencyFailureStage('package-metadata');assert.equal(stable(a),stable(e),'metadata difference, including optional/platform flags');"
+    },
+    {
+      "old": "const sri=integrityFor(expected,name);",
+      "new": "MarkDependencyFailureStage('integrity-attribution');const sri=integrityFor(expected,name);"
+    },
+    {
+      "old": "attribution.push({packagePath:",
+      "new": "MarkDependencyFailureStage('installed-tar-bytes');attribution.push({packagePath:"
+    },
+    {
+      "old": "const all=inventory(base);",
+      "new": "MarkDependencyFailureStage('installed-inventory');const all=inventory(base);"
+    },
+    {
+      "old": "const extra=Object.keys(all)",
+      "new": "MarkDependencyFailureStage('generated-files');const extra=Object.keys(all)"
+    },
+    {
+      "old": "const original=join(work,'.pi-acp-test');",
+      "new": "MarkDependencyFailureStage('mirror-absence','adapter');const original=join(work,'.pi-acp-test');"
+    },
+    {
+      "old": "copyTree(original,mirror);",
+      "new": "MarkDependencyFailureStage('mirror-copy');copyTree(original,mirror);"
+    },
+    {
+      "old": "assert.deepEqual(inventory(original),inventory(mirror));",
+      "new": "MarkDependencyFailureStage('mirror-inventory');assert.deepEqual(inventory(original),inventory(mirror));"
+    },
+    {
+      "old": "const entryRel='node_modules/pi-acp/dist/index.js'",
+      "new": "MarkDependencyFailureStage('entry-pin');const entryRel='node_modules/pi-acp/dist/index.js'"
+    },
+    {
+      "old": "const originalBefore=inventory(original),mirrorBefore=inventory(mirror);",
+      "new": "MarkDependencyFailureStage('resolution-preinventory');const originalBefore=inventory(original),mirrorBefore=inventory(mirror);"
+    },
+    {
+      "old": "function resolveEntries(entry){const helper=",
+      "new": "function resolveEntries(entry){MarkDependencyFailureStage('resolution-helper');const helper="
+    },
+    {
+      "old": "const run=spawnSync(process.execPath,[helper]",
+      "new": "MarkDependencyFailureStage('resolution-child');const run=spawnSync(process.execPath,[helper]"
+    },
+    {
+      "old": "assert.equal(run.status,0);",
+      "new": "MarkDependencyFailureStage('resolution-output');assert.equal(run.status,0);"
+    },
+    {
+      "old": "assert.deepEqual(a.map(x=>x.name),['@agentclientprotocol/sdk','cross-spawn']);",
+      "new": "MarkDependencyFailureStage('resolution-identities');assert.deepEqual(a.map(x=>x.name),['@agentclientprotocol/sdk','cross-spawn']);"
+    },
+    {
+      "old": "const resolution=[];",
+      "new": "MarkDependencyFailureStage('resolution-targets');const resolution=[];"
+    },
+    {
+      "old": "assert.deepEqual(inventory(original),originalBefore);",
+      "new": "MarkDependencyFailureStage('resolution-postinventory');assert.deepEqual(inventory(original),originalBefore);"
+    },
+    {
+      "old": "assert.equal(digest(readFileSync(marked)),digest(readFileSync(source)));",
+      "new": "MarkDependencyFailureStage('mirror-unmodified');assert.equal(digest(readFileSync(marked)),digest(readFileSync(source)));"
+    },
+    {
+      "old": "writeFileSync(join(evidence,'dependency-result.json')",
+      "new": "MarkDependencyFailureStage('result-write');writeFileSync(join(evidence,'dependency-result.json')"
+    }
+  ],
+  "reverseByteExact": true,
+  "originalAssertionsQueriesCapsAndResultBytesPreserved": true,
+  "qualification": "Original executable body enclosed in try: block lexical/function scope requires concrete transparency controls before execution; no program entry imported/executed in authoring."
+}

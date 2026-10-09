@@ -1,0 +1,8 @@
+[
+  "exact-reversal-and-source-preservation",
+  "success-and-original-error-transparency",
+  "stage-group-freshness-and-boundary",
+  "strict-schema-redaction-and-code",
+  "fixed-file-cap-and-one-write",
+  "catch-relay-ownership-and-writerfault"
+]
