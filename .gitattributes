@@ -1,0 +1,3 @@
+# Preserve exact diagnostic bytes without changing repository-wide text policy.
+/diagnostics/pi-native-single-node-selection-v1/** -text
+/.github/workflows/pi-native-single-node-selection-v1.yml -text
