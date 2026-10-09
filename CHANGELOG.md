@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.36] - 2026-10-09
+
+### 🐛 Bug Fixes
+
+- Fall back to permitted Codex sandbox modes ([#2366](https://github.com/intent-hq/intentd/pull/2366))
+
+### 📚 Documentation
+
+- Explain confirmed script deletion controls ([#2364](https://github.com/intent-hq/intentd/pull/2364))
+
+
 ## [0.10.35] - 2026-10-09
 
 ### 🐛 Bug Fixes
