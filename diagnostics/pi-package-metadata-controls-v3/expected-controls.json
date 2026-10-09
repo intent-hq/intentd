@@ -1,0 +1,8 @@
+[
+  "exact-source-and-canonical-comparison",
+  "evaluation-order-error-identity-and-C1",
+  "fixed-category-mapping-and-security",
+  "snapshot-cap-shape-and-query-sensitivity",
+  "fault-freshness-and-restoration",
+  "metadata-writer-and-native-relay-contract"
+]
