@@ -291,3 +291,123 @@ async fn old_workspace_api_implementations_refuse_addressed_calls_without_legacy
         assert!(matches!(result, Err(Error::Unsupported(_))));
     }
 }
+
+#[test]
+fn recipient_projection_blocks_unsafe_legacy_inputs_on_every_surface() {
+    let golden: Value =
+        serde_json::from_str(include_str!("fixtures/review_monitor_projection_v1.json")).unwrap();
+    let enabled = ReviewMonitoringCapabilities {
+        review_monitoring: Some(1),
+    };
+    let project = |host: &ReviewMonitoringCapabilities, capabilities: Value| {
+        let recipient = ReviewMonitorRecipientSupport::from_capabilities(&capabilities);
+        golden["input"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(surface, entries)| {
+                let entries: Vec<Value> = entries
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|entry| {
+                        let payload = entry["payload"].clone();
+                        let output = match entry["origin"].as_str().unwrap() {
+                            "legacy-github" => ReviewMonitorOutput::LegacyGithub(payload),
+                            "qualified" => ReviewMonitorOutput::Qualified(payload),
+                            other => panic!("invalid fixture origin {other}"),
+                        };
+                        output.project(host, recipient)
+                    })
+                    .collect();
+                (surface.clone(), json!(entries))
+            })
+            .collect::<serde_json::Map<String, Value>>()
+    };
+    for capabilities in [
+        json!({}),
+        json!(null),
+        json!({"reviewMonitoring": null}),
+        json!({"reviewMonitoring": false}),
+        json!({"reviewMonitoring": "1"}),
+        json!({"reviewMonitoring": 0}),
+        json!({"reviewMonitoring": -1}),
+        json!({"reviewMonitoring": 1.5}),
+    ] {
+        assert_eq!(json!(project(&enabled, capabilities)), golden["legacy"]);
+    }
+    let modern = json!({"reviewMonitoring": 1});
+    let actual = json!(project(&enabled, modern.clone()));
+    assert_eq!(actual, golden["qualified"]);
+    assert_eq!(
+        json!(project(&ReviewMonitoringCapabilities::default(), modern)),
+        golden["legacy"]
+    );
+    assert_eq!(
+        json!(project(&enabled, json!({"reviewMonitoring": 2}))),
+        actual
+    );
+
+    // Explicitly exercise the review regressions: colliding identity, unknown
+    // approvals, and no URL must survive unchanged ONLY for supported recipients.
+    assert_eq!(actual["list"][0]["prNumber"], actual["list"][1]["prNumber"]);
+    assert_eq!(actual["list"][0]["repo"], actual["list"][1]["repo"]);
+    assert_ne!(actual["list"][0]["url"], actual["list"][1]["url"]);
+    assert!(actual["list"][1]["lastSnapshot"]["approvals"]["have"].is_null());
+    assert!(actual["list"][2]["lastSnapshot"]["approvals"]["have"].is_null());
+    assert!(actual["wake"][1]["metadata"].get("url").is_none());
+    assert!(actual["missing-url"][0].get("url").is_none());
+    assert_eq!(golden["legacy"]["wake"].as_array().unwrap().len(), 1);
+    assert!(golden["legacy"]["unresolved"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // Optional source-bound oracle consumes actual Rust-projected output, not a
+    // handwritten JS filter. Normal core tests do not require Node or a FE tree.
+    if let Some(path) = std::env::var_os("REVIEW_MONITOR_PROJECTION_OUT") {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&json!({
+                "legacy": project(&enabled, json!({})),
+                "qualified": actual,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn proxy_or_other_session_support_cannot_upgrade_a_legacy_recipient() {
+    let host = ReviewMonitoringCapabilities {
+        review_monitoring: Some(1),
+    };
+    let supported =
+        ReviewMonitorRecipientSupport::from_capabilities(&json!({"reviewMonitoring":1}));
+    let old_session = ReviewMonitorRecipientSupport::default();
+    for recipient in [
+        old_session,
+        supported.intersect(old_session),
+        old_session.intersect(supported),
+    ] {
+        assert_eq!(
+            ReviewMonitorOutput::Qualified("private").project(&host, recipient),
+            None
+        );
+        assert_eq!(
+            ReviewMonitorOutput::LegacyGithub("unchanged").project(&host, recipient),
+            Some("unchanged")
+        );
+    }
+    assert_eq!(
+        ReviewMonitorOutput::Qualified("private").project(&host, supported.intersect(supported)),
+        Some("private")
+    );
+    // A fresh connection/session starts legacy; no previous receiver state is inherited.
+    assert_eq!(
+        ReviewMonitorOutput::Qualified("queued")
+            .project(&host, ReviewMonitorRecipientSupport::default()),
+        None
+    );
+}

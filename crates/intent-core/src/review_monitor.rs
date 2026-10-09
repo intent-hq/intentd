@@ -268,3 +268,69 @@ pub struct ReviewMonitorWakeMetadata {
     #[serde(flatten)]
     pub extension: ReviewMonitorExtension,
 }
+
+/// Per-recipient support, independent of host support and authorization.
+/// Construct from the current connection hello or trusted agent harness receipt,
+/// never an agent-authored request, another connection, or a persisted wake.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReviewMonitorRecipientSupport {
+    qualified_v1: bool,
+}
+
+impl ReviewMonitorRecipientSupport {
+    /// Forwarders must not substitute their support for an old downstream reader.
+    #[must_use]
+    pub const fn intersect(self, downstream: Self) -> Self {
+        Self {
+            qualified_v1: self.qualified_v1 && downstream.qualified_v1,
+        }
+    }
+
+    /// Parse only the negotiated capability object. Missing/malformed versions
+    /// fail closed; future integer versions promise the version-1 subset.
+    #[must_use]
+    pub fn from_capabilities(capabilities: &serde_json::Value) -> Self {
+        Self {
+            qualified_v1: capabilities
+                .get("reviewMonitoring")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|version| version >= 1),
+        }
+    }
+}
+
+/// Internal producer classification, not a wire field or caller-controlled tag.
+/// `LegacyGithub` means output from the UNCHANGED legacy GitHub producer, not a
+/// qualified GitHub observation stripped of resource/availability. Unresolved
+/// provenance, nullable qualified facts and every GitLab observation are Qualified.
+/// T is the whole output envelope, including body/URL/metadata on queued wakes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewMonitorOutput<T> {
+    LegacyGithub(T),
+    Qualified(T),
+}
+
+impl<T> ReviewMonitorOutput<T> {
+    /// Pure planned egress policy. No runtime route calls this declaration yet.
+    /// Apply after fresh authority admission, to every list entry, event, waiting
+    /// entry, direct response and entire wake/replay envelope. None means withhold,
+    /// never acknowledge delivery or erase durable ownership/pending changes.
+    /// Direct operations instead return the generic unsupported error before any
+    /// side effect; list/event projections omit withheld items. See protocol docs.
+    #[must_use]
+    pub fn project(
+        self,
+        host: &ReviewMonitoringCapabilities,
+        recipient: ReviewMonitorRecipientSupport,
+    ) -> Option<T> {
+        match self {
+            Self::LegacyGithub(payload) => Some(payload),
+            Self::Qualified(payload)
+                if host.supports_review_monitoring() && recipient.qualified_v1 =>
+            {
+                Some(payload)
+            }
+            Self::Qualified(_) => None,
+        }
+    }
+}
