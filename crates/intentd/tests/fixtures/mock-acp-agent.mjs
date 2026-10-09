@@ -458,6 +458,20 @@ async function handlePrompt(id, params) {
         ? { code: -32603, message: 'Internal error', data: { details: 'model unavailable' } }
         : sandboxRejection(sandboxMode, allowed) });
     }
+    if (policy.probePlanApproval) {
+      // PlanReviewReporter in pinned codex-acp 2.1.1 continues with the SAME
+      // agentMode after approval; this is not permission to escape its sandbox.
+      const approval = await callClientService('session/request_permission', {
+        sessionId: SESSION_ID,
+        toolCall: { toolCallId: 'plan-review:plan-1', title: 'Implement this plan?',
+          kind: 'switch_mode', status: 'pending', rawInput: { plan: 'Inspect the workspace.' } },
+        options: [
+          { optionId: 'implement_plan', name: 'Yes, implement this plan', kind: 'allow_once' },
+          { optionId: 'revise_plan', name: 'No, and tell Codex what to do differently', kind: 'reject_once' },
+        ],
+      });
+      if (approval.outcome?.optionId !== 'implement_plan') return result(id, { stopReason: 'refusal' });
+    }
     if (policy.probeRestrictions) {
       const permission = await callClientService('session/request_permission', {
         sessionId: SESSION_ID,

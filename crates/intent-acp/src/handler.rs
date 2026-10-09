@@ -216,7 +216,9 @@ impl ClientRequestHandler {
             &parsed,
         );
 
-        let policy = if crate::codex_sandbox::restricted(conn, parsed.session_id.0.as_ref()) {
+        let policy = if crate::codex_sandbox::restricted(conn, parsed.session_id.0.as_ref())
+            && !crate::codex_sandbox::is_plan_approval(&parsed)
+        {
             PermissionPolicy::DenyAll
         } else {
             self.policy

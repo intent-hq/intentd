@@ -208,15 +208,17 @@ command; signing in to the Claude desktop app does not sign in its CLI. For
 conversation history. Do not promise a model or provider switch unless the UI
 offers it; inspect **Settings → Providers** for setup problems.
 
-<!-- Sources: packages/intentd/crates/intent-acp/src/{codex_sandbox.rs,handler.rs}; packages/intentd/crates/intent-services/src/agent_session.rs. -->
+<!-- Sources: packages/intentd/crates/intent-acp/src/{codex_sandbox.rs,handler.rs,mcp_server.rs}; packages/intentd/crates/intent-services/src/agent_session.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/{file.rs,host.rs}. -->
 
 When Codex policy rejects full access before work starts, Intent retries with
 workspace write, then read-only, using only supported modes permitted by that
 policy. The chosen mode stays in effect for later prompts in the live session.
-Explicit stricter modes are never upgraded. Read-only permits inspection, not
-file edits; requests to escape the sandbox are denied. If no permitted mode is
-available, or work has already started, the response fails with details rather
-than replaying the work.
+Explicit stricter modes are never upgraded. Read-only restricts Codex's native
+tools and ACP file operations; Intent workspace tools run through the daemon
+with separate permissions and can still make changes. Sandbox escalation
+requests are denied, while plan approval keeps its usual permission behavior.
+If no permitted mode is available, or work has already started, the response
+fails with details rather than replaying the work.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{pi_cli.rs,agent_manager.rs,pi_mcp_wrapper.cmd}; packages/intentd/crates/intent-providers/src/config.rs. -->
 

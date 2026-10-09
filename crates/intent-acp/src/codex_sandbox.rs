@@ -4,7 +4,9 @@
 //! applies its `sandboxPolicy` on the NEXT prompt. A successful `set_mode` is not
 //! evidence that enterprise policy permits that mode.
 
-use agent_client_protocol::schema::v1::SessionModeState;
+use agent_client_protocol::schema::v1::{
+    PermissionOptionKind, RequestPermissionRequest, SessionModeState, ToolCallStatus, ToolKind,
+};
 
 use crate::{handshake::set_session_mode, AcpError, Connection};
 
@@ -166,14 +168,46 @@ pub async fn fallback(
     }
 }
 
-/// ACP permission requests ask to leave the adapter's sandbox. Never let the
-/// daemon's `AllowAll` policy silently approve those in a restricted Codex mode.
+/// Never let the daemon silently approve sandbox escalation in a restricted mode.
 pub(crate) fn restricted(conn: &Connection, session_id: &str) -> bool {
     conn.codex_sandboxes
         .lock()
         .unwrap()
         .get(session_id)
         .is_some_and(|s| s.current != Mode::Full)
+}
+
+/// codex-acp 2.1.1's `PlanReviewReporter` asks for plan approval through the same
+/// ACP method as sandbox escalation. Its `implement_plan` branch changes only
+/// collaboration mode and sends the next prompt with the SAME `agentMode`.
+/// Recognize that specific request; unknown requests remain denied.
+pub(crate) fn is_plan_approval(request: &RequestPermissionRequest) -> bool {
+    let call = &request.tool_call;
+    let fields = &call.fields;
+    fields.kind == Some(ToolKind::SwitchMode)
+        && fields.status == Some(ToolCallStatus::Pending)
+        && fields.title.as_deref() == Some("Implement this plan?")
+        && call
+            .tool_call_id
+            .0
+            .strip_prefix("plan-review:")
+            .is_some_and(|id| !id.is_empty())
+        && fields
+            .raw_input
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|input| {
+                input.len() == 1 && input.get("plan").is_some_and(serde_json::Value::is_string)
+            })
+        && request.options.len() == 2
+        && request.options.iter().any(|option| {
+            option.option_id.0.as_ref() == "implement_plan"
+                && option.kind == PermissionOptionKind::AllowOnce
+        })
+        && request.options.iter().any(|option| {
+            option.option_id.0.as_ref() == "revise_plan"
+                && option.kind == PermissionOptionKind::RejectOnce
+        })
 }
 
 pub(crate) fn read_only(conn: &Connection, session_id: &str) -> bool {
@@ -189,6 +223,45 @@ mod tests {
     use super::*;
     use crate::error::JsonRpcError;
     use serde_json::json;
+
+    #[test]
+    fn only_pinned_non_escalating_plan_request_keeps_configured_permissions() {
+        let request = json!({
+            "sessionId": "session",
+            "toolCall": {
+                "toolCallId": "plan-review:plan-1", "title": "Implement this plan?",
+                "kind": "switch_mode", "status": "pending",
+                "rawInput": {"plan": "Inspect the workspace."}
+            },
+            "options": [
+                {"optionId": "implement_plan", "name": "Yes, implement this plan", "kind": "allow_once"},
+                {"optionId": "revise_plan", "name": "No, and tell Codex what to do differently", "kind": "reject_once"}
+            ]
+        });
+        assert!(is_plan_approval(
+            &serde_json::from_value(request.clone()).unwrap()
+        ));
+        for (path, value) in [
+            ("/toolCall/kind", json!("execute")),
+            ("/toolCall/kind", json!("edit")),
+            ("/toolCall/toolCallId", json!("plan-review:")),
+            ("/toolCall/title", json!("Change sandbox mode?")),
+            (
+                "/toolCall/rawInput",
+                json!({"plan": "Plan", "command": "escape"}),
+            ),
+            ("/options/0/kind", json!("allow_always")),
+            ("/options/0/optionId", json!("allow_once")),
+            ("/options/1/optionId", json!("reject_once")),
+        ] {
+            let mut altered = request.clone();
+            *altered.pointer_mut(path).unwrap() = value;
+            assert!(
+                !is_plan_approval(&serde_json::from_value(altered).unwrap()),
+                "{path}"
+            );
+        }
+    }
 
     fn rejection(mode: Mode, allowed: &str) -> AcpError {
         AcpError::Rpc(JsonRpcError {

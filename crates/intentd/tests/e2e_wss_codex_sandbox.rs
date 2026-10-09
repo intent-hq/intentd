@@ -557,3 +557,27 @@ async fn output_during_mode_change_prevents_replay() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn workspace_fallback_keeps_non_escalating_plan_approval() {
+    scenario(
+        json!({"allowed":["workspace-write","read-only"],"probePlanApproval":true}),
+        "codex",
+        None,
+        &["agent-full-access", "workspace-write", "workspace-write"],
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn explicit_read_only_plan_approval_keeps_sandbox_restrictions() {
+    scenario(
+        json!({"allowed":["read-only"],"probePlanApproval":true,"probeRestrictions":true}),
+        "codex",
+        Some("read-only"),
+        &["read-only", "read-only"],
+        true,
+    )
+    .await;
+}
