@@ -1,0 +1,3 @@
+# Preserve exact diagnostic bytes without changing repository-wide text policy.
+/diagnostics/pi-native-tar-boundary-v1/** -text
+/.github/workflows/pi-native-tar-boundary-v1.yml -text
