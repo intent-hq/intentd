@@ -1,0 +1,3 @@
+# Preserve exact diagnostic bytes without changing repository-wide text policy.
+/diagnostics/pi-node-npm-selection-controls-v2/** -text
+/.github/workflows/pi-node-npm-selection-controls-v2.yml -text
