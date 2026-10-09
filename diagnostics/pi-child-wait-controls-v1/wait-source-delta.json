@@ -1,0 +1,25 @@
+{
+  "oldOwnerSha256": "30d0cb7a1236685ef2a21704ef2596269dd7bd64c17126b46635132e859d125c",
+  "candidateOwnerSha256": "e5ba2e8add3b904d4303460053a1d4c048ce0ab5e927252b87c03483b649cca1",
+  "ownerChanges": [
+    {
+      "old": "  public long retiredObservedMs=-1;public int observerLines;public volatile bool observerLineReady;\n",
+      "new": "  public long retiredObservedMs=-1;public int observerLines;public volatile bool observerLineReady;\n  public bool childWaitAttempted,childWaitReturned,childWaitHandlePresent;public uint childWaitResult;public int childWaitError;public string childWaitStage=\"not-run\";\n"
+    },
+    {
+      "old": "    long born,exited,kernel,user;r.childSignalledAfter=WaitForSingleObject(childHandle,0)==0;",
+      "new": "    long born,exited,kernel,user;\n    try {r.childWaitStage=\"after-reader-before-child-close\";r.childWaitHandlePresent=true;r.childWaitAttempted=true;}catch{}\n    uint childWaitResult=WaitForSingleObject(childHandle,0);\n    r.childSignalledAfter=childWaitResult==0;\n    // No intervening native call; SetLastError=true preserves this wait's error for WAIT_FAILED only.\n    try {r.childWaitError=childWaitResult==uint.MaxValue?Marshal.GetLastWin32Error():0;r.childWaitResult=childWaitResult;r.childWaitReturned=true;}catch{}"
+    }
+  ],
+  "ownerReverseExact": true,
+  "originalWaitCallsPreserved": true,
+  "originalZeroTimeoutPreserved": true,
+  "newNativeQueries": 0,
+  "newCachedErrorReadsOnFailedFinalWait": 1,
+  "nativeTerminationSignalCallsUnchanged": true,
+  "GateAndA25Unchanged": true,
+  "originalWrapperSha256": "ba15b7db97c43b168b36694bf516af67a82512bbe1957952f0948641e11c862d",
+  "candidateWrapperSha256": "2f0ec5be8bb19efa8a85a7aff6d0324c699a85b9ad2d90029d7f7e453b5d7a88",
+  "projection": "Add exact helper, one bounded per-native record field, and require valid metadata for overallPASS. Existing predicates/ownership/failure counts unchanged; no new signaled waiver.",
+  "unassembled": "Payload manifest/route/commit not generated; these candidate files are artifact-only and cannot pass current strict manifest."
+}

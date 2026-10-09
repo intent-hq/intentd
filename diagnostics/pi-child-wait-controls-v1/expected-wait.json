@@ -1,0 +1,8 @@
+[
+  "same-wait-expression-and-original-owner-preservation",
+  "fixed-result-mapping-and-strict-negative-sensitivity",
+  "not-run-partial-and-freshness",
+  "original-finalizer-transparency-and-bookkeeping-fault",
+  "owned-native-wait-and-error-discrimination",
+  "affected-whole-lifetime-evidence"
+]
