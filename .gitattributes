@@ -1,0 +1,3 @@
+# Preserve exact diagnostic bytes without changing repository-wide text policy.
+/diagnostics/pi-native-retired-parent-v1/** -text
+/.github/workflows/pi-native-retired-parent-v1.yml -text
