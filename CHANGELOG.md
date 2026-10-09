@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.35] - 2026-10-09
+
+### 🐛 Bug Fixes
+
+- Downscale images before provider delivery ([#2361](https://github.com/intent-hq/intentd/pull/2361))
+
+### 📚 Documentation
+
+- Explain image paste in question answers ([#2362](https://github.com/intent-hq/intentd/pull/2362))
+
+
 ## [0.10.34] - 2026-10-08
 
 ### 🚀 Features
