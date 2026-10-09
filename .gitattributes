@@ -1,0 +1,3 @@
+# Preserve exact diagnostic bytes without changing repository-wide text policy.
+/diagnostics/pi-capture-controls-v4/** -text
+/.github/workflows/pi-capture-controls-v4.yml -text

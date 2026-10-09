@@ -1,0 +1,16 @@
+[
+  "equal-pass",
+  "missing-known",
+  "extra-unknown",
+  "case-mismatch",
+  "directory-present",
+  "digest-mismatch",
+  "file-read-error",
+  "manifest-read-error",
+  "inventory-read-error",
+  "invalid-name",
+  "extra-truncated",
+  "unknown-fields-redacted",
+  "redacted-null-json-roundtrip",
+  "valid-digest-json-roundtrip"
+]
