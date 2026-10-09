@@ -1,0 +1,11 @@
+{
+  "context-controls.ps1": "904e9c9512c0a8129689a95cf96b16635c5da7105c9e6109cc47093b8fd61429",
+  "expected-controls.json": "4ed43b6afaa08a8ba69a9e439ed8c04ea9d8feb3e3448ec78b005fad959693f8",
+  "guard-functions.ps1": "0cb5edfa3489a9a35d20ebb92c1afbb857184424aff5a535f1c67fffa58e01f3",
+  "lower-evidence-functions.ps1": "9f0230a83cad9ccd34eec8b93ea072104ed7f1e79f31592c6378219a7d83a6fc",
+  "marked-suite.ps1": "58cca03055ad6691a003e30654f9f573523b77322530ff8a10ba97bcd1aef10d",
+  "original-guard-named.ps1": "1f982b3235ba926c4dd16803a4ba7413b79065686fd95e4b9b8ce3fd576207cc",
+  "original-guard.ps1": "7aaaddbab0dbb470f61f3acb244fd72a566f6c636c38804a22d6a7d17ca2ab68",
+  "original-suite.ps1": "42aa6f2eea2010d044c03151dae50eb1b27c164522c57998f475f911ea7d8ab8",
+  "run-controls.ps1": "90279f47132f68ba40eb81ff93bb534e581797d9a4eeb56eb854eebcd85631d7"
+}
