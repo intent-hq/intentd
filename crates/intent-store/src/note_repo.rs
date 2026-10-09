@@ -507,16 +507,19 @@ impl Store {
         id: &NoteId,
         expected_version: Option<i64>,
     ) -> Result<()> {
-        let mut conn = self
-            .write_pool()
-            .acquire()
-            .await
-            .map_err(|e| Error::Internal(format!("note delete connection: {e}")))?;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("note delete transaction: {e}")))?;
+        let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
         let result = async {
+            // Retain only the IDs detached by the legacy same-workspace trigger.
+            // Immediate deletion has no grace-path child cardinality limit.
+            let child_ids: Vec<String> = sqlx::query_scalar(
+                "SELECT id FROM note WHERE workspace_id=? AND parent_id=? AND id!=? ORDER BY id",
+            )
+            .bind(workspace_id.as_str())
+            .bind(id.as_str())
+            .bind(id.as_str())
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("note delete children: {e}")))?;
             let res = match expected_version {
                 Some(rev) => {
                     sqlx::query("DELETE FROM note WHERE id = ? AND workspace_id = ? AND rev = ?")
@@ -534,13 +537,22 @@ impl Store {
                     .await
                     .map_err(|e| Error::Internal(format!("delete note failed: {e}")))?,
             };
-            // The legacy delete trigger clears surviving children's parent IDs.
-            // Their metadata and read generations must commit with that rewrite.
-            crate::note_page_index::rebuild_pending(&mut conn).await?;
+            if res.rows_affected() > 0 {
+                crate::note_page_index::rebuild_pending(&mut conn).await?;
+                for child in child_ids {
+                    crate::note_annotation_repo::rebuild_note_anchors(
+                        &mut conn,
+                        workspace_id,
+                        &NoteId::from(child),
+                        None,
+                    )
+                    .await?;
+                }
+            }
             Ok(res)
         }
         .await;
-        let res = crate::commit_with_rollback_guard(conn, result, "commit note delete").await?;
+        let res = conn.finish(result, "commit note delete").await?;
         if res.rows_affected() == 0 {
             // Re-read by composite key: a present row means the
             // `expected_version` gate failed (conflict, carrying the current

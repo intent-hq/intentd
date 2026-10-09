@@ -14,6 +14,7 @@ use std::sync::{
 mod anchor_lifecycle;
 mod delete_grace;
 mod guarded_metadata;
+mod immediate_delete;
 mod plain_markdown;
 mod writer_anchors;
 
