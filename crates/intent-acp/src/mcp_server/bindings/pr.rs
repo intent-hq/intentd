@@ -12,6 +12,11 @@
 //! spelling never selects a provider. Both exist independently of remotes,
 //! and both currently use the same GitHub observation backend.
 //!
+//! Planned addressed arguments are declared by `intent_core::review_monitor`.
+//! Do not add them to runtime help or forward them to a legacy method until
+//! the addressed service path and original-caller admission are implemented.
+//! This module deliberately keeps the shipped aliases and feature gate intact.
+//!
 //! Monitors are agent-owned, so `pr.monitor` / `pr.unmonitor` / `pr.monitors`
 //! require an agent caller context (mirroring `ws.hook.schedule`): the FE
 //! front door manages monitors through the `prMonitor.*` wire methods.
