@@ -58,7 +58,8 @@ impl LiveFixture {
         .unwrap();
         let owner = RepositoryContextOwner::bind(
             base.auth.service.clone(),
-            RepositoryReadOwner::capture(base.auth.service.clone()),
+            RepositoryReadOwner::capture(base.auth.service.clone())
+                .map(RepositoryReadOwner::with_review_monitoring),
             &physical,
         )
         .unwrap();
@@ -247,7 +248,8 @@ async fn live_context_original_allocation_epoch_invalidation_and_checked_overflo
     let foreign = Arc::new(f.base.auth.service.as_ref().clone());
     assert!(RepositoryContextOwner::bind(
         foreign,
-        RepositoryReadOwner::capture(f.base.auth.service.clone()),
+        RepositoryReadOwner::capture(f.base.auth.service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &f.physical
     )
     .is_err());
@@ -268,7 +270,8 @@ async fn live_context_original_allocation_epoch_invalidation_and_checked_overflo
     );
     let separate = RepositoryContextOwner::bind(
         f.base.auth.service.clone(),
-        RepositoryReadOwner::capture(f.base.auth.service.clone()),
+        RepositoryReadOwner::capture(f.base.auth.service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &f.physical,
     )
     .unwrap();
@@ -526,7 +529,8 @@ async fn live_context_foreign_domain_pending_wire_and_physical_loss_never_gain_o
     let other = LiveFixture::new(&other_http).await;
     assert!(RepositoryContextOwner::bind(
         f.base.auth.service.clone(),
-        RepositoryReadOwner::capture(f.base.auth.service.clone()),
+        RepositoryReadOwner::capture(f.base.auth.service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &other.physical
     )
     .is_err());
@@ -557,7 +561,8 @@ async fn live_context_foreign_domain_pending_wire_and_physical_loss_never_gain_o
         .unwrap();
     assert!(RepositoryContextOwner::bind(
         f.base.auth.service.clone(),
-        RepositoryReadOwner::capture(f.base.auth.service.clone()),
+        RepositoryReadOwner::capture(f.base.auth.service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &f.physical
     )
     .is_err());

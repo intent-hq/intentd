@@ -120,9 +120,20 @@ impl ActualRead {
     }
 
     pub(crate) fn context(&self) -> RepositoryCallbackContext {
-        self.owner
+        self.owner.callback().with_read_owner(
+            RepositoryReadOwner::capture(self.auth.service.clone())
+                .map(RepositoryReadOwner::with_review_monitoring),
+        )
+    }
+
+    fn legacy_server(&self) -> WorkspaceMcpServer {
+        let context = self
+            .owner
             .callback()
-            .with_read_owner(RepositoryReadOwner::capture(self.auth.service.clone()))
+            .with_read_owner(RepositoryReadOwner::capture(self.auth.service.clone()));
+        WorkspaceMcpServer::new(self.api(), self.git.workspace.id.clone())
+            .with_caller_agent_id(Some(self.agent.clone()))
+            .with_request_context(Arc::new(context))
     }
 
     pub(crate) fn server(&self) -> WorkspaceMcpServer {
@@ -161,6 +172,9 @@ impl WorkspaceApi for TestReadApi {
         let captured = CapturedReview::capture(&self.0, workspace, number);
         Box::pin(async move {
             match captured.read(&self.0).await.map_err(|_| refused())? {
+                ReadOutcome::Unsupported => Err(intent_core::Error::Unsupported(
+                    "Addressed review monitoring unavailable".into(),
+                )),
                 ReadOutcome::Github(repo) => {
                     Ok(json!({"ordinary":format!("{}/{}",repo.owner,repo.name)}))
                 }
@@ -187,6 +201,57 @@ pub(crate) async fn run(server: &WorkspaceMcpServer, code: &str) -> Value {
 }
 
 #[intent_test_macros::daemon_test]
+async fn review_monitor_routing_unsupported_recipient_refuses_before_provider_read() {
+    for namespace in ["pr", "mr"] {
+        for selector in ["", ", { gitRootId: 'foreign-root' }"] {
+            let provider = ReadServer::new().await;
+            let f = ActualRead::new(&provider).await;
+            let before = provider.count();
+            let reply = run(
+                &f.legacy_server(),
+                &format!("return await ws.{namespace}.snapshot(4{selector});"),
+            )
+            .await;
+            assert_eq!(
+                provider.count(),
+                before,
+                "unsupported recipient must not cause a qualified read: {reply}"
+            );
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            assert!(reply
+                .to_string()
+                .contains("Addressed review monitoring unavailable"));
+            assert!(!reply.to_string().contains("actual review"));
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_routing_explicit_target_never_falls_back_to_selected_root() {
+    for namespace in ["pr", "mr"] {
+        let provider = ReadServer::new().await;
+        let f = ActualRead::new(&provider).await;
+        let before = provider.count();
+        let target = json!({
+            "repository": { "provider": "gitlab", "instanceBaseUrl":
+                provider.fixture.descriptor.instance().as_str(), "projectPath": "other/nested/project" },
+            "kind": "merge-request", "number": 4,
+        });
+        let reply = run(
+            &f.legacy_server(),
+            &format!("return await host({{method:'{namespace}.snapshot',args:{{prNumber:4,target:{target}}}}});"),
+        ).await;
+        assert_eq!(
+            provider.count(),
+            before,
+            "explicit target was ignored: {reply}"
+        );
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert!(!reply.to_string().contains("actual review"));
+    }
+}
+
+#[intent_test_macros::daemon_test]
 async fn actual_native_read_uses_original_member_git_file_http_and_both_transfers() {
     let server = ReadServer::new().await;
     let f = ActualRead::new(&server).await;
@@ -199,6 +264,721 @@ async fn actual_native_read_uses_original_member_git_file_http_and_both_transfer
         std::fs::read(f.auth.service.gitlab_secret_store.path()).unwrap()
     );
     assert!(!reply.to_string().contains("stored-pat"));
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_routing_explicit_gitlab_snapshot_without_remote_uses_both_aliases() {
+    let provider = ReadServer::new().await;
+    let f = ActualRead::new(&provider).await;
+    f.git.git(&f.git.path, &["remote", "remove", "origin"]);
+    let target = json!({
+        "repository": { "provider": "gitlab", "instanceBaseUrl":
+            provider.fixture.descriptor.instance().as_str(), "projectPath": "group/project" },
+        "kind": "merge-request", "number": 4,
+    });
+    for namespace in ["pr", "mr"] {
+        let reply = run(
+            &f.server(),
+            &format!("return await ws.{namespace}.snapshot(4,{{target:{target}}});"),
+        )
+        .await;
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert!(reply.to_string().contains("actual review"), "{reply}");
+        assert!(reply.to_string().contains("merge-request"), "{reply}");
+    }
+    let implicit = run(&f.server(), "return await ws.mr.snapshot(4);").await;
+    assert_eq!(
+        implicit["result"]["isError"], true,
+        "per-call target changed defaults: {implicit}"
+    );
+}
+
+fn routing_json(reply: &Value) -> Value {
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_registration_aliases_share_record_and_cancel_captured_target() {
+    let provider = ReadServer::new().await;
+    let f = ActualRead::new(&provider).await;
+    f.auth
+        .registry
+        .apply(&[
+            ("workspaceApi.toonOutput".into(), json!(false)),
+            ("workspaceApi.maxOutputChars".into(), json!(0)),
+        ])
+        .unwrap();
+    let target = json!({
+        "repository": { "provider": "gitlab", "instanceBaseUrl":
+            provider.fixture.descriptor.instance().as_str(), "projectPath": "group/project" },
+        "kind": "merge-request", "number": 4,
+    });
+    let first = routing_json(
+        &run(
+            &f.server(),
+            &format!("return await ws.pr.monitor(4,{{target:{target}}});"),
+        )
+        .await,
+    );
+    let second = routing_json(
+        &run(
+            &f.server(),
+            &format!("return await ws.mr.monitor(4,{{target:{target}}});"),
+        )
+        .await,
+    );
+    assert_eq!(first["ok"], true);
+    assert_eq!(
+        first["monitor"]["monitorId"],
+        second["monitor"]["monitorId"]
+    );
+    assert_eq!(first["monitor"]["resource"], target);
+    assert_eq!(
+        first["monitor"]["lastSnapshot"]["availability"]["checks"],
+        "available"
+    );
+    assert!(!first.to_string().contains("monitorBinding"));
+    f.git.git(
+        &f.git.path,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/group/project.git",
+        ],
+    );
+    let before = provider.count();
+    let listed = routing_json(&run(&f.server(), "return await ws.mr.monitors();").await);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["resource"], target);
+    let cancelled = routing_json(
+        &run(
+            &f.server(),
+            &format!("return await ws.mr.unmonitor(4,{{target:{target}}});"),
+        )
+        .await,
+    );
+    assert_eq!(
+        cancelled["monitor"]["monitorId"],
+        first["monitor"]["monitorId"]
+    );
+    assert_eq!(cancelled["monitor"]["state"], "cancelled");
+    assert_eq!(
+        provider.count(),
+        before,
+        "listing/cancellation must not fetch the provider"
+    );
+    let id = intent_core::PrMonitorId::from(first["monitor"]["monitorId"].as_str().unwrap());
+    let stored = f
+        .auth
+        .service
+        .store
+        .get_qualified_pr_monitor(&id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        stored.target(),
+        intent_store::PersistedMonitorTarget::Resolved { .. }
+    ));
+    assert!(stored
+        .monitor()
+        .last_snapshot
+        .as_ref()
+        .unwrap()
+        .contains("monitorBinding"));
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_registration_legacy_recipient_has_no_effects_or_owner_disclosure() {
+    let provider = ReadServer::new().await;
+    let f = ActualRead::new(&provider).await;
+    for namespace in ["pr", "mr"] {
+        for method in ["monitor", "unmonitor"] {
+            let reply = run(
+                &f.legacy_server(),
+                &format!("return await ws.{namespace}.{method}(4);"),
+            )
+            .await;
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            assert!(
+                reply
+                    .to_string()
+                    .contains("Addressed review monitoring unavailable"),
+                "{reply}"
+            );
+            assert!(!reply.to_string().contains("ownerAgentId"));
+        }
+    }
+    assert_eq!(provider.count(), 0);
+    assert!(f
+        .auth
+        .service
+        .store
+        .list_pr_monitors_by_agent(&f.agent)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+fn routing_options(f: &ActualRead) {
+    f.auth
+        .registry
+        .apply(&[
+            ("workspaceApi.toonOutput".into(), json!(false)),
+            ("workspaceApi.maxOutputChars".into(), json!(0)),
+        ])
+        .unwrap();
+}
+
+async fn routing_actor(
+    f: &ActualRead,
+    parent: Option<&AgentId>,
+) -> (AgentId, RepositoryPhysicalOwner, WorkspaceMcpServer) {
+    let id = AgentId::new();
+    let session: AgentSession = serde_json::from_value(json!({
+        "id":id,"workspaceId":f.git.workspace.id,"name":"routing-contender",
+        "parentAgentId":parent,"status":"active","createdAt":"2026-10-09T00:00:00Z",
+        "updatedAt":"2026-10-09T00:00:00Z"
+    }))
+    .unwrap();
+    let services = &f.auth.service;
+    services.store.insert_agent_session(&session).await.unwrap();
+    let registry = services.repository_lifecycle_registry().await.unwrap();
+    let owner = RepositoryCreationOwner::allocate(
+        &registry,
+        &services.store,
+        f.git.workspace.id.clone(),
+        id.clone(),
+        RepositoryCreationIntent::FirstSet,
+    )
+    .unwrap()
+    .initialize(&services.store, || async {
+        Ok("routing ACP fixture".into())
+    })
+    .await
+    .unwrap();
+    let context = owner.callback().with_read_owner(
+        RepositoryReadOwner::capture(services.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
+    );
+    let server = WorkspaceMcpServer::new(f.api(), f.git.workspace.id.clone())
+        .with_caller_agent_id(Some(id.clone()))
+        .with_request_context(Arc::new(context));
+    (id, owner, server)
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_registration_live_owner_refusal_then_orphan_or_parent_adoption() {
+    for parent_takeover in [false, true] {
+        let provider = ReadServer::new().await;
+        let f = ActualRead::new(&provider).await;
+        routing_options(&f);
+        let (child, _physical, endpoint) =
+            routing_actor(&f, parent_takeover.then_some(&f.agent)).await;
+        let first = routing_json(&run(&endpoint, "return await ws.mr.monitor(4);").await);
+        let before = provider.count();
+        let refusal = routing_json(&run(&f.server(), "return await ws.pr.monitor(4);").await);
+        assert_eq!(refusal["refused"], true, "{refusal}");
+        assert_eq!(refusal["ownerAgentId"], json!(child));
+        assert_eq!(refusal["resource"], first["monitor"]["resource"]);
+        assert_eq!(
+            provider.count(),
+            before,
+            "live-owner refusal must not fetch"
+        );
+        let status = if parent_takeover {
+            intent_core::AgentStatus::RuntimeIdle
+        } else {
+            intent_core::AgentStatus::Error
+        };
+        f.auth
+            .service
+            .store
+            .set_agent_session_status(
+                &f.git.workspace.id,
+                &child,
+                status,
+                false,
+                "2026-10-09T00:01:00Z",
+                None,
+            )
+            .await
+            .unwrap();
+        let adopted = routing_json(&run(&f.server(), "return await ws.pr.monitor(4);").await);
+        assert_eq!(adopted["ok"], true, "{adopted}");
+        assert_eq!(adopted["adoptedFrom"], json!(child));
+        assert_eq!(
+            adopted["monitor"]["monitorId"],
+            first["monitor"]["monitorId"]
+        );
+        assert!(
+            routing_json(&run(&endpoint, "return await ws.mr.monitors();").await)
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let stopped = routing_json(&run(&f.server(), "return await ws.mr.unmonitor(4);").await);
+        assert_eq!(stopped["ok"], true);
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_registration_changes_during_provider_await_leave_no_registration() {
+    for retire_original in [false, true] {
+        let provider = ReadServer::new().await;
+        let f = ActualRead::new(&provider).await;
+        routing_options(&f);
+        provider.pause(MR);
+        let endpoint = f.server();
+        let pending =
+            tokio::spawn(async move { run(&endpoint, "return await ws.mr.monitor(4);").await });
+        provider.entered().await;
+        if retire_original {
+            f.owner.retirement().retire();
+        } else {
+            f.git.git(
+                &f.git.path,
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://gitlab.test/forge/other/project.git",
+                ],
+            );
+        }
+        provider.resume();
+        let reply = pending.await.unwrap();
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert!(!reply.to_string().contains("actual review"), "{reply}");
+        assert!(f
+            .auth
+            .service
+            .store
+            .list_pr_monitors_by_agent(&f.agent)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_registration_feature_off_raw_dispatch_has_no_effects() {
+    let provider = ReadServer::new().await;
+    let f = ActualRead::new(&provider).await;
+    f.auth
+        .registry
+        .apply(&[("agentFeatures.prMonitor".into(), json!(false))])
+        .unwrap();
+    let endpoint =
+        f.server()
+            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings {
+                pr_monitor: false,
+                ..Default::default()
+            });
+    for namespace in ["pr", "mr"] {
+        for method in ["monitor", "unmonitor", "monitors"] {
+            let reply = run(&endpoint, &format!(
+                "return await host({{method:'{namespace}.{method}',args:{{prNumber:4,gitRootId:'missing'}}}});"
+            )).await;
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            assert!(!reply.to_string().contains("ownerAgentId"));
+        }
+    }
+    assert_eq!(provider.count(), 0);
+    assert!(f
+        .auth
+        .service
+        .store
+        .list_pr_monitors_by_agent(&f.agent)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_registration_quota_defers_baseline_but_retains_private_target() {
+    let provider = ReadServer::new().await;
+    let f = ActualRead::new(&provider).await;
+    routing_options(&f);
+    provider.status(MR, 429);
+    let registered = routing_json(&run(&f.server(), "return await ws.mr.monitor(4);").await);
+    assert_eq!(registered["ok"], true);
+    assert!(registered["requirements"].is_null());
+    assert!(registered["monitor"]["lastSnapshot"].is_null());
+    assert!(registered["pausedUntil"].is_string());
+    assert_eq!(
+        registered["monitor"]["pausedUntil"],
+        registered["pausedUntil"]
+    );
+    assert!(!registered.to_string().contains("monitorBinding"));
+    assert!(
+        f.auth.service.sweep_rate_limit_paused_until().is_none(),
+        "GitLab quota must not pause GitHub"
+    );
+    let rows = f
+        .auth
+        .service
+        .store
+        .list_pr_monitors_by_agent(&f.agent)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].last_polled_at.is_none());
+    let private: Value = serde_json::from_str(rows[0].last_snapshot.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        private["monitorBinding"]["resource"],
+        registered["monitor"]["resource"]
+    );
+    let before = provider.count();
+    let stopped = routing_json(&run(&f.server(), "return await ws.pr.unmonitor(4);").await);
+    assert_eq!(stopped["ok"], true);
+    assert_eq!(provider.count(), before);
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_registration_cap_allows_same_record_but_refuses_new_target_before_read() {
+    let provider = ReadServer::new().await;
+    let f = ActualRead::new(&provider).await;
+    routing_options(&f);
+    f.auth
+        .registry
+        .apply(&[("prMonitor.maxPerAgent".into(), json!(1))])
+        .unwrap();
+    let first = routing_json(&run(&f.server(), "return await ws.mr.monitor(4);").await);
+    let rearmed = routing_json(&run(&f.server(), "return await ws.pr.monitor(4);").await);
+    assert_eq!(
+        rearmed["monitor"]["monitorId"],
+        first["monitor"]["monitorId"]
+    );
+    let before = provider.count();
+    let refused = run(&f.server(), "return await ws.mr.monitor(5);").await;
+    assert_eq!(refused["result"]["isError"], true);
+    assert!(refused.to_string().contains("max 1"), "{refused}");
+    assert_eq!(provider.count(), before);
+    let rows = routing_json(&run(&f.server(), "return await ws.pr.monitors();").await);
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["monitorId"], first["monitor"]["monitorId"]);
+}
+
+async fn routing_registered_root(f: &ActualRead) -> (GitFixture, intent_core::WorkspaceGitRootId) {
+    let root = GitFixture::new().await;
+    root.git(
+        &root.path,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://gitlab.test/forge/group/project.git",
+        ],
+    );
+    let id = intent_core::WorkspaceGitRootId::new();
+    let record: intent_core::WorkspaceGitRoot = serde_json::from_value(json!({
+        "id":id,"workspaceId":f.git.workspace.id,"path":root.path.to_str().unwrap(),
+        "source":"agent","registeredByAgentIds":[f.agent],
+        "createdAt":"2026-10-09T00:00:00Z","updatedAt":"2026-10-09T00:00:00Z"
+    }))
+    .unwrap();
+    f.auth
+        .service
+        .store
+        .upsert_workspace_git_root(&record)
+        .await
+        .unwrap();
+    (root, id)
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_routing_registered_root_observes_only_its_own_selection() {
+    for change_selected_root in [false, true] {
+        let provider = ReadServer::new().await;
+        let f = ActualRead::new(&provider).await;
+        routing_options(&f);
+        let (_repo, root_id) = routing_registered_root(&f).await;
+        provider.pause(MR);
+        let endpoint = f.server();
+        let code = format!("return await ws.mr.monitor(4,{{gitRootId:'{root_id}'}});");
+        let pending = tokio::spawn(async move { run(&endpoint, &code).await });
+        provider.entered().await;
+        let root = RepositoryRootId {
+            workspace_id: f.git.workspace.id.clone(),
+            kind: if change_selected_root {
+                RepositoryRootKind::Registered {
+                    git_root_id: root_id,
+                }
+            } else {
+                RepositoryRootKind::Primary
+            },
+        };
+        let before = f
+            .auth
+            .service
+            .store
+            .repository_selection_snapshot(&root)
+            .await
+            .unwrap();
+        f.auth
+            .service
+            .store
+            .write_repository_selection(
+                &before,
+                intent_store::RepositorySelectionChange::ExplicitRemote {
+                    remote_name: "origin".into(),
+                },
+            )
+            .await
+            .result
+            .unwrap();
+        provider.resume();
+        let reply = pending.await.unwrap();
+        if change_selected_root {
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            assert!(f
+                .auth
+                .service
+                .store
+                .list_pr_monitors_by_agent(&f.agent)
+                .await
+                .unwrap()
+                .is_empty());
+        } else {
+            let body = routing_json(&reply);
+            assert_eq!(body["ok"], true);
+            assert_eq!(
+                body["monitor"]["resource"]["repository"]["projectPath"],
+                "group/project"
+            );
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_routing_nested_project_port_and_prefix_are_captured_exactly() {
+    let instance = "https://gitlab.test:8443/scm";
+    let provider = ReadServer::at_instance(instance).await;
+    let f = ActualRead::new(&provider).await;
+    routing_options(&f);
+    let project = "Team/Nested/project";
+    let url = format!("{instance}/{project}/-/merge_requests/4");
+    {
+        let mut bodies = provider.replies.bodies.lock().unwrap();
+        bodies.insert(
+            "/api/v4/projects/Team%2FNested%2Fproject".into(),
+            json!({
+                "id":55,"path_with_namespace":project,"only_allow_merge_if_pipeline_succeeds":false,
+                "only_allow_merge_if_all_discussions_are_resolved":false
+            }),
+        );
+        bodies.insert("/api/v4/projects/Team%2FNested%2Fproject/merge_requests/4".into(), json!({
+            "iid":4,"web_url":url,"title":"nested review","state":"opened","draft":false,
+            "source_branch":"feature","target_branch":"main","source_project_id":55,"target_project_id":55,
+            "created_at":"2026-09-27T00:00:00Z","updated_at":"2026-09-27T00:00:00Z"
+        }));
+    }
+    let target = json!({"repository":{"provider":"gitlab","instanceBaseUrl":instance,"projectPath":project},"kind":"merge-request","number":4});
+    let created = routing_json(
+        &run(
+            &f.server(),
+            &format!("return await ws.pr.monitor(4,{{target:{target}}});"),
+        )
+        .await,
+    );
+    assert_eq!(created["monitor"]["resource"], target);
+    assert_eq!(created["monitor"]["url"], url);
+    assert_eq!(created["monitor"]["repo"], project);
+    let before = provider.count();
+    for wrong_instance in [
+        "https://gitlab.test/scm",
+        "https://gitlab.test:8443",
+        "https://gitlab.test:8444/scm",
+    ] {
+        let mut wrong = target.clone();
+        wrong["repository"]["instanceBaseUrl"] = json!(wrong_instance);
+        let reply = run(
+            &f.server(),
+            &format!("return await ws.mr.monitor(4,{{target:{wrong}}});"),
+        )
+        .await;
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert!(!reply.to_string().contains("ownerAgentId"));
+    }
+    assert_eq!(
+        provider.count(),
+        before,
+        "other instances must not use this account"
+    );
+    assert_eq!(
+        f.auth
+            .service
+            .store
+            .list_pr_monitors_by_agent(&f.agent)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_routing_native_unqualified_controls_refuse_before_effects() {
+    let provider = ReadServer::new().await;
+    let f = ActualRead::new(&provider).await;
+    routing_options(&f);
+    let first = routing_json(&run(&f.server(), "return await ws.mr.monitor(4);").await);
+    let id = intent_core::PrMonitorId::from(first["monitor"]["monitorId"].as_str().unwrap());
+    let before = provider.count();
+    let listed = f
+        .auth
+        .service
+        .pr_monitor_list(f.git.workspace.id.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(listed, json!({"monitors":[]}));
+    for check in [false, true] {
+        let error = f
+            .auth
+            .service
+            .pr_monitor_flush_pending(f.git.workspace.id.clone(), id.clone(), check)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Addressed review monitoring unavailable"));
+    }
+    let error = f
+        .auth
+        .service
+        .pr_monitor_cancel_by_id(f.git.workspace.id.clone(), id.clone())
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Addressed review monitoring unavailable"));
+    assert_eq!(provider.count(), before);
+    assert_eq!(
+        f.auth
+            .service
+            .store
+            .get_pr_monitor(&id)
+            .await
+            .unwrap()
+            .state,
+        intent_core::PrMonitorState::Active
+    );
+    assert_eq!(
+        routing_json(&run(&f.server(), "return await ws.pr.unmonitor(4);").await)["ok"],
+        true
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_producer_fixture_preserves_availability_nulls_and_omissions() {
+    let provider = ReadServer::new().await;
+    let f = ActualRead::new(&provider).await;
+    routing_options(&f);
+    provider.status(&format!("{MR}/approvals"), 403);
+    let registered = routing_json(&run(&f.server(), "return await ws.mr.monitor(4);").await);
+    let listed = routing_json(&run(&f.server(), "return await ws.pr.monitors();").await);
+    assert_eq!(listed[0], registered["monitor"]);
+    assert_eq!(listed[0]["monitorAvailability"]["state"], "available");
+    assert_eq!(
+        listed[0]["lastSnapshot"]["availability"]["approvals"],
+        "restricted"
+    );
+    assert!(listed[0]["lastSnapshot"]["approvals"]["have"].is_null());
+    assert!(listed[0]["lastSnapshot"]["approvals"]
+        .get("needed")
+        .is_none());
+    assert!(listed[0].get("pausedUntil").is_none());
+    assert_eq!(listed[0]["lastSnapshot"]["checks"]["failingRequired"], 0);
+    assert_eq!(listed[0]["lastSnapshot"]["checks"]["pendingRequired"], 0);
+    assert_eq!(
+        registered["requirements"]["checks"]["failingRequired"],
+        json!([])
+    );
+    assert_eq!(
+        registered["requirements"]["checks"]["pendingRequired"],
+        json!([])
+    );
+    let fixture = json!({"registered":registered,"listed":listed});
+    assert!(!fixture.to_string().contains("monitorBinding"));
+    println!("ROUTING_PRODUCER_FIXTURE={fixture}");
+}
+
+async fn routing_pipeline_fixture(provider: &ReadServer, restricted: bool) -> ActualRead {
+    let f = ActualRead::new(provider).await;
+    routing_options(&f);
+    let jobs = "/api/v4/projects/42/pipelines/18/jobs?page=1&per_page=100";
+    {
+        let mut bodies = provider.replies.bodies.lock().unwrap();
+        bodies.insert(
+            PROJECT.into(),
+            json!({"id":42,"path_with_namespace":"group/project",
+            "only_allow_merge_if_pipeline_succeeds":true,
+            "only_allow_merge_if_all_discussions_are_resolved":false}),
+        );
+        bodies.insert(MR.into(), json!({"iid":4,"web_url":"https://gitlab.test/forge/group/project/-/merge_requests/4",
+            "title":"pipeline review","state":"opened","draft":false,"source_branch":"feature","target_branch":"main",
+            "source_project_id":42,"target_project_id":42,"created_at":"2026-09-27T00:00:00Z","updated_at":"2026-09-27T00:00:00Z",
+            "head_pipeline":{"id":18,"project_id":42,"status":"failed"}}));
+        bodies.insert(
+            jobs.into(),
+            json!([
+                {"name":"failed required","status":"failed","allow_failure":false},
+                {"name":"pending required","status":"running","allow_failure":false},
+                {"name":"optional failure","status":"failed","allow_failure":true}
+            ]),
+        );
+    }
+    if restricted {
+        provider.status(jobs, 403);
+    }
+    f
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_producer_counts_required_checks_without_changing_rich_snapshot() {
+    let provider = ReadServer::new().await;
+    let f = routing_pipeline_fixture(&provider, false).await;
+    let registered = routing_json(&run(&f.server(), "return await ws.mr.monitor(4);").await);
+    let listed = routing_json(&run(&f.server(), "return await ws.pr.monitors();").await);
+    assert_eq!(listed[0], registered["monitor"]);
+    let full = &registered["requirements"]["checks"];
+    assert_eq!(
+        full["failingRequired"],
+        json!(["GitLab pipeline", "failed required"])
+    );
+    assert_eq!(full["pendingRequired"], json!(["pending required"]));
+    let summary = &listed[0]["lastSnapshot"]["checks"];
+    assert_eq!(summary["failingRequired"], 2);
+    assert_eq!(summary["pendingRequired"], 1);
+    assert!(summary.get("items").is_none());
+    assert!(!registered.to_string().contains("monitorBinding"));
+}
+
+#[intent_test_macros::daemon_test]
+async fn review_monitor_producer_keeps_unavailable_check_counts_null() {
+    let provider = ReadServer::new().await;
+    let f = routing_pipeline_fixture(&provider, true).await;
+    let registered = routing_json(&run(&f.server(), "return await ws.mr.monitor(4);").await);
+    let listed = routing_json(&run(&f.server(), "return await ws.pr.monitors();").await);
+    assert_eq!(listed[0], registered["monitor"]);
+    assert_eq!(
+        listed[0]["lastSnapshot"]["availability"]["checks"],
+        "restricted"
+    );
+    for field in [
+        "total",
+        "passed",
+        "failed",
+        "pending",
+        "failingRequired",
+        "pendingRequired",
+    ] {
+        assert_eq!(listed[0]["lastSnapshot"]["checks"][field], Value::Null);
+        assert_eq!(registered["requirements"]["checks"][field], Value::Null);
+    }
+    assert_eq!(listed[0]["lastSnapshot"]["checks"]["requiredKnown"], false);
 }
 
 #[intent_test_macros::daemon_test]
@@ -382,6 +1162,15 @@ async fn mcp_delivery_optional_context_cannot_disclose_denied_snapshot_over_tcp(
 
     let http = ReadServer::new().await;
     let f = LiveFixture::new(&http).await;
+    // Keep the original final-delivery regression behind an explicitly capable
+    // test recipient. Production harnesses remain unqualified in this wave.
+    let owner = crate::repository_context_live::RepositoryContextOwner::bind(
+        f.base.auth.service.clone(),
+        RepositoryReadOwner::capture(f.base.auth.service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
+        &f.physical,
+    )
+    .unwrap();
     let server = WorkspaceMcpServer::new(
         Arc::new(DenyProjectAfterRead {
             services: f.base.auth.service.clone(),
@@ -391,14 +1180,14 @@ async fn mcp_delivery_optional_context_cannot_disclose_denied_snapshot_over_tcp(
         f.session.workspace_id.clone(),
     )
     .with_caller_agent_id(Some(f.session.id.clone()))
-    .with_request_context(f.owner.mcp_context())
-    .with_repository_guidance(&f.session, f.owner.guidance_source());
+    .with_request_context(owner.mcp_context())
+    .with_repository_guidance(&f.session, owner.guidance_source());
     let reply = tcp(
         server,
         "const a=await ws.pr.snapshot(4); try {await ws.pr.snapshot(5);} catch(e) {} return a;",
     )
     .await;
-    f.owner.drain_jobs().await;
+    owner.drain_jobs().await;
     assert!(!reply.to_string().contains("actual review"), "{reply}");
     assert!(!reply.to_string().contains(FACTS), "{reply}");
     assert!(
@@ -421,7 +1210,7 @@ async fn mcp_delivery_optional_context_cannot_disclose_denied_snapshot_over_tcp(
 
 #[intent_test_macros::daemon_test]
 async fn ambiguous_unmapped_and_missing_anchor_discovery_never_acquire_or_disclose() {
-    for mode in ["ambiguous", "unmapped", "missing-anchor"] {
+    for mode in ["ambiguous", "unmapped", "no-remote", "missing-anchor"] {
         let server = ReadServer::new().await;
         let f = ActualRead::new(&server).await;
         if mode == "ambiguous" {
@@ -445,21 +1234,41 @@ async fn ambiguous_unmapped_and_missing_anchor_discovery_never_acquire_or_disclo
                 ],
             );
         }
+        if mode == "no-remote" {
+            f.git.git(&f.git.path, &["remote", "remove", "origin"]);
+        }
         let mut endpoint = f.server();
         if mode == "missing-anchor" {
             endpoint = WorkspaceMcpServer::new(f.auth.service.clone(), f.git.workspace.id.clone())
                 .with_caller_agent_id(Some(f.agent.clone()))
                 .with_request_context(Arc::new(f.owner.callback()));
         }
-        let reply = run(
-            &endpoint,
-            "try { return await ws.pr.snapshot(4); } catch(e) { return e.message; }",
-        )
-        .await;
-        assert!(reply.to_string().contains(REFUSAL), "{reply}");
-        assert_eq!(server.count(), 0);
-        assert!(!reply.to_string().contains("private/hidden"));
-        assert!(!reply.to_string().contains(f.git.path.to_str().unwrap()));
+        for namespace in ["pr", "mr"] {
+            for action in ["snapshot", "monitor", "unmonitor"] {
+                let reply = run(&endpoint, &format!("try {{ return await ws.{namespace}.{action}(4); }} catch(e) {{ return e.message; }}")).await;
+                let expected = if mode == "missing-anchor" {
+                    "Addressed review monitoring unavailable"
+                } else {
+                    REFUSAL
+                };
+                assert!(
+                    reply.to_string().contains(expected),
+                    "{mode}/{namespace}/{action}: {reply}"
+                );
+                assert_eq!(server.count(), 0);
+                assert!(!reply.to_string().contains("private/hidden"));
+                assert!(!reply.to_string().contains(f.git.path.to_str().unwrap()));
+                assert!(!reply.to_string().contains("ownerAgentId"));
+            }
+        }
+        assert!(f
+            .auth
+            .service
+            .store
+            .list_pr_monitors_by_agent(&f.agent)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
 
@@ -556,6 +1365,7 @@ async fn current_provider_denial_and_quota_never_become_successful_private_data(
 #[derive(Default)]
 struct Replies {
     statuses: Mutex<HashMap<String, u16>>,
+    bodies: Mutex<HashMap<String, Value>>,
     pause: Mutex<Option<String>>,
     entered: Notify,
     release: Notify,
@@ -574,6 +1384,10 @@ impl Drop for ReadServer {
 }
 impl ReadServer {
     pub(crate) async fn new() -> Self {
+        Self::at_instance("https://gitlab.test/forge").await
+    }
+
+    async fn at_instance(instance: &str) -> Self {
         let mut fixture = Server::new().await;
         let upstream = fixture
             .host
@@ -585,9 +1399,12 @@ impl ReadServer {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         // Only select the disposable endpoint BEFORE original Services creation.
         // Auth/adoption still forwards to the unchanged original owner fixture.
-        fixture.host = fixture.host.clone().with_api_origin(&endpoint).unwrap();
+        fixture.host = intent_sourcecontrol::GitlabHost::parse(instance)
+            .unwrap()
+            .with_api_origin(&endpoint)
+            .unwrap();
         fixture.descriptor = GitlabDescriptor::with_loopback_endpoint(
-            fixture.descriptor.instance().clone(),
+            intent_sourcecontrol::GitlabInstance::parse(instance).unwrap(),
             &endpoint,
         )
         .unwrap();
@@ -658,7 +1475,8 @@ impl ReadServer {
                         control.entered.notify_one();
                         control.release.notified().await;
                     }
-                    let body=if path==PROJECT {
+                    let custom = control.bodies.lock().unwrap().get(&path).cloned();
+                    let body=if let Some(custom) = custom { custom } else if path==PROJECT {
                         json!({"id":42,"path_with_namespace":"group/project",
                             "only_allow_merge_if_pipeline_succeeds":false,
                             "only_allow_merge_if_all_discussions_are_resolved":false})
@@ -941,31 +1759,39 @@ async fn foreign_services_caller_and_wire_cannot_supply_qualified_read_ownership
             endpoint = WorkspaceMcpServer::new(f.api(), f.git.workspace.id.clone())
                 .with_caller_agent_id(Some(f.agent.clone()));
         }
-        let body = async {
-            run(
-                &endpoint,
-                "try {return await ws.pr.snapshot(4);} catch(e) {return e.message;}",
-            )
+        for namespace in ["pr", "mr"] {
+            for action in ["snapshot", "monitor", "unmonitor"] {
+                let code = format!("try {{return await ws.{namespace}.{action}(4);}} catch(e) {{return e.message;}}");
+                let body = run(&endpoint, &code);
+                let reply = if mode == "wire" {
+                    with_wire_credential(
+                        Some(WireCredential::Principal {
+                            principal_id: intent_core::PrincipalId::new(),
+                            token_hash: "original wire fixture".into(),
+                        }),
+                        body,
+                    )
+                    .await
+                } else {
+                    body.await
+                };
+                assert!(
+                    !reply.to_string().contains("actual review"),
+                    "{mode}/{namespace}/{action}: {reply}"
+                );
+                assert_eq!(http.count(), 0);
+                assert!(!reply.to_string().contains(f.git.path.to_str().unwrap()));
+                assert!(!reply.to_string().contains("ownerAgentId"));
+            }
+        }
+        assert!(f
+            .auth
+            .service
+            .store
+            .list_pr_monitors_by_agent(&f.agent)
             .await
-        };
-        let reply = if mode == "wire" {
-            with_wire_credential(
-                Some(WireCredential::Principal {
-                    principal_id: intent_core::PrincipalId::new(),
-                    token_hash: "original wire fixture".into(),
-                }),
-                body,
-            )
-            .await
-        } else {
-            body.await
-        };
-        assert!(
-            !reply.to_string().contains("actual review"),
-            "{mode}: {reply}"
-        );
-        assert_eq!(http.count(), 0);
-        assert!(!reply.to_string().contains(f.git.path.to_str().unwrap()));
+            .unwrap()
+            .is_empty());
     }
 }
 

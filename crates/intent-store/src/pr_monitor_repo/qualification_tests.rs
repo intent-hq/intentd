@@ -746,3 +746,113 @@ INSERT INTO pr_monitor (
     '2026-09-20T12:00:01Z', '2026-09-20T12:00:00Z', '2026-09-20T12:00:02Z'
 );
 "#;
+
+#[tokio::test]
+async fn routing_cancellation_cannot_cancel_a_transferred_captured_row() {
+    let (_dir, store) = store().await;
+    let original = monitor("captured-cancel");
+    let resource = target(Gitlab, "https://gitlab.test/forge", "o/r", MergeRequest, 42);
+    assert!(store
+        .insert_qualified_pr_monitor(&original, &resource, CapturedRequest)
+        .await
+        .unwrap());
+    let captured = store
+        .get_qualified_pr_monitor(&original.monitor_id)
+        .await
+        .unwrap();
+    assert!(store
+        .adopt_pr_monitor(
+            &original.monitor_id,
+            &original.agent_id,
+            &AgentId("b".into()),
+            PrMonitorPollUpdate {
+                last_snapshot: original.last_snapshot.as_deref(),
+                baseline_snapshot: original.baseline_snapshot.as_deref(),
+                pending_changes: &[],
+                updated_at: "transferred",
+                expected_updated_at: &original.updated_at,
+                ..Default::default()
+            }
+        )
+        .await
+        .unwrap());
+    // The old caller must lose after adoption, even with the same row ID.
+    let cancelled = store
+        .cancel_qualified_pr_monitor(&captured, "cancel-attempt")
+        .await
+        .unwrap();
+    assert!(
+        !cancelled,
+        "old owner cancelled the new owner's captured target"
+    );
+    let current = store.get_pr_monitor(&original.monitor_id).await.unwrap();
+    assert_eq!(current.agent_id, AgentId("b".into()));
+    assert_eq!(current.state, PrMonitorState::Active);
+    let current = store
+        .get_qualified_pr_monitor(&original.monitor_id)
+        .await
+        .unwrap();
+    assert!(store
+        .cancel_qualified_pr_monitor(&current, "current-owner-cancel")
+        .await
+        .unwrap());
+    assert!(!store
+        .cancel_qualified_pr_monitor(&current, "duplicate-cancel")
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .get_pr_monitor(&original.monitor_id)
+            .await
+            .unwrap()
+            .state,
+        PrMonitorState::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn routing_cancellation_compares_binding_target_and_poll_without_timestamp_assumptions() {
+    for changed_column in ["last_snapshot", "target_project_path", "pending_changes"] {
+        let (_dir, store) = store().await;
+        let original = monitor("captured-change");
+        let resource = target(Gitlab, "https://gitlab.test/forge", "o/r", MergeRequest, 42);
+        assert!(store
+            .insert_qualified_pr_monitor(&original, &resource, CapturedRequest)
+            .await
+            .unwrap());
+        let captured = store
+            .get_qualified_pr_monitor(&original.monitor_id)
+            .await
+            .unwrap();
+        // Simulate an independently committed replacement with the exact same
+        // updated_at. A timestamp alone cannot fence identity or private evidence.
+        sqlx::query(&format!(
+            "UPDATE pr_monitor SET {changed_column} = ? WHERE monitor_id = ?"
+        ))
+        .bind("replacement")
+        .bind(original.monitor_id.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+        assert!(
+            !store
+                .cancel_qualified_pr_monitor(&captured, "stale-cancel")
+                .await
+                .unwrap(),
+            "{changed_column}"
+        );
+        let current = store
+            .get_qualified_pr_monitor(&original.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(current.monitor().state, PrMonitorState::Active);
+        assert_eq!(current.monitor().updated_at, original.updated_at);
+        assert!(
+            store
+                .cancel_qualified_pr_monitor(&current, "fresh-cancel")
+                .await
+                .unwrap(),
+            "{changed_column}"
+        );
+    }
+}

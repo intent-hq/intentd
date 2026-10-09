@@ -589,11 +589,67 @@ async fn boot_with_source_control(sc: Option<Arc<dyn SourceControl>>) -> Fixture
     let workspaces_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
 
+    // Implicit monitoring resolves the actual selected checkout. Metadata-only
+    // owner/name fields cannot stand in for an observed Git remote.
+    let repository = dir.join("repository");
+    std::fs::create_dir_all(&repository).expect("create repository");
+    for args in [
+        vec!["init", "--initial-branch=main"],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
+        vec!["remote", "add", "origin", "https://github.com/o/r.git"],
+    ] {
+        let result = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(&args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .output()
+            .expect("fixture git");
+        assert!(
+            result.status.success(),
+            "fixture git {args:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
     let ws_id = WorkspaceId::new();
+    let mut workspace = workspace(&ws_id);
+    workspace.repository_path = Some(repository.to_str().unwrap().into());
     store
-        .insert_workspace(&workspace(&ws_id))
+        .insert_workspace(&workspace)
         .await
         .expect("seed workspace");
+    // Existing owner/name metadata is deliberately unresolved until a user
+    // selects a remote; exercise monitoring with that choice actually persisted.
+    let selection = store
+        .repository_selection_snapshot(&intent_core::RepositoryRootId {
+            workspace_id: ws_id.clone(),
+            kind: intent_core::RepositoryRootKind::Primary,
+        })
+        .await
+        .unwrap();
+    store
+        .write_repository_selection(
+            &selection,
+            intent_store::RepositorySelectionChange::ExplicitRemote {
+                remote_name: "origin".into(),
+            },
+        )
+        .await
+        .result
+        .expect("select fixture remote");
     let agent_id = AgentId::from("agent-prmon-e2e");
     store
         .insert_agent_session(&agent_session(&ws_id, agent_id.as_str()))
@@ -3498,4 +3554,91 @@ async fn qwen_legacy_fallback_and_post_push_recovery_over_wss() {
         assert_eq!(listed["monitors"][0]["pendingChanges"], json!([]));
         assert_eq!(owner_messages(&fx).await, delivered);
     }
+}
+
+/// A persisted qualified identity is evidence, not a native recipient receipt.
+/// Until native lifecycle consumers are qualified, the whole row is hidden and
+/// controls refuse before a provider request, cancellation or owner wake.
+#[intent_test_macros::daemon_test]
+async fn qualified_monitor_requires_recipient_support_over_real_wss() {
+    let fx = boot().await;
+    let (legacy, _) = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("legacy producer");
+    let mut qualified = legacy.clone();
+    qualified.monitor_id = intent_core::PrMonitorId::new();
+    qualified.last_snapshot = Some(
+        json!({"monitorBinding":{"private":"must-not-disclose"},
+        "qualifiedSnapshot":{"title":"private MR sentinel"}})
+        .to_string(),
+    );
+    qualified.baseline_snapshot = qualified.last_snapshot.clone();
+    let target = intent_core::ReviewTarget {
+        repository: intent_core::RepositoryTarget {
+            provider: intent_core::RepositoryProvider::Gitlab,
+            instance_base_url: "https://gitlab.test:8443/scm".into(),
+            project_path: "o/r".into(),
+        },
+        kind: intent_core::RepositoryResourceKind::MergeRequest,
+        number: 42,
+    };
+    assert!(fx
+        .services
+        .store()
+        .insert_qualified_pr_monitor(
+            &qualified,
+            &target,
+            intent_store::MonitorTargetProvenance::CapturedRequest
+        )
+        .await
+        .unwrap());
+    let before_fetches = fx.forge.fetches();
+    let before_messages = owner_messages(&fx).await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let list = wss_rpc(
+        &mut rpc,
+        1,
+        "prMonitor.list",
+        json!({"workspaceId":fx.ws_id}),
+    )
+    .await;
+    assert_eq!(list["monitors"].as_array().unwrap().len(), 1);
+    assert_eq!(list["monitors"][0]["monitorId"], json!(legacy.monitor_id));
+    assert!(!list.to_string().contains("private MR sentinel"));
+    assert!(!list.to_string().contains("monitorBinding"));
+    for (id, method, check) in [
+        (2, "prMonitor.cancel", false),
+        (3, "prMonitor.flush", false),
+        (4, "prMonitor.flush", true),
+    ] {
+        let reply = wss_call(
+            &mut rpc,
+            id,
+            method,
+            json!({"workspaceId":fx.ws_id,"monitorId":qualified.monitor_id,"check":check}),
+        )
+        .await;
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Addressed review monitoring unavailable"),
+            "{reply}"
+        );
+        assert!(reply.get("result").is_none(), "{reply}");
+        assert!(!reply.to_string().contains("private MR sentinel"));
+    }
+    assert_eq!(fx.forge.fetches(), before_fetches);
+    assert_eq!(owner_messages(&fx).await, before_messages);
+    assert_eq!(
+        fx.services
+            .store()
+            .get_pr_monitor(&qualified.monitor_id)
+            .await
+            .unwrap()
+            .state,
+        intent_core::PrMonitorState::Active
+    );
 }

@@ -682,8 +682,10 @@ pub(super) fn begin_initialization(
     {
         return Err(unavailable());
     }
-    let mut keys = pending.keys.clone();
-    keys.remove(&RepositoryLifecycleKey::Database);
+    // Initialization replaces this agent's physical session, not every session
+    // observing the same workspace. The pending allocation still validates its
+    // workspace/database keys above; workspace mutations retire it separately.
+    let keys = HashSet::from([RepositoryLifecycleKey::Agent(binding.agent_id.clone())]);
     let barrier = state.next().map_err(|_| unavailable())?;
     state.pending.insert(barrier, keys.clone());
     invalidate_pending(&mut state, &keys, Some(proof.id));

@@ -428,6 +428,30 @@ pub(crate) struct RepositoryCapturedRequest {
 }
 
 impl RepositoryCapturedRequest {
+    /// A monitor owns a separate leaf of the SAME physical session. Ending the
+    /// MCP invocation must not retire the registration; replacing/retiring the
+    /// physical session still does. No lookup by public agent ID is involved.
+    pub(super) fn retain_monitor(&self) -> AdmissionResult<Arc<Self>> {
+        require_mandatory_execution()?;
+        self.check_read_caller()?;
+        let original = self.captured.as_ref().map_err(|error| *error)?;
+        let retirement = RepositoryRetirement::default();
+        let (caller, subscription) = original
+            .registry
+            .capture_request(&original.origin, retirement.clone())?;
+        self.check_read_caller()?;
+        Ok(Arc::new(Self {
+            captured: Ok(Captured {
+                registry: original.registry.clone(),
+                origin: original.origin.clone(),
+                caller,
+                store: original.store.clone(),
+                subscriptions: Arc::new(Mutex::new(vec![subscription])),
+            }),
+            retirement,
+        }))
+    }
+
     pub(super) fn check_read_owner(
         &self,
         store: &Store,

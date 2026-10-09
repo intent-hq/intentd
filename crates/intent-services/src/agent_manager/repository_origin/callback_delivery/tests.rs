@@ -2361,7 +2361,9 @@ impl NativeHarness {
         f.count_writes().await;
         let failed = failed_anchor.then(|| RepositoryReadOwner::capture(original.clone()));
         let origin = RepositoryOrigin::allocate(&original, &f.row).await;
-        let read_owner = failed.unwrap_or_else(|| RepositoryReadOwner::capture(original.clone()));
+        let read_owner = failed
+            .unwrap_or_else(|| RepositoryReadOwner::capture(original.clone()))
+            .map(RepositoryReadOwner::with_review_monitoring);
         assert_eq!(read_owner.is_err(), failed_anchor);
         let workspace = f.row.workspace_id.clone();
         let agent = f.row.id.clone();
@@ -2642,7 +2644,7 @@ async fn confirmed_read_public_session_uses_original_services_cache_and_register
         assert!(
             denied
                 .to_string()
-                .contains(crate::repository_read_source::REFUSAL),
+                .contains("Addressed review monitoring unavailable"),
             "{denied}"
         );
         assert_eq!(h.http.count(), before);
@@ -2741,7 +2743,7 @@ async fn confirmed_read_disabled_older_and_unavailable_receipts_keep_ordinary_re
         assert!(
             denied
                 .to_string()
-                .contains(crate::repository_read_source::REFUSAL),
+                .contains("Addressed review monitoring unavailable"),
             "{denied}"
         );
         assert_eq!(h.http.count(), 0);
@@ -2758,7 +2760,7 @@ async fn confirmed_read_disabled_older_and_unavailable_receipts_keep_ordinary_re
         )
         .await
         .to_string()
-        .contains(crate::repository_read_source::REFUSAL));
+        .contains("Addressed review monitoring unavailable"));
     assert!(RepositoryReadOwner::capture(h.original.clone()).is_ok());
     assert!(h
         .call(
@@ -2768,7 +2770,7 @@ async fn confirmed_read_disabled_older_and_unavailable_receipts_keep_ordinary_re
         )
         .await
         .to_string()
-        .contains(crate::repository_read_source::REFUSAL));
+        .contains("Addressed review monitoring unavailable"));
     assert_eq!(h.http.count(), 0, "original failed capture never retries");
     assert_eq!(h.f.writes().await, 1);
     h.finish().await;
@@ -2812,7 +2814,7 @@ async fn confirmed_read_seventeenth_pending_capture_cannot_upgrade_after_registr
         assert!(
             denied
                 .to_string()
-                .contains(crate::repository_read_source::REFUSAL),
+                .contains("Addressed review monitoring unavailable"),
             "{denied}"
         );
     }
@@ -4134,7 +4136,7 @@ async fn confirmed_read_hard_stop_retires_delivery_but_keeps_accepted_ordinary_r
     assert!(
         denied
             .to_string()
-            .contains(crate::repository_read_source::REFUSAL),
+            .contains("Addressed review monitoring unavailable"),
         "{denied}"
     );
     assert_eq!(h.http.count(), before);
@@ -5702,6 +5704,11 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             std::fs::rename(&git.path, &path).unwrap();
             git.path = path;
             git.workspace.repository_path = Some(git.path.to_str().unwrap().into());
+            // This fixture qualifies its original recipient explicitly; real
+            // runtime session creation and all authority checks remain intact.
+            let mut service = auth.service.as_ref().clone();
+            service.test_review_monitoring_recipient = true;
+            auth.service = Arc::new(service);
             let bus = crate::events::EventBus::new(auth.service.store.clone());
             let original = Arc::new(
                 auth.service
@@ -6037,7 +6044,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             .await;
         assert!(pending
             .to_string()
-            .contains(crate::repository_read_source::REFUSAL));
+            .contains("Addressed review monitoring unavailable"));
         h.dispatch(&s.session_id, s.turn, "normal original prompt")
             .await
             .unwrap();
@@ -6202,7 +6209,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                     .await;
                 assert!(denied
                     .to_string()
-                    .contains(crate::repository_read_source::REFUSAL));
+                    .contains("Addressed review monitoring unavailable"));
                 if mode == "registration-timeout" {
                     h.rpc("fixture/release", json!({})).await;
                 }

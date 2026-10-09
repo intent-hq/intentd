@@ -1428,6 +1428,14 @@ pub struct Services {
     /// Serialize quota admission through persistence per owner, including
     /// adoption; unrelated owners never wait on each other's forge reads.
     pr_monitor_registration: Arc<KeyedInflight<AgentId>>,
+    /// Original qualified registration lifetimes, never rebuilt from stored IDs.
+    review_monitor_authorities: Arc<
+        Mutex<HashMap<intent_core::PrMonitorId, Arc<repository_read_source::MonitorAuthority>>>,
+    >,
+    /// Explicit fixture receipt for tests that exercise the real session launcher.
+    /// Captured once by the original read owner; absent from production builds.
+    #[cfg(test)]
+    test_review_monitoring_recipient: bool,
     /// Upper bound on one shared forge fetch within a PR-monitor sweep (60 s
     /// in production) — defense in depth above the client-level network
     /// timeouts, so a hung connection can never wedge the sweep loop. Tests
@@ -1791,6 +1799,9 @@ impl Services {
             pr_monitor_debounce_seconds: None,
             pr_monitors_max_per_agent: None,
             pr_monitor_registration: Arc::default(),
+            review_monitor_authorities: Arc::default(),
+            #[cfg(test)]
+            test_review_monitoring_recipient: false,
             pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
             pr_refresh_fetch_timeout: PR_REFRESH_FETCH_TIMEOUT,
             sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),
@@ -31944,6 +31955,46 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn pr_state_addressed(
+        &self,
+        workspace_id: WorkspaceId,
+        request: intent_core::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let captured = repository_read_source::CapturedReview::capture_addressed(
+            self,
+            workspace_id.clone(),
+            &request,
+        );
+        self.execution_call(async move {
+            match captured?
+                .read(self)
+                .await
+                .map_err(|_| repository_read_source::refused())?
+            {
+                repository_read_source::ReadOutcome::Unsupported => Err(Error::Unsupported(
+                    "Addressed review monitoring unavailable".into(),
+                )),
+                repository_read_source::ReadOutcome::Github(repo) => {
+                    self.pr_state(
+                        workspace_id,
+                        request.pr_number,
+                        Some(format!("{}/{}", repo.owner, repo.name)),
+                    )
+                    .await
+                }
+                repository_read_source::ReadOutcome::Managed { target, result } => {
+                    let read = (*result).map_err(|failure| match failure.cause {
+                        pr_monitor::qualified_cache::CacheError::Provider(error) => {
+                            pr_ops::map_sc_err(error)
+                        }
+                        _ => repository_read_source::refused(),
+                    })?;
+                    pr_ops::qualified_review_snapshot(&target, &read.value)
+                }
+            }
+        })
+    }
+
     fn pr_state(
         &self,
         workspace_id: WorkspaceId,
@@ -31971,6 +32022,11 @@ impl WorkspaceApi for Services {
                     .await
                     .map_err(|_| repository_read_source::refused())?
                 {
+                    repository_read_source::ReadOutcome::Unsupported => {
+                        return Err(Error::Unsupported(
+                            "Addressed review monitoring unavailable".into(),
+                        ));
+                    }
                     repository_read_source::ReadOutcome::Github(repo) => repo,
                     repository_read_source::ReadOutcome::Managed { target, result } => {
                         let read = (*result).map_err(|failure| match failure.cause {
@@ -35172,7 +35228,51 @@ impl WorkspaceApi for Services {
         })
     }
 
-    /// `ws.pr.monitor`: register (idempotently) a centralized PR monitor.
+    fn pr_monitor_start_addressed(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        request: intent_core::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let captured = repository_read_source::CapturedReview::capture_addressed(
+            self,
+            workspace_id.clone(),
+            &request,
+        );
+        let retained = repository_read_source::capture_monitor_owner(self);
+        self.execution_call(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.review_monitor_start_op(
+                &workspace_id,
+                &agent_id,
+                request.pr_number,
+                captured?,
+                retained,
+            )
+            .await
+        })
+    }
+
+    fn pr_monitor_stop_addressed(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        request: intent_core::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let captured = repository_read_source::CapturedReview::capture_addressed(
+            self,
+            workspace_id.clone(),
+            &request,
+        );
+        self.execution_call(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.review_monitor_stop_op(&workspace_id, &agent_id, request.pr_number, captured?)
+                .await
+        })
+    }
+
+    /// Explicit legacy GitHub calls retain their original producer. Omission
+    /// resolves the selected original root before choosing a provider.
     fn pr_monitor_start(
         &self,
         workspace_id: WorkspaceId,
@@ -35180,14 +35280,28 @@ impl WorkspaceApi for Services {
         pr_number: u64,
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        let captured = repo.is_none().then(|| {
+            repository_read_source::CapturedReview::capture(self, workspace_id.clone(), pr_number)
+        });
+        let retained = repository_read_source::capture_monitor_owner(self);
+        self.execution_call(async move {
             self.require_agent_member(&agent_id).await?;
-            self.pr_monitor_start_op(&workspace_id, &agent_id, pr_number, repo)
+            if let Some(captured) = captured {
+                self.review_monitor_start_op(
+                    &workspace_id,
+                    &agent_id,
+                    pr_number,
+                    captured,
+                    retained,
+                )
                 .await
+            } else {
+                self.pr_monitor_start_op(&workspace_id, &agent_id, pr_number, repo)
+                    .await
+            }
         })
     }
 
-    /// `ws.pr.unmonitor`: cancel the caller's own monitor on a PR.
     fn pr_monitor_stop(
         &self,
         workspace_id: WorkspaceId,
@@ -35195,10 +35309,18 @@ impl WorkspaceApi for Services {
         pr_number: u64,
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        let captured = repo.is_none().then(|| {
+            repository_read_source::CapturedReview::capture(self, workspace_id.clone(), pr_number)
+        });
+        self.execution_call(async move {
             self.require_agent_member(&agent_id).await?;
-            self.pr_monitor_stop_op(&workspace_id, &agent_id, pr_number, repo)
-                .await
+            if let Some(captured) = captured {
+                self.review_monitor_stop_op(&workspace_id, &agent_id, pr_number, captured)
+                    .await
+            } else {
+                self.pr_monitor_stop_op(&workspace_id, &agent_id, pr_number, repo)
+                    .await
+            }
         })
     }
 

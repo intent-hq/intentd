@@ -112,6 +112,51 @@ impl QualifiedPrMonitor {
     }
 }
 
+impl Store {
+    /// Cancel only the original active row, including its owner, private binding
+    /// and qualified target. A transfer, rearm or intervening poll loses this
+    /// comparison rather than lending its replacement row to the old caller.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database update fails.
+    pub async fn cancel_qualified_pr_monitor(
+        &self,
+        expected: &QualifiedPrMonitor,
+        now: &str,
+    ) -> Result<bool> {
+        let mut query =
+            QueryBuilder::<Sqlite>::new("UPDATE pr_monitor SET state = 'cancelled', updated_at = ");
+        query.push_bind(now).push(" WHERE state = 'active'");
+        for (i, column) in COLUMNS.split(',').map(str::trim).enumerate() {
+            query.push(" AND ").push(column).push(" IS ");
+            if column == "pr_number" {
+                query.push_bind(expected.monitor.pr_number);
+            } else {
+                query.push_bind(expected.original_text[i].as_deref());
+            }
+        }
+        for (column, value) in TARGET_COLUMNS
+            .split(',')
+            .map(str::trim)
+            .zip(expected.columns.values())
+        {
+            query
+                .push(" AND ")
+                .push(column)
+                .push(" IS ")
+                .push_bind(value);
+        }
+        query
+            .build()
+            .execute(self.write_pool())
+            .await
+            .map(|result| result.rows_affected() == 1)
+            .map_err(|error| {
+                intent_core::Error::Internal(format!("cancel captured monitor: {error}"))
+            })
+    }
+}
+
 /// A conflict leaves all original values and the current target untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MonitorQualificationOutcome {

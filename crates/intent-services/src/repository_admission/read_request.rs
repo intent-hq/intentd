@@ -6,7 +6,7 @@
 
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use intent_acp::mcp_server::private_results::McpPrivatePolicy;
 use intent_core::caller::current_caller;
@@ -23,12 +23,19 @@ use super::{AdmissionError, AdmissionResult, RepositoryRetirement};
 pub(crate) type ReadPolicyFactory =
     dyn Fn(Arc<RepositoryReadRequest>) -> Arc<dyn McpPrivatePolicy> + Send + Sync;
 
+enum OriginalReadOwner {
+    Request(Arc<dyn Any + Send + Sync>),
+    Monitor(Weak<dyn Any + Send + Sync>),
+}
+
 pub(crate) struct RepositoryReadOwner {
     // Storage only: downcasting this allocation cannot supply authority.
-    original: Arc<dyn Any + Send + Sync>,
+    original: OriginalReadOwner,
     store: Store,
     registry: Arc<RepositoryLifecycleRegistry>,
     policy: Option<Arc<ReadPolicyFactory>>,
+    #[cfg(test)]
+    review_monitoring: bool,
 }
 
 impl RepositoryReadOwner {
@@ -44,16 +51,23 @@ impl RepositoryReadOwner {
             return Err(AdmissionError::Unavailable);
         }
         Ok(Arc::new(Self {
-            original,
+            original: OriginalReadOwner::Request(original),
             store,
             registry,
             policy: None,
+            #[cfg(test)]
+            review_monitoring: false,
         }))
     }
 
     pub(crate) fn retains<T: Any + Send + Sync>(&self, original: &T) -> bool {
-        self.original
-            .downcast_ref::<T>()
+        let retained = match &self.original {
+            OriginalReadOwner::Request(value) => Some(value.clone()),
+            OriginalReadOwner::Monitor(value) => value.upgrade(),
+        };
+        retained
+            .as_ref()
+            .and_then(|value| value.downcast_ref::<T>())
             .is_some_and(|retained| std::ptr::eq(retained, original))
     }
 
@@ -62,6 +76,14 @@ impl RepositoryReadOwner {
         Arc::get_mut(&mut self)
             .expect("unpublished read owner")
             .policy = Some(factory);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_review_monitoring(mut self: Arc<Self>) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("unpublished read owner")
+            .review_monitoring = true;
         self
     }
 }
@@ -75,6 +97,38 @@ pub(crate) struct RepositoryReadRequest {
 }
 
 impl RepositoryReadRequest {
+    pub(crate) fn retain_monitor(&self) -> AdmissionResult<Arc<Self>> {
+        self.check_current()?;
+        let original = match &self.owner.original {
+            OriginalReadOwner::Request(value) => Arc::downgrade(value),
+            OriginalReadOwner::Monitor(_) => return Err(AdmissionError::Denied),
+        };
+        // No Services -> monitor -> Services cycle and no retained short-call
+        // output policy. Physical retirement remains an independent obligation.
+        let owner = Arc::new(RepositoryReadOwner {
+            original: OriginalReadOwner::Monitor(original),
+            store: self.owner.store.clone(),
+            registry: self.owner.registry.clone(),
+            policy: None,
+            #[cfg(test)]
+            review_monitoring: self.owner.review_monitoring,
+        });
+        Self::capture(owner, self.original.retain_monitor()?)
+    }
+
+    /// No production harness is qualified for monitor delivery yet. The later
+    /// lifecycle activation must install a receipt at original session creation;
+    /// request arguments, persisted metadata and ambient caller IDs cannot opt in.
+    pub(crate) fn supports_review_monitoring(&self) -> bool {
+        if self.check_current().is_err() {
+            return false;
+        }
+        #[cfg(test)]
+        return self.owner.review_monitoring;
+        #[cfg(not(test))]
+        false
+    }
+
     /// Prequeue capture uses the authentic physical caller already captured by
     /// the registry. The ambient caller is restored later by the existing ACP
     /// scope and must match before any future consumer may use this evidence.
@@ -121,10 +175,7 @@ impl RepositoryReadRequest {
     }
 
     pub(crate) fn retains<T: Any + Send + Sync>(&self, original: &T) -> bool {
-        self.owner
-            .original
-            .downcast_ref::<T>()
-            .is_some_and(|retained| std::ptr::eq(retained, original))
+        self.owner.retains(original)
     }
 
     pub(crate) fn capture_optional(self: &Arc<Self>) -> AdmissionResult<RepositoryOptionalScope> {

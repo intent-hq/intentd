@@ -1543,3 +1543,51 @@ async fn compatible_uses_only_captured_store_even_with_same_observer_and_foreign
         Some("original database")
     );
 }
+
+#[tokio::test]
+async fn workspace_and_database_mutations_retire_live_and_pending_original_owners() {
+    for database in [false, true] {
+        let f = Fixture::new(None).await;
+        let owner = f
+            .creator(RepositoryCreationIntent::FirstSet)
+            .initialize(&f.store, || async { Ok("original".into()) })
+            .await
+            .unwrap();
+        let request = owner.callback().capture();
+        let pending = f.creator(RepositoryCreationIntent::Loaded {
+            session_id: "original".into(),
+        });
+        let key = if database {
+            RepositoryLifecycleKey::Database
+        } else {
+            RepositoryLifecycleKey::Workspace(f.workspace.id.clone())
+        };
+        // Explicit original observer boundary: no SQL effect is asserted here.
+        let mutation = f.registry.begin_mutation(&[key]).unwrap();
+        assert!(!current(&request, f.caller()).await);
+        assert!(RepositoryCreationOwner::allocate(
+            &f.registry,
+            &f.store,
+            f.workspace.id.clone(),
+            f.agent.clone(),
+            RepositoryCreationIntent::Loaded {
+                session_id: "original".into()
+            }
+        )
+        .is_err());
+        mutation.settle_confirmed();
+        assert!(!current(&owner.callback().capture(), f.caller()).await);
+        assert!(pending
+            .initialize(&f.store, || async { Ok("original".into()) })
+            .await
+            .is_err());
+        let fresh = f
+            .creator(RepositoryCreationIntent::Loaded {
+                session_id: "original".into(),
+            })
+            .initialize(&f.store, || async { Ok("original".into()) })
+            .await
+            .unwrap();
+        assert!(current(&fresh.callback().capture(), f.caller()).await);
+    }
+}

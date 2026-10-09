@@ -97,6 +97,7 @@ use crate::{publish_event, system_actor, Services};
     reason = "qualified reads await admitted caller-directory wiring"
 )]
 pub(crate) mod qualified_cache;
+mod routing;
 use qualified_cache::{CacheKey, CacheSlot};
 
 use intent_core::config::{
@@ -2361,7 +2362,22 @@ impl Services {
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 };
-                self.store.insert_pr_monitor(&m).await?.then_some(m)
+                self.store
+                    .insert_qualified_pr_monitor(
+                        &m,
+                        &intent_core::ReviewTarget {
+                            repository: intent_core::RepositoryTarget {
+                                provider: intent_core::RepositoryProvider::Github,
+                                instance_base_url: "https://github.com".into(),
+                                project_path: format!("{repo_owner}/{repo_name}"),
+                            },
+                            kind: intent_core::RepositoryResourceKind::PullRequest,
+                            number: pr_number,
+                        },
+                        intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+                    )
+                    .await?
+                    .then_some(m)
             };
             if let Some(m) = inserted {
                 monitor = Some(m);
@@ -2511,6 +2527,14 @@ impl Services {
         else {
             return Ok(None);
         };
+        self.classify_pr_monitor_holder(owner, agent_id).await
+    }
+
+    async fn classify_pr_monitor_holder(
+        &self,
+        owner: PrMonitor,
+        agent_id: &AgentId,
+    ) -> Result<Option<PrMonitorHolder>> {
         if owner.agent_id == *agent_id {
             return Ok(None);
         }
@@ -4264,12 +4288,16 @@ impl Services {
             Some(a) => self.pr_monitors_for_agent(a).await?,
             None => self.pr_monitors_for_workspace(workspace_id).await?,
         };
-        let paused_until = self.sweep_rate_limit_paused_until();
-        let monitors: Vec<Value> = monitors
+        let mut projected = Vec::new();
+        for monitor in monitors
             .into_iter()
             .filter(|m| &m.workspace_id == workspace_id)
-            .map(|m| pr_monitor_wire(&m, paused_until.as_deref()))
-            .collect();
+        {
+            if let Some(value) = self.review_monitor_list_entry(&monitor).await? {
+                projected.push(value);
+            }
+        }
+        let monitors = projected;
         Ok(json!({ "monitors": monitors }))
     }
 
@@ -4280,6 +4308,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         monitor_id: &PrMonitorId,
     ) -> Result<Value> {
+        self.require_legacy_monitor_control(monitor_id).await?;
         let monitor = self
             .pr_monitor_cancel(workspace_id, monitor_id, None)
             .await?;
@@ -4297,6 +4326,7 @@ impl Services {
         monitor_id: &PrMonitorId,
         check: bool,
     ) -> Result<Value> {
+        self.require_legacy_monitor_control(monitor_id).await?;
         let flushed = if check {
             self.pr_monitor_check_and_flush(workspace_id, monitor_id)
                 .await?
@@ -14363,6 +14393,68 @@ mod tests {
                 .with_pr_monitor_hourly_request_budget(MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET)
                 .pr_monitor_hourly_request_budget(),
             MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET
+        );
+    }
+    #[intent_test_macros::daemon_test]
+    async fn qualified_and_legacy_identical_names_numbers_keep_independent_records() {
+        use crate::repository_read_source::tests::{run, ActualRead, ReadServer};
+        fn body(reply: &Value) -> Value {
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+        }
+        let provider = ReadServer::new().await;
+        let mut f = ActualRead::new(&provider).await;
+        let forge = StubForge::new();
+        f.auth.service = Arc::new(
+            f.auth
+                .service
+                .as_ref()
+                .clone()
+                .with_source_control(Arc::new(forge.clone())),
+        );
+        f.auth
+            .registry
+            .apply(&[
+                ("workspaceApi.toonOutput".into(), json!(false)),
+                ("workspaceApi.maxOutputChars".into(), json!(0)),
+            ])
+            .unwrap();
+        let gl = body(&run(&f.server(), "return await ws.mr.monitor(4);").await);
+        let gh = body(
+            &run(
+                &f.server(),
+                "return await ws.pr.monitor(4,{repo:'group/project'});",
+            )
+            .await,
+        );
+        assert_ne!(gl["monitor"]["monitorId"], gh["monitor"]["monitorId"]);
+        assert_eq!(gl["monitor"]["repo"], gh["monitor"]["repo"]);
+        assert_eq!(gl["monitor"]["prNumber"], gh["monitor"]["prNumber"]);
+        assert_eq!(
+            gl["monitor"]["resource"]["repository"]["provider"],
+            "gitlab"
+        );
+        assert!(
+            gh["monitor"].get("resource").is_none(),
+            "legacy shape remains unchanged"
+        );
+        let all = body(&run(&f.server(), "return await ws.pr.monitors();").await);
+        assert_eq!(all.as_array().unwrap().len(), 2);
+        let before = forge.get_pr_calls.load(std::sync::atomic::Ordering::SeqCst);
+        let stopped = body(
+            &run(
+                &f.server(),
+                "return await ws.pr.unmonitor(4,{repo:'group/project'});",
+            )
+            .await,
+        );
+        assert_eq!(stopped["monitor"]["monitorId"], gh["monitor"]["monitorId"]);
+        let left = body(&run(&f.server(), "return await ws.mr.monitors();").await);
+        assert_eq!(left.as_array().unwrap().len(), 1);
+        assert_eq!(left[0]["monitorId"], gl["monitor"]["monitorId"]);
+        assert_eq!(
+            forge.get_pr_calls.load(std::sync::atomic::Ordering::SeqCst),
+            before
         );
     }
 }

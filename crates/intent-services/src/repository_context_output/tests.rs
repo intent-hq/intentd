@@ -867,7 +867,8 @@ async fn context_output_original_missing_settings_attachment_omits_after_late_in
     .unwrap();
     let owner = RepositoryContextOwner::bind(
         service.clone(),
-        RepositoryReadOwner::capture(service.clone()),
+        RepositoryReadOwner::capture(service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &physical,
     )
     .unwrap();
