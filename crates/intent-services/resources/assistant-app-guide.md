@@ -208,7 +208,9 @@ workspace tabs, including pinned tabs. Numbers **1–6** identify the workspace'
 Micro key assignment. An unassigned workspace has no number.
 
 Right-click a workspace's list row, board card, or top tab and choose **Assign to
-Micro Key**, then a key number. This also works for workspaces without a number.
+Micro Key**, then a key number. This also works for workspaces without a number;
+the workspace does not need to be selected. Archived, deleted, and Assistant
+workspaces cannot receive Micro assignments.
 An occupied key's menu label names the workspace it will replace. Choose
 **Unassign** to remove the current assignment. Changes are shared across these
 views and saved.
