@@ -1,0 +1,13 @@
+{
+  "controls.ps1": "7cac88e1bb54e984725ba49dea8eb60b3a8aa25515d2e7fb457b869ef99ad2d8",
+  "expected-controls.json": "6faa02fcf9aacd5cd85ea3ae64cd22316c9dc158d876e392b85b1999176d22ee",
+  "lifetime-observer.mjs": "2fe11c297b2c01dceeae72694803b8d79ed6ef79b744d2613c7d8a9bb7094dbe",
+  "native-controls.ps1": "0c1261b2e3ae6be965bda2887c11e572371635a91754af5391f3cc12af7d95ce",
+  "original-native-controls.ps1": "b6c2cfea7010942e74927497e612352abce33cc2b7788fcd73f809be6df4c675",
+  "original-owned.cs": "910f10dd00d2aea24ef8963c59eab179ccc5acb865a36122a7e674de36a92f8f",
+  "original-synthetic-child.mjs": "a3d2fb1095592a7dc967e4f4c1adb4e68b1e9931fb09e9802ffb7b05397d55f6",
+  "owned-lifetime.cs": "30d0cb7a1236685ef2a21704ef2596269dd7bd64c17126b46635132e859d125c",
+  "run-controls.ps1": "a891dc4c8691d765df5a06c19338796901a789b8c1aff0bd9afb37cdaada0487",
+  "setup-only.ps1": "f8b90fbf6cf4670c5a74cc1b2ca46e862992be5bd2eca63c777c4c4088444941",
+  "synthetic-child.mjs": "28603c3d9a0908c64f8959213748d0091064da349a308dcb1d368ba340c87356"
+}

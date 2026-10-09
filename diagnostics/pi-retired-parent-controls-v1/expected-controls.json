@@ -1,0 +1,10 @@
+[
+  "exact-check-pass-and-refusal",
+  "assertion-redaction-and-no-normalization",
+  "installed-writer-fault-preserves-refusal",
+  "check-expression-and-catch-composition",
+  "exact-one-option-source-reversal",
+  "native-parent-retirement-and-owned-descendant",
+  "default-vs-detached-discriminator",
+  "ownership-refusal-and-bounds-sensitivity"
+]
