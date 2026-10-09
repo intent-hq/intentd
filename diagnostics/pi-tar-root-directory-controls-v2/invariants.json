@@ -1,0 +1,42 @@
+[
+  {
+    "id": "R01",
+    "rule": "Existing loop admits only a full512-byte nonzero header; existing A01 unsigned checksum, A02 octal size grammar and A03 <=32MiB/body extent execute before the branch. No checks moved or replaced."
+  },
+  {
+    "id": "R02",
+    "rule": "Only decoded primitive name exactly package AND decoded type exactly5 take new branch. Existing name construction remains unchanged. Exact literal has no slash, backslash, traversal segment or colon; prefix is explicitly empty. No casefolding/slash stripping/path normalization."
+  },
+  {
+    "id": "R03",
+    "rule": "Root length must be numeric zero as parsed by existing octal check. Nonzero sizes are rejected, not clamped or skipped. No body byte is consumed as directory payload."
+  },
+  {
+    "id": "R04",
+    "rule": "Root branch requires existing field decoder to observe ustar in257..263 and version00 in263..265. Unknown/legacy/GNU/PAX formats are not newly admitted by this exception. No guarantee all legal tar formats supported."
+  },
+  {
+    "id": "R05",
+    "rule": "Root branch also requires whole inflated tar length divisible by512, rejecting a partial terminalblock in any archive taking this branch. Existing completeblock loop and checksum apply to following entries. This is a root-route restriction, not a general ordinary-parser rewrite."
+  },
+  {
+    "id": "R06",
+    "rule": "After validation offset advances exactly512 then continues; zero payload means same stride as normal zero-size directory. No repeatedheader/infinite loop; offset monotonic and inflated tar cap bounds maximum headers. No filesystem entry is created, hashed, counted or inserted for root."
+  },
+  {
+    "id": "R07",
+    "rule": "All nonroot entries run byte-identical A04-A09 and shared stride. package/ remains on old path; ./package, lookalikes, links, PAX x/g, GNU L/K and unknown types get no new exception. Root followed by ordinary badpath/type/duplicate retains exact existing rejection."
+  },
+  {
+    "id": "R08",
+    "rule": "A09 files.size>0 remains: root-only/repeatedroots/zero blocks cannot satisfy content acceptance. Root metadata neither rewrites files map nor bypasses subsequent pinned dependency bytes/inventory/metadata/resolution checks."
+  },
+  {
+    "id": "R09",
+    "rule": "Existing first-zero-block/EOF and NUL-field interpretation remains; no complete tar conformance, trailing-content authenticity or global ordinary-directory validation claim. Root archives with incomplete total blocks now reject; nonroot-only inherited trailingfragment behavior is unchanged."
+  },
+  {
+    "id": "R10",
+    "rule": "New assert uses fixed message invalid exact package root directory. It lies before A04, so original A04 wrappers are bypassed only for eligible rootdir; failure has existing outercatch/samevalue rethrow and may retain generic tar-parse or stale marker. No new enum/record/relay change. It is functional acceptance change and requires separate review/controls."
+  }
+]

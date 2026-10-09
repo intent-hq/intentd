@@ -1,0 +1,15 @@
+{
+  "file": "accept-dependencies.mjs",
+  "before": "54518a44b045e43574fdec9d5faad08baf2cbf6e4e8f35c4344f4595d79a7609",
+  "after": "0450222f706f0167771012deee0736a7d6d62d37b9164a6f60db3f076a4b25dd",
+  "changes": [
+    {
+      "old": "throw dependencyTarError;}{let dependencyA04Part='unavailable',dependencyA04Returned=false,dependencyA04Value;",
+      "new": "throw dependencyTarError;}if(name==='package'&&type==='5'){assert(length===0&&tar.length%512===0&&prefix===''&&field(257,263)==='ustar'&&field(263,265)==='00','invalid exact package root directory');offset+=512;continue;}{let dependencyA04Part='unavailable',dependencyA04Returned=false,dependencyA04Value;"
+    }
+  ],
+  "insertedSource": "if(name==='package'&&type==='5'){assert(length===0&&tar.length%512===0&&prefix===''&&field(257,263)==='ustar'&&field(263,265)==='00','invalid exact package root directory');offset+=512;continue;}",
+  "forwardExact": true,
+  "reverseExact": true,
+  "setupUnchanged": "f636fcfaa73f875469d26ff85b134b97ef6f7ead5eaca7a563c7e2b1dd1fcd36"
+}

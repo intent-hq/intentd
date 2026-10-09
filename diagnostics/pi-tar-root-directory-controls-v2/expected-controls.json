@@ -1,0 +1,8 @@
+[
+  "valid-root-content-and-attribution",
+  "literal-path-and-type-refusals",
+  "header-size-and-block-bounds",
+  "stride-and-ordinary-ordering",
+  "query-error-and-model-sensitivity",
+  "cache-catch-and-output-preservation"
+]
