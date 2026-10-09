@@ -409,7 +409,7 @@ exit 97
                 .iter()
                 .find(|r| r["pid"] == prompts[0]["pid"] && r["method"] == "thread/start")
                 .unwrap();
-            assert_eq!(thread["params"]["config"]["agents"]["enabled"], false);
+            assert_eq!(thread["params"]["config"]["features"]["multi_agent"], false);
             assert_eq!(
                 thread["params"]["config"]["features"]["multi_agent_v2"],
                 false
@@ -439,7 +439,7 @@ exit 97
             if provider == "codex" {
                 let policy: Value =
                     serde_json::from_str(launch["policy"].as_str().unwrap()).unwrap();
-                assert_eq!(policy["agents"]["enabled"], false);
+                assert_eq!(policy["features"]["multi_agent"], false);
                 assert_eq!(policy["features"]["multi_agent_v2"], false);
             }
         }
