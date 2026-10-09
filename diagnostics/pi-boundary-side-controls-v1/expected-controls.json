@@ -1,0 +1,9 @@
+[
+  "same-catch-alias",
+  "nested-bare-rethrow",
+  "observer-scope-discriminator",
+  "exact-original-marked-provider-boundary",
+  "replacement-negative-controls",
+  "fixed-schema-and-bookkeeping",
+  "writer-and-capture-composition"
+]

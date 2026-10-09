@@ -1,0 +1,8 @@
+[
+  "original-side-collision",
+  "corrected-original-and-marked",
+  "missing-observer-stays-incomplete",
+  "invalid-context-and-stale-binding",
+  "same-scope-side-reset",
+  "readonly-and-exception-preservation"
+]

@@ -1,0 +1,16 @@
+{
+  "capture-functions.ps1": "927188fb15f9e10d09385a315f7da159673ae92a7614e0add91deec2bce2c1f7",
+  "controls.metadata-candidate.ps1": "141d6acd1c552ef454e8fdf61824e01c0ac79d322533451bcbe3d7151a8f4f55",
+  "controls.ps1": "c829a3b8aa1b8f07d7357058df3acb01392898bf2919339da2e0c63c1cc294f6",
+  "expected-controls.json": "fab1b1fd38e04c2bfb6ad63272a3bcf3045622b3c7662b233b5af51450f43212",
+  "expected-side-controls.json": "3b36dcb6f4d24be40145770ba40c1e0f5e0e04403ef40d627d26021608822e79",
+  "identity-detail-helper.ps1": "ab3b72ed27bc81cd4f1a58273d240d86f4f5251bf1e2251bd980b3a9fec059da",
+  "identity-detail-original.ps1": "9cd866d3d7a97df6aa3cdcca1e81deb9a06e4d65cfb7b19f588648d23d9f1b01",
+  "identity-projector.ps1": "876b9e6ac01d760dd367d0756418414ee40a32d9a3b43b3a23a45233f1876d8f",
+  "original-tool-provenance.ps1": "49ef5269629c5dbca6fe31a7796abff8eb425d6cde1da0e60462ae27faadc272",
+  "run-controls.ps1": "3519c45939ef97544bbdbbdc2d8bebc7054c11f733d232fdfc991beab52467ff",
+  "selection-helper.ps1": "e6fec4cd9badbadd23c944133441a645805fe4ef6ca3bc5796f0f18df85f3083",
+  "setup-only.ps1": "0a007b21677d4fdb2206bae19baea09a29b910267a7fbe02261e5d2a6cd95bb7",
+  "side-controls.ps1": "8a022b4473c49abd12e473af5d7a56fc63fdf32fd6596bda5c864a4ae074ef35",
+  "tool-provenance.ps1": "58e219d1f8d53104415578dec7a9ff568124edead3f91b8c170c58621614fce8"
+}
