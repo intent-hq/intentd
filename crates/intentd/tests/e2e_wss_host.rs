@@ -1831,7 +1831,11 @@ async fn host_provider_discovery_over_wss() {
             intent_providers::adapter_cli::requirement(p["id"].as_str().unwrap())
         {
             assert_eq!(p["cliCommand"], requirement.command, "{p}");
-            assert_eq!(p["cliMinimumVersion"], requirement.minimum.to_string(), "{p}");
+            assert_eq!(
+                p["cliMinimumVersion"],
+                requirement.minimum.to_string(),
+                "{p}"
+            );
             assert_eq!(p["cliVersionRange"], requirement.range, "{p}");
             continue;
         }
