@@ -1,0 +1,20 @@
+{
+  "before-disposal-owned.cs": "e5ba2e8add3b904d4303460053a1d4c048ce0ab5e927252b87c03483b649cca1",
+  "bound-whole-controls.ps1": "c0a7673dfdf65100c0524eed3cbb0584fb619ea8a1e134af28b8efc6bd0042db",
+  "controls.ps1": "c0a7673dfdf65100c0524eed3cbb0584fb619ea8a1e134af28b8efc6bd0042db",
+  "disposal-controls.ps1": "4d792aff70a058217a1697aa35aa3f02684c510b91581f6df58793aed3c568be",
+  "disposal-model.cs": "ea43c7cbf4a423989c0d9f3ab5abde757876b96b500c730a921d8abd93a22e47",
+  "disposal-probe.cs": "544b986b4c1a418e60670ee2e0a7c0a97966d96e7df9ee410f85efd87c8ef47b",
+  "disposal-source-delta.json": "9adc3dc545c702ed00f2eb5c4fa4d31079a57828ddf5750d569a4154fea75225",
+  "expected-controls.json": "6faa02fcf9aacd5cd85ea3ae64cd22316c9dc158d876e392b85b1999176d22ee",
+  "expected-disposal.json": "10646218cf9e9daffda53a988b55e58352498d1069cdf23f4705736034e09961",
+  "lifetime-observer.mjs": "2fe11c297b2c01dceeae72694803b8d79ed6ef79b744d2613c7d8a9bb7094dbe",
+  "native-controls.ps1": "0c1261b2e3ae6be965bda2887c11e572371635a91754af5391f3cc12af7d95ce",
+  "original-native-controls.ps1": "b6c2cfea7010942e74927497e612352abce33cc2b7788fcd73f809be6df4c675",
+  "original-owned.cs": "910f10dd00d2aea24ef8963c59eab179ccc5acb865a36122a7e674de36a92f8f",
+  "original-synthetic-child.mjs": "a3d2fb1095592a7dc967e4f4c1adb4e68b1e9931fb09e9802ffb7b05397d55f6",
+  "owned-lifetime.cs": "71f416f1b6ff7df50426e33b6ecef535575eccff70fef19598b8cd37ae435f19",
+  "run-controls.ps1": "f2c08afc592f15c580f5f58e095588bbb1e983cd6207530b2ba9eea0860edb60",
+  "setup-only.ps1": "f8b90fbf6cf4670c5a74cc1b2ca46e862992be5bd2eca63c777c4c4088444941",
+  "synthetic-child.mjs": "28603c3d9a0908c64f8959213748d0091064da349a308dcb1d368ba340c87356"
+}

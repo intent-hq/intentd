@@ -1,0 +1,26 @@
+{
+  "originalSha256": "e5ba2e8add3b904d4303460053a1d4c048ce0ab5e927252b87c03483b649cca1",
+  "candidateSha256": "71f416f1b6ff7df50426e33b6ecef535575eccff70fef19598b8cd37ae435f19",
+  "changes": [
+    {
+      "old": "  finally {\n   // Handles and an exclusive job, never numeric-PID termination.",
+      "new": "  finally {\n   var disposal=Stopwatch.StartNew();\n   // Handles and an exclusive job, never numeric-PID termination."
+    },
+    {
+      "old": "var cleanup=Stopwatch.StartNew();while(cleanup.ElapsedMilliseconds<10000)",
+      "new": "while(disposal.ElapsedMilliseconds<10000)"
+    },
+    {
+      "old": "    uint childWaitResult=WaitForSingleObject(childHandle,0);",
+      "new": "    uint childWaitResult=WaitForSingleObject(childHandle,(uint)Math.Max(0L,10000L-disposal.ElapsedMilliseconds));"
+    }
+  ],
+  "reverseExact": true,
+  "unchanged": {
+    "original-owned.cs": "910f10dd00d2aea24ef8963c59eab179ccc5acb865a36122a7e674de36a92f8f",
+    "controls.ps1": "c0a7673dfdf65100c0524eed3cbb0584fb619ea8a1e134af28b8efc6bd0042db",
+    "run-controls.ps1": "3c2f96660a8d47c58da9b70936f83465e5be29751cd3bbaae9589fdeff99b5ac",
+    "synthetic-child.mjs": "28603c3d9a0908c64f8959213748d0091064da349a308dcb1d368ba340c87356",
+    "lifetime-observer.mjs": "2fe11c297b2c01dceeae72694803b8d79ed6ef79b744d2613c7d8a9bb7094dbe"
+  }
+}
