@@ -1126,3 +1126,62 @@ async fn installed_cli_cancelled_preparation_releases_actual_directories_after_c
     });
     cancel_version_owner(operation, root.path()).await;
 }
+
+#[tokio::test]
+async fn codex_prelaunch_rejects_confirmed_old_but_allows_newer_unknown_and_other_cli() {
+    let minimum = intent_providers::adapter_cli::requirement("codex")
+        .unwrap()
+        .minimum
+        .to_string();
+    for (cli, version, rejected) in [
+        (InstalledCli::Codex, "codex-cli 0.114.0", true),
+        (InstalledCli::Codex, minimum.as_str(), false),
+        (InstalledCli::Codex, "codex-cli 99.0.0", false),
+        (InstalledCli::Codex, "unknown", false),
+        (InstalledCli::Claude, "0.0.1", false),
+    ] {
+        let (root, context) = fixture(cli, &format!("#!/bin/sh\nprintf '%s' '{version}'\n"));
+        let prepared = crate::acp_adapter::AcpAdapterCommand::binary(
+            "/must-not-launch-adapter".into(),
+            vec![],
+        )
+        .cwd(root.path().to_owned())
+        .prepare_with_context(context)
+        .await;
+        if rejected {
+            let Err(error) = prepared else {
+                panic!("old Codex was accepted");
+            };
+            assert!(error.contains("0.114.0"), "{error}");
+            assert!(error.contains(&minimum), "{error}");
+            assert!(error.contains("Upgrade"), "{error}");
+        } else {
+            assert!(
+                prepared.is_ok(),
+                "{version}: {}",
+                prepared.err().unwrap_or_default()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires INTENT_CODEX_OLD_TEST_BINARY pointing to a real below-minimum Codex CLI"]
+async fn codex_real_old_runtime_is_rejected_before_adapter_start() {
+    let binary = std::env::var_os("INTENT_CODEX_OLD_TEST_BINARY").expect("set old Codex path");
+    let (root, context) = fixture(InstalledCli::Codex, "#!/bin/sh\nexit 99\n");
+    std::fs::remove_file(root.path().join("codex")).unwrap();
+    std::os::unix::fs::symlink(binary, root.path().join("codex")).unwrap();
+    let result =
+        crate::acp_adapter::AcpAdapterCommand::binary("/must-not-launch-adapter".into(), vec![])
+            .cwd(root.path().to_owned())
+            .prepare_with_context(context)
+            .await;
+    let Err(error) = result else {
+        panic!("old runtime reached adapter preparation");
+    };
+    let requirement = intent_providers::adapter_cli::requirement("codex").unwrap();
+    assert!(error.contains("0.114.0"), "{error}");
+    assert!(error.contains(&requirement.minimum.to_string()), "{error}");
+    println!("{error}");
+}

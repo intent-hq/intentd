@@ -172,6 +172,14 @@ impl InstalledContext {
         }
     }
 
+    pub fn validate_launch_version(&self, version: &str) -> Result<(), String> {
+        let provider = match self.runtime.cli() {
+            InstalledCli::Codex => "codex",
+            InstalledCli::Claude => "claude-code",
+        };
+        intent_providers::adapter_cli::validate_launch_version(provider, version)
+    }
+
     pub fn key(&self, identity: &InstalledCliIdentity) -> Option<String> {
         let context_key = self.context_key?;
         let adapter = match self.runtime.cli() {

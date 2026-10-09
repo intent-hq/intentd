@@ -17425,7 +17425,7 @@ async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
         assert_eq!(
             session["codexPolicy"],
             json!({
-                "config": {"agents": {"enabled": false}, "features": {"multi_agent_v2": false}},
+                "config": {"agents": {"enabled": false}, "features": {"multi_agent": false, "multi_agent_v2": false}},
                 "pathPresent": true,
                 "codexPath": selected_cli,
             }),

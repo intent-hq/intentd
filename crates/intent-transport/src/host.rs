@@ -458,13 +458,14 @@ pub(crate) async fn handle_with_host_environment(
             // resolve (monorepo#1065). resolvedPath/secondaryResolvedPath
             // stay auto-detected.
             let provider_paths = read_provider_paths(api).await;
-            let result = tokio::task::spawn_blocking(move || {
+            let mut result = tokio::task::spawn_blocking(move || {
                 host_ops::provider_discovery_op(&provider_paths)
             })
             .await
             .unwrap_or_else(|_| {
                 json!({ "providers": [], "npx": { "resolvedPath": null, "version": null, "versionOk": false } })
             });
+            intent_services::provider_cli::add_installed_cli_versions(&mut result).await;
             // Default-provider self-heal (monorepo#3044): with the discovery
             // verdicts in hand, backfill unset default provider/model
             // settings from the installed set. Idempotent and no-overwrite;

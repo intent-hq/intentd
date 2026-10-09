@@ -20,6 +20,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts/auto-pin-codex-acp.py"
 CONFIG = "crates/intent-providers/src/config.rs"
+METADATA = "crates/intent-providers/data/adapter-cli-packages.json"
 BRANCH = "auto/codex-acp-pin"
 REF = f"refs/heads/{BRANCH}"
 REPO = "intent-hq/intentd"
@@ -149,6 +150,9 @@ class PinAutomationTests(unittest.TestCase):
         self.pin_file = self.repo / CONFIG
         self.pin_file.parent.mkdir(parents=True)
         self.pin_file.write_text(FIXTURE.replace("VERSION", "1.9.0"))
+        metadata_path = self.repo / METADATA
+        metadata_path.parent.mkdir(parents=True)
+        metadata_path.write_text(json.dumps({"codex": {"cliPackage":"@openai/codex", "cliCommand":"codex", "pinConstant":"CODEX_ACP_NPX_PACKAGE", "package":{"name":"@agentclientprotocol/codex-acp", "version":"1.9.0"}}}))
         (self.repo / "other.txt").write_text("Unrelated content\n")
         self.git("add", ".")
         self.git("commit", "-qm", "chore: fixture")
@@ -160,7 +164,7 @@ class PinAutomationTests(unittest.TestCase):
             executable.chmod(0o755)
         self.env["PATH"] = f"{self.bin}:{os.environ['PATH']}"
         self.state = {
-            "manifest": {"name": "@agentclientprotocol/codex-acp", "version": "1.13.1"},
+            "manifest": {"name": "@agentclientprotocol/codex-acp", "version": "1.13.1", "dependencies":{"@openai/codex":"^0.159.1"}},
             "remote": str(self.remote), "calls": [], "writes": [],
             "main_fetches": 0, "pr_lookups": 0, "pr": None,
         }
@@ -204,12 +208,15 @@ class PinAutomationTests(unittest.TestCase):
         self.git("push", "-q", "origin", f"{commit}:refs/heads/fixture-live-main")
         return commit
 
-    def test_stable_upgrade_changes_only_the_named_constant(self):
+    def test_stable_upgrade_changes_only_pin_and_adapter_metadata(self):
         self.invoke()
         head = self.head()
         self.assertEqual(self.git("show", f"{head}:{CONFIG}"),
                          FIXTURE.replace("VERSION", "1.13.1").strip())
-        self.assertEqual(self.git("diff", "--name-only", self.base, head), CONFIG)
+        self.assertEqual(self.git("diff", "--name-only", self.base, head), "\n".join(sorted([CONFIG, METADATA])))
+        metadata = json.loads(self.git("show", f"{head}:{METADATA}"))
+        self.assertEqual(metadata["codex"]["package"]["version"], self.state["manifest"]["version"])
+        self.assertEqual(metadata["codex"]["package"]["dependencies"], self.state["manifest"]["dependencies"])
         self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(self.state["writes"], ["create"])
@@ -252,6 +259,14 @@ class PinAutomationTests(unittest.TestCase):
         self.assertEqual(self.state["writes"], ["edit"])
         self.assertEqual(self.state["pr"]["number"], 12)
         self.assertIn("v1.14.0", self.state["pr"]["title"])
+
+    def test_next_pin_refreshes_declared_cli_requirement_automatically(self):
+        self.invoke()
+        self.state["manifest"]["version"] = "1.14.0"
+        self.state["manifest"]["dependencies"]["@openai/codex"] = "^0.160.0"
+        self.invoke()
+        metadata = json.loads(self.git("show", f"{self.head()}:{METADATA}"))
+        self.assertEqual(metadata["codex"]["package"]["dependencies"]["@openai/codex"], "^0.160.0")
 
     def test_repeat_run_does_not_create_commits_push_or_edit_pr(self):
         self.invoke()
