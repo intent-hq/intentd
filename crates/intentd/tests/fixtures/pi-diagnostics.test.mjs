@@ -136,3 +136,22 @@ test('raw and escaped credential whitespace stays redacted across every chunk bo
     assert.equal(safeText('C:\\temp\\runtime\\test.json').text, 'C:\\temp\\runtime\\test.json', 'Windows paths must not be unescaped as whitespace');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('nested JSON error labels are redacted before reports and artifacts are emitted', () => {
+  const value = 'SYNTHETIC_NESTED_DIAGNOSTIC_VALUE_4567';
+  const root = mkdtempSync(join(tmpdir(), 'pi-nested-error-'));
+  try {
+    let message = JSON.stringify({ details: JSON.stringify({ token: value }) });
+    for (let depth = 0; depth < 11; depth++) {
+      const error = new Error(message);
+      const report = failureReport('loadSession', error);
+      assert.ok(!report.includes('SYNTHETIC_'), 'Nested error leaked into failure report');
+      assert.ok(Buffer.byteLength(report) <= LIMITS.report);
+      const record = publishEvidence(join(root, 'nested.json'), { error: { message: error.message } });
+      assert.ok(!JSON.stringify(record).includes('SYNTHETIC_'), 'Nested error leaked into artifact');
+      if (Buffer.byteLength(message) > LIMITS.capture) assert.equal(record.artifactTruncated, true);
+      assert.ok(statSync(join(root, 'nested.json')).size <= LIMITS.artifact);
+      message = JSON.stringify({ details: message });
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

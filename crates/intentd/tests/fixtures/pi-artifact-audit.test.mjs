@@ -190,3 +190,71 @@ test('actual failing TAP file and console redact supported credentials across co
     for (const label of labels) for (const separator of forms) assert.throws(() => auditText(label + separator + value), 'Audit accepts a credential');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('producer and independent auditor agree on supported credential syntax', async () => {
+  const { default: diagnostics } = await import('./pi-diagnostics.cjs');
+  const value = 'SYNTHETIC_CONTRACT_CREDENTIAL_2468';
+  const labels = ['authorization', 'token', 'password', 'secret', 'credential',
+    ...['access', 'refresh', 'auth', 'api'].flatMap(prefix => ['token', 'key'].flatMap(suffix => ['', '_', '-'].map(joiner => prefix + joiner + suffix)))];
+  const cases = [];
+  for (const label of labels) for (const quote of ['"', "'"]) for (const escapes of [0, 1, 3, 7]) {
+    for (const separator of [' ', '\r\n# ', '\\r\\n# \\# ', '\\x0d']) {
+      const escapedQuote = '\\'.repeat(escapes) + quote;
+      cases.push({ raw: `${escapedQuote}${label}${escapedQuote}:${separator}${escapedQuote}${value}${escapedQuote}`, value });
+    }
+  }
+  for (const separator of [' ', '\t', '\r\n# ', '\\r\\n# \\# ', '\\u0009']) {
+    cases.push({ raw: `Bearer${separator}${value}`, value });
+  }
+  cases.push({ raw: `https://user:${value}@example.test`, value }, { raw: secret, value: secret });
+  for (const row of cases) {
+    assert.throws(() => auditText(row.raw), 'Auditor missed a supported credential');
+    const bytes = Buffer.from('original é error\n' + row.raw + '\n');
+    for (let split = 0; split <= bytes.length; split++) {
+      const capture = new diagnostics.Capture();
+      capture.push(bytes.subarray(0, split));
+      assert.ok(!capture.snapshot().text.includes(row.value), 'Partial capture leaked');
+      capture.push(bytes.subarray(split));
+      const text = capture.snapshot(true).text;
+      assert.ok(!text.includes(row.value), 'Producer missed a supported credential');
+      auditText(text);
+    }
+    for (const limit of [64, 128]) {
+      const text = diagnostics.safeText('original error\n' + row.raw.repeat(100), { limit }).text;
+      assert.ok(!text.includes('SYNTHETIC_') && !text.includes('CANARY_'), 'Truncation leaked a credential prefix');
+      assert.ok(Buffer.byteLength(text) <= limit);
+      auditText(text);
+    }
+    auditText(diagnostics.failureReport('loadSession', new Error(row.raw)));
+    auditText(JSON.stringify(diagnostics.safeValue({ message: row.raw })));
+  }
+  for (const path of ['C:\\temp\\runtime\\test.json', '\\\\server\\share\\token-files\\test.json']) {
+    assert.equal(diagnostics.safeText(path).text, path);
+    auditText(path);
+  }
+});
+
+test('actual failing runner redacts nested JSON errors before TAP and console publication', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-tap-nested-error-'));
+  const value = 'SYNTHETIC_NESTED_DIAGNOSTIC_VALUE_4567';
+  try {
+    const driver = join(root, 'nested.test.mjs');
+    writeFileSync(driver, `import test from 'node:test'; import {writeSync} from 'node:fs';
+      test('nested error', () => {
+        for (const label of ['token', 'password', 'api_key', 'authorization']) {
+          let message = JSON.stringify({details: JSON.stringify({[label]: ${JSON.stringify(value)}})});
+          for (let depth = 0; depth < 5; depth++) { writeSync(2, message + '\\n'); message = JSON.stringify({details: message}); }
+        }
+        throw new Error(JSON.stringify({details: JSON.stringify({token: ${JSON.stringify(value)}})}));
+      });`);
+    const run = spawnSync(process.execPath, [fixture('./pi-fixture-runner.mjs'), 'nested.tap', driver], {
+      env: { ...env, PI_ACP_EVIDENCE_DIR: root, PI_DIAGNOSTICS_RUN_ID: 'nested-proof' }, encoding: 'utf8', timeout: 15000,
+    });
+    assert.equal(run.status, 1, 'Intentional test failure must remain visible');
+    for (const text of [readFileSync(join(root, 'nested.tap'), 'utf8'), run.stdout, run.stderr]) {
+      assert.ok(!text.includes(value), 'Nested error leaked before publication');
+      assert.ok(Buffer.byteLength(text) <= 131072);
+      auditText(text);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

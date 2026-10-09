@@ -80,6 +80,9 @@ export function auditText(text) {
   for (const match of text.matchAll(/\b(?:authorization|(?:access|refresh|auth|api)[_-]?(?:token|key)|token|password|secret|credential)(?:\\*["'])?(?:(?:\r?\n|\\+n)[ \t]*(?:\\*#[ \t]*)+|\s|\\+(?:[trn]|x(?:09|0a|0d)|u00(?:09|0a|0d)))*[:=](?:(?:\r?\n|\\+n)[ \t]*(?:\\*#[ \t]*)+|\s|\\+(?:[trn]|x(?:09|0a|0d)|u00(?:09|0a|0d)))*(?:\\*["'])?([^\\\s"',}]+)/gi)) {
     assert.equal(match[1], '[REDACTED]', 'Unredacted labeled credential');
   }
+  for (const match of text.matchAll(/https?:\/\/([^/\s]+)@/gi)) {
+    assert.equal(match[1], '[REDACTED]', 'Unredacted URL credential');
+  }
   assert.ok(!text.includes('CANARY_pi_fixture_secret_9387'), 'Unredacted synthetic credential');
   assert.doesNotMatch(text, /[\x00-\x09\x0b-\x1f\x7f-\x9f]/, 'Terminal control in diagnostic text');
   assert.doesNotMatch(text, /\\(?:u00(?:1b|9b|9d)|x1b)/i, 'Escaped terminal control in diagnostic text');

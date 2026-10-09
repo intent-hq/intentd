@@ -23,7 +23,7 @@ function sanitize(text, secrets) {
     // Node TAP/JSON may spell whitespace as backslash escapes. Normalize only
     // credential boundaries (including TAP comment continuation), not paths like C:\\temp.
     .replace(/\bBearer(?:(?:\n|\\+n)[ \t]*(?:\\*#[ \t]*)+|\s|\\+[trn])+/gi, 'Bearer ')
-    .replace(/\b(?:authorization|(?:access|refresh|auth|api)[_-]?(?:token|key)|token|password|secret|credential)["']?(?:(?:\n|\\+n)[ \t]*(?:\\*#[ \t]*)+|\s|\\+[trn])*[:=](?:(?:\n|\\+n)[ \t]*(?:\\*#[ \t]*)+|\s|\\+[trn])*[^\n]*/gi, '[REDACTED]')
+    .replace(/\b(?:authorization|(?:access|refresh|auth|api)[_-]?(?:token|key)|token|password|secret|credential)(?:\\*["'])?(?:(?:\n|\\+n)[ \t]*(?:\\*#[ \t]*)+|\s|\\+[trn])*[:=](?:(?:\n|\\+n)[ \t]*(?:\\*#[ \t]*)+|\s|\\+[trn])*[^\n]*/gi, '[REDACTED]')
     .replace(/\bBearer\s+[^\s"']+/gi, 'Bearer [REDACTED]')
     .replace(/(https?:\/\/)[^\s/]+@/gi, '$1[REDACTED]@');
   for (const secret of [...secrets].map(controls).filter(Boolean).sort((a, b) => b.length - a.length)) {
