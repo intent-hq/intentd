@@ -1,0 +1,3 @@
+# Preserve exact diagnostic bytes without changing repository-wide text policy.
+/diagnostics/pi-native-pax-local-v2/** -text
+/.github/workflows/pi-native-pax-local-v2.yml -text
