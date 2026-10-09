@@ -1,0 +1,18 @@
+[
+  "known-binding-category-command-parameter",
+  "unknown-projection-fields-redacted",
+  "null-error-invalid",
+  "non-error-record-invalid",
+  "int32-hresult-boundaries",
+  "binding-failure-zero-provider-counts",
+  "counter-null-type-overflow-invalid",
+  "bookkeeping-fault-preserves-caught-behavior",
+  "caught-original-state-and-output-preserved",
+  "lower-null-fields-json-roundtrip",
+  "extra-fields-never-exported",
+  "original-twentyone-oracles-and-throws-preserved",
+  "reset-before-unknown-fields-redacted",
+  "reset-before-redacted-null-json-roundtrip",
+  "reset-before-valid-digest-json-roundtrip",
+  "affected-original-marked-pair-transparency"
+]
