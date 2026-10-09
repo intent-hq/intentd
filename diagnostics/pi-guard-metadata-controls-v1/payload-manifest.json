@@ -1,0 +1,11 @@
+{
+  "diagnostic-functions.ps1": "9a121c01cf33b2a155ee550f6126a3bf66e64b3d246b8df49937c17807f57e6b",
+  "expected-metadata-controls.json": "30f4c49e5465d42dc8ca3e4e06650537932545ee0551a3bfe7c6e3d00c3e8d11",
+  "guard-case-names.json": "a2b854b50cd9127193658ba006cb045da96c807ea5ac163464ee805c6a581b13",
+  "guard-functions.ps1": "0cb5edfa3489a9a35d20ebb92c1afbb857184424aff5a535f1c67fffa58e01f3",
+  "marked-suite.ps1": "3914b20a7681f37ae5fd312b37ce7c2e8bf384becaab4381c2f38000722d29be",
+  "metadata-controls.ps1": "0630adc0810485fd785e08956f5d018f7ffcb01539b21ae1508799bce34d9ac2",
+  "original-guard.ps1": "7aaaddbab0dbb470f61f3acb244fd72a566f6c636c38804a22d6a7d17ca2ab68",
+  "original-suite.ps1": "8b4cf25c5bf644e0903958b600e8b8defad4331a377189321005fa91c467f2c5",
+  "run-metadata-controls.ps1": "19c5f64bb4a96931ff650b46ae9830d7d4dc8c519d2279545dca433187f361b8"
+}
