@@ -1,0 +1,73 @@
+{
+  "originalStatement": "assert(name.startsWith('package/')&&!name.includes('\\\\')&&!name.split('/').includes('..')&&!name.includes(':'));",
+  "rows": [
+    {
+      "index": 1,
+      "part": "prefix",
+      "exactOperand": "name.startsWith('package/')",
+      "assertionCallArgument": 0,
+      "skippedUnless": "all earlier operands truthy under original && semantics",
+      "withinOperand": "member lookup/call/arguments/negation remain original bytes; traversal includes both split and array includes so eval label doesnot distinguish those internal steps.",
+      "interpretation": "A returnedfalse says exact package/ prefix check returnedfalse under current provider; no prefix correction inferred.",
+      "outcomes": {
+        "eval": "part assigned before evaluation; expression threw before returnedflag set. Includes getter/provider/call/evaluation failure, not evidence booleanfalse.",
+        "false": "original operand returned primitive false and && stopped; assert received false unless assert provider itself alteredbehavior.",
+        "true": "operand returned primitive true; failure may be from assert invocation or unexpected later path; not falsification of originalpredicate.",
+        "other": "operand returned nonboolean; original &&/assert receive originalvalue with no normalization. Usually possible only with altered providers; no rawvalue or exacttype disclosed."
+      }
+    },
+    {
+      "index": 2,
+      "part": "backslash",
+      "exactOperand": "!name.includes('\\\\')",
+      "assertionCallArgument": 0,
+      "skippedUnless": "all earlier operands truthy under original && semantics",
+      "withinOperand": "member lookup/call/arguments/negation remain original bytes; traversal includes both split and array includes so eval label doesnot distinguish those internal steps.",
+      "interpretation": "Operand is logical-not of includes(one U+005C); returnedfalse means the includes result was truthy, with native builtin meaning backslash present.",
+      "outcomes": {
+        "eval": "part assigned before evaluation; expression threw before returnedflag set. Includes getter/provider/call/evaluation failure, not evidence booleanfalse.",
+        "false": "original operand returned primitive false and && stopped; assert received false unless assert provider itself alteredbehavior.",
+        "true": "operand returned primitive true; failure may be from assert invocation or unexpected later path; not falsification of originalpredicate.",
+        "other": "operand returned nonboolean; original &&/assert receive originalvalue with no normalization. Usually possible only with altered providers; no rawvalue or exacttype disclosed."
+      }
+    },
+    {
+      "index": 3,
+      "part": "traversal",
+      "exactOperand": "!name.split('/').includes('..')",
+      "assertionCallArgument": 0,
+      "skippedUnless": "all earlier operands truthy under original && semantics",
+      "withinOperand": "member lookup/call/arguments/negation remain original bytes; traversal includes both split and array includes so eval label doesnot distinguish those internal steps.",
+      "interpretation": "Operand is logical-not of includes(..) on split(/) result; nativefalse indicates exact parent-directory segment, not substring a..b. No split or includes re-evaluation.",
+      "outcomes": {
+        "eval": "part assigned before evaluation; expression threw before returnedflag set. Includes getter/provider/call/evaluation failure, not evidence booleanfalse.",
+        "false": "original operand returned primitive false and && stopped; assert received false unless assert provider itself alteredbehavior.",
+        "true": "operand returned primitive true; failure may be from assert invocation or unexpected later path; not falsification of originalpredicate.",
+        "other": "operand returned nonboolean; original &&/assert receive originalvalue with no normalization. Usually possible only with altered providers; no rawvalue or exacttype disclosed."
+      }
+    },
+    {
+      "index": 4,
+      "part": "colon",
+      "exactOperand": "!name.includes(':')",
+      "assertionCallArgument": 0,
+      "skippedUnless": "all earlier operands truthy under original && semantics",
+      "withinOperand": "member lookup/call/arguments/negation remain original bytes; traversal includes both split and array includes so eval label doesnot distinguish those internal steps.",
+      "interpretation": "Operand is logical-not of includes(:); nativefalse indicates colon anywhere, not a normalized drive classification.",
+      "outcomes": {
+        "eval": "part assigned before evaluation; expression threw before returnedflag set. Includes getter/provider/call/evaluation failure, not evidence booleanfalse.",
+        "false": "original operand returned primitive false and && stopped; assert received false unless assert provider itself alteredbehavior.",
+        "true": "operand returned primitive true; failure may be from assert invocation or unexpected later path; not falsification of originalpredicate.",
+        "other": "operand returned nonboolean; original &&/assert receive originalvalue with no normalization. Usually possible only with altered providers; no rawvalue or exacttype disclosed."
+      }
+    }
+  ],
+  "sourceBackslashLiteralBytes": [
+    92,
+    92
+  ],
+  "languageEscapeMeaning": "Two source reverse-solidus bytes in a quoted JS literal encode one U+005C search character; unchanged source literal, not two-character search.",
+  "assertCalleeOrder": "Original assert reference/callee evaluation remains before its argument expressions; newlocals initialized outside that call. If no operand reached, generic prior A04 label remains. Call-provider failure after arguments reports last reached operand/result, not unique assertion-refusal cause.",
+  "valueFlow": "Comma expressions yield their last actual operand value; && uses same shortcircuit and returns same operand value. No boolean cast added. Original assert receives same one argument and no message; rethrow uses same caughtvalue.",
+  "noAcceptanceChange": "No name normalization, path canonicalization, fallback, extra allowed tar types, extraction, bypass or revised predicates."
+}
