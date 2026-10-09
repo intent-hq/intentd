@@ -1,0 +1,46 @@
+# PROPOSAL ONLY. Requires separate reviewed diagnostic-branch publication selection.
+name: Pi diagnostic native setup only
+on:
+  push:
+    branches: [diagnostic/pi-native-npm-selection-v1-once]
+permissions:
+  contents: read
+concurrency:
+  group: pi-native-npm-selection-v1-once
+  cancel-in-progress: false
+jobs:
+  windows-setup-only:
+    # Ordinary subsequent pushes cannot execute this job. There is NO behavioral step,
+    # workflow_dispatch input, dynamic command, or automatic continuation to observation.
+    if: github.event.created == true && github.run_attempt == 1 && github.event.deleted == false
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 24.21.0
+      - name: Validate exact diagnostic branch scope
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          if((git rev-parse HEAD) -ne '${{ github.sha }}'){throw 'checkout_head_mismatch'}
+          if((git rev-parse HEAD^) -ne '08a8582cae52aeddb6977d69909924588f5d11ef'){throw 'diagnostic_parent_mismatch'}
+          $changed=git diff-tree --no-commit-id --name-only -r HEAD
+          foreach($path in $changed){if($path -ne '.gitattributes' -and $path -ne '.github/workflows/pi-native-npm-selection-v1.yml' -and -not $path.StartsWith('diagnostics/pi-native-npm-selection-v1/')){throw 'unreviewed_branch_delta'}}
+          if(git status --porcelain){throw 'source_dirty'}
+      - name: Native setup controls and dependency acceptance only
+        shell: pwsh
+        run: |
+          & diagnostics/pi-native-npm-selection-v1/setup-only.ps1 -WorkRoot (Join-Path '${{ runner.temp }}' 'pi-native-npm-selection-v1-${{ github.run_id }}-${{ github.run_attempt }}')
+      - name: Upload bounded setup evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pi-native-npm-selection-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pi-native-npm-selection-v1-${{ github.run_id }}-${{ github.run_attempt }}/upload/
+          if-no-files-found: error
+          retention-days: 7

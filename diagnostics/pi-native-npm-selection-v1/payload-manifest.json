@@ -1,0 +1,23 @@
+{
+  "OwnedSetup.cs": "910f10dd00d2aea24ef8963c59eab179ccc5acb865a36122a7e674de36a92f8f",
+  "accept-dependencies.mjs": "18d9e0391f2bf4c421a324d7bb177b12149b90052e48a1dd46621d6640f0a7e4",
+  "latch-controls.ps1": "71af961b82c4cbb705da18a87c5a76654e28e70eada09e2ec4344e4ef00353c3",
+  "native-controls.ps1": "b6c2cfea7010942e74927497e612352abce33cc2b7788fcd73f809be6df4c675",
+  "package-lock.json": "b3e555800fcef9fb3d0d4f6e045345d55101c13573f910bfca0d06ee96e81e49",
+  "payload/diagnostic/collector.mjs": "32849dd3204ef7465763265715ed39d643ffa070fd93740fa9e98b7cf24a45f0",
+  "payload/diagnostic/controls.mjs": "119fb0d206a46eec0e30b3b3c9195bcdc2fe4922020f5a332be0b6f9ae8d0c80",
+  "payload/diagnostic/expected-tests.json": "207c451053e02fce2e1053693cc459ce97d5deb53c22bae21bb43a9709321038",
+  "payload/diagnostic/index.instrumented.mjs": "a9c5fd5fba1c0533b4e40aa63410353145a2fdee9083226e5c4b042558427fe1",
+  "payload/diagnostic/parser.mjs": "72d95c19abb5c6a52175700b5c311c525fa1a1b0e0b391a05ec62b02306cbe93",
+  "payload/pinned-sources/pi-acp/package/dist/index.js": "324aeb8bba1228937e16b1326fb3e014e2a625b2dea549dbcd49b006cd5df6a2",
+  "pi-package-lock.json": "6cd6f58eda6edbf120202904f1de608efcd3b645a4ff3073e61526e9ad1e1c78",
+  "resolution-control.mjs": "700f2ac6c4fc850cd7d3ad53e9d13eb4b671a72acf39bda29a25d53fd437c986",
+  "resolve-entry.mjs": "2230613fea783fff6d2f671e00b13d9efb0a39c74abf695df1a2b884739553e2",
+  "setup-only.ps1": "0a007b21677d4fdb2206bae19baea09a29b910267a7fbe02261e5d2a6cd95bb7",
+  "synthetic-child.mjs": "a3d2fb1095592a7dc967e4f4c1adb4e68b1e9931fb09e9802ffb7b05397d55f6",
+  "tool-provenance.ps1": "58e219d1f8d53104415578dec7a9ff568124edead3f91b8c170c58621614fce8",
+  "upload-expected.json": "e2696400eafed1b34d2d6e385a5498f724c65dc7d0a72c1af25ee45062a10f7e",
+  "upload-policy-controls.mjs": "5cda664c65d1e773d245770f94c9435560b13c56b8c2dae27ac33aa020ba24b7",
+  "upload-policy.mjs": "4851a0292d7c85bf1322b04d6a195cfcee228e7dc254fd151df5c5481cd45642",
+  "upload-success-fixture.mjs": "d798f62bc728bdc3ffcaa384e26aad4351e776c85c9a82b3180a5e7ac440eeeb"
+}
