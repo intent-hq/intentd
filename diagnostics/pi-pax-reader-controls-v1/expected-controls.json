@@ -1,0 +1,8 @@
+[
+  "closed-reader-loader-and-ordinary-baseline",
+  "effective-path-and-security-differential",
+  "effective-size-and-physical-stride-differential",
+  "byte-framing-and-strict-refusal-differential",
+  "local-state-and-unsupported-type-differential",
+  "oracle-sensitivity-errors-and-restoration"
+]

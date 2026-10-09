@@ -1,0 +1,166 @@
+{
+  "revision": "955266bfdd854cd280dffd47548673914484e4c0",
+  "entry": "deps/npm/node_modules/tar/dist/commonjs/parse.js",
+  "builtinAllowlist": [
+    "assert",
+    "buffer",
+    "events",
+    "node:events",
+    "node:path",
+    "node:stream",
+    "node:string_decoder",
+    "zlib"
+  ],
+  "modules": {
+    "deps/npm/node_modules/tar/dist/commonjs/parse.js": {
+      "sha256": "f7c48ffcc23e27d0fed96d97063cc973cff09ee20a0aeb9ce494681a5e839810",
+      "bytes": 24267,
+      "requires": {
+        "events": {
+          "builtin": "events"
+        },
+        "minizlib": {
+          "module": "deps/npm/node_modules/minizlib/dist/commonjs/index.js"
+        },
+        "./header.js": {
+          "module": "deps/npm/node_modules/tar/dist/commonjs/header.js"
+        },
+        "./pax.js": {
+          "module": "deps/npm/node_modules/tar/dist/commonjs/pax.js"
+        },
+        "./read-entry.js": {
+          "module": "deps/npm/node_modules/tar/dist/commonjs/read-entry.js"
+        },
+        "./warn-method.js": {
+          "module": "deps/npm/node_modules/tar/dist/commonjs/warn-method.js"
+        }
+      },
+      "gitBlob": "2968e861ee68e546cca84edd06e151db051f033f",
+      "file": "reader-00.cjs"
+    },
+    "deps/npm/node_modules/minizlib/dist/commonjs/index.js": {
+      "sha256": "1545b857e5a597a4fb9294e5040f8b8e3f207e53901f935de2b135a4200abbbf",
+      "bytes": 14870,
+      "requires": {
+        "assert": {
+          "builtin": "assert"
+        },
+        "buffer": {
+          "builtin": "buffer"
+        },
+        "minipass": {
+          "module": "deps/npm/node_modules/minipass/dist/commonjs/index.js"
+        },
+        "zlib": {
+          "builtin": "zlib"
+        },
+        "./constants.js": {
+          "module": "deps/npm/node_modules/minizlib/dist/commonjs/constants.js"
+        }
+      },
+      "gitBlob": "78c6536baf6be9f39aff9a12e41fedf4fd215a02",
+      "file": "reader-01.cjs"
+    },
+    "deps/npm/node_modules/tar/dist/commonjs/header.js": {
+      "sha256": "2840b352ffdee3ed31cb30b87e51d9b96c6255ea484ced0fe2437ad46f49ad93",
+      "bytes": 14094,
+      "requires": {
+        "node:path": {
+          "builtin": "node:path"
+        },
+        "./large-numbers.js": {
+          "module": "deps/npm/node_modules/tar/dist/commonjs/large-numbers.js"
+        },
+        "./types.js": {
+          "module": "deps/npm/node_modules/tar/dist/commonjs/types.js"
+        }
+      },
+      "gitBlob": "f4a84fb76c34627184b2385bfd7fc4a4845d6aea",
+      "file": "reader-02.cjs"
+    },
+    "deps/npm/node_modules/tar/dist/commonjs/pax.js": {
+      "sha256": "8b3fc3092056e28a0e137c4b7ddc230465d62d27df7e9d1665df3f3acbb7c0b2",
+      "bytes": 5397,
+      "requires": {
+        "node:path": {
+          "builtin": "node:path"
+        },
+        "./header.js": {
+          "module": "deps/npm/node_modules/tar/dist/commonjs/header.js"
+        }
+      },
+      "gitBlob": "fce37f63058e10314e9652fc6f985d921d1ac2e8",
+      "file": "reader-03.cjs"
+    },
+    "deps/npm/node_modules/tar/dist/commonjs/read-entry.js": {
+      "sha256": "3152ca6809643af42d413214fbb268736c5f60285941746a9b9d78086e666062",
+      "bytes": 4394,
+      "requires": {
+        "minipass": {
+          "module": "deps/npm/node_modules/minipass/dist/commonjs/index.js"
+        },
+        "./normalize-windows-path.js": {
+          "module": "deps/npm/node_modules/tar/dist/commonjs/normalize-windows-path.js"
+        }
+      },
+      "gitBlob": "655d7dbc0d357b0c5f0b84a89a7f930eff4958c7",
+      "file": "reader-04.cjs"
+    },
+    "deps/npm/node_modules/tar/dist/commonjs/warn-method.js": {
+      "sha256": "eace06acccb8ab8a6372b3b7635da64e8dc7ff4577937a5d5714b61abf1c6589",
+      "bytes": 927,
+      "requires": {},
+      "gitBlob": "f25502776e36a302414fa1d875e4c1e16ba9ad6c",
+      "file": "reader-05.cjs"
+    },
+    "deps/npm/node_modules/minipass/dist/commonjs/index.js": {
+      "sha256": "085dc9747f0f4b28a196353df3702e2ff8cf0bc883a02378df062525a7cf9a38",
+      "bytes": 34050,
+      "requires": {
+        "node:events": {
+          "builtin": "node:events"
+        },
+        "node:stream": {
+          "builtin": "node:stream"
+        },
+        "node:string_decoder": {
+          "builtin": "node:string_decoder"
+        }
+      },
+      "gitBlob": "91f3a5cfc7a0b93eaa9e2b1c85a72ab5de993e11",
+      "file": "reader-06.cjs"
+    },
+    "deps/npm/node_modules/minizlib/dist/commonjs/constants.js": {
+      "sha256": "1574ad656e72d59598f1fd44bf2d242ff57d05ebd27cdf177b504e24b3e64fdf",
+      "bytes": 4299,
+      "requires": {
+        "zlib": {
+          "builtin": "zlib"
+        }
+      },
+      "gitBlob": "dfc2c1957bfc9974baad180b59ec8ae83c62568a",
+      "file": "reader-07.cjs"
+    },
+    "deps/npm/node_modules/tar/dist/commonjs/large-numbers.js": {
+      "sha256": "6de856e25f82701b0ab91e1d1e39efbffc4e73530abcf0a66caba0239b4c9472",
+      "bytes": 2733,
+      "requires": {},
+      "gitBlob": "5b07aa7f71b48df1d232df650ba596eb7c5af4dc",
+      "file": "reader-08.cjs"
+    },
+    "deps/npm/node_modules/tar/dist/commonjs/types.js": {
+      "sha256": "c07cef6564bcef1f93b7a18a3e22c97b57f18229e31a3f66d15127c43b182b5c",
+      "bytes": 1889,
+      "requires": {},
+      "gitBlob": "7cbcc17ef1918ecc5c3b24cdf22ac7b826fdc051",
+      "file": "reader-09.cjs"
+    },
+    "deps/npm/node_modules/tar/dist/commonjs/normalize-windows-path.js": {
+      "sha256": "549d841aa9e43dbc1eae3ca716944b8f7ac9cdfca1638a4c9cb6370beeac97a4",
+      "bytes": 615,
+      "requires": {},
+      "gitBlob": "0e0c08a1d2cc15804c40ae7d19412bfee46202fb",
+      "file": "reader-10.cjs"
+    }
+  }
+}

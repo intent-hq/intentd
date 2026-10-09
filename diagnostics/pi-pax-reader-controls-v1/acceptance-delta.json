@@ -1,0 +1,43 @@
+{
+  "before": "0450222f706f0167771012deee0736a7d6d62d37b9164a6f60db3f076a4b25dd",
+  "after": "acb01a730e3e1f4cbb4e9e0beffb694220be71d6906b76ebda112939c3e7ae64",
+  "changes": [
+    {
+      "old": "const files=new Map();let count=0;",
+      "new": "const files=new Map();let count=0;\n // Strict, bounded local PAX subset. Metadata is interpreted, never silently skipped.\n let pendingPax=null,paxBytes=0,paxHeaders=0;\n function paxPath(value){\n  assert(value.startsWith('package/')&&!value.includes('\\\\')&&!value.split('/').includes('..')&&!value.includes(':'),'pax effective path');\n  const rel=value.slice(8);\n  assert(rel&&!value.endsWith('/')&&rel.split('/').filter(Boolean).every(x=>!/[ .]$/.test(x)&&! /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\\.|$)/i.test(x)),'pax effective Windows name');\n  return rel;\n }\n function paxRecords(body){\n  const values=Object.create(null);let pos=0,records=0;\n  while(pos<body.length){\n   const space=body.indexOf(32,pos);\n   assert(space>pos&&space-pos<=7,'pax record length');\n   const digits=body.subarray(pos,space).toString('latin1');\n   assert(/^[1-9][0-9]*$/.test(digits),'pax record length');\n   const n=Number(digits),end=pos+n;\n   assert(Number.isSafeInteger(n)&&end<=body.length&&end>space+3&&body[end-1]===10,'pax record extent');\n   const equal=body.indexOf(61,space+1);\n   assert(equal>space+1&&equal<end-1,'pax record key');\n   const key=body.subarray(space+1,equal).toString('latin1');\n   assert(['path','size','mtime','linkpath'].includes(key)&&!Object.hasOwn(values,key)&&++records<=4,'pax record key');\n   const bytes=body.subarray(equal+1,end-1);\n   assert(!bytes.includes(0)&&!bytes.includes(10)&&!bytes.includes(13),'pax record value');\n   if(key==='path'){\n    assert(bytes.length>0&&bytes.length<=4096,'pax path bytes');\n    const value=bytes.toString('utf8');\n    assert(Buffer.from(value,'utf8').equals(bytes)&&!value.startsWith('\\uFEFF'),'pax path encoding');\n    paxPath(value);values.path=value;\n   }else if(key==='size'){\n    const value=bytes.toString('latin1');\n    assert(/^(0|[1-9][0-9]*)$/.test(value)&&Number.isSafeInteger(Number(value))&&Number(value)<=33554432,'pax size');\n    values.size=Number(value);\n   }else if(key==='mtime'){\n    const value=bytes.toString('latin1');\n    assert(bytes.length>0&&bytes.length<=64&&/^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$/.test(value)&&Number.isFinite(Number(value))&&Math.abs(Number(value))<=8640000000000,'pax mtime');\n    values.mtime=value;\n   }else {assert(bytes.length===0,'pax linkpath');values.linkpath='';}\n   pos=end;\n  }\n  assert(records>0&&pos===body.length,'pax records');return values;\n }\n"
+    },
+    {
+      "old": "if(block.every(x=>x===0))break;",
+      "new": "if(block.every(x=>x===0)){if(pendingPax!==null)assert(false,'pax orphan');break;}"
+    },
+    {
+      "old": "if(name==='package'&&type==='5')",
+      "new": "if(pendingPax!==null)assert(type==='0','pax regular target');\n if(type==='x'){\n  assert(tar.length%512===0&&prefix===''&&field(257,263)==='ustar'&&field(263,265)==='00'&&field(157,257)==='','pax carrier header');\n  const carrier=name.slice(10);\n  assert(name.startsWith('PaxHeader/')&&carrier!==''&&carrier!=='.'&&carrier!=='..'&&!/[\\\\/:\\x00]/.test(carrier)&&!/[ .]$/.test(carrier)&&! /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\\.|$)/i.test(carrier),'pax carrier path');\n  assert(length>0&&length<=1048576&&paxBytes+length<=8388608&&paxHeaders+1<=1024,'pax metadata cap');\n  const next=offset+512+Math.ceil(length/512)*512;\n  assert(next<=tar.length&&tar.subarray(offset+512+length,next).every(x=>x===0),'pax metadata padding');\n  const values=paxRecords(tar.subarray(offset+512,offset+512+length));\n  pendingPax=values;paxBytes+=length;paxHeaders++;offset=next;continue;\n }\n if(name==='package'&&type==='5')"
+    },
+    {
+      "old": "}}const rel=name.slice(8);",
+      "new": "}}let rel=name.slice(8),contentLength=length;"
+    },
+    {
+      "old": "if(type==='0'){try {assert(rel&&!files.has(rel));}",
+      "new": "if(pendingPax!==null){\n  assert(!name.endsWith('/')&&rel!==''&&field(157,257)==='','pax regular target');\n  if(Object.hasOwn(pendingPax,'path'))rel=paxPath(pendingPax.path);\n  if(Object.hasOwn(pendingPax,'size'))contentLength=pendingPax.size;\n  assert(contentLength<=33554432&&offset+512+contentLength<=tar.length&&offset+512+Math.ceil(contentLength/512)*512<=tar.length,'pax effective extent');\n  assert(count+1<=100000,'pax file count');pendingPax=null;\n }\n if(type==='0'){try {assert(rel&&!files.has(rel));}"
+    },
+    {
+      "old": "digest(tar.subarray(offset+512,offset+512+length)),bytes:length",
+      "new": "digest(tar.subarray(offset+512,offset+512+contentLength)),bytes:contentLength"
+    },
+    {
+      "old": "offset+=512+Math.ceil(length/512)*512;",
+      "new": "offset+=512+Math.ceil(contentLength/512)*512;"
+    },
+    {
+      "old": " }try {assert(files.size>0);}",
+      "new": " }if(pendingPax!==null)assert(false,'pax orphan');try {assert(files.size>0);}"
+    },
+    {
+      "old": "tarParser:'Regular files/directories only; unsupported archive features stop setup.'",
+      "new": "tarParser:'Regular files/directories and bounded single local PAX regular-file overrides; unsupported archive features stop setup.'"
+    }
+  ],
+  "reverseVerified": true
+}
