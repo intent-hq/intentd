@@ -1,0 +1,8 @@
+[
+  "fresh-valid-baseline",
+  "four-in-bound-schema-refusals",
+  "separate-oversize-refusal",
+  "line-and-prefix-sensitivity",
+  "redaction-and-no-normalization",
+  "exact-reversal-and-population-boundary"
+]
