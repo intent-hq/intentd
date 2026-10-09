@@ -144,6 +144,15 @@ terminal being open. If setup stays running, inspect its last output before
 retrying. Include that output, the Intent version, and the operating system when
 reporting the problem.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; messages/en.json. -->
+
+To delete a saved script, use **Delete script** beside its play/edit controls in
+the bottom bar, or open the script panel's **…** menu and choose **Delete script**
+immediately after **Show in bottom bar**. Both actions ask for confirmation;
+cancel to keep the script. Stop an active script first and wait until it is idle
+or has exited. Deletion stays disabled while the script is starting, running,
+restarting, its state is unknown, or a deletion is pending.
+
 To continue work, open its existing card or sidebar entry, then the existing agent's
 conversation. Read its status and last response before sending a follow-up. Use
 **Create new agent** in that workspace only when a separate conversation is needed;
