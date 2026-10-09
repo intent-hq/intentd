@@ -1,0 +1,74 @@
+{
+  "originalWrapperSha256": "c0373aff6bd95f160d79e8c8295b52fbfd3b77eaa2871f0e435ff5edc990ac83",
+  "candidateWrapperSha256": "f8e8b0e82491abd4ae80b594176d54130dfcdc06dccb02e7a0791b83a9785d15",
+  "changes": [
+    {
+      "old": "  $allowedCases=@('framing-and-finite-fields','effective-path-and-raw-security','effective-size-and-physical-stride','single-use-state-and-unsupported-types','ordinary-regression-and-provenance','finite-cap-models-and-error-restoration')",
+      "new": "  $allowedCases=@('exact-source-and-canonical-comparison','evaluation-order-error-identity-and-C1','fixed-category-mapping-and-security','snapshot-cap-shape-and-query-sensitivity','fault-freshness-and-restoration','metadata-writer-and-native-relay-contract')",
+      "count": 1
+    },
+    {
+      "old": "function Hash([string]$Path)",
+      "new": "function Test-ControlProgressAgreement($Progress,$Rows) {\n try {\n  if($Progress -isnot [Collections.IDictionary] -or (($Progress.Keys|Sort-Object)-join '|') -cne 'assertion|case|completed|valid'){return $false}\n  if($Progress.valid -isnot [bool] -or -not $Progress.valid -or $Progress.case -isnot [string] -or $Progress.assertion -isnot [int] -or $Progress.assertion -ne 40){return $false}\n  if($Progress.completed -isnot [object[]] -or $Progress.completed.Rank -ne 1 -or $Progress.completed.GetLowerBound(0) -ne 0 -or $Progress.completed.Count -ne 6){return $false}\n  if($Rows -isnot [object[]] -or $Rows.Rank -ne 1 -or $Rows.GetLowerBound(0) -ne 0 -or $Rows.Count -ne 6){return $false}\n  for($i=0;$i -lt 6;$i++){\n   $row=$Rows[$i]\n   if($row -isnot [hashtable] -or (($row.Keys|Sort-Object)-join '|') -cne 'name|outcome' -or $row.name -isnot [string] -or $row.outcome -isnot [string] -or $row.outcome -cne 'PASS' -or $Progress.completed[$i] -isnot [string] -or $Progress.completed[$i] -cne $row.name){return $false}\n  }\n  if($Progress.case -cne $Rows[5].name){return $false}\n  return $true\n }catch{return $false}\n}\nfunction Hash([string]$Path)",
+      "count": 1
+    },
+    {
+      "old": "  $record=[ordered]@{schema=",
+      "new": "  # BEGIN COMPLETE CONTROL PROGRESS ADMISSION\n  if($outcome -ceq 'PASS' -and -not (Test-ControlProgressAgreement $progressSafe $rows)){\n   $outcome='FAILED';$phase='progress-admission';$category='InvalidData';$hresult=0\n  }\n  # END COMPLETE CONTROL PROGRESS ADMISSION\n  $record=[ordered]@{schema=",
+      "count": 1
+    }
+  ],
+  "oldCases": [
+    "framing-and-finite-fields",
+    "effective-path-and-raw-security",
+    "effective-size-and-physical-stride",
+    "single-use-state-and-unsupported-types",
+    "ordinary-regression-and-provenance",
+    "finite-cap-models-and-error-restoration"
+  ],
+  "expectedCases": [
+    "exact-source-and-canonical-comparison",
+    "evaluation-order-error-identity-and-C1",
+    "fixed-category-mapping-and-security",
+    "snapshot-cap-shape-and-query-sensitivity",
+    "fault-freshness-and-restoration",
+    "metadata-writer-and-native-relay-contract"
+  ],
+  "actualResultSha256": "aa58f9ae43aef956e039d03ffef83bf262944f4bb72aac0d4b8933566a5de3d6",
+  "actualReviewSha256": "5542939a1aa3b1bcf0e72efc46b6de9115f7dd71ff16a079d2127b77e58a8a89",
+  "withheldOutcome": "PASS",
+  "withheldAcceptedCount": 6,
+  "withheldProgress": {
+    "valid": false,
+    "case": null,
+    "assertion": null,
+    "completed": []
+  },
+  "withheldRows": [
+    {
+      "name": "exact-source-and-canonical-comparison",
+      "outcome": "PASS"
+    },
+    {
+      "name": "evaluation-order-error-identity-and-C1",
+      "outcome": "PASS"
+    },
+    {
+      "name": "fixed-category-mapping-and-security",
+      "outcome": "PASS"
+    },
+    {
+      "name": "snapshot-cap-shape-and-query-sensitivity",
+      "outcome": "PASS"
+    },
+    {
+      "name": "fault-freshness-and-restoration",
+      "outcome": "PASS"
+    },
+    {
+      "name": "metadata-writer-and-native-relay-contract",
+      "outcome": "PASS"
+    }
+  ],
+  "scope": "Only already-exported fixed names/outcomes/count/invalidprogress projection. No private raw controlProgress, exception, runtime assemblies or package data copied."
+}

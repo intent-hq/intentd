@@ -1,0 +1,29 @@
+{
+  "review": "43d03120dfba1f6c4b4c10ecf864465cf1f019eaacea0767a944e1ef2eaa2208",
+  "actual": "0c52742a90bfbd3897fdb72ed0f49bb5dd1512273f7e532e2e584360a3a9b173",
+  "labels": [
+    "pm-no-actual",
+    "pm-no-expected",
+    "pm-shape",
+    "pm-identity",
+    "pm-integrity",
+    "pm-graph",
+    "pm-platform",
+    "pm-lifecycle",
+    "pm-descriptive",
+    "pm-other",
+    "pm-multiple",
+    "pm-equal-call",
+    "pm-unclassified"
+  ],
+  "originalStatement": "assert.equal(stable(a),stable(e),'metadata difference, including optional/platform flags');",
+  "C1": "pm-equal-call only exact captured string equality; parsed equal/raw unequal pm-unclassified. No ordinary canonical stable claim violated.",
+  "limits": {
+    "snapshotBytesEach": 16384,
+    "unionTopKeys": 64,
+    "sidefileBytes": 512,
+    "readBytes": 513,
+    "lineCharacters": 768
+  },
+  "nativeVsModel": "Native assert/string/JSON/Buffer and actual helper/expression with synthetic records. Provider/getter/fault/mutant cases are explicit source models. No real installed record, archive, npm writer or fullsetup evidence."
+}
