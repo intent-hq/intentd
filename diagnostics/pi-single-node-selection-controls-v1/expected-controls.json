@@ -1,0 +1,10 @@
+[
+  "native-precedence-multiple-distinct",
+  "single-and-duplicate-paths",
+  "scalar-derivation-and-basic-boundary",
+  "application-filter-and-no-fallback",
+  "missing-malformed-and-query-errors",
+  "refusal-provenance-error-transparency",
+  "unchanged-npm-observer-and-faults",
+  "source-reversal-and-current-context"
+]
