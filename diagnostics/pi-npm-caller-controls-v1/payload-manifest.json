@@ -1,0 +1,9 @@
+{
+  "controls.ps1": "ef7451badc1ca1c382f3d5e11c2cf26ec5defbf65c0f05744558cfdf9e61d6ca",
+  "expected-controls.json": "237c5a0814591455759c4b95312e39c42716cf3eb8a9f1755b49112b2fadb25d",
+  "original-setup-only.ps1": "0a007b21677d4fdb2206bae19baea09a29b910267a7fbe02261e5d2a6cd95bb7",
+  "original-tool-provenance.ps1": "58e219d1f8d53104415578dec7a9ff568124edead3f91b8c170c58621614fce8",
+  "run-controls.ps1": "99769a2ddedefca0e5dc1a38d28e04c3a09b592a0b908d456023c57d082e8dec",
+  "setup-only.ps1": "877d8a567d451d7b750398a25ea540240ed70971543a8d1d0e71045d81101461",
+  "tool-provenance.ps1": "dc97e62e6dcdafa7080f245546fa4ea056974c08c47f53b0e45a7c3031b628f8"
+}

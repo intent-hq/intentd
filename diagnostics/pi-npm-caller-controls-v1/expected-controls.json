@@ -1,0 +1,10 @@
+[
+  "caller-enumeration-and-typed-boundary",
+  "single-and-multiple-relationship",
+  "bounded-shape-negative",
+  "lookup-cardinality-no-new-query",
+  "schema-redaction-and-context",
+  "original-error-and-provider-transparency",
+  "installed-writer-and-bookkeeping-faults",
+  "three-site-composition"
+]
