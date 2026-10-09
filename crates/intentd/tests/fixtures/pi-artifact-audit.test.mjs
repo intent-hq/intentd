@@ -152,6 +152,12 @@ test('a failing stream beyond the detail cap fails both validators without banni
     assert.deepEqual(clean.streamErrorSummary, { total: 129, unexpected: 0 });
     cleanup.assertNoUnexpectedStreamErrors(clean);
     auditArtifact(clean, expected);
+    for (const total of [1, 129]) {
+      const contradictory = { ...clean, streamErrors: [{ expected: false, message: 'retained unexpected error' }],
+        streamErrorSummary: { total, unexpected: 0 } };
+      assert.throws(() => cleanup.assertNoUnexpectedStreamErrors(contradictory), /Inconsistent stream-error summary/);
+      assert.throws(() => auditArtifact(contradictory, expected), /Inconsistent stream-error summary/);
+    }
     for (const summary of [undefined, {}, { total: 0, unexpected: 0 }, { total: 129, unexpected: -1 }]) {
       const missingProof = { ...clean, streamErrorSummary: summary };
       assert.throws(() => cleanup.assertNoUnexpectedStreamErrors(missingProof));
@@ -160,15 +166,16 @@ test('a failing stream beyond the detail cap fails both validators without banni
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('actual failing TAP file and console redact raw and escaped TAB and CR Bearer credentials', () => {
+test('actual failing TAP file and console redact supported credentials across control continuations', () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-tap-whitespace-'));
   const value = 'SYNTHETIC_UNLISTED_CREDENTIAL_123456';
   try {
-    const forms = ['\t', '\r', '\r\n', '\\t', '\\r', '\\u0009', '\\x0d'];
+    const forms = ['\t', '\r', '\r\n', '\n# ', '\r\n# ', '\n# # ', '\x1b[31m\r', '\\u001b[31m\r', '\\t', '\\r', '\\r\\n', '\\r\\n# ', '\\n# # ', '\\u0009', '\\x0d'];
+    const labels = ['Bearer', 'authorization:', 'token=', 'password:', 'api_key:', 'access-token=', 'refresh_key:', 'authkey=', 'secret:', 'credential='];
     const driver = join(root, 'failure.test.mjs');
     writeFileSync(driver, `import test from 'node:test'; import {writeSync} from 'node:fs';
       test('unexpected fixture failure', () => {
-        for (const separator of ${JSON.stringify(forms)}) writeSync(2, 'Bearer' + separator + ${JSON.stringify(value)} + '\\n');
+        for (const label of ${JSON.stringify(labels)}) for (const separator of ${JSON.stringify(forms)}) writeSync(2, label + separator + ${JSON.stringify(value)} + '\\n');
         throw new Error('Bearer\\t' + ${JSON.stringify(value)});
       });`);
     const run = spawnSync(process.execPath, [fixture('./pi-fixture-runner.mjs'), 'failed.tap', driver], {
@@ -180,6 +187,6 @@ test('actual failing TAP file and console redact raw and escaped TAB and CR Bear
       assert.ok(Buffer.byteLength(text) <= 131072);
       auditText(text);
     }
-    for (const separator of forms) assert.throws(() => auditText('Bearer' + separator + value), 'Audit accepts a credential');
+    for (const label of labels) for (const separator of forms) assert.throws(() => auditText(label + separator + value), 'Audit accepts a credential');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

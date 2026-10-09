@@ -109,8 +109,10 @@ test('raw and escaped credential whitespace stays redacted across every chunk bo
   const value = 'SYNTHETIC_UNLISTED_CREDENTIAL_123456';
   const root = mkdtempSync(join(tmpdir(), 'pi-whitespace-redaction-'));
   try {
-    for (const separator of ['\t', '\r', '\r\n', '\n# ', '\r\n# ', '\\t', '\\r', '\\r\\n', '\\x09', '\\x0d', '\\u0009', '\\u000d', '\\\\t', '\\\\r']) {
-      const raw = Buffer.from(`original é failure\nBearer${separator}${value}\n`);
+    const labels = ['Bearer', 'authorization:', 'token=', 'password:', 'secret=', 'credential:',
+      ...['access', 'refresh', 'auth', 'api'].flatMap(prefix => ['token', 'key'].flatMap(suffix => ['', '_', '-'].map(joiner => prefix + joiner + suffix + ':')))];
+    for (const label of labels) for (const separator of ['\t', '\r', '\r\n', '\n# ', '\r\n# ', '\n# # ', '\x1b[31m\r', '\\u001b[31m\r', '\\t', '\\r', '\\r\\n', '\\r\\n# ', '\\n# # ', '\\x09', '\\x0d', '\\u0009', '\\u000d', '\\\\t', '\\\\r']) {
+      const raw = Buffer.from(`original é failure\n${label}${separator}${value}\n`);
       for (let split = 0; split <= raw.length; split++) {
         const capture = new Capture();
         capture.push(raw.subarray(0, split));
@@ -119,6 +121,13 @@ test('raw and escaped credential whitespace stays redacted across every chunk bo
         const result = capture.snapshot(true);
         assert.ok(!result.text.includes(value), 'Completed capture leaks a credential');
         assert.match(result.text, /original é failure/);
+      }
+      for (let limit = 48; limit < raw.length; limit++) {
+        const capture = new Capture({ limit });
+        capture.push(raw);
+        const capped = capture.snapshot(true);
+        assert.ok(!capped.text.includes('SYNTHETIC_'), 'Truncated capture leaks a credential prefix');
+        assert.ok(Buffer.byteLength(capped.text) <= limit);
       }
       assert.ok(!failureReport('loadSession', new Error(raw.toString())).includes(value), 'Failure report leaks a credential');
       const record = publishEvidence(join(root, 'evidence.json'), { error: raw.toString() });

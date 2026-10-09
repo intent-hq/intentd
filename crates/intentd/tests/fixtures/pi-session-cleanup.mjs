@@ -49,5 +49,8 @@ export function assertNoUnexpectedStreamErrors(record) {
     && Number.isSafeInteger(summary.unexpected) && summary.unexpected >= 0
     && summary.unexpected <= summary.total, 'Missing or invalid stream-error summary');
   assert.ok(summary.total >= (record.streamErrors?.length ?? 0), 'Inconsistent stream-error summary');
+  assert.ok(summary.unexpected >= (record.streamErrors ?? []).filter(row => row?.expected === false).length
+    && summary.total - summary.unexpected >= (record.streamErrors ?? []).filter(row => row?.expected === true).length,
+    'Inconsistent stream-error summary');
   assert.equal(summary.unexpected, 0, 'Unexpected MCP stream error');
 }

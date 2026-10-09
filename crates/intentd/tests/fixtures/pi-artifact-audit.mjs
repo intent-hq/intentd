@@ -44,6 +44,9 @@ export function auditArtifact(record, { run, route, oversized, runtime = false }
       && Number.isSafeInteger(summary.unexpected) && summary.unexpected >= 0
       && summary.unexpected <= summary.total, 'Missing or invalid stream-error summary');
     assert.ok(summary.total >= (record.streamErrors?.length ?? 0), 'Inconsistent stream-error summary');
+    assert.ok(summary.unexpected >= (record.streamErrors ?? []).filter(row => row?.expected === false).length
+      && summary.total - summary.unexpected >= (record.streamErrors ?? []).filter(row => row?.expected === true).length,
+      'Inconsistent stream-error summary');
     assert.equal(summary.unexpected, 0, 'Unexpected MCP stream error');
     assert.equal(record.result, 'passed', 'Real runtime fixture failed');
     assert.deepEqual(record.replay?.map(row => row.text), ['first:created', 'second:created'], 'Saved-session replay missing');
@@ -69,10 +72,13 @@ export function auditArtifact(record, { run, route, oversized, runtime = false }
   }
 }
 export function auditText(text) {
-  // Independently reject unmasked Bearer values, including TAP/JSON escape
+  // Independently reject unmasked labeled and Bearer values, including TAP/JSON escape
   // spellings. Do not use the producer's normalization or sanitizer here.
-  for (const match of text.matchAll(/\bBearer(?:\r?\n[ \t]*#[ \t]*|\s|\\+(?:[trn]|x(?:09|0a|0d)|u00(?:09|0a|0d)))+([^\\\s"']+)/gi)) {
+  for (const match of text.matchAll(/\bBearer(?:(?:\r?\n|\\+n)[ \t]*(?:\\*#[ \t]*)+|\s|\\+(?:[trn]|x(?:09|0a|0d)|u00(?:09|0a|0d)))+([^\\\s"']+)/gi)) {
     assert.equal(match[1], '[REDACTED]', 'Unredacted Bearer credential');
+  }
+  for (const match of text.matchAll(/\b(?:authorization|(?:access|refresh|auth|api)[_-]?(?:token|key)|token|password|secret|credential)(?:\\*["'])?(?:(?:\r?\n|\\+n)[ \t]*(?:\\*#[ \t]*)+|\s|\\+(?:[trn]|x(?:09|0a|0d)|u00(?:09|0a|0d)))*[:=](?:(?:\r?\n|\\+n)[ \t]*(?:\\*#[ \t]*)+|\s|\\+(?:[trn]|x(?:09|0a|0d)|u00(?:09|0a|0d)))*(?:\\*["'])?([^\\\s"',}]+)/gi)) {
+    assert.equal(match[1], '[REDACTED]', 'Unredacted labeled credential');
   }
   assert.ok(!text.includes('CANARY_pi_fixture_secret_9387'), 'Unredacted synthetic credential');
   assert.doesNotMatch(text, /[\x00-\x09\x0b-\x1f\x7f-\x9f]/, 'Terminal control in diagnostic text');
