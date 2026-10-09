@@ -742,3 +742,97 @@ async fn agent_set_model_triggers_respawn_over_wss() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+/// Startup warning data follows the installed CLI, never an adapter override.
+#[intent_test_macros::daemon_test]
+async fn wss_provider_cli_minimum_reports_old_supported_and_unknown() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_data_dir();
+    let data_dir = dir.path();
+    let bin = data_dir.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let codex = bin.join("codex");
+    std::fs::write(
+        &codex,
+        "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 92\n/bin/cat \"$0.version\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let version_file = bin.join("codex.version");
+    std::fs::write(&version_file, "codex-cli 0.114.0\n").unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let _daemon = Daemon {
+        child: spawn_serve(
+            data_dir,
+            "both",
+            &[
+                ("INTENTD_AUTH_TOKEN", TOKEN),
+                ("PATH", &path),
+                ("CODEX_PATH", "/must-not-probe-this-adapter"),
+            ],
+        ),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut rpc = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let requirement = intent_providers::adapter_cli::requirement("codex").unwrap();
+    let minimum = requirement.minimum.to_string();
+    for (index, (version, expected)) in [
+        ("codex-cli 0.0.1", Some(false)),
+        (minimum.as_str(), Some(true)),
+        ("codex-cli 99.0.0", Some(true)),
+        ("codex unknown build", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        std::fs::write(&version_file, version).unwrap();
+        let discovered = wss_rpc(
+            &mut rpc,
+            i64::try_from(index).unwrap() + 1,
+            "host.providerDiscovery",
+            json!({}),
+        )
+        .await;
+        let providers = discovered["providers"].as_array().unwrap();
+        let row = providers.iter().find(|row| row["id"] == "codex").unwrap();
+        assert_eq!(row["cliCommand"], "codex");
+        assert_eq!(row["cliResolvedPath"], json!(codex));
+        assert_eq!(row["cliResolved"], true);
+        assert_eq!(row["cliVersion"], version);
+        assert_eq!(row["cliMinimumVersion"], minimum);
+        assert_eq!(row["cliVersionRange"], requirement.range);
+        assert_eq!(row.get("cliVersionOk"), expected.map(Value::Bool).as_ref());
+        assert!(
+            row.get("unavailableReason").is_none(),
+            "discovery remains descriptive: {row}"
+        );
+        if expected == Some(false) {
+            let prompt = wss_rpc(
+                &mut rpc,
+                100,
+                "host.providerTestPrompt",
+                json!({"providerId": "codex"}),
+            )
+            .await;
+            assert_eq!(prompt["ok"], false, "{prompt}");
+            let message = prompt["message"].as_str().unwrap();
+            assert!(message.contains(version), "{prompt}");
+            assert!(message.contains(&minimum), "{prompt}");
+            assert!(message.contains("Upgrade Codex"), "{prompt}");
+        }
+        let no_minimum = providers
+            .iter()
+            .find(|row| row["id"] == "claude-code")
+            .unwrap();
+        assert!(no_minimum.get("cliRequirement").is_none());
+        assert!(no_minimum.get("cliVersionOk").is_none());
+    }
+}

@@ -1903,7 +1903,9 @@ jobs:
       - name: Test the Makefile gate forwarder
         run: ./scripts/test-makefile-forwarder.sh
       - name: Test the Codex ACP rolling pin PR automation
-        run: python3 -S scripts/test-auto-pin-codex-acp.py
+        run: |
+          python3 -S scripts/test-auto-pin-codex-acp.py
+          python3 -S scripts/test-provider-cli-metadata.py
       - name: Test the release-plz no-op baseline
         run: python3 -S scripts/test-release-plz-noop.py
       - uses: taiki-e/install-action@v2

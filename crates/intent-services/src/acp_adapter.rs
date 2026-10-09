@@ -297,9 +297,10 @@ impl AcpAdapterCommand {
                     npx_dir.clone(),
                     codex_home.clone(),
                 ));
-                let (identity, _version) = context
+                let (identity, version) = context
                     .observe_with_dependency(&command, Some(dependency))
                     .await?;
+                context.validate_launch_version(&version)?;
                 let env = command
                     .as_std()
                     .get_envs()

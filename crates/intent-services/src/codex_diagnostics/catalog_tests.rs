@@ -887,6 +887,40 @@ child.on('exit',code=>process.exit(code||0));
     }
 
     #[tokio::test]
+    async fn installed_old_codex_is_rejected_before_acp_and_raw_catalog_launch() {
+        let fixture = Fixture::new(&json!({"installed":true}));
+        let mut launch = fixture.launch(true);
+        let installed_dir = fixture.root.path().join("installed");
+        let context = crate::installed_cli::test_context_in(
+            intent_providers::installed_cli::InstalledCli::Codex,
+            &installed_dir,
+        );
+        std::fs::write(
+            installed_dir.join("codex"),
+            "#!/bin/sh\nprintf 'codex-cli 0.114.0\\n'\n",
+        )
+        .unwrap();
+        launch.codex_path = Some(installed_dir.join("codex").into_os_string());
+        launch.installed = Some(context);
+        let report = launch
+            .catalogs_with_auth(Ok(fixture.auth().await), Limits::default())
+            .await;
+        assert_eq!(
+            report.acp,
+            CatalogOutcome::Failed(CatalogFailure::RuntimeBelowMinimum)
+        );
+        assert_eq!(
+            report.raw,
+            CatalogOutcome::Failed(CatalogFailure::RuntimeBelowMinimum)
+        );
+        assert!(!fixture
+            .events()
+            .iter()
+            .any(|event| event["started"] == true));
+        fixture.assert_clean();
+    }
+
+    #[tokio::test]
     async fn installed_cli_identity_and_raw_catalog_survive_adapter_start_failure() {
         let fixture = Fixture::new(&json!({"installed":true}));
         let mut launch = fixture.launch(true);

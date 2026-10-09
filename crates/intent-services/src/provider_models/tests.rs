@@ -1942,7 +1942,7 @@ fn codex_probe_launch_enforces_both_subagent_settings() {
     });
     assert_eq!(
         value,
-        Some(json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}))
+        Some(json!({"features": {"multi_agent": false, "multi_agent_v2": false}}))
     );
 }
 

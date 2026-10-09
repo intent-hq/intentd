@@ -1666,7 +1666,7 @@ mod build_command_tests {
             .expect("pinned npx Codex spawn must set daemon-owned CODEX_CONFIG");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&config).unwrap(),
-            serde_json::json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}})
+            serde_json::json!({"features": {"multi_agent": false, "multi_agent_v2": false}})
         );
     }
 
@@ -1933,7 +1933,7 @@ mod captured_env_tests {
                 ("CODEX_PATH", "/untrusted/codex"),
                 (
                     "CODEX_CONFIG",
-                    r#"{"agents":{"enabled":true},"features":{"multi_agent_v2":true},"model":"untrusted"}"#,
+                    r#"{"agents":{"enabled":true},"features":{"multi_agent":true,"multi_agent_v2":true},"model":"untrusted"}"#,
                 ),
                 (unrelated.as_str(), "preserved"),
             ] {
@@ -1955,7 +1955,7 @@ mod captured_env_tests {
                 .expect("pinned adapter must set the daemon-owned subagent policy");
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&config).unwrap(),
-                serde_json::json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}),
+                serde_json::json!({"features": {"multi_agent": false, "multi_agent_v2": false}}),
                 "policy must win over {source} env"
             );
             assert_eq!(env_value(&cmd, &unrelated).as_deref(), Some("preserved"));

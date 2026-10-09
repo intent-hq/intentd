@@ -16,6 +16,8 @@ import subprocess
 import sys
 import tempfile
 
+from provider_cli_metadata import METADATA, package_snapshot, replace_package
+
 
 REPO = "intent-hq/intentd"
 BRANCH = "auto/codex-acp-pin"
@@ -84,13 +86,15 @@ def title(target):
     return f"fix: bump Codex ACP fallback to v{target}"
 
 
-def message(current, target, previous_metadata_hash=None):
+def message(current, target, previous_metadata_hash=None, package_metadata_hash=None):
     return (
         f"{title(target)}\n\n"
         f"Managed Codex ACP pin: {current} -> {target}.\n"
         "Auto-pin-Codex-ACP: v1\n"
     ) + (f"Previous-PR-Metadata-SHA256: {previous_metadata_hash}\n"
-         if previous_metadata_hash else "")
+         if previous_metadata_hash else "") + (
+        f"Adapter-Package-Metadata-SHA256: {package_metadata_hash}\n"
+        if package_metadata_hash else "")
 
 
 def pr_metadata_hash(pr):
@@ -174,25 +178,39 @@ def inspect_branch(head, base):
     before, after = config_at(parent), config_at(head)
     current, target = read_pin(before), read_pin(after)
     commit_message = git("show", "-s", "--format=%B", head).strip()
-    receipt = re.search(r"\nPrevious-PR-Metadata-SHA256: ([0-9a-f]{64})$", commit_message)
+    receipt = re.search(r"\nPrevious-PR-Metadata-SHA256: ([0-9a-f]{64})(?:\n|$)", commit_message)
     previous_metadata_hash = receipt[1] if receipt else None
+    metadata_receipt = re.search(r"\nAdapter-Package-Metadata-SHA256: ([0-9a-f]{64})$", commit_message)
+    package_metadata_hash = metadata_receipt[1] if metadata_receipt else None
+    changed = git("diff-tree", "--no-commit-id", "--name-status", "-r", parent, head).strip()
+    expected_changes = f"M\t{CONFIG}"
+    if package_metadata_hash:
+        metadata = git("show", f"{head}:{METADATA}")
+        if hashlib.sha256(metadata.encode()).hexdigest() != package_metadata_hash:
+            raise Refusal("Adapter metadata was edited; preserving human changes.")
+        previous = decode_json(git("show", f"{parent}:{METADATA}"))
+        actual = decode_json(metadata)
+        package = actual["codex"]["package"]
+        expected = decode_json(replace_package(json.dumps(previous), "codex", package))
+        if actual != expected or package.get("name") != PACKAGE or package.get("version") != target:
+            raise Refusal("Unexpected adapter metadata changes; preserving human edits.")
+        expected_changes = "\n".join(sorted([expected_changes, f"M\t{METADATA}"]))
     identity = git("show", "-s", "--format=%an%n%ae%n%cn%n%ce", head).splitlines()
     expected_identity = [BOT_NAME, BOT_EMAIL, BOT_NAME, BOT_EMAIL]
     if (
         version(target) <= version(current)
         or after != replace_pin(before, target)
-        or git("diff-tree", "--no-commit-id", "--name-status", "-r", parent, head).strip()
-        != f"M\t{CONFIG}"
+        or changed != expected_changes
         or git("ls-tree", parent, CONFIG).split()[0]
         != git("ls-tree", head, CONFIG).split()[0]
         or identity != expected_identity
-        or commit_message != message(current, target, previous_metadata_hash).strip()
+        or commit_message != message(current, target, previous_metadata_hash, package_metadata_hash).strip()
     ):
         raise Refusal("Rolling branch has unexpected edits; preserving them for human review.")
     return current, target, previous_metadata_hash
 
 
-def make_commit(base, content, current, target, previous_metadata_hash=None):
+def make_commit(base, content, current, target, manifest, previous_metadata_hash=None):
     # A private index keeps staging and the caller's working tree untouched.
     with tempfile.TemporaryDirectory(prefix="codex-acp-pin-") as directory:
         env = os.environ | {"GIT_INDEX_FILE": str(Path(directory) / "index")}
@@ -200,13 +218,18 @@ def make_commit(base, content, current, target, previous_metadata_hash=None):
         git("read-tree", base, env=env)
         mode = git("ls-tree", base, CONFIG).split()[0]
         git("update-index", "--cacheinfo", f"{mode},{blob},{CONFIG}", env=env)
+        metadata = replace_package(git("show", f"{base}:{METADATA}"), "codex", manifest)
+        metadata_blob = git("hash-object", "-w", "--stdin", input=metadata).strip()
+        metadata_mode = git("ls-tree", base, METADATA).split()[0]
+        git("update-index", "--cacheinfo", f"{metadata_mode},{metadata_blob},{METADATA}", env=env)
+        package_metadata_hash = hashlib.sha256(metadata.encode()).hexdigest()
         tree = git("write-tree", env=env).strip()
         env |= {
             "GIT_AUTHOR_NAME": BOT_NAME, "GIT_COMMITTER_NAME": BOT_NAME,
             "GIT_AUTHOR_EMAIL": BOT_EMAIL, "GIT_COMMITTER_EMAIL": BOT_EMAIL,
         }
         return git("-c", "commit.gpgsign=false", "commit-tree", tree, "-p", base,
-                   input=message(current, target, previous_metadata_hash), env=env).strip()
+                   input=message(current, target, previous_metadata_hash, package_metadata_hash), env=env).strip()
 
 
 def main():
@@ -232,6 +255,10 @@ def main():
     ))
     if not isinstance(manifest, dict) or manifest.get("name") != PACKAGE:
         raise Refusal("Registry response is not the expected Codex ACP package.")
+    try:
+        package_snapshot(manifest)
+    except ValueError as error:
+        raise Refusal("Invalid adapter dependency metadata; stopping publication.") from error
     target = manifest.get("version")
     if version(target) <= version(current):
         print(f"Main pin {current} is not older than npm stable {target}; nothing to do.")
@@ -285,7 +312,7 @@ def main():
         raise Refusal("Rolling branch changed during this run; preserving concurrent edits.")
 
     commit = head if proposed == target else make_commit(
-        base, content, current, target, pr_metadata_hash(pr) if pr else None,
+        base, content, current, target, manifest, pr_metadata_hash(pr) if pr else None,
     )
     if commit != head:
         git("push", f"--force-with-lease={REF}:{head}", "origin", f"{commit}:{REF}")

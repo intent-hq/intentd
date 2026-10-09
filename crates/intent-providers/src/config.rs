@@ -51,12 +51,13 @@ pub const NPX_NPM_REQUIREMENT: &str = "npm 7+";
 pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@2.1.1";
 
 /// Daemon-owned Codex subagent denial shared by persistent agents, model
-/// probes, and one-shot launches. V2 feature enabling takes precedence over
-/// `agents.enabled` in this runtime, so both settings must be false. Set this
-/// after all environment merges and set the resolved `CODEX_PATH` so the adapter uses
-/// the installed CLI. Do not merge user `CODEX_CONFIG`.
+/// probes, and one-shot launches. Disable both generations through feature
+/// flags: older installed Codex versions interpret `agents.enabled` as a role
+/// and reject the boolean with an `AgentRoleToml` error (intent-hq/intent#6982).
+/// Set this after all environment merges and set the resolved `CODEX_PATH`
+/// so the adapter uses the installed CLI. Do not merge user `CODEX_CONFIG`.
 pub const CODEX_SUBAGENT_POLICY_CONFIG: &str =
-    r#"{"agents":{"enabled":false},"features":{"multi_agent_v2":false}}"#;
+    r#"{"features":{"multi_agent":false,"multi_agent_v2":false}}"#;
 
 /// Actionable prerequisite failure shared by all Codex launch entrypoints.
 pub const CODEX_ACP_PREREQUISITE_ERROR: &str =

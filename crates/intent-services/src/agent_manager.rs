@@ -3666,9 +3666,12 @@ impl AgentManager {
                 let prepared = Arc::new(prepared);
                 let dependency =
                     crate::codex_diagnostics::process::ProbeDependency::hold(prepared.clone());
-                context
+                let (_, version) = context
                     .observe_with_dependency(&prepared.command, Some(dependency))
                     .await
+                    .map_err(Error::InvalidInput)?;
+                context
+                    .validate_launch_version(&version)
                     .map_err(Error::InvalidInput)?;
                 Arc::try_unwrap(prepared).map_err(|_| {
                     Error::Internal("installed CLI cleanup still owns the launch directory".into())

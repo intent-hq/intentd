@@ -222,6 +222,7 @@ mod primitive_ops;
 mod principal_ops;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
+pub mod provider_cli;
 mod provider_images;
 pub mod provider_models;
 mod provider_preparation;

@@ -1268,7 +1268,7 @@ rl.on('line', (line) => {
                 .env("CODEX_PATH", "/custom/forbidden-codex")
                 .env(
                     "CODEX_CONFIG",
-                    json!({"agents": {"enabled": true}, "features": {"multi_agent_v2": enabled}})
+                    json!({"agents": {"enabled": true}, "features": {"multi_agent": enabled, "multi_agent_v2": enabled}})
                         .to_string(),
                 );
                 // Test prompts finalize policy after their provider env merge.
@@ -1308,7 +1308,7 @@ rl.on('line', (line) => {
                     serde_json::from_str(observed["config"].as_str().unwrap()).unwrap();
                 assert_eq!(
                     config,
-                    json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}})
+                    json!({"features": {"multi_agent": false, "multi_agent_v2": false}})
                 );
                 assert_eq!(
                     observed["selectedModel"],
@@ -1359,7 +1359,7 @@ rl.on('line', (line) => {
             .map(|(_, value)| value.to_str().unwrap());
         assert_eq!(
             config.map(|value| serde_json::from_str::<Value>(value).unwrap()),
-            Some(json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}))
+            Some(json!({"features": {"multi_agent": false, "multi_agent_v2": false}}))
         );
         assert!(!cmd.removed_env_vars().iter().any(|key| key == "CODEX_PATH"));
         assert!(!cmd
