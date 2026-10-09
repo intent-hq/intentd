@@ -3550,6 +3550,64 @@ impl Services {
                         .await;
                 }
             }
+            // Codex validates its sandbox override at turn/start, not set_mode.
+            // Only a recognized pre-start policy rejection may change modes and
+            // replay the untouched prompt. Reuse the output/client-work guards
+            // above, and recheck after the asynchronous mode change.
+            if !closed
+                && !any_update_received
+                && conn.client_request_seq() == client_request_watermark
+            {
+                if let (Err(error), Some(input)) = (&attempt_result, local.as_ref()) {
+                    match intent_acp::codex_sandbox::fallback(
+                        input.connection,
+                        acp_session_id,
+                        error,
+                    )
+                    .await
+                    {
+                        Ok(Some(mode)) => {
+                            while let Ok(note) = notifications.try_recv() {
+                                activity.touch();
+                                any_update_received = true;
+                                updates_applied |= self
+                                    .route_notification(
+                                        &note,
+                                        agent_id,
+                                        workspace_id,
+                                        &mut transcript,
+                                    )
+                                    .await;
+                            }
+                            if any_update_received
+                                || notifications.is_closed()
+                                || conn.client_request_seq() != client_request_watermark
+                            {
+                                break attempt_result;
+                            }
+                            tracing::warn!(agent = %agent_id, mode, "Codex sandbox rejected by policy; retrying with a stricter mode");
+                            self.publish_status_event(
+                                workspace_id,
+                                agent_id,
+                                "prompt",
+                                &format!(
+                                    "Codex policy requires {mode}; retrying before work started."
+                                ),
+                                "info",
+                            )
+                            .await;
+                            if let Some(original) =
+                                local.as_mut().and_then(|input| input.captured.as_mut())
+                            {
+                                original.recapture();
+                            }
+                            continue;
+                        }
+                        Err(error) => break Err(error),
+                        Ok(None) => {}
+                    }
+                }
+            }
             match &attempt_result {
                 Err(e)
                     if fetch_retry_attempt < MAX_TRANSIENT_PROMPT_FETCH_RETRIES

@@ -5082,7 +5082,10 @@ impl AgentManager {
         acp_session_id: &str,
         modes: Option<&SessionModeState>,
     ) {
-        if self.policy != PermissionPolicy::AllowAll {
+        intent_acp::codex_sandbox::configure(conn, provider.id, acp_session_id, modes);
+        // Codex already reports its INITIAL_AGENT_MODE. Never replace an
+        // explicit stricter choice or a retained policy fallback with bypass.
+        if provider.id == "codex" || self.policy != PermissionPolicy::AllowAll {
             return;
         }
         try_bypass_permissions_mode(conn, provider, acp_session_id, modes).await;

@@ -208,6 +208,16 @@ command; signing in to the Claude desktop app does not sign in its CLI. For
 conversation history. Do not promise a model or provider switch unless the UI
 offers it; inspect **Settings → Providers** for setup problems.
 
+<!-- Sources: packages/intentd/crates/intent-acp/src/{codex_sandbox.rs,handler.rs}; packages/intentd/crates/intent-services/src/agent_session.rs. -->
+
+When Codex policy rejects full access before work starts, Intent retries with
+workspace write, then read-only, using only supported modes permitted by that
+policy. The chosen mode stays in effect for later prompts in the live session.
+Explicit stricter modes are never upgraded. Read-only permits inspection, not
+file edits; requests to escape the sandbox are denied. If no permitted mode is
+available, or work has already started, the response fails with details rather
+than replaying the work.
+
 <!-- Sources: packages/intentd/crates/intent-services/src/{pi_cli.rs,agent_manager.rs,pi_mcp_wrapper.cmd}; packages/intentd/crates/intent-providers/src/config.rs. -->
 
 Pi requires the installed Pi CLI version shown in **Providers**. Intent supplies

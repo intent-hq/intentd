@@ -39,6 +39,14 @@ let effectiveEffort = null;
 // with `promptCount > 1` proves the daemon resumed the SAME process (keep-alive)
 // rather than respawning it.
 let promptCount = 0;
+// Codex 2.1.1 modes: set_mode updates local state; turn/start validates policy.
+let sandboxMode = process.env.INITIAL_AGENT_MODE || 'agent-full-access';
+function sandboxRejection(mode, allowed) {
+  const names = { 'agent-full-access': 'DangerFullAccess', 'workspace-write': 'WorkspaceWrite', 'read-only': 'ReadOnly' };
+  return { code: -32603, message: 'Internal error', data: { details:
+    `invalid thread settings override: invalid value for \`sandbox_mode\`: \`${names[mode]}\` is not in the allowed set [${allowed.map(m => names[m]).join(', ')}] (set by enterprise-managed requirements All users (9da573b3-18c6-493b-b593-89d0770df50a))`
+  } };
+}
 const pendingPromptIds = [];
 // Tool calls parked by `parkMidToolCall`; on `session/cancel` each gets a
 // title-less failed `tool_call_update` echo before the prompt resolves (STAB-124).
@@ -350,6 +358,11 @@ function selectBehavior(behavior, promptText) {
 // effort application discovers it by (PROTOCOL §5.5). Omitted by default so
 // existing tests see the bare `{ sessionId }` result.
 function sessionConfigOptions(behavior = {}) {
+  if (behavior.sandboxPolicy) {
+    return { modes: { currentModeId: sandboxMode, availableModes:
+      (behavior.sandboxPolicy.advertised || ['agent-full-access', 'workspace-write', 'read-only'])
+        .map(id => ({ id, name: id })) } };
+  }
   if (process.env.MOCK_AGENT_SESSION_RESULT) {
     return JSON.parse(process.env.MOCK_AGENT_SESSION_RESULT);
   }
@@ -416,6 +429,7 @@ async function handlePrompt(id, params) {
         promptLog,
         JSON.stringify({
           turn: promptCount,
+          sandboxMode,
           ...(checkpointFile ? { checkpointContext, sessionFromLoad } : {}),
           ...(effectiveModel !== null ? { effectiveModel, effectiveEffort } : {}),
           text: extractPromptText(params),
@@ -432,6 +446,39 @@ async function handlePrompt(id, params) {
     behavior = JSON.parse(process.env.MOCK_AGENT_BEHAVIOR || '{}');
   } catch {
     behavior = {};
+  }
+  if (behavior.sandboxPolicy) {
+    const policy = behavior.sandboxPolicy;
+    const allowed = policy.allowedByMode?.[sandboxMode] || policy.allowed;
+    if (!allowed.includes(sandboxMode)) {
+      if (policy.outputBeforeError) note('session/update', { sessionId: SESSION_ID,
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Already started.' } } });
+      if (policy.clientCallBeforeError) await callClientService('fs/read_text_file', { sessionId: SESSION_ID, path: 'nonexistent-sandbox-probe' }).catch(() => {});
+      return send({ jsonrpc: '2.0', id, error: policy.unrelated
+        ? { code: -32603, message: 'Internal error', data: { details: 'model unavailable' } }
+        : sandboxRejection(sandboxMode, allowed) });
+    }
+    if (policy.probeRestrictions) {
+      const permission = await callClientService('session/request_permission', {
+        sessionId: SESSION_ID,
+        toolCall: { toolCallId: 'escape-sandbox', title: 'Write outside sandbox', kind: 'edit', status: 'pending' },
+        options: [{ optionId: 'allow_once', name: 'Allow', kind: 'allow_once' },
+          { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' }],
+      });
+      if (permission.outcome?.optionId !== 'reject_once') return result(id, { stopReason: 'refusal' });
+      for (const [method, params] of [
+        ['fs/write_text_file', { path: 'readonly-probe.txt', content: 'must not write' }],
+        ['terminal/create', { command: 'touch', args: ['readonly-probe.txt'] }],
+      ]) {
+        try {
+          await callClientService(method, { sessionId: SESSION_ID, ...params });
+          return result(id, { stopReason: 'refusal' });
+        } catch (error) {
+          if (!error.message.includes('Codex sandbox')) return result(id, { stopReason: 'refusal' });
+        }
+      }
+      if (fs.existsSync('readonly-probe.txt')) return result(id, { stopReason: 'refusal' });
+    }
   }
   // Model the adapter's capability-driven notice/text fallback, including
   // warnings immediately before a fatal prompt response.
@@ -769,6 +816,7 @@ async function handlePrompt(id, params) {
     }
   }
   let base = active.response || behavior.response || 'Mock agent completed.';
+  if (behavior.sandboxPolicy) base = `effective-sandbox=${sandboxMode}`;
   if (behavior.modelSelection) {
     base = `effective-model=${effectiveModel} effort=${effectiveEffort} loaded=${sessionFromLoad}`;
   }
@@ -1064,7 +1112,16 @@ async function dispatch(msg) {
       }
       return send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'no load' } });
     case 'session/set_mode':
-      // Accept any mode change request (no-op for the mock).
+      if (behavior.sandboxPolicy) {
+        if (process.env.MOCK_AGENT_CONFIG_LOG) fs.appendFileSync(process.env.MOCK_AGENT_CONFIG_LOG,
+          JSON.stringify({ method: msg.method, mode: msg.params.modeId }) + '\n');
+        if (behavior.sandboxPolicy.rejectSetMode?.includes(msg.params.modeId)) {
+          return send({ jsonrpc: '2.0', id: msg.id, error: sandboxRejection(msg.params.modeId, behavior.sandboxPolicy.allowed.filter(mode => mode !== msg.params.modeId)) });
+        }
+        sandboxMode = msg.params.modeId;
+        if (behavior.sandboxPolicy.outputOnSetMode) note('session/update', { sessionId: SESSION_ID,
+          update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Late output.' } } });
+      }
       return result(msg.id, {});
     case 'session/set_model': {
       // Post-session model application for set_model providers (grok-like).
