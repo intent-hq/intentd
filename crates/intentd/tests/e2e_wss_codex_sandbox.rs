@@ -285,9 +285,8 @@ async fn scenario(
     let status = common::await_wss_status(&path.join("intentd.sock")).await;
     let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
     let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
-    let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
-    let mut rpc = common::wss_connect_with_retry(port, cfg.clone(), &url).await;
-    let mut sub = common::wss_connect_with_retry(port, cfg, &url).await;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
     let created = wss_rpc(
         &mut rpc,
         1,
@@ -310,13 +309,7 @@ async fn scenario(
         let sent = wss_rpc(&mut rpc, 4+turn, "agent.sendMessage", json!({"workspaceId":ws_id,"agentId":agent_id,"content":format!("sandbox turn {turn}")})).await;
         assert_eq!(sent["success"], true);
         let mut events = drain_until_stream_end(&mut sub, agent_id).await;
-        if !succeeds {
-            while events_of(&events, "agent:failed").is_empty() {
-                events.push(wss_event(&mut sub, 30).await);
-            }
-            let failed = events_of(&events, "agent:failed");
-            assert!(failed[0]["data"]["error"].as_str().is_some());
-        } else {
+        if succeeds {
             assert!(
                 events_of(&events, "agent:failed").is_empty(),
                 "unexpected failure: {events:?}"
@@ -344,6 +337,12 @@ async fn scenario(
                     .contains(&format!("effective-sandbox={}", expected.last().unwrap())),
                 "missing effective mode: {conversation}"
             );
+        } else {
+            while events_of(&events, "agent:failed").is_empty() {
+                events.push(wss_event(&mut sub, 30).await);
+            }
+            let failed = events_of(&events, "agent:failed");
+            assert!(failed[0]["data"]["error"].as_str().is_some());
         }
     }
     let log: Vec<Value> = std::fs::read_to_string(prompts)
@@ -359,12 +358,12 @@ async fn scenario(
         actual, expected,
         "exact bounded prompt attempts and session persistence"
     );
-    let changes: Vec<Value> = std::fs::read_to_string(modes)
+    let mode_log: Vec<Value> = std::fs::read_to_string(modes)
         .unwrap_or_default()
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    let changed: Vec<&str> = changes.iter().filter_map(|v| v["mode"].as_str()).collect();
+    let changed: Vec<&str> = mode_log.iter().filter_map(|v| v["mode"].as_str()).collect();
     let unique: std::collections::HashSet<_> = changed.iter().collect();
     assert_eq!(
         unique.len(),
