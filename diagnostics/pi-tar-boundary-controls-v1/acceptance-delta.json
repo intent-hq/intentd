@@ -1,0 +1,61 @@
+{
+  "original": "5bcb0bbf01c4f7b176ffb073275fa1d6340864b20960ecd5a4a2a04b948229ae",
+  "candidate": "862e9b5bb3206dc7acdfdfc11ee55c9e71ddb70c39cf12a517573a142bfad93e",
+  "changes": [
+    {
+      "id": "A01",
+      "old": "assert.equal(sum,checksum,'tar checksum');",
+      "new": "try {assert.equal(sum,checksum,'tar checksum');} catch(dependencyTarError) {try {MarkDependencyFailureStage('tar-a01-checksum');} catch {} throw dependencyTarError;}"
+    },
+    {
+      "id": "A02",
+      "old": "assert(/^[0-7]+$/.test(sizeText));",
+      "new": "try {assert(/^[0-7]+$/.test(sizeText));} catch(dependencyTarError) {try {MarkDependencyFailureStage('tar-a02-octal-size');} catch {} throw dependencyTarError;}"
+    },
+    {
+      "id": "A03",
+      "old": "assert(length<=33554432&&offset+512+length<=tar.length);",
+      "new": "try {assert(length<=33554432&&offset+512+length<=tar.length);} catch(dependencyTarError) {try {MarkDependencyFailureStage('tar-a03-size-extent');} catch {} throw dependencyTarError;}"
+    },
+    {
+      "id": "A04",
+      "old": "assert(name.startsWith('package/')&&!name.includes('\\\\')&&!name.split('/').includes('..')&&!name.includes(':'));",
+      "new": "try {assert(name.startsWith('package/')&&!name.includes('\\\\')&&!name.split('/').includes('..')&&!name.includes(':'));} catch(dependencyTarError) {try {MarkDependencyFailureStage('tar-a04-package-path');} catch {} throw dependencyTarError;}"
+    },
+    {
+      "id": "A05",
+      "old": "assert(rel.split('/').filter(Boolean).every(x=>!/[ .]$/.test(x)&&! /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\\.|$)/i.test(x)),'unsafe Windows tar name');",
+      "new": "try {assert(rel.split('/').filter(Boolean).every(x=>!/[ .]$/.test(x)&&! /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\\.|$)/i.test(x)),'unsafe Windows tar name');} catch(dependencyTarError) {try {MarkDependencyFailureStage('tar-a05-windows-name');} catch {} throw dependencyTarError;}"
+    },
+    {
+      "id": "A06",
+      "old": "assert(rel&&!files.has(rel));",
+      "new": "try {assert(rel&&!files.has(rel));} catch(dependencyTarError) {try {MarkDependencyFailureStage('tar-a06-file-unique');} catch {} throw dependencyTarError;}"
+    },
+    {
+      "id": "A07",
+      "old": "assert(count<=100000);",
+      "new": "try {assert(count<=100000);} catch(dependencyTarError) {try {MarkDependencyFailureStage('tar-a07-file-count');} catch {} throw dependencyTarError;}"
+    },
+    {
+      "id": "A08",
+      "old": "else assert(type==='5','unsupported tar entry: fail closed, no automatic extraction');",
+      "new": "else {try {assert(type==='5','unsupported tar entry: fail closed, no automatic extraction');} catch(dependencyTarError) {try {MarkDependencyFailureStage('tar-a08-entry-type');} catch {} throw dependencyTarError;}}"
+    },
+    {
+      "id": "A09",
+      "old": "assert(files.size>0);",
+      "new": "try {assert(files.size>0);} catch(dependencyTarError) {try {MarkDependencyFailureStage('tar-a09-nonempty');} catch {} throw dependencyTarError;}"
+    },
+    {
+      "id": "stage-allowlist",
+      "old": "const DEPENDENCY_FAILURE_STAGES=[\"argument-resolution\",\"platform\",\"node-version\",\"expected-lock-read\",\"installed-lock-read\",\"package-keys\",\"package-path\",\"package-metadata\",\"integrity-attribution\",\"tar-cache-key\",\"tar-url-policy\",\"tar-fetch\",\"tar-response\",\"tar-stream\",\"tar-integrity\",\"tar-inflate\",\"tar-parse\",\"installed-tar-bytes\",\"installed-inventory\",\"generated-files\",\"mirror-absence\",\"mirror-copy\",\"mirror-inventory\",\"entry-pin\",\"resolution-preinventory\",\"resolution-helper\",\"resolution-child\",\"resolution-output\",\"resolution-identities\",\"resolution-targets\",\"resolution-postinventory\",\"mirror-unmodified\",\"result-write\"];",
+      "new": "const DEPENDENCY_FAILURE_STAGES=[\"argument-resolution\",\"platform\",\"node-version\",\"expected-lock-read\",\"installed-lock-read\",\"package-keys\",\"package-path\",\"package-metadata\",\"integrity-attribution\",\"tar-cache-key\",\"tar-url-policy\",\"tar-fetch\",\"tar-response\",\"tar-stream\",\"tar-integrity\",\"tar-inflate\",\"tar-parse\",\"installed-tar-bytes\",\"installed-inventory\",\"generated-files\",\"mirror-absence\",\"mirror-copy\",\"mirror-inventory\",\"entry-pin\",\"resolution-preinventory\",\"resolution-helper\",\"resolution-child\",\"resolution-output\",\"resolution-identities\",\"resolution-targets\",\"resolution-postinventory\",\"mirror-unmodified\",\"result-write\",\"tar-a01-checksum\",\"tar-a02-octal-size\",\"tar-a03-size-extent\",\"tar-a04-package-path\",\"tar-a05-windows-name\",\"tar-a06-file-unique\",\"tar-a07-file-count\",\"tar-a08-entry-type\",\"tar-a09-nonempty\"];"
+    }
+  ],
+  "reverseByteExact": true,
+  "originalAssertionsUnmodified": true,
+  "originalCatchThrowUnmodified": true,
+  "successPathExtraMarkers": 0,
+  "catchBoundaryNotBooleanConjunctProof": true
+}

@@ -1,0 +1,15 @@
+{
+  "accept-dependencies.mjs": "862e9b5bb3206dc7acdfdfc11ee55c9e71ddb70c39cf12a517573a142bfad93e",
+  "acceptance-delta.json": "7821972227768c3a31ef493c75649b77cdb2a150f245706614cc681aa76a551f",
+  "assertion-map.json": "4f6b8b4d836de54d8cf1b70a92da544f2341c89879e6b77bb99831588defdc2d",
+  "controls.ps1": "e2458996a1ac2995bf232d6c6c5e9a629588db4647542bca70d5fe4b02e36047",
+  "expected-controls.json": "1c8c0c633ec53d00ec88a36bb2abbcd7d4f5154e3393df05c229f1bd4cdcac08",
+  "node-controls.mjs": "3e77a2103403c9b5e9c0ceb0df82c8886d0cf90800aa8c7e61c1dcd4f6d18aaa",
+  "original-accept-dependencies.mjs": "5bcb0bbf01c4f7b176ffb073275fa1d6340864b20960ecd5a4a2a04b948229ae",
+  "original-setup-only.ps1": "c8b92507c0429c02b8786c6fdf6eda5f3a76386b4f853ee4cc66ca23f89a34a6",
+  "relay-function.ps1": "c8a92e3e3ccb11dae2c930995038a08e574456c32a38f2997545454a80314d47",
+  "run-controls.ps1": "cb30fd6ddab275c170b188ac7a9a6dcca2501a924d98e48c52d58cdfd0ea8cc3",
+  "schema.json": "4eded880c79d6e473b134798dfbbea9fec50ef55dd2f4afc56fea24749b8a389",
+  "setup-delta.json": "1db4f75e2dcf62b2343dcea168da1f797149b5c8d9afa6b28e2e6072dbf01e7f",
+  "setup-only.ps1": "1f1595d9afc3115289fd48cf3d4cc10c7c0a7bc25f29c3ed7b500bf86cb0375b"
+}

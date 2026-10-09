@@ -1,0 +1,12 @@
+{
+  "original": "c8b92507c0429c02b8786c6fdf6eda5f3a76386b4f853ee4cc66ca23f89a34a6",
+  "candidate": "1f1595d9afc3115289fd48cf3d4cc10c7c0a7bc25f29c3ed7b500bf86cb0375b",
+  "changes": [
+    {
+      "old": "@('argument-resolution','platform','node-version','expected-lock-read','installed-lock-read','package-keys','package-path','package-metadata','integrity-attribution','tar-cache-key','tar-url-policy','tar-fetch','tar-response','tar-stream','tar-integrity','tar-inflate','tar-parse','installed-tar-bytes','installed-inventory','generated-files','mirror-absence','mirror-copy','mirror-inventory','entry-pin','resolution-preinventory','resolution-helper','resolution-child','resolution-output','resolution-identities','resolution-targets','resolution-postinventory','mirror-unmodified','result-write','unknown')",
+      "new": "@('argument-resolution','platform','node-version','expected-lock-read','installed-lock-read','package-keys','package-path','package-metadata','integrity-attribution','tar-cache-key','tar-url-policy','tar-fetch','tar-response','tar-stream','tar-integrity','tar-inflate','tar-parse','installed-tar-bytes','installed-inventory','generated-files','mirror-absence','mirror-copy','mirror-inventory','entry-pin','resolution-preinventory','resolution-helper','resolution-child','resolution-output','resolution-identities','resolution-targets','resolution-postinventory','mirror-unmodified','result-write','unknown','tar-a01-checksum','tar-a02-octal-size','tar-a03-size-extent','tar-a04-package-path','tar-a05-windows-name','tar-a06-file-unique','tar-a07-file-count','tar-a08-entry-type','tar-a09-nonempty')"
+    }
+  ],
+  "reverseByteExact": true,
+  "onlyNineFixedStageEnumAdditions": true
+}

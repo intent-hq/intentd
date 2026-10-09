@@ -1,0 +1,83 @@
+[
+  {
+    "id": "A01",
+    "stageValue": "tar-a01-checksum",
+    "semanticCategory": "checksum",
+    "originalStatement": "assert.equal(sum,checksum,'tar checksum');",
+    "meaning": "header checksum equals computed sum with checksum field treated as spaces",
+    "originalLine": 39,
+    "failureMeaning": "Catch boundary includes original assertion call and argument evaluation. Exact nested false conjunct, package, header offset/type/name and raw error remain undisclosed. Same caught value rethrown; failed marker may leave previous stage."
+  },
+  {
+    "id": "A02",
+    "stageValue": "tar-a02-octal-size",
+    "semanticCategory": "octal-size",
+    "originalStatement": "assert(/^[0-7]+$/.test(sizeText));",
+    "meaning": "size field contains only one or more octal digits",
+    "originalLine": 39,
+    "failureMeaning": "Catch boundary includes original assertion call and argument evaluation. Exact nested false conjunct, package, header offset/type/name and raw error remain undisclosed. Same caught value rethrown; failed marker may leave previous stage."
+  },
+  {
+    "id": "A03",
+    "stageValue": "tar-a03-size-extent",
+    "semanticCategory": "size-extent",
+    "originalStatement": "assert(length<=33554432&&offset+512+length<=tar.length);",
+    "meaning": "declared length cap32MiB and payload end within decompressed tar; conjunct identity remains grouped",
+    "originalLine": 39,
+    "failureMeaning": "Catch boundary includes original assertion call and argument evaluation. Exact nested false conjunct, package, header offset/type/name and raw error remain undisclosed. Same caught value rethrown; failed marker may leave previous stage."
+  },
+  {
+    "id": "A04",
+    "stageValue": "tar-a04-package-path",
+    "semanticCategory": "package-path",
+    "originalStatement": "assert(name.startsWith('package/')&&!name.includes('\\\\')&&!name.split('/').includes('..')&&!name.includes(':'));",
+    "meaning": "package prefix and no backslash/traversal/colon; conjunct identity remains grouped",
+    "originalLine": 39,
+    "failureMeaning": "Catch boundary includes original assertion call and argument evaluation. Exact nested false conjunct, package, header offset/type/name and raw error remain undisclosed. Same caught value rethrown; failed marker may leave previous stage."
+  },
+  {
+    "id": "A05",
+    "stageValue": "tar-a05-windows-name",
+    "semanticCategory": "windows-name",
+    "originalStatement": "assert(rel.split('/').filter(Boolean).every(x=>!/[ .]$/.test(x)&&! /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\\.|$)/i.test(x)),'unsafe Windows tar name');",
+    "meaning": "each nonempty segment avoids trailing dot/space or Windows reserved device name",
+    "originalLine": 39,
+    "failureMeaning": "Catch boundary includes original assertion call and argument evaluation. Exact nested false conjunct, package, header offset/type/name and raw error remain undisclosed. Same caught value rethrown; failed marker may leave previous stage."
+  },
+  {
+    "id": "A06",
+    "stageValue": "tar-a06-file-unique",
+    "semanticCategory": "file-unique",
+    "originalStatement": "assert(rel&&!files.has(rel));",
+    "meaning": "regular file relative path nonempty and absent from current file map",
+    "originalLine": 39,
+    "failureMeaning": "Catch boundary includes original assertion call and argument evaluation. Exact nested false conjunct, package, header offset/type/name and raw error remain undisclosed. Same caught value rethrown; failed marker may leave previous stage."
+  },
+  {
+    "id": "A07",
+    "stageValue": "tar-a07-file-count",
+    "semanticCategory": "file-count",
+    "originalStatement": "assert(count<=100000);",
+    "meaning": "regular file count at most100000",
+    "originalLine": 39,
+    "failureMeaning": "Catch boundary includes original assertion call and argument evaluation. Exact nested false conjunct, package, header offset/type/name and raw error remain undisclosed. Same caught value rethrown; failed marker may leave previous stage."
+  },
+  {
+    "id": "A08",
+    "stageValue": "tar-a08-entry-type",
+    "semanticCategory": "entry-type",
+    "originalStatement": "assert(type==='5','unsupported tar entry: fail closed, no automatic extraction');",
+    "meaning": "nonregular entry must be directory; old null type is normalized to regular by unchanged original code",
+    "originalLine": 39,
+    "failureMeaning": "Catch boundary includes original assertion call and argument evaluation. Exact nested false conjunct, package, header offset/type/name and raw error remain undisclosed. Same caught value rethrown; failed marker may leave previous stage."
+  },
+  {
+    "id": "A09",
+    "stageValue": "tar-a09-nonempty",
+    "semanticCategory": "nonempty",
+    "originalStatement": "assert(files.size>0);",
+    "meaning": "parsed regular file map nonempty",
+    "originalLine": 40,
+    "failureMeaning": "Catch boundary includes original assertion call and argument evaluation. Exact nested false conjunct, package, header offset/type/name and raw error remain undisclosed. Same caught value rethrown; failed marker may leave previous stage."
+  }
+]
