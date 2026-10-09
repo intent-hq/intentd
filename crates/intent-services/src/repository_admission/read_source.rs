@@ -612,6 +612,29 @@ impl MonitorAuthority {
         self.request.check_current()
     }
 
+    /// Reserve the database writer before entering this boundary. A blocking
+    /// worker retains both original physical lifetime and credential/source
+    /// fences through the actual SQL statement and COMMIT. Cancellation of the
+    /// awaiting caller drops only its `JoinHandle`, not an admitted SQL worker.
+    pub(crate) async fn commit(
+        self: &Arc<Self>,
+        services: &Services,
+        write: intent_store::PreparedMonitorWrite,
+    ) -> intent_core::Result<bool> {
+        self.validate(services).await.map_err(|_| refused())?;
+        let authority = self.clone();
+        tokio::task::spawn_blocking(move || {
+            // Context/caller checks ran in the original async call. This worker
+            // can use only its retained original leaf, never ambient authority.
+            authority
+                .lifetime
+                .commit_monitor_write(authority.eligibility.get().ok_or_else(refused)?, write)
+                .map_err(|_| refused())?
+        })
+        .await
+        .map_err(|_| refused())?
+    }
+
     pub(crate) fn owner(&self) -> &intent_core::AgentId {
         &self.member.agent.id
     }

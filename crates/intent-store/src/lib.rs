@@ -106,7 +106,7 @@ pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
 pub use pr_monitor_repo::{
     pr_monitor_pause_error, MonitorQualificationOutcome, MonitorTargetProvenance,
     MonitorTargetUnresolvedReason, PersistedMonitorTarget, PrMonitorListEntry, PrMonitorPollUpdate,
-    QualifiedPrMonitor, WorkspacePrMonitorReads, PR_MONITOR_PAUSE_MARKER,
+    PreparedMonitorWrite, QualifiedPrMonitor, WorkspacePrMonitorReads, PR_MONITOR_PAUSE_MARKER,
 };
 pub use principal_repo::{
     ArchivedGuestSweep, CollaboratorAddOutcome, EffectiveWorkspaceMember, InviteInsertOutcome,

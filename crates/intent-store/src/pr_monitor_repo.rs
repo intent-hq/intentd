@@ -16,6 +16,9 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 
 use crate::Store;
 
+mod prepared_write;
+pub use prepared_write::PreparedMonitorWrite;
+
 #[cfg(test)]
 mod qualification_tests;
 
@@ -126,26 +129,8 @@ impl Store {
     ) -> Result<bool> {
         let mut query =
             QueryBuilder::<Sqlite>::new("UPDATE pr_monitor SET state = 'cancelled', updated_at = ");
-        query.push_bind(now).push(" WHERE state = 'active'");
-        for (i, column) in COLUMNS.split(',').map(str::trim).enumerate() {
-            query.push(" AND ").push(column).push(" IS ");
-            if column == "pr_number" {
-                query.push_bind(expected.monitor.pr_number);
-            } else {
-                query.push_bind(expected.original_text[i].as_deref());
-            }
-        }
-        for (column, value) in TARGET_COLUMNS
-            .split(',')
-            .map(str::trim)
-            .zip(expected.columns.values())
-        {
-            query
-                .push(" AND ")
-                .push(column)
-                .push(" IS ")
-                .push_bind(value);
-        }
+        query.push_bind(now.to_owned());
+        prepared_write::captured_condition(&mut query, expected);
         query
             .build()
             .execute(self.write_pool())

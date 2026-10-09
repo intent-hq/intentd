@@ -205,6 +205,15 @@ impl RepositoryReadRequest {
     }
 }
 
+/// Service-owned account fence for one already prepared database mutation.
+/// Shared request code does not import the concrete Services credential owner.
+pub(crate) trait MonitorCommitAuthority {
+    fn commit_prepared(
+        &self,
+        write: intent_store::PreparedMonitorWrite,
+    ) -> AdmissionResult<intent_core::Result<bool>>;
+}
+
 /// Owns cleanup independently of escaped metadata and authority handles.
 pub(crate) struct RepositoryReadChild {
     request: Arc<RepositoryReadRequest>,
@@ -226,6 +235,19 @@ impl RepositoryReadChild {
             keys,
         )?);
         Ok(())
+    }
+
+    /// Finish only a prepared monitor transaction on its blocking worker.
+    /// The original async caller was validated before dispatch; this retained
+    /// leaf joins physical retirement through the database commit itself.
+    pub(crate) fn commit_monitor_write(
+        &self,
+        eligibility: &impl MonitorCommitAuthority,
+        write: intent_store::PreparedMonitorWrite,
+    ) -> AdmissionResult<intent_core::Result<bool>> {
+        self.lifetime
+            .retirement()
+            .dispatch(|| eligibility.commit_prepared(write))
     }
 
     pub(crate) fn transfer<T>(

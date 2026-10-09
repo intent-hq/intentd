@@ -3,8 +3,7 @@
 
 use super::{
     json, now_iso, pr_monitor_wire, pr_ops, qualified_cache, AgentId, Arc, Error, PrMonitor,
-    PrMonitorHolder, PrMonitorId, PrMonitorPollUpdate, PrMonitorState, Result, Services, Value,
-    WorkspaceId,
+    PrMonitorHolder, PrMonitorId, PrMonitorState, Result, Services, Value, WorkspaceId,
 };
 use crate::repository_admission::read_request::RepositoryReadRequest;
 use crate::repository_admission::AdmissionResult;
@@ -13,6 +12,13 @@ use crate::repository_read_source::{
 };
 use intent_core::ReviewTarget;
 use intent_store::{MonitorTargetProvenance, PersistedMonitorTarget};
+
+struct QualifiedBaseline {
+    snapshot: Option<String>,
+    polled_at: Option<String>,
+    last_error: Option<String>,
+    now: String,
+}
 
 fn wire(m: &PrMonitor, target: &ReviewTarget) -> Result<Value> {
     let mut value = pr_monitor_wire(m, None);
@@ -86,6 +92,18 @@ fn same_connection(m: &PrMonitor, authority: &MonitorAuthority) -> Result<()> {
 }
 
 impl Services {
+    #[cfg(test)]
+    fn monitor_write_ready(&self) {
+        if let Some(ready) = self
+            .test_review_monitor_write_ready
+            .lock()
+            .unwrap()
+            .as_ref()
+        {
+            ready.notify_one();
+        }
+    }
+
     /// Native recipients have no qualified receipt in this wave. Refuse before
     /// cancellation/flush can disclose an owner, emit a wake or read a provider.
     pub(crate) async fn require_legacy_monitor_control(&self, id: &PrMonitorId) -> Result<()> {
@@ -235,12 +253,15 @@ impl Services {
             same_connection(&old, &authority)?;
             if old.agent_id == *agent {
                 self.refresh_qualified_monitor(
-                    old,
+                    current.clone(),
+                    &authority,
                     agent,
-                    baseline,
-                    polled_at.clone(),
-                    last_error.clone(),
-                    &now,
+                    QualifiedBaseline {
+                        snapshot: baseline,
+                        polled_at: polled_at.clone(),
+                        last_error: last_error.clone(),
+                        now: now.clone(),
+                    },
                 )
                 .await?
             } else {
@@ -253,12 +274,15 @@ impl Services {
                     Some(PrMonitorHolder::Orphaned(old) | PrMonitorHolder::SettledChild(old)) => {
                         adopted_from = Some(old.agent_id.clone());
                         self.refresh_qualified_monitor(
-                            old,
+                            current.clone(),
+                            &authority,
                             agent,
-                            baseline,
-                            polled_at.clone(),
-                            last_error.clone(),
-                            &now,
+                            QualifiedBaseline {
+                                snapshot: baseline,
+                                polled_at: polled_at.clone(),
+                                last_error: last_error.clone(),
+                                now: now.clone(),
+                            },
                         )
                         .await?
                     }
@@ -289,14 +313,10 @@ impl Services {
                 created_at: now.clone(),
                 updated_at: now,
             };
-            self.store
-                .insert_qualified_pr_monitor(
-                    &monitor,
-                    &target,
-                    MonitorTargetProvenance::CapturedRequest,
-                )
-                .await?
-                .then_some(monitor)
+            #[cfg(test)]
+            self.monitor_write_ready();
+            let write = self.store.prepare_monitor_insert(&monitor, &target).await?;
+            authority.commit(self, write).await?.then_some(monitor)
         }
         .ok_or_else(|| {
             Error::InvalidParams("pr.monitor: registration changed concurrently; retry".into())
@@ -323,45 +343,31 @@ impl Services {
     /// no baseline. A nonempty envelope is not a successful provider poll.
     async fn refresh_qualified_monitor(
         &self,
-        mut monitor: PrMonitor,
+        expected: intent_store::QualifiedPrMonitor,
+        authority: &Arc<MonitorAuthority>,
         agent: &AgentId,
-        baseline: Option<String>,
-        polled_at: Option<String>,
-        last_error: Option<String>,
-        now: &str,
+        baseline: QualifiedBaseline,
     ) -> Result<Option<PrMonitor>> {
-        let update = PrMonitorPollUpdate {
-            last_snapshot: baseline.as_deref(),
-            baseline_snapshot: baseline.as_deref(),
-            pending_changes: &[],
-            last_polled_at: polled_at.as_deref(),
-            last_error: last_error.as_deref(),
-            updated_at: now,
-            expected_updated_at: &monitor.updated_at,
-            ..Default::default()
-        };
-        let updated = if &monitor.agent_id == agent {
-            self.store
-                .update_pr_monitor_poll(&monitor.monitor_id, update)
-                .await?
-        } else {
-            self.store
-                .adopt_pr_monitor(&monitor.monitor_id, &monitor.agent_id, agent, update)
-                .await?
-        };
-        if !updated {
-            return Ok(None);
-        }
-        self.consume_pr_monitor_catch_up(&monitor.monitor_id);
+        let mut monitor = expected.monitor().clone();
         monitor.agent_id = agent.clone();
-        monitor.last_snapshot = baseline.clone();
-        monitor.baseline_snapshot = baseline;
+        monitor.last_snapshot = baseline.snapshot.clone();
+        monitor.baseline_snapshot = baseline.snapshot;
         monitor.pending_changes.clear();
         monitor.pending_since = None;
         monitor.last_change_at = None;
-        monitor.last_polled_at = polled_at;
-        monitor.last_error = last_error;
-        monitor.updated_at = now.into();
+        monitor.last_polled_at = baseline.polled_at;
+        monitor.last_error = baseline.last_error;
+        monitor.updated_at = baseline.now;
+        #[cfg(test)]
+        self.monitor_write_ready();
+        let write = self
+            .store
+            .prepare_monitor_replace(&expected, &monitor)
+            .await?;
+        if !authority.commit(self, write).await? {
+            return Ok(None);
+        }
+        self.consume_pr_monitor_catch_up(&monitor.monitor_id);
         Ok(Some(monitor))
     }
 
@@ -416,11 +422,10 @@ impl Services {
             .reserve_output(self)
             .map_err(|_| source::refused())?;
         let now = now_iso();
-        if !self
-            .store
-            .cancel_qualified_pr_monitor(&record, &now)
-            .await?
-        {
+        #[cfg(test)]
+        self.monitor_write_ready();
+        let write = self.store.prepare_monitor_cancel(&record, &now).await?;
+        if !authority.commit(self, write).await? {
             return Err(Error::InvalidParams(
                 "pr.unmonitor: monitor changed; retry cancellation".into(),
             ));

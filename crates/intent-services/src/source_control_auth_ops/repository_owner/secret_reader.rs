@@ -975,6 +975,18 @@ pub(crate) struct RepositoryReadEligibility {
     scope: RepositoryReadScope,
 }
 
+impl crate::repository_admission::read_request::MonitorCommitAuthority
+    for RepositoryReadEligibility
+{
+    fn commit_prepared(
+        &self,
+        write: intent_store::PreparedMonitorWrite,
+    ) -> crate::repository_admission::AdmissionResult<intent_core::Result<bool>> {
+        self.commit_monitor_write(write)
+            .map_err(|_| crate::repository_admission::AdmissionError::Retired)
+    }
+}
+
 #[cfg_attr(
     not(test),
     expect(
@@ -983,6 +995,24 @@ pub(crate) struct RepositoryReadEligibility {
     )
 )]
 impl RepositoryReadEligibility {
+    /// Dedicated database-effect boundary. The Store token already owns an
+    /// IMMEDIATE transaction, so this cannot wait for pool/writer acquisition or
+    /// call provider/lifecycle code while metadata fences are held. Only the
+    /// `SQLite` worker executes the prebuilt statement and commit under these
+    /// fences; account retirement cannot finish until that commit finishes.
+    pub(crate) fn commit_monitor_write(
+        &self,
+        write: intent_store::PreparedMonitorWrite,
+    ) -> Result<intent_core::Result<bool>> {
+        let mut write = Some(write);
+        let mut outcome = None;
+        self.with_current(&mut || {
+            outcome = Some(write.take().ok_or(Error::Indeterminate)?.commit());
+            Ok(())
+        })?;
+        outcome.ok_or(Error::Indeterminate)
+    }
+
     pub(crate) fn check(&self) -> Result<()> {
         self.with_current(&mut || Ok(()))
     }
@@ -1155,6 +1185,8 @@ impl RepositoryReadEligibility {
 
     /// Lock order: settings config -> descriptor -> directory -> source proof.
     /// Only a prebuilt, synchronous metadata/ownership action may run here.
+    /// The typed `commit_monitor_write` entry is the sole database exception: it
+    /// reserves its writer before this fence, never acquires one inside it.
     pub(crate) fn with_current(
         &self,
         action: &mut (dyn FnMut() -> Result<()> + Send),

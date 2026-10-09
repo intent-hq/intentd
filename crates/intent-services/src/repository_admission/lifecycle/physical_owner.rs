@@ -735,6 +735,18 @@ pub(crate) struct RepositoryPhysicalRetirement {
 }
 
 impl RepositoryPhysicalRetirement {
+    #[cfg(test)]
+    pub(crate) fn detached_for_test(&self) -> bool {
+        self.origin.registry.upgrade().is_none_or(|registry| {
+            !registry
+                .state
+                .lock()
+                .unwrap()
+                .origins
+                .contains_key(&self.origin.id)
+        })
+    }
+
     pub(crate) fn retire(&self) {
         let Some(registry) = self.origin.registry.upgrade() else {
             return;

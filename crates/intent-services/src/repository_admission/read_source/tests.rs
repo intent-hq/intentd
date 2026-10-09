@@ -2075,3 +2075,5 @@ async fn joint_local_records_required_git_change_refuses_even_current_optional()
 async fn joint_local_records_action_panic_never_retries_or_recovers_required_output() {
     joint_probe(JointMode::Panic).await;
 }
+
+mod sql_effects;
