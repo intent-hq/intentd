@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.37] - 2026-10-09
+
+### 🚀 Features
+
+- Add cross-platform daemon lifecycle commands ([#2355](https://github.com/intent-hq/intentd/pull/2355))
+
+
 ## [0.10.36] - 2026-10-09
 
 ### 🐛 Bug Fixes
