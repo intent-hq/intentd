@@ -1,0 +1,8 @@
+[
+  "exact-reversal-and-success-single-evaluation",
+  "four-predicate-first-false-and-sensitive-negatives",
+  "evaluation-fault-and-return-type-boundaries",
+  "fresh-block-marker-and-observer-faults",
+  "fixed-sixfield-relay-schema-and-redaction",
+  "outercatch-file-writer-ownership-composition"
+]

@@ -1,0 +1,12 @@
+{
+  "original": "1f1595d9afc3115289fd48cf3d4cc10c7c0a7bc25f29c3ed7b500bf86cb0375b",
+  "candidate": "ce649e2a80c8111132d376e4b6eca6b75f9726a23e6d79d417ce8a2c9f3e71f1",
+  "changes": [
+    {
+      "old": "@('argument-resolution','platform','node-version','expected-lock-read','installed-lock-read','package-keys','package-path','package-metadata','integrity-attribution','tar-cache-key','tar-url-policy','tar-fetch','tar-response','tar-stream','tar-integrity','tar-inflate','tar-parse','installed-tar-bytes','installed-inventory','generated-files','mirror-absence','mirror-copy','mirror-inventory','entry-pin','resolution-preinventory','resolution-helper','resolution-child','resolution-output','resolution-identities','resolution-targets','resolution-postinventory','mirror-unmodified','result-write','unknown','tar-a01-checksum','tar-a02-octal-size','tar-a03-size-extent','tar-a04-package-path','tar-a05-windows-name','tar-a06-file-unique','tar-a07-file-count','tar-a08-entry-type','tar-a09-nonempty')",
+      "new": "@('argument-resolution','platform','node-version','expected-lock-read','installed-lock-read','package-keys','package-path','package-metadata','integrity-attribution','tar-cache-key','tar-url-policy','tar-fetch','tar-response','tar-stream','tar-integrity','tar-inflate','tar-parse','installed-tar-bytes','installed-inventory','generated-files','mirror-absence','mirror-copy','mirror-inventory','entry-pin','resolution-preinventory','resolution-helper','resolution-child','resolution-output','resolution-identities','resolution-targets','resolution-postinventory','mirror-unmodified','result-write','unknown','tar-a01-checksum','tar-a02-octal-size','tar-a03-size-extent','tar-a04-package-path','tar-a05-windows-name','tar-a06-file-unique','tar-a07-file-count','tar-a08-entry-type','tar-a09-nonempty','tar-a04-prefix-eval','tar-a04-prefix-false','tar-a04-prefix-true','tar-a04-prefix-other','tar-a04-backslash-eval','tar-a04-backslash-false','tar-a04-backslash-true','tar-a04-backslash-other','tar-a04-traversal-eval','tar-a04-traversal-false','tar-a04-traversal-true','tar-a04-traversal-other','tar-a04-colon-eval','tar-a04-colon-false','tar-a04-colon-true','tar-a04-colon-other')"
+    }
+  ],
+  "reverseByteExact": true,
+  "onlySixteenFixedStageEnumsAdded": true
+}

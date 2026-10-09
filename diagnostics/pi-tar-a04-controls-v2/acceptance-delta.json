@@ -1,0 +1,45 @@
+{
+  "original": "862e9b5bb3206dc7acdfdfc11ee55c9e71ddb70c39cf12a517573a142bfad93e",
+  "candidate": "5c971c1abf8dc276cd116bc3089c0bb26a0f712d9ebeabf3cef9bec464154ea6",
+  "changes": [
+    {
+      "id": "A04-single-evaluation-capture",
+      "old": "try {assert(name.startsWith('package/')&&!name.includes('\\\\')&&!name.split('/').includes('..')&&!name.includes(':'));} catch(dependencyTarError) {try {MarkDependencyFailureStage('tar-a04-package-path');} catch {} throw dependencyTarError;}",
+      "new": "{let dependencyA04Part='unavailable',dependencyA04Returned=false,dependencyA04Value;\ntry {assert((dependencyA04Part='prefix',dependencyA04Returned=false,dependencyA04Value=name.startsWith('package/'),dependencyA04Returned=true,dependencyA04Value)&&(dependencyA04Part='backslash',dependencyA04Returned=false,dependencyA04Value=!name.includes('\\\\'),dependencyA04Returned=true,dependencyA04Value)&&(dependencyA04Part='traversal',dependencyA04Returned=false,dependencyA04Value=!name.split('/').includes('..'),dependencyA04Returned=true,dependencyA04Value)&&(dependencyA04Part='colon',dependencyA04Returned=false,dependencyA04Value=!name.includes(':'),dependencyA04Returned=true,dependencyA04Value));} catch(dependencyTarError) {\n try {\n  const dependencyA04Kind=!dependencyA04Returned?'eval':typeof dependencyA04Value==='boolean'?(dependencyA04Value?'true':'false'):'other';\n  let dependencyA04Stage='tar-a04-package-path';\n  if(dependencyA04Part==='prefix')dependencyA04Stage='tar-a04-prefix-'+dependencyA04Kind;\n  else if(dependencyA04Part==='backslash')dependencyA04Stage='tar-a04-backslash-'+dependencyA04Kind;\n  else if(dependencyA04Part==='traversal')dependencyA04Stage='tar-a04-traversal-'+dependencyA04Kind;\n  else if(dependencyA04Part==='colon')dependencyA04Stage='tar-a04-colon-'+dependencyA04Kind;\n  MarkDependencyFailureStage(dependencyA04Stage);\n } catch {}\n throw dependencyTarError;\n}}"
+    },
+    {
+      "id": "fixed-stage-enum",
+      "old": "const DEPENDENCY_FAILURE_STAGES=[\"argument-resolution\",\"platform\",\"node-version\",\"expected-lock-read\",\"installed-lock-read\",\"package-keys\",\"package-path\",\"package-metadata\",\"integrity-attribution\",\"tar-cache-key\",\"tar-url-policy\",\"tar-fetch\",\"tar-response\",\"tar-stream\",\"tar-integrity\",\"tar-inflate\",\"tar-parse\",\"installed-tar-bytes\",\"installed-inventory\",\"generated-files\",\"mirror-absence\",\"mirror-copy\",\"mirror-inventory\",\"entry-pin\",\"resolution-preinventory\",\"resolution-helper\",\"resolution-child\",\"resolution-output\",\"resolution-identities\",\"resolution-targets\",\"resolution-postinventory\",\"mirror-unmodified\",\"result-write\",\"tar-a01-checksum\",\"tar-a02-octal-size\",\"tar-a03-size-extent\",\"tar-a04-package-path\",\"tar-a05-windows-name\",\"tar-a06-file-unique\",\"tar-a07-file-count\",\"tar-a08-entry-type\",\"tar-a09-nonempty\"];",
+      "new": "const DEPENDENCY_FAILURE_STAGES=[\"argument-resolution\",\"platform\",\"node-version\",\"expected-lock-read\",\"installed-lock-read\",\"package-keys\",\"package-path\",\"package-metadata\",\"integrity-attribution\",\"tar-cache-key\",\"tar-url-policy\",\"tar-fetch\",\"tar-response\",\"tar-stream\",\"tar-integrity\",\"tar-inflate\",\"tar-parse\",\"installed-tar-bytes\",\"installed-inventory\",\"generated-files\",\"mirror-absence\",\"mirror-copy\",\"mirror-inventory\",\"entry-pin\",\"resolution-preinventory\",\"resolution-helper\",\"resolution-child\",\"resolution-output\",\"resolution-identities\",\"resolution-targets\",\"resolution-postinventory\",\"mirror-unmodified\",\"result-write\",\"tar-a01-checksum\",\"tar-a02-octal-size\",\"tar-a03-size-extent\",\"tar-a04-package-path\",\"tar-a05-windows-name\",\"tar-a06-file-unique\",\"tar-a07-file-count\",\"tar-a08-entry-type\",\"tar-a09-nonempty\",\"tar-a04-prefix-eval\",\"tar-a04-prefix-false\",\"tar-a04-prefix-true\",\"tar-a04-prefix-other\",\"tar-a04-backslash-eval\",\"tar-a04-backslash-false\",\"tar-a04-backslash-true\",\"tar-a04-backslash-other\",\"tar-a04-traversal-eval\",\"tar-a04-traversal-false\",\"tar-a04-traversal-true\",\"tar-a04-traversal-other\",\"tar-a04-colon-eval\",\"tar-a04-colon-false\",\"tar-a04-colon-true\",\"tar-a04-colon-other\"];"
+    }
+  ],
+  "reverseByteExact": true,
+  "targetOperandOrderAndOccurrences": [
+    {
+      "part": "prefix",
+      "operand": "name.startsWith('package/')",
+      "occurrences": 1
+    },
+    {
+      "part": "backslash",
+      "operand": "!name.includes('\\\\')",
+      "occurrences": 1
+    },
+    {
+      "part": "traversal",
+      "operand": "!name.split('/').includes('..')",
+      "occurrences": 1
+    },
+    {
+      "part": "colon",
+      "operand": "!name.includes(':')",
+      "occurrences": 1
+    }
+  ],
+  "otherEightAssertionWrappersByteEqual": true,
+  "assertArgumentCount": 1,
+  "originalSameValueThrowPreserved": true,
+  "extraSuccessMarkerCalls": 0,
+  "newLocalCaptureAssignmentsPerReachedOperand": 4,
+  "newTargetProviderCalls": 0
+}

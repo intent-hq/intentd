@@ -1,0 +1,24 @@
+{
+  "original": "2d18711b751814ca01f089f0f010bd00a6a3db3fbca91312a78c0882e50de0a3",
+  "candidate": "68971f13da15c437418ab111a1e0dffb04a05535c5ec400957e54d79c2bb9ac0",
+  "acceptedHeaderOnlyCandidate": "8b9dd3767caecf3a3db3b65010a7e9ce8710f36c2fd521df5d09ce33e762b686",
+  "changes": [
+    {
+      "old": "function expectedEvents(stop=3,last=false){",
+      "new": "function expectedEvents(stop=3,last){if(arguments.length<2)last=false;"
+    },
+    {
+      "id": "group1-exact-oracle-reversal",
+      "old": "  need(sha(old)===delta.original&&sha(marked)===delta.candidate&&delta.changes.length===2,19);",
+      "new": "  const oracleDelta=JSON.parse(read('oracle-delta.json')),failedOracle=read('original-oracle-node-controls.mjs'),thisOracle=read('node-controls.mjs');\n  need(sha(failedOracle)===oracleDelta.original&&sha(thisOracle)===oracleDelta.candidate,71);\n  let oracleReverse=thisOracle;for(const c of [...oracleDelta.changes].reverse()){need(oracleReverse.split(c.new).length===2,72);oracleReverse=oracleReverse.replace(c.new,c.old);}\n  need(oracleReverse===failedOracle&&oracleDelta.changes.length===3,73);\n  need(sha(old)===delta.original&&sha(marked)===delta.candidate&&delta.changes.length===2,19);"
+    },
+    {
+      "id": "group3-native-oracle-sensitivities",
+      "old": " await group(3,async()=>{",
+      "new": " await group(3,async()=>{\n  // Exact helpers extracted as source; native parameter semantics are executed only in a selected run.\n  const failedOracle=read('original-oracle-node-controls.mjs');\n  function oracleHelper(source){const begin=source.indexOf('function expectedEvents('),end=source.indexOf('\\nfunction negative(',begin);need(begin>=0&&end>begin,74);return new Function(source.slice(begin,end)+';return expectedEvents;')();}\n  const beforeOracle=oracleHelper(failedOracle),afterOracle=oracleHelper(read('node-controls.mjs'));\n  const manualUndefined=[['get','startsWith'],['call','startsWith',true,['package/']],['assert',1,undefined]];\n  const manualFalse=[['get','startsWith'],['call','startsWith',true,['package/']],['assert',1,false]];\n  equalEvents(beforeOracle(0),manualFalse);equalEvents(afterOracle(0),manualFalse);\n  equalEvents(beforeOracle(0,undefined),manualFalse);\n  negative(()=>equalEvents(beforeOracle(0,undefined),manualUndefined),50);\n  equalEvents(afterOracle(0,undefined),manualUndefined);\n  equalEvents(beforeOracle(),beforeOracle(3,false));equalEvents(afterOracle(),afterOracle(3,false));\n  equalEvents(beforeOracle(undefined),beforeOracle(3,false));equalEvents(afterOracle(undefined),afterOracle(3,false));\n  const sharedObject={},sharedSymbol=Symbol('private-identity');\n  for(const value of [false,true,0,-0,'',null,undefined,NaN,sharedObject,sharedSymbol]){\n   const actual=afterOracle(0,value);need(actual.length===3&&actual[2][0]==='assert'&&actual[2][1]===1&&Object.is(actual[2][2],value),75);\n   equalEvents(actual,[['get','startsWith'],['call','startsWith',true,['package/']],['assert',1,value]]);\n   equalEvents(afterOracle(0,value,'ignored-extra'),actual);\n  }\n  // Exact A50 failures, with all preceding event/type/count checks held valid for value negatives.\n  negative(()=>equalEvents(afterOracle(0,undefined),afterOracle(0,false)),50);\n  negative(()=>equalEvents(afterOracle(0,false),afterOracle(0,undefined)),50);\n  negative(()=>equalEvents(afterOracle(0,+0),afterOracle(0,-0)),50);\n  negative(()=>equalEvents(afterOracle(0,sharedObject),afterOracle(0,{})),50);\n  negative(()=>equalEvents(afterOracle(0,sharedSymbol),afterOracle(0,Symbol('private-identity'))),50);\n  const baseline=afterOracle(0,false);\n  negative(()=>equalEvents(baseline,baseline.slice(0,-1)),50);\n  negative(()=>equalEvents(baseline,[baseline[1],baseline[0],baseline[2]]),50);\n  negative(()=>equalEvents(baseline,[['get','includes'],baseline[1],baseline[2]]),50);\n  negative(()=>equalEvents(baseline,[baseline[0],['call','startsWith',false,['package/']],baseline[2]]),50);\n  negative(()=>equalEvents(baseline,[baseline[0],['call','startsWith',true,['wrong/']],baseline[2]]),50);\n  for(const args of [[0],[0,undefined],[0,false],[0,undefined],[0]]){\n   const expected=args.length<2?manualFalse:args[1]===undefined?manualUndefined:manualFalse;\n   equalEvents(afterOracle(...args),expected);\n  }\n"
+    }
+  ],
+  "reverseByteExact": true,
+  "groupCount": 6,
+  "targetCandidatesUnchanged": true
+}
